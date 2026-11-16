@@ -87,13 +87,6 @@ import {
   deleteSnapshot,
   detectDrift,
   checkInstanceHealth,
-  listLoadoutProfiles,
-  createLoadoutProfile,
-  listLoadoutUnlistedMods,
-  applyLoadoutProfile,
-  deleteLoadoutProfile,
-  previewLoadoutUpdate,
-  updateLoadoutProfile,
   openInstanceFolder,
   revealPath,
   clearCachedInstanceUpdates,
@@ -126,15 +119,13 @@ import {
   type UpdateInfo,
   type Snapshot,
   type SnapshotDiff,
-  type LoadoutProfile,
-  type LoadoutChange,
-  type UnlistedModsChoice,
   type LockfileDriftReport,
   type MemoryRecommendation,
   type HealthReport,
   type LoaderChangePlan,
 } from '../lib/tauri';
 import { InstanceTemplatePanel } from '../components/InstanceTemplatePanel';
+import { LoadoutProfilesPanel } from '../components/LoadoutProfilesPanel';
 import { useConfirm } from '@/components/ui/confirm';
 import { Switch } from '@/components/ui/switch';
 import { formatDateTime, formatPlayTime } from '@/lib/utils';
@@ -366,35 +357,6 @@ const TOP_TAB_OF: Record<EditorTabId, TopTabId> = {
   console: 'java-logs',
 };
 
-function countOf(count: number, one: string, many: string): string {
-  return `${count} ${count === 1 ? one : many}`;
-}
-
-/** Plain-words summary of what a loadout profile switches on, from the counts saved with it. */
-function describeLoadoutCoverage(prof: LoadoutProfile): string {
-  const covers = prof.covers;
-  if (!covers) {
-    return `Saved before counts were recorded: ${countOf(prof.enabled_mods.length, 'item', 'items')} switched on. Mods it does not list are asked about when you apply; other items it does not list are left alone.`;
-  }
-  const parts = [
-    countOf(covers.mods, 'mod', 'mods'),
-    countOf(covers.resourcepacks, 'resource pack', 'resource packs'),
-    countOf(covers.shaders, 'shader pack', 'shader packs'),
-    countOf(covers.datapacks, 'data pack', 'data packs'),
-    countOf(covers.worlds, 'world', 'worlds'),
-  ];
-  return `Switches on: ${parts.join(', ')}. Mods it does not list are asked about when you apply; other items it does not list are left alone.`;
-}
-
-/** One line for the Update review: what saving the profile again does to one item. */
-function describeLoadoutChange(change: LoadoutChange): string {
-  const kind = change.kind;
-  if (kind === 'turned_on') return `Turn on ${change.filename}`;
-  if (kind === 'turned_off') return `Turn off ${change.filename}`;
-  if ('added' in kind) return `Add ${change.filename} (${kind.added.enabled ? 'on' : 'off'})`;
-  return `Drop ${change.filename}, which is no longer on this instance`;
-}
-
 function previewJavaMajor(version: string | undefined): number {
   const parts = (version ?? '').split('.');
   const first = Number(parts[0]);
@@ -461,48 +423,6 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
   const [confirmDeleteSnapshot, setConfirmDeleteSnapshot] = useState<string | null>(null);
   const [snapshotDiff, setSnapshotDiff] = useState<{ snapshotId: string; diff: SnapshotDiff } | null>(null);
 
-  // Loadout profiles state (Phase 6)
-  const [profiles, setProfiles] = useState<LoadoutProfile[]>([]);
-  const [profileNameInput, setProfileNameInput] = useState('');
-  const [profileBusy, setProfileBusy] = useState<string | null>(null);
-  const [confirmDeleteProfile, setConfirmDeleteProfile] = useState<string | null>(null);
-  // Set while the user is asked what to do with enabled mods a profile does not list.
-  const [unlistedChoice, setUnlistedChoice] = useState<{ profile: string; mods: string[] } | null>(null);
-  // Set while the user reviews what saving a profile again from the setup would change.
-  const [updateReview, setUpdateReview] = useState<{ profile: string; changes: LoadoutChange[] } | null>(null);
-
-  const runProfileApply = async (name: string, unlistedMods: UnlistedModsChoice) => {
-    setProfileBusy(name);
-    setError(null);
-    try {
-      await applyLoadoutProfile(instanceId, name, unlistedMods);
-      await reloadInstance();
-      setStatus(`Profile "${name}" applied. Before switching, Agora saved an undo point under Snapshots, labelled before-loadout (only the newest is kept).`);
-    } catch (e) {
-      setError(formatError(e));
-    } finally {
-      setProfileBusy(null);
-    }
-  };
-
-  // Apply asks first when the instance has enabled mods the profile does not
-  // list. Keep is only the value passed when there is nothing to switch off.
-  const requestProfileApply = async (name: string) => {
-    setError(null);
-    setProfileBusy(name);
-    const unlisted = await listLoadoutUnlistedMods(instanceId, name).catch((e: unknown) => {
-      setError(formatError(e));
-      return null;
-    });
-    setProfileBusy(null);
-    if (unlisted === null) return;
-    if (unlisted.length === 0) {
-      await runProfileApply(name, 'keep');
-      return;
-    }
-    setUnlistedChoice({ profile: name, mods: unlisted });
-  };
-
   // The launch health check, run on demand. The Health Check dialog opens with its
   // result even when there is nothing to review.
   const requestReadinessCheck = async () => {
@@ -512,38 +432,6 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
       onReviewHealth?.(instanceId, row?.name ?? 'Instance', report);
     } catch (cause) {
       setError(formatError(cause));
-    }
-  };
-
-  // Update shows every change to the profile first, and saves only when the user confirms.
-  const requestProfileUpdate = async (name: string) => {
-    setError(null);
-    setProfileBusy(name);
-    try {
-      const preview = await previewLoadoutUpdate(instanceId, name);
-      if (preview.changes.length === 0) {
-        setStatus(`Profile "${name}" already matches the current setup. Nothing to save.`);
-      } else {
-        setUpdateReview({ profile: name, changes: preview.changes });
-      }
-    } catch (e) {
-      setError(formatError(e));
-    } finally {
-      setProfileBusy(null);
-    }
-  };
-
-  const saveProfileUpdate = async (name: string) => {
-    setProfileBusy(name);
-    setError(null);
-    try {
-      await updateLoadoutProfile(instanceId, name);
-      setProfiles(await listLoadoutProfiles(instanceId));
-      setStatus(`Profile "${name}" now records the current setup of this instance.`);
-    } catch (e) {
-      setError(formatError(e));
-    } finally {
-      setProfileBusy(null);
     }
   };
 
@@ -887,21 +775,6 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
       try {
         const result = await listSnapshots(instanceId);
         if (!cancelled) setSnapshots(result);
-      } catch (e) {
-        if (!cancelled) setError(formatError(e));
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [instanceId, activeTab]);
-
-  // Load loadout profiles when tab becomes active
-  useEffect(() => {
-    if (activeTab !== 'loadout-profiles') return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const result = await listLoadoutProfiles(instanceId);
-        if (!cancelled) setProfiles(result);
       } catch (e) {
         if (!cancelled) setError(formatError(e));
       }
@@ -1385,7 +1258,6 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
     await Promise.all([
       refreshContent(),
       listSnapshots(instanceId).then(setSnapshots).catch(() => undefined),
-      listLoadoutProfiles(instanceId).then(setProfiles).catch(() => undefined),
     ]);
   };
 
@@ -2935,117 +2807,13 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
       )}
 
       {activeTab === 'loadout-profiles' && (
-        <section className="rounded-xl border border-border bg-card p-4 space-y-4">
-          <div className="flex items-center justify-between">
-            <h3 className="font-semibold text-sm">Loadout Profiles</h3>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={profileNameInput}
-                disabled={recoveryBlocked}
-                onChange={(e) => setProfileNameInput(e.target.value)}
-                placeholder="Profile name…"
-                className="rounded-lg border border-input bg-background px-3 py-1.5 text-sm w-48"
-              />
-              <button
-                onClick={async () => {
-                  const name = profileNameInput.trim();
-                  if (!name) return;
-                  setError(null);
-                  try {
-                    await createLoadoutProfile(instanceId, name);
-                    const result = await listLoadoutProfiles(instanceId);
-                    setProfiles(result);
-                    setProfileNameInput('');
-                    setStatus(`Profile "${name}" created.`);
-                  } catch (e) {
-                    setError(formatError(e));
-                  }
-                }}
-                disabled={recoveryBlocked || !profileNameInput.trim()}
-                className="rounded-lg bg-primary px-4 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 whitespace-nowrap"
-              >
-                Create Profile
-              </button>
-            </div>
-          </div>
-
-          <p className="text-xs text-muted-foreground">
-            A profile records which mods, resource packs, shader packs, data packs and worlds are switched on or off. Apply sets each item it records to that state. A mod it does not list, such as one added since it was saved, is asked about when you apply: keep it on, or switch it off. Packs and worlds it does not list are left as they are. Update from setup saves the profile again from what the instance has now, after showing you what would change. Configs, versions and the loader are not part of a profile.
-          </p>
-
-          {profiles.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              No loadout profiles yet. Enter a name and click Create Profile.
-            </p>
-          ) : (
-            <div className="space-y-2">
-              {profiles.map((prof) => (
-                <div key={prof.name} className="flex items-center justify-between rounded-lg border border-border px-3 py-2 text-sm">
-                  <div className="min-w-0 flex-1">
-                    <span className="font-medium block">{prof.name}</span>
-                    <span className="text-xs text-muted-foreground block">{describeLoadoutCoverage(prof)}</span>
-                  </div>
-                  <div className="flex gap-2 ml-3">
-                    <button
-                      onClick={() => requestProfileApply(prof.name)}
-                       disabled={profileBusy === prof.name || recoveryBlocked}
-                      className="text-xs text-foreground hover:underline disabled:opacity-50"
-                    >
-                      {profileBusy === prof.name ? 'Applying…' : 'Apply'}
-                    </button>
-                    <button
-                      onClick={() => requestProfileUpdate(prof.name)}
-                      disabled={profileBusy === prof.name || recoveryBlocked}
-                      className="text-xs text-foreground hover:underline disabled:opacity-50"
-                    >
-                      Update from setup
-                    </button>
-                    {confirmDeleteProfile === prof.name ? (
-                      <div className="flex gap-1">
-                        <button
-                          onClick={async () => {
-                            setProfileBusy(prof.name);
-                            setError(null);
-                            try {
-                              await deleteLoadoutProfile(instanceId, prof.name);
-                              const result = await listLoadoutProfiles(instanceId);
-                              setProfiles(result);
-                              setConfirmDeleteProfile(null);
-                            } catch (e) {
-                              setError(formatError(e));
-                            } finally {
-                              setProfileBusy(null);
-                            }
-                          }}
-                           disabled={recoveryBlocked}
-                           className="text-xs text-destructive font-medium disabled:opacity-50"
-                        >
-                          Confirm
-                        </button>
-                        <button
-                         onClick={() => setConfirmDeleteProfile(null)}
-                         disabled={recoveryBlocked}
-                          className="text-xs text-muted-foreground"
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    ) : (
-                      <button
-                         onClick={() => setConfirmDeleteProfile(prof.name)}
-                         disabled={recoveryBlocked}
-                         className="text-xs text-destructive hover:underline disabled:opacity-50"
-                      >
-                        Delete
-                      </button>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </section>
+        <LoadoutProfilesPanel
+          instanceId={instanceId}
+          disabled={recoveryBlocked}
+          onStatus={setStatus}
+          onError={setError}
+          onApplied={reloadInstance}
+        />
       )}
 
       {activeTab === 'migrate' && (
@@ -3958,91 +3726,6 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
             }}
         />
       )}
-
-      <Dialog
-        open={unlistedChoice !== null}
-        onOpenChange={(open) => { if (!open) setUnlistedChoice(null); }}
-      >
-        <DialogContent className="max-h-[85vh] max-w-lg overflow-hidden flex flex-col gap-3">
-          <DialogTitle className="shrink-0">Mods this profile does not list</DialogTitle>
-          <DialogDescription className="shrink-0">
-            {`Profile "${unlistedChoice?.profile ?? ''}" does not list ${unlistedChoice?.mods.length ?? 0} enabled ${unlistedChoice?.mods.length === 1 ? 'mod' : 'mods'}, such as ones added since it was saved. Keep them on, or switch them off?`}
-          </DialogDescription>
-          <ul className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border p-2 font-mono text-xs">
-            {(unlistedChoice?.mods ?? []).map((mod) => (
-              <li key={mod} className="truncate py-0.5">{mod}</li>
-            ))}
-          </ul>
-          <div className="flex shrink-0 justify-end gap-2">
-            <button
-              type="button"
-              onClick={() => setUnlistedChoice(null)}
-              className="rounded-lg border border-input px-4 py-2 text-sm font-medium hover:bg-accent"
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                const choice = unlistedChoice;
-                setUnlistedChoice(null);
-                if (choice) void runProfileApply(choice.profile, 'keep');
-              }}
-              className="rounded-lg border border-input px-4 py-2 text-sm font-medium hover:bg-accent"
-            >
-              Keep them on
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                const choice = unlistedChoice;
-                setUnlistedChoice(null);
-                if (choice) void runProfileApply(choice.profile, 'off');
-              }}
-              className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90"
-            >
-              Switch them off
-            </button>
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog
-        open={updateReview !== null}
-        onOpenChange={(open) => { if (!open) setUpdateReview(null); }}
-      >
-        <DialogContent className="max-h-[85vh] max-w-lg overflow-hidden flex flex-col gap-3">
-          <DialogTitle className="shrink-0">{`Update "${updateReview?.profile ?? ''}" from the current setup?`}</DialogTitle>
-          <DialogDescription className="shrink-0">
-            {`Saving records every mod, pack and world on this instance as it is now, on or off, and drops the ones that are gone. These changes would be saved (${updateReview?.changes.length ?? 0}):`}
-          </DialogDescription>
-          <ul className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border p-2 text-xs">
-            {(updateReview?.changes ?? []).map((change) => (
-              <li key={`${change.content_type}:${change.filename}`} className="truncate py-0.5">{describeLoadoutChange(change)}</li>
-            ))}
-          </ul>
-          <div className="flex shrink-0 justify-end gap-2">
-            <button
-              type="button"
-              onClick={() => setUpdateReview(null)}
-              className="rounded-lg border border-input px-4 py-2 text-sm font-medium hover:bg-accent"
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                const review = updateReview;
-                setUpdateReview(null);
-                if (review) void saveProfileUpdate(review.profile);
-              }}
-              className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90"
-            >
-              Save changes
-            </button>
-          </div>
-        </DialogContent>
-      </Dialog>
 
       {/* Optional dependencies overlay — the standard-editor mirror of the
           high-interaction instance editor's optional panel. Every listed target is

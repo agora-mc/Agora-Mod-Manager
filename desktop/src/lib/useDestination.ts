@@ -10,10 +10,10 @@ export type Tab = 'home' | 'browse' | 'library' | 'instances' | 'governance' | '
 export type GameTabId = 'home' | 'browse' | 'instances' | 'library';
 
 /** The pages of one instance of a non-Minecraft game. */
-export type GameInstancePage = 'overview' | 'content' | 'plugins' | 'ini-saves' | 'tools';
+export type GameInstancePage = 'overview' | 'content' | 'plugins' | 'ini-saves' | 'loadouts' | 'tools';
 
 export const GAME_TAB_IDS: readonly GameTabId[] = ['home', 'browse', 'instances', 'library'];
-export const GAME_INSTANCE_PAGE_IDS: readonly GameInstancePage[] = ['overview', 'content', 'plugins', 'ini-saves', 'tools'];
+export const GAME_INSTANCE_PAGE_IDS: readonly GameInstancePage[] = ['overview', 'content', 'plugins', 'ini-saves', 'loadouts', 'tools'];
 
 /**
  * A single typed application destination. Replaces the previous pattern of

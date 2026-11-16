@@ -263,6 +263,17 @@ snapshot first, and `template delete` asks unless given `--yes`.
   copied under Documents only with `--copy-saves`. If scan says the game folder is a real install
   Agora has not added, import with `--add-folder` (or run `agora games folder add <path>` first).
   Show the plan before importing; a second import of the same profile needs `--name`.
+- **Several profiles:** `--profiles <a,b,...|all> --as merged|separate` imports more than one
+  profile. `merged` makes one instance holding the union and a loadout per profile (the first is
+  applied); `separate` makes one instance per profile. `--suggest` prints Agora's grouping and
+  the overlap numbers first (profiles sharing more than half their enabled mods go together).
+  The plan states the bytes and the free space and refuses only when they cannot fit. The same
+  flags work on `games import mo2`.
+- **Loadouts on game instances:** `agora loadout create/list/apply/update/delete` work on a game
+  instance, not just Minecraft. A game loadout records its content, plugin list, INI copies,
+  load-after rules and save choice; apply restores them together, refuses while the game runs,
+  and saves the replaced setup as the undo point. This is the same store and the same desktop
+  picker, not a second feature.
 
 ## Finding and installing content
 

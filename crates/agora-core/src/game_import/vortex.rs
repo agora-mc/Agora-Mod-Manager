@@ -476,6 +476,9 @@ pub struct VortexScanProfile {
     pub name: String,
     pub mods_enabled: usize,
     pub mods_total: usize,
+    /// The ids of the mods this profile enables, so a grouping can compare profiles.
+    #[serde(default)]
+    pub enabled_mod_ids: Vec<String>,
     pub plugins_txt: bool,
     pub loadorder_txt: bool,
     pub local_settings: bool,
@@ -557,11 +560,18 @@ pub fn scan(
                 .filter(|m| profile.enabled.get(&m.id).copied().unwrap_or(false))
                 .count();
             let (plugins_txt, loadorder_txt) = plugin_files_found(&state, game, profile);
+            let enabled_mod_ids: Vec<String> = game
+                .mods
+                .iter()
+                .filter(|m| profile.enabled.get(&m.id).copied().unwrap_or(false))
+                .map(|m| m.id.clone())
+                .collect();
             profiles.push(VortexScanProfile {
                 id: profile.id.clone(),
                 name: profile.name.clone(),
                 mods_enabled: enabled,
                 mods_total: game.mods.len(),
+                enabled_mod_ids,
                 plugins_txt,
                 loadorder_txt,
                 local_settings: profile.local_settings,
@@ -899,11 +909,13 @@ fn find_manifests(def: Option<&GameDefinition>, install: &Path) -> ManifestSearc
 const VORTEX_STAGING_MARKER: &str = "__vortex_staging_folder";
 
 fn normalise_path(path: &Path) -> String {
-    fold_path_case(
-        path.to_string_lossy()
-            .replace('/', "\\")
-            .trim_end_matches('\\'),
-    )
+    // Vortex, a game store and a user can all spell one folder differently: an
+    // 8.3 short name, another case, a trailing separator, `/` for `\`, or the
+    // `\?\` prefix. Resolve the real folder first, so two spellings of one
+    // folder compare equal; a folder that is gone keeps its stored spelling.
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let shown = crate::game_discovery::custom_folders::display_path(&resolved);
+    fold_path_case(shown.replace('/', "\\").trim_end_matches('\\'))
 }
 
 /// Where Vortex keeps a profile's plugin files. The source names the files but not their folder;
@@ -2708,6 +2720,385 @@ pub fn run(
         ));
     }
     Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// Several profiles
+// ---------------------------------------------------------------------------
+
+/// The profiles of one Vortex game, with what each enables, for a grouping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSets {
+    pub game: GameId,
+    pub game_name: String,
+    pub profiles: Vec<super::profiles::ProfileSet>,
+}
+
+/// Read one Vortex game's profiles and the mods each enables. Reads a copy of
+/// the store, like every other Vortex read.
+pub fn profile_sets(
+    ctx: &Ctx,
+    inventory: &GameInventory,
+    store: &Path,
+    game: &str,
+) -> Result<ProfileSets, ImportError> {
+    let scan = scan(ctx, inventory, store)?;
+    let found = scan
+        .games
+        .iter()
+        .find(|g| g.vortex_game == game || g.game.as_ref().is_some_and(|id| id.as_str() == game))
+        .ok_or_else(|| ImportError::NoVortexGame(game.to_string()))?;
+    if let Some(reason) = &found.reason {
+        return Err(ImportError::Other(reason.clone()));
+    }
+    let game = found
+        .game
+        .clone()
+        .ok_or_else(|| ImportError::NoVortexGame(game.to_string()))?;
+    Ok(ProfileSets {
+        game,
+        game_name: found.game_name.clone().unwrap_or_default(),
+        profiles: found
+            .profiles
+            .iter()
+            .map(|profile| super::profiles::ProfileSet {
+                name: profile.name.clone(),
+                enabled: profile.enabled_mod_ids.iter().cloned().collect(),
+            })
+            .collect(),
+    })
+}
+
+/// What importing several profiles would do, read and checked. Nothing is written.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MultiProfilePlan {
+    pub grouping: super::profiles::Grouping,
+    pub profiles: Vec<String>,
+    pub game: GameId,
+    pub game_name: String,
+    /// One plan per profile, in the order asked for.
+    pub plans: Vec<VortexPlan>,
+    /// The bytes the choice brings in: the union for a merge, the sum for separate instances.
+    pub bytes: u64,
+    /// The free bytes on the content store's drive, when they can be read.
+    pub free_bytes: Option<u64>,
+    /// False only when the bytes cannot fit.
+    pub fits: bool,
+    pub suggestion: super::profiles::Suggestion,
+    pub warnings: Vec<String>,
+}
+
+/// Plan several profiles at once, and say whether the bytes fit.
+pub fn plan_profiles(
+    ctx: &Ctx,
+    inventory: &GameInventory,
+    base: &VortexRequest,
+    profiles: &[String],
+    grouping: super::profiles::Grouping,
+) -> Result<MultiProfilePlan, ImportError> {
+    if profiles.is_empty() {
+        return Err(ImportError::NoProfiles);
+    }
+    let sets = profile_sets(ctx, inventory, &base.store, base.game.as_str())?;
+    let mut plans = Vec::with_capacity(profiles.len());
+    let mut names = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        let request = VortexRequest {
+            profile: profile.clone(),
+            ..base.clone()
+        };
+        plans.push(plan(ctx, inventory, &request)?);
+        names.push(profile.clone());
+    }
+
+    let mut union: BTreeMap<String, u64> = BTreeMap::new();
+    let mut separate_bytes = 0u64;
+    for plan in &plans {
+        for item in plan.mods.iter().filter(|m| m.enabled) {
+            union.insert(item.mod_id.clone(), item.bytes);
+            separate_bytes = separate_bytes.saturating_add(item.bytes);
+        }
+    }
+    let bytes = match grouping {
+        super::profiles::Grouping::Merged => union.values().sum(),
+        super::profiles::Grouping::Separate => separate_bytes,
+    };
+    let free_bytes = crate::game_tool_swap::available_bytes(&ctx.paths.content_root());
+    let fits = free_bytes.is_none_or(|free| bytes <= free);
+    let suggestion = super::profiles::suggest_grouping(&sets.profiles);
+    let mut warnings = Vec::new();
+    if !fits {
+        warnings.push(format!(
+            "the choice needs {} but only {} is free on the content store's drive",
+            crate::game_tool_swap::human_bytes(bytes),
+            crate::game_tool_swap::human_bytes(free_bytes.unwrap_or(0))
+        ));
+    }
+    if suggestion.groups.len() > 1 {
+        warnings.push(suggestion.note.clone());
+    }
+    Ok(MultiProfilePlan {
+        grouping,
+        profiles: names,
+        game: sets.game,
+        game_name: sets.game_name,
+        plans,
+        bytes,
+        free_bytes,
+        fits,
+        suggestion,
+        warnings,
+    })
+}
+
+/// What importing several profiles did.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MultiProfileReport {
+    pub plan: MultiProfilePlan,
+    /// One instance id per import: one for a merge, one per profile for separate.
+    pub instances: Vec<String>,
+    /// The loadout profiles a merge created, by name.
+    pub loadouts: Vec<String>,
+}
+
+fn add_mod_to_merged(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    plan: &VortexPlan,
+    item: &PlannedMod,
+) -> Result<String, ImportError> {
+    let source = ContentSource::VortexImport {
+        store: plan.store.to_string_lossy().to_string(),
+        game: plan.vortex_game.clone(),
+        mod_id: item.mod_id.clone(),
+        installation_folder: item.folder.clone(),
+        provenance: item.provenance.clone(),
+        added_at_unix_ms: content_store::now_unix_ms(),
+    };
+    let outcome = content_store::add_collected(ctx, &item.name, item.paths.clone(), source)
+        .map_err(|e| ImportError::Store {
+            mod_folder: item.name.clone(),
+            reason: e.to_string(),
+        })?;
+    let item_id = outcome.item().item_id.clone();
+    let manifest = game_instance::get_manifest(ctx, instance_id)?;
+    let present = manifest.layers.layers().iter().any(|layer| {
+        matches!(&layer.source, agora_game_api::LayerSource::Content { content } if content == &item_id)
+    });
+    if !present {
+        let mount = data_mount(definition);
+        let mount_arg = if mount.is_empty() {
+            None
+        } else {
+            Some(mount.as_str())
+        };
+        game_deploy::add_content(ctx, instance_id, &item_id, mount_arg, None).map_err(|e| {
+            ImportError::Other(format!(
+                "'{}' could not be put on the merged instance: {e}",
+                item.name
+            ))
+        })?;
+    }
+    Ok(item_id)
+}
+
+fn profile_state_for_merge(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    plan: &VortexPlan,
+    layer_mod: &HashMap<String, Option<String>>,
+) -> Result<crate::game_loadout::GameLoadout, ImportError> {
+    let mut state =
+        crate::game_loadout::capture(ctx, instance_id, definition).map_err(ImportError::Other)?;
+    let enabled: BTreeSet<&str> = plan
+        .mods
+        .iter()
+        .filter(|m| m.enabled)
+        .map(|m| m.mod_id.as_str())
+        .collect();
+    for item in &mut state.content {
+        item.enabled = layer_mod
+            .get(item.item.as_str())
+            .and_then(|mod_id| mod_id.as_deref())
+            .is_some_and(|mod_id| enabled.contains(mod_id));
+    }
+    if plan.plugins.kept {
+        if let Some(rule) = definition.load_orders.first() {
+            let lines: Vec<(String, bool)> = plan
+                .plugins
+                .lines
+                .iter()
+                .map(|line| (line.name.clone(), line.active))
+                .collect();
+            let bytes = game_plugins::list_bytes(rule, &lines);
+            if let Some(list) = state.plugin_lists.iter_mut().find(|l| l.list == rule.id) {
+                list.contents = Some(bytes);
+            }
+        }
+    }
+    for ini in &plan.inis {
+        let contents = match std::fs::read(&ini.from) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                return Err(ImportError::Other(format!(
+                    "the profile's INI {} could not be read: {e}",
+                    ini.from.display()
+                )))
+            }
+        };
+        if let Some(existing) = state.inis.iter_mut().find(|i| i.file == ini.instance_path) {
+            existing.contents = contents;
+        } else {
+            state.inis.push(crate::game_loadout::GameLoadoutIni {
+                file: ini.instance_path.clone(),
+                contents,
+            });
+        }
+    }
+    if let Some(rule) = definition.load_orders.first() {
+        let rules: Vec<crate::game_load_order::LoadAfterRule> = plan
+            .userlist
+            .rules
+            .iter()
+            .map(|rule| crate::game_load_order::LoadAfterRule {
+                item: rule.item.clone(),
+                after: rule.after.clone(),
+            })
+            .collect();
+        if let Some(existing) = state.rules.iter_mut().find(|r| r.list == rule.id) {
+            existing.rules = rules;
+        } else {
+            state.rules.push(crate::game_loadout::GameLoadoutRules {
+                list: rule.id.clone(),
+                rules,
+            });
+        }
+    }
+    state.saves = if plan.local_saves {
+        SavesChoice::Own
+    } else {
+        SavesChoice::Shared
+    };
+    Ok(state)
+}
+
+/// Run a several-profile import. A merge makes one instance holding the union,
+/// creates a loadout per profile and applies the first; separate imports make
+/// one instance per profile.
+pub fn run_profiles(
+    ctx: &Ctx,
+    inventory: &GameInventory,
+    base: &VortexRequest,
+    profiles: &[String],
+    grouping: super::profiles::Grouping,
+    options: RunOptions,
+    progress: &dyn Fn(ImportProgress),
+) -> Result<MultiProfileReport, ImportError> {
+    let plan = plan_profiles(ctx, inventory, base, profiles, grouping)?;
+    if !plan.fits {
+        return Err(ImportError::NotEnoughSpace {
+            needed: plan.bytes,
+            free: plan.free_bytes.unwrap_or(0),
+        });
+    }
+    match grouping {
+        super::profiles::Grouping::Separate => {
+            let mut instances = Vec::new();
+            for profile in profiles {
+                let request = VortexRequest {
+                    profile: profile.clone(),
+                    name: Some(
+                        base.name
+                            .clone()
+                            .map(|name| format!("{name} ({profile})"))
+                            .unwrap_or_else(|| profile.clone()),
+                    ),
+                    ..base.clone()
+                };
+                let report = run(ctx, inventory, &request, options, progress)?;
+                if let Some(instance) = report.instance_id {
+                    instances.push(instance);
+                }
+            }
+            Ok(MultiProfileReport {
+                plan,
+                instances,
+                loadouts: Vec::new(),
+            })
+        }
+        super::profiles::Grouping::Merged => {
+            let request = VortexRequest {
+                profile: profiles[0].clone(),
+                ..base.clone()
+            };
+            let report = run(ctx, inventory, &request, options, progress)?;
+            let instance_id = report
+                .instance_id
+                .clone()
+                .ok_or_else(|| ImportError::Other("the base import made no instance".into()))?;
+
+            let definition = ctx
+                .games
+                .game(&plan.game)
+                .cloned()
+                .ok_or_else(|| ImportError::Other("the game definition is missing".into()))?;
+
+            // Every mod the chosen profiles enable, not just the first's.
+            let mut mod_to_item: HashMap<String, String> = HashMap::new();
+            for profile_plan in &plan.plans {
+                for item in profile_plan.mods.iter().filter(|m| m.enabled) {
+                    if mod_to_item.contains_key(&item.mod_id) {
+                        continue;
+                    }
+                    let item_id =
+                        add_mod_to_merged(ctx, &instance_id, &definition, profile_plan, item)?;
+                    mod_to_item.insert(item.mod_id.clone(), item_id);
+                }
+            }
+
+            let reverse: HashMap<String, String> = mod_to_item
+                .iter()
+                .map(|(mod_id, item_id)| (item_id.clone(), mod_id.clone()))
+                .collect();
+            let manifest = game_instance::get_manifest(ctx, &instance_id)?;
+            let mut layer_mod: HashMap<String, Option<String>> = HashMap::new();
+            for layer in manifest.layers.layers() {
+                if let agora_game_api::LayerSource::Content { content } = &layer.source {
+                    layer_mod.insert(layer.id.as_str().to_string(), reverse.get(content).cloned());
+                }
+            }
+
+            let mut loadouts = Vec::new();
+            for (profile, profile_plan) in profiles.iter().zip(plan.plans.iter()) {
+                let state = profile_state_for_merge(
+                    ctx,
+                    &instance_id,
+                    &definition,
+                    profile_plan,
+                    &layer_mod,
+                )?;
+                crate::game_loadout::save_game_profile(ctx, &instance_id, profile, state)
+                    .map_err(ImportError::Other)?;
+                loadouts.push(profile.clone());
+            }
+            // The instance keeps the first profile's setup.
+            crate::game_loadout::apply_game_profile_with_undo(
+                ctx,
+                &instance_id,
+                &definition,
+                &profiles[0],
+            )
+            .map_err(|e| ImportError::Other(e.to_string()))?;
+
+            Ok(MultiProfileReport {
+                plan,
+                instances: vec![instance_id],
+                loadouts,
+            })
+        }
+    }
 }
 
 #[cfg(test)]

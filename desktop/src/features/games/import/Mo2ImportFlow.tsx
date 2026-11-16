@@ -20,6 +20,8 @@ import { openGameSettings } from '@/lib/settingsSection';
 import { formatError, pickDirectory } from '@/lib/tauri';
 import {
   importMo2Profile,
+  importMo2Profiles,
+  suggestMo2Profiles,
   listenImportProgress,
   NO_INSTALL_CODE,
   scanMo2Setups,
@@ -34,6 +36,7 @@ import { isGamesError, type InstallSummary } from '../shared/types';
 import { storeName } from '../shared/stores';
 import { planBlockReason } from './planRules';
 import { PlanView } from './PlanView';
+import { MultiProfilesSection } from './MultiProfilesSection';
 import { ImportProgressView } from './ImportProgressView';
 
 /** One step's panel inside the dialog: a quiet card on the dialog's own surface. */
@@ -440,6 +443,36 @@ export function Mo2ImportFlow({ gameId, onStateChange }: Mo2ImportFlowProps) {
                 </Button>
               </div>
 
+              <MultiProfilesSection
+                profiles={chosen.profiles.map((name) => ({ name }))}
+                onSuggest={() => suggestMo2Profiles(chosen.iniPath)}
+                onPlan={async (profiles, mode) => {
+                  const reply = await importMo2Profiles({
+                    iniPath: chosen.iniPath,
+                    profiles,
+                    mode,
+                    name: null,
+                    dryRun: true,
+                    copySaves,
+                    install,
+                  });
+                  if (reply.kind !== 'plan') throw new Error('The preview did not return a plan.');
+                  return reply;
+                }}
+                onRun={async (profiles, mode) => {
+                  const reply = await importMo2Profiles({
+                    iniPath: chosen.iniPath,
+                    profiles,
+                    mode,
+                    name: null,
+                    dryRun: false,
+                    copySaves,
+                    install,
+                  });
+                  if (reply.kind !== 'run') throw new Error('The import did not return a report.');
+                  return reply;
+                }}
+              />
               {plan.status === 'error' && <PreviewError message={plan.message} noInstall={plan.noInstall} />}
             </>
           )}

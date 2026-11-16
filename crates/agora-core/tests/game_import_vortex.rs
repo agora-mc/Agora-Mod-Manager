@@ -561,6 +561,68 @@ fn a_fresh_data_dir_says_the_folder_needs_adding_then_adds_it() {
         .any(|folder| Path::new(folder) == f._tmp.path().join("game")));
 }
 
+/// The folder's 8.3 short name, the spelling CI's temp folder can arrive as.
+/// `None` when the volume does not make one, or gives the same name back.
+#[cfg(windows)]
+fn short_path(path: &Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut buffer = vec![0u16; 260];
+    let len = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+            wide.as_ptr(),
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+        )
+    };
+    if len == 0 || len as usize >= buffer.len() {
+        return None;
+    }
+    buffer.truncate(len as usize);
+    let short = PathBuf::from(String::from_utf16_lossy(&buffer));
+    (short != path).then_some(short)
+}
+
+/// Vortex can name a folder with its 8.3 short form while the folder Agora added
+/// is stored under its long form. They are one folder, so the add must not
+/// happen twice and the planned install must still be there when the run looks
+/// for it.
+#[test]
+fn a_folder_spelled_with_its_83_short_name_is_the_same_folder() {
+    let f = fixture();
+    let game_dir = f._tmp.path().join("game");
+    let Some(short) = short_path(&game_dir) else {
+        return;
+    };
+    write_store(
+        &f.store,
+        &[(
+            &format!("settings###gameMode###discovered###{VORTEX_GAME}"),
+            format!(
+                r#"{{"path":"{}"}}"#,
+                short.to_string_lossy().replace('\\', "/")
+            ),
+        )],
+    );
+
+    let mut empty = f.inventory.clone();
+    empty.installs.clear();
+    empty.unsupported.clear();
+
+    let mut with_add = request(&f, Some("Short Path Import"));
+    with_add.add_folder = true;
+    let report = vortex::run(&f.ctx, &empty, &with_add, Default::default(), &|_| {})
+        .expect("the short spelling is the same folder, so the import runs");
+    assert_eq!(report.stored_mods, 2);
+    assert!(report.instance_id.is_some());
+    let folders = agora_core::game_discovery::custom_folders::list_folders(&f.ctx.paths).unwrap();
+    assert_eq!(folders.len(), 1, "the folder is added once: {folders:?}");
+}
+
 #[test]
 fn a_missing_manifest_falls_back_to_vortex_rules_and_says_where_it_looked() {
     let f = fixture();
@@ -1080,4 +1142,179 @@ fn a_profiles_userlist_becomes_load_after_rules_and_refuses_bad_ones() {
     assert!(rules
         .iter()
         .any(|rule| rule.item == "Alpha.esp" && rule.after == "Beta.esp"));
+}
+
+/// A second profile, "Alt", enables every mod; "Main" leaves Gamma off. Both keep
+/// the same staging folder, as Vortex really does.
+fn add_second_profile(f: &Fixture) {
+    let profiles = format!(
+        r#"{{"p1":{{"id":"p1","gameId":"{VORTEX_GAME}","name":"Main","modState":{{"mod-alpha":{{"enabled":true}},"mod-beta":{{"enabled":true}},"mod-gamma":{{"enabled":false}}}},"features":{{"local_game_settings":true,"local_saves":true}}}},"p2":{{"id":"p2","gameId":"{VORTEX_GAME}","name":"Alt","modState":{{"mod-alpha":{{"enabled":true}},"mod-beta":{{"enabled":true}},"mod-gamma":{{"enabled":true}}}},"features":{{}}}}}}"#
+    );
+    write_store(&f.store, &[("persistent###profiles", profiles)]);
+    let alt = f
+        ._tmp
+        .path()
+        .join("Vortex")
+        .join(VORTEX_GAME)
+        .join("profiles")
+        .join("p2");
+    write(
+        &alt.join("plugins.txt"),
+        b"# Alt\r\n*Alpha.esp\r\n*Beta.esp\r\n*Gamma.esp\r\n",
+    );
+}
+
+fn chosen_profiles() -> Vec<String> {
+    vec!["Main".to_string(), "Alt".to_string()]
+}
+
+fn enabled_count(ctx: &CoreContext, instance: &str, profile: &str) -> usize {
+    let dir = ctx.paths.instance_dir(instance).unwrap();
+    let profiles = agora_core::loadout::list_profiles(&dir).unwrap();
+    profiles
+        .iter()
+        .find(|p| p.name == profile)
+        .and_then(|p| p.game.as_ref())
+        .map(|game| game.content.iter().filter(|item| item.enabled).count())
+        .unwrap_or_else(|| panic!("no loadout '{profile}' on {instance}"))
+}
+
+#[test]
+fn a_merged_import_makes_one_instance_and_a_loadout_per_profile() {
+    let f = fixture();
+    add_second_profile(&f);
+    let report = vortex::run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("Merged Setup")),
+        &chosen_profiles(),
+        agora_core::game_import::profiles::Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("the merge runs");
+
+    assert_eq!(report.instances.len(), 1, "{report:?}");
+    assert_eq!(report.loadouts, chosen_profiles());
+    let instance = &report.instances[0];
+    let manifest = agora_core::game_instance::get_manifest(&f.ctx, instance).unwrap();
+    let content: Vec<_> = manifest
+        .layers
+        .layers()
+        .iter()
+        .filter(|layer| matches!(layer.source, agora_game_api::LayerSource::Content { .. }))
+        .collect();
+    assert_eq!(content.len(), 3, "the union holds every mod: {content:?}");
+    // The first profile is applied, so the instance as it stands has Main's two.
+    assert_eq!(content.iter().filter(|layer| layer.enabled).count(), 2);
+    assert_eq!(enabled_count(&f.ctx, instance, "Main"), 2);
+    assert_eq!(enabled_count(&f.ctx, instance, "Alt"), 3);
+}
+
+#[test]
+fn a_separate_import_makes_one_instance_per_profile_with_only_its_mods() {
+    let f = fixture();
+    add_second_profile(&f);
+    let report = vortex::run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("Sep Setup")),
+        &chosen_profiles(),
+        agora_core::game_import::profiles::Grouping::Separate,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("the separate import runs");
+    assert_eq!(report.instances.len(), 2, "{report:?}");
+    assert!(report.loadouts.is_empty());
+    let mut counts: Vec<usize> = report
+        .instances
+        .iter()
+        .map(|instance| {
+            let manifest = agora_core::game_instance::get_manifest(&f.ctx, instance).unwrap();
+            manifest
+                .layers
+                .layers()
+                .iter()
+                .filter(|layer| matches!(layer.source, agora_game_api::LayerSource::Content { .. }))
+                .count()
+        })
+        .collect();
+    counts.sort_unstable();
+    assert_eq!(counts, vec![2, 3], "Main has two mods, Alt three");
+}
+
+#[test]
+fn the_suggestion_groups_the_two_overlapping_profiles() {
+    use agora_core::game_import::profiles;
+
+    let f = fixture();
+    add_second_profile(&f);
+    let sets = vortex::profile_sets(&f.ctx, &f.inventory, &f.store, GAME).unwrap();
+    assert_eq!(sets.profiles.len(), 2);
+    let suggestion = profiles::suggest_grouping(&sets.profiles);
+    assert_eq!(suggestion.groups.len(), 1, "{suggestion:?}");
+    assert_eq!(
+        suggestion.groups[0].profiles,
+        vec!["Alt".to_string(), "Main".to_string()]
+    );
+    let pair = &suggestion.pairs[0];
+    assert_eq!(pair.shared, 2);
+    assert_eq!(pair.union, 3);
+    assert!(pair.ratio > profiles::OVERLAP_THRESHOLD);
+
+    // Two profiles with nothing in common stay apart.
+    let apart = profiles::suggest_grouping(&[
+        profiles::ProfileSet {
+            name: "One".into(),
+            enabled: ["a".to_string()].into_iter().collect(),
+        },
+        profiles::ProfileSet {
+            name: "Two".into(),
+            enabled: ["b".to_string()].into_iter().collect(),
+        },
+    ]);
+    assert_eq!(apart.groups.len(), 2);
+    assert_eq!(apart.pairs[0].shared, 0);
+}
+
+#[test]
+fn an_import_that_cannot_fit_is_refused_after_stating_the_bytes() {
+    use agora_core::game_import::profiles::Grouping;
+    use agora_core::game_import::ImportError;
+
+    let f = fixture();
+    add_second_profile(&f);
+    let request = request(&f, Some("Too Big"));
+    let plan = vortex::plan_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request,
+        &chosen_profiles(),
+        Grouping::Merged,
+    )
+    .expect("the plan is made");
+    assert!(plan.bytes > 0);
+    assert!(plan.fits, "the real disk has room");
+
+    agora_core::game_tool_swap::set_volume_seam(Some(agora_core::game_tool_swap::VolumeSeam {
+        free_bytes: Some(1),
+        same_volume: None,
+    }));
+    let error = vortex::run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request,
+        &chosen_profiles(),
+        Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect_err("one byte cannot hold the merge");
+    agora_core::game_tool_swap::set_volume_seam(None);
+    assert!(
+        matches!(error, ImportError::NotEnoughSpace { .. }),
+        "{error}"
+    );
+    assert!(agora_core::game_instance::list(&f.ctx).unwrap().is_empty());
 }

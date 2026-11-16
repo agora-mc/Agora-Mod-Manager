@@ -530,6 +530,18 @@ enum ImportCmd {
         /// The profile to import, by folder name.
         #[arg(long)]
         profile: Option<String>,
+        /// Import several profiles: `a,b,...` or `all`. Use --as to choose one
+        /// instance with a loadout per profile (merged) or one instance per
+        /// profile (separate), and --suggest to see Agora's grouping first.
+        #[arg(long, value_name = "A,B,...|all")]
+        profiles: Option<String>,
+        /// How several profiles import: `merged` or `separate`.
+        #[arg(long = "as", value_name = "MERGED|SEPARATE")]
+        as_mode: Option<ProfileModeArg>,
+        /// Print Agora's suggested grouping of the setup's profiles and the
+        /// overlap numbers, and stop.
+        #[arg(long)]
+        suggest: bool,
         /// Name for the new instance. Needed to import the same setup and profile again.
         #[arg(long)]
         name: Option<String>,
@@ -564,6 +576,18 @@ enum ImportCmd {
         /// The Vortex profile, by name.
         #[arg(long)]
         profile: Option<String>,
+        /// Import several profiles: `a,b,...` or `all`. Use --as to choose one
+        /// instance with a loadout per profile (merged) or one instance per
+        /// profile (separate), and --suggest to see Agora's grouping first.
+        #[arg(long, value_name = "A,B,...|all")]
+        profiles: Option<String>,
+        /// How several profiles import: `merged` or `separate`.
+        #[arg(long = "as", value_name = "MERGED|SEPARATE")]
+        as_mode: Option<ProfileModeArg>,
+        /// Print Agora's suggested grouping of the game's profiles and the
+        /// overlap numbers, and stop.
+        #[arg(long)]
+        suggest: bool,
         /// Name for the new instance. Needed to import the same profile again.
         #[arg(long)]
         name: Option<String>,
@@ -590,6 +614,22 @@ enum ImportCmd {
         #[arg(long)]
         verbose: bool,
     },
+}
+
+/// How `--profiles` imports: one merged instance, or one per profile.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum ProfileModeArg {
+    Merged,
+    Separate,
+}
+
+impl From<ProfileModeArg> for agora_core::game_import::profiles::Grouping {
+    fn from(value: ProfileModeArg) -> Self {
+        match value {
+            ProfileModeArg::Merged => Self::Merged,
+            ProfileModeArg::Separate => Self::Separate,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -5509,8 +5549,16 @@ async fn run_loadout_command(
             if !instance_dir.exists() {
                 anyhow::bail!("Instance '{}' not found", instance);
             }
-            let profile = agora_core::loadout::create_profile(&instance_dir, &name)
-                .map_err(|e| anyhow::anyhow!("Failed to create loadout: {e}"))?;
+            let profile = if let Some(record) = agora_core::game_instance::get(ctx, &instance)? {
+                let definition = ctx.games.game(&record.game).ok_or_else(|| {
+                    anyhow::anyhow!("The definition for game '{}' is missing", record.game)
+                })?;
+                agora_core::game_loadout::create_game_profile(ctx, &instance, definition, &name)
+                    .map_err(|e| anyhow::anyhow!("Failed to create loadout: {e}"))?
+            } else {
+                agora_core::loadout::create_profile(&instance_dir, &name)
+                    .map_err(|e| anyhow::anyhow!("Failed to create loadout: {e}"))?
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&profile)?);
             } else {
@@ -5533,11 +5581,12 @@ async fn run_loadout_command(
                 let rows: Vec<Vec<String>> = profiles
                     .iter()
                     .map(|p| {
-                        vec![
-                            p.name.clone(),
-                            p.created_at.clone(),
-                            p.enabled_mods.len().to_string(),
-                        ]
+                        let entries = p
+                            .game
+                            .as_ref()
+                            .map(|game| game.content.iter().filter(|item| item.enabled).count())
+                            .unwrap_or(p.enabled_mods.len());
+                        vec![p.name.clone(), p.created_at.clone(), entries.to_string()]
                     })
                     .collect();
                 print_table(&["Name", "Created", "Entries"], &rows);
@@ -5552,28 +5601,47 @@ async fn run_loadout_command(
             if !instance_dir.exists() {
                 anyhow::bail!("Instance '{}' not found", instance);
             }
-            // Same core service the desktop uses: the lock, the running-game
-            // check and the undo point are not things a second front end skips.
-            let service = agora_game_minecraft::loadout_service::LoadoutService::new(ctx.clone());
-            let unlisted = service.unlisted_mods(&instance, &name)?;
-            let choice = match (others, unlisted.is_empty()) {
-                (Some(choice), _) => choice.into(),
-                // Nothing would be switched off either way, so there is nothing to ask.
-                (None, true) => agora_core::loadout::UnlistedMods::Keep,
-                (None, false) => anyhow::bail!(
-                    "Loadout '{}' does not list {} enabled mod(s) on '{}': {}. \
-                     Rerun with --others keep to leave them on, or --others off to switch them off.",
-                    name,
-                    unlisted.len(),
-                    instance,
-                    unlisted.join(", ")
-                ),
-            };
-            service.apply(&instance, &name, choice)?;
+            let game_instance = agora_core::game_instance::get(ctx, &instance)?.is_some();
+            if game_instance {
+                let record = agora_core::game_instance::get(ctx, &instance)?
+                    .expect("the instance was just found");
+                let definition = ctx.games.game(&record.game).ok_or_else(|| {
+                    anyhow::anyhow!("The definition for game '{}' is missing", record.game)
+                })?;
+                agora_core::game_loadout::apply_game_profile_with_undo(
+                    ctx, &instance, definition, &name,
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            } else {
+                // Same core service the desktop uses: the lock, the running-game
+                // check and the undo point are not things a second front end skips.
+                let service =
+                    agora_game_minecraft::loadout_service::LoadoutService::new(ctx.clone());
+                let unlisted = service.unlisted_mods(&instance, &name)?;
+                let choice = match (others, unlisted.is_empty()) {
+                    (Some(choice), _) => choice.into(),
+                    // Nothing would be switched off either way, so there is nothing to ask.
+                    (None, true) => agora_core::loadout::UnlistedMods::Keep,
+                    (None, false) => anyhow::bail!(
+                        "Loadout '{}' does not list {} enabled mod(s) on '{}': {}. \
+                         Rerun with --others keep to leave them on, or --others off to switch them off.",
+                        name,
+                        unlisted.len(),
+                        instance,
+                        unlisted.join(", ")
+                    ),
+                };
+                service.apply(&instance, &name, choice)?;
+            }
             if json {
                 println!(
                     "{}",
                     serde_json::json!({"status": "applied", "instanceId": instance, "profile": name})
+                );
+            } else if game_instance {
+                println!(
+                    "Applied loadout '{}' to '{}'. The setup it replaced was saved as the undo point (only the newest is kept).",
+                    name, instance
                 );
             } else {
                 println!(
@@ -5593,8 +5661,21 @@ async fn run_loadout_command(
             if !instance_dir.exists() {
                 anyhow::bail!("Instance '{}' not found", instance);
             }
+            let game_record = agora_core::game_instance::get(ctx, &instance)?;
+            let game_definition = match &game_record {
+                Some(record) => Some(ctx.games.game(&record.game).ok_or_else(|| {
+                    anyhow::anyhow!("The definition for game '{}' is missing", record.game)
+                })?),
+                None => None,
+            };
             let service = agora_game_minecraft::loadout_service::LoadoutService::new(ctx.clone());
-            let preview = service.update_preview(&instance, &name)?;
+            let preview = match game_definition {
+                Some(definition) => agora_core::game_loadout::plan_game_profile_update(
+                    ctx, &instance, definition, &name,
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to read the loadout: {e}"))?,
+                None => service.update_preview(&instance, &name)?,
+            };
             if preview.changes.is_empty() {
                 if json {
                     println!(
@@ -5617,7 +5698,13 @@ async fn run_loadout_command(
                     println!("Loadout '{}' was not changed.", name);
                 }
             } else {
-                let done = service.update(&instance, &name)?;
+                let done = match game_definition {
+                    Some(definition) => agora_core::game_loadout::update_game_profile(
+                        ctx, &instance, definition, &name,
+                    )
+                    .map_err(|e| anyhow::anyhow!("Failed to update the loadout: {e}"))?,
+                    None => service.update(&instance, &name)?,
+                };
                 if json {
                     println!(
                         "{}",
@@ -9846,14 +9933,88 @@ fn run_games_import(
             action: None,
             ini: Some(ini),
             profile,
+            profiles,
+            as_mode,
+            suggest,
             name,
             dry_run,
             copy_saves,
             install,
         } => {
+            if suggest {
+                let sets = game_import::mo2_profile_sets(&ini)?;
+                let suggestion = agora_core::game_import::profiles::suggest_grouping(&sets);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&suggestion)?);
+                } else {
+                    print_suggestion(&suggestion);
+                }
+                return Ok(());
+            }
+            if let Some(list) = profiles {
+                let grouping: agora_core::game_import::profiles::Grouping = as_mode
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("--as merged|separate is required with --profiles")
+                    })?
+                    .into();
+                let all: Vec<String> = game_import::mo2_profile_sets(&ini)?
+                    .into_iter()
+                    .map(|profile| profile.name)
+                    .collect();
+                let chosen = profile_list(&list, &all)?;
+                let request = Mo2Request {
+                    ini_path: ini,
+                    profile: chosen[0].clone(),
+                    name,
+                    copy_saves,
+                    install,
+                };
+                let inventory = agora_core::game_registry::installed_games(ctx);
+                let plan =
+                    game_import::mo2_plan_profiles(ctx, &inventory, &request, &chosen, grouping)?;
+                if dry_run {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&plan)?);
+                    } else {
+                        print_mo2_multi_plan(&plan);
+                    }
+                    return Ok(());
+                }
+                if !json {
+                    eprintln!(
+                        "Importing {}. Every listed mod is stored as it is on disk; a large setup takes a while.",
+                        multigrouping_name(grouping)
+                    );
+                }
+                let report = game_import::mo2_run_profiles(
+                    ctx,
+                    &inventory,
+                    &request,
+                    &chosen,
+                    grouping,
+                    RunOptions::default(),
+                    &|p: ImportProgress| {
+                        if !json && p.phase == ImportPhase::Storing && p.current_mod.is_none() {
+                            eprintln!(
+                                "  stored {}/{} mods, {} of {}",
+                                p.mods_done,
+                                p.mods_total,
+                                human_gb(p.bytes_done),
+                                human_gb(p.bytes_total)
+                            );
+                        }
+                    },
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print_multi_run(&report.instances, &report.loadouts);
+                }
+                return Ok(());
+            }
             let Some(profile) = profile else {
                 anyhow::bail!(
-                    "--profile is required: name the profile to import, as the setup lists it"
+                    "--profile is required: name the profile to import, as the setup lists it, or use --profiles"
                 );
             };
             let request = Mo2Request {
@@ -9907,6 +10068,9 @@ fn run_games_import(
             store,
             game,
             profile,
+            profiles,
+            as_mode,
+            suggest,
             name,
             dry_run,
             install,
@@ -9926,18 +10090,98 @@ fn run_games_import(
                 }
                 return Ok(());
             }
-            let Some(game) = game else {
+            let Some(game_arg) = game else {
                 anyhow::bail!(
                     "--game is required: name the game as `agora games import vortex scan` lists it (its Vortex id or its Agora id)"
                 );
             };
+            if suggest {
+                let sets = agora_core::game_import::vortex::profile_sets(
+                    ctx, &inventory, &store, &game_arg,
+                )?;
+                let suggestion =
+                    agora_core::game_import::profiles::suggest_grouping(&sets.profiles);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&suggestion)?);
+                } else {
+                    print_suggestion(&suggestion);
+                }
+                return Ok(());
+            }
+            let game = agora_game_api::GameId::new(&game_arg)
+                .map_err(|error| anyhow::anyhow!("'{game_arg}' is not a game id: {error}"))?;
+            if let Some(list) = profiles {
+                let grouping: agora_core::game_import::profiles::Grouping = as_mode
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("--as merged|separate is required with --profiles")
+                    })?
+                    .into();
+                let all: Vec<String> = agora_core::game_import::vortex::profile_sets(
+                    ctx, &inventory, &store, &game_arg,
+                )?
+                .profiles
+                .into_iter()
+                .map(|profile| profile.name)
+                .collect();
+                let chosen = profile_list(&list, &all)?;
+                let request = agora_core::game_import::vortex::VortexRequest {
+                    store,
+                    game,
+                    profile: chosen[0].clone(),
+                    name,
+                    install,
+                    add_folder,
+                    copy_saves,
+                    all_mods,
+                };
+                let plan = agora_core::game_import::vortex::plan_profiles(
+                    ctx, &inventory, &request, &chosen, grouping,
+                )?;
+                if dry_run {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&plan)?);
+                    } else {
+                        print_vortex_multi_plan(&plan);
+                    }
+                    return Ok(());
+                }
+                if !json {
+                    eprintln!(
+                        "Importing {}. Every mod is stored as it is in Vortex's staging folder; a large setup takes a while.",
+                        multigrouping_name(grouping)
+                    );
+                }
+                let report = agora_core::game_import::vortex::run_profiles(
+                    ctx,
+                    &inventory,
+                    &request,
+                    &chosen,
+                    grouping,
+                    RunOptions::default(),
+                    &|p: ImportProgress| {
+                        if !json && p.phase == ImportPhase::Storing && p.current_mod.is_none() {
+                            eprintln!(
+                                "  stored {}/{} mods, {} of {}",
+                                p.mods_done,
+                                p.mods_total,
+                                human_gb(p.bytes_done),
+                                human_gb(p.bytes_total)
+                            );
+                        }
+                    },
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print_multi_run(&report.instances, &report.loadouts);
+                }
+                return Ok(());
+            }
             let Some(profile) = profile else {
                 anyhow::bail!(
-                    "--profile is required: name the Vortex profile to import, as `agora games import vortex scan` lists it"
+                    "--profile is required: name the Vortex profile to import, as `agora games import vortex scan` lists it, or use --profiles"
                 );
             };
-            let game = agora_game_api::GameId::new(&game)
-                .map_err(|error| anyhow::anyhow!("'{game}' is not a game id: {error}"))?;
             let request = agora_core::game_import::vortex::VortexRequest {
                 store,
                 game,
@@ -10004,6 +10248,149 @@ fn resolve_vortex_store(store: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 
 fn human_gb(bytes: u64) -> String {
     format!("{:.2} GB", bytes as f64 / 1e9)
+}
+
+/// One `--profiles` value: `a,b,...`, or `all` for every profile the setup
+/// has. Names are matched case-insensitively and return the setup's spelling.
+fn profile_list(arg: &str, all: &[String]) -> anyhow::Result<Vec<String>> {
+    if arg.trim().eq_ignore_ascii_case("all") {
+        if all.is_empty() {
+            anyhow::bail!("this setup has no profiles to import");
+        }
+        return Ok(all.to_vec());
+    }
+    let mut names: Vec<String> = Vec::new();
+    for wanted in arg.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        let found = all
+            .iter()
+            .find(|name| name.eq_ignore_ascii_case(wanted))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "'{wanted}' is not one of this setup's profiles: {}",
+                    all.join(", ")
+                )
+            })?;
+        if !names.iter().any(|name| name == found) {
+            names.push(found.clone());
+        }
+    }
+    if names.is_empty() {
+        anyhow::bail!("--profiles needs at least one profile name, or `all`");
+    }
+    Ok(names)
+}
+
+fn print_suggestion(suggestion: &agora_core::game_import::profiles::Suggestion) {
+    println!(
+        "Agora's grouping (profiles sharing more than {:.0}% of their enabled mods go together):",
+        suggestion.threshold * 100.0
+    );
+    for (index, group) in suggestion.groups.iter().enumerate() {
+        println!("  Group {}: {}", index + 1, group.profiles.join(", "));
+    }
+    for pair in &suggestion.pairs {
+        println!(
+            "  {} & {}: {} shared of {} enabled ({:.0}%)",
+            pair.a,
+            pair.b,
+            pair.shared,
+            pair.union,
+            pair.ratio * 100.0
+        );
+    }
+    println!("  {}", suggestion.note);
+}
+
+fn multigrouping_name(grouping: agora_core::game_import::profiles::Grouping) -> &'static str {
+    use agora_core::game_import::profiles::Grouping;
+    match grouping {
+        Grouping::Merged => "merged",
+        Grouping::Separate => "separate",
+    }
+}
+
+fn free_space_text(free: Option<u64>) -> String {
+    match free {
+        Some(bytes) => agora_core::game_tool_swap::human_bytes(bytes),
+        None => "unknown".to_string(),
+    }
+}
+
+fn print_mo2_multi_plan(plan: &agora_core::game_import::Mo2MultiPlan) {
+    println!(
+        "Import plan: {} profile(s), {}",
+        plan.profiles.len(),
+        multigrouping_name(plan.grouping)
+    );
+    println!("  profiles: {}", plan.profiles.join(", "));
+    println!(
+        "  brings in {} of content; {} free on the content store's drive ({})",
+        agora_core::game_tool_swap::human_bytes(plan.bytes),
+        free_space_text(plan.free_bytes),
+        if plan.fits {
+            "it fits"
+        } else {
+            "it does not fit"
+        }
+    );
+    for (name, profile_plan) in plan.profiles.iter().zip(plan.plans.iter()) {
+        println!(
+            "  {name}: {} enabled mod(s), {} file(s), {}",
+            profile_plan.mods_enabled,
+            profile_plan.files,
+            agora_core::game_tool_swap::human_bytes(profile_plan.bytes)
+        );
+    }
+    println!("  {}", plan.suggestion.note);
+    for warning in &plan.warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+fn print_vortex_multi_plan(plan: &agora_core::game_import::vortex::MultiProfilePlan) {
+    println!(
+        "Import plan: {} profile(s) of {}, {}",
+        plan.profiles.len(),
+        plan.game_name,
+        multigrouping_name(plan.grouping)
+    );
+    println!("  profiles: {}", plan.profiles.join(", "));
+    println!(
+        "  brings in {} of content; {} free on the content store's drive ({})",
+        agora_core::game_tool_swap::human_bytes(plan.bytes),
+        free_space_text(plan.free_bytes),
+        if plan.fits {
+            "it fits"
+        } else {
+            "it does not fit"
+        }
+    );
+    for (name, profile_plan) in plan.profiles.iter().zip(plan.plans.iter()) {
+        println!(
+            "  {name}: {} enabled mod(s), {} file(s), {}",
+            profile_plan.mods_enabled,
+            profile_plan.files,
+            agora_core::game_tool_swap::human_bytes(profile_plan.bytes)
+        );
+    }
+    println!("  {}", plan.suggestion.note);
+    for warning in &plan.warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+fn print_multi_run(instances: &[String], loadouts: &[String]) {
+    if instances.len() == 1 {
+        println!("Imported one instance: {}", instances[0]);
+    } else {
+        println!("Imported {} instances:", instances.len());
+        for instance in instances {
+            println!("  {instance}");
+        }
+    }
+    if !loadouts.is_empty() {
+        println!("Loadouts created: {}", loadouts.join(", "));
+    }
 }
 
 fn mo2_provenance_text(provenance: &agora_core::content_store::Mo2Provenance) -> String {
@@ -10534,9 +10921,20 @@ fn print_vortex_run(report: &agora_core::game_import::vortex::VortexRunReport) {
     );
 }
 
+/// Whether a failed Steam hand-off may fall back to the ordinary launch.
+///
+/// Only a non-Steam install may: its launch has nothing to do with Steam. A Steam install with no
+/// `steam` command cannot work through any other path — a Windows game needs Proton through
+/// Steam, and a native Steam game needs the Steam client — so its error is reported instead.
+#[cfg(target_os = "linux")]
+fn steam_failure_falls_back(error: &agora_core::game_wrap::WrapError) -> bool {
+    matches!(error, agora_core::game_wrap::WrapError::NotSteam(_))
+}
+
 /// `games instance launch` on Linux: Steam starts the game, so Agora records what it asked for
-/// and hands the request to Steam. The `games wrap` it starts does the rest. A non-Steam instance,
-/// or a machine with no Steam command, returns `None` and the ordinary launch path runs it.
+/// and hands the request to Steam. The `games wrap` it starts does the rest. A non-Steam instance
+/// returns `None` and the ordinary launch path runs it. A Steam instance that cannot be handed to
+/// Steam is an error, because the ordinary path cannot start it either.
 #[cfg(target_os = "linux")]
 fn cli_linux_launch(
     ctx: &agora_core::ctx::Ctx,
@@ -10547,7 +10945,7 @@ fn cli_linux_launch(
 
     let status = match agora_core::game_wrap::start_via_steam(ctx, instance_id) {
         Ok(status) => status,
-        Err(WrapError::NotSteam(_)) | Err(WrapError::SteamMissing) => return Ok(None),
+        Err(error) if steam_failure_falls_back(&error) => return Ok(None),
         Err(error) => {
             if json {
                 let out = serde_json::json!({
@@ -15854,6 +16252,21 @@ mod tests {
             Commands::Loadout {
                 action: LoadoutCmd::Update { yes: true, .. }
             }
+        ));
+    }
+
+    /// A Steam instance that cannot reach Steam must not be handed to the ordinary launch: that
+    /// path cannot start it. Only a non-Steam instance falls back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_non_steam_instance_falls_back_from_a_failed_steam_handoff() {
+        use agora_core::game_wrap::WrapError;
+        assert!(super::steam_failure_falls_back(&WrapError::NotSteam(
+            "gog".into()
+        )));
+        assert!(!super::steam_failure_falls_back(&WrapError::SteamMissing));
+        assert!(!super::steam_failure_falls_back(
+            &WrapError::InstallNotFound("skyrim".into())
         ));
     }
 

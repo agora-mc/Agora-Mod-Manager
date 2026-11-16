@@ -1096,6 +1096,49 @@ pub fn remove_load_after_rule(
     Ok(changed > 0)
 }
 
+/// Replace every load-after rule of one list with `rules`, in one transaction.
+///
+/// A loadout apply and a multi-profile import both restore a whole set of rules
+/// at once; removing and adding them one by one would leave a half-set behind
+/// if one call failed. A self rule or a blank name is skipped, because neither
+/// can ever be satisfied.
+pub fn replace_load_after_rules(
+    ctx: &Ctx,
+    instance_id: &str,
+    list_id: &str,
+    rules: &[LoadAfterRule],
+) -> Result<(), LoadOrderError> {
+    let mut conn = crate::db::local_state_connection(&ctx.paths.local_state_db())
+        .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
+    let tx = conn
+        .transaction()
+        .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
+    tx.execute(
+        "DELETE FROM plugin_load_order_rules WHERE instance_id = ?1 AND list_id = ?2",
+        rusqlite::params![instance_id, list_id],
+    )
+    .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for rule in rules {
+        let item = rule.item.trim();
+        let after = rule.after.trim();
+        if item.is_empty() || after.is_empty() || key(item) == key(after) {
+            continue;
+        }
+        if !seen.insert((key(item), key(after))) {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO plugin_load_order_rules (instance_id, list_id, item, after_item)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![instance_id, list_id, item, after],
+        )
+        .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
+    }
+    tx.commit()
+        .map_err(|error| LoadOrderError::RulesStore(error.to_string()))
+}
+
 /// The user rules the order does not satisfy. A rule whose item or target is not in the list is
 /// unused and never reported.
 fn broken_rules(entries: &[LoadOrderEntry], rules: &[LoadAfterRule]) -> Vec<LoadAfterRule> {

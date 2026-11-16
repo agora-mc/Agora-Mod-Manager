@@ -5261,6 +5261,38 @@ pub async fn delete_snapshot(
     })
 }
 
+fn loadout_error(message: String) -> LauncherError {
+    LauncherError::Generic {
+        code: "ERR_LOADOUT".into(),
+        message,
+    }
+}
+
+/// The definition of the game an instance belongs to, when it is a game
+/// instance. `None` means a Minecraft instance, whose loadouts use the
+/// Minecraft service.
+fn game_definition_for(
+    ctx: &agora_core::ctx::Ctx,
+    instance_id: &str,
+) -> LauncherResult<Option<agora_game_api::GameDefinition>> {
+    let record = agora_core::game_instance::get(ctx, instance_id)
+        .map_err(|e| loadout_error(e.to_string()))?;
+    match record {
+        None => Ok(None),
+        Some(record) => ctx
+            .games
+            .game(&record.game)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| {
+                loadout_error(format!(
+                    "The definition for game '{}' is missing",
+                    record.game
+                ))
+            }),
+    }
+}
+
 #[tauri::command]
 pub async fn list_loadout_profiles(
     app: tauri::AppHandle,
@@ -5286,13 +5318,32 @@ pub async fn create_loadout_profile(
     instance_id: String,
     name: String,
 ) -> LauncherResult<agora_core::loadout::LoadoutProfile> {
+    let ctx = crate::core_context(&app)?;
     let sanitized = paths::sanitize_id(&instance_id);
     let instance_dir =
         paths::instance_dir(&app, &sanitized).map_err(|e| LauncherError::Generic {
             code: "ERR_PATH".into(),
             message: e.to_string(),
         })?;
-    agora_core::loadout::create_profile(&instance_dir, &name).map_err(|e| LauncherError::Generic {
+    let profile =
+        match agora_core::game_instance::get(&ctx, &sanitized).map_err(|e| {
+            LauncherError::Generic {
+                code: "ERR_LOADOUT".into(),
+                message: e.to_string(),
+            }
+        })? {
+            Some(record) => {
+                let definition = ctx.games.game(&record.game).cloned().ok_or_else(|| {
+                    LauncherError::Generic {
+                        code: "ERR_LOADOUT".into(),
+                        message: format!("The definition for game '{}' is missing", record.game),
+                    }
+                })?;
+                agora_core::game_loadout::create_game_profile(&ctx, &sanitized, &definition, &name)
+            }
+            None => agora_core::loadout::create_profile(&instance_dir, &name),
+        };
+    profile.map_err(|e| LauncherError::Generic {
         code: "ERR_LOADOUT".into(),
         message: e,
     })
@@ -5309,9 +5360,16 @@ pub async fn preview_loadout_update(
 ) -> LauncherResult<agora_core::loadout::LoadoutUpdate> {
     let ctx = crate::core_context(&app)?;
     let sanitized = paths::sanitize_id(&instance_id);
-    tokio::task::spawn_blocking(move || {
-        agora_game_minecraft::loadout_service::LoadoutService::new(ctx)
-            .update_preview(&sanitized, &profile_name)
+    tokio::task::spawn_blocking(move || match game_definition_for(&ctx, &sanitized)? {
+        Some(definition) => agora_core::game_loadout::plan_game_profile_update(
+            &ctx,
+            &sanitized,
+            &definition,
+            &profile_name,
+        )
+        .map_err(loadout_error),
+        None => agora_game_minecraft::loadout_service::LoadoutService::new(ctx)
+            .update_preview(&sanitized, &profile_name),
     })
     .await
     .map_err(|_| LauncherError::LocalStateFailed)?
@@ -5328,9 +5386,16 @@ pub async fn update_loadout_profile(
 ) -> LauncherResult<agora_core::loadout::LoadoutUpdate> {
     let ctx = crate::core_context(&app)?;
     let sanitized = paths::sanitize_id(&instance_id);
-    tokio::task::spawn_blocking(move || {
-        agora_game_minecraft::loadout_service::LoadoutService::new(ctx)
-            .update(&sanitized, &profile_name)
+    tokio::task::spawn_blocking(move || match game_definition_for(&ctx, &sanitized)? {
+        Some(definition) => agora_core::game_loadout::update_game_profile(
+            &ctx,
+            &sanitized,
+            &definition,
+            &profile_name,
+        )
+        .map_err(loadout_error),
+        None => agora_game_minecraft::loadout_service::LoadoutService::new(ctx)
+            .update(&sanitized, &profile_name),
     })
     .await
     .map_err(|_| LauncherError::LocalStateFailed)?
@@ -5347,9 +5412,12 @@ pub async fn list_loadout_unlisted_mods(
 ) -> LauncherResult<Vec<String>> {
     let ctx = crate::core_context(&app)?;
     let sanitized = paths::sanitize_id(&instance_id);
-    tokio::task::spawn_blocking(move || {
-        agora_game_minecraft::loadout_service::LoadoutService::new(ctx)
-            .unlisted_mods(&sanitized, &profile_name)
+    tokio::task::spawn_blocking(move || match game_definition_for(&ctx, &sanitized)? {
+        // A game profile records every content layer, so there is no unlisted
+        // mod for the player to decide about.
+        Some(_) => Ok(Vec::new()),
+        None => agora_game_minecraft::loadout_service::LoadoutService::new(ctx)
+            .unlisted_mods(&sanitized, &profile_name),
     })
     .await
     .map_err(|_| LauncherError::LocalStateFailed)?
@@ -5367,12 +5435,19 @@ pub async fn apply_loadout_profile(
     // rolls back on failure. The desktop only hands over the request.
     let ctx = crate::core_context(&app)?;
     let sanitized = paths::sanitize_id(&instance_id);
-    tokio::task::spawn_blocking(move || {
-        agora_game_minecraft::loadout_service::LoadoutService::new(ctx).apply(
+    tokio::task::spawn_blocking(move || match game_definition_for(&ctx, &sanitized)? {
+        Some(definition) => agora_core::game_loadout::apply_game_profile_with_undo(
+            &ctx,
+            &sanitized,
+            &definition,
+            &profile_name,
+        )
+        .map_err(|e| loadout_error(e.to_string())),
+        None => agora_game_minecraft::loadout_service::LoadoutService::new(ctx).apply(
             &sanitized,
             &profile_name,
             unlisted_mods,
-        )
+        ),
     })
     .await
     .map_err(|_| LauncherError::LocalStateFailed)?

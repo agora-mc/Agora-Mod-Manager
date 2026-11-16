@@ -45,6 +45,11 @@ pub struct LoadoutProfile {
     /// Absent on profiles saved before this existed.
     #[serde(default)]
     pub items: Option<Vec<LoadoutItem>>,
+    /// A game instance's state: its content layers, plugin lists, INI copies,
+    /// load-after rules and save choice (MASTER_SPEC §26.10). `None` on a
+    /// Minecraft profile, which keeps the fields above instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game: Option<crate::game_loadout::GameLoadout>,
 }
 
 /// Mods are every kind that is not a pack or a world, matching `content_subdir`.
@@ -55,11 +60,11 @@ fn is_mod_kind(content_type: &str) -> bool {
     )
 }
 
-fn loadouts_dir(instance_dir: &Path) -> std::path::PathBuf {
+pub(crate) fn loadouts_dir(instance_dir: &Path) -> std::path::PathBuf {
     instance_dir.join(".agora_loadouts")
 }
 
-fn sanitize_profile_name(name: &str) -> String {
+pub(crate) fn sanitize_profile_name(name: &str) -> String {
     name.chars()
         .map(|c| match c {
             ':' | '/' | '\\' | '<' | '>' | '"' | '|' | '?' | '*' => '_',
@@ -148,10 +153,11 @@ fn profile_from_manifest(
         created_at,
         covers: Some(covers),
         items: Some(items),
+        game: None,
     }
 }
 
-fn write_profile(instance_dir: &Path, profile: &LoadoutProfile) -> Result<(), String> {
+pub(crate) fn write_profile(instance_dir: &Path, profile: &LoadoutProfile) -> Result<(), String> {
     let profiles_dir = loadouts_dir(instance_dir);
     fs::create_dir_all(&profiles_dir).map_err(|e| format!("Cannot create loadouts dir: {e}"))?;
 
@@ -314,7 +320,10 @@ pub fn list_profiles(instance_dir: &Path) -> Result<Vec<LoadoutProfile>, String>
     Ok(profiles)
 }
 
-fn read_profile(instance_dir: &Path, profile_name: &str) -> Result<LoadoutProfile, String> {
+pub(crate) fn read_profile(
+    instance_dir: &Path,
+    profile_name: &str,
+) -> Result<LoadoutProfile, String> {
     let safe_name = sanitize_profile_name(profile_name);
     let profile_path = loadouts_dir(instance_dir).join(format!("{safe_name}.json"));
     let content =
@@ -749,6 +758,7 @@ mod tests {
             created_at: Utc::now().to_rfc3339(),
             covers: None,
             items: None,
+            game: None,
         };
         let profiles_dir = loadouts_dir(&dir);
         fs::create_dir_all(&profiles_dir).unwrap();
@@ -816,6 +826,7 @@ mod tests {
             created_at: Utc::now().to_rfc3339(),
             covers: None,
             items: None,
+            game: None,
         };
         let profiles_dir = loadouts_dir(&dir);
         fs::create_dir_all(&profiles_dir).unwrap();
@@ -934,6 +945,7 @@ mod tests {
             created_at: Utc::now().to_rfc3339(),
             covers: None,
             items: None,
+            game: None,
         };
         let profiles_dir = loadouts_dir(&dir);
         fs::create_dir_all(&profiles_dir).unwrap();
@@ -1270,6 +1282,7 @@ mod tests {
             created_at: Utc::now().to_rfc3339(),
             covers: None,
             items: None,
+            game: None,
         };
         let profiles_dir = loadouts_dir(dir);
         fs::create_dir_all(&profiles_dir).unwrap();

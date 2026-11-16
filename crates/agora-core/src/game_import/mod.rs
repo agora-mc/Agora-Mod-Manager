@@ -11,10 +11,11 @@
 //! decides what they mean for a game and what to store.
 
 pub mod mo2;
+pub mod profiles;
 pub mod vortex;
 pub mod vortex_store;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use agora_game_api::{
@@ -79,6 +80,12 @@ pub enum ImportError {
     Unidentified { path: PathBuf, reasons: String },
     #[error("this setup and profile were already imported as instance '{instance}'. Give --name to import them again as a new instance")]
     AlreadyImported { instance: String },
+    #[error("name at least one profile to import")]
+    NoProfiles,
+    #[error(
+        "this import needs {needed} bytes, but only {free} are free on the content store's drive"
+    )]
+    NotEnoughSpace { needed: u64, free: u64 },
     #[error("the setup's mod folder cannot be read: {0}")]
     ModsUnreadable(String),
     #[error("the setup has no modlist.txt for profile '{0}'")]
@@ -508,8 +515,13 @@ fn mount_point(def: &GameDefinition) -> String {
 }
 
 fn normalise_path(path: &Path) -> String {
-    let text = path.to_string_lossy().replace('/', "\\");
-    fold_path_case(text.trim_end_matches('\\'))
+    // Vortex, a game store and a user can all spell one folder differently: an
+    // 8.3 short name, another case, a trailing separator, `/` for `\`, or the
+    // `\?\` prefix. Resolve the real folder first, so two spellings of one
+    // folder compare equal; a folder that is gone keeps its stored spelling.
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let shown = crate::game_discovery::custom_folders::display_path(&resolved);
+    fold_path_case(shown.replace('/', "\\").trim_end_matches('\\'))
 }
 
 fn read_text_optional(path: &Path) -> Result<Option<String>, ImportError> {
@@ -1772,6 +1784,319 @@ fn import_executables(
         Err(error) => report.next_steps.push(format!(
             "MO2's executables were not added as tools: {error}"
         )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Several MO2 profiles
+// ---------------------------------------------------------------------------
+
+/// Read a setup's profiles and the mods each enables, for a grouping. Reads the
+/// setup only.
+pub fn mo2_profile_sets(ini_path: &Path) -> Result<Vec<profiles::ProfileSet>, ImportError> {
+    let setup = inspect_setup(ini_path)?;
+    let ini_text = read_text_optional(ini_path)?.unwrap_or_default();
+    let ini_dir = ini_path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let ini = mo2::parse_ini(&ini_text, ini_dir);
+    let mut profiles = Vec::new();
+    for name in setup.profiles {
+        let modlist =
+            read_text_optional(&ini.profiles.join(&name).join("modlist.txt"))?.unwrap_or_default();
+        let enabled = mo2::parse_modlist(&modlist)
+            .into_iter()
+            .filter(|line| line.state == mo2::ModState::Enabled)
+            .map(|line| line.name)
+            .collect();
+        profiles.push(profiles::ProfileSet { name, enabled });
+    }
+    Ok(profiles)
+}
+
+/// What importing several MO2 profiles would do, read and checked.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Mo2MultiPlan {
+    pub grouping: profiles::Grouping,
+    pub profiles: Vec<String>,
+    pub plans: Vec<Mo2Plan>,
+    pub bytes: u64,
+    pub free_bytes: Option<u64>,
+    pub fits: bool,
+    pub suggestion: profiles::Suggestion,
+    pub warnings: Vec<String>,
+}
+
+pub fn mo2_plan_profiles(
+    ctx: &Ctx,
+    inventory: &GameInventory,
+    base: &Mo2Request,
+    profiles: &[String],
+    grouping: profiles::Grouping,
+) -> Result<Mo2MultiPlan, ImportError> {
+    if profiles.is_empty() {
+        return Err(ImportError::NoProfiles);
+    }
+    let sets = mo2_profile_sets(&base.ini_path)?;
+    let mut plans = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        let request = Mo2Request {
+            profile: profile.clone(),
+            ..base.clone()
+        };
+        plans.push(plan(ctx, inventory, &request)?);
+    }
+    let mut union: BTreeMap<String, u64> = BTreeMap::new();
+    let mut separate_bytes = 0u64;
+    for plan in &plans {
+        for item in plan.mods.iter().filter(|m| m.enabled) {
+            union.insert(item.folder.clone(), item.bytes);
+            separate_bytes = separate_bytes.saturating_add(item.bytes);
+        }
+    }
+    let bytes = match grouping {
+        profiles::Grouping::Merged => union.values().sum(),
+        profiles::Grouping::Separate => separate_bytes,
+    };
+    let free_bytes = crate::game_tool_swap::available_bytes(&ctx.paths.content_root());
+    let fits = free_bytes.is_none_or(|free| bytes <= free);
+    let suggestion = profiles::suggest_grouping(&sets);
+    let mut warnings = Vec::new();
+    if !fits {
+        warnings.push(format!(
+            "the choice needs {} but only {} is free on the content store's drive",
+            crate::game_tool_swap::human_bytes(bytes),
+            crate::game_tool_swap::human_bytes(free_bytes.unwrap_or(0))
+        ));
+    }
+    if suggestion.groups.len() > 1 {
+        warnings.push(suggestion.note.clone());
+    }
+    Ok(Mo2MultiPlan {
+        grouping,
+        profiles: profiles.to_vec(),
+        plans,
+        bytes,
+        free_bytes,
+        fits,
+        suggestion,
+        warnings,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Mo2MultiReport {
+    pub plan: Mo2MultiPlan,
+    pub instances: Vec<String>,
+    pub loadouts: Vec<String>,
+}
+
+fn add_mo2_mod_to_merged(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    plan: &Mo2Plan,
+    item: &PlannedMod,
+) -> Result<String, ImportError> {
+    let source = ContentSource::Mo2Import {
+        setup: plan.setup.to_string_lossy().to_string(),
+        mo2_folder: item.folder.clone(),
+        provenance: item.provenance.clone(),
+        added_at_unix_ms: content_store::now_unix_ms(),
+    };
+    let (files, _) = collect_mod_files(&item.path).map_err(|e| ImportError::Store {
+        mod_folder: item.folder.clone(),
+        reason: e.to_string(),
+    })?;
+    let outcome = content_store::add_collected(ctx, &item.folder, files, source).map_err(|e| {
+        ImportError::Store {
+            mod_folder: item.folder.clone(),
+            reason: e.to_string(),
+        }
+    })?;
+    let item_id = outcome.item().item_id.clone();
+    let manifest = game_instance::get_manifest(ctx, instance_id)?;
+    let present = manifest.layers.layers().iter().any(|layer| {
+        matches!(&layer.source, agora_game_api::LayerSource::Content { content } if content == &item_id)
+    });
+    if !present {
+        let mount = mount_point(definition);
+        let mount_arg = if mount.is_empty() {
+            None
+        } else {
+            Some(mount.as_str())
+        };
+        game_deploy::add_content(ctx, instance_id, &item_id, mount_arg, None).map_err(|e| {
+            ImportError::Other(format!(
+                "'{}' could not be put on the merged instance: {e}",
+                item.folder
+            ))
+        })?;
+    }
+    Ok(item_id)
+}
+
+fn mo2_state_for_merge(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    plan: &Mo2Plan,
+    layer_mod: &HashMap<String, Option<String>>,
+) -> Result<crate::game_loadout::GameLoadout, ImportError> {
+    let mut state =
+        crate::game_loadout::capture(ctx, instance_id, definition).map_err(ImportError::Other)?;
+    let enabled: std::collections::BTreeSet<&str> = plan
+        .mods
+        .iter()
+        .filter(|m| m.enabled)
+        .map(|m| m.folder.as_str())
+        .collect();
+    for item in &mut state.content {
+        item.enabled = layer_mod
+            .get(item.item.as_str())
+            .and_then(|folder| folder.as_deref())
+            .is_some_and(|folder| enabled.contains(folder));
+    }
+    if plan.plugins.kept {
+        if let Some(rule) = definition.load_orders.first() {
+            let lines: Vec<(String, bool)> = plan
+                .plugins
+                .lines
+                .iter()
+                .map(|line| (line.name.clone(), line.active))
+                .collect();
+            let bytes = crate::game_plugins::list_bytes(rule, &lines);
+            if let Some(list) = state.plugin_lists.iter_mut().find(|l| l.list == rule.id) {
+                list.contents = Some(bytes);
+            }
+        }
+    }
+    for ini in &plan.inis {
+        let contents = match std::fs::read(&ini.from) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                return Err(ImportError::Other(format!(
+                    "the profile's INI {} could not be read: {e}",
+                    ini.from.display()
+                )))
+            }
+        };
+        if let Some(existing) = state.inis.iter_mut().find(|i| i.file == ini.instance_path) {
+            existing.contents = contents;
+        } else {
+            state.inis.push(crate::game_loadout::GameLoadoutIni {
+                file: ini.instance_path.clone(),
+                contents,
+            });
+        }
+    }
+    state.saves = if plan.saves.local {
+        crate::game_instance::SavesChoice::Own
+    } else {
+        crate::game_instance::SavesChoice::Shared
+    };
+    Ok(state)
+}
+
+pub fn mo2_run_profiles(
+    ctx: &Ctx,
+    inventory: &GameInventory,
+    base: &Mo2Request,
+    profiles: &[String],
+    grouping: profiles::Grouping,
+    options: RunOptions,
+    progress: &dyn Fn(ImportProgress),
+) -> Result<Mo2MultiReport, ImportError> {
+    let multi = mo2_plan_profiles(ctx, inventory, base, profiles, grouping)?;
+    if !multi.fits {
+        return Err(ImportError::NotEnoughSpace {
+            needed: multi.bytes,
+            free: multi.free_bytes.unwrap_or(0),
+        });
+    }
+    match grouping {
+        profiles::Grouping::Separate => {
+            let mut instances = Vec::new();
+            for profile in profiles {
+                let request = Mo2Request {
+                    profile: profile.clone(),
+                    name: Some(
+                        base.name
+                            .clone()
+                            .map(|name| format!("{name} ({profile})"))
+                            .unwrap_or_else(|| profile.clone()),
+                    ),
+                    ..base.clone()
+                };
+                let report = run(ctx, inventory, &request, options, progress)?;
+                if let Some(instance) = report.instance_id {
+                    instances.push(instance);
+                }
+            }
+            Ok(Mo2MultiReport {
+                plan: multi,
+                instances,
+                loadouts: Vec::new(),
+            })
+        }
+        profiles::Grouping::Merged => {
+            let request = Mo2Request {
+                profile: profiles[0].clone(),
+                ..base.clone()
+            };
+            let report = run(ctx, inventory, &request, options, progress)?;
+            let instance_id = report
+                .instance_id
+                .clone()
+                .ok_or_else(|| ImportError::Other("the base import made no instance".into()))?;
+            let definition = ctx
+                .games
+                .game(&multi.plans[0].game)
+                .cloned()
+                .ok_or_else(|| ImportError::Other("the game definition is missing".into()))?;
+
+            let mut folder_to_item: HashMap<String, String> = HashMap::new();
+            for profile_plan in &multi.plans {
+                for item in profile_plan.mods.iter().filter(|m| m.enabled) {
+                    if folder_to_item.contains_key(&item.folder) {
+                        continue;
+                    }
+                    let item_id =
+                        add_mo2_mod_to_merged(ctx, &instance_id, &definition, profile_plan, item)?;
+                    folder_to_item.insert(item.folder.clone(), item_id);
+                }
+            }
+            let reverse: HashMap<String, String> = folder_to_item
+                .iter()
+                .map(|(folder, item_id)| (item_id.clone(), folder.clone()))
+                .collect();
+            let manifest = game_instance::get_manifest(ctx, &instance_id)?;
+            let mut layer_mod: HashMap<String, Option<String>> = HashMap::new();
+            for layer in manifest.layers.layers() {
+                if let agora_game_api::LayerSource::Content { content } = &layer.source {
+                    layer_mod.insert(layer.id.as_str().to_string(), reverse.get(content).cloned());
+                }
+            }
+
+            let mut loadouts = Vec::new();
+            for (profile, profile_plan) in profiles.iter().zip(multi.plans.iter()) {
+                let state =
+                    mo2_state_for_merge(ctx, &instance_id, &definition, profile_plan, &layer_mod)?;
+                crate::game_loadout::save_game_profile(ctx, &instance_id, profile, state)
+                    .map_err(ImportError::Other)?;
+                loadouts.push(profile.clone());
+            }
+            crate::game_loadout::apply_game_profile_with_undo(
+                ctx,
+                &instance_id,
+                &definition,
+                &profiles[0],
+            )
+            .map_err(|e| ImportError::Other(e.to_string()))?;
+            Ok(Mo2MultiReport {
+                plan: multi,
+                instances: vec![instance_id],
+                loadouts,
+            })
+        }
     }
 }
 
