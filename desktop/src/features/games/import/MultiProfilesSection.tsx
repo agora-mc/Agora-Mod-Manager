@@ -4,7 +4,7 @@
  * instance per profile (separate), sees Agora's suggested grouping and the bytes
  * the choice brings in against the free space, and then imports.
  */
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm';
 import { formatBytes } from '@/components/installed-content/contentTableState';
