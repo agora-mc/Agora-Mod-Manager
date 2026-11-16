@@ -61,6 +61,7 @@ fn test_definition() -> GameDefinition {
         id: game_id(),
         extends: None,
         name: "Wrap Test Game".into(),
+        import_ids: Default::default(),
         stores: vec![StoreIdentifier {
             store: StoreId::new("steam").unwrap(),
             product: "4242".into(),

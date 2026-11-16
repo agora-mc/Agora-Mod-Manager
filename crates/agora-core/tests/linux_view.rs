@@ -55,6 +55,7 @@ fn test_definition() -> GameDefinition {
         id: GameId::new("linux-view-test").unwrap(),
         extends: None,
         name: "Linux View Test Game".into(),
+        import_ids: Default::default(),
         stores: vec![StoreIdentifier {
             store: StoreId::new("steam").unwrap(),
             product: "12345".into(),
