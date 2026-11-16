@@ -500,10 +500,10 @@
       ],
       "text": {
         "headline": {
-          "en": "A data file in {owner:mod}'s namespace ({namespace}) could not be read: {message}. Repairing or reinstalling that mod is a possible next step."
+          "en": "A data file that {owner:mod} provides (in {namespace}) could not be read: {message}. Repairing or reinstalling that mod is a possible next step."
         },
         "why_not_sure": {
-          "en": "A broken data file can be unrelated to the crash, or another mod can change the same namespace."
+          "en": "A broken data file can be unrelated to the crash, or another mod can change data in the same place."
         }
       },
       "next_step": "confirm_experiment"

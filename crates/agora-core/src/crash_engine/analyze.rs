@@ -511,9 +511,9 @@ pub fn analyze_with_history(
             report.read_by = None;
             report.read_by_extra.clear();
             report.reason = Some(if report.failures.is_empty() {
-                "no installed crash pack recognised this file".to_string()
+                "the installed crash rules did not recognise this file".to_string()
             } else {
-                "no parser could read this file; see the failures".to_string()
+                "nothing could read this file; see what went wrong".to_string()
             });
         } else {
             // A whole-file text rule searches exactly what a parser could see. Cap it at the same

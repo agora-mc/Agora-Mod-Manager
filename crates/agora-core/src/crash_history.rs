@@ -312,7 +312,7 @@ pub fn sweep_instance_logs(
             report.problems.push(SweepProblem {
                 plugin_id: (*plugin_id).to_string(),
                 source_id: (*source_id).to_string(),
-                detail: "a folder artifact is not swept for older logs; only files are".to_string(),
+                detail: "a folder is not swept for older logs; only files are".to_string(),
             });
             continue;
         }

@@ -1208,7 +1208,7 @@ fn diagnose_record(
         return Ok(Diagnosed {
             answer: StoredAnswer::NothingToRead {
                 why: format!(
-                    "No crash pack applies to the game '{game_id}', so there was nothing to read the \
+                    "No crash rules apply to the game '{game_id}', so there was nothing to read the \
                      session with."
                 ),
             },

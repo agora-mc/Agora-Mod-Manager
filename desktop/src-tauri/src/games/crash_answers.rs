@@ -287,7 +287,7 @@ pub async fn read_crash_artifact(
         .ok_or_else(|| {
             GamesError::new(
                 CRASH_FILE_MISSING,
-                "That file is no longer in the crash evidence Agora kept.",
+                "That file is no longer in the crash logs Agora kept.",
             )
         })?;
     let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
@@ -321,7 +321,7 @@ pub async fn reveal_crash_artifact(
         .ok_or_else(|| {
             GamesError::new(
                 CRASH_FILE_MISSING,
-                "That file is no longer in the crash evidence Agora kept.",
+                "That file is no longer in the crash logs Agora kept.",
             )
         })?;
     crate::commands::reveal_in_explorer(&path)

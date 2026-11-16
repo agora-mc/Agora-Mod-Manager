@@ -94,7 +94,7 @@ impl<'a> InstanceInspector<'a> {
     ) -> InspectionOutcome {
         let name = self.plugin_name(plugin_id);
         Inspection::Failed(format!(
-            "the inspector `{inspector}` from `{name}` could not check `{target}`: {why}"
+            "the check `{inspector}` from `{name}` could not run on `{target}`: {why}"
         ))
         .into()
     }
@@ -179,7 +179,7 @@ impl SingleFileReads {
         } else {
             Err(ScriptReadError::new(
                 "out_of_scope",
-                format!("`{artifact}` is not the file this inspection may read"),
+                format!("`{artifact}` is not the file this check may read"),
             ))
         }
     }

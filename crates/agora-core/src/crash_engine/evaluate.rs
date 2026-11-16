@@ -2040,7 +2040,7 @@ fn condition_bad_regex(condition: &Condition) -> Option<String> {
         let pattern = ops.regex.as_ref()?;
         regex::Regex::new(pattern)
             .err()
-            .map(|error| format!("this rule's regex `{pattern}` is invalid: {error}"))
+            .map(|error| format!("a crash rule's pattern `{pattern}` is invalid: {error}"))
     }
     match condition {
         Condition::All(list) | Condition::Any(list) | Condition::AtLeast { of: list, .. } => {
@@ -2061,9 +2061,12 @@ fn condition_bad_regex(condition: &Condition) -> Option<String> {
                 .and_then(|reference| reference.value.as_ref())
                 .and_then(check_test)
         }),
-        Condition::Text(text) => regex::Regex::new(&text.regex)
-            .err()
-            .map(|error| format!("this rule's regex `{}` is invalid: {error}", text.regex)),
+        Condition::Text(text) => regex::Regex::new(&text.regex).err().map(|error| {
+            format!(
+                "a crash rule's pattern `{}` is invalid: {error}",
+                text.regex
+            )
+        }),
     }
 }
 
