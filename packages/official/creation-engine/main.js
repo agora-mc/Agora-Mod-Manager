@@ -3027,11 +3027,13 @@ export function creationEngineDiagnostics(args) {
             (listed.entries.length === 1 ? "" : "s") +
             ": " +
             passed +
-            " declare support for game version " +
+            (passed === 1 ? " declares" : " declare") +
+            " support for game version " +
             skseVersionText(running) +
             ", " +
             failed +
-            " were built for another version, and " +
+            (failed === 1 ? " was built" : " were built") +
+            " for another version, and " +
             unknown +
             " could not be judged (an older declaration format is normal).",
           "info",
@@ -3469,7 +3471,7 @@ export async function lootSort(args) {
     limits: { timeoutMs: 90000 },
   });
   if (result.exitCode !== 0) {
-    let message = result.stderrText || "the sorter did not finish";
+    let message = result.stderrText || "sorting did not finish";
     try {
       const failure = JSON.parse(result.stdoutText);
       if (failure && failure.error) message = failure.error;
