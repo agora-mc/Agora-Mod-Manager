@@ -211,6 +211,16 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
           {result.pluginsWritten !== null && (
             <p className="text-sm text-muted-foreground">Plugin list: {result.pluginsWritten} lines written.</p>
           )}
+          {result.rulesAdded > 0 && (
+            <p className="text-sm text-muted-foreground">Load-after rules added: {result.rulesAdded}.</p>
+          )}
+          {result.rulesRefused.length > 0 && (
+            <ul className="list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+              {result.rulesRefused.map((line) => (
+                <li key={line}>Load-after rule refused: {line}</li>
+              ))}
+            </ul>
+          )}
           {result.inisCopied.length > 0 && (
             <p className="text-sm text-muted-foreground">INIs copied: {result.inisCopied.join(', ')}.</p>
           )}
@@ -390,6 +400,42 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
                       Copy the profile’s saves into the new instance
                     </label>
                   </div>
+                )}
+              </div>
+            )}
+
+            {current.userlist.path !== null && (
+              <div className={STEP_CARD} data-testid="vortex-plan-userlist">
+                <h4 className="text-sm font-semibold">LOOT userlist</h4>
+                <p className="text-sm text-muted-foreground">
+                  {current.userlist.rules.length === 0
+                    ? 'No load-after rules to add.'
+                    : `${plural(current.userlist.rules.length, 'load-after rule')} to add.`}
+                </p>
+                {current.userlist.rules.length > 0 && (
+                  <ul className="list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                    {current.userlist.rules.map((rule) => (
+                      <li key={`${rule.item}:${rule.after}`}>
+                        {rule.item} loads after {rule.after}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {current.userlist.refused.length > 0 && (
+                  <ul className="list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                    {current.userlist.refused.map((rule) => (
+                      <li key={`${rule.item}:${rule.after}:refused`}>
+                        Refused {rule.item} after {rule.after}: {rule.reason}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {current.userlist.notImported.length > 0 && (
+                  <ul className="list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                    {current.userlist.notImported.map((line) => (
+                      <li key={line}>Not imported: {line}</li>
+                    ))}
+                  </ul>
                 )}
               </div>
             )}

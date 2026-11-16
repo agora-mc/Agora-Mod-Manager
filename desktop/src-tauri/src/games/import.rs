@@ -818,12 +818,37 @@ pub struct VortexPlanDto {
     pub order: Vec<String>,
     pub disagreements: Vec<VortexDisagreementDto>,
     pub plugins: VortexPluginsDto,
+    pub userlist: VortexUserlistDto,
     pub local_settings: bool,
     pub inis: Vec<String>,
     pub local_saves: bool,
     pub saves: SavesDto,
     pub problems: Vec<ProblemDto>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexUserlistDto {
+    pub path: Option<String>,
+    pub rules: Vec<VortexRuleDto>,
+    pub refused: Vec<VortexRefusedRuleDto>,
+    pub not_imported: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexRuleDto {
+    pub item: String,
+    pub after: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexRefusedRuleDto {
+    pub item: String,
+    pub after: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -933,6 +958,33 @@ impl From<&VortexPlan> for VortexPlanDto {
                 active: plan.plugins.active,
                 notes: plan.plugins.notes.clone(),
             },
+            userlist: VortexUserlistDto {
+                path: plan
+                    .userlist
+                    .path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                rules: plan
+                    .userlist
+                    .rules
+                    .iter()
+                    .map(|rule| VortexRuleDto {
+                        item: rule.item.clone(),
+                        after: rule.after.clone(),
+                    })
+                    .collect(),
+                refused: plan
+                    .userlist
+                    .refused
+                    .iter()
+                    .map(|rule| VortexRefusedRuleDto {
+                        item: rule.item.clone(),
+                        after: rule.after.clone(),
+                        reason: rule.reason.clone(),
+                    })
+                    .collect(),
+                not_imported: plan.userlist.not_imported.clone(),
+            },
             local_settings: plan.local_settings,
             inis: plan.inis.iter().map(|ini| ini.name.clone()).collect(),
             local_saves: plan.local_saves,
@@ -968,6 +1020,8 @@ pub struct VortexRunDto {
     pub duplicates: Vec<String>,
     pub plugins_written: Option<usize>,
     pub plugin_findings: Vec<String>,
+    pub rules_added: usize,
+    pub rules_refused: Vec<String>,
     pub inis_copied: Vec<String>,
     pub saves_copied: usize,
     pub saves_skipped_existing: usize,
@@ -986,6 +1040,8 @@ impl From<&VortexRunReport> for VortexRunDto {
             duplicates: report.duplicates.clone(),
             plugins_written: report.plugins_written,
             plugin_findings: report.plugin_findings.clone(),
+            rules_added: report.rules_added,
+            rules_refused: report.rules_refused.clone(),
             inis_copied: report.inis_copied.clone(),
             saves_copied: report.saves_copied,
             saves_skipped_existing: report.saves_skipped_existing,

@@ -246,7 +246,10 @@ snapshot first, and `template delete` asks unless given `--yes`.
   too, turned off. Mods are copied as they are on disk; downloads are not copied. The layer order comes from
   `vortex.deployment.json`, with Vortex's rules as the tie-breaker, and every file where the two
   disagree is reported; with no manifest (a purged deployment), the rules alone decide and the
-  plan says where it looked. A profile with local game settings brings its INIs; local saves are
+  plan says where it looked. The plugin list reads Vortex's original shape (only active plugins,
+  no `*`) and the Fallout 4 shape (a `*` marks active). LOOT `userlist.yaml` `after` entries
+  become load-after rules; unsuitable ones are refused with a reason, and `req`/`inc` are not
+  imported (no Agora equivalent). A profile with local game settings brings its INIs; local saves are
   copied under Documents only with `--copy-saves`. If scan says the game folder is a real install
   Agora has not added, import with `--add-folder` (or run `agora games folder add <path>` first).
   Show the plan before importing; a second import of the same profile needs `--name`.

@@ -280,6 +280,12 @@ export interface VortexPlanDto {
   order: string[];
   disagreements: { file: string; manifestSupplied: string; rulesSupply: string }[];
   plugins: { kept: boolean; listed: number; active: number; notes: string[] };
+  userlist: {
+    path: string | null;
+    rules: { item: string; after: string }[];
+    refused: { item: string; after: string; reason: string }[];
+    notImported: string[];
+  };
   localSettings: boolean;
   inis: string[];
   localSaves: boolean;
@@ -297,6 +303,8 @@ export interface VortexRunDto {
   duplicates: string[];
   pluginsWritten: number | null;
   pluginFindings: string[];
+  rulesAdded: number;
+  rulesRefused: string[];
   inisCopied: string[];
   savesCopied: number;
   savesSkippedExisting: number;

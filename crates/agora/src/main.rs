@@ -10337,6 +10337,25 @@ fn print_vortex_plan(plan: &agora_core::game_import::vortex::VortexPlan, verbose
     for note in &plan.plugins.notes {
         println!("  note: {note}");
     }
+    if let Some(path) = &plan.userlist.path {
+        println!(
+            "  userlist: {} ({} load-after rule(s))",
+            path.display(),
+            plan.userlist.rules.len()
+        );
+        for rule in &plan.userlist.rules {
+            println!("    {} loads after {}", rule.item, rule.after);
+        }
+        for rule in &plan.userlist.refused {
+            println!(
+                "    refused: {} after {}: {}",
+                rule.item, rule.after, rule.reason
+            );
+        }
+        for line in &plan.userlist.not_imported {
+            println!("    not imported: {line}");
+        }
+    }
     if plan.local_settings {
         let names: Vec<&str> = plan.inis.iter().map(|ini| ini.name.as_str()).collect();
         println!(
@@ -10403,6 +10422,12 @@ fn print_vortex_run(report: &agora_core::game_import::vortex::VortexRunReport) {
     }
     for finding in &report.plugin_findings {
         println!("  plugin order: {finding}");
+    }
+    if report.rules_added > 0 {
+        println!("  load-after rules added: {}", report.rules_added);
+    }
+    for refused in &report.rules_refused {
+        println!("  load-after rule refused: {refused}");
     }
     if !report.inis_copied.is_empty() {
         println!("  INIs copied: {}", report.inis_copied.join(", "));
