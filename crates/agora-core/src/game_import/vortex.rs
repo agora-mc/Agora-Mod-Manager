@@ -1105,6 +1105,9 @@ pub struct VortexRequest {
     pub add_folder: bool,
     /// Copy the profile's own saves into the instance. INIs are copied with their profile.
     pub copy_saves: bool,
+    /// Bring the profile's disabled mods too, turned off. Off by default: a game's staging folder
+    /// is shared by every profile.
+    pub all_mods: bool,
 }
 
 /// A mod folder the profile lists, and what reading it found.
@@ -1161,6 +1164,31 @@ pub struct OrderDisagreement {
     pub rules_supply: String,
 }
 
+/// A LOOT userlist `after` entry, as a load-after rule Agora will store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlannedRule {
+    pub item: String,
+    pub after: String,
+}
+
+/// A userlist rule the import will not add, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RefusedRule {
+    pub item: String,
+    pub after: String,
+    pub reason: String,
+}
+
+/// The profile's `userlist.yaml`, read for its `after` entries. `req` and `inc` have no Agora
+/// equivalent and are named in `not_imported`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct UserlistPlan {
+    pub path: Option<PathBuf>,
+    pub rules: Vec<PlannedRule>,
+    pub refused: Vec<RefusedRule>,
+    pub not_imported: Vec<String>,
+}
+
 /// Everything an import would do, read from the store and checked. Nothing is stored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VortexPlan {
@@ -1183,6 +1211,8 @@ pub struct VortexPlan {
     pub mods: Vec<PlannedMod>,
     pub mods_enabled: usize,
     pub mods_disabled: usize,
+    /// Disabled mods left out because `--all-mods` was not given, by name.
+    pub mods_left_out: Vec<String>,
     pub files: usize,
     pub bytes: u64,
     pub manifest: ManifestPlan,
@@ -1190,6 +1220,8 @@ pub struct VortexPlan {
     pub order: Vec<String>,
     pub disagreements: Vec<OrderDisagreement>,
     pub plugins: PluginPlan,
+    /// The profile's LOOT userlist `after` entries, and what was not imported.
+    pub userlist: UserlistPlan,
     /// The profile keeps its own copies of the game's INI files.
     pub local_settings: bool,
     pub inis: Vec<IniPlan>,
@@ -1244,8 +1276,19 @@ pub fn plan(
         ));
     }
     let mut problems = Vec::new();
-    let mods = plan_mods(game, profile, &staging, &mut problems);
+    let mods = plan_mods(game, profile, &staging, request.all_mods, &mut problems);
     let enabled = mods.iter().filter(|m| m.enabled).count();
+    // A game's staging folder is shared by every profile. Unless asked, only this profile's
+    // enabled mods are imported; the disabled ones are named for --verbose and counted.
+    let mods_left_out: Vec<String> = if request.all_mods {
+        Vec::new()
+    } else {
+        game.mods
+            .iter()
+            .filter(|entry| !profile.enabled.get(&entry.id).copied().unwrap_or(false))
+            .map(|entry| entry.name.clone())
+            .collect()
+    };
 
     let manifest_search = find_manifests(Some(&definition), &install.discovered.location);
     let mut manifest = ManifestPlan {
@@ -1317,6 +1360,7 @@ pub fn plan(
         &mut warnings,
     );
     let profile_dir = profile_folder(&state.source, &game.id, &profile.id);
+    let userlist = plan_userlist(&profile_dir, &plugins, &mut warnings);
     let inis = plan_inis(
         &definition,
         &install.discovered.store,
@@ -1341,7 +1385,9 @@ pub fn plan(
     }
 
     let files = mods.iter().map(|m| m.files).sum();
-    let bytes = mods.iter().map(|m| m.bytes).sum();
+    let bytes: u64 = mods.iter().map(|m| m.bytes).sum();
+    // Validate the space before anything (including adding a game folder) is written.
+    content_store::ensure_room_for_declared(&ctx.paths.content_root(), bytes)?;
     Ok(VortexPlan {
         store: state.source.clone(),
         vortex_game: game.id.clone(),
@@ -1360,6 +1406,7 @@ pub fn plan(
         staging,
         mods_enabled: enabled,
         mods_disabled: mods.len() - enabled,
+        mods_left_out,
         mods,
         files,
         bytes,
@@ -1367,6 +1414,7 @@ pub fn plan(
         order,
         disagreements,
         plugins,
+        userlist,
         local_settings: profile.local_settings,
         inis,
         local_saves: profile.local_saves,
@@ -1456,11 +1504,16 @@ fn plan_mods(
     game: &VortexGame,
     profile: &VortexProfile,
     staging: &Path,
+    all_mods: bool,
     problems: &mut Vec<Problem>,
 ) -> Vec<PlannedMod> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     for entry in &game.mods {
+        let enabled = profile.enabled.get(&entry.id).copied().unwrap_or(false);
+        if !enabled && !all_mods {
+            continue;
+        }
         if let Err(reason) = mo2::check_mod_folder_name(&entry.installation_folder) {
             problems.push(Problem {
                 line: None,
@@ -1535,7 +1588,7 @@ fn plan_mods(
             nexus_mod_id: entry.nexus_mod_id,
             nexus_file_id: entry.nexus_file_id,
             folder: entry.installation_folder.clone(),
-            enabled: profile.enabled.get(&entry.id).copied().unwrap_or(false),
+            enabled,
             files: paths.len(),
             bytes,
             provenance: provenance(entry),
@@ -1898,6 +1951,36 @@ fn disagreements(
     out
 }
 
+/// Parse a profile's `plugins.txt`. Vortex writes two shapes
+/// (`..._util_PluginPersistor.ts`):
+/// - the original shape lists **only active plugins**, with no prefix:
+///   `toPluginListOriginal` filters to active/native and returns bare names (`:459-471`), and
+///   `writeFiles` writes that list (`:600-607`);
+/// - the Fallout 4 shape marks an active plugin with `*` and leaves a ghost bare (`:473-483`).
+///
+/// The original reader treats every entry as active (`initFromKeyList`: `keyEnabled = enable &&
+/// (this.mPluginFormat === "original" || key[0] === "*")`, `:680`). A file with no `*` line is
+/// therefore the original shape, where every line is active; a file with any `*` line is read the
+/// MO2 way, where a bare line is inactive. The order always comes from `loadorder.txt`
+/// (`writeFiles` at `:589-599`, read first for the original format at `:751-762`).
+fn parse_vortex_plugins(text: &str) -> Vec<mo2::PluginLine> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    if lines.iter().any(|line| line.starts_with('*')) {
+        return mo2::parse_plugins(text);
+    }
+    lines
+        .into_iter()
+        .map(|line| mo2::PluginLine {
+            name: line.to_string(),
+            active: true,
+        })
+        .collect()
+}
+
 fn plan_plugins(
     def: &GameDefinition,
     state: &VortexState,
@@ -1937,7 +2020,7 @@ fn plan_plugins(
         }
     };
     let listed = match std::fs::read(&plugins_path) {
-        Ok(bytes) => mo2::parse_plugins(&String::from_utf8_lossy(&bytes)),
+        Ok(bytes) => parse_vortex_plugins(&String::from_utf8_lossy(&bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             warnings.push(format!(
                 "the profile has no plugins.txt (looked in {}); no plugin is active",
@@ -2027,6 +2110,266 @@ fn plan_plugins(
 }
 
 // ---------------------------------------------------------------------------
+// LOOT userlist
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct UserlistEntry {
+    name: String,
+    after: Vec<String>,
+    req: Vec<String>,
+    inc: Vec<String>,
+}
+
+/// Read the profile's `userlist.yaml` for its `after` entries. This is the small YAML LOOT writes
+/// for a profile: a `plugins:` list of `- name:` entries with `after`/`req`/`inc` lists. Other
+/// keys (`groups`, `globals`) are ignored. A quoted or bare value is accepted; an inline
+/// `[a, b]` list is accepted too.
+fn parse_userlist(text: &str) -> Vec<UserlistEntry> {
+    let mut entries = Vec::new();
+    let mut current: Option<UserlistEntry> = None;
+    let mut key: Option<u8> = None; // 0 after, 1 req, 2 inc
+    let mut in_plugins = false;
+    for raw in text.lines() {
+        let line = strip_yaml_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "plugins:" {
+            in_plugins = true;
+            key = None;
+            continue;
+        }
+        if !in_plugins {
+            continue;
+        }
+        if line == "groups:" || line == "globals:" {
+            in_plugins = false;
+            key = None;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("- ") {
+            let rest = rest.trim();
+            if let Some(name) = rest.strip_prefix("name:") {
+                if let Some(entry) = current.take() {
+                    if !entry.name.is_empty() {
+                        entries.push(entry);
+                    }
+                }
+                current = Some(UserlistEntry {
+                    name: unquote(name.trim()),
+                    ..UserlistEntry::default()
+                });
+                key = None;
+                continue;
+            }
+            if let Some(entry) = current.as_mut() {
+                let value = unquote(rest);
+                if value.is_empty() {
+                    continue;
+                }
+                match key {
+                    Some(0) => entry.after.push(value),
+                    Some(1) => entry.req.push(value),
+                    Some(2) => entry.inc.push(value),
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim();
+            let value = value.trim();
+            if name == "name" {
+                if let Some(entry) = current.as_mut() {
+                    entry.name = unquote(value);
+                }
+            } else if matches!(name, "after" | "req" | "inc") {
+                let slot = match name {
+                    "after" => 0,
+                    "req" => 1,
+                    _ => 2,
+                };
+                key = Some(slot);
+                if value.starts_with('[') && value.ends_with(']') {
+                    if let Some(entry) = current.as_mut() {
+                        for item in inline_list(value) {
+                            match slot {
+                                0 => entry.after.push(item),
+                                1 => entry.req.push(item),
+                                _ => entry.inc.push(item),
+                            }
+                        }
+                    }
+                }
+            } else {
+                key = None;
+            }
+        }
+    }
+    if let Some(entry) = current {
+        if !entry.name.is_empty() {
+            entries.push(entry);
+        }
+    }
+    entries
+}
+
+fn strip_yaml_comment(line: &str) -> &str {
+    let mut quote: Option<char> = None;
+    for (index, ch) in line.char_indices() {
+        match ch {
+            '\'' | '"' if quote == Some(ch) => quote = None,
+            '\'' | '"' if quote.is_none() => quote = Some(ch),
+            '#' if quote.is_none()
+                && (index == 0
+                    || line[..index]
+                        .chars()
+                        .last()
+                        .is_some_and(char::is_whitespace)) =>
+            {
+                return &line[..index];
+            }
+            _ => {}
+        }
+    }
+    line
+}
+
+fn unquote(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2 {
+        let first = value.chars().next().unwrap_or(' ');
+        let last = value.chars().last().unwrap_or(' ');
+        if (first == '\'' && last == '\'') || (first == '"' && last == '"') {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value.to_string()
+}
+
+fn inline_list(value: &str) -> Vec<String> {
+    value
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .map(unquote)
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+fn reaches(graph: &HashMap<String, Vec<String>>, from: &str, to: &str) -> bool {
+    let mut stack = vec![from.to_string()];
+    let mut seen = BTreeSet::new();
+    while let Some(node) = stack.pop() {
+        if node == to {
+            return true;
+        }
+        if !seen.insert(node.clone()) {
+            continue;
+        }
+        if let Some(next) = graph.get(&node) {
+            stack.extend(next.iter().cloned());
+        }
+    }
+    false
+}
+
+/// Turn the profile's LOOT `after` entries into load-after rules Agora can store. A rule whose
+/// plugin is not in the profile's list, a self rule and a rule that closes a cycle among the
+/// accepted rules are refused with a reason. A master contradiction is checked by
+/// [`crate::game_load_order::add_load_after_rule`] when the instance exists. `req` and `inc` have
+/// no Agora equivalent and are named in `not_imported`.
+fn plan_userlist(
+    profile_dir: &Path,
+    plugins: &PluginPlan,
+    warnings: &mut Vec<String>,
+) -> UserlistPlan {
+    let path = profile_dir.join("userlist.yaml");
+    if !path.is_file() {
+        return UserlistPlan::default();
+    }
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) => {
+            warnings.push(format!(
+                "the profile's userlist.yaml could not be read ({}): {error}",
+                path.display()
+            ));
+            return UserlistPlan {
+                path: Some(path),
+                ..UserlistPlan::default()
+            };
+        }
+    };
+    let known: BTreeSet<String> = plugins
+        .lines
+        .iter()
+        .map(|line| fold_path_case(&line.name))
+        .collect();
+    let mut graph: HashMap<String, Vec<String>> = HashMap::new();
+    let mut accepted: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut rules = Vec::new();
+    let mut refused = Vec::new();
+    let mut not_imported = Vec::new();
+    for entry in parse_userlist(&text) {
+        let item = entry.name.trim().to_string();
+        if item.is_empty() {
+            continue;
+        }
+        for after in entry.after {
+            let after = after.trim().to_string();
+            let item_key = fold_path_case(&item);
+            let after_key = fold_path_case(&after);
+            let reason = if !known.contains(&item_key) || !known.contains(&after_key) {
+                Some(
+                    "not in the profile's plugin list (it may come from a mod left out)"
+                        .to_string(),
+                )
+            } else if item_key == after_key {
+                Some("a plugin cannot load after itself".to_string())
+            } else if accepted.contains(&(item_key.clone(), after_key.clone())) {
+                None
+            } else if reaches(&graph, &item_key, &after_key) {
+                Some("adding it would make a cycle with the rules already accepted".to_string())
+            } else {
+                None
+            };
+            match reason {
+                Some(reason) => refused.push(RefusedRule {
+                    item: item.clone(),
+                    after,
+                    reason,
+                }),
+                None => {
+                    if accepted.insert((item_key.clone(), after_key.clone())) {
+                        graph.entry(after_key).or_default().push(item_key);
+                        rules.push(PlannedRule {
+                            item: item.clone(),
+                            after,
+                        });
+                    }
+                }
+            }
+        }
+        for target in entry.req {
+            not_imported.push(format!(
+                "{item}: req {target} (Agora has no requirement rule; no equivalent)"
+            ));
+        }
+        for target in entry.inc {
+            not_imported.push(format!("{item}: inc {target} (Agora has no conflict rule)"));
+        }
+    }
+    UserlistPlan {
+        path: Some(path),
+        rules,
+        refused,
+        not_imported,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Running
 // ---------------------------------------------------------------------------
 
@@ -2045,6 +2388,10 @@ pub struct VortexRunReport {
     pub duplicates: Vec<String>,
     pub plugins_written: Option<usize>,
     pub plugin_findings: Vec<String>,
+    /// LOOT userlist `after` rules stored on the instance.
+    pub rules_added: usize,
+    /// Userlist rules refused at import time (masters, cycles), with the reason.
+    pub rules_refused: Vec<String>,
     /// The profile's own INI files copied into the instance.
     pub inis_copied: Vec<String>,
     pub saves_copied: usize,
@@ -2062,8 +2409,16 @@ pub fn run(
     options: RunOptions,
     progress: &dyn Fn(ImportProgress),
 ) -> Result<VortexRunReport, ImportError> {
-    let inventory = add_folder_for_request(ctx, inventory, request)?;
-    let plan = plan(ctx, &inventory, request)?;
+    // Plan and validate before writing anything, including a game folder. Only then is a folder
+    // with --add-folder added, and the plan is made again against the real install.
+    let mut plan = plan(ctx, inventory, request)?;
+    let inventory = if plan.would_add_folder {
+        let added = add_folder_for_request(ctx, inventory, request)?;
+        plan = self::plan(ctx, &added, request)?;
+        added
+    } else {
+        inventory.clone()
+    };
     let install = inventory
         .installs
         .iter()
@@ -2089,6 +2444,8 @@ pub fn run(
         duplicates: Vec::new(),
         plugins_written: None,
         plugin_findings: Vec::new(),
+        rules_added: 0,
+        rules_refused: Vec::new(),
         inis_copied: Vec::new(),
         saves_copied: 0,
         saves_skipped_existing: 0,
@@ -2247,6 +2604,25 @@ pub fn run(
             )?;
             game_plugins::import_list(ctx, &instance_id, &def, &lines, &managed, &[])?;
             report.plugins_written = Some(lines.len());
+            // The profile's LOOT `after` entries become Agora's load-after rules. The rule add
+            // checks masters and cycles against the instance as well; a refused rule is reported
+            // and the rest still apply.
+            for rule in &plan.userlist.rules {
+                match game_load_order::add_load_after_rule(
+                    ctx,
+                    &instance_id,
+                    &def,
+                    None,
+                    &rule.item,
+                    &rule.after,
+                ) {
+                    Ok(true) => report.rules_added += 1,
+                    Ok(false) => {}
+                    Err(error) => report
+                        .rules_refused
+                        .push(format!("{} after {}: {error}", rule.item, rule.after)),
+                }
+            }
             let findings = game_load_order::check(ctx, &instance_id, &def)?;
             if !findings.is_empty() {
                 report.plugin_findings = game_load_order::describe_findings(&findings)

@@ -265,6 +265,8 @@ export interface VortexPlanDto {
   }[];
   modsEnabled: number;
   modsDisabled: number;
+  /** Disabled mods left out by the default; `--all-mods` brings them. */
+  modsLeftOut: string[];
   files: number;
   bytes: number;
   manifest: {
@@ -278,6 +280,12 @@ export interface VortexPlanDto {
   order: string[];
   disagreements: { file: string; manifestSupplied: string; rulesSupply: string }[];
   plugins: { kept: boolean; listed: number; active: number; notes: string[] };
+  userlist: {
+    path: string | null;
+    rules: { item: string; after: string }[];
+    refused: { item: string; after: string; reason: string }[];
+    notImported: string[];
+  };
   localSettings: boolean;
   inis: string[];
   localSaves: boolean;
@@ -295,6 +303,8 @@ export interface VortexRunDto {
   duplicates: string[];
   pluginsWritten: number | null;
   pluginFindings: string[];
+  rulesAdded: number;
+  rulesRefused: string[];
   inisCopied: string[];
   savesCopied: number;
   savesSkippedExisting: number;
@@ -316,6 +326,7 @@ export interface VortexImportRequest {
   install: string | null;
   addFolder: boolean;
   copySaves: boolean;
+  allMods: boolean;
 }
 
 function isVortexScanGame(value: unknown): value is VortexScanGame {

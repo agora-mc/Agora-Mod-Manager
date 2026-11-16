@@ -581,6 +581,14 @@ enum ImportCmd {
         /// Copy the profile's own saves into the instance's own save folder under Documents.
         #[arg(long)]
         copy_saves: bool,
+        /// Bring the profile's disabled mods too, turned off. Off by default: the staging folder
+        /// is shared by every profile, so the safe default imports only this profile's enabled
+        /// mods.
+        #[arg(long)]
+        all_mods: bool,
+        /// List the mods a dry run leaves out, by name, as well as counting them.
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
@@ -9904,6 +9912,8 @@ fn run_games_import(
             install,
             add_folder,
             copy_saves,
+            all_mods,
+            verbose,
         } => {
             let store = resolve_vortex_store(store)?;
             let inventory = agora_core::game_registry::installed_games(ctx);
@@ -9936,13 +9946,14 @@ fn run_games_import(
                 install,
                 add_folder,
                 copy_saves,
+                all_mods,
             };
             if dry_run {
                 let plan = agora_core::game_import::vortex::plan(ctx, &inventory, &request)?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&plan)?);
                 } else {
-                    print_vortex_plan(&plan);
+                    print_vortex_plan(&plan, verbose);
                 }
                 return Ok(());
             }
@@ -10290,7 +10301,7 @@ fn print_vortex_scan(report: &agora_core::game_import::vortex::VortexScan) {
     println!("Nothing was stored.");
 }
 
-fn print_vortex_plan(plan: &agora_core::game_import::vortex::VortexPlan) {
+fn print_vortex_plan(plan: &agora_core::game_import::vortex::VortexPlan, verbose: bool) {
     println!(
         "Import plan: profile \"{}\" from {} (Vortex game {})",
         plan.profile,
@@ -10339,6 +10350,17 @@ fn print_vortex_plan(plan: &agora_core::game_import::vortex::VortexPlan) {
             planned.files,
             vortex_provenance_text(&planned.provenance)
         );
+    }
+    if !plan.mods_left_out.is_empty() {
+        println!(
+            "  left out: {} disabled mod(s) not enabled in this profile; --all-mods imports them turned off",
+            plan.mods_left_out.len()
+        );
+        if verbose {
+            for name in &plan.mods_left_out {
+                println!("    {name}");
+            }
+        }
     }
     println!(
         "  deployment manifest: {} ({} files, {} matched an imported mod)",
@@ -10401,6 +10423,25 @@ fn print_vortex_plan(plan: &agora_core::game_import::vortex::VortexPlan) {
     }
     for note in &plan.plugins.notes {
         println!("  note: {note}");
+    }
+    if let Some(path) = &plan.userlist.path {
+        println!(
+            "  userlist: {} ({} load-after rule(s))",
+            path.display(),
+            plan.userlist.rules.len()
+        );
+        for rule in &plan.userlist.rules {
+            println!("    {} loads after {}", rule.item, rule.after);
+        }
+        for rule in &plan.userlist.refused {
+            println!(
+                "    refused: {} after {}: {}",
+                rule.item, rule.after, rule.reason
+            );
+        }
+        for line in &plan.userlist.not_imported {
+            println!("    not imported: {line}");
+        }
     }
     if plan.local_settings {
         let names: Vec<&str> = plan.inis.iter().map(|ini| ini.name.as_str()).collect();
@@ -10468,6 +10509,12 @@ fn print_vortex_run(report: &agora_core::game_import::vortex::VortexRunReport) {
     }
     for finding in &report.plugin_findings {
         println!("  plugin order: {finding}");
+    }
+    if report.rules_added > 0 {
+        println!("  load-after rules added: {}", report.rules_added);
+    }
+    for refused in &report.rules_refused {
+        println!("  load-after rule refused: {refused}");
     }
     if !report.inis_copied.is_empty() {
         println!("  INIs copied: {}", report.inis_copied.join(", "));

@@ -318,6 +318,7 @@ fn request(f: &Fixture, name: Option<&str>) -> VortexRequest {
         install: None,
         add_folder: false,
         copy_saves: false,
+        all_mods: false,
     }
 }
 
@@ -386,17 +387,16 @@ fn a_game_vortex_discovered_but_agora_does_not_support_is_listed_as_unsupported(
 fn the_manifest_decides_the_layer_order_and_disagreements_are_reported() {
     let f = fixture();
     let plan = vortex::plan(&f.ctx, &f.inventory, &request(&f, None)).expect("the plan is made");
-    assert_eq!(plan.mods.len(), 3);
+    assert_eq!(plan.mods.len(), 2);
     assert_eq!(plan.mods_enabled, 2);
-    assert_eq!(plan.mods_disabled, 1);
+    assert_eq!(plan.mods_disabled, 0);
+    assert_eq!(plan.mods_left_out, vec!["Gamma Mod"]);
     assert!(plan.manifest.found);
-    assert_eq!(plan.manifest.matched, 4);
+    assert_eq!(plan.manifest.matched, 3);
 
     let place = |id: &str| plan.order.iter().position(|m| m == id).unwrap();
-    // Beta supplied the shared file, so it is above Alpha and Gamma even though the rules put
-    // Gamma before both of them.
+    // Beta supplied the shared file, so it is above Alpha even though the rules put Alpha first.
     assert!(place("mod-beta") < place("mod-alpha"));
-    assert!(place("mod-beta") < place("mod-gamma"));
 
     let shared = plan
         .disagreements
@@ -411,6 +411,29 @@ fn the_manifest_decides_the_layer_order_and_disagreements_are_reported() {
 }
 
 #[test]
+fn disabled_mods_are_left_out_unless_all_mods_is_given() {
+    let f = fixture();
+    let default = request(&f, None);
+    let plan = vortex::plan(&f.ctx, &f.inventory, &default).expect("the plan is made");
+    assert_eq!(plan.mods.len(), 2);
+    assert_eq!(plan.mods_left_out, vec!["Gamma Mod"]);
+
+    let mut all = default;
+    all.all_mods = true;
+    let plan = vortex::plan(&f.ctx, &f.inventory, &all).expect("the plan is made");
+    assert_eq!(plan.mods.len(), 3);
+    assert_eq!(plan.mods_enabled, 2);
+    assert_eq!(plan.mods_disabled, 1);
+    assert!(plan.mods_left_out.is_empty());
+    assert!(plan.order.iter().any(|id| id == "mod-gamma"));
+
+    let report = vortex::run(&f.ctx, &f.inventory, &all, Default::default(), &|_| {})
+        .expect("the import runs");
+    assert_eq!(report.stored_mods, 3);
+    assert_eq!(report.disabled_layers, 1);
+}
+
+#[test]
 fn run_makes_an_instance_and_a_second_import_is_refused() {
     let f = fixture();
     let report = vortex::run(
@@ -421,9 +444,9 @@ fn run_makes_an_instance_and_a_second_import_is_refused() {
         &|_| {},
     )
     .expect("the import runs");
-    assert_eq!(report.stored_mods, 3);
-    assert_eq!(report.content_layers, 3);
-    assert_eq!(report.disabled_layers, 1);
+    assert_eq!(report.stored_mods, 2);
+    assert_eq!(report.content_layers, 2);
+    assert_eq!(report.disabled_layers, 0);
     assert_eq!(report.plugins_written, Some(3));
     assert!(report.instance_id.is_some());
     assert!(report.next_steps.iter().any(|s| s.contains("downloads")));
@@ -513,7 +536,8 @@ fn a_fresh_data_dir_says_the_folder_needs_adding_then_adds_it() {
     with_add.add_folder = true;
     let plan = vortex::plan(&f.ctx, &empty, &with_add).expect("the plan is made");
     assert!(plan.would_add_folder);
-    assert_eq!(plan.mods.len(), 3);
+    assert_eq!(plan.mods.len(), 2);
+    assert_eq!(plan.mods_left_out, vec!["Gamma Mod"]);
     assert!(plan.local_settings);
     assert_eq!(plan.inis.len(), 3);
     assert!(plan.local_saves);
@@ -529,7 +553,7 @@ fn a_fresh_data_dir_says_the_folder_needs_adding_then_adds_it() {
     // A real run adds the folder first, then imports.
     let report = vortex::run(&f.ctx, &empty, &with_add, Default::default(), &|_| {})
         .expect("the import runs");
-    assert_eq!(report.stored_mods, 3);
+    assert_eq!(report.stored_mods, 2);
     assert!(report.instance_id.is_some());
     let folders = agora_core::game_discovery::custom_folders::list_folders(&f.ctx.paths).unwrap();
     assert!(folders
@@ -553,10 +577,11 @@ fn a_missing_manifest_falls_back_to_vortex_rules_and_says_where_it_looked() {
         .warnings
         .iter()
         .any(|warning| warning.contains("rules alone") && warning.contains("looked in")));
+    assert_eq!(plan.mods_left_out, vec!["Gamma Mod"]);
     let place = |id: &str| plan.order.iter().position(|m| m == id).unwrap();
-    // A rule chain: Alpha before Gamma before Beta.
-    assert!(place("mod-alpha") < place("mod-gamma"));
-    assert!(place("mod-gamma") < place("mod-beta"));
+    // The imported mods are Alpha and Beta; the rule that names the left-out Gamma cannot order
+    // them, so Alpha stays before Beta.
+    assert!(place("mod-alpha") < place("mod-beta"));
 }
 
 #[test]
@@ -787,6 +812,7 @@ fn a_manifest_at_the_game_root_is_found_and_its_target_subfolder_is_honoured() {
         install: None,
         add_folder: false,
         copy_saves: false,
+        all_mods: false,
     };
     let plan = vortex::plan(&f.ctx, &f.inventory, &request).expect("the plan is made");
     assert!(plan.manifest.found);
@@ -946,6 +972,7 @@ fn the_real_skyrim_package_maps_and_imports_a_not_yet_added_folder() {
         install: None,
         add_folder: false,
         copy_saves: false,
+        all_mods: false,
     };
     let error = vortex::plan(&ctx, &empty, &request).expect_err("the folder is not added");
     assert!(error.to_string().contains("--add-folder"), "{error}");
@@ -971,4 +998,86 @@ fn the_real_skyrim_package_maps_and_imports_a_not_yet_added_folder() {
         folders.iter().any(|folder| Path::new(folder) == game_dir),
         "{folders:?}"
     );
+}
+
+#[test]
+fn a_plugins_txt_without_stars_marks_every_line_active() {
+    let f = fixture();
+    let profile = f
+        ._tmp
+        .path()
+        .join("Vortex")
+        .join(VORTEX_GAME)
+        .join("profiles")
+        .join("p1");
+    write(
+        &profile.join("plugins.txt"),
+        b"# Automatically generated by Vortex\r\nAlpha.esp\r\nBeta.esp\r\n",
+    );
+    let plan = vortex::plan(&f.ctx, &f.inventory, &request(&f, None)).expect("the plan is made");
+    assert_eq!(plan.plugins.active, 2);
+    let line = |name: &str| {
+        plan.plugins
+            .lines
+            .iter()
+            .find(|line| line.name == name)
+            .expect("the plugin is listed")
+    };
+    assert!(line("Alpha.esp").active);
+    assert!(line("Beta.esp").active);
+    assert!(!line("Gamma.esp").active);
+}
+
+#[test]
+fn a_profiles_userlist_becomes_load_after_rules_and_refuses_bad_ones() {
+    use agora_core::game_load_order;
+
+    let f = fixture();
+    let profile = f
+        ._tmp
+        .path()
+        .join("Vortex")
+        .join(VORTEX_GAME)
+        .join("profiles")
+        .join("p1");
+    write(
+        &profile.join("userlist.yaml"),
+        b"plugins:\n  - name: 'Alpha.esp'\n    after:\n      - 'Beta.esp'\n  - name: 'Beta.esp'\n    after: ['Alpha.esp']\n  - name: 'Missing.esp'\n    after:\n      - 'Alpha.esp'\n  - name: 'Gamma.esp'\n    after:\n      - 'Gamma.esp'\n  - name: 'Beta.esp'\n    req:\n      - 'Alpha.esp'\n    inc:\n      - 'Gamma.esp'\n",
+    );
+    let plan = vortex::plan(&f.ctx, &f.inventory, &request(&f, None)).expect("the plan is made");
+    assert_eq!(plan.userlist.rules.len(), 1);
+    assert_eq!(plan.userlist.rules[0].item, "Alpha.esp");
+    assert_eq!(plan.userlist.rules[0].after, "Beta.esp");
+    assert_eq!(plan.userlist.refused.len(), 3);
+    assert!(plan
+        .userlist
+        .refused
+        .iter()
+        .any(|rule| rule.reason.contains("cycle")));
+    assert!(plan
+        .userlist
+        .refused
+        .iter()
+        .any(|rule| rule.reason.contains("itself")));
+    assert!(plan
+        .userlist
+        .refused
+        .iter()
+        .any(|rule| rule.reason.contains("not in the profile")));
+    assert_eq!(plan.userlist.not_imported.len(), 2);
+
+    let report = vortex::run(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, None),
+        Default::default(),
+        &|_| {},
+    )
+    .expect("the import runs");
+    assert_eq!(report.rules_added, 1);
+    let instance = report.instance_id.as_deref().expect("an instance was made");
+    let rules = game_load_order::load_after_rules(&f.ctx, instance, "plugins").expect("rules read");
+    assert!(rules
+        .iter()
+        .any(|rule| rule.item == "Alpha.esp" && rule.after == "Beta.esp"));
 }

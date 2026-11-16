@@ -250,11 +250,16 @@ snapshot first, and `template delete` asks unless given `--yes`.
   id the scan prints (its Vortex id, e.g. `skyrimse`, or the Agora game id) with
   `agora games import vortex --game <id> --profile <name> --dry-run`; that shows the plan. Drop
   `--dry-run` to import. **Close Vortex first:** Agora refuses while Vortex holds the store's
-  lock, and never opens the live store (it reads a copy). Mods are copied from the staging folder
-  as they are on disk; downloads are not copied. The layer order comes from
+  lock, and never opens the live store (it reads a copy). By default only the mods the profile
+  enables are copied, because Vortex shares one staging folder across every profile; the plan
+  counts the disabled mods it leaves out (`--verbose` names them), and `--all-mods` brings them
+  too, turned off. Mods are copied as they are on disk; downloads are not copied. The layer order comes from
   `vortex.deployment.json`, with Vortex's rules as the tie-breaker, and every file where the two
   disagree is reported; with no manifest (a purged deployment), the rules alone decide and the
-  plan says where it looked. A profile with local game settings brings its INIs; local saves are
+  plan says where it looked. The plugin list reads Vortex's original shape (only active plugins,
+  no `*`) and the Fallout 4 shape (a `*` marks active). LOOT `userlist.yaml` `after` entries
+  become load-after rules; unsuitable ones are refused with a reason, and `req`/`inc` are not
+  imported (no Agora equivalent). A profile with local game settings brings its INIs; local saves are
   copied under Documents only with `--copy-saves`. If scan says the game folder is a real install
   Agora has not added, import with `--add-folder` (or run `agora games folder add <path>` first).
   Show the plan before importing; a second import of the same profile needs `--name`.

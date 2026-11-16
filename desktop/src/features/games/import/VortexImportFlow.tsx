@@ -73,6 +73,7 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
   const [selected, setSelected] = useState<{ game: VortexScanGame; profile: VortexScanProfile } | null>(null);
   const [instanceName, setInstanceName] = useState('');
   const [copySaves, setCopySaves] = useState(false);
+  const [allMods, setAllMods] = useState(false);
   const [addingFolder, setAddingFolder] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
   const [plan, setPlan] = useState<PlanState>({ status: 'idle' });
@@ -125,6 +126,7 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
     setSelected({ game, profile });
     setInstanceName('');
     setCopySaves(false);
+    setAllMods(false);
     setRun({ status: 'idle' });
     setPlan({ status: 'busy' });
     try {
@@ -137,6 +139,7 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
         install: null,
         addFolder: false,
         copySaves,
+        allMods,
       });
       if (!mounted.current) return;
       if (reply.kind !== 'plan') throw new Error('The preview did not return a plan.');
@@ -166,6 +169,7 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
         install: null,
         addFolder: false,
         copySaves,
+        allMods,
       });
       if (!mounted.current) return;
       if (reply.kind !== 'run') throw new Error('The import did not return a report.');
@@ -206,6 +210,16 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
           </p>
           {result.pluginsWritten !== null && (
             <p className="text-sm text-muted-foreground">Plugin list: {result.pluginsWritten} lines written.</p>
+          )}
+          {result.rulesAdded > 0 && (
+            <p className="text-sm text-muted-foreground">Load-after rules added: {result.rulesAdded}.</p>
+          )}
+          {result.rulesRefused.length > 0 && (
+            <ul className="list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+              {result.rulesRefused.map((line) => (
+                <li key={line}>Load-after rule refused: {line}</li>
+              ))}
+            </ul>
           )}
           {result.inisCopied.length > 0 && (
             <p className="text-sm text-muted-foreground">INIs copied: {result.inisCopied.join(', ')}.</p>
@@ -300,6 +314,12 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
                 {plural(current.modsEnabled, 'enabled mod')}, {plural(current.modsDisabled, 'disabled mod')} ·{' '}
                 {plural(current.files, 'file')} · {formatBytes(current.bytes)}
               </p>
+              {current.modsLeftOut.length > 0 && (
+                <p className="text-sm text-muted-foreground" data-testid="vortex-plan-left-out">
+                  {plural(current.modsLeftOut.length, 'disabled mod')} left out; turn on “Also bring the
+                  profile’s disabled mods” to import them turned off.
+                </p>
+              )}
               <p className="text-sm text-muted-foreground">
                 Instance name:{' '}
                 <span className="font-medium text-foreground">{instanceName.trim() || current.instanceName}</span>
@@ -384,6 +404,42 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
               </div>
             )}
 
+            {current.userlist.path !== null && (
+              <div className={STEP_CARD} data-testid="vortex-plan-userlist">
+                <h4 className="text-sm font-semibold">LOOT userlist</h4>
+                <p className="text-sm text-muted-foreground">
+                  {current.userlist.rules.length === 0
+                    ? 'No load-after rules to add.'
+                    : `${plural(current.userlist.rules.length, 'load-after rule')} to add.`}
+                </p>
+                {current.userlist.rules.length > 0 && (
+                  <ul className="list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                    {current.userlist.rules.map((rule) => (
+                      <li key={`${rule.item}:${rule.after}`}>
+                        {rule.item} loads after {rule.after}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {current.userlist.refused.length > 0 && (
+                  <ul className="list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                    {current.userlist.refused.map((rule) => (
+                      <li key={`${rule.item}:${rule.after}:refused`}>
+                        Refused {rule.item} after {rule.after}: {rule.reason}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {current.userlist.notImported.length > 0 && (
+                  <ul className="list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                    {current.userlist.notImported.map((line) => (
+                      <li key={line}>Not imported: {line}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+
             {current.problems.length > 0 && (
               <div className={STEP_CARD} data-testid="vortex-plan-problems">
                 <h4 className="text-sm font-semibold">Left out ({current.problems.length})</h4>
@@ -445,6 +501,10 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
       {scan.status === 'loaded' && (
         <>
           <p className="break-all font-mono text-xs text-muted-foreground">{scan.reply.store}</p>
+          <label className="flex items-center gap-2 text-sm">
+            <Switch checked={allMods} onCheckedChange={setAllMods} />
+            Also bring the profile’s disabled mods (they arrive turned off)
+          </label>
           {scan.reply.games.length === 0 && (
             <p className="text-sm text-muted-foreground">No games are in this store.</p>
           )}
