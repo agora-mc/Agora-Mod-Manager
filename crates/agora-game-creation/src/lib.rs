@@ -243,8 +243,18 @@ mod tests {
         );
         assert!(!skse.reason.is_empty());
 
-        // Empty lists
-        assert!(game.content_rules.is_empty());
+        // The Pandora pack is placed by its own marker (MASTER_SPEC §30.12).
+        assert_eq!(game.content_rules.len(), 1);
+        let pandora = &game.content_rules[0];
+        assert_eq!(pandora.kind, "Pandora Behaviour Engine");
+        assert_eq!(
+            pandora.matching.marker.as_deref(),
+            Some("Pandora Behaviour Engine+.exe")
+        );
+        assert_eq!(
+            pandora.mount,
+            RelPath::new("Data/Pandora Behaviour Engine+").unwrap()
+        );
         // SKSE and Address Library are the frameworks Skyrim SE declares (MASTER_SPEC §26.11).
         assert_eq!(
             game.framework_ids,
