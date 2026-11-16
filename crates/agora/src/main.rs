@@ -718,7 +718,7 @@ enum GameInstanceCmd {
         skip_before_launch: bool,
     },
     /// Choose how an instance's game folder is deployed and run: virtual (under the virtual file
-    /// system), links, copies, or auto (let Agora pick and announce any step down).
+    /// system), links, copies, or auto (let Agora pick, and say if it uses a simpler mode).
     #[command(name = "set-deployment")]
     SetDeployment {
         /// Instance ID.
@@ -1012,7 +1012,7 @@ enum InstancePluginsCmd {
         #[arg(long)]
         verbose: bool,
     },
-    /// Update what the list's sorter keeps, if the list declares an update hook.
+    /// Update the list's sorting data, if the list supports it.
     Masterlist {
         /// Instance ID.
         instance_id: String,
@@ -1411,7 +1411,7 @@ enum PluginCmd {
         #[command(subcommand)]
         source: PluginSourceCmd,
     },
-    /// Check a development folder's manifest, crash packs and game packages without installing.
+    /// Check a development folder's manifest, crash rules and game packages without installing.
     ///
     /// Prints every lint problem with the file it came from and, for a rule or a
     /// field, its name. Exits non-zero if anything is wrong.
@@ -2063,8 +2063,8 @@ enum CrashCmd {
         /// The crash file to read. May be repeated. Not needed with --paste.
         #[arg(required_unless_present = "paste")]
         files: Vec<PathBuf>,
-        /// Read the crash text from stdin as a pasted fragment. A pack's snippet parsers may read
-        /// it, and the answer says the text was a snippet.
+        /// Read the crash text from stdin as a pasted fragment. The crash rules' snippet parsers
+        /// may read it, and the answer says the text was a snippet.
         #[arg(long)]
         paste: bool,
         /// Analyze each file as its own crash, then summarize the pattern across them.
@@ -2073,7 +2073,7 @@ enum CrashCmd {
         /// The instance the crash came from. Lets an inspector open a file in its deployed view.
         #[arg(long = "instance")]
         instance: Option<String>,
-        /// A plugin development folder to read crash packs from. May be repeated.
+        /// A plugin development folder to read crash rules from. May be repeated.
         #[arg(long = "plugin-dir")]
         plugin_dirs: Vec<PathBuf>,
         /// The game version the crash came from, when you know it.
@@ -3212,7 +3212,7 @@ async fn run_plugin_command(
                 }
                 if report.is_clean() {
                     println!(
-                        "Validated {} crash pack(s) and {} game package(s) in {}.",
+                        "Validated {} crash rule set(s) and {} game package(s) in {}.",
                         report.crash.packs.len(),
                         report.game_packages.packages.len(),
                         path.display()
@@ -4986,7 +4986,7 @@ fn describe_session(session: &agora_core::crash_live::SessionBrief) -> String {
         Some(SessionVerdict::Froze) => "froze",
         Some(SessionVerdict::Stopped) => "was stopped",
         Some(SessionVerdict::Normal) => "closed normally",
-        Some(SessionVerdict::ClosedUnknown) => "ended with no recorded verdict",
+        Some(SessionVerdict::ClosedUnknown) => "ended, but how is unknown",
         None => "its ending was not recorded",
     };
     match &session.ended_at {
@@ -5055,7 +5055,7 @@ fn report_user_files_catch_up(user: Option<&agora_core::crash_live::UserFilesCat
         );
     } else if user.restored > 0 {
         eprintln!(
-            "Restored {} per-user file(s); {} changed during the session and were kept in the instance.",
+            "Restored {} per-user file(s); {} changed during the session and stayed in the instance.",
             user.restored, user.changed
         );
     }
@@ -7583,11 +7583,11 @@ async fn run_command(
                                 println!("{}", serde_json::to_string_pretty(&out)?);
                             } else if chosen.is_some() {
                                 println!(
-                                    "Instance '{instance_id}' will always deploy and run as '{shown}'; Agora will not step down from it."
+                                    "Instance '{instance_id}' will always deploy and run as '{shown}'; Agora will not fall back to another mode."
                                 );
                             } else {
                                 println!(
-                                    "Instance '{instance_id}' will use the game's default; Agora announces any step down."
+                                    "Instance '{instance_id}' will use the game's default; Agora will say if it falls back."
                                 );
                             }
                         }
@@ -8214,7 +8214,7 @@ async fn run_command(
                                         let _ = agora_core::crash_live::record_could_not_analyze(
                                             ctx,
                                             session,
-                                            format!("the crash packs could not be loaded: {error}"),
+                                            format!("the crash rules could not be loaded: {error}"),
                                         );
                                     }
                                 }
@@ -10433,7 +10433,7 @@ fn print_mo2_plan(plan: &agora_core::game_import::Mo2Plan) {
         human_gb(plan.bytes)
     );
     println!(
-        "  top-level meta.ini left out of the content: {} (MO2 metadata; its claims are still read as provenance)",
+        "  top-level meta.ini left out of the content: {} (MO2 metadata; its claims are still read as the source)",
         plan.meta_ini_excluded
     );
     println!(
@@ -10587,7 +10587,7 @@ fn vortex_provenance_text(provenance: &agora_core::content_store::VortexProvenan
             modid: Some(id), ..
         } => format!("Nexus mod {id}, not verified"),
         VortexProvenance::Claimed { modid: None, .. } => "no Nexus mod id".to_string(),
-        VortexProvenance::Absent => "no provenance recorded".to_string(),
+        VortexProvenance::Absent => "no source recorded".to_string(),
     }
 }
 
@@ -11498,7 +11498,7 @@ fn print_tool_run(outcome: &agora_core::game_tools::RunOutcome) {
     }
     if outcome.unchanged_dropped > 0 {
         println!(
-            "{} file(s) the tool opened but did not change were left out",
+            "Left out {} file(s) the tool opened but did not change",
             outcome.unchanged_dropped
         );
     }
@@ -12568,7 +12568,7 @@ fn plugins_load_order_command(
                     }
                 }
                 Ok(None) => fail(
-                    "This list has no sorter with an update, so there is nothing to update."
+                    "This list has no sorting update to run, so there is nothing to update."
                         .to_string(),
                 ),
                 Err(e) => fail(e.to_string()),
@@ -14431,7 +14431,7 @@ fn report_user_files_restore(
             let changed = report.files.iter().filter(|f| f.changed).count();
             if !json && !report.files.is_empty() {
                 println!(
-                    "Restored {} per-user file(s); {changed} changed during the session and were kept in the instance.",
+                    "Restored {} per-user file(s); {changed} changed during the session and stayed in the instance.",
                     report.files.len()
                 );
             }

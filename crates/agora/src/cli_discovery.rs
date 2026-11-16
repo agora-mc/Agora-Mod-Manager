@@ -41,7 +41,9 @@ pub fn run_games_folder(action: FolderCmd, ctx: &Ctx, json: bool) -> anyhow::Res
             if json {
                 println!("{}", serde_json::json!({ "removed": removed }));
             } else {
-                println!("Removed {removed} from your game folders. Its files were not touched.");
+                println!(
+                    "Removed {removed} from your game folders. Agora did not touch its files."
+                );
             }
         }
         FolderCmd::List => {

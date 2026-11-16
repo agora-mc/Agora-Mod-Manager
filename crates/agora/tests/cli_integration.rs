@@ -1995,7 +1995,7 @@ fn crash_analyze_names_a_file_it_cannot_open() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Could not read not-a-file.txt"), "{stderr}");
-    assert!(!stderr.contains("No crash pack loaded"), "{stderr}");
+    assert!(!stderr.contains("No crash rules loaded"), "{stderr}");
 }
 
 #[test]
@@ -2008,7 +2008,7 @@ fn crash_analyze_of_a_file_nobody_reads_states_no_diagnosis() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("could not read these files"), "{stdout}");
     assert!(
-        stdout.contains("notes.txt: no installed crash pack recognised this file"),
+        stdout.contains("notes.txt: the installed crash rules did not recognise this file"),
         "{stdout}"
     );
     // No diagnosis and no list of checks for a file that was never read.
@@ -2079,7 +2079,10 @@ fn crash_analyze_each_judges_three_logs_and_summarizes_the_pattern() {
     assert!(stdout.contains("AlphaMod.dll"), "{stdout}");
     assert!(stdout.contains("BetaMod.dll"), "{stdout}");
     assert!(stdout.contains("Across 3 crashes"), "{stdout}");
-    assert!(stdout.contains("not a verdict"), "{stdout}");
+    assert!(
+        stdout.contains("not a conclusion about the cause"),
+        "{stdout}"
+    );
     assert!(stdout.contains("Could not read: 1 crash."), "{stdout}");
 }
 

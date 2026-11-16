@@ -84,7 +84,7 @@ pub async fn investigate(
     .map_err(|error| anyhow::anyhow!("Could not read instance '{instance_id}': {error}"))?;
     if evidence.game_packs().next().is_none() {
         anyhow::bail!(
-            "No crash pack applies to the game '{}', so Agora cannot tell which folders to search. Install the game's plugin, or name a file with --file.",
+            "No crash rules apply to the game '{}', so Agora cannot tell which folders to search. Install the game's plugin, or name a file with --file.",
             evidence.resolved.game_id
         );
     }
@@ -262,9 +262,9 @@ fn no_evidence_reason(
             ));
         }
     } else if evidence.collection.folders.is_empty() {
-        why.push_str(" No crash pack source named a folder to search.");
+        why.push_str(" No crash rule named a folder to search.");
     } else {
-        why.push_str(" Every folder the game's crash packs name was missing or empty.");
+        why.push_str(" Every folder the game's crash rules name was missing or empty.");
     }
     why
 }
@@ -316,7 +316,7 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
     }
 
     if packs.is_empty() {
-        anyhow::bail!("No crash pack loaded, so Agora cannot read crash files.");
+        anyhow::bail!("No crash rules loaded, so Agora cannot read crash files.");
     }
 
     let mut crash_files = Vec::with_capacity(args.files.len() + usize::from(args.paste));
@@ -757,7 +757,7 @@ fn print_sweep(sweep: &crash_history::LogSweepReport) {
     );
     if sweep.skipped_older > 0 {
         println!(
-            "{} older log(s) were left for a later sweep.",
+            "Left {} older log(s) for a later sweep.",
             sweep.skipped_older
         );
     }
@@ -1075,7 +1075,7 @@ fn print_each_text(outputs: &[AnalyzeOutput]) {
 
 fn print_history(summary: &CrashHistory) {
     println!(
-        "Across {} crashes. This is a count of how often each suspect came up, not a verdict.",
+        "Across {} crashes. This is a count of how often each suspect came up, not a conclusion about the cause.",
         summary.crashes
     );
     if summary.suspects.is_empty() {
@@ -1087,7 +1087,7 @@ fn print_history(summary: &CrashHistory) {
         }
     }
     if !summary.always_running.is_empty() {
-        println!("Always running (framework or hook framework; appears in many crashes for that reason):");
+        println!("Always running (a framework, or part of one; appears in many crashes for that reason):");
         for owner in &summary.always_running {
             print_history_owner(owner);
         }
@@ -1193,7 +1193,7 @@ fn print_file_list(files: &[agora_core::crash_engine::AnalyzedFile]) {
                 file.name,
                 file.reason
                     .as_deref()
-                    .unwrap_or("not recognised by any installed crash pack")
+                    .unwrap_or("not recognised by the crash rules Agora has installed")
             ),
         }
         for reader in &file.also_recognised_by {
