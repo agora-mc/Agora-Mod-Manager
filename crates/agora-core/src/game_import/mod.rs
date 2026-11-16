@@ -95,8 +95,8 @@ pub enum ImportError {
     NoStaging { game: String, path: PathBuf },
     #[error("Vortex never discovered a game folder for {game}; discover the game in Vortex, or add its folder in Agora first")]
     VortexFolderMissing { game: String },
-    #[error("Vortex's game folder is a real {game} install at {path}, but Agora has not added it. Run `agora games folder add \"{}\"`, or import with --add-folder", path.display())]
-    VortexFolderNotAdded { game: String, path: PathBuf },
+    #[error("{reason}")]
+    VortexFolderNotAdded { reason: String },
     #[error("Vortex's game folder for {game} is {path}, which Agora cannot use: {reason}")]
     VortexFolderNotGame {
         game: String,

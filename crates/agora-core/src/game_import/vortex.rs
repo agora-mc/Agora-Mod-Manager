@@ -43,6 +43,9 @@ use crate::content_store::{self, ContentSource, VortexProvenance};
 use crate::ctx::Ctx;
 use crate::game_base::{BaseMode, BuildOptions, BuildOutcome};
 use crate::game_deploy;
+use crate::game_discovery::{
+    volume::VolumeDetector, DiscoveredInstall, DiscoveryReport, InstallCapabilities, InstallKind,
+};
 use crate::game_ini;
 use crate::game_instance::{self, GameInstanceManifest, SavesChoice};
 use crate::game_load_order;
@@ -608,10 +611,82 @@ fn definition_for_vortex<'a>(ctx: &'a Ctx, vortex_game: &str) -> Option<&'a Game
     })
 }
 
+/// The Vortex game and the Agora definition it maps to, by either id. `wanted` may be the Agora
+/// game id (`skyrim-se`) or the Vortex game id (`skyrimse`), because the scan lists the latter and
+/// users type what they see. This is the one resolution the scan and the import share.
+fn resolve_game<'a>(
+    ctx: &'a Ctx,
+    state: &'a VortexState,
+    wanted: &str,
+) -> Option<(&'a VortexGame, &'a GameDefinition)> {
+    state.games.iter().find_map(|game| {
+        let definition = definition_for_vortex(ctx, &game.id)?;
+        let matches = definition.id.as_str().eq_ignore_ascii_case(wanted)
+            || definition
+                .import_ids
+                .values()
+                .any(|id| id.eq_ignore_ascii_case(wanted));
+        matches.then_some((game, definition))
+    })
+}
+
+/// An install identified from the folder as if it had been added, without writing the folder list.
+/// A dry run uses it to show the plan the real import would make.
+fn speculative_install(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    path: &Path,
+) -> Option<IdentifiedInstall> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let discovered = DiscoveredInstall {
+        store: StoreId::direct(),
+        product: normalise_path(path),
+        name,
+        kind: InstallKind::BaseGame,
+        parent_product: None,
+        location: path.to_path_buf(),
+        store_version: None,
+        store_build: None,
+        executables: Vec::new(),
+        capabilities: InstallCapabilities {
+            executables_readable: true,
+            accepts_new_files: true,
+            relocatable: true,
+        },
+        volume: VolumeDetector::new().get_volume_info(path),
+    };
+    let report = DiscoveryReport {
+        installs: vec![discovered],
+        warnings: Vec::new(),
+    };
+    let inventory = crate::game_registry::identify_installs(
+        &ctx.games,
+        &report,
+        &crate::game_discovery::file_version::read_file_version,
+    );
+    inventory
+        .installs
+        .into_iter()
+        .find(|install| install.game == definition.id)
+}
+
 enum FolderState<'a> {
     Installed(&'a IdentifiedInstall),
     NeedsAdd { why: String },
     NotThisGame { why: String },
+}
+
+/// The one sentence the scan and the import both use when a real install is not in Agora yet.
+fn needs_add_message(definition: &GameDefinition, path: &Path) -> String {
+    format!(
+        "{} is a real {} install, but Agora has not added it; run `agora games folder add \"{}\"`, or import with --add-folder",
+        path.display(),
+        definition.name,
+        path.display()
+    )
 }
 
 /// What the folder Vortex discovered is for this game. The check is the package's own: its
@@ -671,18 +746,13 @@ fn folder_state<'a>(
         return FolderState::Installed(install);
     }
     FolderState::NeedsAdd {
-        why: format!(
-            "{} is a real {} install, but Agora has not added it; run `agora games folder add \"{}\"`, or import with --add-folder",
-            path.display(),
-            definition.name,
-            path.display()
-        ),
+        why: needs_add_message(definition, path),
     }
 }
 
 /// Add Vortex's game folder to Agora when the request asks for it, then read the install list
-/// again. Otherwise the inventory is passed through unchanged.
-pub fn prepare_inventory(
+/// again. A dry run never calls this (`plan` only says it would add the folder).
+fn add_folder_for_request(
     ctx: &Ctx,
     inventory: &GameInventory,
     request: &VortexRequest,
@@ -691,19 +761,19 @@ pub fn prepare_inventory(
         return Ok(inventory.clone());
     }
     let state = read_state(&request.store)?;
-    let (definition, game) = state
-        .games
-        .iter()
-        .find_map(|game| {
-            let definition = definition_for_vortex(ctx, &game.id)?;
-            (definition.id == request.game).then_some((definition, game))
-        })
+    let (game, definition) = resolve_game(ctx, &state, request.game.as_str())
         .ok_or_else(|| ImportError::NoVortexGame(request.game.as_str().to_string()))?;
     let Some(path) = &game.discovered_path else {
         return Err(ImportError::VortexFolderMissing {
             game: definition.name.clone(),
         });
     };
+    if inventory.installs.iter().any(|install| {
+        install.game == definition.id
+            && normalise_path(&install.discovered.location) == normalise_path(path)
+    }) {
+        return Ok(inventory.clone());
+    }
     match crate::game_discovery::custom_folders::add_folder(
         &ctx.paths,
         &ctx.games,
@@ -1106,6 +1176,9 @@ pub struct VortexPlan {
     pub install_location: PathBuf,
     /// The store id of the install Agora imports onto.
     pub store_id: StoreId,
+    /// The folder is a real install but Agora has not added it. A real import adds it first; a
+    /// plan (`--dry-run`) only says it would.
+    pub would_add_folder: bool,
     pub staging: PathBuf,
     pub mods: Vec<PlannedMod>,
     pub mods_enabled: usize,
@@ -1135,7 +1208,8 @@ pub fn plan(
     request: &VortexRequest,
 ) -> Result<VortexPlan, ImportError> {
     let state = read_state(&request.store)?;
-    let (game, definition, install) = match_for_request(ctx, inventory, &state, request)?;
+    let (game, definition, install, would_add) =
+        match_for_request(ctx, inventory, &state, request)?;
 
     let profile = game
         .profiles
@@ -1163,6 +1237,12 @@ pub fn plan(
     }
 
     let mut warnings = state.warnings.clone();
+    if would_add {
+        warnings.push(format!(
+            "{} is not in Agora yet; this import will add it first. A dry run writes nothing.",
+            install.discovered.location.display()
+        ));
+    }
     let mut problems = Vec::new();
     let mods = plan_mods(game, profile, &staging, &mut problems);
     let enabled = mods.iter().filter(|m| m.enabled).count();
@@ -1276,6 +1356,7 @@ pub fn plan(
         install_id: install.install_id.as_str().to_string(),
         install_location: install.discovered.location.clone(),
         store_id: install.discovered.store.clone(),
+        would_add_folder: would_add,
         staging,
         mods_enabled: enabled,
         mods_disabled: mods.len() - enabled,
@@ -1296,20 +1377,15 @@ pub fn plan(
 }
 
 fn match_for_request<'a>(
-    ctx: &Ctx,
-    inventory: &'a GameInventory,
+    ctx: &'a Ctx,
+    inventory: &GameInventory,
     state: &'a VortexState,
     request: &VortexRequest,
-) -> Result<(&'a VortexGame, GameDefinition, &'a IdentifiedInstall), ImportError> {
-    let (game, definition) = state
-        .games
-        .iter()
-        .find_map(|game| {
-            let definition = definition_for_vortex(ctx, &game.id)?;
-            (definition.id == request.game).then_some((game, definition))
-        })
+) -> Result<(&'a VortexGame, GameDefinition, IdentifiedInstall, bool), ImportError> {
+    let (game, definition) = resolve_game(ctx, state, request.game.as_str())
         .ok_or_else(|| ImportError::NoVortexGame(request.game.as_str().to_string()))?;
 
+    let mut would_add = false;
     let install = match request.install.as_deref() {
         Some(wanted) => {
             let found = inventory
@@ -1329,7 +1405,7 @@ fn match_for_request<'a>(
                     game: definition.name.clone(),
                 });
             }
-            found
+            found.clone()
         }
         None => {
             let path =
@@ -1339,12 +1415,23 @@ fn match_for_request<'a>(
                         game: definition.name.clone(),
                     })?;
             match folder_state(ctx, inventory, definition, path) {
-                FolderState::Installed(install) => install,
-                FolderState::NeedsAdd { .. } => {
-                    return Err(ImportError::VortexFolderNotAdded {
-                        game: definition.name.clone(),
-                        path: path.clone(),
-                    })
+                FolderState::Installed(install) => install.clone(),
+                FolderState::NeedsAdd { why } => {
+                    if !request.add_folder {
+                        return Err(ImportError::VortexFolderNotAdded { reason: why });
+                    }
+                    would_add = true;
+                    speculative_install(ctx, definition, path).ok_or_else(|| {
+                        ImportError::VortexFolderNotGame {
+                            game: definition.name.clone(),
+                            path: path.clone(),
+                            reason: format!(
+                                "{} looks like a {} install but its version could not be read",
+                                path.display(),
+                                definition.name
+                            ),
+                        }
+                    })?
                 }
                 FolderState::NotThisGame { why } => {
                     return Err(ImportError::VortexFolderNotGame {
@@ -1362,7 +1449,7 @@ fn match_for_request<'a>(
             reasons: reasons.join("; "),
         });
     }
-    Ok((game, definition.clone(), install))
+    Ok((game, definition.clone(), install, would_add))
 }
 
 fn plan_mods(
@@ -1975,7 +2062,8 @@ pub fn run(
     options: RunOptions,
     progress: &dyn Fn(ImportProgress),
 ) -> Result<VortexRunReport, ImportError> {
-    let plan = plan(ctx, inventory, request)?;
+    let inventory = add_folder_for_request(ctx, inventory, request)?;
+    let plan = plan(ctx, &inventory, request)?;
     let install = inventory
         .installs
         .iter()

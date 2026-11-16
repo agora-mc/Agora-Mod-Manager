@@ -236,8 +236,9 @@ snapshot first, and `template delete` asks unless given `--yes`.
   `agora backup import <FILE>` restores it as a snapshot without touching the live instance.
   `agora backup prune <ID> --keep <N>` deletes old snapshots, so it needs the person's yes.
 - **Vortex:** `agora games import vortex scan` lists the games and profiles in
-  `%APPDATA%\Vortex\state.v2` (or `--store <DIR>`), and says which games Agora supports.
-  `agora games import vortex --game <id> --profile <name> --dry-run` shows the plan; drop
+  `%APPDATA%\Vortex\state.v2` (or `--store <DIR>`), and says which games Agora supports. Use the
+  id the scan prints (its Vortex id, e.g. `skyrimse`, or the Agora game id) with
+  `agora games import vortex --game <id> --profile <name> --dry-run`; that shows the plan. Drop
   `--dry-run` to import. **Close Vortex first:** Agora refuses while Vortex holds the store's
   lock, and never opens the live store (it reads a copy). Mods are copied from the staging folder
   as they are on disk; downloads are not copied. The layer order comes from

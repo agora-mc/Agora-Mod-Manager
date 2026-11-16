@@ -483,6 +483,7 @@ fn a_fresh_data_dir_says_the_folder_needs_adding_then_adds_it() {
     empty.installs.clear();
     empty.unsupported.clear();
 
+    // Scan: mapped through import_ids, a real install Agora has not added.
     let scan = vortex::scan(&f.ctx, &empty, &f.store).expect("the store scans");
     let game = &scan.games[0];
     assert!(game.supported, "{game:?}");
@@ -495,23 +496,45 @@ fn a_fresh_data_dir_says_the_folder_needs_adding_then_adds_it() {
         .unwrap_or_default()
         .contains("has not added"));
 
-    let mut request = request(&f, None);
-    request.add_folder = true;
-    let inventory =
-        vortex::prepare_inventory(&f.ctx, &empty, &request).expect("the folder is added");
-    assert!(inventory
-        .installs
-        .iter()
-        .any(|install| install.game == GameId::new(GAME).unwrap()));
-    let plan = vortex::plan(&f.ctx, &inventory, &request).expect("the plan is made");
+    // Import without --add-folder says exactly what to do, and writes nothing.
+    let request = request(&f, None);
+    let error = vortex::plan(&f.ctx, &empty, &request).expect_err("the folder is not added");
+    let text = error.to_string();
+    assert!(text.contains("games folder add"), "{text}");
+    assert!(text.contains("--add-folder"), "{text}");
+    assert!(
+        agora_core::game_discovery::custom_folders::list_folders(&f.ctx.paths)
+            .unwrap()
+            .is_empty()
+    );
+
+    // A dry run with --add-folder plans the folder addition but writes nothing.
+    let mut with_add = request.clone();
+    with_add.add_folder = true;
+    let plan = vortex::plan(&f.ctx, &empty, &with_add).expect("the plan is made");
+    assert!(plan.would_add_folder);
     assert_eq!(plan.mods.len(), 3);
-    // A custom folder has no store, but the profile's INIs are still its own; the saves stay
-    // shared because Agora cannot tell which store's Documents folder it uses.
     assert!(plan.local_settings);
     assert_eq!(plan.inis.len(), 3);
     assert!(plan.local_saves);
     assert!(!plan.saves.local);
     assert!(plan.saves.note.contains("custom folder"));
+    assert!(
+        agora_core::game_discovery::custom_folders::list_folders(&f.ctx.paths)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(agora_core::game_instance::list(&f.ctx).unwrap().is_empty());
+
+    // A real run adds the folder first, then imports.
+    let report = vortex::run(&f.ctx, &empty, &with_add, Default::default(), &|_| {})
+        .expect("the import runs");
+    assert_eq!(report.stored_mods, 3);
+    assert!(report.instance_id.is_some());
+    let folders = agora_core::game_discovery::custom_folders::list_folders(&f.ctx.paths).unwrap();
+    assert!(folders
+        .iter()
+        .any(|folder| Path::new(folder) == f._tmp.path().join("game")));
 }
 
 #[test]
@@ -770,4 +793,182 @@ fn a_manifest_at_the_game_root_is_found_and_its_target_subfolder_is_honoured() {
     assert_eq!(plan.manifest.matched, 1);
     assert_eq!(plan.order, vec!["cpmod"]);
     assert!(plan.manifest.path.ends_with("vortex.deployment.json"));
+}
+
+/// The real official Skyrim package, loaded from `packages/official` through the same JSON and
+/// inheritance path the registry uses, then a whole scan → refuse → dry-run → run sequence.
+#[test]
+fn the_real_skyrim_package_maps_and_imports_a_not_yet_added_folder() {
+    use agora_core::game_discovery::custom_folders;
+    use agora_core::game_registry::inherit::{self, PackageInput};
+    use agora_core::game_registry::PackageSource;
+    use serde_json::Value;
+
+    struct UserDataGuard;
+    impl Drop for UserDataGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("AGORA_TEST_USER_DATA_ROOT");
+        }
+    }
+
+    struct RealPackage(PackageDefinition);
+    impl GamePackage for RealPackage {
+        fn definition(&self) -> &PackageDefinition {
+            &self.0
+        }
+    }
+
+    let _lock = USER_DATA.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let user_data = TempDir::new().unwrap();
+    std::env::set_var("AGORA_TEST_USER_DATA_ROOT", user_data.path());
+    let _guard = UserDataGuard;
+
+    let packages = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/official");
+    let read = |relative: &str| -> Value {
+        let path = packages.join(relative);
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("the package file is read"))
+            .expect("the package file is JSON")
+    };
+    let input = |plugin: &str, relative: &str| PackageInput {
+        source: PackageSource::Plugin {
+            plugin_id: plugin.to_string(),
+        },
+        blocked: false,
+        label: format!("Plugin {plugin}, game package {relative}"),
+        json: read(relative),
+    };
+    let (resolved, warnings) = inherit::resolve(vec![
+        input(
+            "agora.creation-engine",
+            "creation-engine/games/package.json",
+        ),
+        input("agora.skyrim-se", "skyrim-se/games/package.json"),
+    ]);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let mut builder = GameRegistry::builder();
+    for package in resolved {
+        if package.definition.games.is_empty() {
+            continue;
+        }
+        builder
+            .add(package.source, Arc::new(RealPackage(package.definition)))
+            .expect("the package registers");
+    }
+    let registry = Arc::new(builder.build());
+    let definition = registry
+        .game(&GameId::new("skyrim-se").unwrap())
+        .expect("the real Skyrim definition is registered");
+    assert_eq!(
+        definition.import_ids.get("vortex").map(String::as_str),
+        Some("skyrimse")
+    );
+
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let ctx = ctx.with_games(registry);
+
+    // An invented folder that passes the real package's executable detection.
+    let game_dir = tmp.path().join("Skyrim Special Edition");
+    std::fs::create_dir_all(&game_dir).unwrap();
+    std::fs::copy(
+        r"C:\Windows\System32\cmd.exe",
+        game_dir.join("SkyrimSE.exe"),
+    )
+    .unwrap();
+    write(&game_dir.join("Data/Skyrim.esm"), b"MASTER");
+
+    let store = tmp.path().join("Vortex").join("state.v2");
+    std::fs::create_dir_all(&store).unwrap();
+    let staging = tmp.path().join("Vortex").join("skyrimse").join("mods");
+    write(&staging.join("Alpha Mod/readme.txt"), b"MOD");
+    let profile = tmp
+        .path()
+        .join("Vortex")
+        .join("skyrimse")
+        .join("profiles")
+        .join("p1");
+    write(
+        &profile.join("Skyrim.ini"),
+        b"[General]\r\nsLocalTest=1\r\n",
+    );
+    write(
+        &profile.join("SkyrimPrefs.ini"),
+        b"[Display]\r\niSize H=1080\r\n",
+    );
+    write(
+        &profile.join("SkyrimCustom.ini"),
+        b"[Custom]\r\nsCustom=2\r\n",
+    );
+    let mods = r#"{"skyrimse":{"mod-alpha":{"id":"mod-alpha","state":"installed","installationPath":"Alpha Mod","attributes":{"name":"Alpha Mod","version":"1.0","modId":101}}}}"#;
+    let profiles = r#"{"p1":{"id":"p1","gameId":"skyrimse","name":"Test Profile","modState":{"mod-alpha":{"enabled":true}},"features":{"local_game_settings":true}}}"#;
+    write_store(
+        &store,
+        &[
+            ("persistent###mods", mods.to_string()),
+            ("persistent###profiles", profiles.to_string()),
+            (
+                "settings###mods###installPath###skyrimse",
+                "\"{USERDATA}/{GAME}/mods\"".to_string(),
+            ),
+            (
+                "settings###gameMode###discovered###skyrimse",
+                format!(
+                    r#"{{"path":"{}"}}"#,
+                    game_dir.to_string_lossy().replace('\\', "/")
+                ),
+            ),
+        ],
+    );
+    let empty = GameInventory {
+        installs: Vec::new(),
+        unsupported: Vec::new(),
+    };
+
+    // The scan maps the Vortex id through the real package and says the folder is not added.
+    let scan = vortex::scan(&ctx, &empty, &store).expect("the store scans");
+    let game = &scan.games[0];
+    assert!(game.supported, "{game:?}");
+    assert_eq!(game.game.as_ref(), Some(&GameId::new("skyrim-se").unwrap()));
+    assert!(game.needs_folder_add, "{game:?}");
+    assert!(game
+        .detection
+        .as_deref()
+        .unwrap_or_default()
+        .contains("has not added"));
+
+    let request = VortexRequest {
+        store: store.clone(),
+        // The owner's command passes the Vortex id the scan prints.
+        game: GameId::new("skyrimse").unwrap(),
+        profile: "Test Profile".into(),
+        name: None,
+        install: None,
+        add_folder: false,
+        copy_saves: false,
+    };
+    let error = vortex::plan(&ctx, &empty, &request).expect_err("the folder is not added");
+    assert!(error.to_string().contains("--add-folder"), "{error}");
+    assert!(error.to_string().contains("games folder add"), "{error}");
+    assert!(custom_folders::list_folders(&ctx.paths).unwrap().is_empty());
+
+    let mut with_add = request.clone();
+    with_add.add_folder = true;
+    let plan = vortex::plan(&ctx, &empty, &with_add).expect("the dry run plans");
+    assert!(plan.would_add_folder);
+    assert_eq!(plan.game.as_str(), "skyrim-se");
+    assert_eq!(plan.mods.len(), 1);
+    assert_eq!(plan.inis.len(), 3);
+    assert!(custom_folders::list_folders(&ctx.paths).unwrap().is_empty());
+    assert!(agora_core::game_instance::list(&ctx).unwrap().is_empty());
+
+    let report = vortex::run(&ctx, &empty, &with_add, Default::default(), &|_| {})
+        .expect("the real run imports");
+    assert!(report.instance_id.is_some());
+    assert_eq!(report.stored_mods, 1);
+    let folders = custom_folders::list_folders(&ctx.paths).unwrap();
+    assert!(
+        folders.iter().any(|folder| Path::new(folder) == game_dir),
+        "{folders:?}"
+    );
 }

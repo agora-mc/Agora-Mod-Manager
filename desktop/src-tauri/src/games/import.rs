@@ -765,8 +765,6 @@ pub async fn games_import_vortex(
             copy_saves: request.copy_saves,
         };
         let inventory = installed_games(&ctx);
-        let inventory =
-            vortex::prepare_inventory(&ctx, &inventory, &core_request).map_err(import_failed)?;
         if request.dry_run {
             let plan = vortex::plan(&ctx, &inventory, &core_request).map_err(import_failed)?;
             return Ok(VortexImportReply::Plan(Box::new(VortexPlanDto::from(
@@ -801,6 +799,8 @@ pub struct VortexPlanDto {
     pub instance_name: String,
     pub install_id: String,
     pub install_location: String,
+    /// The folder is a real install but Agora has not added it; a real import adds it first.
+    pub would_add_folder: bool,
     pub staging: String,
     pub mods: Vec<VortexModDto>,
     pub mods_enabled: usize,
@@ -875,6 +875,7 @@ impl From<&VortexPlan> for VortexPlanDto {
             instance_name: plan.instance_name.clone(),
             install_id: plan.install_id.clone(),
             install_location: plan.install_location.to_string_lossy().into_owned(),
+            would_add_folder: plan.would_add_folder,
             staging: plan.staging.to_string_lossy().into_owned(),
             mods: plan
                 .mods
