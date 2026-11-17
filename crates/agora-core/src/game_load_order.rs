@@ -106,6 +106,8 @@ pub enum LoadOrderError {
     RuleSelf(String),
     #[error("'{item}' cannot load after '{after}': '{after}' needs '{item}' as a master")]
     RuleContradictsMaster { item: String, after: String },
+    #[error("'{item}' cannot load after '{after}': '{item}' is always loaded first")]
+    RuleImplicit { item: String, after: String },
     #[error(
         "'{item}' cannot load after '{after}': that would make a loop with the rules already set"
     )]
@@ -348,8 +350,9 @@ pub struct SortMove {
     pub to: usize,
 }
 
-/// A plugin that loads above a master the sort may not move, so the sort could not fix that
-/// master finding. The plugin would have to move, and it is locked or always loaded.
+/// A plugin that loads above a master the sort could not put before it, so the sort could not fix
+/// that master finding. Either the master is locked or always loaded, or moving it would itself
+/// put it above one of its own masters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Blocked {
     pub plugin: String,
@@ -482,10 +485,11 @@ impl OverlapReport {
     }
 }
 
-/// The last report an overlaps reader gave for one list, with what it was computed from.
+/// The last report an overlaps reader gave for one instance's list, with what it was computed
+/// from. The instance is part of the key: two instances of one game never share a report.
 #[derive(Default)]
 struct OverlapsCache {
-    entries: Mutex<HashMap<(String, String), CachedOverlaps>>,
+    entries: Mutex<HashMap<(String, String, String), CachedOverlaps>>,
 }
 
 #[derive(Clone)]
@@ -498,6 +502,7 @@ struct CachedOverlaps {
 impl OverlapsCache {
     fn lookup(
         &self,
+        instance: &str,
         game: &str,
         list: &str,
         fingerprint: &str,
@@ -508,7 +513,7 @@ impl OverlapsCache {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         entries
-            .get(&(game.to_string(), list.to_string()))
+            .get(&(instance.to_string(), game.to_string(), list.to_string()))
             .filter(|cached| {
                 cached.fingerprint == fingerprint && cached.data_version == data_version
             })
@@ -517,6 +522,7 @@ impl OverlapsCache {
 
     fn store(
         &self,
+        instance: &str,
         game: &str,
         list: &str,
         fingerprint: String,
@@ -528,7 +534,7 @@ impl OverlapsCache {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         entries.insert(
-            (game.to_string(), list.to_string()),
+            (instance.to_string(), game.to_string(), list.to_string()),
             CachedOverlaps {
                 fingerprint,
                 data_version,
@@ -538,10 +544,12 @@ impl OverlapsCache {
     }
 }
 
-/// The last notes a sorter gave for one list, with what they were computed from.
+/// The last notes a sorter gave for one instance's list, with what they were computed from. The
+/// instance is part of the key, so two instances of one game never share notes that name an
+/// instance.
 #[derive(Default)]
 struct SorterNotesCache {
-    entries: Mutex<HashMap<(String, String), CachedSorterNotes>>,
+    entries: Mutex<HashMap<(String, String, String), CachedSorterNotes>>,
 }
 
 #[derive(Clone)]
@@ -554,6 +562,7 @@ struct CachedSorterNotes {
 impl SorterNotesCache {
     fn lookup(
         &self,
+        instance: &str,
         game: &str,
         list: &str,
         fingerprint: &str,
@@ -564,7 +573,7 @@ impl SorterNotesCache {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         entries
-            .get(&(game.to_string(), list.to_string()))
+            .get(&(instance.to_string(), game.to_string(), list.to_string()))
             .filter(|cached| {
                 cached.fingerprint == fingerprint && cached.data_version == data_version
             })
@@ -573,6 +582,7 @@ impl SorterNotesCache {
 
     fn store(
         &self,
+        instance: &str,
         game: &str,
         list: &str,
         fingerprint: String,
@@ -584,7 +594,7 @@ impl SorterNotesCache {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         entries.insert(
-            (game.to_string(), list.to_string()),
+            (instance.to_string(), game.to_string(), list.to_string()),
             CachedSorterNotes {
                 fingerprint,
                 data_version,
@@ -705,6 +715,7 @@ fn cache_sorter_notes(
 ) {
     let cache = ctx.extensions.get_or_insert_with(SorterNotesCache::default);
     cache.store(
+        instance_id,
         definition.id.as_str(),
         &rule.id,
         sorter_fingerprint(entries, installed),
@@ -982,6 +993,50 @@ fn reaches(edges: &HashMap<String, Vec<String>>, from: &str, to: &str) -> bool {
     false
 }
 
+/// Refuse one load-after rule that can never hold, whatever else is stored: it would put an
+/// always-loaded plugin after a normal one, contradict a master, or close a loop. `next` maps an
+/// item to the items that must come after it, from the masters and the rules being considered.
+fn check_load_after_rule(
+    entries: &[LoadOrderEntry],
+    next: &HashMap<String, Vec<String>>,
+    item: &str,
+    after: &str,
+) -> Result<(), LoadOrderError> {
+    let item_key = key(item);
+    let after_key = key(after);
+    let is_implicit = |name: &str| {
+        entries
+            .iter()
+            .any(|entry| key(&entry.name) == key(name) && entry.implicit)
+    };
+    // An always-loaded plugin is loaded first by the game, so no rule can put it after a normal
+    // plugin; the rule would never hold.
+    if is_implicit(item) && !is_implicit(after) {
+        return Err(LoadOrderError::RuleImplicit {
+            item: item.to_string(),
+            after: after.to_string(),
+        });
+    }
+    // The game's own rules come first: a rule that asks an item to load after one of its masters
+    // can never hold.
+    if let Some(entry) = entries.iter().find(|entry| key(&entry.name) == after_key) {
+        if entry.masters.iter().any(|master| key(master) == item_key) {
+            return Err(LoadOrderError::RuleContradictsMaster {
+                item: item.to_string(),
+                after: after.to_string(),
+            });
+        }
+    }
+    // Adding `item loads after after` closes a loop when item already reaches after.
+    if reaches(next, &item_key, &after_key) {
+        return Err(LoadOrderError::RuleCycle {
+            item: item.to_string(),
+            after: after.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Add a user's load-after rule (MASTER_SPEC §31.4). Returns whether it was new. A rule that
 /// contradicts a master requirement, or that would make a loop with the rules and masters already
 /// in place, is refused with the reason.
@@ -1026,21 +1081,6 @@ pub fn add_load_after_rule(
     let item = canonical(item);
     let after = canonical(after);
 
-    // The game's own rules come first: a rule that asks an item to load after one of its masters
-    // can never hold.
-    if let Some(entry) = order
-        .entries
-        .iter()
-        .find(|entry| key(&entry.name) == key(&after))
-    {
-        if entry.masters.iter().any(|master| key(master) == key(&item)) {
-            return Err(LoadOrderError::RuleContradictsMaster {
-                item: item.clone(),
-                after: after.clone(),
-            });
-        }
-    }
-
     // "next" maps an item to the items that must come after it, from the masters and the rules
     // already set. Adding `item loads after after` closes a loop when item already reaches after.
     let mut next: HashMap<String, Vec<String>> = HashMap::new();
@@ -1054,12 +1094,7 @@ pub fn add_load_after_rule(
             .or_default()
             .push(key(&existing.item));
     }
-    if reaches(&next, &key(&item), &key(&after)) {
-        return Err(LoadOrderError::RuleCycle {
-            item: item.clone(),
-            after: after.clone(),
-        });
-    }
+    check_load_after_rule(&order.entries, &next, &item, &after)?;
 
     let conn = crate::db::local_state_connection(&ctx.paths.local_state_db())
         .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
@@ -1096,18 +1131,68 @@ pub fn remove_load_after_rule(
     Ok(changed > 0)
 }
 
+/// The entries of an instance's list when core can find the game's definition. `None` (an
+/// unknown instance or game) leaves only the rules themselves to check; a caller that already
+/// holds the definition still gets the master checks through [`order_in`].
+fn order_entries_for(ctx: &Ctx, instance_id: &str, list_id: &str) -> Option<Vec<LoadOrderEntry>> {
+    let record = crate::game_instance::get(ctx, instance_id).ok().flatten()?;
+    let definition = ctx.games.game(&record.game)?;
+    order_in(ctx, instance_id, definition, Some(list_id))
+        .ok()
+        .map(|order| order.entries)
+}
+
 /// Replace every load-after rule of one list with `rules`, in one transaction.
 ///
 /// A loadout apply and a multi-profile import both restore a whole set of rules
 /// at once; removing and adding them one by one would leave a half-set behind
-/// if one call failed. A self rule or a blank name is skipped, because neither
-/// can ever be satisfied.
+/// if one call failed. A self or blank rule is skipped, and so is any rule the same
+/// checks as [`add_load_after_rule`] refuse: an always-loaded item after a normal
+/// one, a master contradiction, or a loop in the set, so no path writes a rule
+/// that can never hold.
 pub fn replace_load_after_rules(
     ctx: &Ctx,
     instance_id: &str,
     list_id: &str,
     rules: &[LoadAfterRule],
 ) -> Result<(), LoadOrderError> {
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut proposed: Vec<LoadAfterRule> = Vec::new();
+    for rule in rules {
+        let item = rule.item.trim();
+        let after = rule.after.trim();
+        if item.is_empty() || after.is_empty() || key(item) == key(after) {
+            continue;
+        }
+        if !seen.insert((key(item), key(after))) {
+            continue;
+        }
+        proposed.push(LoadAfterRule {
+            item: item.to_string(),
+            after: after.to_string(),
+        });
+    }
+
+    // Check the whole set at once against the game's masters and against itself, so a bulk
+    // restore runs the same validation as adding one rule at a time. Every proposed rule is an
+    // edge, even one later refused, so a loop through it is found too.
+    let entries = order_entries_for(ctx, instance_id, list_id).unwrap_or_default();
+    let mut next: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in &entries {
+        for master in &entry.masters {
+            next.entry(key(master)).or_default().push(key(&entry.name));
+        }
+    }
+    for rule in &proposed {
+        next.entry(key(&rule.after))
+            .or_default()
+            .push(key(&rule.item));
+    }
+    let accepted: Vec<&LoadAfterRule> = proposed
+        .iter()
+        .filter(|rule| check_load_after_rule(&entries, &next, &rule.item, &rule.after).is_ok())
+        .collect();
+
     let mut conn = crate::db::local_state_connection(&ctx.paths.local_state_db())
         .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
     let tx = conn
@@ -1118,20 +1203,11 @@ pub fn replace_load_after_rules(
         rusqlite::params![instance_id, list_id],
     )
     .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
-    let mut seen: HashSet<(String, String)> = HashSet::new();
-    for rule in rules {
-        let item = rule.item.trim();
-        let after = rule.after.trim();
-        if item.is_empty() || after.is_empty() || key(item) == key(after) {
-            continue;
-        }
-        if !seen.insert((key(item), key(after))) {
-            continue;
-        }
+    for rule in accepted {
         tx.execute(
             "INSERT INTO plugin_load_order_rules (instance_id, list_id, item, after_item)
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![instance_id, list_id, item, after],
+            rusqlite::params![instance_id, list_id, rule.item, rule.after],
         )
         .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
     }
@@ -1338,6 +1414,15 @@ pub fn classify_overlaps(
     for (position, entry) in entries.iter().enumerate().filter(|(_, e)| loads(e)) {
         positions.insert(key(&entry.name), (position, entry));
     }
+    // "after" must come before "item", so these edges order the two the way the player asked.
+    // A chain of rules decides the pair at its ends, not only a single rule.
+    let mut rule_edges: HashMap<String, Vec<String>> = HashMap::new();
+    for rule in rules {
+        rule_edges
+            .entry(key(&rule.after))
+            .or_default()
+            .push(key(&rule.item));
+    }
 
     let mut report = OverlapReport {
         notes: overlaps_notes(reply)?,
@@ -1424,9 +1509,7 @@ pub fn classify_overlaps(
                 report.patched += 1;
                 continue;
             }
-            if rules.iter().any(|rule| {
-                key(&rule.item) == key(winner_name) && key(&rule.after) == key(changer.1)
-            }) {
+            if reaches(&rule_edges, &key(changer.1), &key(winner_name)) {
                 report.decided += 1;
                 record_pair(&mut report.decided_pairs, winner_name, changer.1, &label);
                 continue;
@@ -1467,10 +1550,13 @@ fn record_pair(pairs: &mut Vec<ConflictPair>, winner: &str, loser: &str, label: 
 }
 
 /// Whether `winner` lists `changer` among its masters, directly or through its masters' masters.
+/// Only a master the game actually loads can carry a patch: an inactive or missing plugin in the
+/// chain patches nothing.
 fn winner_masters(entries: &[LoadOrderEntry], winner: &LoadOrderEntry, changer: &str) -> bool {
     let wanted = key(changer);
     let by_name: HashMap<String, &LoadOrderEntry> = entries
         .iter()
+        .filter(|entry| loads(entry))
         .map(|entry| (key(&entry.name), entry))
         .collect();
     let mut seen: HashSet<String> = HashSet::new();
@@ -1514,6 +1600,7 @@ fn overlaps_fingerprint(
 
 fn cache_overlaps(
     ctx: &Ctx,
+    instance: &str,
     game: &str,
     list: &str,
     fingerprint: String,
@@ -1521,7 +1608,14 @@ fn cache_overlaps(
     report: &OverlapReport,
 ) {
     let cache = ctx.extensions.get_or_insert_with(OverlapsCache::default);
-    cache.store(game, list, fingerprint, data_version, report.clone());
+    cache.store(
+        instance,
+        game,
+        list,
+        fingerprint,
+        data_version,
+        report.clone(),
+    );
 }
 
 /// Ask the overlaps reader now, cache the report for the list as it stands, and return it.
@@ -1561,6 +1655,7 @@ pub fn refresh_overlaps(
     mark_new_pairs(ctx, instance_id, &rule.id, &mut report, &entries);
     cache_overlaps(
         ctx,
+        instance_id,
         definition.id.as_str(),
         &rule.id,
         overlaps_fingerprint(&entries, &installed, &rules),
@@ -1602,9 +1697,11 @@ fn mark_new_pairs(
     }
 }
 
-/// Whether a conflict pair is new since the load order the last session recorded: one of its
-/// plugins was added, turned on, or moved. A session with no recorded entries for the list is not
-/// a baseline, so no pair is reported as new against it.
+/// Whether a conflict pair is new since the load order the last session recorded. What matters is
+/// the pair's own relative order among the active plugins: adding, removing or moving an unrelated
+/// or inactive plugin shifts raw positions but does not make this conflict new. A plugin that is
+/// active now and was not before (added or turned on) always makes the pair new. A session with no
+/// recorded entries for the list is not a baseline, so no pair is reported as new against it.
 fn pair_is_new_since(
     pair: &ConflictPair,
     current: &[LoadOrderEntry],
@@ -1613,26 +1710,33 @@ fn pair_is_new_since(
     if previous.is_empty() {
         return false;
     }
-    let previous_by_name: HashMap<String, (usize, bool)> = previous
+    let previous_active: Vec<String> = previous
         .iter()
-        .enumerate()
-        .map(|(position, entry)| (key(&entry.name), (position, entry.active)))
+        .filter(|entry| entry.active)
+        .map(|entry| key(&entry.name))
         .collect();
-    let current_by_name: HashMap<String, (usize, bool)> = current
+    let current_active: Vec<String> = current
         .iter()
-        .filter(|entry| !entry.implicit)
-        .enumerate()
-        .map(|(position, entry)| (key(&entry.name), (position, entry.active)))
+        .filter(|entry| entry.active && !entry.implicit)
+        .map(|entry| key(&entry.name))
         .collect();
-    [&pair.winner, &pair.loser].into_iter().any(|name| {
-        let Some((position, active)) = current_by_name.get(&key(name)) else {
-            return false;
-        };
-        match previous_by_name.get(&key(name)) {
-            None => true,
-            Some((before, was_active)) => (!*was_active && *active) || before != position,
-        }
-    })
+    let position = |names: &[String], name: &str| names.iter().position(|entry| entry == name);
+    let winner = key(&pair.winner);
+    let loser = key(&pair.loser);
+    // A pair member the last launch did not load was added or turned on.
+    let (Some(was_winner), Some(was_loser)) = (
+        position(&previous_active, &winner),
+        position(&previous_active, &loser),
+    ) else {
+        return true;
+    };
+    let (Some(is_winner), Some(is_loser)) = (
+        position(&current_active, &winner),
+        position(&current_active, &loser),
+    ) else {
+        return false;
+    };
+    (was_winner < was_loser) != (is_winner < is_loser)
 }
 
 /// The overlaps findings the instance check reports (MASTER_SPEC §31.5): the count of conflicts,
@@ -2550,6 +2654,35 @@ fn place_free(
     free_slots[place]
 }
 
+/// Whether moving the entry at `from` to absolute position `target` would put it above one of its
+/// own masters, directly or through their masters. A sort must never break a master requirement
+/// it is trying to keep; the dependent it was moving for is reported as blocked instead.
+fn crosses_own_master(entries: &[LoadOrderEntry], from: usize, target: usize) -> bool {
+    if target >= from {
+        return false;
+    }
+    let mut loaded: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if loads(entry) {
+            loaded.entry(key(&entry.name)).or_default().push(index);
+        }
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut pending: Vec<String> = entries[from].masters.iter().map(|m| key(m)).collect();
+    while let Some(name) = pending.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        for &index in loaded.get(&name).map(Vec::as_slice).unwrap_or_default() {
+            if index >= target && index < from {
+                return true;
+            }
+            pending.extend(entries[index].masters.iter().map(|m| key(m)));
+        }
+    }
+    false
+}
+
 /// The first place where a plugin needs a master that may move, as (master position, slot index
 /// the master takes). A plugin that does not move takes the master just above it; a fixed plugin
 /// (locked, or always loaded) takes the slot just above its own position, and if there is none,
@@ -2584,6 +2717,11 @@ fn first_move(
                 .find(|(_, m)| loads(m) && key(&m.name) == k && !fixed.fixed(m))
                 .map(|(index, _)| index);
             if let Some(from) = later {
+                if crosses_own_master(entries, from, free_slots[place]) {
+                    // Moving that master here would break one of its own masters, so this
+                    // dependent stays blocked instead of trading one broken order for another.
+                    continue;
+                }
                 return Some((from, place));
             }
         }
@@ -3037,6 +3175,7 @@ fn order_of_with_view(
         let data_version = sorter_data_version(ctx, instance_id, definition, rule);
         let cache = ctx.extensions.get_or_insert_with(SorterNotesCache::default);
         match cache.lookup(
+            instance_id,
             definition.id.as_str(),
             &rule.id,
             &fingerprint,
@@ -3055,6 +3194,7 @@ fn order_of_with_view(
                 let data_version = sorter_data_version(ctx, instance_id, definition, rule);
                 let cache = ctx.extensions.get_or_insert_with(OverlapsCache::default);
                 match cache.lookup(
+                    instance_id,
                     definition.id.as_str(),
                     &rule.id,
                     &fingerprint,
@@ -3599,6 +3739,13 @@ mod tests {
         entries.iter().map(|e| e.name.clone()).collect()
     }
 
+    fn position_of(entries: &[LoadOrderEntry], name: &str) -> usize {
+        entries
+            .iter()
+            .position(|entry| key(&entry.name) == key(name))
+            .expect("the list holds the name")
+    }
+
     fn plugin_line_of(name: &str, active: bool) -> PluginEntry {
         PluginEntry {
             name: name.to_string(),
@@ -3803,6 +3950,60 @@ mod tests {
         let (second, _) = sort_entries(&mut list).unwrap();
         assert!(second.is_empty());
         assert_eq!(list, settled);
+    }
+
+    #[test]
+    fn a_sort_does_not_pull_a_master_above_the_chain_of_its_own_masters() {
+        // A needs B, B needs C, and C needs the locked M.esm. A is above B, so the sort would like
+        // to move B up; that would put B above C (which B needs) and C above M.esm (which C needs).
+        let mut list = vec![
+            entry("A.esp", &["B.esp"]),
+            locked("M.esm", &[]),
+            entry("C.esp", &["M.esm"]),
+            entry("B.esp", &["C.esp"]),
+        ];
+        let (moves, blocked) = sort_entries(&mut list).unwrap();
+        assert!(
+            moves.is_empty(),
+            "the sort moved a plugin above its own master: {moves:?}"
+        );
+        assert!(
+            position_of(&list, "M.esm") < position_of(&list, "C.esp"),
+            "C.esp was pulled above its locked master M.esm: {list:?}"
+        );
+        assert!(
+            position_of(&list, "C.esp") < position_of(&list, "B.esp"),
+            "B.esp was pulled above its master C.esp: {list:?}"
+        );
+        assert_eq!(
+            blocked,
+            [Blocked {
+                plugin: "A.esp".into(),
+                master: "B.esp".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_sort_does_not_pull_a_master_above_a_master_it_only_reaches_indirectly() {
+        // B's direct master D is above the slot B would take, so the direct lookup sees nothing
+        // wrong; but D needs M.esm, which is below that slot. Moving B up would cross M.esm.
+        let mut list = vec![
+            entry("X.esp", &[]),
+            entry("D.esp", &["M.esm"]),
+            entry("A.esp", &["B.esp"]),
+            locked("M.esm", &[]),
+            entry("B.esp", &["D.esp"]),
+        ];
+        let (moves, _) = sort_entries(&mut list).unwrap();
+        assert!(
+            moves.is_empty(),
+            "the sort moved a plugin above an indirect master: {moves:?}"
+        );
+        assert!(
+            position_of(&list, "M.esm") < position_of(&list, "B.esp"),
+            "B.esp was pulled above an indirect master M.esm: {list:?}"
+        );
     }
 
     #[test]
@@ -4224,6 +4425,61 @@ mod tests {
     }
 
     #[test]
+    fn a_winner_does_not_patch_through_an_inactive_master() {
+        // Middle.esp is listed but switched off, so the game does not load it and it cannot carry
+        // Patch.esp's patch of A.esp. The pair is a real conflict, not a patch.
+        let mut middle = entry("Middle.esp", &["Base.esm", "A.esp"]);
+        middle.active = false;
+        let list = [
+            entry("Base.esm", &[]),
+            entry("A.esp", &[]),
+            middle,
+            entry("Patch.esp", &["Middle.esp"]),
+        ];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[
+                ("Base.esm", "original"),
+                ("A.esp", "old"),
+                ("Patch.esp", "new"),
+            ],
+        )]);
+        let report = classify_overlaps(&list, &reply, &[]).unwrap();
+        assert_eq!(
+            report.patched, 0,
+            "an inactive master patched the pair: {report:?}"
+        );
+        assert_eq!(report.pairs.len(), 1);
+        assert_eq!(report.pairs[0].winner, "Patch.esp");
+        assert_eq!(report.pairs[0].loser, "A.esp");
+    }
+
+    #[test]
+    fn a_winner_does_not_patch_through_a_master_that_is_not_listed() {
+        let list = [
+            entry("Base.esm", &[]),
+            entry("A.esp", &[]),
+            entry("Patch.esp", &["Gone.esp"]),
+        ];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[
+                ("Base.esm", "original"),
+                ("A.esp", "old"),
+                ("Patch.esp", "new"),
+            ],
+        )]);
+        let report = classify_overlaps(&list, &reply, &[]).unwrap();
+        assert_eq!(
+            report.patched, 0,
+            "a missing master patched the pair: {report:?}"
+        );
+        assert_eq!(report.pairs.len(), 1);
+    }
+
+    #[test]
     fn a_winner_that_masters_a_changer_through_an_intermediate_master_is_patched() {
         let list = [
             entry("Base.esm", &[]),
@@ -4348,6 +4604,46 @@ mod tests {
     }
 
     #[test]
+    fn a_transitive_load_after_chain_decides_the_pair_it_orders() {
+        // The player ordered B after A and C after B. B has no record of its own, so only the
+        // chain of rules orders C after A.
+        let list = [
+            entry("Base.esm", &[]),
+            entry("A.esp", &[]),
+            entry("B.esp", &[]),
+            entry("C.esp", &[]),
+        ];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[("Base.esm", "original"), ("A.esp", "old"), ("C.esp", "new")],
+        )]);
+        let rules = [after("B.esp", "A.esp"), after("C.esp", "B.esp")];
+        let report = classify_overlaps(&list, &reply, &rules).unwrap();
+        assert_eq!(report.decided, 1, "{report:?}");
+        assert!(report.pairs.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn a_load_after_chain_that_does_not_reach_the_changer_does_not_decide() {
+        // C loads after B, but nothing puts B after A, so C is not ordered after A.
+        let list = [
+            entry("Base.esm", &[]),
+            entry("A.esp", &[]),
+            entry("B.esp", &[]),
+            entry("C.esp", &[]),
+        ];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[("Base.esm", "original"), ("A.esp", "old"), ("C.esp", "new")],
+        )]);
+        let report = classify_overlaps(&list, &reply, &[after("C.esp", "B.esp")]).unwrap();
+        assert_eq!(report.decided, 0, "{report:?}");
+        assert_eq!(report.pairs.len(), 1, "{report:?}");
+    }
+
+    #[test]
     fn a_rule_deciding_one_pair_of_three_leaves_the_other_two_alone() {
         let list = [
             entry("Base.esm", &[]),
@@ -4446,7 +4742,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pair_is_new_when_its_loser_was_added_turned_on_or_moved() {
+    fn a_pair_is_new_when_one_of_its_plugins_was_added_turned_on_or_reordered() {
         let pair = ConflictPair {
             winner: "C.esp".into(),
             loser: "B.esp".into(),
@@ -4479,13 +4775,43 @@ mod tests {
         let without_b = [session_entry("A.esp", true), session_entry("C.esp", true)];
         assert!(pair_is_new_since(&pair, &current, &without_b));
 
-        // Both were listed, but B sat above A last time.
-        let moved = [
+        // C sat above B last time, so the pair itself is the other way round now.
+        let reordered = [
+            session_entry("A.esp", true),
+            session_entry("C.esp", true),
+            session_entry("B.esp", true),
+        ];
+        assert!(pair_is_new_since(&pair, &current, &reordered));
+
+        // A moved from below C to above B, but B still loads before C: this pair is old.
+        let unrelated_moved = [
             session_entry("B.esp", true),
             session_entry("A.esp", true),
             session_entry("C.esp", true),
         ];
-        assert!(pair_is_new_since(&pair, &current, &moved));
+        assert!(!pair_is_new_since(&pair, &current, &unrelated_moved));
+
+        // A new active plugin was added between B and C, which changes raw positions but not
+        // this pair's order.
+        let with_a_between = [
+            entry("B.esp", &[]),
+            entry("A.esp", &[]),
+            entry("C.esp", &[]),
+        ];
+        let both_before = [session_entry("B.esp", true), session_entry("C.esp", true)];
+        assert!(!pair_is_new_since(&pair, &with_a_between, &both_before));
+
+        // An inactive plugin moving does not count either.
+        let inactive_moved = [
+            entry("B.esp", &[]),
+            {
+                let mut skipped = entry("Off.esp", &[]);
+                skipped.active = false;
+                skipped
+            },
+            entry("C.esp", &[]),
+        ];
+        assert!(!pair_is_new_since(&pair, &inactive_moved, &both_before));
     }
 
     #[test]

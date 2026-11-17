@@ -3820,9 +3820,11 @@ export async function overlaps(args) {
     if (indexed.entry) files[name] = indexed.entry;
     else failed.add(name);
   }
-
+  const checkEveryName = others.length === 0;
+  // With no non-master active, the "needed" shortcut has nothing to derive the key set from;
+  // skip it and read every active plugin below instead.
   let needed = [];
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < 3 && !checkEveryName; attempt += 1) {
     const checked = others.filter((name) => !failed.has(name));
     const cached = [];
     const stored = [];
@@ -3857,6 +3859,25 @@ export async function overlaps(args) {
     if (!progressed || attempt === 2) break;
   }
 
+  // With nothing but masters and light plugins active, there is no non-master
+  // whose records say which master records matter, and the reference shortcut
+  // can miss an override of a master that is installed but switched off. Read
+  // every active plugin whole and compare them all.
+  if (checkEveryName) {
+    for (const name of names) {
+      const entry = files[name];
+      if (entry && entry.whole && Array.isArray(entry.chunks) && entry.chunks.length) continue;
+      const indexed = await indexRecordFile(name, entry, null);
+      addNotes(indexed.notes);
+      if (indexed.entry) {
+        indexed.entry.whole = true;
+        files[name] = indexed.entry;
+      } else {
+        failed.add(name);
+      }
+    }
+  }
+
   const fingerprint = needed.length ? keysFingerprint(needed) : null;
   if (needed.length && saved && saved.neededHash !== fingerprint) {
     // The key set changed, so every master's restricted index is out of date.
@@ -3880,7 +3901,9 @@ export async function overlaps(args) {
   await storage.set(OVERLAPS_INDEX_KEY, { files: files, neededHash: fingerprint });
 
   const checkedNames = names.filter(
-    (name) => !failed.has(name) && (needed.length > 0 || !masterSet.has(name)),
+    (name) =>
+      !failed.has(name) &&
+      (checkEveryName || needed.length > 0 || !masterSet.has(name)),
   );
   if (checkedNames.length < 2) return { keys: [], notes: notes };
 

@@ -854,6 +854,68 @@ fn a_second_call_reuses_the_saved_index_and_a_changed_file_is_reindexed() {
 }
 
 #[test]
+fn masters_and_light_plugins_are_compared_when_no_esp_is_active() {
+    // Every active plugin is a master or a light plugin, so there is no .esp to tell the reader
+    // which master records matter. The two overhauls still change the same record of a master
+    // that is installed but switched off, so the "records another plugin uses" shortcut finds
+    // nothing while the records themselves do overlap.
+    let (_dir, host, id, bridge) = engine();
+    let data = data_folder(&[
+        (
+            "Retired.esm",
+            plugin(
+                &[],
+                0,
+                &group(b"GMST", 0, &gmst(0x000abc, 1, "JumpSetting")),
+            ),
+        ),
+        (
+            "First.esm",
+            plugin(
+                &["Retired.esm"],
+                0,
+                &group(b"GMST", 0, &gmst(0x000abc, 2, "JumpSetting")),
+            ),
+        ),
+        (
+            "Second.esl",
+            plugin(
+                &["Retired.esm"],
+                LIGHT,
+                &group(b"GMST", 0, &gmst(0x000abc, 3, "JumpSetting")),
+            ),
+        ),
+        (
+            "Third.esm",
+            plugin(
+                &["Retired.esm"],
+                0,
+                &group(b"GMST", 0, &gmst(0x000abc, 4, "JumpSetting")),
+            ),
+        ),
+    ]);
+    let reply = invoke(
+        &host,
+        &id,
+        &["First.esm", "Second.esl", "Third.esm"],
+        data.path(),
+        &bridge,
+    );
+    assert!(reply["notes"].as_array().unwrap().is_empty(), "{reply}");
+    let found = items(&reply, "retired.esm:000abc");
+    assert_eq!(
+        found
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["First.esm", "Second.esl", "Third.esm"]
+    );
+    assert_ne!(found[0].1, found[1].1);
+    assert_ne!(found[1].1, found[2].1);
+    host.deactivate(&id).ok();
+}
+
+#[test]
 fn fewer_than_two_plugins_have_nothing_to_compare() {
     let (_dir, host, id, bridge) = engine();
     let data = data_folder(&[(

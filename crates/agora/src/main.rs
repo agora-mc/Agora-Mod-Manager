@@ -12565,7 +12565,7 @@ fn plugins_load_order_command(
                         }
                         for b in &report.blocked {
                             println!(
-                                "Cannot fix: '{}' loads above its master '{}', and one of them is locked or always loaded.",
+                                "Cannot fix: '{}' loads above its master '{}', and the sort cannot move either one without breaking another master.",
                                 b.plugin, b.master
                             );
                         }
