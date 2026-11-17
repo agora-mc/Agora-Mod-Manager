@@ -1339,6 +1339,15 @@ pub fn classify_overlaps(
     for (position, entry) in entries.iter().enumerate().filter(|(_, e)| loads(e)) {
         positions.insert(key(&entry.name), (position, entry));
     }
+    // "after" must come before "item", so these edges order the two the way the player asked.
+    // A chain of rules decides the pair at its ends, not only a single rule.
+    let mut rule_edges: HashMap<String, Vec<String>> = HashMap::new();
+    for rule in rules {
+        rule_edges
+            .entry(key(&rule.after))
+            .or_default()
+            .push(key(&rule.item));
+    }
 
     let mut report = OverlapReport {
         notes: overlaps_notes(reply)?,
@@ -1425,9 +1434,7 @@ pub fn classify_overlaps(
                 report.patched += 1;
                 continue;
             }
-            if rules.iter().any(|rule| {
-                key(&rule.item) == key(winner_name) && key(&rule.after) == key(changer.1)
-            }) {
+            if reaches(&rule_edges, &key(changer.1), &key(winner_name)) {
                 report.decided += 1;
                 record_pair(&mut report.decided_pairs, winner_name, changer.1, &label);
                 continue;
@@ -4487,6 +4494,54 @@ mod tests {
                 new_since_last_launch: false,
             }]
         );
+    }
+
+    #[test]
+    fn a_transitive_load_after_chain_decides_the_pair_it_orders() {
+        // The player ordered B after A and C after B. B has no record of its own, so only the
+        // chain of rules orders C after A.
+        let list = [
+            entry("Base.esm", &[]),
+            entry("A.esp", &[]),
+            entry("B.esp", &[]),
+            entry("C.esp", &[]),
+        ];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[
+                ("Base.esm", "original"),
+                ("A.esp", "old"),
+                ("C.esp", "new"),
+            ],
+        )]);
+        let rules = [after("B.esp", "A.esp"), after("C.esp", "B.esp")];
+        let report = classify_overlaps(&list, &reply, &rules).unwrap();
+        assert_eq!(report.decided, 1, "{report:?}");
+        assert!(report.pairs.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn a_load_after_chain_that_does_not_reach_the_changer_does_not_decide() {
+        // C loads after B, but nothing puts B after A, so C is not ordered after A.
+        let list = [
+            entry("Base.esm", &[]),
+            entry("A.esp", &[]),
+            entry("B.esp", &[]),
+            entry("C.esp", &[]),
+        ];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[
+                ("Base.esm", "original"),
+                ("A.esp", "old"),
+                ("C.esp", "new"),
+            ],
+        )]);
+        let report = classify_overlaps(&list, &reply, &[after("C.esp", "B.esp")]).unwrap();
+        assert_eq!(report.decided, 0, "{report:?}");
+        assert_eq!(report.pairs.len(), 1, "{report:?}");
     }
 
     #[test]
