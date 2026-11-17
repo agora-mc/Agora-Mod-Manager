@@ -813,6 +813,51 @@ fn target_is_unchanged_outside_the_namespace() {
     assert_eq!(read(&fixture.writable().join("inside.txt")), b"inside");
 }
 
+/// The namespace's uid 0 is the player's own host uid, not host root. It is deliberately kept
+/// (rather than mapping the player's uid directly) because overlay copy-up keeps a lower file's
+/// read-only mode: content-store objects are 0444, and an unprivileged in-namespace uid cannot
+/// write the copy-up, so a game could not change a mod's own config. This pins both facts, so a
+/// change of mapping must also solve copy-up.
+#[test]
+fn the_view_maps_its_root_to_the_player_so_read_only_content_stays_writable() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let out = fixture._tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let target = fixture._tmp.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let target_display = target.display().to_string();
+
+    let mut request = ViewRequest {
+        instance_id: fixture.instance_id.clone(),
+        target,
+        command: fixture.command(concat!(
+            "id -u > \"$OUT/uid\"\n",
+            "printf changed > \"$TARGET/mod_file.txt\"\n",
+        )),
+        per_user_files: vec![],
+    };
+    request.command.environment = Some(vec![
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("OUT".into(), out.display().to_string()),
+        ("TARGET".into(), target_display),
+    ]);
+
+    let run = ran(run_view(&fixture, &request)).expect("the fixture host must run the view");
+    assert!(run.status.success(), "the command failed: {:?}", run.status);
+    assert_eq!(
+        String::from_utf8(read(&out.join("uid"))).unwrap().trim(),
+        "0",
+        "the game's uid inside the namespace changed; solve read-only copy-up first"
+    );
+    assert_eq!(read(&fixture.writable().join("mod_file.txt")), b"changed");
+    assert_eq!(
+        read(fixture.content_object("mod_file.txt")),
+        b"mod only",
+        "the read-only content object was written through its copy-up"
+    );
+}
+
 #[test]
 fn per_user_file_is_the_instance_copy_and_the_real_file_stays() {
     let _serial = serial();

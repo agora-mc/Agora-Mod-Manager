@@ -672,7 +672,13 @@ mod linux_impl {
                 ],
             );
         }
-        // Now that uid 0 exists inside the namespace, mount changes are permitted.
+        // uid 0 here is the player's own host uid mapped into the namespace, so the game gets
+        // no privilege over real files. It is kept as 0 (rather than mapping the player's uid
+        // directly) because overlay copy-up keeps a lower layer's read-only mode: content
+        // objects are 0444, and an unprivileged uid cannot write the copy-up, so a game could
+        // not change a mod's config. uid 0 keeps CAP_DAC_OVERRIDE inside the namespace only.
+        // Steam's pressure-vessel runtime has not been run against this; try a real launch before
+        // changing the mapping.
         if unsafe { c::unshare(c::CLONE_NEWNS) } != 0 {
             step_down(
                 pipe,
