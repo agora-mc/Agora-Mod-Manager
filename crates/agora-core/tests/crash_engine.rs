@@ -7,9 +7,10 @@ use agora_core::crash_engine::{
     InspectionRequest, Inspector, PackInput, ParsedArtifact, PluginIdentity,
 };
 use agora_game_api::crash::{
-    certainty_claim, AttrValue, Cause, Coverage, CoverageState, CrashPack, Fact, Level, MatchedBy,
-    NextStepKind, Owner, ParserLimits, ParserOutput, Producer, Ref, Role, Rule, Scalar, Scope,
-    SessionVerdict, Strength, CRASH_CONTRACT_VERSION,
+    certainty_claim, AttrValue, Cause, Coverage, CoverageState, CrashAnswer, CrashPack, Fact,
+    Family, Finding, Level, LocalText, MatchedBy, NextStepKind, Owner, ParserLimits, ParserOutput,
+    Producer, Ref, Role, Rule, Scalar, Scope, SessionVerdict, Signal, Strength,
+    CRASH_CONTRACT_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -895,6 +896,110 @@ fn tie_for_first_abstains_and_shows_both_with_their_sources() {
     for candidate in &consensus.candidates {
         assert!(!candidate.sources.is_empty());
     }
+}
+
+/// Two tied mod candidates plus one finding that names nobody, so the headline rule can be
+/// exercised without a parser or a pack.
+fn tie_with_side_finding(weight: u32, finding_level: Level) -> (ConsensusOutput, CrashAnswer) {
+    let plugin = PluginIdentity {
+        id: "test.plugin".to_string(),
+        name: "Test Plugin".to_string(),
+        version: "1.0.0".to_string(),
+    };
+    let owner = |key: &str, name: &str| Owner::Item {
+        key: key.to_string(),
+        name: name.to_string(),
+    };
+    let signals = vec![
+        Signal {
+            family: Family::Execution,
+            candidate: owner("mod-a", "Mod A"),
+            weight,
+            cause: Some(Cause::Mod),
+            also_provided_by: Vec::new(),
+            source: plugin.parser_source("p"),
+            evidence: Vec::new(),
+        },
+        Signal {
+            family: Family::Execution,
+            candidate: owner("mod-b", "Mod B"),
+            weight,
+            cause: Some(Cause::Mod),
+            also_provided_by: Vec::new(),
+            source: plugin.parser_source("p"),
+            evidence: Vec::new(),
+        },
+    ];
+    let roles = std::collections::BTreeMap::new();
+    let consensus = consensus(
+        &ConsensusInput {
+            signals: &signals,
+            roles: &roles,
+            level_caps: &[],
+        },
+        &ConsensusProfile::default(),
+    );
+    let mut headline = LocalText::new();
+    headline.insert("en".to_string(), "System memory was 90% full.".to_string());
+    let evaluated = EvaluateOutput {
+        signals,
+        findings: vec![Finding {
+            scope: Scope::Environment,
+            level: finding_level,
+            cause: Cause::Memory,
+            candidate: None,
+            headline,
+            why_not_sure: None,
+            source: plugin.parser_source("p"),
+            evidence: Vec::new(),
+        }],
+        ..EvaluateOutput::default()
+    };
+    let answer = answer(&AnswerInput {
+        verdict: SessionVerdict::Crashed {
+            how: MatchedBy::Supplied,
+        },
+        evaluated: &evaluated,
+        consensus: &consensus,
+    });
+    (consensus, answer)
+}
+
+#[test]
+fn a_strong_tie_between_mods_is_not_overwritten_by_a_possible_side_finding() {
+    let (consensus, answer) = tie_with_side_finding(20, Level::Possible);
+    assert!(consensus.abstained);
+    assert!(consensus.strong_tie);
+    let headline = english(&answer.headline);
+    assert!(headline.contains("Mod A") && headline.contains("Mod B"));
+    assert_eq!(answer.level, Level::NotSure);
+    // The cause stays the suspects' own kind, not the side finding's.
+    assert_eq!(answer.cause, Some(Cause::Mod));
+    // The side finding is still reported, just not as the answer.
+    assert!(answer
+        .findings
+        .iter()
+        .any(|finding| finding.cause == Cause::Memory));
+}
+
+#[test]
+fn a_weak_abstention_lets_a_possible_finding_lead() {
+    // 5 is above the abstention floor (4) but below the Likely bar (8): the suspects are weak.
+    let (consensus, answer) = tie_with_side_finding(5, Level::Possible);
+    assert!(consensus.abstained);
+    assert!(!consensus.strong_tie, "weak evidence is not a strong tie");
+    assert_eq!(english(&answer.headline), "System memory was 90% full.");
+    assert_eq!(answer.level, Level::Possible);
+    assert_eq!(answer.cause, Some(Cause::Memory));
+}
+
+#[test]
+fn a_likely_finding_leads_even_over_a_strong_tie() {
+    let (consensus, answer) = tie_with_side_finding(20, Level::Likely);
+    assert!(consensus.strong_tie);
+    assert_eq!(english(&answer.headline), "System memory was 90% full.");
+    assert_eq!(answer.level, Level::Likely);
+    assert_eq!(answer.cause, Some(Cause::Memory));
 }
 
 #[test]

@@ -23,6 +23,10 @@ pub struct ConsensusOutput {
     pub candidates: Vec<Candidate>,
     pub level: Level,
     pub abstained: bool,
+    /// The abstention is a tie between candidates whose own (non-boost) evidence is strong enough
+    /// to have been at least `Likely` if one had led. Such a tie is the answer: a merely possible
+    /// finding of another kind may not overwrite it. A weak abstention makes no such claim.
+    pub strong_tie: bool,
 }
 
 struct Bucket {
@@ -198,6 +202,7 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
             candidates,
             level: Level::NotSure,
             abstained: true,
+            strong_tie: false,
         };
     }
 
@@ -241,6 +246,12 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
         level = level.min(*cap);
     }
     let abstained = level == Level::NotSure;
+    // A tie is strong when the top candidate's own evidence would have been at least `Likely` had
+    // it led. The margin is why the answer abstains, not doubt about the evidence itself.
+    let strong_tie = abstained
+        && second.is_some()
+        && top.core >= profile.medium.core_min
+        && lead < i64::from(profile.medium.lead_min);
 
     if abstained {
         for candidate in &mut candidates {
@@ -256,6 +267,7 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
         candidates,
         level,
         abstained,
+        strong_tie,
     }
 }
 

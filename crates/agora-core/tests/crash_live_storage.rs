@@ -144,13 +144,64 @@ fn the_newest_session_without_an_answer_does_not_make_an_older_one_look_new() {
             .and_then(|session| session.verdict),
         Some(SessionVerdict::FailedToStart)
     );
-    // The old accessor still reads by when the answer was stored; that is the trap this helper
-    // exists to avoid.
+    // The accessor follows the session's own time too: the only answer is the one there is.
     assert_eq!(
         latest_answer(&conn, "inst")
             .unwrap()
             .map(|answer| answer.session_id),
         Some("answered".to_string())
+    );
+}
+
+#[test]
+fn latest_answer_follows_when_the_session_started_not_when_it_ended_or_was_answered() {
+    let conn = db();
+    // The older session started first but ran long, and was only diagnosed the next morning.
+    insert_session(&conn, "long-old", "inst", "2026-01-01T01:00:00Z");
+    conn.execute(
+        "UPDATE launch_history SET ended_at = '2026-01-01T03:00:00Z' WHERE session_id = 'long-old'",
+        [],
+    )
+    .unwrap();
+    // The newer session started later, ended sooner, and was diagnosed at once.
+    insert_session(&conn, "short-new", "inst", "2026-01-01T02:00:00Z");
+    conn.execute(
+        "UPDATE launch_history SET ended_at = '2026-01-01T02:10:00Z' WHERE session_id = 'short-new'",
+        [],
+    )
+    .unwrap();
+    store_answer(
+        &conn,
+        &answer(
+            "short-new",
+            "inst",
+            "2026-01-01T02:11:00Z",
+            "the newer session",
+        ),
+    )
+    .unwrap();
+    store_answer(
+        &conn,
+        &answer(
+            "long-old",
+            "inst",
+            "2026-01-01T04:00:00Z",
+            "the old catch-up",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        latest_answer(&conn, "inst")
+            .unwrap()
+            .map(|answer| answer.session_id),
+        Some("short-new".to_string()),
+        "the latest answer is the latest session by when it started"
+    );
+    let context = latest_answer_with_context(&conn, "inst").unwrap();
+    assert_eq!(
+        context.answer.map(|answer| answer.session_id),
+        Some("short-new".to_string())
     );
 }
 

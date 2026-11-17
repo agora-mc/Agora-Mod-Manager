@@ -96,6 +96,13 @@ pub fn answer(input: &AnswerInput<'_>) -> CrashAnswer {
             )
         });
     let finding_wins = strongest.is_some_and(|finding| {
+        // A strong tie between suspects is the answer, not a gap another finding may fill: a
+        // merely possible finding of another kind must not overwrite it. A weak abstention makes
+        // no such claim, so a stronger finding there may still lead. A finding at least `Likely`
+        // is not "merely possible" and may lead even past a strong tie.
+        if input.consensus.strong_tie && finding.level <= Level::Possible {
+            return false;
+        }
         candidates.is_empty()
             || finding.level > top_candidate_level
             // A specific non-mod cause at the same level as a suspect is the better answer: a mod

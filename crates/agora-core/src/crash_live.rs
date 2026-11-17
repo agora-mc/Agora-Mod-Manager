@@ -9,31 +9,36 @@
 //! It holds no game knowledge. The sources, parsers and rules all come from packs; the instance
 //! view comes from core's attribution; only the generic engine facts are built here.
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use agora_game_api::crash::{
-    Artifact, AttrValue, BuiltInPack, CrashAnswer, Fact, MatchedBy, RefMap, RoleRule, Scalar,
-    SessionVerdict, SourceRole,
+    Artifact, AttrValue, BuiltInPack, CrashAnswer, Fact, GameHandle, MatchedBy, ParserLimits,
+    Reads, RefMap, RoleRule, Scalar, SessionVerdict, SourceRole, DETECT_HEAD_BYTES,
 };
 use agora_game_api::GamePath;
-use agora_plugin_api::host::ScriptHost;
+use agora_plugin_api::host::{ScriptHost, ScriptReads};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::crash_engine::attribution::Resolver;
 use crate::crash_engine::evidence::{
     collect_sources, ArtifactFacts, CollectionLimits, CopiedSession, CopyLimits, CrashSession,
-    EvidenceStore, FoundArtifact, NoArtifactFacts, RetentionLimits, SessionWindow,
-    SourceCollection, SourceLocation, SourceRoots, SourceSpec, EVIDENCE_STORE_DIR,
+    EvidenceStore, FoundArtifact, ProcessFacts, RetentionLimits, SessionWindow, SourceCollection,
+    SourceLocation, SourceRoots, SourceSpec, EVIDENCE_STORE_DIR,
 };
 use crate::crash_engine::{
     analyze_with_history, history::LocalConfirmation, history::RecordedCrash, AnalyzeInput,
     AnalyzedFile, CrashFile, InstanceAnalysis, InstanceInspector,
 };
-use crate::crash_packs::{load_built_in_packs, LoadedCrashPack};
+use crate::crash_packs::{
+    artifact_handle, detect_parsers_with_snippets, load_built_in_packs, parser_request,
+    run_parser_with_builtin, LoadedCrashPack, MemoryArtifact, ParserDispatch, BUILT_IN_PLUGIN_ID,
+};
 use crate::ctx::Ctx;
 use crate::session_ledger::{self, ExitObservation, ManifestChange, SessionRecord};
 
@@ -147,8 +152,10 @@ pub fn answer_for_session(
 }
 
 /// Every stored answer for an instance, newest session first. The newest is the card the overview
-/// shows; the rest are the instance's earlier crashes. A session with no row in `launch_history`
-/// (only possible for an answer written by hand) is ordered by when it was stored.
+/// shows; the rest are the instance's earlier crashes. "Newest" is the latest session by when it
+/// started, because an older session can be diagnosed later (a catch-up) and must not displace a
+/// crash the player already saw. A session with no row in `launch_history` (only possible for an
+/// answer written by hand) is ordered by when it was stored.
 pub fn answers_for_instance(
     conn: &Connection,
     instance_id: &str,
@@ -158,7 +165,7 @@ pub fn answers_for_instance(
            FROM session_answers a
            LEFT JOIN launch_history h ON h.session_id = a.session_id
           WHERE a.instance_id = ?1
-          ORDER BY COALESCE(h.ended_at, h.started_at, a.created_at) DESC, a.session_id DESC",
+          ORDER BY COALESCE(h.started_at, a.created_at) DESC, h.id DESC, a.session_id DESC",
     )?;
     let rows = stmt
         .query_map([instance_id], |row| {
@@ -227,16 +234,21 @@ pub fn latest_answer_with_context(
     })
 }
 
-/// The newest stored answer for an instance.
+/// The newest stored answer for an instance: the answer of the latest session by when it started,
+/// not of the session whose answer was written most recently. A catch-up that diagnoses an old
+/// session later must not make it look newer than a crash the player already saw.
 pub fn latest_answer(
     conn: &Connection,
     instance_id: &str,
 ) -> anyhow::Result<Option<SessionAnswer>> {
     let row: Option<(String, String, String, String)> = conn
         .query_row(
-            "SELECT session_id, instance_id, created_at, answer_json
-               FROM session_answers WHERE instance_id = ?1
-               ORDER BY created_at DESC, session_id DESC LIMIT 1",
+            "SELECT a.session_id, a.instance_id, a.created_at, a.answer_json
+               FROM session_answers a
+               LEFT JOIN launch_history h ON h.session_id = a.session_id
+              WHERE a.instance_id = ?1
+              ORDER BY COALESCE(h.started_at, a.created_at) DESC, h.id DESC, a.session_id DESC
+              LIMIT 1",
             [instance_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
@@ -495,6 +507,162 @@ impl InstanceEvidence {
     }
 }
 
+/// The artifact id a parser is given while collection reads a candidate's process facts. It is the
+/// same id the analyzer uses; a parser never sees a path.
+const FACTS_ARTIFACT_ID: &str = "artifact";
+
+/// Process facts read from a candidate artifact, so a pack's `pid_in_facts` and
+/// `working_dir_in_facts` binds work in live collection as they do in a hand-run test. The same
+/// file is parsed at most once per collection: a source can declare both binds.
+struct LiveArtifactFacts<'a> {
+    packs: &'a [LoadedCrashPack],
+    built_in: &'a [BuiltInPack],
+    host: &'a dyn ScriptHost,
+    game_id: &'a str,
+    runtime_version: Option<&'a str>,
+    cache: RefCell<BTreeMap<PathBuf, Option<ProcessFacts>>>,
+}
+
+impl<'a> LiveArtifactFacts<'a> {
+    fn new(
+        packs: &'a [LoadedCrashPack],
+        built_in: &'a [BuiltInPack],
+        host: &'a dyn ScriptHost,
+        game_id: &'a str,
+        runtime_version: Option<&'a str>,
+    ) -> Self {
+        Self {
+            packs,
+            built_in,
+            host,
+            game_id,
+            runtime_version,
+            cache: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    /// Run the primary parser a pack's own detection chooses for this file and read the
+    /// `core.process` fact it reports. A parser that fails or does not recognise the file
+    /// contributes nothing; that is not a contradiction, so the other binds still decide.
+    fn read_facts(&self, path: &Path) -> Option<ProcessFacts> {
+        let name = path.file_name()?.to_string_lossy().into_owned();
+        let bytes = read_facts_bytes(path)?;
+        if bytes.is_empty() {
+            return None;
+        }
+        let head = &bytes[..bytes.len().min(DETECT_HEAD_BYTES)];
+        let limits = ParserLimits::DEFAULT;
+        for pack in self.packs {
+            if !(pack.pack.games.is_empty()
+                || pack.pack.games.iter().any(|game| game == self.game_id))
+            {
+                continue;
+            }
+            let built_in = if pack.plugin_id == BUILT_IN_PLUGIN_ID {
+                self.built_in
+                    .iter()
+                    .find(|built_in| built_in.file == pack.file)
+            } else {
+                None
+            };
+            let Ok(parsers) = detect_parsers_with_snippets(&pack.pack, &name, head) else {
+                continue;
+            };
+            let Some(parser) = parsers
+                .iter()
+                .copied()
+                .find(|parser| parser.reads == Reads::Primary)
+            else {
+                continue;
+            };
+            let mut reads = MemoryArtifact::new(limits);
+            reads.insert(FACTS_ARTIFACT_ID, bytes.clone());
+            let reads: Arc<dyn ScriptReads> = Arc::new(reads);
+            let handle = artifact_handle(
+                FACTS_ARTIFACT_ID,
+                name.clone(),
+                bytes.len() as u64,
+                Vec::new(),
+            );
+            let request = parser_request(
+                "",
+                handle,
+                GameHandle {
+                    id: self.game_id.to_string(),
+                    runtime_version: self.runtime_version.map(str::to_string),
+                },
+                limits,
+            );
+            let attempt = run_parser_with_builtin(
+                self.host,
+                &pack.plugin_id,
+                parser,
+                &request,
+                reads,
+                built_in,
+            );
+            let ParserDispatch::Parsed(output) = attempt.outcome else {
+                continue;
+            };
+            let facts = process_facts(&output.facts);
+            if facts.pid.is_some() || facts.working_dir.is_some() {
+                return Some(facts);
+            }
+        }
+        None
+    }
+}
+
+impl ArtifactFacts for LiveArtifactFacts<'_> {
+    fn process_facts(&self, artifact: &Path) -> Option<ProcessFacts> {
+        if let Some(cached) = self.cache.borrow().get(artifact) {
+            return cached.clone();
+        }
+        let facts = self.read_facts(artifact);
+        self.cache
+            .borrow_mut()
+            .insert(artifact.to_path_buf(), facts.clone());
+        facts
+    }
+}
+
+/// The file's bytes, bounded by what one parser read may hold. A larger file is not parsed here:
+/// the analyzer would refuse it the same way, so there are no facts to find.
+fn read_facts_bytes(path: &Path) -> Option<Vec<u8>> {
+    let size = std::fs::metadata(path).ok()?.len();
+    if size > ParserLimits::DEFAULT.max_total_read_bytes {
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
+/// Pull the pid and working folder a parser reported for the artifact.
+fn process_facts(facts: &[Fact]) -> ProcessFacts {
+    let mut process = ProcessFacts::default();
+    for fact in facts.iter().filter(|fact| fact.kind == "core.process") {
+        if process.pid.is_none() {
+            process.pid = match fact.attrs.get("pid") {
+                Some(AttrValue::Scalar(Scalar::Number(pid))) => number_to_pid(*pid),
+                Some(AttrValue::Scalar(Scalar::Text(pid))) => pid.parse().ok(),
+                _ => None,
+            };
+        }
+        if process.working_dir.is_none() {
+            process.working_dir = match fact.attrs.get("cwd") {
+                Some(AttrValue::Scalar(Scalar::Text(path))) if !path.is_empty() => {
+                    Some(PathBuf::from(path))
+                }
+                _ => None,
+            };
+        }
+    }
+    process
+}
+
+fn number_to_pid(pid: f64) -> Option<u32> {
+    (pid.is_finite() && pid >= 0.0 && pid <= f64::from(u32::MAX)).then_some(pid as u32)
+}
+
 /// Search the folders the applicable packs name for the evidence of one window, plus the files the
 /// caller named. This is the one search the live diagnosis and `crash investigate` both use.
 pub fn collect_instance_evidence(
@@ -537,7 +705,13 @@ pub fn collect_instance_evidence(
             })
         })
         .collect();
-    let facts = NoArtifactFacts;
+    let facts = LiveArtifactFacts::new(
+        &packs,
+        live.built_in,
+        live.host,
+        &game_id,
+        resolved.runtime_version.as_deref(),
+    );
     let collection = collect_sources(
         &specs,
         &roots,
@@ -824,6 +998,50 @@ pub fn catch_up(ctx: &Ctx, instance_id: &str, live: LivePacks<'_>) -> CatchUpRep
             session_id: closed.session_id,
             instance_id: closed.instance_id,
             answer,
+        });
+    }
+    // A launch path closes this instance's orphans itself before any catch-up runs. Those rows are
+    // already closed as `ClosedUnknown`, so the open list above never sees them; a crash in one of
+    // them would otherwise be lost. Diagnose the ones with no answer. A window bounded by the next
+    // session is always safe; with none, only when the game is provably gone, because a running
+    // game could still write into the old session's window.
+    let handled: BTreeSet<String> = caught
+        .iter()
+        .map(|entry| entry.session_id.clone())
+        .collect();
+    let closed_unknown =
+        session_ledger::list(&conn, instance_id, session_ledger::KEPT_SESSIONS).unwrap_or_default();
+    for record in closed_unknown {
+        if handled.contains(record.session_id.as_str())
+            || record.verdict != Some(SessionVerdict::ClosedUnknown)
+        {
+            continue;
+        }
+        if answer_for_session(&conn, &record.session_id)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            continue;
+        }
+        let bounded = parse_time(&record.started_at)
+            .ok()
+            .and_then(|started| {
+                next_session_start(&conn, instance_id, started)
+                    .ok()
+                    .flatten()
+            })
+            .is_some();
+        if !bounded && !provably_gone {
+            continue;
+        }
+        let Some(answer) = diagnose_session_with(ctx, &record.session_id, &live, true) else {
+            continue;
+        };
+        caught.push(CaughtUp {
+            session_id: record.session_id,
+            instance_id: record.instance_id,
+            answer: Some(answer),
         });
     }
     CatchUpReport {
@@ -1172,13 +1390,59 @@ fn log_shows_normal_stop(
     })
 }
 
+/// Take out evidence another session's stored answer already read. A crash log is not evidence for
+/// two crashes: a caught-up session must not claim a log a later session already answered, even
+/// when the file still sits in a shared folder. The files stay listed as seen, with the reason, so
+/// nothing vanishes silently.
+fn exclude_answered_evidence(
+    conn: &Connection,
+    record: &SessionRecord,
+    collection: &mut SourceCollection,
+) -> Result<(), String> {
+    let answered = crate::crash_history::answered_artifact_hashes(
+        conn,
+        &record.instance_id,
+        Some(&record.session_id),
+    )
+    .map_err(|error| format!("the stored crash answers could not be read: {error}"))?;
+    if answered.is_empty() {
+        return Ok(());
+    }
+    let mut kept = Vec::with_capacity(collection.bound.len());
+    for found in collection.bound.drain(..) {
+        let already = found.unit == agora_game_api::crash::ArtifactUnit::File
+            && crate::crash_history::content_hash_file(&found.path)
+                .ok()
+                .is_some_and(|hash| answered.contains(&hash));
+        if already {
+            collection
+                .seen
+                .push(crate::crash_engine::evidence::SeenArtifact {
+                    plugin_id: found.plugin_id,
+                    source_id: found.source_id,
+                    name: found.name,
+                    path: found.path,
+                    reason: crate::crash_engine::evidence::RejectedReason::AlreadyAnswered,
+                    modified_at: found.modified.map(crate::crash_engine::evidence::rfc3339),
+                });
+            continue;
+        }
+        kept.push(found);
+    }
+    collection.bound = kept;
+    collection
+        .seen
+        .sort_by(|left, right| (&left.source_id, &left.name).cmp(&(&right.source_id, &right.name)));
+    Ok(())
+}
+
 fn diagnose_record(
     ctx: &Ctx,
     conn: &Connection,
     record: &SessionRecord,
     live: &LivePacks<'_>,
 ) -> Result<Diagnosed, String> {
-    let window = record_window(record)?;
+    let window = evidence_window(conn, record, ctx.clock.now())?;
     let pid = match &record.exit {
         Some(ExitObservation::Code { pid, .. }) => Some(*pid),
         _ => None,
@@ -1192,9 +1456,10 @@ fn diagnose_record(
     let InstanceEvidence {
         resolved,
         packs,
-        collection,
+        mut collection,
         ..
     } = collect_instance_evidence(ctx, &record.instance_id, live, &session, &[])?;
+    exclude_answered_evidence(conn, record, &mut collection)?;
     let game_id = resolved.game_id.clone();
     let runtime_version = resolved.runtime_version.clone();
     let could_not_check = resolved.could_not_check.clone();
@@ -1368,9 +1633,7 @@ fn diagnose_record(
         );
     }
 
-    let at_unix_ms = record_window(record)
-        .ok()
-        .map(|window| crate::crash_engine::evidence::unix_ms(window.started));
+    let at_unix_ms = Some(crate::crash_engine::evidence::unix_ms(window.started));
     let recorded = RecordedCrash {
         record: output.record.clone(),
         bucket: crate::crash_engine::history::parsed_bucket(&output.parsed),
@@ -1430,6 +1693,61 @@ fn record_window(record: &SessionRecord) -> Result<SessionWindow, String> {
         .ok_or_else(|| "the session has no end time".to_string())
         .and_then(parse_time)?;
     Ok(SessionWindow::new(started, ended))
+}
+
+/// The span a session's evidence may cover. A known ending ends it. An unknown ending (a session
+/// Agora caught up on, or one nobody finished) ends when the next session of the same instance
+/// started, so it can never swallow a later session's crash log; with no later session it ends at
+/// `now`, because nothing else can bound it.
+fn evidence_window(
+    conn: &Connection,
+    record: &SessionRecord,
+    now: SystemTime,
+) -> Result<SessionWindow, String> {
+    let started = parse_time(&record.started_at)?;
+    let end_is_unknown = record.ended_at.is_none()
+        || matches!(record.verdict, None | Some(SessionVerdict::ClosedUnknown));
+    let ended = if end_is_unknown {
+        next_session_start(conn, &record.instance_id, started)?.unwrap_or(now)
+    } else {
+        record
+            .ended_at
+            .as_deref()
+            .ok_or_else(|| "the session has no end time".to_string())
+            .and_then(parse_time)?
+    };
+    Ok(SessionWindow::new(started, ended.max(started)))
+}
+
+/// When the next session of this instance started, after `after`. Times are parsed rather than
+/// compared as text: rows written by older builds may use a different RFC 3339 offset.
+fn next_session_start(
+    conn: &Connection,
+    instance_id: &str,
+    after: SystemTime,
+) -> Result<Option<SystemTime>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT started_at FROM launch_history
+              WHERE instance_id = ?1 AND session_id IS NOT NULL",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([instance_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    let mut next: Option<SystemTime> = None;
+    for row in rows {
+        let Ok(text) = row else {
+            continue;
+        };
+        let Ok(candidate) = parse_time(&text) else {
+            continue;
+        };
+        if candidate > after && next.is_none_or(|current| candidate < current) {
+            next = Some(candidate);
+        }
+    }
+    Ok(next)
 }
 
 fn parse_time(text: &str) -> Result<SystemTime, String> {
