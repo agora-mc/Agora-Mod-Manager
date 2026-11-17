@@ -73,7 +73,11 @@ fn transitive_load_after_rule_fails_to_mark_overlap_as_decided() {
         keys: vec![overlap_key(
             "Base.esm:000001",
             "GMST fJumpHeightMin",
-            &[("Base.esm", "orig"), ("A.esp", "change_a"), ("C.esp", "change_c")],
+            &[
+                ("Base.esm", "orig"),
+                ("A.esp", "change_a"),
+                ("C.esp", "change_c"),
+            ],
         )],
         notes: Vec::new(),
     };
@@ -99,7 +103,11 @@ fn winner_masters_traverses_inactive_intermediate_plugin() {
         keys: vec![overlap_key(
             "Base.esm:000001",
             "GMST fJumpHeightMin",
-            &[("Base.esm", "orig"), ("A.esp", "change_a"), ("Winner.esp", "change_w")],
+            &[
+                ("Base.esm", "orig"),
+                ("A.esp", "change_a"),
+                ("Winner.esp", "change_w"),
+            ],
         )],
         notes: Vec::new(),
     };

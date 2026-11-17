@@ -513,11 +513,7 @@ impl OverlapsCache {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         entries
-            .get(&(
-                instance.to_string(),
-                game.to_string(),
-                list.to_string(),
-            ))
+            .get(&(instance.to_string(), game.to_string(), list.to_string()))
             .filter(|cached| {
                 cached.fingerprint == fingerprint && cached.data_version == data_version
             })
@@ -538,11 +534,7 @@ impl OverlapsCache {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         entries.insert(
-            (
-                instance.to_string(),
-                game.to_string(),
-                list.to_string(),
-            ),
+            (instance.to_string(), game.to_string(), list.to_string()),
             CachedOverlaps {
                 fingerprint,
                 data_version,
@@ -581,11 +573,7 @@ impl SorterNotesCache {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         entries
-            .get(&(
-                instance.to_string(),
-                game.to_string(),
-                list.to_string(),
-            ))
+            .get(&(instance.to_string(), game.to_string(), list.to_string()))
             .filter(|cached| {
                 cached.fingerprint == fingerprint && cached.data_version == data_version
             })
@@ -606,11 +594,7 @@ impl SorterNotesCache {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         entries.insert(
-            (
-                instance.to_string(),
-                game.to_string(),
-                list.to_string(),
-            ),
+            (instance.to_string(), game.to_string(), list.to_string()),
             CachedSorterNotes {
                 fingerprint,
                 data_version,
@@ -3979,7 +3963,10 @@ mod tests {
             entry("B.esp", &["C.esp"]),
         ];
         let (moves, blocked) = sort_entries(&mut list).unwrap();
-        assert!(moves.is_empty(), "the sort moved a plugin above its own master: {moves:?}");
+        assert!(
+            moves.is_empty(),
+            "the sort moved a plugin above its own master: {moves:?}"
+        );
         assert!(
             position_of(&list, "M.esm") < position_of(&list, "C.esp"),
             "C.esp was pulled above its locked master M.esm: {list:?}"
@@ -4009,7 +3996,10 @@ mod tests {
             entry("B.esp", &["D.esp"]),
         ];
         let (moves, _) = sort_entries(&mut list).unwrap();
-        assert!(moves.is_empty(), "the sort moved a plugin above an indirect master: {moves:?}");
+        assert!(
+            moves.is_empty(),
+            "the sort moved a plugin above an indirect master: {moves:?}"
+        );
         assert!(
             position_of(&list, "M.esm") < position_of(&list, "B.esp"),
             "B.esp was pulled above an indirect master M.esm: {list:?}"
@@ -4456,7 +4446,10 @@ mod tests {
             ],
         )]);
         let report = classify_overlaps(&list, &reply, &[]).unwrap();
-        assert_eq!(report.patched, 0, "an inactive master patched the pair: {report:?}");
+        assert_eq!(
+            report.patched, 0,
+            "an inactive master patched the pair: {report:?}"
+        );
         assert_eq!(report.pairs.len(), 1);
         assert_eq!(report.pairs[0].winner, "Patch.esp");
         assert_eq!(report.pairs[0].loser, "A.esp");
@@ -4479,7 +4472,10 @@ mod tests {
             ],
         )]);
         let report = classify_overlaps(&list, &reply, &[]).unwrap();
-        assert_eq!(report.patched, 0, "a missing master patched the pair: {report:?}");
+        assert_eq!(
+            report.patched, 0,
+            "a missing master patched the pair: {report:?}"
+        );
         assert_eq!(report.pairs.len(), 1);
     }
 
@@ -4620,11 +4616,7 @@ mod tests {
         let reply = overlap_reply(vec![overlap_key(
             "Game:000001",
             "GMST fJumpHeightMin",
-            &[
-                ("Base.esm", "original"),
-                ("A.esp", "old"),
-                ("C.esp", "new"),
-            ],
+            &[("Base.esm", "original"), ("A.esp", "old"), ("C.esp", "new")],
         )]);
         let rules = [after("B.esp", "A.esp"), after("C.esp", "B.esp")];
         let report = classify_overlaps(&list, &reply, &rules).unwrap();
@@ -4644,11 +4636,7 @@ mod tests {
         let reply = overlap_reply(vec![overlap_key(
             "Game:000001",
             "GMST fJumpHeightMin",
-            &[
-                ("Base.esm", "original"),
-                ("A.esp", "old"),
-                ("C.esp", "new"),
-            ],
+            &[("Base.esm", "original"), ("A.esp", "old"), ("C.esp", "new")],
         )]);
         let report = classify_overlaps(&list, &reply, &[after("C.esp", "B.esp")]).unwrap();
         assert_eq!(report.decided, 0, "{report:?}");
@@ -4810,10 +4798,7 @@ mod tests {
             entry("A.esp", &[]),
             entry("C.esp", &[]),
         ];
-        let both_before = [
-            session_entry("B.esp", true),
-            session_entry("C.esp", true),
-        ];
+        let both_before = [session_entry("B.esp", true), session_entry("C.esp", true)];
         assert!(!pair_is_new_since(&pair, &with_a_between, &both_before));
 
         // An inactive plugin moving does not count either.

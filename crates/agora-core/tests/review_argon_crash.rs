@@ -112,8 +112,8 @@ fn latest_answer_returns_older_caught_up_session_instead_of_newest_session() {
 
 #[test]
 fn pid_in_facts_bind_never_vetoes_foreign_pid_during_live_collection() {
-    use agora_core::crash_engine::instance_view::{ExtraInstanceProvider, ResolvedCrashInstance};
     use agora_core::crash_engine::attribution::InstanceView;
+    use agora_core::crash_engine::instance_view::{ExtraInstanceProvider, ResolvedCrashInstance};
 
     struct DummyProvider {
         dir: std::path::PathBuf,
@@ -223,8 +223,8 @@ fn pid_in_facts_bind_never_vetoes_foreign_pid_during_live_collection() {
 
 #[test]
 fn unwatched_session_has_infinite_window_and_steals_later_sessions_crash_log() {
-    use agora_core::crash_engine::instance_view::{ExtraInstanceProvider, ResolvedCrashInstance};
     use agora_core::crash_engine::attribution::InstanceView;
+    use agora_core::crash_engine::instance_view::{ExtraInstanceProvider, ResolvedCrashInstance};
 
     struct DummyProvider;
     impl ExtraInstanceProvider for DummyProvider {
