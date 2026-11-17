@@ -598,6 +598,31 @@ fn overlaps_and_notes_cache_collide_across_instances_of_same_game() {
 }
 
 #[test]
+fn overlaps_cache_does_not_share_a_report_across_instances_of_same_game() {
+    let h = ReviewHarness::new(Vec::new());
+    let inst1 = h.instance("overlaps-1", "*A.esp\r\n*B.esp\r\n");
+    let inst2 = h.instance("overlaps-2", "*A.esp\r\n*B.esp\r\n");
+
+    let report =
+        game_load_order::refresh_overlaps(&h.ctx, &inst1.instance_id, &h.def, Some("plugins"))
+            .unwrap();
+    assert_eq!(report.pairs.len(), 1);
+
+    // The two instances have the same files and rules, so only the instance key separates them.
+    let order2 =
+        game_load_order::order_in(&h.ctx, &inst2.instance_id, &h.def, Some("plugins")).unwrap();
+    assert!(
+        order2.overlaps.is_none(),
+        "inst2 was served inst1's cached overlaps report: {:?}",
+        order2.overlaps
+    );
+    assert!(
+        order2.overlaps_out_of_date,
+        "inst2 must ask its own overlaps reader"
+    );
+}
+
+#[test]
 fn new_since_last_launch_ignores_inactive_plugin_moving_in_previous_manifest() {
     let h = ReviewHarness::new(Vec::new());
     // Suppose in the last launch, plugins were: Inactive.esp (off), A.esp (on), B.esp (on).

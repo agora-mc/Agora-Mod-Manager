@@ -485,10 +485,11 @@ impl OverlapReport {
     }
 }
 
-/// The last report an overlaps reader gave for one list, with what it was computed from.
+/// The last report an overlaps reader gave for one instance's list, with what it was computed
+/// from. The instance is part of the key: two instances of one game never share a report.
 #[derive(Default)]
 struct OverlapsCache {
-    entries: Mutex<HashMap<(String, String), CachedOverlaps>>,
+    entries: Mutex<HashMap<(String, String, String), CachedOverlaps>>,
 }
 
 #[derive(Clone)]
@@ -501,6 +502,7 @@ struct CachedOverlaps {
 impl OverlapsCache {
     fn lookup(
         &self,
+        instance: &str,
         game: &str,
         list: &str,
         fingerprint: &str,
@@ -511,7 +513,11 @@ impl OverlapsCache {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         entries
-            .get(&(game.to_string(), list.to_string()))
+            .get(&(
+                instance.to_string(),
+                game.to_string(),
+                list.to_string(),
+            ))
             .filter(|cached| {
                 cached.fingerprint == fingerprint && cached.data_version == data_version
             })
@@ -520,6 +526,7 @@ impl OverlapsCache {
 
     fn store(
         &self,
+        instance: &str,
         game: &str,
         list: &str,
         fingerprint: String,
@@ -531,7 +538,11 @@ impl OverlapsCache {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         entries.insert(
-            (game.to_string(), list.to_string()),
+            (
+                instance.to_string(),
+                game.to_string(),
+                list.to_string(),
+            ),
             CachedOverlaps {
                 fingerprint,
                 data_version,
@@ -541,10 +552,12 @@ impl OverlapsCache {
     }
 }
 
-/// The last notes a sorter gave for one list, with what they were computed from.
+/// The last notes a sorter gave for one instance's list, with what they were computed from. The
+/// instance is part of the key, so two instances of one game never share notes that name an
+/// instance.
 #[derive(Default)]
 struct SorterNotesCache {
-    entries: Mutex<HashMap<(String, String), CachedSorterNotes>>,
+    entries: Mutex<HashMap<(String, String, String), CachedSorterNotes>>,
 }
 
 #[derive(Clone)]
@@ -557,6 +570,7 @@ struct CachedSorterNotes {
 impl SorterNotesCache {
     fn lookup(
         &self,
+        instance: &str,
         game: &str,
         list: &str,
         fingerprint: &str,
@@ -567,7 +581,11 @@ impl SorterNotesCache {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         entries
-            .get(&(game.to_string(), list.to_string()))
+            .get(&(
+                instance.to_string(),
+                game.to_string(),
+                list.to_string(),
+            ))
             .filter(|cached| {
                 cached.fingerprint == fingerprint && cached.data_version == data_version
             })
@@ -576,6 +594,7 @@ impl SorterNotesCache {
 
     fn store(
         &self,
+        instance: &str,
         game: &str,
         list: &str,
         fingerprint: String,
@@ -587,7 +606,11 @@ impl SorterNotesCache {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         entries.insert(
-            (game.to_string(), list.to_string()),
+            (
+                instance.to_string(),
+                game.to_string(),
+                list.to_string(),
+            ),
             CachedSorterNotes {
                 fingerprint,
                 data_version,
@@ -708,6 +731,7 @@ fn cache_sorter_notes(
 ) {
     let cache = ctx.extensions.get_or_insert_with(SorterNotesCache::default);
     cache.store(
+        instance_id,
         definition.id.as_str(),
         &rule.id,
         sorter_fingerprint(entries, installed),
@@ -1592,6 +1616,7 @@ fn overlaps_fingerprint(
 
 fn cache_overlaps(
     ctx: &Ctx,
+    instance: &str,
     game: &str,
     list: &str,
     fingerprint: String,
@@ -1599,7 +1624,14 @@ fn cache_overlaps(
     report: &OverlapReport,
 ) {
     let cache = ctx.extensions.get_or_insert_with(OverlapsCache::default);
-    cache.store(game, list, fingerprint, data_version, report.clone());
+    cache.store(
+        instance,
+        game,
+        list,
+        fingerprint,
+        data_version,
+        report.clone(),
+    );
 }
 
 /// Ask the overlaps reader now, cache the report for the list as it stands, and return it.
@@ -1639,6 +1671,7 @@ pub fn refresh_overlaps(
     mark_new_pairs(ctx, instance_id, &rule.id, &mut report, &entries);
     cache_overlaps(
         ctx,
+        instance_id,
         definition.id.as_str(),
         &rule.id,
         overlaps_fingerprint(&entries, &installed, &rules),
@@ -3149,6 +3182,7 @@ fn order_of_with_view(
         let data_version = sorter_data_version(ctx, instance_id, definition, rule);
         let cache = ctx.extensions.get_or_insert_with(SorterNotesCache::default);
         match cache.lookup(
+            instance_id,
             definition.id.as_str(),
             &rule.id,
             &fingerprint,
@@ -3167,6 +3201,7 @@ fn order_of_with_view(
                 let data_version = sorter_data_version(ctx, instance_id, definition, rule);
                 let cache = ctx.extensions.get_or_insert_with(OverlapsCache::default);
                 match cache.lookup(
+                    instance_id,
                     definition.id.as_str(),
                     &rule.id,
                     &fingerprint,
