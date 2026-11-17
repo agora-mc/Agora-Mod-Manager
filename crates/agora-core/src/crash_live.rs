@@ -9,31 +9,37 @@
 //! It holds no game knowledge. The sources, parsers and rules all come from packs; the instance
 //! view comes from core's attribution; only the generic engine facts are built here.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use agora_game_api::crash::{
-    Artifact, AttrValue, BuiltInPack, CrashAnswer, Fact, MatchedBy, RefMap, RoleRule, Scalar,
-    SessionVerdict, SourceRole,
+    Artifact, AttrValue, BuiltInPack, CrashAnswer, Fact, GameHandle, MatchedBy, ParserLimits,
+    Reads, RefMap, RoleRule, Scalar, SessionVerdict, SourceRole, DETECT_HEAD_BYTES,
 };
 use agora_game_api::GamePath;
-use agora_plugin_api::host::ScriptHost;
+use agora_plugin_api::host::{ScriptHost, ScriptReads};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::crash_engine::attribution::Resolver;
 use crate::crash_engine::evidence::{
     collect_sources, ArtifactFacts, CollectionLimits, CopiedSession, CopyLimits, CrashSession,
-    EvidenceStore, FoundArtifact, NoArtifactFacts, RetentionLimits, SessionWindow,
-    SourceCollection, SourceLocation, SourceRoots, SourceSpec, EVIDENCE_STORE_DIR,
+    EvidenceStore, FoundArtifact, ProcessFacts, RetentionLimits, SessionWindow, SourceCollection,
+    SourceLocation, SourceRoots, SourceSpec, EVIDENCE_STORE_DIR,
 };
 use crate::crash_engine::{
     analyze_with_history, history::LocalConfirmation, history::RecordedCrash, AnalyzeInput,
     AnalyzedFile, CrashFile, InstanceAnalysis, InstanceInspector,
 };
-use crate::crash_packs::{load_built_in_packs, LoadedCrashPack};
+use crate::crash_packs::{
+    artifact_handle, detect_parsers_with_snippets, load_built_in_packs, parser_request,
+    run_parser_with_builtin, LoadedCrashPack, MemoryArtifact, ParserDispatch,
+    BUILT_IN_PLUGIN_ID,
+};
 use crate::ctx::Ctx;
 use crate::session_ledger::{self, ExitObservation, ManifestChange, SessionRecord};
 
@@ -502,6 +508,162 @@ impl InstanceEvidence {
     }
 }
 
+/// The artifact id a parser is given while collection reads a candidate's process facts. It is the
+/// same id the analyzer uses; a parser never sees a path.
+const FACTS_ARTIFACT_ID: &str = "artifact";
+
+/// Process facts read from a candidate artifact, so a pack's `pid_in_facts` and
+/// `working_dir_in_facts` binds work in live collection as they do in a hand-run test. The same
+/// file is parsed at most once per collection: a source can declare both binds.
+struct LiveArtifactFacts<'a> {
+    packs: &'a [LoadedCrashPack],
+    built_in: &'a [BuiltInPack],
+    host: &'a dyn ScriptHost,
+    game_id: &'a str,
+    runtime_version: Option<&'a str>,
+    cache: RefCell<BTreeMap<PathBuf, Option<ProcessFacts>>>,
+}
+
+impl<'a> LiveArtifactFacts<'a> {
+    fn new(
+        packs: &'a [LoadedCrashPack],
+        built_in: &'a [BuiltInPack],
+        host: &'a dyn ScriptHost,
+        game_id: &'a str,
+        runtime_version: Option<&'a str>,
+    ) -> Self {
+        Self {
+            packs,
+            built_in,
+            host,
+            game_id,
+            runtime_version,
+            cache: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    /// Run the primary parser a pack's own detection chooses for this file and read the
+    /// `core.process` fact it reports. A parser that fails or does not recognise the file
+    /// contributes nothing; that is not a contradiction, so the other binds still decide.
+    fn read_facts(&self, path: &Path) -> Option<ProcessFacts> {
+        let name = path.file_name()?.to_string_lossy().into_owned();
+        let bytes = read_facts_bytes(path)?;
+        if bytes.is_empty() {
+            return None;
+        }
+        let head = &bytes[..bytes.len().min(DETECT_HEAD_BYTES)];
+        let limits = ParserLimits::DEFAULT;
+        for pack in self.packs {
+            if !(pack.pack.games.is_empty()
+                || pack.pack.games.iter().any(|game| game == self.game_id))
+            {
+                continue;
+            }
+            let built_in = if pack.plugin_id == BUILT_IN_PLUGIN_ID {
+                self.built_in
+                    .iter()
+                    .find(|built_in| built_in.file == pack.file)
+            } else {
+                None
+            };
+            let Ok(parsers) = detect_parsers_with_snippets(&pack.pack, &name, head) else {
+                continue;
+            };
+            let Some(parser) = parsers
+                .iter()
+                .copied()
+                .find(|parser| parser.reads == Reads::Primary)
+            else {
+                continue;
+            };
+            let mut reads = MemoryArtifact::new(limits);
+            reads.insert(FACTS_ARTIFACT_ID, bytes.clone());
+            let reads: Arc<dyn ScriptReads> = Arc::new(reads);
+            let handle = artifact_handle(
+                FACTS_ARTIFACT_ID,
+                name.clone(),
+                bytes.len() as u64,
+                Vec::new(),
+            );
+            let request = parser_request(
+                "",
+                handle,
+                GameHandle {
+                    id: self.game_id.to_string(),
+                    runtime_version: self.runtime_version.map(str::to_string),
+                },
+                limits,
+            );
+            let attempt = run_parser_with_builtin(
+                self.host,
+                &pack.plugin_id,
+                parser,
+                &request,
+                reads,
+                built_in,
+            );
+            let ParserDispatch::Parsed(output) = attempt.outcome else {
+                continue;
+            };
+            let facts = process_facts(&output.facts);
+            if facts.pid.is_some() || facts.working_dir.is_some() {
+                return Some(facts);
+            }
+        }
+        None
+    }
+}
+
+impl ArtifactFacts for LiveArtifactFacts<'_> {
+    fn process_facts(&self, artifact: &Path) -> Option<ProcessFacts> {
+        if let Some(cached) = self.cache.borrow().get(artifact) {
+            return cached.clone();
+        }
+        let facts = self.read_facts(artifact);
+        self.cache
+            .borrow_mut()
+            .insert(artifact.to_path_buf(), facts.clone());
+        facts
+    }
+}
+
+/// The file's bytes, bounded by what one parser read may hold. A larger file is not parsed here:
+/// the analyzer would refuse it the same way, so there are no facts to find.
+fn read_facts_bytes(path: &Path) -> Option<Vec<u8>> {
+    let size = std::fs::metadata(path).ok()?.len();
+    if size > ParserLimits::DEFAULT.max_total_read_bytes {
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
+/// Pull the pid and working folder a parser reported for the artifact.
+fn process_facts(facts: &[Fact]) -> ProcessFacts {
+    let mut process = ProcessFacts::default();
+    for fact in facts.iter().filter(|fact| fact.kind == "core.process") {
+        if process.pid.is_none() {
+            process.pid = match fact.attrs.get("pid") {
+                Some(AttrValue::Scalar(Scalar::Number(pid))) => number_to_pid(*pid),
+                Some(AttrValue::Scalar(Scalar::Text(pid))) => pid.parse().ok(),
+                _ => None,
+            };
+        }
+        if process.working_dir.is_none() {
+            process.working_dir = match fact.attrs.get("cwd") {
+                Some(AttrValue::Scalar(Scalar::Text(path))) if !path.is_empty() => {
+                    Some(PathBuf::from(path))
+                }
+                _ => None,
+            };
+        }
+    }
+    process
+}
+
+fn number_to_pid(pid: f64) -> Option<u32> {
+    (pid.is_finite() && pid >= 0.0 && pid <= f64::from(u32::MAX)).then_some(pid as u32)
+}
+
 /// Search the folders the applicable packs name for the evidence of one window, plus the files the
 /// caller named. This is the one search the live diagnosis and `crash investigate` both use.
 pub fn collect_instance_evidence(
@@ -544,7 +706,13 @@ pub fn collect_instance_evidence(
             })
         })
         .collect();
-    let facts = NoArtifactFacts;
+    let facts = LiveArtifactFacts::new(
+        &packs,
+        live.built_in,
+        live.host,
+        &game_id,
+        resolved.runtime_version.as_deref(),
+    );
     let collection = collect_sources(
         &specs,
         &roots,
