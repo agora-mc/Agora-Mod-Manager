@@ -963,6 +963,9 @@ fn two_crashes_back_to_back_each_get_their_own_answer() {
     end_session(&f, &second, &now_minus(30), 0xC000_0005);
 
     diagnose(&f, &first).expect("the first crash is diagnosed");
+    // Each crash writes its own log. The first one is already that session's evidence and may not
+    // be reused as the second's, so this crash leaves a fresh file.
+    write_named_log(&f, "crash-2.txt", "2000");
     diagnose(&f, &second).expect("the second crash is diagnosed");
 
     let first = stored(&f, &first);

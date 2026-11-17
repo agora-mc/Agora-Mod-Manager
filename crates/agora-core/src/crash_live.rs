@@ -1430,6 +1430,9 @@ fn exclude_answered_evidence(
         kept.push(found);
     }
     collection.bound = kept;
+    collection
+        .seen
+        .sort_by(|left, right| (&left.source_id, &left.name).cmp(&(&right.source_id, &right.name)));
     Ok(())
 }
 

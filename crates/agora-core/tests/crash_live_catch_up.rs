@@ -223,13 +223,13 @@ fn a_log_another_sessions_answer_already_read_is_not_used_again() {
         &s1,
         &SessionFinish {
             ended_at: chrono::DateTime::<chrono::Utc>::from(ended).to_rfc3339(),
-            duration_ms: 3600_000,
+            duration_ms: 3_600_000,
             exit: ExitObservation::Code {
                 pid: 4242,
                 image: "Game.exe".to_string(),
                 code: 0xC000_0005,
             },
-            game_runtime_ms: Some(3600_000),
+            game_runtime_ms: Some(3_600_000),
             normal_exit_codes: vec![0],
             artifact: None,
             froze: false,
