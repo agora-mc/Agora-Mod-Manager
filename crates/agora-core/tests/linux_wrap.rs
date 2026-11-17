@@ -21,7 +21,7 @@ use agora_core::game_registry::{
     GameRegistry, IdentifiedInstall, PackageSource, RuntimeResolution,
 };
 use agora_core::game_wrap::{self, WrapError, WrapOutcome, PROTON_UNTESTED};
-use agora_core::linux_view::KNOWN_RESTRICTED_ENV;
+use agora_core::linux_view::{KNOWN_RESTRICTED_ENV, REFUSE_OVERLAY_ENV};
 use agora_game_api::crash::{
     BuiltInPack, BuiltInParser, BuiltInParserError, Coverage, CoverageState, Fact, ParserOutput,
     ParserReads, ParserRequest, Producer, CRASH_CONTRACT_VERSION,
@@ -35,6 +35,14 @@ use agora_plugin_host::QuickJsHost;
 use tempfile::TempDir;
 
 static SERIAL: Mutex<()> = Mutex::new(());
+
+// Send a signal without pulling in a libc crate for the test binary.
+unsafe extern "C" {
+    #[link_name = "kill"]
+    fn raw_kill(pid: i32, signal: i32) -> i32;
+}
+
+const SIGTERM: i32 = 15;
 
 fn serial() -> std::sync::MutexGuard<'static, ()> {
     SERIAL
@@ -630,6 +638,155 @@ fn an_instance_copy_is_not_bound_when_the_real_file_is_absent() {
         !fixture.real_config.exists(),
         "the wrapper created the bind target in the real prefix"
     );
+    assert_eq!(
+        std::fs::read(&fixture.instance_config).unwrap(),
+        b"instance config"
+    );
+}
+
+#[test]
+fn a_stop_signal_restores_the_files_before_the_wrapper_exits() {
+    let _serial = serial();
+    struct ClearEnv;
+    impl Drop for ClearEnv {
+        fn drop(&mut self) {
+            std::env::remove_var(REFUSE_OVERLAY_ENV);
+        }
+    }
+    std::env::set_var(REFUSE_OVERLAY_ENV, "1");
+    let _clear = ClearEnv;
+
+    let fixture = Fixture::new();
+    fixture.pending();
+    let out = fixture._tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let started = out.join("started");
+    let release = out.join("release");
+    let command = fixture._tmp.path().join("fake-proton-stop.sh");
+    script(
+        &command,
+        &format!(
+            "set -e\nprintf 'game wrote' > '{config}'\nprintf started > '{started}'\nwhile [ ! -e '{release}' ]; do sleep 0.02; done\n",
+            config = fixture.real_config.display(),
+            started = started.display(),
+            release = release.display(),
+        ),
+    );
+    std::env::set_var("SteamAppId", "4242");
+    let host = QuickJsHost::new();
+    let live = fixture.live(&[], &[], &host);
+
+    // Steam's Stop: SIGTERM to the wrapper once the game is up.
+    let wrapper = std::process::id() as i32;
+    let wait_for = started.clone();
+    let stopper = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !wait_for.exists() {
+            if std::time::Instant::now() > deadline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        unsafe { raw_kill(wrapper, SIGTERM) };
+    });
+    let outcome = game_wrap::wrap(&fixture.ctx, &live, &[command.display().to_string()]).unwrap();
+    stopper.join().unwrap();
+
+    match outcome {
+        WrapOutcome::Ran {
+            exit_code,
+            stepped_down: Some(reason),
+            restore_error,
+            ..
+        } => {
+            assert!(reason.contains(REFUSE_OVERLAY_ENV), "{reason}");
+            assert_ne!(
+                exit_code,
+                Some(0),
+                "a stopped wrapper must not report success"
+            );
+            assert_eq!(restore_error, None, "the restore failed: {restore_error:?}");
+        }
+        other => panic!("expected a step-down run: {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(&fixture.real_config).unwrap(),
+        b"player original",
+        "the player's file was not put back after a stop"
+    );
+    assert_eq!(
+        std::fs::read(&fixture.instance_config).unwrap(),
+        b"game wrote"
+    );
+}
+
+#[test]
+fn a_restore_failure_after_a_step_down_is_reported() {
+    let _serial = serial();
+    struct ClearEnv;
+    impl Drop for ClearEnv {
+        fn drop(&mut self) {
+            std::env::remove_var(REFUSE_OVERLAY_ENV);
+        }
+    }
+    std::env::set_var(REFUSE_OVERLAY_ENV, "1");
+    let _clear = ClearEnv;
+
+    let fixture = Fixture::new();
+    fixture.pending();
+    let out = fixture._tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let started = out.join("started");
+    let release = out.join("release");
+    let command = fixture._tmp.path().join("fake-proton-restore-fails.sh");
+    script(
+        &command,
+        &format!(
+            "set -e\nprintf 'game wrote' > '{config}'\nprintf started > '{started}'\nwhile [ ! -e '{release}' ]; do sleep 0.02; done\n",
+            config = fixture.real_config.display(),
+            started = started.display(),
+            release = release.display(),
+        ),
+    );
+    std::env::set_var("SteamAppId", "4242");
+    let host = QuickJsHost::new();
+    let live = fixture.live(&[], &[], &host);
+
+    // Corrupt the backup the restore trusts, so putting the player's file back fails.
+    let backup = fixture
+        .ctx
+        .paths
+        .user_files_backup_dir(game_id().as_str(), "steam")
+        .join("0");
+    let wait_for = started.clone();
+    let tamper = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !wait_for.exists() {
+            if std::time::Instant::now() > deadline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::write(&backup, b"tampered").unwrap();
+        std::fs::write(&release, b"").unwrap();
+    });
+    let outcome = game_wrap::wrap(&fixture.ctx, &live, &[command.display().to_string()]).unwrap();
+    tamper.join().unwrap();
+
+    match outcome {
+        WrapOutcome::Ran { restore_error, .. } => {
+            let error = restore_error.expect("a failed restore must be reported, not discarded");
+            assert!(
+                error.to_ascii_lowercase().contains("backup")
+                    || error.to_ascii_lowercase().contains("match"),
+                "the reported failure must name the problem: {error}"
+            );
+        }
+        other => panic!("expected a step-down run: {other:?}"),
+    }
+    // Nothing was put back, so the player's file is still the game's write and the instance
+    // keeps its own copy for the next restore.
+    assert_eq!(std::fs::read(&fixture.real_config).unwrap(), b"game wrote");
     assert_eq!(
         std::fs::read(&fixture.instance_config).unwrap(),
         b"instance config"

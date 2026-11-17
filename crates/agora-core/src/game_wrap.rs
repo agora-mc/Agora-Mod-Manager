@@ -96,6 +96,9 @@ pub enum WrapOutcome {
         mechanism: String,
         exit_code: Option<i32>,
         stepped_down: Option<String>,
+        /// Why putting the player's files back after a step-down failed, if it did. The files
+        /// stay swapped in and the next launch or a restore finishes the job.
+        restore_error: Option<String>,
     },
     /// No instance was chosen, so Steam's command ran untouched and the reason says why.
     PassedThrough {
@@ -326,6 +329,7 @@ pub fn wrap(ctx: &Ctx, live: &LivePacks<'_>, command: &[String]) -> Result<WrapO
                 mechanism: run.mechanism.as_str().to_string(),
                 exit_code: run.status.code(),
                 stepped_down: None,
+                restore_error: None,
             })
         }
         Ok(ViewOutcome::SteppedDown(step)) => {
@@ -652,6 +656,10 @@ fn run_step_down(
     session_id: Option<&str>,
     started: std::time::Instant,
 ) -> Result<WrapOutcome, WrapError> {
+    // Steam's Stop sends SIGTERM. Install the handler before the swap, so a stop at any point
+    // after the player's files change still puts them back before this process exits.
+    let _stop = install_step_down_stop();
+
     crate::game_deploy::deploy(ctx, instance_id, definition, mode)?;
     let farm = crate::game_deploy::deployment_dir(ctx, instance_id)?.ok_or_else(|| {
         crate::game_deploy::DeployError::Other(format!(
@@ -676,36 +684,104 @@ fn run_step_down(
         return Err(WrapError::UserFiles(error));
     }
 
+    // A stop that arrived during the deploy or the swap must still put the player's files back.
+    if step_down_stop_requested() {
+        let restore_error = end_step_down(
+            ctx, live, definition, store, session_id, program, None, started,
+        );
+        return Ok(WrapOutcome::Ran {
+            instance_id: instance_id.to_string(),
+            mechanism: mode.plain_name().to_string(),
+            exit_code: Some(STOP_EXIT_CODE),
+            stepped_down: Some(reason.to_string()),
+            restore_error,
+        });
+    }
+
     let mode_program = remap(program, install, &farm);
     let mode_args: Vec<String> = args
         .iter()
         .map(|arg| remap_arg(arg, install, &farm))
         .collect();
-    let run = Command::new(&mode_program)
+    let mut child = match Command::new(&mode_program)
         .args(&mode_args)
         .current_dir(&farm)
-        .status()
-        .map_err(|error| WrapError::Command(error.to_string()));
-    let status = match run {
-        Ok(status) => status,
+        .spawn()
+    {
+        Ok(child) => child,
         Err(error) => {
-            let _ = crate::game_instance::end_session(ctx, definition, store);
-            if let Some(session) = session_id {
-                finish_session(
-                    ctx,
-                    live,
-                    definition,
-                    Some(session),
-                    program,
-                    0,
-                    None,
-                    started.elapsed(),
-                );
-            }
-            return Err(error);
+            end_step_down(
+                ctx, live, definition, store, session_id, program, None, started,
+            );
+            return Err(WrapError::Command(error.to_string()));
         }
     };
-    let _ = crate::game_instance::end_session(ctx, definition, store);
+    set_step_down_child(Some(child.id()));
+    let wait = child.wait();
+    set_step_down_child(None);
+    let status = match wait {
+        Ok(status) => status,
+        Err(error) => {
+            end_step_down(
+                ctx, live, definition, store, session_id, program, None, started,
+            );
+            return Err(WrapError::Command(error.to_string()));
+        }
+    };
+    if step_down_stop_requested() {
+        // The player asked for this; the session ledger says a stop ended it.
+        crate::session_ledger::record_stop(ctx, instance_id);
+    }
+    let restore_error = end_step_down(
+        ctx,
+        live,
+        definition,
+        store,
+        session_id,
+        program,
+        Some(&status),
+        started,
+    );
+    Ok(WrapOutcome::Ran {
+        instance_id: instance_id.to_string(),
+        mechanism: mode.plain_name().to_string(),
+        exit_code: status.code(),
+        stepped_down: Some(reason.to_string()),
+        restore_error,
+    })
+}
+
+/// The exit code a wrapper yields when Steam's Stop asked it to end: 128 + SIGTERM.
+const STOP_EXIT_CODE: i32 = 143;
+
+/// Put the player's per-user files back after a step-down, report a failure instead of
+/// discarding it, and record the session's end. Returns the failure, if any.
+#[allow(clippy::too_many_arguments)]
+fn end_step_down(
+    ctx: &Ctx,
+    live: &LivePacks<'_>,
+    definition: &GameDefinition,
+    store: &StoreId,
+    session_id: Option<&str>,
+    program: &Path,
+    status: Option<&ExitStatus>,
+    started: std::time::Instant,
+) -> Option<String> {
+    let restore_error = match crate::game_instance::end_session(ctx, definition, store) {
+        Ok(_) => None,
+        Err(error) => {
+            let reason = error.to_string();
+            eprintln!(
+                "agora games wrap: {}",
+                crate::game_user_files::restore_failure_message(
+                    &reason,
+                    definition.id.as_str(),
+                    store.as_str()
+                )
+            );
+            Some(reason)
+        }
+    };
     finish_session(
         ctx,
         live,
@@ -713,15 +789,85 @@ fn run_step_down(
         session_id,
         program,
         0,
-        Some(&status),
+        status,
         started.elapsed(),
     );
-    Ok(WrapOutcome::Ran {
-        instance_id: instance_id.to_string(),
-        mechanism: mode.plain_name().to_string(),
-        exit_code: status.code(),
-        stepped_down: Some(reason.to_string()),
-    })
+    restore_error
+}
+
+#[cfg(target_os = "linux")]
+static STEP_DOWN_CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+#[cfg(target_os = "linux")]
+static STEP_DOWN_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Installs a SIGTERM handler for the step-down command's lifetime and restores the old one.
+#[cfg(target_os = "linux")]
+struct StepDownStop {
+    previous: nix::sys::signal::SigAction,
+}
+
+#[cfg(target_os = "linux")]
+extern "C" fn on_step_down_signal(_signal: i32) {
+    use std::sync::atomic::Ordering;
+    let child = STEP_DOWN_CHILD.load(Ordering::SeqCst);
+    if child > 0 {
+        // Forward to the command only. Its own group is left alone, so a wineserver that
+        // belongs to the prefix and is shared with another launch is never signalled.
+        unsafe { nix::libc::kill(child, nix::libc::SIGTERM) };
+    }
+    STEP_DOWN_STOP.store(true, Ordering::SeqCst);
+}
+
+#[cfg(target_os = "linux")]
+fn install_step_down_stop() -> StepDownStop {
+    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+    use std::sync::atomic::Ordering;
+    STEP_DOWN_CHILD.store(0, Ordering::SeqCst);
+    STEP_DOWN_STOP.store(false, Ordering::SeqCst);
+    let action = SigAction::new(
+        SigHandler::Handler(on_step_down_signal),
+        SaFlags::SA_RESTART,
+        SigSet::empty(),
+    );
+    let previous = unsafe { sigaction(Signal::SIGTERM, &action) }
+        .unwrap_or_else(|_| SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty()));
+    StepDownStop { previous }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for StepDownStop {
+    fn drop(&mut self) {
+        let _ = unsafe {
+            nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGTERM, &self.previous)
+        };
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_step_down_child(pid: Option<u32>) {
+    use std::sync::atomic::Ordering;
+    STEP_DOWN_CHILD.store(pid.map(|pid| pid as i32).unwrap_or(0), Ordering::SeqCst);
+}
+
+#[cfg(target_os = "linux")]
+fn step_down_stop_requested() -> bool {
+    STEP_DOWN_STOP.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(target_os = "linux"))]
+struct StepDownStop;
+
+#[cfg(not(target_os = "linux"))]
+fn install_step_down_stop() -> StepDownStop {
+    StepDownStop
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_step_down_child(_pid: Option<u32>) {}
+
+#[cfg(not(target_os = "linux"))]
+fn step_down_stop_requested() -> bool {
+    false
 }
 
 fn remap(path: &Path, install: &Path, farm: &Path) -> PathBuf {
