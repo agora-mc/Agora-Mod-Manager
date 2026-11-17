@@ -1012,6 +1012,28 @@ fn plan_inis(
     out
 }
 
+/// One entry in the profile's own save folder, as the folder listed it.
+struct SaveEntry {
+    path: PathBuf,
+    metadata: std::io::Result<std::fs::Metadata>,
+}
+
+/// A readable save file's size; a folder or a link counts no file. A size that cannot be read is
+/// reported, never silently counted as 0.
+fn sized_save(entry: SaveEntry, warnings: &mut Vec<String>) -> Option<u64> {
+    match entry.metadata {
+        Ok(meta) if meta.is_file() => Some(meta.len()),
+        Ok(_) => None,
+        Err(error) => {
+            warnings.push(format!(
+                "a save file's size could not be read ({}): {error}",
+                entry.path.display()
+            ));
+            None
+        }
+    }
+}
+
 /// A profile's own saves. Vortex keeps them under the game's shared save folder, in a folder named
 /// after the profile id (`extensions/gamebryo-savegame-management/src/util/profileSavePath.ts:8-20`),
 /// not in the profile folder. Only the count is read here; the files are copied with --copy-saves.
@@ -1020,6 +1042,7 @@ fn plan_saves(
     store: &StoreId,
     profile_id: &str,
     local: bool,
+    warnings: &mut Vec<String>,
 ) -> Result<SavesPlan, ImportError> {
     if !local {
         return Ok(SavesPlan {
@@ -1063,12 +1086,22 @@ fn plan_saves(
     let mut bytes = 0u64;
     match std::fs::read_dir(&from) {
         Ok(entries) => {
-            for entry in entries.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    if meta.is_file() {
-                        files += 1;
-                        bytes += meta.len();
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => SaveEntry {
+                        path: entry.path(),
+                        metadata: entry.metadata(),
+                    },
+                    Err(error) => {
+                        warnings.push(format!(
+                            "an entry in the profile's own save folder could not be read: {error}"
+                        ));
+                        continue;
                     }
+                };
+                if let Some(size) = sized_save(entry, warnings) {
+                    files += 1;
+                    bytes += size;
                 }
             }
         }
@@ -1394,6 +1427,7 @@ pub fn plan(
         &install.discovered.store,
         &profile.id,
         profile.local_saves,
+        &mut warnings,
     )?;
     if profile.local_saves && !saves.local && !saves.note.is_empty() {
         warnings.push(saves.note.clone());
@@ -1591,17 +1625,19 @@ fn plan_mods(
             });
             continue;
         }
-        let mut bytes = 0u64;
-        let mut plugin_files = Vec::new();
-        let mut file_set = BTreeSet::new();
-        for (rel, abs) in &paths {
-            bytes += std::fs::metadata(abs).map(|m| m.len()).unwrap_or(0);
-            file_set.insert(fold_path_case(rel.as_str()));
-            let text = rel.as_str();
-            if !text.contains('/') && mo2::is_plugin_file(text) {
-                plugin_files.push(text.to_string());
+        let (bytes, plugin_files, file_set) = match size_mod_files(&paths) {
+            Ok(sized) => sized,
+            Err((file, error)) => {
+                problems.push(Problem {
+                    line: None,
+                    entry: entry.name.clone(),
+                    reason: format!(
+                        "the size of {file} cannot be read ({error}); the space it needs is unknown, so the mod was not read"
+                    ),
+                });
+                continue;
             }
-        }
+        };
         out.push(PlannedMod {
             mod_id: entry.id.clone(),
             name: entry.name.clone(),
@@ -1620,6 +1656,26 @@ fn plan_mods(
         });
     }
     out
+}
+
+/// A mod folder's total size, its plugin files at the top level, and every file it holds. A file
+/// whose size cannot be read is an error: counting it as 0 would understate what the import needs.
+fn size_mod_files(
+    paths: &[(RelPath, PathBuf)],
+) -> Result<(u64, Vec<String>, BTreeSet<String>), (String, std::io::Error)> {
+    let mut bytes = 0u64;
+    let mut plugin_files = Vec::new();
+    let mut file_set = BTreeSet::new();
+    for (rel, abs) in paths {
+        let meta = std::fs::metadata(abs).map_err(|error| (rel.as_str().to_string(), error))?;
+        bytes += meta.len();
+        file_set.insert(fold_path_case(rel.as_str()));
+        let text = rel.as_str();
+        if !text.contains('/') && mo2::is_plugin_file(text) {
+            plugin_files.push(text.to_string());
+        }
+    }
+    Ok((bytes, plugin_files, file_set))
 }
 
 fn provenance(entry: &VortexMod) -> VortexProvenance {
@@ -2680,8 +2736,27 @@ pub fn run(
                 report.saves_folder = Some(folder.clone());
                 if request.copy_saves {
                     if let Some(from) = &plan.saves.from {
-                        for entry in std::fs::read_dir(from)?.flatten() {
-                            if !entry.path().is_file() {
+                        for entry in std::fs::read_dir(from)? {
+                            let entry = match entry {
+                                Ok(entry) => entry,
+                                Err(error) => {
+                                    report.next_steps.push(format!(
+                                        "an entry in the profile's own save folder could not be read, so it was not copied: {error}"
+                                    ));
+                                    continue;
+                                }
+                            };
+                            let is_file = match entry.metadata() {
+                                Ok(meta) => meta.is_file(),
+                                Err(error) => {
+                                    report.next_steps.push(format!(
+                                        "{} could not be read, so it was not copied: {error}",
+                                        entry.path().display()
+                                    ));
+                                    continue;
+                                }
+                            };
+                            if !is_file {
                                 continue;
                             }
                             let dest = folder.join(entry.file_name());
@@ -3147,6 +3222,32 @@ mod tests {
         write_store(&store, &[("settings###mods###installPath", "{}")]);
         let error = read_state(&store).expect_err("no mods is not an empty setup");
         assert!(matches!(error, ImportError::VortexNoMods), "{error}");
+    }
+
+    #[test]
+    fn a_save_file_size_that_cannot_be_read_is_reported_not_counted_as_zero() {
+        let mut warnings = Vec::new();
+        let entry = SaveEntry {
+            path: PathBuf::from("Save1.ess"),
+            metadata: Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the file is locked",
+            )),
+        };
+        assert_eq!(sized_save(entry, &mut warnings), None);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("size could not be read"));
+        assert!(warnings[0].contains("Save1.ess"));
+    }
+
+    #[test]
+    fn a_file_whose_size_cannot_be_read_is_an_error_not_zero_bytes() {
+        let tmp = tempfile::TempDir::new().expect("a temp folder can be made");
+        let missing = tmp.path().join("gone.esp");
+        let paths = vec![(RelPath::new("gone.esp").unwrap(), missing)];
+        let (file, error) = size_mod_files(&paths).expect_err("a missing file cannot be sized");
+        assert_eq!(file, "gone.esp");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
