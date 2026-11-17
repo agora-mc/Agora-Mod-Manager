@@ -1020,8 +1020,6 @@ fn restore_journal_internal(
         .map_err(|e| UserFilesError::Other(e.to_string()))?;
 
     // 2. Applicable mappings for this store
-    let prefix = crate::game_instance::proton_prefix_checked(ctx, &journal.instance_id)
-        .map_err(|e| UserFilesError::Other(e.to_string()))?;
     let applicable_mappings: Vec<&UserFileMapping> = definition
         .user_files
         .iter()
@@ -1029,6 +1027,14 @@ fn restore_journal_internal(
             m.strategy == UserFileStrategy::JournaledSwap && m.applies_to_store(&journal.store)
         })
         .collect();
+    // A session that journaled no files has nothing whose real path needs resolving, so ending it
+    // must not fail just because the Proton prefix (and its base record) is unavailable.
+    let prefix = if journal.files.is_empty() {
+        None
+    } else {
+        crate::game_instance::proton_prefix_checked(ctx, &journal.instance_id)
+            .map_err(|e| UserFilesError::Other(e.to_string()))?
+    };
 
     // 3. Pre-validate all journal entries BEFORE modifying or deleting any file on disk.
     // "A journal entry whose instance_path matches no mapping for that store,
