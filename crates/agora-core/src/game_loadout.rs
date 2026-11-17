@@ -516,6 +516,14 @@ fn apply_state(
     definition: &GameDefinition,
     state: &GameLoadout,
 ) -> Result<(), String> {
+    for ini in &state.inis {
+        if crate::save_backup::safe_relative(&ini.file).is_none() {
+            return Err(format!(
+                "the loadout's INI '{}' is not a file inside the instance; nothing was applied",
+                ini.file
+            ));
+        }
+    }
     let mut manifest = game_instance::get_manifest(ctx, instance_id).map_err(|e| e.to_string())?;
 
     let wanted: HashMap<&str, bool> = state

@@ -455,7 +455,7 @@ pub fn session_backup(
         .optional()?)
 }
 
-fn safe_relative(path: &str) -> Option<PathBuf> {
+pub(crate) fn safe_relative(path: &str) -> Option<PathBuf> {
     if path.is_empty() {
         return None;
     }
