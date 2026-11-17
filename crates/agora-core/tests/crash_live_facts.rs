@@ -83,7 +83,12 @@ impl Fixture {
     }
 }
 
-fn process_pack(bind: serde_json::Value, detect: &str, line: &str, attrs: serde_json::Value) -> BuiltInPack {
+fn process_pack(
+    bind: serde_json::Value,
+    detect: &str,
+    line: &str,
+    attrs: serde_json::Value,
+) -> BuiltInPack {
     BuiltInPack {
         file: "test/process-pack/pack.json".to_string(),
         json: serde_json::json!({
@@ -157,7 +162,10 @@ fn a_matching_process_fact_binds_by_pid_outside_the_time_window() {
 fn a_matching_working_folder_binds_even_when_the_name_and_time_do_not() {
     let fixture = Fixture::new();
     let cwd = fixture.logs_dir.to_string_lossy().into_owned();
-    fixture.write_log("crash-2.log", &format!("HEADER\nWorking Directory: {cwd}\n"));
+    fixture.write_log(
+        "crash-2.log",
+        &format!("HEADER\nWorking Directory: {cwd}\n"),
+    );
     let pack = process_pack(
         serde_json::json!([
             "working_dir_in_facts",
@@ -201,8 +209,7 @@ fn a_foreign_working_folder_vetoes_a_log_the_time_window_would_bind() {
         "another folder's log must not bind through the time fallback"
     );
     assert!(evidence.collection.seen.iter().any(|seen| {
-        seen.name == "crash-3.log"
-            && seen.reason == RejectedReason::WorkingDirMismatch
+        seen.name == "crash-3.log" && seen.reason == RejectedReason::WorkingDirMismatch
     }));
 }
 

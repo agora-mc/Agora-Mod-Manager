@@ -239,22 +239,30 @@ pub fn stored_log_count(conn: &Connection, instance_id: &str) -> anyhow::Result<
 }
 
 /// The whole-file hashes of artifacts that a live diagnosis already read, from its stored answer.
-/// A stored answer this build cannot decode simply contributes none.
-fn answered_artifact_hashes(
+/// A stored answer this build cannot decode simply contributes none. A caller diagnosing one
+/// session passes its id as `exclude_session` so the session's own earlier answer does not hide
+/// the evidence it is about to read again; every other session's evidence is not reused.
+pub(crate) fn answered_artifact_hashes(
     conn: &Connection,
     instance_id: &str,
+    exclude_session: Option<&str>,
 ) -> Result<BTreeSet<String>, String> {
     let mut stmt = conn
-        .prepare("SELECT answer_json FROM session_answers WHERE instance_id = ?1")
+        .prepare("SELECT session_id, answer_json FROM session_answers WHERE instance_id = ?1")
         .map_err(|error| error.to_string())?;
     let rows = stmt
-        .query_map([instance_id], |row| row.get::<_, String>(0))
+        .query_map([instance_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .map_err(|error| error.to_string())?;
     let mut hashes = BTreeSet::new();
     for row in rows {
-        let Ok(json) = row else {
+        let Ok((session_id, json)) = row else {
             continue;
         };
+        if exclude_session == Some(session_id.as_str()) {
+            continue;
+        }
         if let Ok(StoredAnswer::Analyzed {
             artifact_hashes, ..
         }) = serde_json::from_str::<StoredAnswer>(&json)
@@ -435,7 +443,7 @@ pub fn sweep_instance_logs(
     let analyzed_at = chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339();
     // Logs belonging to crashes Agora already diagnosed live. Read once; a bad answer is skipped,
     // never allowed to stop the sweep.
-    let answered_hashes = answered_artifact_hashes(conn, setup.instance_id)
+    let answered_hashes = answered_artifact_hashes(conn, setup.instance_id, None)
         .map_err(|error| format!("the stored crash answers could not be read: {error}"))?;
     for candidate in &candidates {
         if candidate.size > limits.max_file_bytes {

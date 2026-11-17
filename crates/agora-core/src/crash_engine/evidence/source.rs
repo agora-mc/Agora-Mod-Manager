@@ -85,7 +85,9 @@ pub struct FoundArtifact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RejectedReason {
     OutsideSessionWindow,
-    PidMismatch { found: Option<u32> },
+    PidMismatch {
+        found: Option<u32>,
+    },
     WorkingDirMismatch,
     NoBindDeclared,
     NoBindMatched,
@@ -94,6 +96,8 @@ pub enum RejectedReason {
     NotFinished,
     NotAnArtifact,
     FolderArtifactExpected,
+    /// Another session's stored answer already read this file. It must not become a second crash.
+    AlreadyAnswered,
 }
 
 /// A file collection saw and refused to bind, kept so the reason is shown rather than the file

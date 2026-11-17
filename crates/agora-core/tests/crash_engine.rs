@@ -976,7 +976,10 @@ fn a_strong_tie_between_mods_is_not_overwritten_by_a_possible_side_finding() {
     // The cause stays the suspects' own kind, not the side finding's.
     assert_eq!(answer.cause, Some(Cause::Mod));
     // The side finding is still reported, just not as the answer.
-    assert!(answer.findings.iter().any(|finding| finding.cause == Cause::Memory));
+    assert!(answer
+        .findings
+        .iter()
+        .any(|finding| finding.cause == Cause::Memory));
 }
 
 #[test]

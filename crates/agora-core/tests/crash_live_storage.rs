@@ -172,12 +172,22 @@ fn latest_answer_follows_when_the_session_started_not_when_it_ended_or_was_answe
     .unwrap();
     store_answer(
         &conn,
-        &answer("short-new", "inst", "2026-01-01T02:11:00Z", "the newer session"),
+        &answer(
+            "short-new",
+            "inst",
+            "2026-01-01T02:11:00Z",
+            "the newer session",
+        ),
     )
     .unwrap();
     store_answer(
         &conn,
-        &answer("long-old", "inst", "2026-01-01T04:00:00Z", "the old catch-up"),
+        &answer(
+            "long-old",
+            "inst",
+            "2026-01-01T04:00:00Z",
+            "the old catch-up",
+        ),
     )
     .unwrap();
 

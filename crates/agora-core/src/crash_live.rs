@@ -10,7 +10,7 @@
 //! view comes from core's attribution; only the generic engine facts are built here.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,8 +37,7 @@ use crate::crash_engine::{
 };
 use crate::crash_packs::{
     artifact_handle, detect_parsers_with_snippets, load_built_in_packs, parser_request,
-    run_parser_with_builtin, LoadedCrashPack, MemoryArtifact, ParserDispatch,
-    BUILT_IN_PLUGIN_ID,
+    run_parser_with_builtin, LoadedCrashPack, MemoryArtifact, ParserDispatch, BUILT_IN_PLUGIN_ID,
 };
 use crate::ctx::Ctx;
 use crate::session_ledger::{self, ExitObservation, ManifestChange, SessionRecord};
@@ -1001,6 +1000,50 @@ pub fn catch_up(ctx: &Ctx, instance_id: &str, live: LivePacks<'_>) -> CatchUpRep
             answer,
         });
     }
+    // A launch path closes this instance's orphans itself before any catch-up runs. Those rows are
+    // already closed as `ClosedUnknown`, so the open list above never sees them; a crash in one of
+    // them would otherwise be lost. Diagnose the ones with no answer. A window bounded by the next
+    // session is always safe; with none, only when the game is provably gone, because a running
+    // game could still write into the old session's window.
+    let handled: BTreeSet<String> = caught
+        .iter()
+        .map(|entry| entry.session_id.clone())
+        .collect();
+    let closed_unknown =
+        session_ledger::list(&conn, instance_id, session_ledger::KEPT_SESSIONS).unwrap_or_default();
+    for record in closed_unknown {
+        if handled.contains(record.session_id.as_str())
+            || record.verdict != Some(SessionVerdict::ClosedUnknown)
+        {
+            continue;
+        }
+        if answer_for_session(&conn, &record.session_id)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            continue;
+        }
+        let bounded = parse_time(&record.started_at)
+            .ok()
+            .and_then(|started| {
+                next_session_start(&conn, instance_id, started)
+                    .ok()
+                    .flatten()
+            })
+            .is_some();
+        if !bounded && !provably_gone {
+            continue;
+        }
+        let Some(answer) = diagnose_session_with(ctx, &record.session_id, &live, true) else {
+            continue;
+        };
+        caught.push(CaughtUp {
+            session_id: record.session_id,
+            instance_id: record.instance_id,
+            answer: Some(answer),
+        });
+    }
     CatchUpReport {
         sessions: caught,
         user_files: restore_user_files_if_finished(ctx, instance_id),
@@ -1347,13 +1390,56 @@ fn log_shows_normal_stop(
     })
 }
 
+/// Take out evidence another session's stored answer already read. A crash log is not evidence for
+/// two crashes: a caught-up session must not claim a log a later session already answered, even
+/// when the file still sits in a shared folder. The files stay listed as seen, with the reason, so
+/// nothing vanishes silently.
+fn exclude_answered_evidence(
+    conn: &Connection,
+    record: &SessionRecord,
+    collection: &mut SourceCollection,
+) -> Result<(), String> {
+    let answered = crate::crash_history::answered_artifact_hashes(
+        conn,
+        &record.instance_id,
+        Some(&record.session_id),
+    )
+    .map_err(|error| format!("the stored crash answers could not be read: {error}"))?;
+    if answered.is_empty() {
+        return Ok(());
+    }
+    let mut kept = Vec::with_capacity(collection.bound.len());
+    for found in collection.bound.drain(..) {
+        let already = found.unit == agora_game_api::crash::ArtifactUnit::File
+            && crate::crash_history::content_hash_file(&found.path)
+                .ok()
+                .is_some_and(|hash| answered.contains(&hash));
+        if already {
+            collection
+                .seen
+                .push(crate::crash_engine::evidence::SeenArtifact {
+                    plugin_id: found.plugin_id,
+                    source_id: found.source_id,
+                    name: found.name,
+                    path: found.path,
+                    reason: crate::crash_engine::evidence::RejectedReason::AlreadyAnswered,
+                    modified_at: found.modified.map(crate::crash_engine::evidence::rfc3339),
+                });
+            continue;
+        }
+        kept.push(found);
+    }
+    collection.bound = kept;
+    Ok(())
+}
+
 fn diagnose_record(
     ctx: &Ctx,
     conn: &Connection,
     record: &SessionRecord,
     live: &LivePacks<'_>,
 ) -> Result<Diagnosed, String> {
-    let window = record_window(record)?;
+    let window = evidence_window(conn, record, ctx.clock.now())?;
     let pid = match &record.exit {
         Some(ExitObservation::Code { pid, .. }) => Some(*pid),
         _ => None,
@@ -1367,9 +1453,10 @@ fn diagnose_record(
     let InstanceEvidence {
         resolved,
         packs,
-        collection,
+        mut collection,
         ..
     } = collect_instance_evidence(ctx, &record.instance_id, live, &session, &[])?;
+    exclude_answered_evidence(conn, record, &mut collection)?;
     let game_id = resolved.game_id.clone();
     let runtime_version = resolved.runtime_version.clone();
     let could_not_check = resolved.could_not_check.clone();
@@ -1543,9 +1630,7 @@ fn diagnose_record(
         );
     }
 
-    let at_unix_ms = record_window(record)
-        .ok()
-        .map(|window| crate::crash_engine::evidence::unix_ms(window.started));
+    let at_unix_ms = Some(crate::crash_engine::evidence::unix_ms(window.started));
     let recorded = RecordedCrash {
         record: output.record.clone(),
         bucket: crate::crash_engine::history::parsed_bucket(&output.parsed),
@@ -1605,6 +1690,61 @@ fn record_window(record: &SessionRecord) -> Result<SessionWindow, String> {
         .ok_or_else(|| "the session has no end time".to_string())
         .and_then(parse_time)?;
     Ok(SessionWindow::new(started, ended))
+}
+
+/// The span a session's evidence may cover. A known ending ends it. An unknown ending (a session
+/// Agora caught up on, or one nobody finished) ends when the next session of the same instance
+/// started, so it can never swallow a later session's crash log; with no later session it ends at
+/// `now`, because nothing else can bound it.
+fn evidence_window(
+    conn: &Connection,
+    record: &SessionRecord,
+    now: SystemTime,
+) -> Result<SessionWindow, String> {
+    let started = parse_time(&record.started_at)?;
+    let end_is_unknown = record.ended_at.is_none()
+        || matches!(record.verdict, None | Some(SessionVerdict::ClosedUnknown));
+    let ended = if end_is_unknown {
+        next_session_start(conn, &record.instance_id, started)?.unwrap_or(now)
+    } else {
+        record
+            .ended_at
+            .as_deref()
+            .ok_or_else(|| "the session has no end time".to_string())
+            .and_then(parse_time)?
+    };
+    Ok(SessionWindow::new(started, ended.max(started)))
+}
+
+/// When the next session of this instance started, after `after`. Times are parsed rather than
+/// compared as text: rows written by older builds may use a different RFC 3339 offset.
+fn next_session_start(
+    conn: &Connection,
+    instance_id: &str,
+    after: SystemTime,
+) -> Result<Option<SystemTime>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT started_at FROM launch_history
+              WHERE instance_id = ?1 AND session_id IS NOT NULL",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([instance_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    let mut next: Option<SystemTime> = None;
+    for row in rows {
+        let Ok(text) = row else {
+            continue;
+        };
+        let Ok(candidate) = parse_time(&text) else {
+            continue;
+        };
+        if candidate > after && next.is_none_or(|current| candidate < current) {
+            next = Some(candidate);
+        }
+    }
+    Ok(next)
 }
 
 fn parse_time(text: &str) -> Result<SystemTime, String> {
