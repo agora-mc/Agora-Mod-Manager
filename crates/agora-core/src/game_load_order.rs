@@ -106,6 +106,8 @@ pub enum LoadOrderError {
     RuleSelf(String),
     #[error("'{item}' cannot load after '{after}': '{after}' needs '{item}' as a master")]
     RuleContradictsMaster { item: String, after: String },
+    #[error("'{item}' cannot load after '{after}': '{item}' is always loaded first")]
+    RuleImplicit { item: String, after: String },
     #[error(
         "'{item}' cannot load after '{after}': that would make a loop with the rules already set"
     )]
@@ -983,6 +985,50 @@ fn reaches(edges: &HashMap<String, Vec<String>>, from: &str, to: &str) -> bool {
     false
 }
 
+/// Refuse one load-after rule that can never hold, whatever else is stored: it would put an
+/// always-loaded plugin after a normal one, contradict a master, or close a loop. `next` maps an
+/// item to the items that must come after it, from the masters and the rules being considered.
+fn check_load_after_rule(
+    entries: &[LoadOrderEntry],
+    next: &HashMap<String, Vec<String>>,
+    item: &str,
+    after: &str,
+) -> Result<(), LoadOrderError> {
+    let item_key = key(item);
+    let after_key = key(after);
+    let is_implicit = |name: &str| {
+        entries
+            .iter()
+            .any(|entry| key(&entry.name) == key(name) && entry.implicit)
+    };
+    // An always-loaded plugin is loaded first by the game, so no rule can put it after a normal
+    // plugin; the rule would never hold.
+    if is_implicit(item) && !is_implicit(after) {
+        return Err(LoadOrderError::RuleImplicit {
+            item: item.to_string(),
+            after: after.to_string(),
+        });
+    }
+    // The game's own rules come first: a rule that asks an item to load after one of its masters
+    // can never hold.
+    if let Some(entry) = entries.iter().find(|entry| key(&entry.name) == after_key) {
+        if entry.masters.iter().any(|master| key(master) == item_key) {
+            return Err(LoadOrderError::RuleContradictsMaster {
+                item: item.to_string(),
+                after: after.to_string(),
+            });
+        }
+    }
+    // Adding `item loads after after` closes a loop when item already reaches after.
+    if reaches(next, &item_key, &after_key) {
+        return Err(LoadOrderError::RuleCycle {
+            item: item.to_string(),
+            after: after.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Add a user's load-after rule (MASTER_SPEC §31.4). Returns whether it was new. A rule that
 /// contradicts a master requirement, or that would make a loop with the rules and masters already
 /// in place, is refused with the reason.
@@ -1027,21 +1073,6 @@ pub fn add_load_after_rule(
     let item = canonical(item);
     let after = canonical(after);
 
-    // The game's own rules come first: a rule that asks an item to load after one of its masters
-    // can never hold.
-    if let Some(entry) = order
-        .entries
-        .iter()
-        .find(|entry| key(&entry.name) == key(&after))
-    {
-        if entry.masters.iter().any(|master| key(master) == key(&item)) {
-            return Err(LoadOrderError::RuleContradictsMaster {
-                item: item.clone(),
-                after: after.clone(),
-            });
-        }
-    }
-
     // "next" maps an item to the items that must come after it, from the masters and the rules
     // already set. Adding `item loads after after` closes a loop when item already reaches after.
     let mut next: HashMap<String, Vec<String>> = HashMap::new();
@@ -1055,12 +1086,7 @@ pub fn add_load_after_rule(
             .or_default()
             .push(key(&existing.item));
     }
-    if reaches(&next, &key(&item), &key(&after)) {
-        return Err(LoadOrderError::RuleCycle {
-            item: item.clone(),
-            after: after.clone(),
-        });
-    }
+    check_load_after_rule(&order.entries, &next, &item, &after)?;
 
     let conn = crate::db::local_state_connection(&ctx.paths.local_state_db())
         .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
@@ -1097,18 +1123,68 @@ pub fn remove_load_after_rule(
     Ok(changed > 0)
 }
 
+/// The entries of an instance's list when core can find the game's definition. `None` (an
+/// unknown instance or game) leaves only the rules themselves to check; a caller that already
+/// holds the definition still gets the master checks through [`order_in`].
+fn order_entries_for(ctx: &Ctx, instance_id: &str, list_id: &str) -> Option<Vec<LoadOrderEntry>> {
+    let record = crate::game_instance::get(ctx, instance_id).ok().flatten()?;
+    let definition = ctx.games.game(&record.game)?;
+    order_in(ctx, instance_id, definition, Some(list_id))
+        .ok()
+        .map(|order| order.entries)
+}
+
 /// Replace every load-after rule of one list with `rules`, in one transaction.
 ///
 /// A loadout apply and a multi-profile import both restore a whole set of rules
 /// at once; removing and adding them one by one would leave a half-set behind
-/// if one call failed. A self rule or a blank name is skipped, because neither
-/// can ever be satisfied.
+/// if one call failed. A self or blank rule is skipped, and so is any rule the same
+/// checks as [`add_load_after_rule`] refuse: an always-loaded item after a normal
+/// one, a master contradiction, or a loop in the set, so no path writes a rule
+/// that can never hold.
 pub fn replace_load_after_rules(
     ctx: &Ctx,
     instance_id: &str,
     list_id: &str,
     rules: &[LoadAfterRule],
 ) -> Result<(), LoadOrderError> {
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut proposed: Vec<LoadAfterRule> = Vec::new();
+    for rule in rules {
+        let item = rule.item.trim();
+        let after = rule.after.trim();
+        if item.is_empty() || after.is_empty() || key(item) == key(after) {
+            continue;
+        }
+        if !seen.insert((key(item), key(after))) {
+            continue;
+        }
+        proposed.push(LoadAfterRule {
+            item: item.to_string(),
+            after: after.to_string(),
+        });
+    }
+
+    // Check the whole set at once against the game's masters and against itself, so a bulk
+    // restore runs the same validation as adding one rule at a time. Every proposed rule is an
+    // edge, even one later refused, so a loop through it is found too.
+    let entries = order_entries_for(ctx, instance_id, list_id).unwrap_or_default();
+    let mut next: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in &entries {
+        for master in &entry.masters {
+            next.entry(key(master)).or_default().push(key(&entry.name));
+        }
+    }
+    for rule in &proposed {
+        next.entry(key(&rule.after))
+            .or_default()
+            .push(key(&rule.item));
+    }
+    let accepted: Vec<&LoadAfterRule> = proposed
+        .iter()
+        .filter(|rule| check_load_after_rule(&entries, &next, &rule.item, &rule.after).is_ok())
+        .collect();
+
     let mut conn = crate::db::local_state_connection(&ctx.paths.local_state_db())
         .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
     let tx = conn
@@ -1119,20 +1195,11 @@ pub fn replace_load_after_rules(
         rusqlite::params![instance_id, list_id],
     )
     .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
-    let mut seen: HashSet<(String, String)> = HashSet::new();
-    for rule in rules {
-        let item = rule.item.trim();
-        let after = rule.after.trim();
-        if item.is_empty() || after.is_empty() || key(item) == key(after) {
-            continue;
-        }
-        if !seen.insert((key(item), key(after))) {
-            continue;
-        }
+    for rule in accepted {
         tx.execute(
             "INSERT INTO plugin_load_order_rules (instance_id, list_id, item, after_item)
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![instance_id, list_id, item, after],
+            rusqlite::params![instance_id, list_id, rule.item, rule.after],
         )
         .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
     }

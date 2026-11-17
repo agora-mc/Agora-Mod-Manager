@@ -506,6 +506,76 @@ fn replace_load_after_rules_accepts_cycles_and_master_contradictions() {
 }
 
 #[test]
+fn replace_load_after_rules_keeps_a_rule_that_can_hold() {
+    let h = ReviewHarness::new(Vec::new());
+    let inst = h.instance("replace-valid", "*A.esp\r\n*B.esp\r\n");
+
+    game_load_order::replace_load_after_rules(
+        &h.ctx,
+        &inst.instance_id,
+        "plugins",
+        &[LoadAfterRule {
+            item: "A.esp".into(),
+            after: "B.esp".into(),
+        }],
+    )
+    .unwrap();
+
+    let stored = game_load_order::load_after_rules(&h.ctx, &inst.instance_id, "plugins").unwrap();
+    assert_eq!(
+        stored,
+        [LoadAfterRule {
+            item: "A.esp".into(),
+            after: "B.esp".into(),
+        }],
+        "a valid replacement rule must still be stored: {stored:?}"
+    );
+}
+
+#[test]
+fn replace_load_after_rules_skips_a_rule_that_puts_an_implicit_plugin_after_a_normal_one() {
+    let h = ReviewHarness::new(Vec::new());
+    let inst = h.instance("replace-implicit", "*A.esp\r\n*B.esp\r\n");
+
+    game_load_order::replace_load_after_rules(
+        &h.ctx,
+        &inst.instance_id,
+        "plugins",
+        &[LoadAfterRule {
+            item: "Base.esm".into(),
+            after: "A.esp".into(),
+        }],
+    )
+    .unwrap();
+
+    let stored = game_load_order::load_after_rules(&h.ctx, &inst.instance_id, "plugins").unwrap();
+    assert!(
+        stored.is_empty(),
+        "replace stored a rule that would make the always-loaded Base.esm load after a normal plugin: {stored:?}"
+    );
+}
+
+#[test]
+fn add_load_after_rule_names_the_implicit_plugin_as_the_reason() {
+    let h = ReviewHarness::new(Vec::new());
+    let inst = h.instance("implicit-reason", "*A.esp\r\n*B.esp\r\n");
+
+    let error = game_load_order::add_load_after_rule(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        Some("plugins"),
+        "Base.esm",
+        "A.esp",
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("always loaded first"),
+        "the refusal must name why: {error}"
+    );
+}
+
+#[test]
 fn overlaps_and_notes_cache_collide_across_instances_of_same_game() {
     let h = ReviewHarness::new(Vec::new());
     let inst1 = h.instance("inst-1", "*A.esp\r\n*B.esp\r\n");
