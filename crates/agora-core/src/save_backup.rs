@@ -524,6 +524,63 @@ fn kept_copy_path(dest: &Path) -> Result<PathBuf, SaveBackupError> {
     )))
 }
 
+/// Put `from` at `to` without ever leaving `to` missing: copy to a temp name beside it, verify the
+/// copy, and only then swap it in. A failed copy removes the temp and leaves the current save in
+/// place. A current file that is replaced is kept beside itself in `kept_current`.
+fn copy_into_place(
+    from: &Path,
+    to: &Path,
+    kept_current: &mut Vec<String>,
+) -> Result<(), SaveBackupError> {
+    let Some(parent) = to.parent() else {
+        return Err(SaveBackupError::Other(format!(
+            "{} has no folder",
+            to.display()
+        )));
+    };
+    let name = to
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("save");
+    let temp = parent.join(format!(
+        ".{name}.agora-restore-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    if let Err(source) = fs::copy(from, &temp) {
+        let _ = fs::remove_file(&temp);
+        return Err(read_error(from, source));
+    }
+    if !same_contents(from, &temp)? {
+        let _ = fs::remove_file(&temp);
+        return Err(SaveBackupError::Other(format!(
+            "the copy of {} does not match its backup; the current save was left in place",
+            to.display()
+        )));
+    }
+    let kept = if to.is_file() {
+        let kept = kept_copy_path(to)?;
+        if let Err(source) = fs::rename(to, &kept) {
+            let _ = fs::remove_file(&temp);
+            return Err(write_error(to, source));
+        }
+        Some(kept)
+    } else {
+        None
+    };
+    if let Err(source) = fs::rename(&temp, to) {
+        let _ = fs::remove_file(&temp);
+        // Put the current save back under its own name; a crash here still leaves it in `kept`.
+        if let Some(kept) = &kept {
+            let _ = fs::rename(kept, to);
+        }
+        return Err(write_error(to, source));
+    }
+    if let Some(kept) = kept {
+        kept_current.push(kept.display().to_string());
+    }
+    Ok(())
+}
+
 /// Put a backup's files back into the instance's save folder.
 ///
 /// Never deletes. A current file of the same name is kept beside itself as
@@ -532,7 +589,7 @@ fn kept_copy_path(dest: &Path) -> Result<PathBuf, SaveBackupError> {
 pub fn restore(
     ctx: &Ctx,
     instance_id: &str,
-    definition: &GameDefinition,
+    _definition: &GameDefinition,
     backup_id: &str,
 ) -> Result<SaveRestore, SaveBackupError> {
     if !is_valid_id(backup_id) {
@@ -564,7 +621,11 @@ pub fn restore(
         )));
     }
 
-    let folder = save_folder(ctx, instance_id, definition)?;
+    // The folder the backup was taken from, as it was recorded at backup time. The instance's
+    // current Shared/Own choice may have changed since, and the restore must not follow it: a
+    // backup taken under Own belongs back in the Own folder, and a shared save belongs in the
+    // shared folder it came from.
+    let folder = PathBuf::from(&stored.source);
     fs::create_dir_all(&folder).map_err(|source| write_error(&folder, source))?;
     let files_dir = dir.join(BACKUP_FILES);
 
@@ -582,16 +643,11 @@ pub fn restore(
         if let Some(parent) = to.parent() {
             fs::create_dir_all(parent).map_err(|source| write_error(parent, source))?;
         }
-        if to.is_file() {
-            if same_contents(&from, &to)? {
-                restored += 1;
-                continue;
-            }
-            let kept = kept_copy_path(&to)?;
-            fs::rename(&to, &kept).map_err(|source| write_error(&to, source))?;
-            kept_current.push(kept.display().to_string());
+        if to.is_file() && same_contents(&from, &to)? {
+            restored += 1;
+            continue;
         }
-        fs::copy(&from, &to).map_err(|source| read_error(&from, source))?;
+        copy_into_place(&from, &to, &mut kept_current)?;
         restored += 1;
     }
 

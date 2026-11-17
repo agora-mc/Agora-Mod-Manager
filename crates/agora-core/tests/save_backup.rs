@@ -100,12 +100,77 @@ impl Harness {
     fn backup(&self, instance_id: &str, def: &GameDefinition) -> save_backup::SaveBackup {
         save_backup::backup(&self.ctx, instance_id, def).unwrap()
     }
+
+    fn set_saves(&self, instance_id: &str, saves: SavesChoice) {
+        let path = self
+            .instance_dir(instance_id)
+            .join("instance_manifest.json");
+        let mut manifest: GameInstanceManifest =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest.saves = saves;
+        std::fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    }
 }
 
 impl Drop for Harness {
     fn drop(&mut self) {
         std::env::remove_var("AGORA_TEST_USER_DATA_ROOT");
     }
+}
+
+#[test]
+fn a_restore_goes_to_the_folder_the_backup_was_taken_from() {
+    let h = Harness::new();
+    let def = skyrim();
+    h.make_instance("moved", SavesChoice::Shared);
+    h.write_save("Run.ess", b"the save at backup time");
+    let backup = h.backup("moved", &def);
+    assert_eq!(backup.source, h.shared_saves());
+
+    // The player switches the instance to its own save folder after the backup. A restore must
+    // put the save back where it came from, not where the instance now says saves live.
+    h.set_saves("moved", SavesChoice::Own);
+    h.write_save("Run.ess", b"the save the game holds");
+
+    let restore = save_backup::restore(&h.ctx, "moved", &def, &backup.id).unwrap();
+
+    assert_eq!(restore.folder, h.shared_saves());
+    assert_eq!(h.read_save("Run.ess"), b"the save at backup time");
+}
+
+#[test]
+fn a_failed_copy_leaves_the_current_save_in_place() {
+    let h = Harness::new();
+    let def = skyrim();
+    h.make_instance("failed-copy", SavesChoice::Shared);
+    h.write_save("Run.ess", b"the save at backup time");
+    let backup = h.backup("failed-copy", &def);
+    h.write_save("Run.ess", b"the save the game holds");
+
+    // The backup's copy of the save is gone, so the copy into place cannot succeed.
+    std::fs::remove_file(backup.path.join("files").join("Run.ess")).unwrap();
+    let error = save_backup::restore(&h.ctx, "failed-copy", &def, &backup.id).unwrap_err();
+    assert!(matches!(error, SaveBackupError::Read { .. }), "{error:?}");
+
+    assert_eq!(
+        h.read_save("Run.ess"),
+        b"the save the game holds",
+        "a failed copy left the save missing under its own name"
+    );
+    assert!(
+        !h.shared_saves().join("Run.ess.before-restore").exists(),
+        "a failed copy moved the current save aside before it was safe"
+    );
+    assert!(
+        std::fs::read_dir(h.shared_saves())
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".agora-restore-")),
+        "a failed copy left its temp file behind"
+    );
 }
 
 #[test]
