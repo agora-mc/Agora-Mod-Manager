@@ -295,7 +295,10 @@ pub fn wrap(ctx: &Ctx, live: &LivePacks<'_>, command: &[String]) -> Result<WrapO
             program: program.clone(),
             args: args.clone(),
             environment: None,
-            working_directory: None,
+            // Steam starts the command with the game folder as its working directory. Re-enter
+            // that path inside the namespace after the overlay is mounted, so a relative read or
+            // write goes through the view instead of the folder underneath it.
+            working_directory: Some(install.clone()),
         },
         per_user_files: mounts,
     };
@@ -629,6 +632,7 @@ fn run_step_down(
         .collect();
     let run = Command::new(&mode_program)
         .args(&mode_args)
+        .current_dir(&farm)
         .status()
         .map_err(|error| WrapError::Command(error.to_string()));
     let status = match run {

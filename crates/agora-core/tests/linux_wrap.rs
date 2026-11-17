@@ -379,6 +379,15 @@ fn script(path: &Path, body: &str) {
     std::fs::set_permissions(path, permissions).unwrap();
 }
 
+/// Restore the process working directory when a test that imitates Steam's launch leaves.
+struct RestoreDirectory(PathBuf);
+
+impl Drop for RestoreDirectory {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.0);
+    }
+}
+
 fn latest_session(
     ctx: &CoreContext,
     instance_id: &str,
@@ -515,6 +524,45 @@ fn the_pending_launch_picks_the_instance_opens_the_session_and_mounts_user_files
     assert!(!session.is_empty());
     assert!(ended_at.is_some(), "the wrapper must close its session");
     assert_eq!(verdict.as_deref(), Some("{\"kind\":\"normal\"}"));
+}
+
+#[test]
+fn a_relative_write_lands_in_the_view_not_the_real_game_folder() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    fixture.pending();
+    let command = fixture._tmp.path().join("fake-proton-relative.sh");
+    script(
+        &command,
+        "set -e\nprintf 'relative write' > relative-from-view.txt\nexit 0\n",
+    );
+    std::env::set_var("SteamAppId", "4242");
+    let host = QuickJsHost::new();
+    let live = fixture.live(&[], &[], &host);
+
+    // Steam starts the command with the game folder as its working directory. The inherited
+    // cwd stays on the folder underneath the mount unless the view re-enters it.
+    let _restore = RestoreDirectory(std::env::current_dir().unwrap());
+    std::env::set_current_dir(&fixture.install).unwrap();
+    let outcome = game_wrap::wrap(&fixture.ctx, &live, &[command.display().to_string()]).unwrap();
+    let Some(WrapOutcome::Ran { .. }) = ran_or_skip(outcome) else {
+        return;
+    };
+
+    assert!(
+        !fixture.install.join("relative-from-view.txt").exists(),
+        "the relative write landed in the real game folder, not the view"
+    );
+    let writable = fixture
+        .ctx
+        .paths
+        .instance_dir(&fixture.instance_id)
+        .unwrap()
+        .join("writable");
+    assert_eq!(
+        std::fs::read(writable.join("relative-from-view.txt")).unwrap(),
+        b"relative write"
+    );
 }
 
 #[test]
