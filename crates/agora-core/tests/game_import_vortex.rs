@@ -470,6 +470,29 @@ fn run_makes_an_instance_and_a_second_import_is_refused() {
 }
 
 #[test]
+fn a_profile_id_that_is_a_path_is_refused_before_a_read() {
+    let f = fixture();
+    // The id names the profile's folder under Vortex's user data. A path here would make every
+    // read look outside it.
+    let profiles = format!(
+        r#"{{"p1":{{"id":"../../escape","gameId":"{VORTEX_GAME}","name":"Main","modState":{{"mod-alpha":{{"enabled":true}}}},"features":{{}}}}}}"#
+    );
+    write_store(&f.store, &[("persistent###profiles", profiles)]);
+
+    let report = vortex::scan(&f.ctx, &f.inventory, &f.store).expect("the store scans");
+    let game = &report.games[0];
+    assert!(game.profiles.is_empty(), "{:?}", game.profiles);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("not a folder name")),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
 fn a_profile_that_does_not_exist_is_named() {
     let f = fixture();
     let mut request = request(&f, None);
@@ -1334,4 +1357,325 @@ fn an_import_that_cannot_fit_is_refused_after_stating_the_bytes() {
         "{error}"
     );
     assert!(agora_core::game_instance::list(&f.ctx).unwrap().is_empty());
+}
+
+fn loadout(f: &Fixture, instance: &str, name: &str) -> agora_core::loadout::LoadoutProfile {
+    let dir = f.ctx.paths.instance_dir(instance).unwrap();
+    agora_core::loadout::list_profiles(&dir)
+        .expect("the loadouts list")
+        .into_iter()
+        .find(|profile| profile.name == name)
+        .unwrap_or_else(|| panic!("no loadout '{name}' on {instance}"))
+}
+
+fn content_layer_names(f: &Fixture, instance: &str) -> Vec<String> {
+    let manifest = agora_core::game_instance::get_manifest(&f.ctx, instance).unwrap();
+    manifest
+        .layers
+        .layers()
+        .iter()
+        .filter_map(|layer| match &layer.source {
+            agora_game_api::LayerSource::Content { content } => {
+                agora_core::content_store::get_item(&f.ctx, content)
+                    .ok()
+                    .map(|item| item.name)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The manifest says Alpha supplied the shared file, so Alpha is above Beta even though the rules
+/// alone put Beta above Alpha. Alt adds Gamma (which the rules put between them); the merge must
+/// keep the single-import order, not append Gamma last.
+#[test]
+fn a_merged_import_layers_later_profiles_in_vortex_order() {
+    let f = fixture();
+    add_second_profile(&f);
+    write(
+        &f._tmp.path().join("game/Data/vortex.deployment.json"),
+        br#"{
+  "version": 1,
+  "instance": "test-instance",
+  "files": [
+    { "relPath": "Alpha.esp", "source": "Alpha Folder", "time": 1 },
+    { "relPath": "Beta.esp", "source": "Beta Folder", "time": 1 },
+    { "relPath": "Gamma.esp", "source": "Gamma Folder", "time": 1 },
+    { "relPath": "shared.txt", "source": "Alpha Folder", "time": 1 }
+  ]
+}"#,
+    );
+    let report = vortex::run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("Ordered Merge")),
+        &chosen_profiles(),
+        agora_core::game_import::profiles::Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("the merge runs");
+    let instance = &report.instances[0];
+    // Layers run lowest first: Beta, then Gamma, then Alpha on top.
+    assert_eq!(
+        content_layer_names(&f, instance),
+        vec!["Beta Mod", "Gamma Mod", "Alpha Mod"],
+        "{:?}",
+        report.plan.plans[0].order
+    );
+}
+
+#[test]
+fn a_merged_profile_without_its_own_settings_uses_the_shared_ones() {
+    let f = fixture();
+    add_second_profile(&f);
+    // Alt keeps no INIs of its own (its profile has no local_game_settings) and no plugins list.
+    let alt = f
+        ._tmp
+        .path()
+        .join("Vortex")
+        .join(VORTEX_GAME)
+        .join("profiles")
+        .join("p2");
+    std::fs::remove_file(alt.join("plugins.txt")).unwrap();
+
+    let report = vortex::run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("Shared Settings")),
+        &chosen_profiles(),
+        agora_core::game_import::profiles::Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("the merge runs");
+    let instance = &report.instances[0];
+
+    let main = loadout(&f, instance, "Main").game.expect("a game loadout");
+    assert_eq!(main.inis.len(), 4);
+    assert!(
+        main.inis.iter().all(|ini| ini.contents.is_some()),
+        "Main keeps its own INIs: {:?}",
+        main.inis
+    );
+    assert!(
+        main.plugin_lists.iter().all(|list| list.contents.is_some()),
+        "Main keeps its own plugin list"
+    );
+
+    let alt = loadout(&f, instance, "Alt").game.expect("a game loadout");
+    assert_eq!(alt.inis.len(), main.inis.len());
+    assert!(
+        alt.inis.iter().all(|ini| ini.contents.is_none()),
+        "Alt has no INIs of its own, so it uses the game's shared ones: {:?}",
+        alt.inis
+    );
+    assert!(
+        alt.plugin_lists.iter().all(|list| list.contents.is_none()),
+        "Alt has no plugins.txt of its own, so it uses the game's shared list: {:?}",
+        alt.plugin_lists
+    );
+}
+
+/// Two mods with the same file name and bytes are one content item. Each profile still enables
+/// its own mod, so neither loadout may switch the shared layer off.
+#[test]
+fn two_mods_with_identical_bytes_stay_enabled_in_each_profiles_loadout() {
+    let f = fixture();
+    write(
+        &f.staging.join("Delta Folder/Shared.esp"),
+        b"THE SAME PLUGIN",
+    );
+    write(
+        &f.staging.join("Echo Folder/Shared.esp"),
+        b"THE SAME PLUGIN",
+    );
+    let mods = format!(
+        r#"{{"{VORTEX_GAME}":{{
+  "mod-alpha": {{"id":"mod-alpha","state":"installed","installationPath":"Alpha Folder","attributes":{{"name":"Alpha Mod"}}}},
+  "mod-beta": {{"id":"mod-beta","state":"installed","installationPath":"Beta Folder","attributes":{{"name":"Beta Mod"}}}},
+  "mod-delta": {{"id":"mod-delta","state":"installed","installationPath":"Delta Folder","attributes":{{"name":"Delta Mod"}}}},
+  "mod-echo": {{"id":"mod-echo","state":"installed","installationPath":"Echo Folder","attributes":{{"name":"Echo Mod"}}}}
+}}}}"#
+    );
+    let profiles = format!(
+        r#"{{"p1":{{"id":"p1","gameId":"{VORTEX_GAME}","name":"Main","modState":{{"mod-alpha":{{"enabled":true}},"mod-delta":{{"enabled":true}}}},"features":{{}}}},"p2":{{"id":"p2","gameId":"{VORTEX_GAME}","name":"Alt","modState":{{"mod-beta":{{"enabled":true}},"mod-echo":{{"enabled":true}}}},"features":{{}}}}}}"#
+    );
+    write_store(
+        &f.store,
+        &[
+            ("persistent###mods", mods),
+            ("persistent###profiles", profiles),
+        ],
+    );
+
+    let report = vortex::run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("Same Bytes")),
+        &chosen_profiles(),
+        agora_core::game_import::profiles::Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("the merge runs");
+    let instance = &report.instances[0];
+    let content = content_layer_names(&f, instance);
+    assert_eq!(content.len(), 3, "{content:?}");
+    assert_eq!(
+        enabled_count(&f.ctx, instance, "Main"),
+        2,
+        "Main enables Alpha and Delta's shared layer"
+    );
+    assert_eq!(
+        enabled_count(&f.ctx, instance, "Alt"),
+        2,
+        "Alt enables Beta and Echo's shared layer"
+    );
+}
+
+#[test]
+fn merged_copy_saves_copies_each_profiles_saves_and_says_which() {
+    let f = fixture();
+    add_second_profile(&f);
+    let def = skyrim_like();
+    let rule = agora_core::game_saves::rule_for(&def, &StoreId::steam()).expect("a save rule");
+    let alt_saves = agora_core::game_saves::shared_folder(rule)
+        .expect("the shared save folder")
+        .join("p2");
+    write(&alt_saves.join("AltSave.ess"), b"ALT SAVE");
+    // The same name as Main's save, with different bytes: the two setups must not collide.
+    write(&alt_saves.join("Save1.ess"), b"ALT SAVE WITH THE SAME NAME");
+    let profiles = format!(
+        r#"{{"p1":{{"id":"p1","gameId":"{VORTEX_GAME}","name":"Main","modState":{{"mod-alpha":{{"enabled":true}},"mod-beta":{{"enabled":true}},"mod-gamma":{{"enabled":false}}}},"features":{{"local_game_settings":true,"local_saves":true}}}},"p2":{{"id":"p2","gameId":"{VORTEX_GAME}","name":"Alt","modState":{{"mod-alpha":{{"enabled":true}},"mod-beta":{{"enabled":true}},"mod-gamma":{{"enabled":true}}}},"features":{{"local_saves":true}}}}}}"#
+    );
+    write_store(&f.store, &[("persistent###profiles", profiles)]);
+
+    let mut request = request(&f, Some("Merged Saves"));
+    request.copy_saves = true;
+    let report = vortex::run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request,
+        &chosen_profiles(),
+        agora_core::game_import::profiles::Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("the merge runs");
+    let instance = &report.instances[0];
+
+    let main = report
+        .saves
+        .iter()
+        .find(|save| save.profile == "Main")
+        .expect("Main's saves are reported");
+    assert_eq!(main.copied, 1);
+    let alt = report
+        .saves
+        .iter()
+        .find(|save| save.profile == "Alt")
+        .expect("Alt's saves are reported");
+    assert_eq!(alt.copied, 2, "{alt:?}");
+
+    let main_folder = agora_core::game_saves::own_folder_scoped(rule, instance, Some("Main"))
+        .expect("Main's own save folder");
+    let alt_folder = agora_core::game_saves::own_folder_scoped(rule, instance, Some("Alt"))
+        .expect("Alt's own save folder");
+    assert_ne!(main_folder, alt_folder, "each loadout has its own folder");
+    let main_loadout = loadout(&f, instance, "Main").game.expect("Main's loadout");
+    assert_eq!(
+        main_loadout.save_folder.as_deref(),
+        Some("Main"),
+        "a merged profile never adopts the instance's single folder"
+    );
+    let alt_loadout = loadout(&f, instance, "Alt").game.expect("Alt's loadout");
+    assert_eq!(alt_loadout.save_folder.as_deref(), Some("Alt"));
+    assert_eq!(
+        std::fs::read(main_folder.join("Save1.ess")).unwrap(),
+        b"SAVE ONE",
+        "Main's same-named save is its own"
+    );
+    assert_eq!(
+        std::fs::read(alt_folder.join("Save1.ess")).unwrap(),
+        b"ALT SAVE WITH THE SAME NAME",
+        "Alt's same-named save was not overwritten by Main's"
+    );
+    assert!(
+        alt_folder.join("AltSave.ess").is_file(),
+        "Alt's other save was copied too"
+    );
+}
+
+#[test]
+fn merged_copy_saves_a_profile_with_no_save_folder_yet_copies_nothing() {
+    let f = fixture();
+    add_second_profile(&f);
+    let profiles = format!(
+        r#"{{"p1":{{"id":"p1","gameId":"{VORTEX_GAME}","name":"Main","modState":{{"mod-alpha":{{"enabled":true}},"mod-beta":{{"enabled":true}}}},"features":{{"local_game_settings":true,"local_saves":true}}}},"p2":{{"id":"p2","gameId":"{VORTEX_GAME}","name":"Alt","modState":{{"mod-gamma":{{"enabled":true}}}},"features":{{"local_saves":true}}}}}}"#
+    );
+    write_store(&f.store, &[("persistent###profiles", profiles)]);
+
+    let mut request = request(&f, Some("No Alt Saves"));
+    request.copy_saves = true;
+    let report = vortex::run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request,
+        &chosen_profiles(),
+        agora_core::game_import::profiles::Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("a profile with no saves folder yet is not an error");
+    let alt = report
+        .saves
+        .iter()
+        .find(|save| save.profile == "Alt")
+        .expect("Alt's saves are reported");
+    assert_eq!(alt.copied, 0);
+    assert_eq!(alt.skipped_existing, 0);
+}
+
+#[test]
+fn a_failure_after_the_merge_started_abandons_the_half_made_instance() {
+    use agora_core::game_import::ImportPhase;
+
+    let f = fixture();
+    add_second_profile(&f);
+    // Alt keeps its own INI, planned before the run. It is removed while run() makes the first
+    // profile's instance, so reading it during the merge fails after the instance exists.
+    let profiles = format!(
+        r#"{{"p1":{{"id":"p1","gameId":"{VORTEX_GAME}","name":"Main","modState":{{"mod-alpha":{{"enabled":true}},"mod-beta":{{"enabled":true}}}},"features":{{"local_game_settings":true,"local_saves":true}}}},"p2":{{"id":"p2","gameId":"{VORTEX_GAME}","name":"Alt","modState":{{"mod-gamma":{{"enabled":true}}}},"features":{{"local_game_settings":true}}}}}}"#
+    );
+    write_store(&f.store, &[("persistent###profiles", profiles)]);
+    let alt_ini = f
+        ._tmp
+        .path()
+        .join("Vortex")
+        .join(VORTEX_GAME)
+        .join("profiles")
+        .join("p2")
+        .join("Skyrim.ini");
+    write(&alt_ini, b"[General]\r\nsAlt=1\r\n");
+
+    let error = vortex::run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("Broken Merge")),
+        &chosen_profiles(),
+        agora_core::game_import::profiles::Grouping::Merged,
+        Default::default(),
+        &|progress| {
+            if progress.phase == ImportPhase::Instance {
+                let _ = std::fs::remove_file(&alt_ini);
+            }
+        },
+    )
+    .expect_err("the missing profile INI fails the merge");
+    assert!(error.to_string().contains("could not be read"), "{error}");
+    assert!(
+        agora_core::game_instance::list(&f.ctx).unwrap().is_empty(),
+        "the half-made instance was left behind"
+    );
 }

@@ -208,6 +208,15 @@ pub fn parse_state(store: &VortexStore) -> Result<VortexState, ImportError> {
                 }
                 let id = get_str(profile, "id").unwrap_or_else(|| profile_id.clone());
                 let name = get_str(profile, "name").unwrap_or_else(|| id.clone());
+                // The id names the profile's folder under Vortex's user data, so it is a folder
+                // name and never a path. An id that could escape that folder is refused before
+                // any read is joined to it.
+                if let Err(reason) = mo2::check_mod_folder_name(&id) {
+                    warnings.push(format!(
+                        "profile '{name}' in {game_id} has an id that is not a folder name ({reason}); it was skipped"
+                    ));
+                    continue;
+                }
                 let mut enabled = BTreeMap::new();
                 if let Some(mod_state) = profile.get("modState").and_then(Value::as_object) {
                     for (mod_id, entry) in mod_state {
@@ -1003,6 +1012,28 @@ fn plan_inis(
     out
 }
 
+/// One entry in the profile's own save folder, as the folder listed it.
+struct SaveEntry {
+    path: PathBuf,
+    metadata: std::io::Result<std::fs::Metadata>,
+}
+
+/// A readable save file's size; a folder or a link counts no file. A size that cannot be read is
+/// reported, never silently counted as 0.
+fn sized_save(entry: SaveEntry, warnings: &mut Vec<String>) -> Option<u64> {
+    match entry.metadata {
+        Ok(meta) if meta.is_file() => Some(meta.len()),
+        Ok(_) => None,
+        Err(error) => {
+            warnings.push(format!(
+                "a save file's size could not be read ({}): {error}",
+                entry.path.display()
+            ));
+            None
+        }
+    }
+}
+
 /// A profile's own saves. Vortex keeps them under the game's shared save folder, in a folder named
 /// after the profile id (`extensions/gamebryo-savegame-management/src/util/profileSavePath.ts:8-20`),
 /// not in the profile folder. Only the count is read here; the files are copied with --copy-saves.
@@ -1011,6 +1042,7 @@ fn plan_saves(
     store: &StoreId,
     profile_id: &str,
     local: bool,
+    warnings: &mut Vec<String>,
 ) -> Result<SavesPlan, ImportError> {
     if !local {
         return Ok(SavesPlan {
@@ -1054,12 +1086,22 @@ fn plan_saves(
     let mut bytes = 0u64;
     match std::fs::read_dir(&from) {
         Ok(entries) => {
-            for entry in entries.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    if meta.is_file() {
-                        files += 1;
-                        bytes += meta.len();
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => SaveEntry {
+                        path: entry.path(),
+                        metadata: entry.metadata(),
+                    },
+                    Err(error) => {
+                        warnings.push(format!(
+                            "an entry in the profile's own save folder could not be read: {error}"
+                        ));
+                        continue;
                     }
+                };
+                if let Some(size) = sized_save(entry, warnings) {
+                    files += 1;
+                    bytes += size;
                 }
             }
         }
@@ -1337,7 +1379,7 @@ pub fn plan(
         .map(|m| (m.mod_id.clone(), m.file_set.clone()))
         .collect();
     let (manifest_winners, owners, unmatched) =
-        match_manifest(game, &manifest_search.entries, &folded_sets);
+        match_manifest(&folder_ids_of(game), &manifest_search.entries, &folded_sets);
     manifest.matched = manifest_winners.len();
     if unmatched > 0 {
         warnings.push(format!(
@@ -1385,6 +1427,7 @@ pub fn plan(
         &install.discovered.store,
         &profile.id,
         profile.local_saves,
+        &mut warnings,
     )?;
     if profile.local_saves && !saves.local && !saves.note.is_empty() {
         warnings.push(saves.note.clone());
@@ -1582,17 +1625,19 @@ fn plan_mods(
             });
             continue;
         }
-        let mut bytes = 0u64;
-        let mut plugin_files = Vec::new();
-        let mut file_set = BTreeSet::new();
-        for (rel, abs) in &paths {
-            bytes += std::fs::metadata(abs).map(|m| m.len()).unwrap_or(0);
-            file_set.insert(fold_path_case(rel.as_str()));
-            let text = rel.as_str();
-            if !text.contains('/') && mo2::is_plugin_file(text) {
-                plugin_files.push(text.to_string());
+        let sized = match size_mod_files(&paths) {
+            Ok(sized) => sized,
+            Err((file, error)) => {
+                problems.push(Problem {
+                    line: None,
+                    entry: entry.name.clone(),
+                    reason: format!(
+                        "the size of {file} cannot be read ({error}); the space it needs is unknown, so the mod was not read"
+                    ),
+                });
+                continue;
             }
-        }
+        };
         out.push(PlannedMod {
             mod_id: entry.id.clone(),
             name: entry.name.clone(),
@@ -1602,15 +1647,45 @@ fn plan_mods(
             folder: entry.installation_folder.clone(),
             enabled,
             files: paths.len(),
-            bytes,
+            bytes: sized.bytes,
             provenance: provenance(entry),
-            plugin_files,
+            plugin_files: sized.plugin_files,
             rules: entry.rules.clone(),
             paths,
-            file_set,
+            file_set: sized.file_set,
         });
     }
     out
+}
+
+/// What reading a mod folder's files found.
+#[derive(Debug)]
+struct SizedModFiles {
+    bytes: u64,
+    plugin_files: Vec<String>,
+    file_set: BTreeSet<String>,
+}
+
+/// A mod folder's total size, its plugin files at the top level, and every file it holds. A file
+/// whose size cannot be read is an error: counting it as 0 would understate what the import needs.
+fn size_mod_files(paths: &[(RelPath, PathBuf)]) -> Result<SizedModFiles, (String, std::io::Error)> {
+    let mut bytes = 0u64;
+    let mut plugin_files = Vec::new();
+    let mut file_set = BTreeSet::new();
+    for (rel, abs) in paths {
+        let meta = std::fs::metadata(abs).map_err(|error| (rel.as_str().to_string(), error))?;
+        bytes += meta.len();
+        file_set.insert(fold_path_case(rel.as_str()));
+        let text = rel.as_str();
+        if !text.contains('/') && mo2::is_plugin_file(text) {
+            plugin_files.push(text.to_string());
+        }
+    }
+    Ok(SizedModFiles {
+        bytes,
+        plugin_files,
+        file_set,
+    })
 }
 
 fn provenance(entry: &VortexMod) -> VortexProvenance {
@@ -1718,10 +1793,30 @@ fn read_manifest(path: &Path) -> ManifestRead {
     }
 }
 
+/// A mod's installation folder and id, folded, both naming the mod. The manifest's `source` may
+/// spell either one.
+fn folder_ids(mods: &[PlannedMod]) -> HashMap<String, String> {
+    let mut by_folder = HashMap::new();
+    for entry in mods {
+        by_folder.insert(fold_path_case(&entry.folder), entry.mod_id.clone());
+        by_folder.insert(fold_path_case(&entry.mod_id), entry.mod_id.clone());
+    }
+    by_folder
+}
+
+fn folder_ids_of(game: &VortexGame) -> HashMap<String, String> {
+    let mut by_folder = HashMap::new();
+    for entry in &game.mods {
+        by_folder.insert(fold_path_case(&entry.installation_folder), entry.id.clone());
+        by_folder.insert(fold_path_case(&entry.id), entry.id.clone());
+    }
+    by_folder
+}
+
 /// What the manifest says supplied each file, and which imported mods hold that file. Keys are
 /// folded. A manifest entry whose `source` names no imported mod is not counted.
 fn match_manifest(
-    game: &VortexGame,
+    by_folder: &HashMap<String, String>,
     entries: &[ManifestEntry],
     mod_sets: &HashMap<String, BTreeSet<String>>,
 ) -> (
@@ -1729,11 +1824,6 @@ fn match_manifest(
     BTreeMap<String, Vec<String>>,
     usize,
 ) {
-    let mut by_folder = HashMap::new();
-    for entry in &game.mods {
-        by_folder.insert(fold_path_case(&entry.installation_folder), entry.id.clone());
-        by_folder.insert(fold_path_case(&entry.id), entry.id.clone());
-    }
     let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (mod_id, files) in mod_sets {
         for file in files {
@@ -2666,23 +2756,16 @@ pub fn run(
                     &def,
                     SavesChoice::Own,
                     request.copy_saves,
+                    None,
                 )?;
                 let folder = crate::game_saves::own_folder(rule, &instance_id)?;
                 report.saves_folder = Some(folder.clone());
                 if request.copy_saves {
                     if let Some(from) = &plan.saves.from {
-                        for entry in std::fs::read_dir(from)?.flatten() {
-                            if !entry.path().is_file() {
-                                continue;
-                            }
-                            let dest = folder.join(entry.file_name());
-                            if dest.exists() {
-                                report.saves_skipped_existing += 1;
-                                continue;
-                            }
-                            std::fs::copy(entry.path(), &dest)?;
-                            report.saves_copied += 1;
-                        }
+                        let (copied, skipped, notes) = copy_save_folder(from, &folder)?;
+                        report.saves_copied = copied;
+                        report.saves_skipped_existing = skipped;
+                        report.next_steps.extend(notes);
                     }
                 } else if plan.saves.files > 0 {
                     report.next_steps.push(format!(
@@ -2851,6 +2934,16 @@ pub fn plan_profiles(
     })
 }
 
+/// What one profile's saves did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProfileSavesReport {
+    pub profile: String,
+    pub copied: usize,
+    pub skipped_existing: usize,
+    /// What happened when nothing was copied, or something could not be read.
+    pub note: Option<String>,
+}
+
 /// What importing several profiles did.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MultiProfileReport {
@@ -2859,6 +2952,8 @@ pub struct MultiProfileReport {
     pub instances: Vec<String>,
     /// The loadout profiles a merge created, by name.
     pub loadouts: Vec<String>,
+    /// What each profile's own saves did, in profile order.
+    pub saves: Vec<ProfileSavesReport>,
 }
 
 fn add_mod_to_merged(
@@ -2903,12 +2998,157 @@ fn add_mod_to_merged(
     Ok(item_id)
 }
 
+/// Copy the files directly inside `from` into `folder`, keeping a file already there. An entry
+/// or a size that cannot be read is returned as a note, never silently skipped.
+fn copy_save_folder(
+    from: &Path,
+    folder: &Path,
+) -> Result<(usize, usize, Vec<String>), ImportError> {
+    std::fs::create_dir_all(folder).map_err(|e| {
+        ImportError::Other(format!(
+            "the instance's save folder {} could not be made: {e}",
+            folder.display()
+        ))
+    })?;
+    let mut copied = 0usize;
+    let mut skipped = 0usize;
+    let mut notes = Vec::new();
+    let entries = match std::fs::read_dir(from) {
+        Ok(entries) => entries,
+        // The planner already counts an absent folder as no saves.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0, notes)),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                notes.push(format!(
+                    "an entry in {} could not be read, so it was not copied: {error}",
+                    from.display()
+                ));
+                continue;
+            }
+        };
+        let is_file = match entry.metadata() {
+            Ok(meta) => meta.is_file(),
+            Err(error) => {
+                notes.push(format!(
+                    "{} could not be read, so it was not copied: {error}",
+                    entry.path().display()
+                ));
+                continue;
+            }
+        };
+        if !is_file {
+            continue;
+        }
+        let dest = folder.join(entry.file_name());
+        if dest.exists() {
+            skipped += 1;
+            continue;
+        }
+        std::fs::copy(entry.path(), &dest).map_err(|e| {
+            ImportError::Other(format!(
+                "{} could not be copied to {}: {e}",
+                entry.path().display(),
+                dest.display()
+            ))
+        })?;
+        copied += 1;
+    }
+    Ok((copied, skipped, notes))
+}
+
+/// Every chosen profile's mods, in the order one import of all of them would put them: the
+/// deployment manifest decides, and Vortex's rules break ties.
+fn merged_mod_order(
+    definition: &GameDefinition,
+    plan: &MultiProfilePlan,
+) -> Result<Vec<String>, ImportError> {
+    // The first profile's mods are already on the instance, including the disabled ones an
+    // `--all-mods` run stored; every later profile adds only what it enables.
+    let mut union: BTreeMap<String, PlannedMod> = BTreeMap::new();
+    for (index, profile_plan) in plan.plans.iter().enumerate() {
+        for item in &profile_plan.mods {
+            if index > 0 && !item.enabled {
+                continue;
+            }
+            union
+                .entry(item.mod_id.clone())
+                .or_insert_with(|| item.clone());
+        }
+    }
+    let mods: Vec<PlannedMod> = union.into_values().collect();
+    let install = plan
+        .plans
+        .first()
+        .map(|plan| plan.install_location.clone())
+        .ok_or_else(|| ImportError::Other("no profile was planned".into()))?;
+    let search = find_manifests(Some(definition), &install);
+    let folded_sets: HashMap<String, BTreeSet<String>> = mods
+        .iter()
+        .map(|mod_| (mod_.mod_id.clone(), mod_.file_set.clone()))
+        .collect();
+    let (winners, owners, _) = match_manifest(&folder_ids(&mods), &search.entries, &folded_sets);
+    let (order, _, _) = order_mods(&mods, &winners, &owners);
+    Ok(order)
+}
+
+/// Put the instance's content layers in `order`'s order (highest first). The layers are added as
+/// the union is stored; this gives them Vortex's layer order rather than the order they arrived.
+fn order_merged_layers(
+    ctx: &Ctx,
+    instance_id: &str,
+    order: &[String],
+    mod_to_item: &HashMap<String, String>,
+) -> Result<(), ImportError> {
+    let mut item_rank: HashMap<String, usize> = HashMap::new();
+    for (index, mod_id) in order.iter().enumerate() {
+        if let Some(item) = mod_to_item.get(mod_id) {
+            item_rank
+                .entry(item.clone())
+                .and_modify(|rank| *rank = (*rank).min(index))
+                .or_insert(index);
+        }
+    }
+    let mut manifest = game_instance::get_manifest(ctx, instance_id)?;
+    let mut layers = manifest.layers.layers().to_vec();
+    let positions: Vec<usize> = layers
+        .iter()
+        .enumerate()
+        .filter(|(_, layer)| matches!(&layer.source, agora_game_api::LayerSource::Content { .. }))
+        .map(|(index, _)| index)
+        .collect();
+    let rank_of = |layer: &agora_game_api::Layer| match &layer.source {
+        agora_game_api::LayerSource::Content { content } => {
+            item_rank.get(content).copied().unwrap_or(usize::MAX)
+        }
+        _ => usize::MAX,
+    };
+    let mut content: Vec<agora_game_api::Layer> = positions
+        .iter()
+        .map(|index| layers[*index].clone())
+        .collect();
+    // An order index of 0 is the highest layer; the layer list runs lowest first.
+    content.sort_by_key(|layer| std::cmp::Reverse(rank_of(layer)));
+    for (position, layer) in positions.into_iter().zip(content) {
+        layers[position] = layer;
+    }
+    manifest.layers =
+        agora_game_api::LayerStack::new(layers).map_err(|e| ImportError::Other(e.to_string()))?;
+    game_deploy::write_instance_manifest_atomic(ctx, instance_id, &manifest)?;
+    Ok(())
+}
+
+/// One profile's state on the merged instance. Its own INIs and plugin list are the profile's;
+/// a profile that has neither uses the game's shared settings, never the first profile's copies.
 fn profile_state_for_merge(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
     plan: &VortexPlan,
-    layer_mod: &HashMap<String, Option<String>>,
+    layer_mod: &HashMap<String, Vec<String>>,
 ) -> Result<crate::game_loadout::GameLoadout, ImportError> {
     let mut state =
         crate::game_loadout::capture(ctx, instance_id, definition).map_err(ImportError::Other)?;
@@ -2921,26 +3161,43 @@ fn profile_state_for_merge(
     for item in &mut state.content {
         item.enabled = layer_mod
             .get(item.item.as_str())
-            .and_then(|mod_id| mod_id.as_deref())
-            .is_some_and(|mod_id| enabled.contains(mod_id));
+            .is_some_and(|mods| mods.iter().any(|mod_id| enabled.contains(mod_id.as_str())));
     }
-    if plan.plugins.kept {
-        if let Some(rule) = definition.load_orders.first() {
+
+    // A profile without its own plugins.txt keeps the game's shared list. A loadout entry with no
+    // contents means the instance has no copy, so the game reads the shared file.
+    let (plugins_path, _) = plugin_files(&plan.store, &plan.vortex_game, &plan.profile_id);
+    let own_plugins = plugins_path.is_file();
+    let first_rule = definition.load_orders.first();
+    let plugin_contents = if own_plugins && plan.plugins.kept {
+        first_rule.map(|rule| {
             let lines: Vec<(String, bool)> = plan
                 .plugins
                 .lines
                 .iter()
                 .map(|line| (line.name.clone(), line.active))
                 .collect();
-            let bytes = game_plugins::list_bytes(rule, &lines);
-            if let Some(list) = state.plugin_lists.iter_mut().find(|l| l.list == rule.id) {
-                list.contents = Some(bytes);
-            }
+            game_plugins::list_bytes(rule, &lines)
+        })
+    } else {
+        None
+    };
+    for list in &mut state.plugin_lists {
+        list.contents = None;
+    }
+    if let Some(rule) = first_rule {
+        if let Some(list) = state.plugin_lists.iter_mut().find(|l| l.list == rule.id) {
+            list.contents = plugin_contents.clone();
         }
+    }
+
+    // Likewise, only this profile's own INI copies go in the loadout. Every other INI is shared.
+    for ini in &mut state.inis {
+        ini.contents = None;
     }
     for ini in &plan.inis {
         let contents = match std::fs::read(&ini.from) {
-            Ok(bytes) => Some(bytes),
+            Ok(bytes) => bytes,
             Err(e) => {
                 return Err(ImportError::Other(format!(
                     "the profile's INI {} could not be read: {e}",
@@ -2949,13 +3206,29 @@ fn profile_state_for_merge(
             }
         };
         if let Some(existing) = state.inis.iter_mut().find(|i| i.file == ini.instance_path) {
-            existing.contents = contents;
+            existing.contents = Some(contents);
         } else {
             state.inis.push(crate::game_loadout::GameLoadoutIni {
                 file: ini.instance_path.clone(),
-                contents,
+                contents: Some(contents),
             });
         }
+    }
+    // The game's plugin list is also one of its user files, so keep the INI-shaped entry in step
+    // with the plugin list above rather than clearing it after writing the list.
+    if let Some(rule) = first_rule {
+        if let Some(ini) = state
+            .inis
+            .iter_mut()
+            .find(|ini| ini.file == rule.file.as_str())
+        {
+            ini.contents = plugin_contents;
+        }
+    }
+
+    // The profile's own load-after rules replace anything captured from the first profile.
+    for rules in &mut state.rules {
+        rules.rules = Vec::new();
     }
     if let Some(rule) = definition.load_orders.first() {
         let rules: Vec<crate::game_load_order::LoadAfterRule> = plan
@@ -2981,6 +3254,8 @@ fn profile_state_for_merge(
     } else {
         SavesChoice::Shared
     };
+    // A merged import has no earlier own folder to adopt: every own-saves profile gets its own.
+    state.save_folder = plan.local_saves.then(|| plan.profile.clone());
     Ok(state)
 }
 
@@ -3006,6 +3281,7 @@ pub fn run_profiles(
     match grouping {
         super::profiles::Grouping::Separate => {
             let mut instances = Vec::new();
+            let mut saves = Vec::new();
             for profile in profiles {
                 let request = VortexRequest {
                     profile: profile.clone(),
@@ -3018,23 +3294,35 @@ pub fn run_profiles(
                     ..base.clone()
                 };
                 let report = run(ctx, inventory, &request, options, progress)?;
-                if let Some(instance) = report.instance_id {
+                if let Some(instance) = report.instance_id.clone() {
                     instances.push(instance);
                 }
+                saves.push(ProfileSavesReport {
+                    profile: report.plan.profile.clone(),
+                    copied: report.saves_copied,
+                    skipped_existing: report.saves_skipped_existing,
+                    note: report
+                        .saves_folder
+                        .is_none()
+                        .then(|| "the profile uses the game's shared saves".to_string()),
+                });
             }
             Ok(MultiProfileReport {
                 plan,
                 instances,
                 loadouts: Vec::new(),
+                saves,
             })
         }
         super::profiles::Grouping::Merged => {
             let request = VortexRequest {
                 profile: profiles[0].clone(),
+                // The merged branch copies each profile's saves into its own loadout folder.
+                copy_saves: false,
                 ..base.clone()
             };
-            let report = run(ctx, inventory, &request, options, progress)?;
-            let instance_id = report
+            let first_report = run(ctx, inventory, &request, options, progress)?;
+            let instance_id = first_report
                 .instance_id
                 .clone()
                 .ok_or_else(|| ImportError::Other("the base import made no instance".into()))?;
@@ -3045,58 +3333,154 @@ pub fn run_profiles(
                 .cloned()
                 .ok_or_else(|| ImportError::Other("the game definition is missing".into()))?;
 
-            // Every mod the chosen profiles enable, not just the first's.
-            let mut mod_to_item: HashMap<String, String> = HashMap::new();
-            for profile_plan in &plan.plans {
-                for item in profile_plan.mods.iter().filter(|m| m.enabled) {
-                    if mod_to_item.contains_key(&item.mod_id) {
-                        continue;
+            let merged = (|| -> Result<(Vec<String>, Vec<ProfileSavesReport>), ImportError> {
+                // Every mod the chosen profiles bring, not just the first's. A mod two profiles
+                // enable with identical bytes is still one content item, but it belongs to both.
+                let mut mod_to_item: HashMap<String, String> = HashMap::new();
+                for (index, profile_plan) in plan.plans.iter().enumerate() {
+                    for item in &profile_plan.mods {
+                        if index > 0 && !item.enabled {
+                            continue;
+                        }
+                        if mod_to_item.contains_key(&item.mod_id) {
+                            continue;
+                        }
+                        let item_id =
+                            add_mod_to_merged(ctx, &instance_id, &definition, profile_plan, item)?;
+                        mod_to_item.insert(item.mod_id.clone(), item_id);
                     }
-                    let item_id =
-                        add_mod_to_merged(ctx, &instance_id, &definition, profile_plan, item)?;
-                    mod_to_item.insert(item.mod_id.clone(), item_id);
                 }
-            }
 
-            let reverse: HashMap<String, String> = mod_to_item
-                .iter()
-                .map(|(mod_id, item_id)| (item_id.clone(), mod_id.clone()))
-                .collect();
-            let manifest = game_instance::get_manifest(ctx, &instance_id)?;
-            let mut layer_mod: HashMap<String, Option<String>> = HashMap::new();
-            for layer in manifest.layers.layers() {
-                if let agora_game_api::LayerSource::Content { content } = &layer.source {
-                    layer_mod.insert(layer.id.as_str().to_string(), reverse.get(content).cloned());
+                // Lay the union out in Vortex's order, not in the order it was stored.
+                let order = merged_mod_order(&definition, &plan)?;
+                order_merged_layers(ctx, &instance_id, &order, &mod_to_item)?;
+
+                let mut item_mods: HashMap<String, Vec<String>> = HashMap::new();
+                for (mod_id, item_id) in &mod_to_item {
+                    item_mods
+                        .entry(item_id.clone())
+                        .or_default()
+                        .push(mod_id.clone());
                 }
-            }
+                let manifest = game_instance::get_manifest(ctx, &instance_id)?;
+                let mut layer_mod: HashMap<String, Vec<String>> = HashMap::new();
+                for layer in manifest.layers.layers() {
+                    if let agora_game_api::LayerSource::Content { content } = &layer.source {
+                        layer_mod.insert(
+                            layer.id.as_str().to_string(),
+                            item_mods.get(content).cloned().unwrap_or_default(),
+                        );
+                    }
+                }
 
-            let mut loadouts = Vec::new();
-            for (profile, profile_plan) in profiles.iter().zip(plan.plans.iter()) {
-                let state = profile_state_for_merge(
+                let mut loadouts = Vec::new();
+                for (profile, profile_plan) in profiles.iter().zip(plan.plans.iter()) {
+                    let state = profile_state_for_merge(
+                        ctx,
+                        &instance_id,
+                        &definition,
+                        profile_plan,
+                        &layer_mod,
+                    )?;
+                    crate::game_loadout::save_game_profile(ctx, &instance_id, profile, state)
+                        .map_err(ImportError::Other)?;
+                    loadouts.push(profile.clone());
+                }
+
+                // The instance keeps the first profile's setup, including its save choice and
+                // the loadout's own save folder.
+                crate::game_loadout::apply_game_profile_with_undo(
                     ctx,
                     &instance_id,
                     &definition,
-                    profile_plan,
-                    &layer_mod,
-                )?;
-                crate::game_loadout::save_game_profile(ctx, &instance_id, profile, state)
-                    .map_err(ImportError::Other)?;
-                loadouts.push(profile.clone());
-            }
-            // The instance keeps the first profile's setup.
-            crate::game_loadout::apply_game_profile_with_undo(
-                ctx,
-                &instance_id,
-                &definition,
-                &profiles[0],
-            )
-            .map_err(|e| ImportError::Other(e.to_string()))?;
+                    &profiles[0],
+                )
+                .map_err(|e| ImportError::Other(e.to_string()))?;
 
-            Ok(MultiProfileReport {
-                plan,
-                instances: vec![instance_id],
-                loadouts,
-            })
+                // Every own-saving profile copies into its own loadout's save folder, so two mod
+                // setups never load each other's saves. A file already there is kept and
+                // counted; an unreadable one is named.
+                let mut saves = Vec::new();
+                for (profile, profile_plan) in profiles.iter().zip(plan.plans.iter()) {
+                    if !profile_plan.saves.local {
+                        saves.push(ProfileSavesReport {
+                            profile: profile.clone(),
+                            copied: 0,
+                            skipped_existing: 0,
+                            note: Some("the profile uses the game's shared saves".to_string()),
+                        });
+                        continue;
+                    }
+                    let Some(rule) =
+                        crate::game_saves::rule_for(&definition, &profile_plan.store_id)
+                    else {
+                        saves.push(ProfileSavesReport {
+                            profile: profile.clone(),
+                            copied: 0,
+                            skipped_existing: 0,
+                            note: Some(
+                                "the game has no save-folder setting for this install, so its saves stay shared"
+                                    .to_string(),
+                            ),
+                        });
+                        continue;
+                    };
+                    let folder =
+                        crate::game_saves::own_folder_scoped(rule, &instance_id, Some(profile))
+                            .map_err(|e| ImportError::Other(e.to_string()))?;
+                    if !base.copy_saves {
+                        let note = if profile_plan.saves.files > 0 {
+                            format!(
+                                "Agora did not copy {} save file(s): they are under Documents, which needs --copy-saves. To copy them by hand, copy the files in {} into {}",
+                                profile_plan.saves.files,
+                                profile_plan
+                                    .saves
+                                    .from
+                                    .as_ref()
+                                    .map(|path| path.display().to_string())
+                                    .unwrap_or_default(),
+                                folder.display()
+                            )
+                        } else {
+                            "the profile's own save folder is empty".to_string()
+                        };
+                        saves.push(ProfileSavesReport {
+                            profile: profile.clone(),
+                            copied: 0,
+                            skipped_existing: 0,
+                            note: Some(note),
+                        });
+                        continue;
+                    }
+                    let Some(from) = &profile_plan.saves.from else {
+                        saves.push(ProfileSavesReport {
+                            profile: profile.clone(),
+                            copied: 0,
+                            skipped_existing: 0,
+                            note: Some("the profile's own save folder is empty".to_string()),
+                        });
+                        continue;
+                    };
+                    let (copied, skipped, notes) = copy_save_folder(from, &folder)?;
+                    saves.push(ProfileSavesReport {
+                        profile: profile.clone(),
+                        copied,
+                        skipped_existing: skipped,
+                        note: (!notes.is_empty()).then(|| notes.join("; ")),
+                    });
+                }
+                Ok((loadouts, saves))
+            })();
+
+            match merged {
+                Ok((loadouts, saves)) => Ok(MultiProfileReport {
+                    plan,
+                    instances: vec![instance_id],
+                    loadouts,
+                    saves,
+                }),
+                Err(error) => Err(abandon_half_made_instance(ctx, &instance_id, error)),
+            }
         }
     }
 }
@@ -3138,6 +3522,32 @@ mod tests {
         write_store(&store, &[("settings###mods###installPath", "{}")]);
         let error = read_state(&store).expect_err("no mods is not an empty setup");
         assert!(matches!(error, ImportError::VortexNoMods), "{error}");
+    }
+
+    #[test]
+    fn a_save_file_size_that_cannot_be_read_is_reported_not_counted_as_zero() {
+        let mut warnings = Vec::new();
+        let entry = SaveEntry {
+            path: PathBuf::from("Save1.ess"),
+            metadata: Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the file is locked",
+            )),
+        };
+        assert_eq!(sized_save(entry, &mut warnings), None);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("size could not be read"));
+        assert!(warnings[0].contains("Save1.ess"));
+    }
+
+    #[test]
+    fn a_file_whose_size_cannot_be_read_is_an_error_not_zero_bytes() {
+        let tmp = tempfile::TempDir::new().expect("a temp folder can be made");
+        let missing = tmp.path().join("gone.esp");
+        let paths = vec![(RelPath::new("gone.esp").unwrap(), missing)];
+        let (file, error) = size_mod_files(&paths).expect_err("a missing file cannot be sized");
+        assert_eq!(file, "gone.esp");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]

@@ -45,6 +45,10 @@ pub struct GameInstanceManifest {
     /// Absent in older manifests, which read as `Shared`.
     #[serde(default, skip_serializing_if = "SavesChoice::is_shared")]
     pub saves: SavesChoice,
+    /// The loadout whose own save folder this instance is using, when one was applied. Absent is
+    /// the instance's single own folder, the layout instances had before per-loadout saves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_scope: Option<String>,
     /// Where the instance was imported from, when it came from another manager's setup (MASTER_SPEC
     /// §26.10). An import refuses to repeat itself unless it is given a new name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -93,6 +97,7 @@ impl GameInstanceManifest {
             layers: LayerStack::default(),
             deployment: None,
             saves: SavesChoice::Shared,
+            save_scope: None,
             imported_from: None,
         }
     }
@@ -416,6 +421,7 @@ pub fn create_with_options(
         layers: LayerStack::default(),
         deployment: None,
         saves: SavesChoice::Shared,
+        save_scope: None,
         imported_from: None,
     };
 

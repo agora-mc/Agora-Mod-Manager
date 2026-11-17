@@ -5578,6 +5578,39 @@ async fn run_loadout_command(
             if json {
                 println!("{}", serde_json::to_string_pretty(&profiles)?);
             } else {
+                let manifest = agora_core::game_instance::get_manifest(ctx, &instance).ok();
+                let definition = manifest
+                    .as_ref()
+                    .and_then(|m| m.runtime_identity.as_ref())
+                    .and_then(|runtime| ctx.games.game(&runtime.game));
+                let store = manifest
+                    .as_ref()
+                    .and_then(|m| m.runtime_identity.as_ref())
+                    .map(|runtime| runtime.store.clone());
+                let saves = |profile: &agora_core::loadout::LoadoutProfile| -> String {
+                    let Some(state) = &profile.game else {
+                        return "-".to_string();
+                    };
+                    match state.saves {
+                        agora_core::game_instance::SavesChoice::Shared => "shared".to_string(),
+                        agora_core::game_instance::SavesChoice::Own => match (definition, &store) {
+                            (Some(definition), Some(store)) => {
+                                agora_core::game_saves::rule_for(definition, store)
+                                    .and_then(|rule| {
+                                        agora_core::game_saves::own_folder_scoped(
+                                            rule,
+                                            &instance,
+                                            state.save_folder.as_deref(),
+                                        )
+                                        .ok()
+                                    })
+                                    .map(|folder| folder.display().to_string())
+                                    .unwrap_or_else(|| "own (folder unknown)".to_string())
+                            }
+                            _ => "own".to_string(),
+                        },
+                    }
+                };
                 let rows: Vec<Vec<String>> = profiles
                     .iter()
                     .map(|p| {
@@ -5586,10 +5619,15 @@ async fn run_loadout_command(
                             .as_ref()
                             .map(|game| game.content.iter().filter(|item| item.enabled).count())
                             .unwrap_or(p.enabled_mods.len());
-                        vec![p.name.clone(), p.created_at.clone(), entries.to_string()]
+                        vec![
+                            p.name.clone(),
+                            p.created_at.clone(),
+                            entries.to_string(),
+                            saves(p),
+                        ]
                     })
                     .collect();
-                print_table(&["Name", "Created", "Entries"], &rows);
+                print_table(&["Name", "Created", "Entries", "Saves"], &rows);
             }
         }
         LoadoutCmd::Apply {
@@ -10201,7 +10239,7 @@ fn run_games_import(
                 if json {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 } else {
-                    print_multi_run(&report.instances, &report.loadouts);
+                    print_vortex_multi_run(&report.instances, &report.loadouts, &report.saves);
                 }
                 return Ok(());
             }
@@ -10404,6 +10442,31 @@ fn print_vortex_multi_plan(plan: &agora_core::game_import::vortex::MultiProfileP
     println!("  {}", plan.suggestion.note);
     for warning in &plan.warnings {
         eprintln!("warning: {warning}");
+    }
+}
+
+fn print_vortex_multi_run(
+    instances: &[String],
+    loadouts: &[String],
+    saves: &[agora_core::game_import::vortex::ProfileSavesReport],
+) {
+    print_multi_run(instances, loadouts);
+    for save in saves {
+        if save.copied > 0 {
+            println!(
+                "Copied {} save file(s) from profile '{}'.",
+                save.copied, save.profile
+            );
+        }
+        if save.skipped_existing > 0 {
+            println!(
+                "Kept {} save file(s) already in the merged instance's save folder, from profile '{}'.",
+                save.skipped_existing, save.profile
+            );
+        }
+        if let Some(note) = &save.note {
+            println!("Saves for profile '{}': {note}", save.profile);
+        }
     }
 }
 

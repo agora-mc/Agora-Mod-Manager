@@ -72,6 +72,11 @@ pub struct GameLoadout {
     pub rules: Vec<GameLoadoutRules>,
     #[serde(default)]
     pub saves: SavesChoice,
+    /// The own save folder this loadout uses. `Some(scope)` names a folder under the instance;
+    /// `None` with `saves = Own` means the instance's single own folder, adopted from before
+    /// loadouts had folders of their own. Unused when `saves = Shared`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_folder: Option<String>,
 }
 
 /// The state an apply replaced, kept so the change can be undone.
@@ -176,6 +181,10 @@ pub fn capture(
         inis,
         rules,
         saves: manifest.saves,
+        save_folder: match manifest.saves {
+            SavesChoice::Shared => None,
+            SavesChoice::Own => manifest.save_scope.clone(),
+        },
     })
 }
 
@@ -189,7 +198,31 @@ pub fn create_game_profile(
     if name.trim().is_empty() {
         return Err("A loadout profile needs a name".into());
     }
-    let state = capture(ctx, instance_id, definition)?;
+    let mut state = capture(ctx, instance_id, definition)?;
+    if state.saves == SavesChoice::Own {
+        let dir = instance_dir(ctx, instance_id)?;
+        let single_claimed = loadout::list_profiles(&dir)
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|profile| {
+                profile.name != name
+                    && profile.game.as_ref().is_some_and(|game| {
+                        game.saves == SavesChoice::Own && game.save_folder.is_none()
+                    })
+            });
+        let store = crate::game_ini::store_of(ctx, instance_id).map_err(|e| e.to_string())?;
+        let single_has_saves = crate::game_saves::rule_for(definition, &store)
+            .and_then(|rule| crate::game_saves::own_folder(rule, instance_id).ok())
+            .is_some_and(|folder| folder_has_saves(&folder));
+        state.save_folder = match &state.save_folder {
+            // A named folder belongs to the loadout that made it; this one gets its own.
+            Some(_) => Some(name.to_string()),
+            // The single own folder is adopted by the first own-saves loadout only, and only
+            // when it already holds saves the player can see in the game.
+            None if single_claimed || !single_has_saves => Some(name.to_string()),
+            None => None,
+        };
+    }
     let enabled_mods = state
         .content
         .iter()
@@ -278,7 +311,8 @@ pub fn update_game_profile(
         .game
         .as_ref()
         .ok_or_else(|| format!("'{profile_name}' is not a game-instance loadout"))?;
-    let current = capture(ctx, instance_id, definition)?;
+    let mut current = capture(ctx, instance_id, definition)?;
+    current.save_folder = old_state.save_folder.clone();
     let changes = diff(old_state, &current);
     let enabled_mods = current
         .content
@@ -518,6 +552,24 @@ fn apply_state(
     definition: &GameDefinition,
     state: &GameLoadout,
 ) -> Result<(), String> {
+    for ini in &state.inis {
+        if crate::save_backup::safe_relative(&ini.file).is_none() {
+            return Err(format!(
+                "the loadout's INI '{}' is not a file inside the instance; nothing was applied",
+                ini.file
+            ));
+        }
+    }
+    // The caller holds the instance lock. The save choice edits the game INI, so take the same
+    // user-files lock every other INI edit takes before touching it.
+    let store = crate::game_ini::store_of(ctx, instance_id).map_err(|e| e.to_string())?;
+    let _user_files = ctx
+        .lock_manager
+        .acquire(
+            LockResource::GameUserFiles(definition.id.clone(), store.clone()),
+            "apply_game_loadout",
+        )
+        .map_err(|e| e.to_string())?;
     let mut manifest = game_instance::get_manifest(ctx, instance_id).map_err(|e| e.to_string())?;
 
     let wanted: HashMap<&str, bool> = state
@@ -572,7 +624,32 @@ fn apply_state(
         .map_err(|e| e.to_string())?;
     }
 
+    // After the loadout's own INIs are in place, so the save-folder setting is not overwritten.
+    // A game without a save-folder setting keeps the recorded choice as it always did.
+    if crate::game_saves::rule_for(definition, &store).is_some() {
+        let scope = if state.saves == SavesChoice::Own {
+            state.save_folder.as_deref()
+        } else {
+            None
+        };
+        crate::game_saves::set_choice_locked(
+            ctx,
+            instance_id,
+            definition,
+            &store,
+            state.saves,
+            true,
+            scope,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
     Ok(())
+}
+
+/// Whether a folder holds anything (the single own save folder has saves to adopt).
+fn folder_has_saves(folder: &std::path::Path) -> bool {
+    std::fs::read_dir(folder).is_ok_and(|entries| entries.flatten().next().is_some())
 }
 
 fn remove_if_present(path: &std::path::Path) -> Result<(), String> {
