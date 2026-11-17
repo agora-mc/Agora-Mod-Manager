@@ -4986,7 +4986,7 @@ fn describe_session(session: &agora_core::crash_live::SessionBrief) -> String {
         Some(SessionVerdict::Froze) => "froze",
         Some(SessionVerdict::Stopped) => "was stopped",
         Some(SessionVerdict::Normal) => "closed normally",
-        Some(SessionVerdict::ClosedUnknown) => "ended, but how is unknown",
+        Some(SessionVerdict::ClosedUnknown) => "ended, but Agora could not tell how",
         None => "its ending was not recorded",
     };
     match &session.ended_at {
