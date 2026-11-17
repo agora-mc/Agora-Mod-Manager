@@ -539,7 +539,7 @@ impl Resolver {
         allow_closest_version: bool,
     ) -> LauncherResult<ResolvedArtifact> {
         let item = {
-            let conn = open_registry_db(&self.ctx.paths.registry_db())?;
+            let conn = self.ctx.registry_connection_fresh()?;
             registry::get_item_by_id(&conn, item_id)?.ok_or_else(|| LauncherError::Generic {
                 code: "ERR_ITEM_NOT_FOUND".into(),
                 message: format!("Registry item '{item_id}' not found."),
@@ -633,7 +633,7 @@ impl Resolver {
     ) -> LauncherResult<(Vec<ResolvedDep>, Vec<DepConflict>)> {
         let dependency_view = self.dependency_view(manifest);
         let (dependency_map, aliases, known_conflicts, dep_display) = {
-            let conn = open_registry_db(&self.ctx.paths.registry_db())?;
+            let conn = self.ctx.registry_connection_fresh()?;
             let dependency_map = registry::get_all_manifest_dependencies(&conn)?;
             let alias_pairs = registry::get_all_mod_aliases(&conn)?;
             let known_conflicts = registry::get_known_conflicts(&conn)?;
@@ -903,7 +903,7 @@ impl Resolver {
 
     async fn load_curated_dep(&self, item_id: &str, manifest: &InstanceManifest) -> DepDisposition {
         let item = {
-            let conn = match open_registry_db(&self.ctx.paths.registry_db()) {
+            let conn = match self.ctx.registry_connection_fresh() {
                 Ok(c) => c,
                 Err(e) => {
                     return DepDisposition::Unresolved {
@@ -1018,7 +1018,7 @@ impl Resolver {
     ) -> LauncherResult<(DepDisposition, Option<String>)> {
         let mut reasons = Vec::new();
         let registry_item = {
-            let conn = open_registry_db(&self.ctx.paths.registry_db())?;
+            let conn = self.ctx.registry_connection_fresh()?;
             registry::get_item_by_id(&conn, key)?
         };
         match registry_item {
@@ -1733,7 +1733,7 @@ impl Resolver {
         metadata: &agora_core::dependency_ops::JarDeps,
     ) -> std::collections::HashMap<String, String> {
         let mut mappings = std::collections::HashMap::new();
-        let Ok(connection) = open_registry_db(&self.ctx.paths.registry_db()) else {
+        let Ok(connection) = self.ctx.registry_connection_fresh() else {
             return mappings;
         };
         let aliases = registry::get_all_mod_aliases(&connection)
@@ -2427,7 +2427,7 @@ pinned_version: None,
         // conflict_id.
         {
             let (known_conflicts, alias_pairs) = {
-                let conn = open_registry_db(&self.ctx.paths.registry_db())?;
+                let conn = self.ctx.registry_connection_fresh()?;
                 (
                     registry::get_known_conflicts(&conn)?,
                     registry::get_all_mod_aliases(&conn)?,
@@ -2500,7 +2500,7 @@ pinned_version: None,
             }
             SourceType::Curated => {
                 let item = {
-                    let conn = open_registry_db(&self.ctx.paths.registry_db()).ok()?;
+                    let conn = self.ctx.registry_connection_fresh().ok()?;
                     registry::get_item_by_id(&conn, item_id).ok()??
                 };
                 let candidates = self
@@ -4080,20 +4080,6 @@ fn pinned_version_honoured(pin: Option<&str>, disposition: &DepDisposition) -> O
         },
         _ => None,
     }
-}
-
-fn open_registry_db(path: &std::path::Path) -> LauncherResult<rusqlite::Connection> {
-    if !path.is_file() {
-        return Err(LauncherError::RegistryMissing);
-    }
-    let conn = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|_| LauncherError::RegistryMissing)?;
-    conn.pragma_update(None, "query_only", "ON")
-        .map_err(|_| LauncherError::RegistryMissing)?;
-    Ok(conn)
 }
 
 // ---------------------------------------------------------------------------

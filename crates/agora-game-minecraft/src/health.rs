@@ -1076,6 +1076,26 @@ fn compatibility_bridge_present(
 /// Phase 3 property: this function NEVER requires registry.db. If the registry
 /// connection is unavailable, curated-conflict checks are skipped — the rest
 /// of the scan still runs.
+/// Open the catalog for health reads only after its bundle verified.
+///
+/// A health report is advisory data, not an install decision, so a stale
+/// catalog is fine. A debug build with a hand-built unsigned `registry.db`
+/// (the test fixtures) is allowed; a release build never opens an unsigned one.
+fn open_health_registry(path: &std::path::Path) -> Option<rusqlite::Connection> {
+    let root = path.parent()?;
+    let bundle = root.join("registry.bundle");
+    #[cfg(debug_assertions)]
+    if !bundle.exists() && !root.join("registry.db.sig").exists() {
+        return db::registry_connection(path).ok();
+    }
+    agora_core::registry_sync::open_verified_registry_with_trust(
+        root,
+        &agora_core::registry_bundle::RegistryTrust::production(),
+    )
+    .ok()
+    .map(agora_core::registry_sync::VerifiedRegistry::into_connection)
+}
+
 pub fn health(
     instance_dir: &Path,
     manifest: &InstanceManifest,
@@ -1155,7 +1175,7 @@ fn health_from_inventory(
     //     in subsequent checks. (registry.db, optional — Phase 3 decoupling)
     let (alias_pairs, curated_deps, catalog_mods): RegistryHealthInputs = registry_db_path
         .filter(|path| path.exists())
-        .and_then(|path| db::registry_connection(path).ok())
+        .and_then(|path| open_health_registry(path))
         .map(|conn| {
             (
                 registry::get_all_mod_aliases(&conn).unwrap_or_default(),
@@ -1586,7 +1606,7 @@ fn health_from_inventory(
     // 7. Curated known_conflicts (registry.db, optional — Phase 3 decoupling)
     if let Some(reg_path) = registry_db_path {
         if reg_path.exists() {
-            if let Ok(conn) = db::registry_connection(reg_path) {
+            if let Some(conn) = open_health_registry(reg_path) {
                 if let Ok(conflicts) = registry::get_known_conflicts(&conn) {
                     for conflict in &conflicts {
                         let a_versions = installed_versions_for_conflict_side(

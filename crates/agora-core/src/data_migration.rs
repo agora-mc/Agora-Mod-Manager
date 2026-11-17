@@ -31,6 +31,8 @@ pub struct MigrationInventory {
     pub has_local_state_db: bool,
     /// Whether a `registry.db` exists at the source.
     pub has_registry_db: bool,
+    /// Whether a signed `registry.bundle` exists at the source.
+    pub has_registry_bundle: bool,
     /// Instance IDs found at the source.
     pub instance_ids: Vec<String>,
 }
@@ -101,6 +103,7 @@ impl DataMigrationService {
         let mut total_size_bytes: u64 = 0;
         let mut has_local_state_db = false;
         let mut has_registry_db = false;
+        let mut has_registry_bundle = false;
         let mut instance_ids = Vec::new();
 
         Self::walk_dir(
@@ -127,6 +130,9 @@ impl DataMigrationService {
                 if rp == "registry.db" {
                     has_registry_db = true;
                 }
+                if rp == "registry.bundle" {
+                    has_registry_bundle = true;
+                }
                 // Detect instances: files under instances/<id>/...
                 if let Some(rest) = rp.strip_prefix("instances/") {
                     if let Some(instance_id) = rest.split('/').next() {
@@ -148,6 +154,7 @@ impl DataMigrationService {
             total_size_bytes,
             has_local_state_db,
             has_registry_db,
+            has_registry_bundle,
             instance_ids,
         })
     }
@@ -233,6 +240,7 @@ impl DataMigrationService {
         // SQLite databases: no silent merge.
         let dest_local_state_db = self.dest.local_state_db();
         let dest_registry_db = self.dest.registry_db();
+        let dest_registry_bundle = self.dest.registry_bundle();
 
         if inventory.has_local_state_db && dest_local_state_db.exists() {
             conflicts.push(MigrationConflict {
@@ -248,6 +256,12 @@ impl DataMigrationService {
                 reason:
                     "Destination already has a registry.db. No silent merge of SQLite databases."
                         .into(),
+            });
+        }
+        if inventory.has_registry_bundle && dest_registry_bundle.exists() {
+            conflicts.push(MigrationConflict {
+                rel_path: "registry.bundle".into(),
+                reason: "Destination already has a signed registry bundle. No silent merge.".into(),
             });
         }
 
@@ -294,6 +308,8 @@ impl DataMigrationService {
             self.dest.local_state_db(),
             self.dest.registry_db(),
             self.dest.registry_signature(),
+            self.dest.registry_bundle(),
+            self.dest.registry_bundle_previous(),
         ];
         for path in &files_to_backup {
             if path.exists() {
@@ -428,7 +444,13 @@ impl DataMigrationService {
     /// Restore destination state from a backup directory.
     fn restore_backup(&self, backup_dir: &Path) -> LauncherResult<()> {
         // Restore top-level files.
-        let files_to_restore = ["local_state.db", "registry.db", "registry.db.sig"];
+        let files_to_restore = [
+            "local_state.db",
+            "registry.db",
+            "registry.db.sig",
+            "registry.bundle",
+            "registry.bundle.prev",
+        ];
         for filename in &files_to_restore {
             let backup_file = backup_dir.join(filename);
             let dest_file = self.dest.root().join(filename);

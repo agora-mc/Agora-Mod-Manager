@@ -231,7 +231,21 @@ impl RegistryService {
     }
 
     /// Open a read-only connection to the resolved registry database.
+    ///
+    /// The catalog is verified in this call. A debug-only `AGORA_DEV_REGISTRY_DB`
+    /// override is an explicit developer choice and is opened unsigned, as before.
     pub fn connection(&self) -> LauncherResult<rusqlite::Connection> {
+        #[cfg(debug_assertions)]
+        if self.development_registry_active() {
+            return self.connection_unverified();
+        }
+        self.ctx.registry_connection()
+    }
+
+    /// An unsigned connection to the resolved path. Only the debug-only dev
+    /// override reaches this.
+    #[cfg(debug_assertions)]
+    fn connection_unverified(&self) -> LauncherResult<rusqlite::Connection> {
         let path = self.resolve_db_path()?;
         if !path.exists() {
             return Err(LauncherError::RegistryMissing);
@@ -265,7 +279,11 @@ impl RegistryService {
         if self.development_registry_active() {
             return get_game_item(&self.connection()?, item_id);
         }
-        let registry = crate::registry_sync::open_verified_registry(self.ctx.paths.root())?;
+        let registry = crate::registry_sync::open_verified_registry_with_trust(
+            self.ctx.paths.root(),
+            &self.ctx.registry_trust,
+        )?;
+        registry.require_fresh()?;
         get_game_item(registry.connection(), item_id)
     }
 
@@ -279,10 +297,11 @@ impl RegistryService {
         item_id: &str,
         pubkey_hex: &str,
     ) -> LauncherResult<Option<GameCatalogItem>> {
-        let registry = crate::registry_sync::open_verified_registry_with_key(
+        let registry = crate::registry_sync::open_verified_registry_with_trust(
             self.ctx.paths.root(),
-            pubkey_hex,
+            &crate::registry_bundle::RegistryTrust::with_key(pubkey_hex),
         )?;
+        registry.require_fresh()?;
         get_game_item(registry.connection(), item_id)
     }
 

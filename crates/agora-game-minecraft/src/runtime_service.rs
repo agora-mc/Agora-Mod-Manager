@@ -17,17 +17,7 @@ impl RuntimeService {
     }
 
     fn registry_conn(&self) -> Option<rusqlite::Connection> {
-        let path = self.ctx.paths.registry_db();
-        if path.exists() {
-            rusqlite::Connection::open_with_flags(
-                &path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-            .ok()
-        } else {
-            None
-        }
+        self.ctx.registry_connection().ok()
     }
 
     pub fn effective_catalog(&self) -> RuntimeCatalog {

@@ -70,6 +70,11 @@ function BannerView({ state, status, error, actions }: BannerProps) {
               {' '}· Update available: {status.latest_tag}
             </span>
           )}
+          {status?.stale && (
+            <span className="text-amber-600 dark:text-amber-400">
+              {' '}· Stale: installs and updates wait for a refresh
+            </span>
+          )}
         </span>
         <button
           onClick={actions.sync}

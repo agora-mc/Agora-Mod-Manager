@@ -622,6 +622,8 @@ export interface RegistryStatus {
   latest_tag: string | null;
   update_available: boolean;
   checked: boolean;
+  stale: boolean;
+  expires_at: string | null;
   message: string;
 }
 

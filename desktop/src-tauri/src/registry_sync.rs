@@ -66,6 +66,8 @@ pub fn get_status<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> RegistryStatu
             latest_tag: None,
             update_available: false,
             checked: false,
+            stale: false,
+            expires_at: None,
             message: "No catalog found. Click Check for Updates.".to_string(),
         },
     }

@@ -1027,11 +1027,7 @@ fn read_instance_manifest(
 }
 
 fn open_registry(ctx: &Ctx) -> LauncherResult<rusqlite::Connection> {
-    let path = ctx.paths.registry_db();
-    if !path.exists() {
-        return Err(LauncherError::RegistryMissing);
-    }
-    agora_core::db::registry_connection(&path).map_err(|_| LauncherError::RegistryMissing)
+    ctx.registry_connection_fresh()
 }
 
 // ---------------------------------------------------------------------------

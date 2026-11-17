@@ -178,8 +178,22 @@ impl AppPaths {
     }
 
     /// Path to the registry Ed25519 signature sidecar.
+    ///
+    /// Kept for reading a cache written before signed bundles. New installs
+    /// carry the signature inside [`Self::registry_bundle`].
     pub fn registry_signature(&self) -> PathBuf {
         self.root.join("registry.db.sig")
+    }
+
+    /// The signed catalog bundle: the database and its signature as one file.
+    pub fn registry_bundle(&self) -> PathBuf {
+        self.root.join("registry.bundle")
+    }
+
+    /// The previous verified bundle, kept so a crash during replacement leaves a
+    /// usable catalog behind.
+    pub fn registry_bundle_previous(&self) -> PathBuf {
+        self.root.join("registry.bundle.prev")
     }
 
     /// Root directory for all instances (`instances/`).
