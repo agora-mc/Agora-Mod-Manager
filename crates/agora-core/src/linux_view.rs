@@ -299,7 +299,7 @@ mod linux_impl {
         fuse_dash_o: CString,
         fuse_data: CString,
         fuse_mountinfo_probe: Vec<u8>,
-        fuse_message: Vec<u8>,
+        fuse_message_prefix: Vec<u8>,
         kernel_message: Vec<u8>,
     }
 
@@ -407,7 +407,7 @@ mod linux_impl {
                 fuse_data: CString::new(fuse_data)
                     .map_err(|_| ViewError::Setup("a view path contains a NUL".into()))?,
                 fuse_mountinfo_probe: probe,
-                fuse_message: b"K\tfuse-overlayfs\n".to_vec(),
+                fuse_message_prefix: b"K\tfuse-overlayfs\t".to_vec(),
                 kernel_message: b"K\tkernel overlayfs with userxattr\n".to_vec(),
             })
         }
@@ -471,7 +471,11 @@ mod linux_impl {
     }
 
     enum Message {
-        Ran(OverlayMechanism),
+        Ran {
+            mechanism: OverlayMechanism,
+            /// The `fuse-overlayfs` daemon Agora started, so only it is ended.
+            daemon: Option<i32>,
+        },
         StepDown(String),
         Failed(String),
     }
@@ -492,14 +496,19 @@ mod linux_impl {
                 let message = read_message(read_raw);
                 drop(read_fd);
                 let status = wait_for(child);
+                // Only the `fuse-overlayfs` daemon Agora started is ended. The game's own
+                // process group may hold a wineserver that belongs to the prefix and that
+                // another launch (or the player) still uses, so the group is never signalled.
+                if let Ok(Message::Ran {
+                    mechanism: OverlayMechanism::Fuse,
+                    daemon: Some(daemon),
+                }) = &message
+                {
+                    stop_fuse_daemon(*daemon);
+                }
                 match message {
-                    Ok(Message::Ran(mechanism)) => {
+                    Ok(Message::Ran { mechanism, .. }) => {
                         let status = status?;
-                        if mechanism == OverlayMechanism::Fuse {
-                            // Its daemon stayed in the child's process group. The game is
-                            // gone, so nothing else needs that group.
-                            unsafe { c::kill(-child.as_raw(), c::SIGKILL) };
-                        }
                         Ok(ViewOutcome::Ran(ViewRun {
                             mechanism,
                             status,
@@ -518,6 +527,22 @@ mod linux_impl {
                 }
             }
         }
+    }
+
+    /// End the `fuse-overlayfs` daemon Agora started, and only it. A polite SIGTERM unmounts; a
+    /// daemon that does not go is killed. Nothing else in the game's process group is touched.
+    fn stop_fuse_daemon(daemon: i32) {
+        if daemon <= 0 {
+            return;
+        }
+        unsafe { c::kill(daemon, c::SIGTERM) };
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if unsafe { c::kill(daemon, 0) } != 0 {
+                return;
+            }
+        }
+        unsafe { c::kill(daemon, c::SIGKILL) };
     }
 
     // -----------------------------------------------------------------------
@@ -703,11 +728,13 @@ mod linux_impl {
                 last_errno()
             }
         };
-        let mechanism = if kernel_error == 0 {
-            OverlayMechanism::Kernel
+        // The fuse daemon is Agora's own. Remember it so every later failure ends it instead of
+        // leaking a mount helper that outlives the view.
+        let daemon = if kernel_error == 0 {
+            None
         } else {
             match try_fuse(prepared) {
-                Ok(()) => OverlayMechanism::Fuse,
+                Ok(daemon) => Some(daemon),
                 Err(fuse) => step_down(
                     pipe,
                     &[
@@ -732,6 +759,7 @@ mod linux_impl {
                 )
             } != 0
             {
+                kill_daemon(daemon);
                 failed(
                     pipe,
                     &[
@@ -746,6 +774,7 @@ mod linux_impl {
 
         if let Some(directory) = &prepared.working_directory {
             if unsafe { c::chdir(directory.as_ptr()) } != 0 {
+                kill_daemon(daemon);
                 failed(
                     pipe,
                     &[
@@ -756,12 +785,21 @@ mod linux_impl {
             }
         }
 
-        let message = match mechanism {
-            OverlayMechanism::Kernel => &prepared.kernel_message,
-            OverlayMechanism::Fuse => &prepared.fuse_message,
-        };
-        if !write_raw(pipe, message) {
-            unsafe { c::_exit(125) };
+        match daemon {
+            None => {
+                if !write_raw(pipe, &prepared.kernel_message) {
+                    unsafe { c::_exit(125) };
+                }
+            }
+            Some(daemon) => {
+                let wrote = write_raw(pipe, &prepared.fuse_message_prefix)
+                    && write_number(pipe, daemon)
+                    && write_raw(pipe, b"\n");
+                if !wrote {
+                    kill_daemon(Some(daemon));
+                    unsafe { c::_exit(125) };
+                }
+            }
         }
         // The write end is close-on-exec, so it goes away exactly when the command starts.
         unsafe {
@@ -771,6 +809,7 @@ mod linux_impl {
                 prepared.envp_ptr.as_ptr(),
             )
         };
+        kill_daemon(daemon);
         failed(
             pipe,
             &[
@@ -778,6 +817,14 @@ mod linux_impl {
                 Piece::Number(last_errno()),
             ],
         );
+    }
+
+    fn kill_daemon(daemon: Option<i32>) {
+        if let Some(daemon) = daemon {
+            unsafe {
+                c::kill(daemon, c::SIGKILL);
+            }
+        }
     }
 
     /// Mount calls return -1 and set errno; a non-zero `error` from the kernel attempt is that
@@ -798,21 +845,26 @@ mod linux_impl {
         }
     }
 
-    /// Mount with `fuse-overlayfs`, if it is installed. Its daemon is left in the child's
-    /// process group so the parent can end it after the command exits.
-    fn try_fuse(prepared: &Prepared) -> Result<(), FuseFailure> {
+    /// Mount with `fuse-overlayfs`, if it is installed. The daemon is forked here, in the mount
+    /// namespace, and its pid is returned so the parent ends exactly that process after the
+    /// command exits. It also dies with the process that execs the command, so a force-stopped
+    /// wrapper cannot leave it behind.
+    fn try_fuse(prepared: &Prepared) -> Result<i32, FuseFailure> {
         let program = prepared
             .fuse_program
             .as_ref()
             .ok_or(FuseFailure::NotOnPath)?;
-        if unsafe { c::setpgid(0, 0) } != 0 {
-            return Err(FuseFailure::Fork);
-        }
         let daemon = unsafe { c::fork() };
         if daemon < 0 {
             return Err(FuseFailure::Fork);
         }
         if daemon == 0 {
+            // If the process that would become the game is already gone, this daemon has no
+            // reason to live. Otherwise the kernel kills it when that process dies.
+            if unsafe { c::getppid() } == 1 {
+                unsafe { c::_exit(127) };
+            }
+            unsafe { c::prctl(c::PR_SET_PDEATHSIG, c::SIGKILL) };
             let argv: [*const c::c_char; 5] = [
                 program.as_ptr(),
                 prepared.fuse_dash_o.as_ptr(),
@@ -828,7 +880,7 @@ mod linux_impl {
         // the daemon inherits the same number. Nothing here depends on the pipe ending.
         for _ in 0..200 {
             if mount_visible(&prepared.fuse_mountinfo_probe) {
-                return Ok(());
+                return Ok(daemon);
             }
             let delay = c::timespec {
                 tv_sec: 0,
@@ -917,10 +969,19 @@ mod linux_impl {
         let line = text.lines().next().unwrap_or_default();
         let (kind, detail) = line.split_once('\t').unwrap_or((line, ""));
         match kind {
-            "K" if detail == "kernel overlayfs with userxattr" => {
-                Ok(Message::Ran(OverlayMechanism::Kernel))
-            }
-            "K" if detail == "fuse-overlayfs" => Ok(Message::Ran(OverlayMechanism::Fuse)),
+            "K" if detail == "kernel overlayfs with userxattr" => Ok(Message::Ran {
+                mechanism: OverlayMechanism::Kernel,
+                daemon: None,
+            }),
+            "K" => match detail.split_once('\t') {
+                Some(("fuse-overlayfs", pid)) => Ok(Message::Ran {
+                    mechanism: OverlayMechanism::Fuse,
+                    daemon: pid.parse().ok(),
+                }),
+                _ => Err(format!(
+                    "the view helper reported an unknown result: {line}"
+                )),
+            },
             "S" => Ok(Message::StepDown(detail.to_string())),
             "E" => Ok(Message::Failed(detail.to_string())),
             "" => Err("the view helper exited without reporting a result".to_string()),
@@ -946,6 +1007,39 @@ mod linux_impl {
                     )));
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn probe(target: &str) -> Vec<u8> {
+            let mut probe = Vec::new();
+            probe.push(b' ');
+            probe.extend(mountinfo_escaped(target.as_bytes()));
+            probe.push(b' ');
+            probe
+        }
+
+        #[test]
+        fn mountinfo_escapes_every_character_the_kernel_escapes() {
+            assert_eq!(
+                mountinfo_escaped(b"/games/A Game\\x\ty\nz"),
+                b"/games/A\\040Game\\134x\\011y\\012z"
+            );
+        }
+
+        #[test]
+        fn a_folder_with_a_space_is_found_by_its_escaped_mountinfo_field() {
+            // The format `/proc/self/mountinfo` writes, with the mount point in field 5.
+            let mountinfo =
+                b"36 35 98:0 / /games/A\\040Game rw,relatime - fuse.overlay /games/A\\040Game rw\n";
+            assert!(contains(mountinfo, &probe("/games/A Game")));
+            // The unescaped path is what the old check looked for, and it never matches.
+            assert!(!contains(mountinfo, b" /games/A Game "));
+            // A sibling whose name merely starts the same is not the mount.
+            assert!(!contains(mountinfo, &probe("/games/A Game Two")));
         }
     }
 }

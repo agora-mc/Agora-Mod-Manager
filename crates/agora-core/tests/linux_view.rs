@@ -706,6 +706,51 @@ fn fuse_overlay_runs_when_the_kernel_refuses() {
 }
 
 #[test]
+fn fuse_finds_its_mount_when_the_game_folder_has_a_space() {
+    let _serial = serial();
+    if !fuse_overlayfs_installed() {
+        eprintln!("SKIPPED: fuse-overlayfs is not on PATH on this host");
+        return;
+    }
+    struct ClearEnv;
+    impl Drop for ClearEnv {
+        fn drop(&mut self) {
+            std::env::remove_var(REFUSE_KERNEL_OVERLAY_ENV);
+        }
+    }
+    std::env::set_var(REFUSE_KERNEL_OVERLAY_ENV, "1");
+    let _clear = ClearEnv;
+
+    let fixture = Fixture::new();
+    let out = fixture._tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    // `/proc/self/mountinfo` escapes this space as `\040`; a check for the raw path never finds
+    // the fuse mount, so the view would time out and step down instead.
+    let target = fixture._tmp.path().join("a game folder");
+    std::fs::create_dir_all(&target).unwrap();
+
+    let mut request = ViewRequest {
+        instance_id: fixture.instance_id.clone(),
+        target: target.clone(),
+        command: fixture.command("cat \"$TARGET/shared.txt\" > \"$OUT/read\"\n"),
+        per_user_files: vec![],
+    };
+    request.command.environment = Some(vec![
+        (
+            "PATH".into(),
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+        ),
+        ("TARGET".into(), target.display().to_string()),
+        ("OUT".into(), out.display().to_string()),
+    ]);
+
+    let run = ran(run_view(&fixture, &request)).expect("the fixture host must run the view");
+    assert_eq!(run.mechanism, OverlayMechanism::Fuse);
+    assert!(run.status.success(), "the command failed: {:?}", run.status);
+    assert_eq!(read(&out.join("read")), b"mod shared");
+}
+
+#[test]
 fn target_is_unchanged_outside_the_namespace() {
     let _serial = serial();
     let fixture = Fixture::new();
