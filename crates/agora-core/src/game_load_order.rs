@@ -348,8 +348,9 @@ pub struct SortMove {
     pub to: usize,
 }
 
-/// A plugin that loads above a master the sort may not move, so the sort could not fix that
-/// master finding. The plugin would have to move, and it is locked or always loaded.
+/// A plugin that loads above a master the sort could not put before it, so the sort could not fix
+/// that master finding. Either the master is locked or always loaded, or moving it would itself
+/// put it above one of its own masters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Blocked {
     pub plugin: String,
@@ -2550,6 +2551,35 @@ fn place_free(
     free_slots[place]
 }
 
+/// Whether moving the entry at `from` to absolute position `target` would put it above one of its
+/// own masters, directly or through their masters. A sort must never break a master requirement
+/// it is trying to keep; the dependent it was moving for is reported as blocked instead.
+fn crosses_own_master(entries: &[LoadOrderEntry], from: usize, target: usize) -> bool {
+    if target >= from {
+        return false;
+    }
+    let mut loaded: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if loads(entry) {
+            loaded.entry(key(&entry.name)).or_default().push(index);
+        }
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut pending: Vec<String> = entries[from].masters.iter().map(|m| key(m)).collect();
+    while let Some(name) = pending.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        for &index in loaded.get(&name).map(Vec::as_slice).unwrap_or_default() {
+            if index >= target && index < from {
+                return true;
+            }
+            pending.extend(entries[index].masters.iter().map(|m| key(m)));
+        }
+    }
+    false
+}
+
 /// The first place where a plugin needs a master that may move, as (master position, slot index
 /// the master takes). A plugin that does not move takes the master just above it; a fixed plugin
 /// (locked, or always loaded) takes the slot just above its own position, and if there is none,
@@ -2584,6 +2614,11 @@ fn first_move(
                 .find(|(_, m)| loads(m) && key(&m.name) == k && !fixed.fixed(m))
                 .map(|(index, _)| index);
             if let Some(from) = later {
+                if crosses_own_master(entries, from, free_slots[place]) {
+                    // Moving that master here would break one of its own masters, so this
+                    // dependent stays blocked instead of trading one broken order for another.
+                    continue;
+                }
                 return Some((from, place));
             }
         }
@@ -3599,6 +3634,13 @@ mod tests {
         entries.iter().map(|e| e.name.clone()).collect()
     }
 
+    fn position_of(entries: &[LoadOrderEntry], name: &str) -> usize {
+        entries
+            .iter()
+            .position(|entry| key(&entry.name) == key(name))
+            .expect("the list holds the name")
+    }
+
     fn plugin_line_of(name: &str, active: bool) -> PluginEntry {
         PluginEntry {
             name: name.to_string(),
@@ -3803,6 +3845,54 @@ mod tests {
         let (second, _) = sort_entries(&mut list).unwrap();
         assert!(second.is_empty());
         assert_eq!(list, settled);
+    }
+
+    #[test]
+    fn a_sort_does_not_pull_a_master_above_the_chain_of_its_own_masters() {
+        // A needs B, B needs C, and C needs the locked M.esm. A is above B, so the sort would like
+        // to move B up; that would put B above C (which B needs) and C above M.esm (which C needs).
+        let mut list = vec![
+            entry("A.esp", &["B.esp"]),
+            locked("M.esm", &[]),
+            entry("C.esp", &["M.esm"]),
+            entry("B.esp", &["C.esp"]),
+        ];
+        let (moves, blocked) = sort_entries(&mut list).unwrap();
+        assert!(moves.is_empty(), "the sort moved a plugin above its own master: {moves:?}");
+        assert!(
+            position_of(&list, "M.esm") < position_of(&list, "C.esp"),
+            "C.esp was pulled above its locked master M.esm: {list:?}"
+        );
+        assert!(
+            position_of(&list, "C.esp") < position_of(&list, "B.esp"),
+            "B.esp was pulled above its master C.esp: {list:?}"
+        );
+        assert_eq!(
+            blocked,
+            [Blocked {
+                plugin: "A.esp".into(),
+                master: "B.esp".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_sort_does_not_pull_a_master_above_a_master_it_only_reaches_indirectly() {
+        // B's direct master D is above the slot B would take, so the direct lookup sees nothing
+        // wrong; but D needs M.esm, which is below that slot. Moving B up would cross M.esm.
+        let mut list = vec![
+            entry("X.esp", &[]),
+            entry("D.esp", &["M.esm"]),
+            entry("A.esp", &["B.esp"]),
+            locked("M.esm", &[]),
+            entry("B.esp", &["D.esp"]),
+        ];
+        let (moves, _) = sort_entries(&mut list).unwrap();
+        assert!(moves.is_empty(), "the sort moved a plugin above an indirect master: {moves:?}");
+        assert!(
+            position_of(&list, "M.esm") < position_of(&list, "B.esp"),
+            "B.esp was pulled above an indirect master M.esm: {list:?}"
+        );
     }
 
     #[test]
