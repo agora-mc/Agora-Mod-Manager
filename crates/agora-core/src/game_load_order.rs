@@ -1713,9 +1713,11 @@ fn mark_new_pairs(
     }
 }
 
-/// Whether a conflict pair is new since the load order the last session recorded: one of its
-/// plugins was added, turned on, or moved. A session with no recorded entries for the list is not
-/// a baseline, so no pair is reported as new against it.
+/// Whether a conflict pair is new since the load order the last session recorded. What matters is
+/// the pair's own relative order among the active plugins: adding, removing or moving an unrelated
+/// or inactive plugin shifts raw positions but does not make this conflict new. A plugin that is
+/// active now and was not before (added or turned on) always makes the pair new. A session with no
+/// recorded entries for the list is not a baseline, so no pair is reported as new against it.
 fn pair_is_new_since(
     pair: &ConflictPair,
     current: &[LoadOrderEntry],
@@ -1724,26 +1726,33 @@ fn pair_is_new_since(
     if previous.is_empty() {
         return false;
     }
-    let previous_by_name: HashMap<String, (usize, bool)> = previous
+    let previous_active: Vec<String> = previous
         .iter()
-        .enumerate()
-        .map(|(position, entry)| (key(&entry.name), (position, entry.active)))
+        .filter(|entry| entry.active)
+        .map(|entry| key(&entry.name))
         .collect();
-    let current_by_name: HashMap<String, (usize, bool)> = current
+    let current_active: Vec<String> = current
         .iter()
-        .filter(|entry| !entry.implicit)
-        .enumerate()
-        .map(|(position, entry)| (key(&entry.name), (position, entry.active)))
+        .filter(|entry| entry.active && !entry.implicit)
+        .map(|entry| key(&entry.name))
         .collect();
-    [&pair.winner, &pair.loser].into_iter().any(|name| {
-        let Some((position, active)) = current_by_name.get(&key(name)) else {
-            return false;
-        };
-        match previous_by_name.get(&key(name)) {
-            None => true,
-            Some((before, was_active)) => (!*was_active && *active) || before != position,
-        }
-    })
+    let position = |names: &[String], name: &str| names.iter().position(|entry| entry == name);
+    let winner = key(&pair.winner);
+    let loser = key(&pair.loser);
+    // A pair member the last launch did not load was added or turned on.
+    let (Some(was_winner), Some(was_loser)) = (
+        position(&previous_active, &winner),
+        position(&previous_active, &loser),
+    ) else {
+        return true;
+    };
+    let (Some(is_winner), Some(is_loser)) = (
+        position(&current_active, &winner),
+        position(&current_active, &loser),
+    ) else {
+        return false;
+    };
+    (was_winner < was_loser) != (is_winner < is_loser)
 }
 
 /// The overlaps findings the instance check reports (MASTER_SPEC §31.5): the count of conflicts,
@@ -4745,7 +4754,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pair_is_new_when_its_loser_was_added_turned_on_or_moved() {
+    fn a_pair_is_new_when_one_of_its_plugins_was_added_turned_on_or_reordered() {
         let pair = ConflictPair {
             winner: "C.esp".into(),
             loser: "B.esp".into(),
@@ -4778,13 +4787,46 @@ mod tests {
         let without_b = [session_entry("A.esp", true), session_entry("C.esp", true)];
         assert!(pair_is_new_since(&pair, &current, &without_b));
 
-        // Both were listed, but B sat above A last time.
-        let moved = [
+        // C sat above B last time, so the pair itself is the other way round now.
+        let reordered = [
+            session_entry("A.esp", true),
+            session_entry("C.esp", true),
+            session_entry("B.esp", true),
+        ];
+        assert!(pair_is_new_since(&pair, &current, &reordered));
+
+        // A moved from below C to above B, but B still loads before C: this pair is old.
+        let unrelated_moved = [
             session_entry("B.esp", true),
             session_entry("A.esp", true),
             session_entry("C.esp", true),
         ];
-        assert!(pair_is_new_since(&pair, &current, &moved));
+        assert!(!pair_is_new_since(&pair, &current, &unrelated_moved));
+
+        // A new active plugin was added between B and C, which changes raw positions but not
+        // this pair's order.
+        let with_a_between = [
+            entry("B.esp", &[]),
+            entry("A.esp", &[]),
+            entry("C.esp", &[]),
+        ];
+        let both_before = [
+            session_entry("B.esp", true),
+            session_entry("C.esp", true),
+        ];
+        assert!(!pair_is_new_since(&pair, &with_a_between, &both_before));
+
+        // An inactive plugin moving does not count either.
+        let inactive_moved = [
+            entry("B.esp", &[]),
+            {
+                let mut skipped = entry("Off.esp", &[]);
+                skipped.active = false;
+                skipped
+            },
+            entry("C.esp", &[]),
+        ];
+        assert!(!pair_is_new_since(&pair, &inactive_moved, &both_before));
     }
 
     #[test]
