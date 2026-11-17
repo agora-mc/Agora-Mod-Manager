@@ -157,7 +157,9 @@ pub fn save_folder(
         game_ini::store_of(ctx, instance_id).map_err(|e| SaveBackupError::Other(e.to_string()))?;
     let rule = game_saves::rule_for(definition, &store).ok_or(SaveBackupError::NoSaveFolder)?;
     match manifest.saves {
-        SavesChoice::Own => game_saves::own_folder(rule, instance_id),
+        SavesChoice::Own => {
+            game_saves::own_folder_scoped(rule, instance_id, manifest.save_scope.as_deref())
+        }
         SavesChoice::Shared => game_saves::shared_folder(rule),
     }
     .map_err(SaveBackupError::from)

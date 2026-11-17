@@ -1594,6 +1594,7 @@ pub fn run(
                 &def,
                 SavesChoice::Own,
                 request.copy_saves,
+                None,
             )?;
             let rule = game_saves::rule_for(&def, &install.discovered.store).cloned();
             if let Some(rule) = rule {

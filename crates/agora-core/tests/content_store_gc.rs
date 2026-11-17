@@ -88,6 +88,7 @@ fn write_generic_instance(ctx: &Ctx, id: &str, name: &str, game: &str, item_ids:
         layers: LayerStack::new(layers).unwrap(),
         deployment: None,
         saves: SavesChoice::Shared,
+        save_scope: None,
         imported_from: None,
     };
     let dir = ctx.paths.instance_dir(id).unwrap();

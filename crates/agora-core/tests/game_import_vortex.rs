@@ -1544,6 +1544,8 @@ fn merged_copy_saves_copies_each_profiles_saves_and_says_which() {
         .expect("the shared save folder")
         .join("p2");
     write(&alt_saves.join("AltSave.ess"), b"ALT SAVE");
+    // The same name as Main's save, with different bytes: the two setups must not collide.
+    write(&alt_saves.join("Save1.ess"), b"ALT SAVE WITH THE SAME NAME");
     let profiles = format!(
         r#"{{"p1":{{"id":"p1","gameId":"{VORTEX_GAME}","name":"Main","modState":{{"mod-alpha":{{"enabled":true}},"mod-beta":{{"enabled":true}},"mod-gamma":{{"enabled":false}}}},"features":{{"local_game_settings":true,"local_saves":true}}}},"p2":{{"id":"p2","gameId":"{VORTEX_GAME}","name":"Alt","modState":{{"mod-alpha":{{"enabled":true}},"mod-beta":{{"enabled":true}},"mod-gamma":{{"enabled":true}}}},"features":{{"local_saves":true}}}}}}"#
     );
@@ -1574,13 +1576,26 @@ fn merged_copy_saves_copies_each_profiles_saves_and_says_which() {
         .iter()
         .find(|save| save.profile == "Alt")
         .expect("Alt's saves are reported");
-    assert_eq!(alt.copied, 1, "{alt:?}");
+    assert_eq!(alt.copied, 2, "{alt:?}");
 
-    let folder = agora_core::game_saves::own_folder(rule, instance).expect("the own save folder");
-    assert!(folder.join("Save1.ess").is_file(), "Main's save was copied");
+    let main_folder = agora_core::game_saves::own_folder_scoped(rule, instance, Some("Main"))
+        .expect("Main's own save folder");
+    let alt_folder = agora_core::game_saves::own_folder_scoped(rule, instance, Some("Alt"))
+        .expect("Alt's own save folder");
+    assert_ne!(main_folder, alt_folder, "each loadout has its own folder");
+    assert_eq!(
+        std::fs::read(main_folder.join("Save1.ess")).unwrap(),
+        b"SAVE ONE",
+        "Main's same-named save is its own"
+    );
+    assert_eq!(
+        std::fs::read(alt_folder.join("Save1.ess")).unwrap(),
+        b"ALT SAVE WITH THE SAME NAME",
+        "Alt's same-named save was not overwritten by Main's"
+    );
     assert!(
-        folder.join("AltSave.ess").is_file(),
-        "Alt's save was copied too"
+        alt_folder.join("AltSave.ess").is_file(),
+        "Alt's other save was copied too"
     );
 }
 

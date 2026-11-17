@@ -96,6 +96,8 @@ fn build_staging(
     let mut manifest = source_manifest.clone();
     manifest.instance_id = new_id.to_string();
     manifest.name = new_name.to_string();
+    // The clone gets its own, unscoped folder; it never borrows a loadout's save folder.
+    manifest.save_scope = None;
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     std::fs::write(staging.join("instance_manifest.json"), manifest_bytes)?;
 
@@ -131,6 +133,7 @@ fn reuse_own_saves(
         definition,
         game_instance::SavesChoice::Own,
         false,
+        None,
     )?;
     std::fs::create_dir_all(&folder)?;
     if let Some(source) = source {
@@ -205,7 +208,11 @@ pub fn clone_instance(
             })
         })?;
         Some(match source_manifest.saves {
-            game_instance::SavesChoice::Own => game_saves::own_folder(rule, source_id)?,
+            game_instance::SavesChoice::Own => game_saves::own_folder_scoped(
+                rule,
+                source_id,
+                source_manifest.save_scope.as_deref(),
+            )?,
             game_instance::SavesChoice::Shared => game_saves::shared_folder(rule)?,
         })
     } else {
@@ -218,7 +225,7 @@ pub fn clone_instance(
         }));
     }
     let clone_save_folder = match (&rule, needs_own_saves) {
-        (Some(rule), true) => Some(game_saves::own_folder(rule, &new_id)?),
+        (Some(rule), true) => Some(game_saves::own_folder_scoped(rule, &new_id, None)?),
         _ => None,
     };
 

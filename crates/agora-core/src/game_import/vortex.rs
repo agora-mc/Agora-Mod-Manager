@@ -2756,6 +2756,7 @@ pub fn run(
                     &def,
                     SavesChoice::Own,
                     request.copy_saves,
+                    None,
                 )?;
                 let folder = crate::game_saves::own_folder(rule, &instance_id)?;
                 report.saves_folder = Some(folder.clone());
@@ -3314,6 +3315,8 @@ pub fn run_profiles(
         super::profiles::Grouping::Merged => {
             let request = VortexRequest {
                 profile: profiles[0].clone(),
+                // The merged branch copies each profile's saves into its own loadout folder.
+                copy_saves: false,
                 ..base.clone()
             };
             let first_report = run(ctx, inventory, &request, options, progress)?;
@@ -3382,18 +3385,21 @@ pub fn run_profiles(
                     loadouts.push(profile.clone());
                 }
 
-                let mut saves = vec![ProfileSavesReport {
-                    profile: profiles[0].clone(),
-                    copied: first_report.saves_copied,
-                    skipped_existing: first_report.saves_skipped_existing,
-                    note: first_report
-                        .saves_folder
-                        .is_none()
-                        .then(|| "the profile uses the game's shared saves".to_string()),
-                }];
-                // Later profiles' own saves go into the same merged instance's save folder. A
-                // file already there is kept and counted; an unreadable one is named.
-                for (profile, profile_plan) in profiles.iter().zip(plan.plans.iter()).skip(1) {
+                // The instance keeps the first profile's setup, including its save choice and
+                // the loadout's own save folder.
+                crate::game_loadout::apply_game_profile_with_undo(
+                    ctx,
+                    &instance_id,
+                    &definition,
+                    &profiles[0],
+                )
+                .map_err(|e| ImportError::Other(e.to_string()))?;
+
+                // Every own-saving profile copies into its own loadout's save folder, so two mod
+                // setups never load each other's saves. A file already there is kept and
+                // counted; an unreadable one is named.
+                let mut saves = Vec::new();
+                for (profile, profile_plan) in profiles.iter().zip(plan.plans.iter()) {
                     if !profile_plan.saves.local {
                         saves.push(ProfileSavesReport {
                             profile: profile.clone(),
@@ -3417,9 +3423,10 @@ pub fn run_profiles(
                         });
                         continue;
                     };
-                    let folder = crate::game_saves::own_folder(rule, &instance_id)
-                        .map_err(|e| ImportError::Other(e.to_string()))?;
-                    if !request.copy_saves {
+                    let folder =
+                        crate::game_saves::own_folder_scoped(rule, &instance_id, Some(profile))
+                            .map_err(|e| ImportError::Other(e.to_string()))?;
+                    if !base.copy_saves {
                         let note = if profile_plan.saves.files > 0 {
                             format!(
                                 "Agora did not copy {} save file(s): they are under Documents, which needs --copy-saves. To copy them by hand, copy the files in {} into {}",
@@ -3460,15 +3467,6 @@ pub fn run_profiles(
                         note: (!notes.is_empty()).then(|| notes.join("; ")),
                     });
                 }
-
-                // The instance keeps the first profile's setup.
-                crate::game_loadout::apply_game_profile_with_undo(
-                    ctx,
-                    &instance_id,
-                    &definition,
-                    &profiles[0],
-                )
-                .map_err(|e| ImportError::Other(e.to_string()))?;
                 Ok((loadouts, saves))
             })();
 

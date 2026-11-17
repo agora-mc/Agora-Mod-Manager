@@ -179,8 +179,18 @@ fn is_reserved_device_name(name: &str) -> bool {
 
 /// The setting's value for this instance: the rule's `own_value` with the folder name filled in.
 pub fn own_value(rule: &SaveLocationRule, instance_id: &str) -> String {
-    rule.own_value
-        .replace("{instance}", &save_folder_name(instance_id))
+    own_value_scoped(rule, instance_id, None)
+}
+
+/// [`own_value`] for one loadout: its own folder sits under the instance's folder, so two mod
+/// setups never load each other's saves. The scope is a loadout name, made into a folder name.
+pub fn own_value_scoped(rule: &SaveLocationRule, instance_id: &str, scope: Option<&str>) -> String {
+    let mut folder = save_folder_name(instance_id);
+    if let Some(scope) = scope {
+        folder.push('\\');
+        folder.push_str(&save_folder_name(scope));
+    }
+    rule.own_value.replace("{instance}", &folder)
 }
 
 fn resolve(path: &GamePath) -> Result<PathBuf, SavesError> {
@@ -198,7 +208,7 @@ pub fn in_use_folder(
     let rule = no_rule_is_an_error(definition, &store)?;
     match manifest.saves {
         SavesChoice::Shared => shared_folder(rule),
-        SavesChoice::Own => own_folder(rule, instance_id),
+        SavesChoice::Own => own_folder_scoped(rule, instance_id, manifest.save_scope.as_deref()),
     }
 }
 
@@ -209,8 +219,17 @@ pub fn shared_folder(rule: &SaveLocationRule) -> Result<PathBuf, SavesError> {
 
 /// The instance's own save folder: `own_value` under the rule's `relative_to` folder.
 pub fn own_folder(rule: &SaveLocationRule, instance_id: &str) -> Result<PathBuf, SavesError> {
+    own_folder_scoped(rule, instance_id, None)
+}
+
+/// [`own_folder`] for one loadout's own save folder.
+pub fn own_folder_scoped(
+    rule: &SaveLocationRule,
+    instance_id: &str,
+    scope: Option<&str>,
+) -> Result<PathBuf, SavesError> {
     let mut folder = resolve(&rule.relative_to)?;
-    for part in own_value(rule, instance_id)
+    for part in own_value_scoped(rule, instance_id, scope)
         .split(['\\', '/'])
         .filter(|p| !p.is_empty())
     {
@@ -299,7 +318,11 @@ pub fn status(
     let store = game_ini::store_of(ctx, instance_id)?;
     let rule = no_rule_is_an_error(definition, &store)?;
     let shared = survey(&shared_folder(rule)?)?;
-    let own = survey(&own_folder(rule, instance_id)?)?;
+    let own = survey(&own_folder_scoped(
+        rule,
+        instance_id,
+        manifest.save_scope.as_deref(),
+    )?)?;
     let (in_use, other) = match manifest.saves {
         SavesChoice::Shared => (shared, own),
         SavesChoice::Own => (own, shared),
@@ -335,7 +358,8 @@ pub fn set_choice(
     definition: &GameDefinition,
     choice: SavesChoice,
 ) -> Result<SavesChange, SavesError> {
-    set_choice_inner(ctx, instance_id, definition, choice, true)
+    let scope = manifest_of(ctx, instance_id)?.save_scope;
+    set_choice_inner(ctx, instance_id, definition, choice, true, scope.as_deref())
 }
 
 /// [`set_choice`]; with `create_folder` false it does not make the instance's own save folder. That
@@ -347,10 +371,19 @@ pub(crate) fn set_choice_inner(
     definition: &GameDefinition,
     choice: SavesChoice,
     create_folder: bool,
+    scope: Option<&str>,
 ) -> Result<SavesChange, SavesError> {
     let store = game_ini::store_of(ctx, instance_id)?;
     let _locks = game_ini::lock_for_edit(ctx, instance_id, definition, &store)?;
-    set_choice_locked(ctx, instance_id, definition, &store, choice, create_folder)
+    set_choice_locked(
+        ctx,
+        instance_id,
+        definition,
+        &store,
+        choice,
+        create_folder,
+        scope,
+    )
 }
 
 /// [`set_choice_inner`] for a caller that already holds the instance and user-files locks taken by
@@ -362,12 +395,13 @@ pub(crate) fn set_choice_locked(
     store: &StoreId,
     choice: SavesChoice,
     create_folder: bool,
+    scope: Option<&str>,
 ) -> Result<SavesChange, SavesError> {
     let manifest = manifest_of(ctx, instance_id)?;
     let rule = no_rule_is_an_error(definition, store)?.clone();
     let state_file = state_path(ctx, instance_id)?;
     let recorded = read_state(&state_file)?;
-    let own = own_value(&rule, instance_id);
+    let own = own_value_scoped(&rule, instance_id, scope);
 
     let setting = match choice {
         SavesChoice::Own => {
@@ -384,8 +418,10 @@ pub(crate) fn set_choice_locked(
                 },
             )?;
             // A second `own` keeps the value from before the first one, so toggling is stable.
-            if recorded.is_none() {
-                write_state(
+            // When a different loadout's folder replaces it, track the new value so returning to
+            // shared still restores the player's own setting.
+            match &recorded {
+                None => write_state(
                     &state_file,
                     &SavesState {
                         ini: rule.ini.as_str().to_string(),
@@ -394,10 +430,18 @@ pub(crate) fn set_choice_locked(
                         set_to: own.clone(),
                         previous: before,
                     },
-                )?;
+                )?,
+                Some(state) if state.set_to != own => write_state(
+                    &state_file,
+                    &SavesState {
+                        set_to: own.clone(),
+                        ..state.clone()
+                    },
+                )?,
+                Some(_) => {}
             }
             if create_folder {
-                let folder = own_folder(&rule, instance_id)?;
+                let folder = own_folder_scoped(&rule, instance_id, scope)?;
                 std::fs::create_dir_all(&folder).map_err(|source| SavesError::Write {
                     path: folder.clone(),
                     source,
@@ -452,15 +496,16 @@ pub(crate) fn set_choice_locked(
         },
     };
 
-    if manifest.saves != choice {
+    if manifest.saves != choice || manifest.save_scope.as_deref() != scope {
         let mut updated = manifest.clone();
         updated.saves = choice;
+        updated.save_scope = scope.map(str::to_string);
         write_instance_manifest_atomic(ctx, instance_id, &updated)
             .map_err(|e| SavesError::Other(e.to_string()))?;
     }
 
     let shared = survey(&shared_folder(&rule)?)?;
-    let own_survey = survey(&own_folder(&rule, instance_id)?)?;
+    let own_survey = survey(&own_folder_scoped(&rule, instance_id, scope)?)?;
     let (in_use, other) = match choice {
         SavesChoice::Shared => (shared, own_survey),
         SavesChoice::Own => (own_survey, shared),
