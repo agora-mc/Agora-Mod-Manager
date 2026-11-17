@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use agora_core::ctx::CoreContext;
 use agora_core::game_registry::{GameRegistry, PackageSource};
 use agora_core::game_user_files::{
-    is_session_running, record_process, restore, restore_finished_for_instance, status, swap_in,
-    Journal, JournaledFile,
+    finish_starting, is_session_running, record_process, restore, restore_finished_for_instance,
+    status, swap_in, Journal, JournaledFile,
 };
 #[cfg(windows)]
 use agora_core::game_user_files::{restore_failure_message, restore_retrying_while_running};
@@ -462,6 +462,7 @@ fn two_instances_swap_and_restore() {
     .unwrap();
 
     // Restore session A
+    finish_starting(&harness.ctx, &def.id, &StoreId::steam()).unwrap();
     let report_a = restore(&harness.ctx, &def, &StoreId::steam()).unwrap();
     assert!(report_a.files.iter().any(|f| f.changed));
 
@@ -502,6 +503,7 @@ fn two_instances_swap_and_restore() {
     .unwrap();
 
     // Restore session B
+    finish_starting(&harness.ctx, &def.id, &StoreId::steam()).unwrap();
     let report_b = restore(&harness.ctx, &def, &StoreId::steam()).unwrap();
     assert!(report_b.files.iter().any(|f| f.changed));
 
@@ -627,6 +629,7 @@ fn failed_launch_restores_cleanly() {
     );
 
     // 2. Simulated spawn failure immediately triggers restore
+    finish_starting(&harness.ctx, &def.id, &StoreId::steam()).unwrap();
     let report = restore(&harness.ctx, &def, &StoreId::steam()).unwrap();
     assert!(!report.files.is_empty());
 
@@ -747,6 +750,7 @@ fn file_edited_externally_before_recovery_is_kept() {
     // After session, external tool edits the real file
     std::fs::write(&real_plugin_file, "Externally Edited By Player\n").unwrap();
 
+    finish_starting(&harness.ctx, &def.id, &StoreId::steam()).unwrap();
     let report = restore(&harness.ctx, &def, &StoreId::steam()).unwrap();
     let file_report = report
         .files
@@ -824,6 +828,7 @@ fn interrupted_swap_restores_correctly() {
         running_from: harness.running_from.clone(),
         processes: vec![],
         starting_launcher: None,
+        launch_id: None,
         files: vec![
             JournaledFile {
                 real_path: real_plugin_file.clone(),
@@ -883,6 +888,72 @@ fn interrupted_swap_restores_correctly() {
 // Gate 7: First launch with no instance copy keeps user file unchanged
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
+#[test]
+fn a_symlinked_user_file_stays_a_symlink() {
+    let harness = TestHarness::new();
+    let def = test_skyrim_definition();
+    let real = harness
+        .local_dir()
+        .join("Skyrim Special Edition")
+        .join("Plugins.txt");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    let target = harness
+        .user_data_dir
+        .path()
+        .join("elsewhere")
+        .join("RealPlugins.txt");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, "player original\n").unwrap();
+    std::os::unix::fs::symlink(&target, &real).unwrap();
+
+    let copy = harness
+        .instance_dir("link")
+        .join("user")
+        .join("Plugins.txt");
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::write(&copy, "instance list\n").unwrap();
+
+    swap_in(
+        &harness.ctx,
+        "link",
+        &def,
+        &StoreId::steam(),
+        &harness.running_from,
+    )
+    .unwrap();
+    assert!(
+        std::fs::symlink_metadata(&real)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "swap_in replaced the player's link with a regular file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "instance list\n",
+        "the instance's file was not written through the link"
+    );
+
+    std::fs::write(&real, "game changed\n").unwrap();
+    finish_starting(&harness.ctx, &def.id, &StoreId::steam()).unwrap();
+    restore(&harness.ctx, &def, &StoreId::steam()).unwrap();
+
+    assert!(
+        std::fs::symlink_metadata(&real)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "restore replaced the player's link with a regular file"
+    );
+    assert_eq!(std::fs::read_link(&real).unwrap(), target);
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "player original\n"
+    );
+    assert_eq!(std::fs::read_to_string(&copy).unwrap(), "game changed\n");
+}
+
 #[test]
 fn first_launch_no_instance_copy_keeps_user_file_unchanged() {
     let harness = TestHarness::new();
@@ -921,6 +992,7 @@ fn first_launch_no_instance_copy_keeps_user_file_unchanged() {
     std::fs::write(&real_ini_file, "Modified Settings INI From Game\n").unwrap();
 
     // Restore
+    finish_starting(&harness.ctx, &def.id, &StoreId::steam()).unwrap();
     restore(&harness.ctx, &def, &StoreId::steam()).unwrap();
 
     // Real file has user's original back
@@ -994,6 +1066,7 @@ fn mapping_for_another_store_not_touched_and_case_insensitive_matching() {
     );
 
     // Restore
+    finish_starting(&harness.ctx, &def.id, &StoreId::steam()).unwrap();
     restore(&harness.ctx, &def, &StoreId::steam()).unwrap();
     assert_eq!(
         std::fs::read_to_string(&steam_real_file).unwrap(),
@@ -1045,6 +1118,7 @@ fn real_file_not_existing_before_session_deleted_on_restore() {
     std::fs::write(&real_plugin_file, "Game Created Content\n").unwrap();
 
     // Restore
+    finish_starting(&harness.ctx, &def.id, &StoreId::steam()).unwrap();
     restore(&harness.ctx, &def, &StoreId::steam()).unwrap();
 
     // Real file that did not exist before the session is deleted on restore

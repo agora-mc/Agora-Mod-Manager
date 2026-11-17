@@ -31,6 +31,7 @@ impl Harness {
         let user = TempDir::new().unwrap();
         std::env::set_var("AGORA_TEST_USER_DATA_ROOT", user.path());
         let ctx = CoreContext::for_testing(data.path().join("app_data"));
+        agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
         Self {
             _lock: lock,
             _data: data,
@@ -99,12 +100,77 @@ impl Harness {
     fn backup(&self, instance_id: &str, def: &GameDefinition) -> save_backup::SaveBackup {
         save_backup::backup(&self.ctx, instance_id, def).unwrap()
     }
+
+    fn set_saves(&self, instance_id: &str, saves: SavesChoice) {
+        let path = self
+            .instance_dir(instance_id)
+            .join("instance_manifest.json");
+        let mut manifest: GameInstanceManifest =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest.saves = saves;
+        std::fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    }
 }
 
 impl Drop for Harness {
     fn drop(&mut self) {
         std::env::remove_var("AGORA_TEST_USER_DATA_ROOT");
     }
+}
+
+#[test]
+fn a_restore_goes_to_the_folder_the_backup_was_taken_from() {
+    let h = Harness::new();
+    let def = skyrim();
+    h.make_instance("moved", SavesChoice::Shared);
+    h.write_save("Run.ess", b"the save at backup time");
+    let backup = h.backup("moved", &def);
+    assert_eq!(backup.source, h.shared_saves());
+
+    // The player switches the instance to its own save folder after the backup. A restore must
+    // put the save back where it came from, not where the instance now says saves live.
+    h.set_saves("moved", SavesChoice::Own);
+    h.write_save("Run.ess", b"the save the game holds");
+
+    let restore = save_backup::restore(&h.ctx, "moved", &def, &backup.id).unwrap();
+
+    assert_eq!(restore.folder, h.shared_saves());
+    assert_eq!(h.read_save("Run.ess"), b"the save at backup time");
+}
+
+#[test]
+fn a_failed_copy_leaves_the_current_save_in_place() {
+    let h = Harness::new();
+    let def = skyrim();
+    h.make_instance("failed-copy", SavesChoice::Shared);
+    h.write_save("Run.ess", b"the save at backup time");
+    let backup = h.backup("failed-copy", &def);
+    h.write_save("Run.ess", b"the save the game holds");
+
+    // The backup's copy of the save is gone, so the copy into place cannot succeed.
+    std::fs::remove_file(backup.path.join("files").join("Run.ess")).unwrap();
+    let error = save_backup::restore(&h.ctx, "failed-copy", &def, &backup.id).unwrap_err();
+    assert!(matches!(error, SaveBackupError::Read { .. }), "{error:?}");
+
+    assert_eq!(
+        h.read_save("Run.ess"),
+        b"the save the game holds",
+        "a failed copy left the save missing under its own name"
+    );
+    assert!(
+        !h.shared_saves().join("Run.ess.before-restore").exists(),
+        "a failed copy moved the current save aside before it was safe"
+    );
+    assert!(
+        std::fs::read_dir(h.shared_saves())
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".agora-restore-")),
+        "a failed copy left its temp file behind"
+    );
 }
 
 #[test]
@@ -246,6 +312,51 @@ fn retention_drops_the_oldest_backup() {
     for id in &ids[1..] {
         assert!(kept.contains(&id.as_str()), "backup {id} was dropped early");
     }
+}
+
+#[test]
+fn one_unreadable_backup_is_reported_and_the_others_still_list_and_prune() {
+    let h = Harness::new();
+    let def = skyrim();
+    h.make_instance("mixed", SavesChoice::Shared);
+    h.write_save("Run.ess", b"a save");
+
+    // One backup folder that cannot be read sits beside the readable ones.
+    let root = h.instance_dir("mixed").join(".agora_save_backups");
+    let unreadable = root.join("unreadable-1");
+    std::fs::create_dir_all(&unreadable).unwrap();
+    std::fs::write(
+        unreadable.join("backup.json"),
+        b"{ this is not a backup record",
+    )
+    .unwrap();
+
+    let mut ids = Vec::new();
+    for _ in 0..=MAX_BACKUPS {
+        ids.push(h.backup("mixed", &def).id);
+    }
+
+    let found = save_backup::list_detailed(&h.ctx, "mixed").unwrap();
+    assert_eq!(
+        found.backups.len(),
+        MAX_BACKUPS,
+        "the unreadable backup hid the readable ones"
+    );
+    assert_eq!(found.warnings.len(), 1);
+    assert!(
+        found.warnings[0].contains("unreadable-1"),
+        "the unreadable backup was not reported: {:?}",
+        found.warnings
+    );
+
+    // Retention still ran on the readable backups...
+    let kept: Vec<&str> = found.backups.iter().map(|b| b.id.as_str()).collect();
+    assert!(!kept.contains(&ids[0].as_str()));
+    // ...and never deleted the one it could not read.
+    assert!(
+        unreadable.is_dir(),
+        "pruning deleted a backup it could not read"
+    );
 }
 
 #[test]

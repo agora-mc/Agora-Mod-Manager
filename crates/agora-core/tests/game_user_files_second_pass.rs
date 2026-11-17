@@ -5,7 +5,8 @@ use std::sync::Mutex;
 
 use agora_core::ctx::CoreContext;
 use agora_core::game_user_files::{
-    is_session_running, record_process, restore, status, swap_in, Journal, JournaledFile,
+    finish_starting, is_session_running, record_process, restore, status, swap_in, Journal,
+    JournaledFile,
 };
 use agora_core::process_identity;
 use agora_game_api::{
@@ -231,6 +232,7 @@ fn stop_after_backup_before_journal_clobbers_the_instances_saved_copy() {
     std::fs::write(&real, "original\n").unwrap();
     reset_journal_to_initial(&journal_path_of(&h, &def));
 
+    finish_starting(&h.ctx, &def.id, &StoreId::steam()).unwrap();
     restore(&h.ctx, &def, &StoreId::steam()).unwrap();
 
     assert_eq!(std::fs::read_to_string(&real).unwrap(), "original\n");

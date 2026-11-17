@@ -298,12 +298,20 @@ fn backup_from(stored: &StoredBackup, dir: &Path) -> SaveBackup {
     }
 }
 
-fn list_dir(root: &Path) -> Result<Vec<SaveBackup>, SaveBackupError> {
+/// What a backup store holds, and the folders that could not be read.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BackupList {
+    pub backups: Vec<SaveBackup>,
+    /// One line per backup folder that could not be read. It is not listed and is never pruned.
+    pub warnings: Vec<String>,
+}
+
+fn list_dir(root: &Path) -> Result<BackupList, SaveBackupError> {
     if !root.is_dir() {
-        return Ok(Vec::new());
+        return Ok(BackupList::default());
     }
     let entries = fs::read_dir(root).map_err(|source| read_error(root, source))?;
-    let mut backups = Vec::new();
+    let mut list = BackupList::default();
     for entry in entries {
         let entry = entry.map_err(|source| read_error(root, source))?;
         let name = entry.file_name().to_string_lossy().to_string();
@@ -315,26 +323,46 @@ fn list_dir(root: &Path) -> Result<Vec<SaveBackup>, SaveBackupError> {
         if !path.is_dir() {
             continue;
         }
-        let stored = read_manifest(&path)?;
+        // One unreadable backup is reported and skipped; it must not hide the others, and it is
+        // never treated as a finished backup, so pruning can never delete it.
+        let stored = match read_manifest(&path) {
+            Ok(stored) => stored,
+            Err(error) => {
+                list.warnings
+                    .push(format!("backup {} was skipped: {error}", path.display()));
+                continue;
+            }
+        };
         if !is_valid_id(&stored.id) {
-            return Err(SaveBackupError::InvalidBackupId(stored.id));
+            list.warnings.push(format!(
+                "backup {} was skipped: '{}' is not a backup id",
+                path.display(),
+                stored.id
+            ));
+            continue;
         }
-        backups.push(backup_from(&stored, &path));
+        list.backups.push(backup_from(&stored, &path));
     }
-    backups.sort_by(|a, b| {
+    list.backups.sort_by(|a, b| {
         b.created_at
             .cmp(&a.created_at)
             .then_with(|| b.id.cmp(&a.id))
     });
-    Ok(backups)
+    Ok(list)
 }
 
 fn prune(root: &Path, keep: &str) {
-    let Ok(backups) = list_dir(root) else {
-        eprintln!("[save-backup] retention skipped: the backup store could not be read");
-        return;
+    let found = match list_dir(root) {
+        Ok(found) => found,
+        Err(_) => {
+            eprintln!("[save-backup] retention skipped: the backup store could not be read");
+            return;
+        }
     };
-    for old in backups.into_iter().skip(MAX_BACKUPS) {
+    for warning in &found.warnings {
+        eprintln!("[save-backup] {warning}");
+    }
+    for old in found.backups.into_iter().skip(MAX_BACKUPS) {
         if old.id == keep {
             continue;
         }
@@ -414,8 +442,19 @@ pub fn backup(
 }
 
 /// Every finished backup for an instance, newest first. A store Agora has never written to is
-/// empty, not an error; a backup that exists but cannot be read is an error, never silence.
+/// empty, not an error; a backup that exists but cannot be read is reported and skipped, so it
+/// never hides the others. Use [`list_detailed`] to see the report.
 pub fn list(ctx: &Ctx, instance_id: &str) -> Result<Vec<SaveBackup>, SaveBackupError> {
+    let found = list_detailed(ctx, instance_id)?;
+    for warning in &found.warnings {
+        eprintln!("[save-backup] {warning}");
+    }
+    Ok(found.backups)
+}
+
+/// Every finished backup for an instance plus the folders that could not be read, newest first. A
+/// store Agora has never written to is empty, not an error.
+pub fn list_detailed(ctx: &Ctx, instance_id: &str) -> Result<BackupList, SaveBackupError> {
     list_dir(&backup_root(ctx, instance_id)?)
 }
 
@@ -524,6 +563,63 @@ fn kept_copy_path(dest: &Path) -> Result<PathBuf, SaveBackupError> {
     )))
 }
 
+/// Put `from` at `to` without ever leaving `to` missing: copy to a temp name beside it, verify the
+/// copy, and only then swap it in. A failed copy removes the temp and leaves the current save in
+/// place. A current file that is replaced is kept beside itself in `kept_current`.
+fn copy_into_place(
+    from: &Path,
+    to: &Path,
+    kept_current: &mut Vec<String>,
+) -> Result<(), SaveBackupError> {
+    let Some(parent) = to.parent() else {
+        return Err(SaveBackupError::Other(format!(
+            "{} has no folder",
+            to.display()
+        )));
+    };
+    let name = to
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("save");
+    let temp = parent.join(format!(
+        ".{name}.agora-restore-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    if let Err(source) = fs::copy(from, &temp) {
+        let _ = fs::remove_file(&temp);
+        return Err(read_error(from, source));
+    }
+    if !same_contents(from, &temp)? {
+        let _ = fs::remove_file(&temp);
+        return Err(SaveBackupError::Other(format!(
+            "the copy of {} does not match its backup; the current save was left in place",
+            to.display()
+        )));
+    }
+    let kept = if to.is_file() {
+        let kept = kept_copy_path(to)?;
+        if let Err(source) = fs::rename(to, &kept) {
+            let _ = fs::remove_file(&temp);
+            return Err(write_error(to, source));
+        }
+        Some(kept)
+    } else {
+        None
+    };
+    if let Err(source) = fs::rename(&temp, to) {
+        let _ = fs::remove_file(&temp);
+        // Put the current save back under its own name; a crash here still leaves it in `kept`.
+        if let Some(kept) = &kept {
+            let _ = fs::rename(kept, to);
+        }
+        return Err(write_error(to, source));
+    }
+    if let Some(kept) = kept {
+        kept_current.push(kept.display().to_string());
+    }
+    Ok(())
+}
+
 /// Put a backup's files back into the instance's save folder.
 ///
 /// Never deletes. A current file of the same name is kept beside itself as
@@ -532,14 +628,16 @@ fn kept_copy_path(dest: &Path) -> Result<PathBuf, SaveBackupError> {
 pub fn restore(
     ctx: &Ctx,
     instance_id: &str,
-    definition: &GameDefinition,
+    _definition: &GameDefinition,
     backup_id: &str,
 ) -> Result<SaveRestore, SaveBackupError> {
     if !is_valid_id(backup_id) {
         return Err(SaveBackupError::InvalidBackupId(backup_id.to_string()));
     }
     // Hold the instance lock across the whole restore, exactly as a snapshot restore does, and
-    // refuse while the game is running: writing saves under a live game corrupts them.
+    // refuse while the game is running: writing saves under a live game corrupts them. The one
+    // activity check also sees an open session with no journaled files and a Linux view session,
+    // and refuses when a store that would answer cannot be read.
     let _guard = ctx
         .lock_manager
         .acquire(
@@ -547,8 +645,8 @@ pub fn restore(
             "restore_save_backup",
         )
         .map_err(|error| SaveBackupError::Other(error.to_string()))?;
-    crate::instance_runtime::check_idle(&ctx.paths, instance_id)
-        .map_err(|error| SaveBackupError::Other(error.to_string()))?;
+    crate::instance_runtime::ensure_game_not_running(ctx, instance_id, "restoring its saves")
+        .map_err(SaveBackupError::Other)?;
     let root = backup_root(ctx, instance_id)?;
     let dir = root.join(backup_id);
     if !dir.is_dir() {
@@ -562,7 +660,11 @@ pub fn restore(
         )));
     }
 
-    let folder = save_folder(ctx, instance_id, definition)?;
+    // The folder the backup was taken from, as it was recorded at backup time. The instance's
+    // current Shared/Own choice may have changed since, and the restore must not follow it: a
+    // backup taken under Own belongs back in the Own folder, and a shared save belongs in the
+    // shared folder it came from.
+    let folder = PathBuf::from(&stored.source);
     fs::create_dir_all(&folder).map_err(|source| write_error(&folder, source))?;
     let files_dir = dir.join(BACKUP_FILES);
 
@@ -580,16 +682,11 @@ pub fn restore(
         if let Some(parent) = to.parent() {
             fs::create_dir_all(parent).map_err(|source| write_error(parent, source))?;
         }
-        if to.is_file() {
-            if same_contents(&from, &to)? {
-                restored += 1;
-                continue;
-            }
-            let kept = kept_copy_path(&to)?;
-            fs::rename(&to, &kept).map_err(|source| write_error(&to, source))?;
-            kept_current.push(kept.display().to_string());
+        if to.is_file() && same_contents(&from, &to)? {
+            restored += 1;
+            continue;
         }
-        fs::copy(&from, &to).map_err(|source| read_error(&from, source))?;
+        copy_into_place(&from, &to, &mut kept_current)?;
         restored += 1;
     }
 
