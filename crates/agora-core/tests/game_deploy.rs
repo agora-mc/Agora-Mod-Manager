@@ -1167,6 +1167,60 @@ fn vfs_whiteout_markers_hide_lower_files_in_every_mode() {
 }
 
 #[test]
+fn overlay_whiteouts_hide_lower_files_in_links_and_copies() {
+    let tmp = TempDir::new().unwrap();
+    let def = make_test_definition();
+    let ctx = create_test_context(&tmp, &def);
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let install = make_test_install(&install_dir, true, true);
+    let inst = create_pinned_instance(&ctx, &install, &def, "OverlayWhiteouts");
+    let id = &inst.instance_id;
+
+    let item = add_content_folder(
+        &ctx,
+        "Mod",
+        &[
+            ("mod_file.txt", b"mod"),
+            ("Scripts/a.pex", b"a"),
+            ("Scripts/b.pex", b"b"),
+        ],
+    );
+    add_content(&ctx, id, &item, None, None).unwrap();
+
+    // How fuse-overlayfs and OCI layering write a deletion: an empty `.wh.<name>` file beside
+    // the deleted path. (Kernel overlayfs writes a char device 0:0 instead; that is covered by
+    // the Linux view test, which runs a real overlay.)
+    let writable = instance_writable_dir(&ctx, id);
+    write_file(&writable.join(".wh.mod_file.txt"), b"");
+    write_file(&writable.join("Scripts/.wh.a.pex"), b"");
+
+    for mode in [DeployMode::Links, DeployMode::Copies] {
+        let p = plan(&ctx, id, &def, mode).unwrap();
+        assert!(find(&p, "mod_file.txt").is_none(), "{mode}");
+        assert!(find(&p, "Scripts/a.pex").is_none(), "{mode}");
+        // A different file in the same folder stays.
+        assert!(find(&p, "Scripts/b.pex").is_some(), "{mode}");
+        assert!(find(&p, "base_file.txt").is_some(), "{mode}");
+        assert!(
+            !p.files
+                .iter()
+                .any(|f| f.path.as_str().to_ascii_lowercase().contains(".wh.")),
+            "{mode}: a whiteout marker was deployed as a game file"
+        );
+    }
+
+    // The game recreated the path: the writable file wins over the marker in modes that place it.
+    write_file(&writable.join("mod_file.txt"), b"recreated");
+    let links = plan(&ctx, id, &def, DeployMode::Links).unwrap();
+    assert!(matches!(
+        find(&links, "mod_file.txt").unwrap().source,
+        FileSource::Writable { .. }
+    ));
+}
+
+#[test]
 fn changing_the_mode_rebuilds_and_the_virtual_farm_survives_writes() {
     let tmp = TempDir::new().unwrap();
     let def = make_test_definition();

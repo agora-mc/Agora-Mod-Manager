@@ -726,6 +726,63 @@ pub fn proton_prefix(ctx: &Ctx, id: &str) -> Option<PathBuf> {
     crate::game_discovery::steam::proton_prefix(&location, &product)
 }
 
+/// [`proton_prefix`], but a prefix that cannot be resolved is an error rather than "no prefix".
+/// The user-files swap uses this: falling back to the Linux home would put a Windows game's files
+/// in the wrong place.
+pub fn proton_prefix_checked(ctx: &Ctx, id: &str) -> Result<Option<PathBuf>, InstanceError> {
+    if !cfg!(target_os = "linux") {
+        return Ok(None);
+    }
+    let manifest = match get_manifest(ctx, id) {
+        Ok(manifest) => manifest,
+        // No instance record is not a Proton-prefix failure; callers that need the instance
+        // report it themselves.
+        Err(InstanceError::NotFound(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let (location, product) = match &manifest.base {
+        BaseReference::Pinned { id: base_id, .. } => {
+            let text = std::fs::read_to_string(ctx.paths.base_manifest_path(base_id)).map_err(|e| {
+                InstanceError::Other(format!(
+                    "the base record for '{base_id}' could not be read, so the Proton prefix could not be found: {e}"
+                ))
+            })?;
+            let base: crate::game_base::BaseManifest = serde_json::from_str(&text).map_err(|e| {
+                InstanceError::Other(format!(
+                    "the base record for '{base_id}' could not be read, so the Proton prefix could not be found: {e}"
+                ))
+            })?;
+            // A base that is not from Steam has no Proton prefix; that is not an error.
+            let Some(product) = base.source_product else {
+                return Ok(None);
+            };
+            (base.source_location, product)
+        }
+        BaseReference::Unpinned { install, .. } => {
+            let (store, product) = install.as_str().split_once(':').ok_or_else(|| {
+                InstanceError::Other(format!(
+                    "the install id '{}' does not name a store, so the Proton prefix could not be found",
+                    install.as_str()
+                ))
+            })?;
+            if store != "steam" {
+                return Ok(None);
+            }
+            let report = crate::game_discovery::discover_with_folders(&ctx.paths);
+            let Some(found) = report.installs.iter().find(|discovered| {
+                crate::game_registry::make_install_id(&discovered.store, &discovered.product)
+                    == *install
+            }) else {
+                // The install is not on this machine; there is no prefix to name.
+                return Ok(None);
+            };
+            (found.location.clone(), product.to_string())
+        }
+    };
+    crate::game_discovery::steam::proton_prefix_checked(&location, &product)
+        .map_err(InstanceError::Other)
+}
+
 /// Delete a generic game instance, moving its folder to Recently deleted so it can be restored.
 /// Refuses Minecraft instances and folders outside `<instances_root>`.
 pub fn delete(ctx: &Ctx, id: &str) -> Result<DeleteOutcome, InstanceError> {

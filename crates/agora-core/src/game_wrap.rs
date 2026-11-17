@@ -73,6 +73,10 @@ pub enum WrapError {
     SteamStart(String),
     #[error("the instance's view could not run: {0}")]
     View(#[from] crate::linux_view::ViewError),
+    #[error("the per-user file '{}' cannot be used: {reason}", path.display())]
+    PerUserFile { path: PathBuf, reason: String },
+    #[error("the Proton prefix could not be found: {0}")]
+    Prefix(String),
     #[error("the command could not be started: {0}")]
     Command(String),
     #[error("the instance's default could not be saved: {0}")]
@@ -94,6 +98,9 @@ pub enum WrapOutcome {
         mechanism: String,
         exit_code: Option<i32>,
         stepped_down: Option<String>,
+        /// Why putting the player's files back after a step-down failed, if it did. The files
+        /// stay swapped in and the next launch or a restore finishes the job.
+        restore_error: Option<String>,
     },
     /// No instance was chosen, so Steam's command ran untouched and the reason says why.
     PassedThrough {
@@ -282,7 +289,6 @@ pub fn wrap(ctx: &Ctx, live: &LivePacks<'_>, command: &[String]) -> Result<WrapO
     .map_err(|reason| WrapError::Instance(game_instance::InstanceError::Other(reason)))?;
 
     let (install, app_id) = instance_install(ctx, &instance_id)?;
-    let prefix = steam::proton_prefix(&install, &app_id);
     let store = game_instance::session_store(
         &record.base,
         &game_instance::get_manifest(ctx, &instance_id)?,
@@ -297,6 +303,9 @@ pub fn wrap(ctx: &Ctx, live: &LivePacks<'_>, command: &[String]) -> Result<WrapO
         ));
     }
 
+    // A prefix that cannot be found is an error that stops the launch: "no prefix" would resolve
+    // the Windows game's per-user files in the Linux home and bind the wrong files.
+    let prefix = steam::proton_prefix_checked(&install, &app_id).map_err(WrapError::Prefix)?;
     let mounts = per_user_mounts(ctx, &instance_id, &definition, &prefix)?;
     let request = ViewRequest {
         instance_id: instance_id.clone(),
@@ -305,7 +314,10 @@ pub fn wrap(ctx: &Ctx, live: &LivePacks<'_>, command: &[String]) -> Result<WrapO
             program: program.clone(),
             args: args.clone(),
             environment: None,
-            working_directory: None,
+            // Steam starts the command with the game folder as its working directory. Re-enter
+            // that path inside the namespace after the overlay is mounted, so a relative read or
+            // write goes through the view instead of the folder underneath it.
+            working_directory: Some(install.clone()),
         },
         per_user_files: mounts,
     };
@@ -331,6 +343,7 @@ pub fn wrap(ctx: &Ctx, live: &LivePacks<'_>, command: &[String]) -> Result<WrapO
                 mechanism: run.mechanism.as_str().to_string(),
                 exit_code: run.status.code(),
                 stepped_down: None,
+                restore_error: None,
             })
         }
         Ok(ViewOutcome::SteppedDown(step)) => {
@@ -568,8 +581,37 @@ fn per_user_mounts(
             &mapping.source,
         )?;
         let instance_copy = instance_dir.join(mapping.instance_path.as_str());
-        ensure_file(&instance_copy)?;
-        ensure_file(&real)?;
+        // A bind mount needs a file at both ends, but the real prefix is the player's and is
+        // never written by the wrapper: no empty placeholder, no first-run blanking. A file the
+        // player does not have is not bound at all, so the game creates it itself, as it would
+        // without Agora.
+        match std::fs::metadata(&real) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Err(WrapError::PerUserFile {
+                    path: real,
+                    reason: "it is not a regular file".to_string(),
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(WrapError::PerUserFile {
+                    path: real,
+                    reason: error.to_string(),
+                })
+            }
+        }
+        // The instance's first launch keeps the player's settings, as Windows does: with no copy
+        // of its own the instance starts from the player's file.
+        if !instance_copy.is_file() {
+            if instance_copy.exists() {
+                return Err(WrapError::PerUserFile {
+                    path: instance_copy,
+                    reason: "it is not a regular file".to_string(),
+                });
+            }
+            seed_instance_copy(&real, &instance_copy)?;
+        }
         mounts.push(PerUserMount {
             real_path: real,
             instance_copy,
@@ -578,18 +620,38 @@ fn per_user_mounts(
     Ok(mounts)
 }
 
-/// A bind mount needs a file at both ends. An absent instance copy starts empty; an absent real
-/// file is the game's own folder, and the mount point is created for the session only.
-fn ensure_file(path: &Path) -> Result<(), WrapError> {
-    if path.is_file() {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| WrapError::Command(format!("{}: {error}", parent.display())))?;
-    }
-    std::fs::write(path, b"")
-        .map_err(|error| WrapError::Command(format!("{}: {error}", path.display())))?;
+/// Copy the player's file into the instance folder, through a temporary name, so a first Linux
+/// launch reads their settings and an interrupted copy never becomes the instance's copy.
+fn seed_instance_copy(real: &Path, instance_copy: &Path) -> Result<(), WrapError> {
+    let parent = instance_copy
+        .parent()
+        .ok_or_else(|| WrapError::PerUserFile {
+            path: instance_copy.to_path_buf(),
+            reason: "it has no parent folder".to_string(),
+        })?;
+    std::fs::create_dir_all(parent).map_err(|error| WrapError::PerUserFile {
+        path: parent.to_path_buf(),
+        reason: error.to_string(),
+    })?;
+    let temporary = instance_copy.with_file_name(format!(
+        ".agora-seed-{}-{}",
+        std::process::id(),
+        instance_copy
+            .file_name()
+            .map(|name| name.to_string_lossy().replace(['/', '\\'], "_"))
+            .unwrap_or_default()
+    ));
+    std::fs::copy(real, &temporary).map_err(|error| WrapError::PerUserFile {
+        path: real.to_path_buf(),
+        reason: error.to_string(),
+    })?;
+    std::fs::rename(&temporary, instance_copy).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        WrapError::PerUserFile {
+            path: instance_copy.to_path_buf(),
+            reason: error.to_string(),
+        }
+    })?;
     Ok(())
 }
 
@@ -608,6 +670,10 @@ fn run_step_down(
     session_id: Option<&str>,
     started: std::time::Instant,
 ) -> Result<WrapOutcome, WrapError> {
+    // Steam's Stop sends SIGTERM. Install the handler before the swap, so a stop at any point
+    // after the player's files change still puts them back before this process exits.
+    let _stop = install_step_down_stop();
+
     crate::game_deploy::deploy(ctx, instance_id, definition, mode)?;
     let farm = crate::game_deploy::deployment_dir(ctx, instance_id)?.ok_or_else(|| {
         crate::game_deploy::DeployError::Other(format!(
@@ -635,44 +701,109 @@ fn run_step_down(
         }
     };
 
+    // A stop that arrived during the deploy or the swap must still put the player's files back.
+    if step_down_stop_requested() {
+        let restore_error = end_step_down(
+            ctx, live, definition, store, session_id, program, &launch_id, None, started,
+        );
+        return Ok(WrapOutcome::Ran {
+            instance_id: instance_id.to_string(),
+            mechanism: mode.plain_name().to_string(),
+            exit_code: Some(STOP_EXIT_CODE),
+            stepped_down: Some(reason.to_string()),
+            restore_error,
+        });
+    }
+
     let mode_program = remap(program, install, &farm);
     let mode_args: Vec<String> = args
         .iter()
         .map(|arg| remap_arg(arg, install, &farm))
         .collect();
-    let run = Command::new(&mode_program)
+    let mut child = match Command::new(&mode_program)
         .args(&mode_args)
-        .status()
-        .map_err(|error| WrapError::Command(error.to_string()));
-    let status = match run {
-        Ok(status) => status,
+        .current_dir(&farm)
+        .spawn()
+    {
+        Ok(child) => child,
         Err(error) => {
-            // This launch swapped the files in itself, so it may give up its own start before
-            // putting them back; a restore from another caller would refuse while it is starting.
-            let _ = crate::game_user_files::finish_starting_launch(
-                ctx,
-                &definition.id,
-                store,
-                &launch_id,
+            end_step_down(
+                ctx, live, definition, store, session_id, program, &launch_id, None, started,
             );
-            let _ = crate::game_instance::end_session(ctx, definition, store);
-            if let Some(session) = session_id {
-                finish_session(
-                    ctx,
-                    live,
-                    definition,
-                    Some(session),
-                    program,
-                    0,
-                    None,
-                    started.elapsed(),
-                );
-            }
-            return Err(error);
+            return Err(WrapError::Command(error.to_string()));
         }
     };
-    let _ = crate::game_user_files::finish_starting_launch(ctx, &definition.id, store, &launch_id);
-    let _ = crate::game_instance::end_session(ctx, definition, store);
+    set_step_down_child(Some(child.id()));
+    let wait = child.wait();
+    set_step_down_child(None);
+    let status = match wait {
+        Ok(status) => status,
+        Err(error) => {
+            end_step_down(
+                ctx, live, definition, store, session_id, program, &launch_id, None, started,
+            );
+            return Err(WrapError::Command(error.to_string()));
+        }
+    };
+    if step_down_stop_requested() {
+        // The player asked for this; the session ledger says a stop ended it.
+        crate::session_ledger::record_stop(ctx, instance_id);
+    }
+    let restore_error = end_step_down(
+        ctx,
+        live,
+        definition,
+        store,
+        session_id,
+        program,
+        &launch_id,
+        Some(&status),
+        started,
+    );
+    Ok(WrapOutcome::Ran {
+        instance_id: instance_id.to_string(),
+        mechanism: mode.plain_name().to_string(),
+        exit_code: status.code(),
+        stepped_down: Some(reason.to_string()),
+        restore_error,
+    })
+}
+
+/// The exit code a wrapper yields when Steam's Stop asked it to end: 128 + SIGTERM.
+const STOP_EXIT_CODE: i32 = 143;
+
+/// Put the player's per-user files back after a step-down, report a failure instead of
+/// discarding it, and record the session's end. Returns the failure, if any.
+#[allow(clippy::too_many_arguments)]
+fn end_step_down(
+    ctx: &Ctx,
+    live: &LivePacks<'_>,
+    definition: &GameDefinition,
+    store: &StoreId,
+    session_id: Option<&str>,
+    program: &Path,
+    launch_id: &str,
+    status: Option<&ExitStatus>,
+    started: std::time::Instant,
+) -> Option<String> {
+    // This launch swapped the files in itself, so it may give up its own start before putting
+    // them back; a restore from another caller would refuse while it is starting.
+    let _ = crate::game_user_files::finish_starting_launch(ctx, &definition.id, store, launch_id);
+    let restore_error = match crate::game_instance::end_session(ctx, definition, store) {
+        Ok(_) => None,
+        Err(error) => {
+            let reason = error.to_string();
+            eprintln!(
+                "agora games wrap: {}",
+                crate::game_user_files::restore_failure_message(
+                    &reason,
+                    definition.id.as_str(),
+                    store.as_str()
+                )
+            );
+            Some(reason)
+        }
+    };
     finish_session(
         ctx,
         live,
@@ -680,15 +811,85 @@ fn run_step_down(
         session_id,
         program,
         0,
-        Some(&status),
+        status,
         started.elapsed(),
     );
-    Ok(WrapOutcome::Ran {
-        instance_id: instance_id.to_string(),
-        mechanism: mode.plain_name().to_string(),
-        exit_code: status.code(),
-        stepped_down: Some(reason.to_string()),
-    })
+    restore_error
+}
+
+#[cfg(target_os = "linux")]
+static STEP_DOWN_CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+#[cfg(target_os = "linux")]
+static STEP_DOWN_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Installs a SIGTERM handler for the step-down command's lifetime and restores the old one.
+#[cfg(target_os = "linux")]
+struct StepDownStop {
+    previous: nix::sys::signal::SigAction,
+}
+
+#[cfg(target_os = "linux")]
+extern "C" fn on_step_down_signal(_signal: i32) {
+    use std::sync::atomic::Ordering;
+    let child = STEP_DOWN_CHILD.load(Ordering::SeqCst);
+    if child > 0 {
+        // Forward to the command only. Its own group is left alone, so a wineserver that
+        // belongs to the prefix and is shared with another launch is never signalled.
+        unsafe { nix::libc::kill(child, nix::libc::SIGTERM) };
+    }
+    STEP_DOWN_STOP.store(true, Ordering::SeqCst);
+}
+
+#[cfg(target_os = "linux")]
+fn install_step_down_stop() -> StepDownStop {
+    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+    use std::sync::atomic::Ordering;
+    STEP_DOWN_CHILD.store(0, Ordering::SeqCst);
+    STEP_DOWN_STOP.store(false, Ordering::SeqCst);
+    let action = SigAction::new(
+        SigHandler::Handler(on_step_down_signal),
+        SaFlags::SA_RESTART,
+        SigSet::empty(),
+    );
+    let previous = unsafe { sigaction(Signal::SIGTERM, &action) }
+        .unwrap_or_else(|_| SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty()));
+    StepDownStop { previous }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for StepDownStop {
+    fn drop(&mut self) {
+        let _ = unsafe {
+            nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGTERM, &self.previous)
+        };
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_step_down_child(pid: Option<u32>) {
+    use std::sync::atomic::Ordering;
+    STEP_DOWN_CHILD.store(pid.map(|pid| pid as i32).unwrap_or(0), Ordering::SeqCst);
+}
+
+#[cfg(target_os = "linux")]
+fn step_down_stop_requested() -> bool {
+    STEP_DOWN_STOP.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(target_os = "linux"))]
+struct StepDownStop;
+
+#[cfg(not(target_os = "linux"))]
+fn install_step_down_stop() -> StepDownStop {
+    StepDownStop
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_step_down_child(_pid: Option<u32>) {}
+
+#[cfg(not(target_os = "linux"))]
+fn step_down_stop_requested() -> bool {
+    false
 }
 
 fn remap(path: &Path, install: &Path, farm: &Path) -> PathBuf {

@@ -6,14 +6,17 @@
 //! Ubuntu job allows user namespaces instead; see the workflow). They never pass silently.
 #![cfg(target_os = "linux")]
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agora_core::ctx::CoreContext;
 use agora_core::game_base::{get_file_identity, BaseMode};
-use agora_core::game_deploy::{add_content, deploy, deployment_dir, DeployMode};
+use agora_core::game_deploy::{add_content, deploy, deployment_dir, plan, DeployMode};
 use agora_core::game_discovery::{DiscoveredInstall, InstallCapabilities};
 use agora_core::game_instance::create;
 use agora_core::game_registry::{
@@ -38,6 +41,57 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
     SERIAL
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+// ---------------------------------------------------------------------------
+// Allocation tracking for the fork/exec child (L3).
+//
+// A process that forks while other threads hold the allocator lock must not allocate in the
+// child. This allocator records, in a shared file, every allocation made by a pid other than the
+// test process. The only such pid in a view run is the forked child before it execs, so a
+// non-empty log is proof that the child allocated between `fork` and `execve`.
+// ---------------------------------------------------------------------------
+
+static TRACK_ALLOCATIONS: AtomicBool = AtomicBool::new(false);
+static PARENT_PID: AtomicI32 = AtomicI32::new(0);
+static ALLOCATION_LOG_FD: AtomicI32 = AtomicI32::new(-1);
+
+unsafe extern "C" {
+    #[link_name = "write"]
+    fn raw_write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize;
+}
+
+struct TrackingAllocator;
+
+unsafe impl GlobalAlloc for TrackingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        record_if_child_allocates();
+        System.alloc(layout)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout);
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: TrackingAllocator = TrackingAllocator;
+
+fn record_if_child_allocates() {
+    if !TRACK_ALLOCATIONS.load(Ordering::Relaxed) {
+        return;
+    }
+    let parent = PARENT_PID.load(Ordering::Relaxed);
+    if parent == 0 || std::process::id() as i32 == parent {
+        return;
+    }
+    let fd = ALLOCATION_LOG_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        // A raw write, so recording an allocation cannot itself allocate.
+        unsafe {
+            raw_write(fd, b"x".as_ptr() as *const _, 1);
+        }
+    }
 }
 
 struct TestPackage(PackageDefinition);
@@ -405,6 +459,43 @@ fn empty_input_is_an_error_never_a_clean_result() {
 }
 
 #[test]
+fn the_forked_child_allocates_nothing_before_it_execs() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let target = fixture._tmp.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let request = ViewRequest {
+        instance_id: fixture.instance_id.clone(),
+        target,
+        command: fixture.command("exit 0\n"),
+        per_user_files: vec![],
+    };
+
+    let mut log = tempfile::tempfile().unwrap();
+    ALLOCATION_LOG_FD.store(log.as_raw_fd(), Ordering::SeqCst);
+    PARENT_PID.store(std::process::id() as i32, Ordering::SeqCst);
+    TRACK_ALLOCATIONS.store(true, Ordering::SeqCst);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_view(&fixture, &request)
+    }));
+    TRACK_ALLOCATIONS.store(false, Ordering::SeqCst);
+    ALLOCATION_LOG_FD.store(-1, Ordering::SeqCst);
+    PARENT_PID.store(0, Ordering::SeqCst);
+
+    use std::io::{Read, Seek, SeekFrom};
+    log.seek(SeekFrom::Start(0)).unwrap();
+    let mut recorded = Vec::new();
+    log.read_to_end(&mut recorded).unwrap();
+    assert!(
+        recorded.is_empty(),
+        "the forked child allocated {} time(s) between fork and exec",
+        recorded.len()
+    );
+    // Still fail loudly on a host that cannot run the view, like the other tests.
+    let _ = ran(outcome.expect("the view must not panic"));
+}
+
+#[test]
 fn merged_view_and_write_isolation() {
     let _serial = serial();
     let fixture = Fixture::new();
@@ -517,6 +608,61 @@ fn fuse_overlayfs_installed() -> bool {
 }
 
 #[test]
+fn a_delete_inside_the_view_stays_deleted_in_a_links_deploy() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let out = fixture._tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let target = fixture._tmp.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+
+    let mut request = ViewRequest {
+        instance_id: fixture.instance_id.clone(),
+        target: target.clone(),
+        command: fixture.command(
+            "rm \"$TARGET/delete_me.txt\"
+",
+        ),
+        per_user_files: vec![],
+    };
+    request.command.environment = Some(vec![
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("TARGET".into(), target.display().to_string()),
+    ]);
+    let run = ran(run_view(&fixture, &request)).expect("the fixture host must run the view");
+    assert!(run.status.success(), "the command failed: {:?}", run.status);
+
+    // Kernel overlayfs records the deletion in the writable layer as a char device 0:0.
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let whiteout = std::fs::symlink_metadata(fixture.writable().join("delete_me.txt"))
+        .expect("a delete must leave a whiteout in the writable layer");
+    assert!(
+        whiteout.file_type().is_char_device() && whiteout.rdev() == 0,
+        "expected a kernel overlay whiteout, got {whiteout:?}"
+    );
+
+    // Deploying the same instance with links (or copies) must not bring the file back.
+    let links = plan(
+        &fixture.ctx,
+        &fixture.instance_id,
+        &fixture.def,
+        DeployMode::Links,
+    )
+    .unwrap();
+    assert!(
+        !links
+            .files
+            .iter()
+            .any(|file| file.path.as_str() == "delete_me.txt"),
+        "the file the game deleted inside the view came back in a links deploy"
+    );
+    assert!(links
+        .files
+        .iter()
+        .any(|file| file.path.as_str() == "base_only.txt"));
+}
+
+#[test]
 fn fuse_overlay_runs_when_the_kernel_refuses() {
     let _serial = serial();
     if !fuse_overlayfs_installed() {
@@ -615,6 +761,51 @@ fn fuse_overlay_runs_when_the_kernel_refuses() {
 }
 
 #[test]
+fn fuse_finds_its_mount_when_the_game_folder_has_a_space() {
+    let _serial = serial();
+    if !fuse_overlayfs_installed() {
+        eprintln!("SKIPPED: fuse-overlayfs is not on PATH on this host");
+        return;
+    }
+    struct ClearEnv;
+    impl Drop for ClearEnv {
+        fn drop(&mut self) {
+            std::env::remove_var(REFUSE_KERNEL_OVERLAY_ENV);
+        }
+    }
+    std::env::set_var(REFUSE_KERNEL_OVERLAY_ENV, "1");
+    let _clear = ClearEnv;
+
+    let fixture = Fixture::new();
+    let out = fixture._tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    // `/proc/self/mountinfo` escapes this space as `\040`; a check for the raw path never finds
+    // the fuse mount, so the view would time out and step down instead.
+    let target = fixture._tmp.path().join("a game folder");
+    std::fs::create_dir_all(&target).unwrap();
+
+    let mut request = ViewRequest {
+        instance_id: fixture.instance_id.clone(),
+        target: target.clone(),
+        command: fixture.command("cat \"$TARGET/shared.txt\" > \"$OUT/read\"\n"),
+        per_user_files: vec![],
+    };
+    request.command.environment = Some(vec![
+        (
+            "PATH".into(),
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+        ),
+        ("TARGET".into(), target.display().to_string()),
+        ("OUT".into(), out.display().to_string()),
+    ]);
+
+    let run = ran(run_view(&fixture, &request)).expect("the fixture host must run the view");
+    assert_eq!(run.mechanism, OverlayMechanism::Fuse);
+    assert!(run.status.success(), "the command failed: {:?}", run.status);
+    assert_eq!(read(&out.join("read")), b"mod shared");
+}
+
+#[test]
 fn target_is_unchanged_outside_the_namespace() {
     let _serial = serial();
     let fixture = Fixture::new();
@@ -675,6 +866,51 @@ fn target_is_unchanged_outside_the_namespace() {
     );
     assert_eq!(read(&out.join("seen")), b"seen");
     assert_eq!(read(&fixture.writable().join("inside.txt")), b"inside");
+}
+
+/// The namespace's uid 0 is the player's own host uid, not host root. It is deliberately kept
+/// (rather than mapping the player's uid directly) because overlay copy-up keeps a lower file's
+/// read-only mode: content-store objects are 0444, and an unprivileged in-namespace uid cannot
+/// write the copy-up, so a game could not change a mod's own config. This pins both facts, so a
+/// change of mapping must also solve copy-up.
+#[test]
+fn the_view_maps_its_root_to_the_player_so_read_only_content_stays_writable() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let out = fixture._tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let target = fixture._tmp.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let target_display = target.display().to_string();
+
+    let mut request = ViewRequest {
+        instance_id: fixture.instance_id.clone(),
+        target,
+        command: fixture.command(concat!(
+            "id -u > \"$OUT/uid\"\n",
+            "printf changed > \"$TARGET/mod_file.txt\"\n",
+        )),
+        per_user_files: vec![],
+    };
+    request.command.environment = Some(vec![
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("OUT".into(), out.display().to_string()),
+        ("TARGET".into(), target_display),
+    ]);
+
+    let run = ran(run_view(&fixture, &request)).expect("the fixture host must run the view");
+    assert!(run.status.success(), "the command failed: {:?}", run.status);
+    assert_eq!(
+        String::from_utf8(read(&out.join("uid"))).unwrap().trim(),
+        "0",
+        "the game's uid inside the namespace changed; solve read-only copy-up first"
+    );
+    assert_eq!(read(&fixture.writable().join("mod_file.txt")), b"changed");
+    assert_eq!(
+        read(fixture.content_object("mod_file.txt")),
+        b"mod only",
+        "the read-only content object was written through its copy-up"
+    );
 }
 
 #[test]
