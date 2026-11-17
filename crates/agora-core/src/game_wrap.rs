@@ -75,6 +75,8 @@ pub enum WrapError {
     View(#[from] crate::linux_view::ViewError),
     #[error("the per-user file '{}' cannot be used: {reason}", path.display())]
     PerUserFile { path: PathBuf, reason: String },
+    #[error("the Proton prefix could not be found: {0}")]
+    Prefix(String),
     #[error("the command could not be started: {0}")]
     Command(String),
     #[error("the instance's default could not be saved: {0}")]
@@ -277,7 +279,6 @@ pub fn wrap(ctx: &Ctx, live: &LivePacks<'_>, command: &[String]) -> Result<WrapO
         .clone();
 
     let (install, app_id) = instance_install(ctx, &instance_id)?;
-    let prefix = steam::proton_prefix(&install, &app_id);
     let store = game_instance::session_store(
         &record.base,
         &game_instance::get_manifest(ctx, &instance_id)?,
@@ -292,6 +293,9 @@ pub fn wrap(ctx: &Ctx, live: &LivePacks<'_>, command: &[String]) -> Result<WrapO
         ));
     }
 
+    // A prefix that cannot be found is an error that stops the launch: "no prefix" would resolve
+    // the Windows game's per-user files in the Linux home and bind the wrong files.
+    let prefix = steam::proton_prefix_checked(&install, &app_id).map_err(WrapError::Prefix)?;
     let mounts = per_user_mounts(ctx, &instance_id, &definition, &prefix)?;
     let request = ViewRequest {
         instance_id: instance_id.clone(),

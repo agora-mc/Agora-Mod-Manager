@@ -526,7 +526,8 @@ pub fn swap_in(
     std::fs::create_dir_all(&backup_dir)?;
     // A Windows game run through Proton keeps its user folders in the prefix, not in the
     // Linux home folder. `None` on every other platform, store and native Linux game.
-    let prefix = crate::game_instance::proton_prefix(ctx, instance_id);
+    let prefix = crate::game_instance::proton_prefix_checked(ctx, instance_id)
+        .map_err(|e| UserFilesError::Other(e.to_string()))?;
 
     // 3. Settle the mappings before anything else. Two mappings for one real file, or two that
     // share one instance path, cannot be swapped and restored unambiguously: the journal is looked
@@ -968,7 +969,8 @@ fn restore_journal_internal(
         .map_err(|e| UserFilesError::Other(e.to_string()))?;
 
     // 2. Applicable mappings for this store
-    let prefix = crate::game_instance::proton_prefix(ctx, &journal.instance_id);
+    let prefix = crate::game_instance::proton_prefix_checked(ctx, &journal.instance_id)
+        .map_err(|e| UserFilesError::Other(e.to_string()))?;
     let applicable_mappings: Vec<&UserFileMapping> = definition
         .user_files
         .iter()

@@ -34,6 +34,49 @@ pub fn proton_prefix(install_location: &Path, app_id: &str) -> Option<PathBuf> {
     None
 }
 
+/// Like [`proton_prefix`], but a game Steam has already run through Proton whose prefix cannot
+/// be used is an error naming why. Falling back to the Linux home would put a Windows game's
+/// files in the wrong place, so an error is never "no prefix".
+pub fn proton_prefix_checked(
+    install_location: &Path,
+    app_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    let mut current = install_location;
+    while let Some(parent) = current.parent() {
+        if current
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("steamapps"))
+        {
+            let compatdata = current.join("compatdata").join(app_id);
+            if !compatdata.exists() {
+                // A native Linux game, or Proton has not run this app yet. There is no prefix.
+                return Ok(None);
+            }
+            let prefix = compatdata.join("pfx");
+            return match std::fs::metadata(&prefix) {
+                Ok(metadata) if metadata.is_dir() => Ok(Some(prefix)),
+                Ok(_) => Err(format!(
+                    "the Proton prefix '{}' is not a folder",
+                    prefix.display()
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+                    "the Proton prefix '{}' is missing, though Steam has used it",
+                    prefix.display()
+                )),
+                Err(error) => Err(format!(
+                    "the Proton prefix '{}' could not be read: {error}",
+                    prefix.display()
+                )),
+            };
+        }
+        current = parent;
+    }
+    Err(format!(
+        "the game folder '{}' is not inside a Steam library, so its Proton prefix could not be found",
+        install_location.display()
+    ))
+}
+
 /// The Windows user folder a `UserDataLocation` names, inside a Proton prefix.
 pub fn user_data_root(prefix: &Path, location: &UserDataLocation) -> PathBuf {
     crate::game_user_files::user_data_root_in_prefix(prefix, location)

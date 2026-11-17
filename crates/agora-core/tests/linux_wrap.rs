@@ -645,6 +645,33 @@ fn an_instance_copy_is_not_bound_when_the_real_file_is_absent() {
 }
 
 #[test]
+fn a_broken_proton_prefix_stops_the_launch_with_its_reason() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    fixture.pending();
+    // Steam has used this app (its compatdata folder exists), but the prefix is gone.
+    std::fs::remove_dir_all(&fixture.prefix).unwrap();
+    let out = fixture._tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let marker = out.join("ran");
+    let command = fixture._tmp.path().join("fake-proton-noprefix.sh");
+    script(&command, &format!("printf ran > '{}'\n", marker.display()));
+    std::env::set_var("SteamAppId", "4242");
+    let host = QuickJsHost::new();
+    let live = fixture.live(&[], &[], &host);
+    let error = game_wrap::wrap(&fixture.ctx, &live, &[command.display().to_string()])
+        .expect_err("a missing Proton prefix must stop the launch, not use the Linux home");
+    match error {
+        WrapError::Prefix(reason) => assert!(
+            reason.contains("Proton prefix"),
+            "the reason must name the prefix: {reason}"
+        ),
+        other => panic!("expected a prefix error, got {other:?}"),
+    }
+    assert!(!marker.exists(), "the command ran without its prefix");
+}
+
+#[test]
 fn a_stop_signal_restores_the_files_before_the_wrapper_exits() {
     let _serial = serial();
     struct ClearEnv;
