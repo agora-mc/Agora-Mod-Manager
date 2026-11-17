@@ -5578,6 +5578,39 @@ async fn run_loadout_command(
             if json {
                 println!("{}", serde_json::to_string_pretty(&profiles)?);
             } else {
+                let manifest = agora_core::game_instance::get_manifest(ctx, &instance).ok();
+                let definition = manifest
+                    .as_ref()
+                    .and_then(|m| m.runtime_identity.as_ref())
+                    .and_then(|runtime| ctx.games.game(&runtime.game));
+                let store = manifest
+                    .as_ref()
+                    .and_then(|m| m.runtime_identity.as_ref())
+                    .map(|runtime| runtime.store.clone());
+                let saves = |profile: &agora_core::loadout::LoadoutProfile| -> String {
+                    let Some(state) = &profile.game else {
+                        return "-".to_string();
+                    };
+                    match state.saves {
+                        agora_core::game_instance::SavesChoice::Shared => "shared".to_string(),
+                        agora_core::game_instance::SavesChoice::Own => match (definition, &store) {
+                            (Some(definition), Some(store)) => {
+                                agora_core::game_saves::rule_for(definition, store)
+                                    .and_then(|rule| {
+                                        agora_core::game_saves::own_folder_scoped(
+                                            rule,
+                                            &instance,
+                                            state.save_folder.as_deref(),
+                                        )
+                                        .ok()
+                                    })
+                                    .map(|folder| folder.display().to_string())
+                                    .unwrap_or_else(|| "own (folder unknown)".to_string())
+                            }
+                            _ => "own".to_string(),
+                        },
+                    }
+                };
                 let rows: Vec<Vec<String>> = profiles
                     .iter()
                     .map(|p| {
@@ -5586,10 +5619,15 @@ async fn run_loadout_command(
                             .as_ref()
                             .map(|game| game.content.iter().filter(|item| item.enabled).count())
                             .unwrap_or(p.enabled_mods.len());
-                        vec![p.name.clone(), p.created_at.clone(), entries.to_string()]
+                        vec![
+                            p.name.clone(),
+                            p.created_at.clone(),
+                            entries.to_string(),
+                            saves(p),
+                        ]
                     })
                     .collect();
-                print_table(&["Name", "Created", "Entries"], &rows);
+                print_table(&["Name", "Created", "Entries", "Saves"], &rows);
             }
         }
         LoadoutCmd::Apply {

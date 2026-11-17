@@ -3254,6 +3254,8 @@ fn profile_state_for_merge(
     } else {
         SavesChoice::Shared
     };
+    // A merged import has no earlier own folder to adopt: every own-saves profile gets its own.
+    state.save_folder = plan.local_saves.then(|| plan.profile.clone());
     Ok(state)
 }
 

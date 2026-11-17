@@ -90,6 +90,7 @@ fn applying_a_loadout_sets_the_saves_ini_to_the_loadouts_folder() {
 
     let state = GameLoadout {
         saves: SavesChoice::Own,
+        save_folder: Some("Own Saves".to_string()),
         ..GameLoadout::default()
     };
     game_loadout::save_game_profile(&h.ctx, h.instance, "Own Saves", state).unwrap();
@@ -111,42 +112,69 @@ fn applying_a_loadout_sets_the_saves_ini_to_the_loadouts_folder() {
 }
 
 #[test]
-fn each_own_loadout_gets_its_own_save_folder() {
+fn the_first_own_loadout_adopts_the_instances_existing_save_folder() {
     let h = Harness::new();
     let def = skyrim();
     let rule = game_saves::rule_for(&def, &StoreId::steam()).expect("a save rule");
-    for name in ["First Setup", "Second Setup"] {
-        let state = GameLoadout {
-            saves: SavesChoice::Own,
-            ..GameLoadout::default()
-        };
-        game_loadout::save_game_profile(&h.ctx, h.instance, name, state).unwrap();
-        game_loadout::apply_game_profile_with_undo(&h.ctx, h.instance, &def, name)
-            .expect("the loadout applies");
-        let expected = game_saves::own_value_scoped(rule, h.instance, Some(name));
-        let status = game_saves::status(&h.ctx, h.instance, &def).expect("the saves status");
-        assert_eq!(
-            status.setting_value.as_deref(),
-            Some(expected.as_str()),
-            "the INI names '{name}'s own folder"
-        );
-        let folder = game_saves::own_folder_scoped(rule, h.instance, Some(name)).unwrap();
-        assert_eq!(
-            status.in_use.path, folder,
-            "'{name}'s saves are read from its folder"
-        );
-        std::fs::write(folder.join("Save1.ess"), name.as_bytes()).unwrap();
-        let backup = agora_core::save_backup::backup(&h.ctx, h.instance, &def)
-            .expect("the loadout's saves are backed up");
-        assert_eq!(backup.source, folder);
-        assert_eq!(backup.file_count, 1);
-    }
+    let existing = game_saves::own_folder(rule, h.instance).expect("the single own folder");
+    std::fs::create_dir_all(&existing).unwrap();
+    std::fs::write(existing.join("Save1.ess"), b"THE PLAYER'S SAVE").unwrap();
+    let mut manifest = agora_core::game_instance::get_manifest(&h.ctx, h.instance).unwrap();
+    manifest.saves = SavesChoice::Own;
+    manifest.save_scope = None;
+    std::fs::write(
+        h.ctx
+            .paths
+            .instance_dir(h.instance)
+            .unwrap()
+            .join("instance_manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
 
-    let first = game_saves::own_folder_scoped(rule, h.instance, Some("First Setup")).unwrap();
-    let second = game_saves::own_folder_scoped(rule, h.instance, Some("Second Setup")).unwrap();
-    assert_ne!(first, second, "two setups never share a save folder");
+    // The first own-saves loadout adopts the folder the player has been using.
+    let first = game_loadout::create_game_profile(&h.ctx, h.instance, &def, "First Setup")
+        .expect("the first loadout is created");
+    assert_eq!(
+        first.game.as_ref().unwrap().save_folder,
+        None,
+        "the first loadout records the instance's existing folder"
+    );
+    game_loadout::apply_game_profile_with_undo(&h.ctx, h.instance, &def, "First Setup")
+        .expect("the first loadout applies");
+    let status = game_saves::status(&h.ctx, h.instance, &def).expect("the saves status");
+    assert_eq!(
+        status.setting_value.as_deref(),
+        Some(game_saves::own_value(rule, h.instance).as_str()),
+        "the INI still names the existing folder"
+    );
+    assert_eq!(
+        status.in_use.path, existing,
+        "the game reads the existing folder"
+    );
+    assert_eq!(status.in_use.saves, 1, "the player's save is still listed");
 
-    // Going back to the shared saves after two own loadouts still restores the player's setting.
+    // The second loadout gets a new folder; the first folder and its save stay untouched.
+    let second = game_loadout::create_game_profile(&h.ctx, h.instance, &def, "Second Setup")
+        .expect("the second loadout is created");
+    assert_eq!(
+        second.game.as_ref().unwrap().save_folder.as_deref(),
+        Some("Second Setup"),
+        "a later loadout gets its own folder"
+    );
+    game_loadout::apply_game_profile_with_undo(&h.ctx, h.instance, &def, "Second Setup")
+        .expect("the second loadout applies");
+    let second_folder =
+        game_saves::own_folder_scoped(rule, h.instance, Some("Second Setup")).unwrap();
+    let status = game_saves::status(&h.ctx, h.instance, &def).expect("the saves status");
+    assert_eq!(status.in_use.path, second_folder);
+    assert_ne!(existing, second_folder);
+    assert!(
+        existing.join("Save1.ess").is_file(),
+        "the adopted folder's save was not moved"
+    );
+
+    // Going back to the shared saves after both own folders still restores the player's setting.
     let shared = GameLoadout {
         saves: SavesChoice::Shared,
         ..GameLoadout::default()

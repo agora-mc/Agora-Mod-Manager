@@ -1583,6 +1583,14 @@ fn merged_copy_saves_copies_each_profiles_saves_and_says_which() {
     let alt_folder = agora_core::game_saves::own_folder_scoped(rule, instance, Some("Alt"))
         .expect("Alt's own save folder");
     assert_ne!(main_folder, alt_folder, "each loadout has its own folder");
+    let main_loadout = loadout(&f, instance, "Main").game.expect("Main's loadout");
+    assert_eq!(
+        main_loadout.save_folder.as_deref(),
+        Some("Main"),
+        "a merged profile never adopts the instance's single folder"
+    );
+    let alt_loadout = loadout(&f, instance, "Alt").game.expect("Alt's loadout");
+    assert_eq!(alt_loadout.save_folder.as_deref(), Some("Alt"));
     assert_eq!(
         std::fs::read(main_folder.join("Save1.ess")).unwrap(),
         b"SAVE ONE",

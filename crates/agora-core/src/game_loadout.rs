@@ -72,15 +72,17 @@ pub struct GameLoadout {
     pub rules: Vec<GameLoadoutRules>,
     #[serde(default)]
     pub saves: SavesChoice,
+    /// The own save folder this loadout uses. `Some(scope)` names a folder under the instance;
+    /// `None` with `saves = Own` means the instance's single own folder, adopted from before
+    /// loadouts had folders of their own. Unused when `saves = Shared`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_folder: Option<String>,
 }
 
 /// The state an apply replaced, kept so the change can be undone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameUndo {
     pub profile: String,
-    /// The loadout whose own save folder the instance was using before this apply.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub save_scope: Option<String>,
     pub state: GameLoadout,
 }
 
@@ -179,6 +181,10 @@ pub fn capture(
         inis,
         rules,
         saves: manifest.saves,
+        save_folder: match manifest.saves {
+            SavesChoice::Shared => None,
+            SavesChoice::Own => manifest.save_scope.clone(),
+        },
     })
 }
 
@@ -192,7 +198,31 @@ pub fn create_game_profile(
     if name.trim().is_empty() {
         return Err("A loadout profile needs a name".into());
     }
-    let state = capture(ctx, instance_id, definition)?;
+    let mut state = capture(ctx, instance_id, definition)?;
+    if state.saves == SavesChoice::Own {
+        let dir = instance_dir(ctx, instance_id)?;
+        let single_claimed = loadout::list_profiles(&dir)
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|profile| {
+                profile.name != name
+                    && profile.game.as_ref().is_some_and(|game| {
+                        game.saves == SavesChoice::Own && game.save_folder.is_none()
+                    })
+            });
+        let store = crate::game_ini::store_of(ctx, instance_id).map_err(|e| e.to_string())?;
+        let single_has_saves = crate::game_saves::rule_for(definition, &store)
+            .and_then(|rule| crate::game_saves::own_folder(rule, instance_id).ok())
+            .is_some_and(|folder| folder_has_saves(&folder));
+        state.save_folder = match &state.save_folder {
+            // A named folder belongs to the loadout that made it; this one gets its own.
+            Some(_) => Some(name.to_string()),
+            // The single own folder is adopted by the first own-saves loadout only, and only
+            // when it already holds saves the player can see in the game.
+            None if single_claimed || !single_has_saves => Some(name.to_string()),
+            None => None,
+        };
+    }
     let enabled_mods = state
         .content
         .iter()
@@ -281,7 +311,8 @@ pub fn update_game_profile(
         .game
         .as_ref()
         .ok_or_else(|| format!("'{profile_name}' is not a game-instance loadout"))?;
-    let current = capture(ctx, instance_id, definition)?;
+    let mut current = capture(ctx, instance_id, definition)?;
+    current.save_folder = old_state.save_folder.clone();
     let changes = diff(old_state, &current);
     let enabled_mods = current
         .content
@@ -467,28 +498,18 @@ pub fn apply_game_profile_with_undo(
         )));
     }
 
-    let save_scope = game_instance::get_manifest(ctx, instance_id)
-        .map_err(|e| LoadoutApplyError::UndoPoint(e.to_string()))?
-        .save_scope;
     let undo = capture(ctx, instance_id, definition).map_err(LoadoutApplyError::UndoPoint)?;
     let undo = GameUndo {
         profile: profile.name.clone(),
         state: undo,
-        save_scope,
     };
     let bytes = serde_json::to_vec_pretty(&undo)
         .map_err(|e| LoadoutApplyError::UndoPoint(e.to_string()))?;
     write_atomic(&undo_path(&dir), &bytes).map_err(LoadoutApplyError::UndoPoint)?;
 
-    if let Err(error) = apply_state(ctx, instance_id, definition, &state, Some(&profile.name)) {
-        let rollback = apply_state(
-            ctx,
-            instance_id,
-            definition,
-            &undo.state,
-            undo.save_scope.as_deref(),
-        )
-        .map_err(|e| e.to_string());
+    if let Err(error) = apply_state(ctx, instance_id, definition, &state) {
+        let rollback =
+            apply_state(ctx, instance_id, definition, &undo.state).map_err(|e| e.to_string());
         return Err(LoadoutApplyError::Apply { error, rollback });
     }
     Ok(())
@@ -518,13 +539,7 @@ pub fn undo_game_apply(
         .map_err(|e| format!("No loadout apply to undo for '{instance_id}': {e}"))?;
     let undo: GameUndo =
         serde_json::from_slice(&bytes).map_err(|e| format!("Invalid undo point: {e}"))?;
-    apply_state(
-        ctx,
-        instance_id,
-        definition,
-        &undo.state,
-        undo.save_scope.as_deref(),
-    )?;
+    apply_state(ctx, instance_id, definition, &undo.state)?;
     fs::remove_file(undo_path(&dir)).map_err(|e| format!("Cannot clear the undo point: {e}"))?;
     Ok(undo.profile)
 }
@@ -534,7 +549,6 @@ fn apply_state(
     instance_id: &str,
     definition: &GameDefinition,
     state: &GameLoadout,
-    save_scope: Option<&str>,
 ) -> Result<(), String> {
     for ini in &state.inis {
         if crate::save_backup::safe_relative(&ini.file).is_none() {
@@ -612,7 +626,7 @@ fn apply_state(
     // A game without a save-folder setting keeps the recorded choice as it always did.
     if crate::game_saves::rule_for(definition, &store).is_some() {
         let scope = if state.saves == SavesChoice::Own {
-            save_scope
+            state.save_folder.as_deref()
         } else {
             None
         };
@@ -629,6 +643,11 @@ fn apply_state(
     }
 
     Ok(())
+}
+
+/// Whether a folder holds anything (the single own save folder has saves to adopt).
+fn folder_has_saves(folder: &std::path::Path) -> bool {
+    std::fs::read_dir(folder).is_ok_and(|entries| entries.flatten().next().is_some())
 }
 
 fn remove_if_present(path: &std::path::Path) -> Result<(), String> {
