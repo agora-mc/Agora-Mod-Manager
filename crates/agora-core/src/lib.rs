@@ -96,6 +96,7 @@ pub mod process_session_manager;
 pub mod providers;
 pub mod ranking;
 pub mod registry;
+pub mod registry_bundle;
 pub mod registry_sync;
 pub mod save_backup;
 pub mod session_ledger;
