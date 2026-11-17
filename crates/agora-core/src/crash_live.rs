@@ -147,8 +147,10 @@ pub fn answer_for_session(
 }
 
 /// Every stored answer for an instance, newest session first. The newest is the card the overview
-/// shows; the rest are the instance's earlier crashes. A session with no row in `launch_history`
-/// (only possible for an answer written by hand) is ordered by when it was stored.
+/// shows; the rest are the instance's earlier crashes. "Newest" is the latest session by when it
+/// started, because an older session can be diagnosed later (a catch-up) and must not displace a
+/// crash the player already saw. A session with no row in `launch_history` (only possible for an
+/// answer written by hand) is ordered by when it was stored.
 pub fn answers_for_instance(
     conn: &Connection,
     instance_id: &str,
@@ -158,7 +160,7 @@ pub fn answers_for_instance(
            FROM session_answers a
            LEFT JOIN launch_history h ON h.session_id = a.session_id
           WHERE a.instance_id = ?1
-          ORDER BY COALESCE(h.ended_at, h.started_at, a.created_at) DESC, a.session_id DESC",
+          ORDER BY COALESCE(h.started_at, a.created_at) DESC, h.id DESC, a.session_id DESC",
     )?;
     let rows = stmt
         .query_map([instance_id], |row| {
@@ -227,16 +229,21 @@ pub fn latest_answer_with_context(
     })
 }
 
-/// The newest stored answer for an instance.
+/// The newest stored answer for an instance: the answer of the latest session by when it started,
+/// not of the session whose answer was written most recently. A catch-up that diagnoses an old
+/// session later must not make it look newer than a crash the player already saw.
 pub fn latest_answer(
     conn: &Connection,
     instance_id: &str,
 ) -> anyhow::Result<Option<SessionAnswer>> {
     let row: Option<(String, String, String, String)> = conn
         .query_row(
-            "SELECT session_id, instance_id, created_at, answer_json
-               FROM session_answers WHERE instance_id = ?1
-               ORDER BY created_at DESC, session_id DESC LIMIT 1",
+            "SELECT a.session_id, a.instance_id, a.created_at, a.answer_json
+               FROM session_answers a
+               LEFT JOIN launch_history h ON h.session_id = a.session_id
+              WHERE a.instance_id = ?1
+              ORDER BY COALESCE(h.started_at, a.created_at) DESC, h.id DESC, a.session_id DESC
+              LIMIT 1",
             [instance_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
