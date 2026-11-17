@@ -577,10 +577,8 @@ mod linux_impl {
     }
 
     fn write_number(fd: RawFd, value: i32) -> bool {
-        if value < 0 {
-            if !write_raw(fd, b"-") {
-                return false;
-            }
+        if value < 0 && !write_raw(fd, b"-") {
+            return false;
         }
         let mut number = value.unsigned_abs();
         let mut digits = [0u8; 10];
