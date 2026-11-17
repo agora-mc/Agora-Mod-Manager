@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use agora_core::ctx::CoreContext;
 use agora_core::game_base::{get_file_identity, BaseMode};
-use agora_core::game_deploy::{add_content, deploy, deployment_dir, DeployMode};
+use agora_core::game_deploy::{add_content, deploy, deployment_dir, plan, DeployMode};
 use agora_core::game_discovery::{DiscoveredInstall, InstallCapabilities};
 use agora_core::game_instance::create;
 use agora_core::game_registry::{
@@ -605,6 +605,61 @@ fn fuse_overlayfs_installed() -> bool {
             candidate.is_file()
         })
     })
+}
+
+#[test]
+fn a_delete_inside_the_view_stays_deleted_in_a_links_deploy() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let out = fixture._tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let target = fixture._tmp.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+
+    let mut request = ViewRequest {
+        instance_id: fixture.instance_id.clone(),
+        target: target.clone(),
+        command: fixture.command(
+            "rm \"$TARGET/delete_me.txt\"
+",
+        ),
+        per_user_files: vec![],
+    };
+    request.command.environment = Some(vec![
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("TARGET".into(), target.display().to_string()),
+    ]);
+    let run = ran(run_view(&fixture, &request)).expect("the fixture host must run the view");
+    assert!(run.status.success(), "the command failed: {:?}", run.status);
+
+    // Kernel overlayfs records the deletion in the writable layer as a char device 0:0.
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let whiteout = std::fs::symlink_metadata(fixture.writable().join("delete_me.txt"))
+        .expect("a delete must leave a whiteout in the writable layer");
+    assert!(
+        whiteout.file_type().is_char_device() && whiteout.rdev() == 0,
+        "expected a kernel overlay whiteout, got {whiteout:?}"
+    );
+
+    // Deploying the same instance with links (or copies) must not bring the file back.
+    let links = plan(
+        &fixture.ctx,
+        &fixture.instance_id,
+        &fixture.def,
+        DeployMode::Links,
+    )
+    .unwrap();
+    assert!(
+        !links
+            .files
+            .iter()
+            .any(|file| file.path.as_str() == "delete_me.txt"),
+        "the file the game deleted inside the view came back in a links deploy"
+    );
+    assert!(links
+        .files
+        .iter()
+        .any(|file| file.path.as_str() == "base_only.txt"));
 }
 
 #[test]

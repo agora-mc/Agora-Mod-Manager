@@ -870,7 +870,12 @@ fn plan_inner(
     let writable_markers = if would_be.is_some() {
         Vec::new()
     } else {
-        read_whiteout_markers(&writable_dir)?
+        let mut markers = read_whiteout_markers(&writable_dir)?;
+        // The Linux view's overlay records a deletion the same way the game does: a char-device
+        // whiteout (kernel overlayfs) or an empty `.wh.<name>` file (fuse-overlayfs). Both mean
+        // the path stays deleted when this instance later deploys with links or copies.
+        markers.extend(read_overlay_whiteouts(&writable_dir)?);
+        markers
     };
     for marker in writable_markers {
         let prefix = format!("{marker}/");
@@ -1121,6 +1126,10 @@ fn walk_writable_dir(
             // The VFS's whiteout markers are bookkeeping, never game files.
             continue;
         }
+        if is_overlay_whiteout(&meta, &file_name) {
+            // An overlay's deletion marker is not a game file; it becomes a deletion below.
+            continue;
+        }
         let child_rel = rel.join(&file_name);
         if meta.is_dir() {
             walk_writable_dir(root, &child_rel, out)?;
@@ -1188,6 +1197,77 @@ fn walk_overrides_dir(
         }
     }
     Ok(())
+}
+
+/// A char-device 0:0 (kernel overlayfs) or an empty `.wh.<name>` file (fuse-overlayfs) is how an
+/// overlay upper layer records a deletion. Neither is a game file.
+fn is_overlay_whiteout(meta: &std::fs::Metadata, name: &std::ffi::OsStr) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        if meta.file_type().is_char_device() && meta.rdev() == 0 {
+            return true;
+        }
+    }
+    is_dot_wh_marker(meta, name)
+}
+
+/// The `.wh.` half of [`is_overlay_whiteout`], kept separate so the name rule is testable
+/// everywhere (fuse-overlayfs and OCI layering write it on any platform).
+fn is_dot_wh_marker(meta: &std::fs::Metadata, name: &std::ffi::OsStr) -> bool {
+    meta.is_file()
+        && meta.len() == 0
+        && name
+            .to_string_lossy()
+            .strip_prefix(".wh.")
+            .is_some_and(|rest| !rest.is_empty())
+}
+
+/// The paths (case-folded, `/`-separated) the Linux view's overlay recorded as deleted in
+/// `writable_dir`. A char device 0:0 names its own path; a `.wh.<name>` file names its sibling.
+fn read_overlay_whiteouts(writable_dir: &Path) -> Result<Vec<String>, DeployError> {
+    fn walk(dir: &Path, rel: &str, out: &mut Vec<String>) -> Result<(), DeployError> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            if is_reparse_point_or_symlink(&meta) {
+                continue;
+            }
+            let name = entry.file_name();
+            let name_string = name.to_string_lossy().to_string();
+            if rel.is_empty() && name_string.eq_ignore_ascii_case(WHITEOUT_DIR) {
+                continue;
+            }
+            let child = if rel.is_empty() {
+                name_string.clone()
+            } else {
+                format!("{rel}/{name_string}")
+            };
+            if meta.is_dir() {
+                walk(&entry.path(), &child, out)?;
+            } else if is_overlay_whiteout(&meta, &name) {
+                let target = name_string
+                    .strip_prefix(".wh.")
+                    .filter(|rest| !rest.is_empty())
+                    .map(|rest| {
+                        if rel.is_empty() {
+                            rest.to_string()
+                        } else {
+                            format!("{rel}/{rest}")
+                        }
+                    })
+                    .unwrap_or(child);
+                out.push(fold_path_case(&target));
+            }
+        }
+        Ok(())
+    }
+
+    let mut out = Vec::new();
+    if writable_dir.is_dir() {
+        walk(writable_dir, "", &mut out)?;
+    }
+    Ok(out)
 }
 
 /// The paths (case-folded, `/`-separated) the VFS has recorded as deleted in `writable_dir`.
