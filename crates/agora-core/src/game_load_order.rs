@@ -1468,10 +1468,13 @@ fn record_pair(pairs: &mut Vec<ConflictPair>, winner: &str, loser: &str, label: 
 }
 
 /// Whether `winner` lists `changer` among its masters, directly or through its masters' masters.
+/// Only a master the game actually loads can carry a patch: an inactive or missing plugin in the
+/// chain patches nothing.
 fn winner_masters(entries: &[LoadOrderEntry], winner: &LoadOrderEntry, changer: &str) -> bool {
     let wanted = key(changer);
     let by_name: HashMap<String, &LoadOrderEntry> = entries
         .iter()
+        .filter(|entry| loads(entry))
         .map(|entry| (key(&entry.name), entry))
         .collect();
     let mut seen: HashSet<String> = HashSet::new();
@@ -4311,6 +4314,55 @@ mod tests {
                 new_since_last_launch: false,
             }]
         );
+    }
+
+    #[test]
+    fn a_winner_does_not_patch_through_an_inactive_master() {
+        // Middle.esp is listed but switched off, so the game does not load it and it cannot carry
+        // Patch.esp's patch of A.esp. The pair is a real conflict, not a patch.
+        let mut middle = entry("Middle.esp", &["Base.esm", "A.esp"]);
+        middle.active = false;
+        let list = [
+            entry("Base.esm", &[]),
+            entry("A.esp", &[]),
+            middle,
+            entry("Patch.esp", &["Middle.esp"]),
+        ];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[
+                ("Base.esm", "original"),
+                ("A.esp", "old"),
+                ("Patch.esp", "new"),
+            ],
+        )]);
+        let report = classify_overlaps(&list, &reply, &[]).unwrap();
+        assert_eq!(report.patched, 0, "an inactive master patched the pair: {report:?}");
+        assert_eq!(report.pairs.len(), 1);
+        assert_eq!(report.pairs[0].winner, "Patch.esp");
+        assert_eq!(report.pairs[0].loser, "A.esp");
+    }
+
+    #[test]
+    fn a_winner_does_not_patch_through_a_master_that_is_not_listed() {
+        let list = [
+            entry("Base.esm", &[]),
+            entry("A.esp", &[]),
+            entry("Patch.esp", &["Gone.esp"]),
+        ];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[
+                ("Base.esm", "original"),
+                ("A.esp", "old"),
+                ("Patch.esp", "new"),
+            ],
+        )]);
+        let report = classify_overlaps(&list, &reply, &[]).unwrap();
+        assert_eq!(report.patched, 0, "a missing master patched the pair: {report:?}");
+        assert_eq!(report.pairs.len(), 1);
     }
 
     #[test]
