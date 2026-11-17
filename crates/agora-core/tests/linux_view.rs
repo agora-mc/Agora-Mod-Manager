@@ -6,8 +6,11 @@
 //! Ubuntu job allows user namespaces instead; see the workflow). They never pass silently.
 #![cfg(target_os = "linux")]
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,6 +41,57 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
     SERIAL
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+// ---------------------------------------------------------------------------
+// Allocation tracking for the fork/exec child (L3).
+//
+// A process that forks while other threads hold the allocator lock must not allocate in the
+// child. This allocator records, in a shared file, every allocation made by a pid other than the
+// test process. The only such pid in a view run is the forked child before it execs, so a
+// non-empty log is proof that the child allocated between `fork` and `execve`.
+// ---------------------------------------------------------------------------
+
+static TRACK_ALLOCATIONS: AtomicBool = AtomicBool::new(false);
+static PARENT_PID: AtomicI32 = AtomicI32::new(0);
+static ALLOCATION_LOG_FD: AtomicI32 = AtomicI32::new(-1);
+
+unsafe extern "C" {
+    #[link_name = "write"]
+    fn raw_write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize;
+}
+
+struct TrackingAllocator;
+
+unsafe impl GlobalAlloc for TrackingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        record_if_child_allocates();
+        System.alloc(layout)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout);
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: TrackingAllocator = TrackingAllocator;
+
+fn record_if_child_allocates() {
+    if !TRACK_ALLOCATIONS.load(Ordering::Relaxed) {
+        return;
+    }
+    let parent = PARENT_PID.load(Ordering::Relaxed);
+    if parent == 0 || std::process::id() as i32 == parent {
+        return;
+    }
+    let fd = ALLOCATION_LOG_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        // A raw write, so recording an allocation cannot itself allocate.
+        unsafe {
+            raw_write(fd, b"x".as_ptr() as *const _, 1);
+        }
+    }
 }
 
 struct TestPackage(PackageDefinition);
@@ -402,6 +456,43 @@ fn empty_input_is_an_error_never_a_clean_result() {
         matches!(error, linux_view::ViewError::EmptyProgram),
         "{error}"
     );
+}
+
+#[test]
+fn the_forked_child_allocates_nothing_before_it_execs() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let target = fixture._tmp.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let request = ViewRequest {
+        instance_id: fixture.instance_id.clone(),
+        target,
+        command: fixture.command("exit 0\n"),
+        per_user_files: vec![],
+    };
+
+    let mut log = tempfile::tempfile().unwrap();
+    ALLOCATION_LOG_FD.store(log.as_raw_fd(), Ordering::SeqCst);
+    PARENT_PID.store(std::process::id() as i32, Ordering::SeqCst);
+    TRACK_ALLOCATIONS.store(true, Ordering::SeqCst);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_view(&fixture, &request)
+    }));
+    TRACK_ALLOCATIONS.store(false, Ordering::SeqCst);
+    ALLOCATION_LOG_FD.store(-1, Ordering::SeqCst);
+    PARENT_PID.store(0, Ordering::SeqCst);
+
+    use std::io::{Read, Seek, SeekFrom};
+    log.seek(SeekFrom::Start(0)).unwrap();
+    let mut recorded = Vec::new();
+    log.read_to_end(&mut recorded).unwrap();
+    assert!(
+        recorded.is_empty(),
+        "the forked child allocated {} time(s) between fork and exec",
+        recorded.len()
+    );
+    // Still fail loudly on a host that cannot run the view, like the other tests.
+    let _ = ran(outcome.expect("the view must not panic"));
 }
 
 #[test]

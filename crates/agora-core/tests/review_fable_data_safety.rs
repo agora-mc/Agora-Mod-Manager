@@ -161,7 +161,10 @@ fn a_save_restore_is_refused_while_the_instances_game_session_is_running() {
     let h = Harness::new();
     let def = skyrim();
     h.make_instance("live");
-    put(&h.shared_saves().join("Run.ess"), b"the save at backup time");
+    put(
+        &h.shared_saves().join("Run.ess"),
+        b"the save at backup time",
+    );
     let backup = save_backup::backup(&h.ctx, "live", &def).unwrap();
 
     // The game is launched (the session counts as running: the same check loadouts and stop use)
@@ -174,7 +177,10 @@ fn a_save_restore_is_refused_while_the_instances_game_session_is_running() {
             .unwrap()
             .running
     );
-    put(&h.shared_saves().join("Run.ess"), b"the save the game holds");
+    put(
+        &h.shared_saves().join("Run.ess"),
+        b"the save the game holds",
+    );
 
     let restored = save_backup::restore(&h.ctx, "live", &def, &backup.id);
 
