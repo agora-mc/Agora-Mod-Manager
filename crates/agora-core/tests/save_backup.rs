@@ -315,6 +315,51 @@ fn retention_drops_the_oldest_backup() {
 }
 
 #[test]
+fn one_unreadable_backup_is_reported_and_the_others_still_list_and_prune() {
+    let h = Harness::new();
+    let def = skyrim();
+    h.make_instance("mixed", SavesChoice::Shared);
+    h.write_save("Run.ess", b"a save");
+
+    // One backup folder that cannot be read sits beside the readable ones.
+    let root = h.instance_dir("mixed").join(".agora_save_backups");
+    let unreadable = root.join("unreadable-1");
+    std::fs::create_dir_all(&unreadable).unwrap();
+    std::fs::write(
+        unreadable.join("backup.json"),
+        b"{ this is not a backup record",
+    )
+    .unwrap();
+
+    let mut ids = Vec::new();
+    for _ in 0..=MAX_BACKUPS {
+        ids.push(h.backup("mixed", &def).id);
+    }
+
+    let found = save_backup::list_detailed(&h.ctx, "mixed").unwrap();
+    assert_eq!(
+        found.backups.len(),
+        MAX_BACKUPS,
+        "the unreadable backup hid the readable ones"
+    );
+    assert_eq!(found.warnings.len(), 1);
+    assert!(
+        found.warnings[0].contains("unreadable-1"),
+        "the unreadable backup was not reported: {:?}",
+        found.warnings
+    );
+
+    // Retention still ran on the readable backups...
+    let kept: Vec<&str> = found.backups.iter().map(|b| b.id.as_str()).collect();
+    assert!(!kept.contains(&ids[0].as_str()));
+    // ...and never deleted the one it could not read.
+    assert!(
+        unreadable.is_dir(),
+        "pruning deleted a backup it could not read"
+    );
+}
+
+#[test]
 fn a_restore_is_refused_while_the_game_is_running_and_changes_nothing() {
     let h = Harness::new();
     let def = skyrim();

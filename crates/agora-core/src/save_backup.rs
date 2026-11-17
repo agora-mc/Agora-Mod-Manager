@@ -298,12 +298,20 @@ fn backup_from(stored: &StoredBackup, dir: &Path) -> SaveBackup {
     }
 }
 
-fn list_dir(root: &Path) -> Result<Vec<SaveBackup>, SaveBackupError> {
+/// What a backup store holds, and the folders that could not be read.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BackupList {
+    pub backups: Vec<SaveBackup>,
+    /// One line per backup folder that could not be read. It is not listed and is never pruned.
+    pub warnings: Vec<String>,
+}
+
+fn list_dir(root: &Path) -> Result<BackupList, SaveBackupError> {
     if !root.is_dir() {
-        return Ok(Vec::new());
+        return Ok(BackupList::default());
     }
     let entries = fs::read_dir(root).map_err(|source| read_error(root, source))?;
-    let mut backups = Vec::new();
+    let mut list = BackupList::default();
     for entry in entries {
         let entry = entry.map_err(|source| read_error(root, source))?;
         let name = entry.file_name().to_string_lossy().to_string();
@@ -315,26 +323,46 @@ fn list_dir(root: &Path) -> Result<Vec<SaveBackup>, SaveBackupError> {
         if !path.is_dir() {
             continue;
         }
-        let stored = read_manifest(&path)?;
+        // One unreadable backup is reported and skipped; it must not hide the others, and it is
+        // never treated as a finished backup, so pruning can never delete it.
+        let stored = match read_manifest(&path) {
+            Ok(stored) => stored,
+            Err(error) => {
+                list.warnings
+                    .push(format!("backup {} was skipped: {error}", path.display()));
+                continue;
+            }
+        };
         if !is_valid_id(&stored.id) {
-            return Err(SaveBackupError::InvalidBackupId(stored.id));
+            list.warnings.push(format!(
+                "backup {} was skipped: '{}' is not a backup id",
+                path.display(),
+                stored.id
+            ));
+            continue;
         }
-        backups.push(backup_from(&stored, &path));
+        list.backups.push(backup_from(&stored, &path));
     }
-    backups.sort_by(|a, b| {
+    list.backups.sort_by(|a, b| {
         b.created_at
             .cmp(&a.created_at)
             .then_with(|| b.id.cmp(&a.id))
     });
-    Ok(backups)
+    Ok(list)
 }
 
 fn prune(root: &Path, keep: &str) {
-    let Ok(backups) = list_dir(root) else {
-        eprintln!("[save-backup] retention skipped: the backup store could not be read");
-        return;
+    let found = match list_dir(root) {
+        Ok(found) => found,
+        Err(_) => {
+            eprintln!("[save-backup] retention skipped: the backup store could not be read");
+            return;
+        }
     };
-    for old in backups.into_iter().skip(MAX_BACKUPS) {
+    for warning in &found.warnings {
+        eprintln!("[save-backup] {warning}");
+    }
+    for old in found.backups.into_iter().skip(MAX_BACKUPS) {
         if old.id == keep {
             continue;
         }
@@ -414,8 +442,19 @@ pub fn backup(
 }
 
 /// Every finished backup for an instance, newest first. A store Agora has never written to is
-/// empty, not an error; a backup that exists but cannot be read is an error, never silence.
+/// empty, not an error; a backup that exists but cannot be read is reported and skipped, so it
+/// never hides the others. Use [`list_detailed`] to see the report.
 pub fn list(ctx: &Ctx, instance_id: &str) -> Result<Vec<SaveBackup>, SaveBackupError> {
+    let found = list_detailed(ctx, instance_id)?;
+    for warning in &found.warnings {
+        eprintln!("[save-backup] {warning}");
+    }
+    Ok(found.backups)
+}
+
+/// Every finished backup for an instance plus the folders that could not be read, newest first. A
+/// store Agora has never written to is empty, not an error.
+pub fn list_detailed(ctx: &Ctx, instance_id: &str) -> Result<BackupList, SaveBackupError> {
     list_dir(&backup_root(ctx, instance_id)?)
 }
 
