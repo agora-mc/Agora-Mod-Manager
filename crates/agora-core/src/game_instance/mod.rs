@@ -727,7 +727,13 @@ pub fn proton_prefix_checked(ctx: &Ctx, id: &str) -> Result<Option<PathBuf>, Ins
     if !cfg!(target_os = "linux") {
         return Ok(None);
     }
-    let manifest = get_manifest(ctx, id)?;
+    let manifest = match get_manifest(ctx, id) {
+        Ok(manifest) => manifest,
+        // No instance record is not a Proton-prefix failure; callers that need the instance
+        // report it themselves.
+        Err(InstanceError::NotFound(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
     let (location, product) = match &manifest.base {
         BaseReference::Pinned { id: base_id, .. } => {
             let text = std::fs::read_to_string(ctx.paths.base_manifest_path(base_id)).map_err(|e| {
@@ -740,11 +746,10 @@ pub fn proton_prefix_checked(ctx: &Ctx, id: &str) -> Result<Option<PathBuf>, Ins
                     "the base record for '{base_id}' could not be read, so the Proton prefix could not be found: {e}"
                 ))
             })?;
-            let product = base.source_product.ok_or_else(|| {
-                InstanceError::Other(format!(
-                    "the pinned base '{base_id}' does not name a Steam product, so the Proton prefix could not be found"
-                ))
-            })?;
+            // A base that is not from Steam has no Proton prefix; that is not an error.
+            let Some(product) = base.source_product else {
+                return Ok(None);
+            };
             (base.source_location, product)
         }
         BaseReference::Unpinned { install, .. } => {
@@ -758,18 +763,13 @@ pub fn proton_prefix_checked(ctx: &Ctx, id: &str) -> Result<Option<PathBuf>, Ins
                 return Ok(None);
             }
             let report = crate::game_discovery::discover_with_folders(&ctx.paths);
-            let found = report
-                .installs
-                .iter()
-                .find(|discovered| {
-                    crate::game_registry::make_install_id(&discovered.store, &discovered.product)
-                        == *install
-                })
-                .ok_or_else(|| {
-                    InstanceError::Other(format!(
-                        "the Steam install for '{id}' was not found, so its Proton prefix could not be found"
-                    ))
-                })?;
+            let Some(found) = report.installs.iter().find(|discovered| {
+                crate::game_registry::make_install_id(&discovered.store, &discovered.product)
+                    == *install
+            }) else {
+                // The install is not on this machine; there is no prefix to name.
+                return Ok(None);
+            };
             (found.location.clone(), product.to_string())
         }
     };

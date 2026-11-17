@@ -71,10 +71,9 @@ pub fn proton_prefix_checked(
         }
         current = parent;
     }
-    Err(format!(
-        "the game folder '{}' is not inside a Steam library, so its Proton prefix could not be found",
-        install_location.display()
-    ))
+    // Not inside a Steam library: there is nothing to name as a Proton prefix, and that is not
+    // the same as a prefix that exists and cannot be used.
+    Ok(None)
 }
 
 /// The Windows user folder a `UserDataLocation` names, inside a Proton prefix.
