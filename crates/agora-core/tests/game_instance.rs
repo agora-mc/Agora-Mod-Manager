@@ -497,6 +497,7 @@ fn delete_refuses_while_the_instances_session_is_starting_or_running() {
         } else {
             None
         },
+        launch_id: None,
         files: Vec::new(),
     };
 

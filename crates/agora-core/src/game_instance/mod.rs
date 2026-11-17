@@ -2218,7 +2218,7 @@ pub fn launch_with(
     };
 
     // 3. Swap in user files
-    crate::game_user_files::swap_in(ctx, id, definition, &store, &running_from)?;
+    let swapped = crate::game_user_files::swap_in(ctx, id, definition, &store, &running_from)?;
 
     // 4. Spawn game process
     let (launched, prepared) = match spawn_prepared(
@@ -2226,11 +2226,17 @@ pub fn launch_with(
     ) {
         Ok(l) => l,
         Err(e) => {
-            // "If spawning fails, restore immediately." The launch never reported a game, so
-            // its starting mark is cleared first. A restore that also fails is reported rather
-            // than swallowed: the journal stays, and the next launch or a restore finishes it.
-            let put_back = crate::game_user_files::finish_starting(ctx, &definition.id, &store)
-                .and_then(|()| crate::game_user_files::restore(ctx, definition, &store));
+            // "If spawning fails, restore immediately." This launch swapped the files in and may
+            // give up its own start; another launch's restore would have to refuse. A restore that
+            // also fails is reported rather than swallowed: the journal stays, and the next launch
+            // or a restore finishes it.
+            let put_back = crate::game_user_files::finish_starting_launch(
+                ctx,
+                &definition.id,
+                &store,
+                &swapped.launch_id,
+            )
+            .and_then(|()| crate::game_user_files::restore(ctx, definition, &store));
             return Err(match put_back {
                 Ok(_) | Err(crate::game_user_files::UserFilesError::NoSession { .. }) => e,
                 Err(restore_error) => InstanceError::Other(format!(

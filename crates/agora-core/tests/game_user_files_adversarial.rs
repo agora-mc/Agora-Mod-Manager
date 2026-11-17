@@ -4,7 +4,8 @@ use std::sync::Mutex;
 
 use agora_core::ctx::CoreContext;
 use agora_core::game_user_files::{
-    is_session_running, record_process, restore, status, swap_in, Journal, JournaledFile,
+    finish_starting_launch, is_session_running, record_process, restore, status, swap_in, Journal,
+    JournaledFile,
 };
 use agora_core::process_identity;
 use agora_game_api::{
@@ -283,7 +284,7 @@ fn probe_garbage_journal_is_an_error_not_none() {
 }
 
 #[test]
-fn a_refused_restore_clears_this_processes_starting_mark() {
+fn a_refused_restore_leaves_another_launchs_starting_mark_alone() {
     let h = TestHarness::new();
     let def = test_skyrim_definition();
     let real = h
@@ -311,6 +312,10 @@ fn a_refused_restore_clears_this_processes_starting_mark() {
     let journal_path = journal_path_of(&h, &def);
     let mut journal: Journal =
         serde_json::from_str(&std::fs::read_to_string(&journal_path).unwrap()).unwrap();
+    let launch_id = journal
+        .launch_id
+        .clone()
+        .expect("swap_in records the launch that swapped the files in");
     journal.processes = vec![process_identity::capture_self().unwrap()];
     journal.starting_launcher = process_identity::capture_self();
     std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
@@ -323,18 +328,27 @@ fn a_refused_restore_clears_this_processes_starting_mark() {
             .running
     );
 
-    // When the helper is gone, another Agora sees a session that can be recovered: the refused
-    // restore cleared this process's starting mark instead of leaving it for the process's life.
+    // The helper is gone. A restore from the same process is still a different launch, so it must
+    // not clear the launch's own starting mark: only the launch that swapped the files in may.
     let mut after: Journal =
         serde_json::from_str(&std::fs::read_to_string(&journal_path).unwrap()).unwrap();
     after.processes.clear();
     std::fs::write(&journal_path, serde_json::to_vec(&after).unwrap()).unwrap();
     assert!(
+        status(&h.ctx, &def.id, &StoreId::steam())
+            .unwrap()
+            .unwrap()
+            .running,
+        "a restore from another launch cleared this launch's starting mark"
+    );
+
+    finish_starting_launch(&h.ctx, &def.id, &StoreId::steam(), &launch_id).unwrap();
+    assert!(
         !status(&h.ctx, &def.id, &StoreId::steam())
             .unwrap()
             .unwrap()
             .running,
-        "the failed restore left this process's starting mark set"
+        "the launch that swapped the files in could not give up its own start"
     );
 }
 
@@ -382,6 +396,7 @@ fn a_hash_mismatch_names_the_real_file_and_its_backup() {
         running_from: h.running_from.clone(),
         processes: Vec::new(),
         starting_launcher: None,
+        launch_id: None,
         files: vec![JournaledFile {
             real_path: real.clone(),
             instance_path: RelPath::new("user/Plugins.txt").unwrap(),

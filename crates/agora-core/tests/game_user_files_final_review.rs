@@ -5,7 +5,8 @@ use std::sync::Mutex;
 
 use agora_core::ctx::CoreContext;
 use agora_core::game_user_files::{
-    is_session_running, record_process, restore, status, swap_in, Journal, JournaledFile,
+    finish_starting, is_session_running, record_process, restore, status, swap_in, Journal,
+    JournaledFile,
 };
 use agora_core::process_identity;
 use agora_game_api::{
@@ -226,6 +227,7 @@ fn rerun_of_an_interrupted_restore_overwrites_the_sessions_instance_copy() {
     // The game changes both files during the session.
     std::fs::write(&plugins, "session-plugins\n").unwrap();
     std::fs::write(&ini, "session-ini\n").unwrap();
+    finish_starting(&h.ctx, &def.id, &StoreId::steam()).unwrap();
 
     // The second backup is unreadable as the original once (disk error, AV, ...), so restore
     // gets through entry 0 and stops on entry 1 with the journal kept.
@@ -259,6 +261,7 @@ fn read_only_user_file_blocks_restore_and_every_later_launch() {
     swap_in(&h.ctx, "final-c", &def, &StoreId::steam(), &h.running_from).unwrap();
 
     // The game ends without touching the file. Restore only has to put the same bytes back.
+    finish_starting(&h.ctx, &def.id, &StoreId::steam()).unwrap();
     let restored = restore(&h.ctx, &def, &StoreId::steam());
     let next = swap_in(&h.ctx, "final-c", &def, &StoreId::steam(), &h.running_from);
 
@@ -285,6 +288,7 @@ fn control_uninterrupted_restore_keeps_the_session_in_the_instance_copy() {
     put(&inst.join("user").join("Plugins.txt"), "inst-plugins\n");
     swap_in(&h.ctx, "final-d", &def, &StoreId::steam(), &h.running_from).unwrap();
     std::fs::write(&plugins, "session-plugins\n").unwrap();
+    finish_starting(&h.ctx, &def.id, &StoreId::steam()).unwrap();
     restore(&h.ctx, &def, &StoreId::steam()).unwrap();
     assert_eq!(std::fs::read_to_string(&plugins).unwrap(), "orig-plugins\n");
     assert_eq!(

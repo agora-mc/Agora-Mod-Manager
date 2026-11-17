@@ -605,22 +605,25 @@ fn run_step_down(
         ))
     })?;
     let swapped = crate::game_user_files::swap_in(ctx, instance_id, definition, store, &farm);
-    if let Err(error) = swapped {
-        // Nothing ran, so the session that was opened must not stay open as if it had.
-        if let Some(session) = session_id {
-            finish_session(
-                ctx,
-                live,
-                definition,
-                Some(session),
-                program,
-                0,
-                None,
-                started.elapsed(),
-            );
+    let launch_id = match swapped {
+        Ok(swapped) => swapped.launch_id,
+        Err(error) => {
+            // Nothing ran, so the session that was opened must not stay open as if it had.
+            if let Some(session) = session_id {
+                finish_session(
+                    ctx,
+                    live,
+                    definition,
+                    Some(session),
+                    program,
+                    0,
+                    None,
+                    started.elapsed(),
+                );
+            }
+            return Err(WrapError::UserFiles(error));
         }
-        return Err(WrapError::UserFiles(error));
-    }
+    };
 
     let mode_program = remap(program, install, &farm);
     let mode_args: Vec<String> = args
@@ -634,6 +637,14 @@ fn run_step_down(
     let status = match run {
         Ok(status) => status,
         Err(error) => {
+            // This launch swapped the files in itself, so it may give up its own start before
+            // putting them back; a restore from another caller would refuse while it is starting.
+            let _ = crate::game_user_files::finish_starting_launch(
+                ctx,
+                &definition.id,
+                store,
+                &launch_id,
+            );
             let _ = crate::game_instance::end_session(ctx, definition, store);
             if let Some(session) = session_id {
                 finish_session(
@@ -650,6 +661,7 @@ fn run_step_down(
             return Err(error);
         }
     };
+    let _ = crate::game_user_files::finish_starting_launch(ctx, &definition.id, store, &launch_id);
     let _ = crate::game_instance::end_session(ctx, definition, store);
     finish_session(
         ctx,

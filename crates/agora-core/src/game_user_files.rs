@@ -80,6 +80,11 @@ pub struct Journal {
     /// still a launch. A crash leaves a dead identity, so recovery is not blocked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub starting_launcher: Option<ProcessIdentity>,
+    /// Identifies the launch that swapped these files in. The desktop is one process for every
+    /// launch, so the process that made the swap is not enough: only the launch whose id matches
+    /// may give up its own start (for example when its spawn fails).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<String>,
     pub files: Vec<JournaledFile>,
 }
 
@@ -166,6 +171,9 @@ impl RestoreReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwapOutcome {
     pub swapped_files: usize,
+    /// The launch that swapped the files in. Its own spawn failure may clear its start with this;
+    /// any other restore must wait for the launch to finish.
+    pub launch_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -294,13 +302,6 @@ pub fn resolve_user_file_source(source: &GamePath) -> Result<PathBuf, UserFilesE
 
 fn hash_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
-}
-
-/// True when `real` is a strict prefix of `complete`: the shape a write that stopped part way
-/// leaves. Agora's own writes are atomic now; this recognises a state an older build or a torn
-/// external write left, so recovery does not take it for the game's output.
-fn is_torn_prefix(real: &[u8], complete: &[u8]) -> bool {
-    real.len() < complete.len() && complete.starts_with(real)
 }
 
 /// Write a user file atomically: a temp file beside it, synced, renamed over the target, then the
@@ -472,6 +473,11 @@ pub fn swap_in(
         "swap-in",
     )?;
 
+    // This launch's own identity, recorded in the journal before any real file is touched. Only
+    // the launch that made the swap may give up its start; a restore from the same process but a
+    // different launch (the previous session's exit watcher, the Restore command) must not.
+    let launch_id = uuid::Uuid::new_v4().to_string();
+
     // An interrupted tool swap for this game and store is put back before a session starts
     // (MASTER_SPEC §26.9). The lock is held here, so the check does not take it again.
     crate::game_tool_swap::recover_store_unlocked(ctx, definition.id.as_str(), store.as_str())
@@ -513,7 +519,10 @@ pub fn swap_in(
         .collect();
 
     if applicable_mappings.is_empty() {
-        return Ok(SwapOutcome { swapped_files: 0 });
+        return Ok(SwapOutcome {
+            swapped_files: 0,
+            launch_id,
+        });
     }
 
     let instance_dir = ctx
@@ -587,6 +596,7 @@ pub fn swap_in(
         running_from: running_from.to_path_buf(),
         processes: Vec::new(),
         starting_launcher: process_identity::capture_self(),
+        launch_id: Some(launch_id.clone()),
         files: journal_files,
     };
 
@@ -709,6 +719,7 @@ pub fn swap_in(
 
     Ok(SwapOutcome {
         swapped_files: journal.files.len(),
+        launch_id,
     })
 }
 
@@ -734,37 +745,26 @@ pub fn restore(
     }
 
     let text = std::fs::read_to_string(&journal_path)?;
-    let mut journal: Journal = serde_json::from_str(&text)?;
+    let journal: Journal = serde_json::from_str(&text)?;
 
     if session_running_apart_from_starting(&journal) {
-        // The restore outcome is known now. If this process is the one that swapped the files in,
-        // its "starting" mark has done its job: keeping it would make another Agora refuse until
-        // this process exits, even after the game and its helpers are gone.
-        if journal
-            .starting_launcher
-            .as_ref()
-            .is_some_and(|launcher| launcher.pid == std::process::id())
-        {
-            journal.starting_launcher = None;
-            write_journal(&journal_path, &journal)?;
-        }
         return Err(UserFilesError::CannotRestoreRunning {
             instance: journal.instance_id.clone(),
         });
     }
-    match journal.starting_launcher.as_ref() {
-        Some(launcher) if process_identity::verify(launcher).is_ok() => {
-            // The process that started the launch is the one restoring: this is a launch that never
-            // reported a game, not a second launch. Any other process restoring must wait for it.
-            if launcher.pid != std::process::id() {
-                return Err(UserFilesError::CannotRestoreRunning {
-                    instance: journal.instance_id.clone(),
-                });
-            }
-            journal.starting_launcher = None;
-            write_journal(&journal_path, &journal)?;
-        }
-        _ => {}
+    // A launch that has swapped the files in and not yet recorded the game is still a launch,
+    // whoever asks to restore. The desktop is one process for every launch, so a matching pid
+    // proves nothing: the previous session's exit watcher or the Restore command would put the
+    // player's files back under the next launch. Only that launch may give up its own start, with
+    // `finish_starting_launch`, when its spawn fails.
+    if journal
+        .starting_launcher
+        .as_ref()
+        .is_some_and(|launcher| process_identity::verify(launcher).is_ok())
+    {
+        return Err(UserFilesError::CannotRestoreRunning {
+            instance: journal.instance_id.clone(),
+        });
     }
 
     restore_journal_internal(ctx, definition, &journal)
@@ -915,6 +915,9 @@ fn is_sharing_violation(_error: &std::io::Error) -> bool {
 
 /// Clear the "starting" mark of a launch that will never spawn. The caller then restores its
 /// files; a launch that failed must not leave the session counting as running.
+///
+/// This is for a caller that is not the launch itself (tests and recovery). A launch clears only
+/// its own start with [`finish_starting_launch`].
 pub fn finish_starting(ctx: &Ctx, game: &GameId, store: &StoreId) -> Result<(), UserFilesError> {
     let _lock = ctx.lock_manager.acquire(
         LockResource::GameUserFiles(game.clone(), store.clone()),
@@ -928,14 +931,46 @@ pub fn finish_starting(ctx: &Ctx, game: &GameId, store: &StoreId) -> Result<(), 
     }
     let text = std::fs::read_to_string(&journal_path)?;
     let mut journal: Journal = serde_json::from_str(&text)?;
-    let ours = journal
-        .starting_launcher
-        .as_ref()
-        .is_some_and(|launcher| launcher.pid == std::process::id());
-    if ours {
+    if journal.starting_launcher.is_some() {
         journal.starting_launcher = None;
         write_journal(&journal_path, &journal)?;
     }
+    Ok(())
+}
+
+/// Clear the "starting" mark of `launch_id`, and only that launch. A launch whose spawn failed may
+/// give up its own start; another launch's restore must not touch it. A journal that belongs to a
+/// different launch, or has no matching id, is left exactly as it is.
+pub fn finish_starting_launch(
+    ctx: &Ctx,
+    game: &GameId,
+    store: &StoreId,
+    launch_id: &str,
+) -> Result<(), UserFilesError> {
+    let _lock = ctx.lock_manager.acquire(
+        LockResource::GameUserFiles(game.clone(), store.clone()),
+        "finish-starting-launch",
+    )?;
+    let journal_path = ctx
+        .paths
+        .user_files_journal_path(game.as_str(), store.as_str());
+    if !journal_path.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&journal_path)?;
+    let mut journal: Journal = serde_json::from_str(&text)?;
+    if journal.starting_launcher.is_none() {
+        return Ok(());
+    }
+    if journal.launch_id.as_deref() != Some(launch_id) {
+        return Err(UserFilesError::Other(
+            "the per-user files were swapped in by a different launch, so this launch left them \
+             in place"
+                .to_string(),
+        ));
+    }
+    journal.starting_launcher = None;
+    write_journal(&journal_path, &journal)?;
     Ok(())
 }
 
@@ -1114,14 +1149,10 @@ fn restore_journal_internal(
             continue;
         }
 
-        let real_is_torn = real_bytes.as_deref().is_some_and(|current| {
-            backup_bytes
-                .as_deref()
-                .is_some_and(|backup| is_torn_prefix(current, backup))
-                || std::fs::read(&entry.derived_instance_copy)
-                    .ok()
-                    .is_some_and(|instance| is_torn_prefix(current, &instance))
-        });
+        // Agora's own writes are atomic (a temp file renamed over the target), so a real file that
+        // differs from what Agora wrote is a real change by the game, including a shorter file the
+        // game emptied or trimmed. It is kept as the instance's copy; a torn write cannot be told
+        // from a game edit by looking at a prefix, and guessing wrongly throws the game's change away.
 
         if entry.existed {
             let Some(original) = entry.original_sha256.as_deref() else {
@@ -1150,8 +1181,7 @@ fn restore_journal_internal(
             // The session's saved copy is the game's changed file, and only when the game changed
             // it from what Agora wrote.
             if let Some(current) = &real_bytes {
-                if !real_is_torn && real_hash.as_deref() != Some(entry.file.written_sha256.as_str())
-                {
+                if real_hash.as_deref() != Some(entry.file.written_sha256.as_str()) {
                     if let Some(parent) = entry.derived_instance_copy.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
@@ -1168,8 +1198,7 @@ fn restore_journal_internal(
             // Agora created this file during the session; the session's copy goes back and the real
             // file goes.
             if let Some(current) = &real_bytes {
-                if !real_is_torn && real_hash.as_deref() != Some(entry.file.written_sha256.as_str())
-                {
+                if real_hash.as_deref() != Some(entry.file.written_sha256.as_str()) {
                     if let Some(parent) = entry.derived_instance_copy.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
@@ -1239,7 +1268,13 @@ pub fn record_process(
         .paths
         .user_files_journal_path(game.as_str(), store.as_str());
     if !journal_path.exists() {
-        return Ok(());
+        // A launch that swapped files in must have a journal. A missing one means the launch this
+        // record belongs to never swapped anything: that is not a success, it is a session nobody
+        // can account for.
+        return Err(UserFilesError::NoSession {
+            game: game.clone(),
+            store: store.clone(),
+        });
     }
 
     let text = std::fs::read_to_string(&journal_path)?;

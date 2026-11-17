@@ -1949,10 +1949,14 @@ fn release_session(
     ctx: &Ctx,
     definition: &GameDefinition,
     store: &StoreId,
+    launch_id: &str,
 ) -> Result<(), ToolError> {
     if game_user_files::status(ctx, &definition.id, store)?.is_none() {
         return Ok(());
     }
+    // This run swapped the files in, so it is the launch that may give up its own start before
+    // restoring. A restore from another caller refuses while a launch is starting.
+    game_user_files::finish_starting_launch(ctx, &definition.id, store, launch_id)?;
     match game_user_files::restore(ctx, definition, store) {
         Ok(_) | Err(UserFilesError::NoSession { .. }) => Ok(()),
         Err(e) => Err(e.into()),
@@ -3086,13 +3090,16 @@ fn run_under_vfs(
         log: log.clone(),
     });
 
-    if let Err(e) = game_user_files::swap_in(ctx, instance_id, definition, &store, &game_dir) {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(e.into());
-    }
+    let swapped = match game_user_files::swap_in(ctx, instance_id, definition, &store, &game_dir) {
+        Ok(swapped) => swapped,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e.into());
+        }
+    };
     if let Some(configured) = configured {
         if let Err(e) = configured.move_aside() {
-            release_session(ctx, definition, &store)?;
+            release_session(ctx, definition, &store, &swapped.launch_id)?;
             let _ = std::fs::remove_dir_all(&staging);
             return Err(e);
         }
@@ -3105,7 +3112,7 @@ fn run_under_vfs(
     let mut launched = match launcher.launch_capturing(&prepared) {
         Ok(launched) => launched,
         Err(e) => {
-            release_session(ctx, definition, &store)?;
+            release_session(ctx, definition, &store, &swapped.launch_id)?;
             let _ = std::fs::remove_dir_all(&staging);
             return Err(match e {
                 LaunchError::VfsUnavailable { reason } => ToolError::VfsUnavailable {
@@ -3143,7 +3150,7 @@ fn run_under_vfs(
         });
     // The game's files go back whatever became of the output, and a failure to settle is reported
     // only after that.
-    let released = release_session(ctx, definition, &store);
+    let released = release_session(ctx, definition, &store, &swapped.launch_id);
     let (settled, unchanged_dropped) = settled?;
     released?;
 
@@ -3238,11 +3245,11 @@ fn run_from_links(
     let mut prepared = PreparedLaunch::undeployed(resolved, Vec::new(), None);
     prepared.deployment = Some(DeployMode::Links);
 
-    game_user_files::swap_in(ctx, instance_id, definition, &store, &game_dir)?;
+    let swapped = game_user_files::swap_in(ctx, instance_id, definition, &store, &game_dir)?;
     if let Some(configured) = configured {
         if let Err(e) = configured.move_aside() {
             let _ = discard_deployment(&deployment_dir, instance_id);
-            release_session(ctx, definition, &store)?;
+            release_session(ctx, definition, &store, &swapped.launch_id)?;
             return Err(e);
         }
     }
@@ -3252,7 +3259,7 @@ fn run_from_links(
     let mut launched = match launcher.launch_capturing(&prepared) {
         Ok(launched) => launched,
         Err(e) => {
-            release_session(ctx, definition, &store)?;
+            release_session(ctx, definition, &store, &swapped.launch_id)?;
             return Err(ToolError::Launch(e));
         }
     };
@@ -3277,7 +3284,7 @@ fn run_from_links(
     // The farm holds whatever the tool wrote. It goes whatever became of the output, and without a
     // harvest: the writes were captured above, and the next launch deploys the promoted output.
     let forgotten = discard_deployment(&deployment_dir, instance_id);
-    let released = release_session(ctx, definition, &store);
+    let released = release_session(ctx, definition, &store, &swapped.launch_id);
     let settled = settled?;
     forgotten?;
     released?;
@@ -3341,7 +3348,7 @@ fn run_by_swap(
 
     // The user files go in before the real Data moves, so the swap journal is the only swap in progress
     // for this game when the recovery check runs.
-    game_user_files::swap_in(ctx, instance_id, definition, &store, &install)?;
+    let swapped = game_user_files::swap_in(ctx, instance_id, definition, &store, &install)?;
 
     let journal = SwapJournal {
         version: game_tool_swap::JOURNAL_VERSION,
@@ -3360,20 +3367,43 @@ fn run_by_swap(
     };
     // The journal is written, and made durable, before the copy or the real Data is touched.
     if let Err(e) = game_tool_swap::write_journal(ctx, &journal) {
-        let _ = release_session(ctx, definition, &store);
+        let _ = release_session(ctx, definition, &store, &swapped.launch_id);
         return Err(e.into());
     }
 
     let (before, prepared) = match game_tool_copy::prepare(ctx, &journal, &copy.files) {
         Ok(prepared) => prepared,
-        Err(e) => return Err(abandon_swap(ctx, definition, &store, &journal, e.into())),
+        Err(e) => {
+            return Err(abandon_swap(
+                ctx,
+                definition,
+                &store,
+                &swapped.launch_id,
+                &journal,
+                e.into(),
+            ))
+        }
     };
     if let Err(e) = game_tool_swap::engage(&journal) {
-        return Err(abandon_swap(ctx, definition, &store, &journal, e.into()));
+        return Err(abandon_swap(
+            ctx,
+            definition,
+            &store,
+            &swapped.launch_id,
+            &journal,
+            e.into(),
+        ));
     }
     if let Some(configured) = configured {
         if let Err(e) = configured.move_aside() {
-            return Err(put_back_after(ctx, definition, &store, &journal, e));
+            return Err(put_back_after(
+                ctx,
+                definition,
+                &store,
+                &swapped.launch_id,
+                &journal,
+                e,
+            ));
         }
     }
 
@@ -3392,6 +3422,7 @@ fn run_by_swap(
                 ctx,
                 definition,
                 &store,
+                &swapped.launch_id,
                 &journal,
                 ToolError::Launch(e),
             ))
@@ -3410,6 +3441,7 @@ fn run_by_swap(
                 ctx,
                 definition,
                 &store,
+                &swapped.launch_id,
                 &journal,
                 ToolError::Launch(e),
             ));
@@ -3423,7 +3455,7 @@ fn run_by_swap(
     // Put the real Data back before capturing: the copy is moved home, then the aside comes back. If that
     // fails, the copy and the journal are kept for the next check.
     if let Err(e) = game_tool_swap::disengage(&journal) {
-        let _ = release_session(ctx, definition, &store);
+        let _ = release_session(ctx, definition, &store, &swapped.launch_id);
         return Err(e.into());
     }
 
@@ -3442,7 +3474,7 @@ fn run_by_swap(
         output_dir,
     );
     let finished = game_tool_copy::finish_copy(ctx, definition, &journal);
-    let released = release_session(ctx, definition, &store);
+    let released = release_session(ctx, definition, &store, &swapped.launch_id);
     let refreshed = finished?;
     game_tool_swap::remove_journal(ctx, &journal)?;
     released?;
@@ -3565,10 +3597,12 @@ fn outside_data(changes: InstallChanges) -> InstallChanges {
 /// A swap that did not get as far as the tool: the real Data is put back if it moved, the copy is
 /// discarded, and the journal goes last. If the real Data cannot be put back, the copy and the journal
 /// are kept for the next check and that error is returned instead.
+#[allow(clippy::too_many_arguments)]
 fn abandon_swap(
     ctx: &Ctx,
     definition: &GameDefinition,
     store: &StoreId,
+    launch_id: &str,
     journal: &SwapJournal,
     error: ToolError,
 ) -> ToolError {
@@ -3576,32 +3610,34 @@ fn abandon_swap(
         return e.into();
     }
     let _ = game_tool_swap::remove_journal(ctx, journal);
-    let _ = release_session(ctx, definition, store);
+    let _ = release_session(ctx, definition, store, launch_id);
     error
 }
 
 /// A swap whose tool did not start: the copy moves home, the kept copy is brought to the plan (or the
 /// per-run copy deleted), and the journal goes. Returns `error`, or the error of the step that failed.
+#[allow(clippy::too_many_arguments)]
 fn put_back_after(
     ctx: &Ctx,
     definition: &GameDefinition,
     store: &StoreId,
+    launch_id: &str,
     journal: &SwapJournal,
     error: ToolError,
 ) -> ToolError {
     if let Err(e) = game_tool_swap::disengage(journal) {
-        let _ = release_session(ctx, definition, store);
+        let _ = release_session(ctx, definition, store, launch_id);
         return e.into();
     }
     if let Err(e) = game_tool_copy::finish_copy(ctx, definition, journal) {
-        let _ = release_session(ctx, definition, store);
+        let _ = release_session(ctx, definition, store, launch_id);
         return e.into();
     }
     if let Err(e) = game_tool_swap::remove_journal(ctx, journal) {
-        let _ = release_session(ctx, definition, store);
+        let _ = release_session(ctx, definition, store, launch_id);
         return e.into();
     }
-    let _ = release_session(ctx, definition, store);
+    let _ = release_session(ctx, definition, store, launch_id);
     error
 }
 

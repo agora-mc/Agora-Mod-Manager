@@ -7967,25 +7967,28 @@ async fn run_command(
                             }
                         };
 
-                        if let Err(e) = agora_core::game_user_files::swap_in(
+                        let swapped = match agora_core::game_user_files::swap_in(
                             ctx,
                             &instance_id,
                             game_def,
                             &store,
                             &running_from,
                         ) {
-                            if json {
-                                let out = serde_json::json!({
-                                    "status": "error",
-                                    "error": format!("{e}"),
-                                    "exitCode": 1,
-                                });
-                                eprintln!("{}", serde_json::to_string_pretty(&out)?);
-                            } else {
-                                eprintln!("Error: {e}");
+                            Ok(swapped) => swapped,
+                            Err(e) => {
+                                if json {
+                                    let out = serde_json::json!({
+                                        "status": "error",
+                                        "error": format!("{e}"),
+                                        "exitCode": 1,
+                                    });
+                                    eprintln!("{}", serde_json::to_string_pretty(&out)?);
+                                } else {
+                                    eprintln!("Error: {e}");
+                                }
+                                std::process::exit(1);
                             }
-                            std::process::exit(1);
-                        }
+                        };
 
                         let launch_start = std::time::Instant::now();
                         // What the VFS's log held before this launch, to read what the session adds.
@@ -8006,6 +8009,14 @@ async fn run_command(
                             ) {
                                 Ok(l) => l,
                                 Err(e) => {
+                                    // Nothing was spawned. This launch swapped the files in and may
+                                    // give up its own start; another caller's restore would refuse.
+                                    let _ = agora_core::game_user_files::finish_starting_launch(
+                                        ctx,
+                                        &game_def.id,
+                                        &store,
+                                        &swapped.launch_id,
+                                    );
                                     // Nothing was spawned, so only a stale journal could be here.
                                     let user_files = report_user_files_restore(
                                         ctx,

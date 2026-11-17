@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use agora_core::ctx::CoreContext;
-use agora_core::game_user_files::{restore, swap_in, Journal, JournaledFile};
+use agora_core::game_user_files::{finish_starting, restore, swap_in, Journal, JournaledFile};
 use agora_game_api::{
     DeploymentStrategy, GameDefinition, GameId, GamePath, RelPath, StoreId, StoreIdentifier,
     UserDataLocation, UserFileMapping, UserFileStrategy,
@@ -155,6 +155,7 @@ fn bug_a_second_restore_overwrites_the_instance_copy_the_first_one_saved() {
     let mut perms = std::fs::metadata(h.ini()).unwrap().permissions();
     perms.set_readonly(true);
     std::fs::set_permissions(h.ini(), perms).unwrap();
+    finish_starting(&h.ctx, &def.id, &StoreId::steam()).unwrap();
     let first = restore(&h.ctx, &def, &StoreId::steam());
     assert!(first.is_err(), "the read-only file must stop the restore");
     let saved = std::fs::read_to_string(h.instance_file("inst-a", "Plugins.txt")).unwrap();
@@ -213,6 +214,7 @@ fn bug_crash_between_overwrite_and_journal_loses_the_original_file() {
         running_from: h.running_from.clone(),
         processes: vec![],
         starting_launcher: None,
+        launch_id: None,
         files: vec![
             JournaledFile {
                 real_path: h.plugins(),

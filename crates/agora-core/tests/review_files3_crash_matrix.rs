@@ -321,6 +321,7 @@ fn build(h: &TestHarness, def: &GameDefinition, id: &str, stages: &[Stage]) {
         running_from: h.running_from.clone(),
         processes: vec![],
         starting_launcher: None,
+        launch_id: None,
         files,
     };
     let jp = journal_path_of(h, def);
@@ -330,7 +331,12 @@ fn build(h: &TestHarness, def: &GameDefinition, id: &str, stages: &[Stage]) {
 
 fn expected_inst(st: Stage, i: usize) -> String {
     match st {
-        SwGame | RInstTorn | RInstSaved | RRealOrig | RDone | RRealTorn => game(i),
+        // An Agora write is atomic (a temp file renamed over the target), so a real file that is a
+        // strict prefix is the game's own shorter file, a real change, and is kept. Only a real
+        // file that still holds the original or what Agora wrote leaves the instance copy alone.
+        SwTorn => inst(i)[..6].to_string(),
+        RRealTorn => orig(i)[..6].to_string(),
+        SwGame | RInstTorn | RInstSaved | RRealOrig | RDone => game(i),
         _ => inst(i),
     }
 }
@@ -422,26 +428,27 @@ fn matrix_two_entries_every_stop_point_recovers_to_original_and_keeps_session_da
 }
 
 #[test]
-fn bug_torn_real_file_after_swap_in_write_overwrites_instance_saved_copy() {
+fn a_shortened_real_file_after_swap_in_is_kept_as_the_instance_copy() {
     let bad = recover_and_check(&[SwTorn]);
     assert!(bad.is_empty(), "{bad:#?}");
 }
 
 #[test]
-fn bug_torn_real_file_during_restore_overwrites_the_sessions_saved_copy() {
+fn a_real_file_that_is_a_prefix_during_restore_is_kept_as_the_instance_copy() {
     let bad = recover_and_check(&[RRealTorn]);
     assert!(bad.is_empty(), "{bad:#?}");
 }
 
 #[test]
-fn bug_torn_new_real_file_after_swap_in_write_overwrites_instance_saved_copy() {
+fn a_shortened_new_real_file_after_swap_in_is_kept_as_the_instance_copy() {
     let h = TestHarness::new();
     let def = def_with(1);
     let real = real_of(&h, 0);
     let ic = inst_of(&h, "n", 0);
     let x = inst(0);
     put(&ic, &x);
-    // journal: existed=false, swapped, written = hash(x); the write of x to real was cut short.
+    // journal: existed=false, swapped, written = hash(x). The game left a shorter file, which is a
+    // real change: an Agora write is atomic, so a prefix is not a torn write.
     let journal = Journal {
         game: def.id.clone(),
         store: StoreId::steam(),
@@ -450,6 +457,7 @@ fn bug_torn_new_real_file_after_swap_in_write_overwrites_instance_saved_copy() {
         running_from: h.running_from.clone(),
         processes: vec![],
         starting_launcher: None,
+        launch_id: None,
         files: vec![JournaledFile {
             real_path: real.clone(),
             instance_path: def.user_files[0].instance_path.clone(),
@@ -471,8 +479,8 @@ fn bug_torn_new_real_file_after_swap_in_write_overwrites_instance_saved_copy() {
     assert!(!real.exists());
     assert_eq!(
         std::fs::read_to_string(&ic).unwrap(),
-        x,
-        "instance copy replaced by a torn file"
+        x[..6],
+        "the game's shorter file was dropped"
     );
 }
 
