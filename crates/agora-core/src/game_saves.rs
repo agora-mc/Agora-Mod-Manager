@@ -348,10 +348,23 @@ pub(crate) fn set_choice_inner(
     choice: SavesChoice,
     create_folder: bool,
 ) -> Result<SavesChange, SavesError> {
-    let manifest = manifest_of(ctx, instance_id)?;
     let store = game_ini::store_of(ctx, instance_id)?;
-    let rule = no_rule_is_an_error(definition, &store)?.clone();
     let _locks = game_ini::lock_for_edit(ctx, instance_id, definition, &store)?;
+    set_choice_locked(ctx, instance_id, definition, &store, choice, create_folder)
+}
+
+/// [`set_choice_inner`] for a caller that already holds the instance and user-files locks taken by
+/// [`game_ini::lock_for_edit`] (a loadout apply holds the instance lock for the whole change).
+pub(crate) fn set_choice_locked(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    store: &StoreId,
+    choice: SavesChoice,
+    create_folder: bool,
+) -> Result<SavesChange, SavesError> {
+    let manifest = manifest_of(ctx, instance_id)?;
+    let rule = no_rule_is_an_error(definition, store)?.clone();
     let state_file = state_path(ctx, instance_id)?;
     let recorded = read_state(&state_file)?;
     let own = own_value(&rule, instance_id);
@@ -362,7 +375,7 @@ pub(crate) fn set_choice_inner(
                 ctx,
                 instance_id,
                 definition,
-                &store,
+                store,
                 rule.ini.as_str(),
                 |doc| {
                     let before = doc.get(&rule.section, &rule.key);
@@ -403,7 +416,7 @@ pub(crate) fn set_choice_inner(
                     ctx,
                     instance_id,
                     definition,
-                    &store,
+                    store,
                     &state.ini,
                     |doc| {
                         let now = doc.get(&state.section, &state.key);

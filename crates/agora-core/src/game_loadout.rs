@@ -524,6 +524,16 @@ fn apply_state(
             ));
         }
     }
+    // The caller holds the instance lock. The save choice edits the game INI, so take the same
+    // user-files lock every other INI edit takes before touching it.
+    let store = crate::game_ini::store_of(ctx, instance_id).map_err(|e| e.to_string())?;
+    let _user_files = ctx
+        .lock_manager
+        .acquire(
+            LockResource::GameUserFiles(definition.id.clone(), store.clone()),
+            "apply_game_loadout",
+        )
+        .map_err(|e| e.to_string())?;
     let mut manifest = game_instance::get_manifest(ctx, instance_id).map_err(|e| e.to_string())?;
 
     let wanted: HashMap<&str, bool> = state
@@ -574,6 +584,20 @@ fn apply_state(
             instance_id,
             &rules.list,
             &rules.rules,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    // After the loadout's own INIs are in place, so the save-folder setting is not overwritten.
+    // A game without a save-folder setting keeps the recorded choice as it always did.
+    if crate::game_saves::rule_for(definition, &store).is_some() {
+        crate::game_saves::set_choice_locked(
+            ctx,
+            instance_id,
+            definition,
+            &store,
+            state.saves,
+            true,
         )
         .map_err(|e| e.to_string())?;
     }
