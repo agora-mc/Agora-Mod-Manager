@@ -73,6 +73,8 @@ pub enum WrapError {
     SteamStart(String),
     #[error("the instance's view could not run: {0}")]
     View(#[from] crate::linux_view::ViewError),
+    #[error("the per-user file '{}' cannot be used: {reason}", path.display())]
+    PerUserFile { path: PathBuf, reason: String },
     #[error("the command could not be started: {0}")]
     Command(String),
     #[error("the instance's default could not be saved: {0}")]
@@ -561,8 +563,37 @@ fn per_user_mounts(
             &mapping.source,
         )?;
         let instance_copy = instance_dir.join(mapping.instance_path.as_str());
-        ensure_file(&instance_copy)?;
-        ensure_file(&real)?;
+        // A bind mount needs a file at both ends, but the real prefix is the player's and is
+        // never written by the wrapper: no empty placeholder, no first-run blanking. A file the
+        // player does not have is not bound at all, so the game creates it itself, as it would
+        // without Agora.
+        match std::fs::metadata(&real) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Err(WrapError::PerUserFile {
+                    path: real,
+                    reason: "it is not a regular file".to_string(),
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(WrapError::PerUserFile {
+                    path: real,
+                    reason: error.to_string(),
+                })
+            }
+        }
+        // The instance's first launch keeps the player's settings, as Windows does: with no copy
+        // of its own the instance starts from the player's file.
+        if !instance_copy.is_file() {
+            if instance_copy.exists() {
+                return Err(WrapError::PerUserFile {
+                    path: instance_copy,
+                    reason: "it is not a regular file".to_string(),
+                });
+            }
+            seed_instance_copy(&real, &instance_copy)?;
+        }
         mounts.push(PerUserMount {
             real_path: real,
             instance_copy,
@@ -571,18 +602,38 @@ fn per_user_mounts(
     Ok(mounts)
 }
 
-/// A bind mount needs a file at both ends. An absent instance copy starts empty; an absent real
-/// file is the game's own folder, and the mount point is created for the session only.
-fn ensure_file(path: &Path) -> Result<(), WrapError> {
-    if path.is_file() {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| WrapError::Command(format!("{}: {error}", parent.display())))?;
-    }
-    std::fs::write(path, b"")
-        .map_err(|error| WrapError::Command(format!("{}: {error}", path.display())))?;
+/// Copy the player's file into the instance folder, through a temporary name, so a first Linux
+/// launch reads their settings and an interrupted copy never becomes the instance's copy.
+fn seed_instance_copy(real: &Path, instance_copy: &Path) -> Result<(), WrapError> {
+    let parent = instance_copy
+        .parent()
+        .ok_or_else(|| WrapError::PerUserFile {
+            path: instance_copy.to_path_buf(),
+            reason: "it has no parent folder".to_string(),
+        })?;
+    std::fs::create_dir_all(parent).map_err(|error| WrapError::PerUserFile {
+        path: parent.to_path_buf(),
+        reason: error.to_string(),
+    })?;
+    let temporary = instance_copy.with_file_name(format!(
+        ".agora-seed-{}-{}",
+        std::process::id(),
+        instance_copy
+            .file_name()
+            .map(|name| name.to_string_lossy().replace(['/', '\\'], "_"))
+            .unwrap_or_default()
+    ));
+    std::fs::copy(real, &temporary).map_err(|error| WrapError::PerUserFile {
+        path: real.to_path_buf(),
+        reason: error.to_string(),
+    })?;
+    std::fs::rename(&temporary, instance_copy).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        WrapError::PerUserFile {
+            path: instance_copy.to_path_buf(),
+            reason: error.to_string(),
+        }
+    })?;
     Ok(())
 }
 

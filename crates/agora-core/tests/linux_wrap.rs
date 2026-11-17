@@ -527,6 +527,116 @@ fn the_pending_launch_picks_the_instance_opens_the_session_and_mounts_user_files
 }
 
 #[test]
+fn a_missing_instance_copy_is_seeded_from_the_players_file() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    fixture.pending();
+    std::fs::remove_file(&fixture.instance_config).unwrap();
+    let out = fixture._tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let read = out.join("read");
+    let command = fixture._tmp.path().join("fake-proton-seed.sh");
+    script(
+        &command,
+        &format!(
+            "set -e\ncat '{config}' > '{read}'\nprintf 'game wrote' > '{config}'\n",
+            config = fixture.real_config.display(),
+            read = read.display(),
+        ),
+    );
+    std::env::set_var("SteamAppId", "4242");
+    let host = QuickJsHost::new();
+    let live = fixture.live(&[], &[], &host);
+    let outcome = game_wrap::wrap(&fixture.ctx, &live, &[command.display().to_string()]).unwrap();
+    let Some(WrapOutcome::Ran { .. }) = ran_or_skip(outcome) else {
+        return;
+    };
+
+    assert_eq!(
+        std::fs::read(&read).unwrap(),
+        b"player original",
+        "the first launch must see the player's settings"
+    );
+    assert_eq!(
+        std::fs::read(&fixture.real_config).unwrap(),
+        b"player original",
+        "the player's real file was changed"
+    );
+    assert_eq!(
+        std::fs::read(&fixture.instance_config).unwrap(),
+        b"game wrote"
+    );
+}
+
+#[test]
+fn the_wrapper_never_creates_a_file_in_the_real_prefix() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    fixture.pending();
+    std::fs::remove_file(&fixture.real_config).unwrap();
+    std::fs::remove_file(&fixture.instance_config).unwrap();
+    let out = fixture._tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let seen = out.join("seen");
+    let command = fixture._tmp.path().join("fake-proton-absent.sh");
+    script(
+        &command,
+        &format!(
+            "if [ -e '{config}' ]; then printf present; else printf missing; fi > '{seen}'\n",
+            config = fixture.real_config.display(),
+            seen = seen.display(),
+        ),
+    );
+    std::env::set_var("SteamAppId", "4242");
+    let host = QuickJsHost::new();
+    let live = fixture.live(&[], &[], &host);
+    let outcome = game_wrap::wrap(&fixture.ctx, &live, &[command.display().to_string()]).unwrap();
+    let Some(WrapOutcome::Ran { .. }) = ran_or_skip(outcome) else {
+        return;
+    };
+
+    assert_eq!(
+        std::fs::read(&seen).unwrap(),
+        b"missing",
+        "the wrapper created the real file before the game ran"
+    );
+    assert!(
+        !fixture.real_config.exists(),
+        "the wrapper created a file in the real prefix"
+    );
+    assert!(
+        !fixture.instance_config.exists(),
+        "the wrapper created an empty instance copy for a file neither side has"
+    );
+}
+
+#[test]
+fn an_instance_copy_is_not_bound_when_the_real_file_is_absent() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    fixture.pending();
+    std::fs::remove_file(&fixture.real_config).unwrap();
+    let command = fixture._tmp.path().join("fake-proton-copy-only.sh");
+    script(&command, "exit 0\n");
+    std::env::set_var("SteamAppId", "4242");
+    let host = QuickJsHost::new();
+    let live = fixture.live(&[], &[], &host);
+    let outcome = game_wrap::wrap(&fixture.ctx, &live, &[command.display().to_string()]).unwrap();
+    let Some(WrapOutcome::Ran { .. }) = ran_or_skip(outcome) else {
+        return;
+    };
+
+    assert!(
+        !fixture.real_config.exists(),
+        "the wrapper created the bind target in the real prefix"
+    );
+    assert_eq!(
+        std::fs::read(&fixture.instance_config).unwrap(),
+        b"instance config"
+    );
+}
+
+#[test]
 fn a_relative_write_lands_in_the_view_not_the_real_game_folder() {
     let _serial = serial();
     let fixture = Fixture::new();
