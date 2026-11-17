@@ -1585,6 +1585,36 @@ fn merged_copy_saves_copies_each_profiles_saves_and_says_which() {
 }
 
 #[test]
+fn merged_copy_saves_a_profile_with_no_save_folder_yet_copies_nothing() {
+    let f = fixture();
+    add_second_profile(&f);
+    let profiles = format!(
+        r#"{{"p1":{{"id":"p1","gameId":"{VORTEX_GAME}","name":"Main","modState":{{"mod-alpha":{{"enabled":true}},"mod-beta":{{"enabled":true}}}},"features":{{"local_game_settings":true,"local_saves":true}}}},"p2":{{"id":"p2","gameId":"{VORTEX_GAME}","name":"Alt","modState":{{"mod-gamma":{{"enabled":true}}}},"features":{{"local_saves":true}}}}}}"#
+    );
+    write_store(&f.store, &[("persistent###profiles", profiles)]);
+
+    let mut request = request(&f, Some("No Alt Saves"));
+    request.copy_saves = true;
+    let report = vortex::run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request,
+        &chosen_profiles(),
+        agora_core::game_import::profiles::Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("a profile with no saves folder yet is not an error");
+    let alt = report
+        .saves
+        .iter()
+        .find(|save| save.profile == "Alt")
+        .expect("Alt's saves are reported");
+    assert_eq!(alt.copied, 0);
+    assert_eq!(alt.skipped_existing, 0);
+}
+
+#[test]
 fn a_failure_after_the_merge_started_abandons_the_half_made_instance() {
     use agora_core::game_import::ImportPhase;
 

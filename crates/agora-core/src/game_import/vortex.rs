@@ -3012,7 +3012,13 @@ fn copy_save_folder(
     let mut copied = 0usize;
     let mut skipped = 0usize;
     let mut notes = Vec::new();
-    for entry in std::fs::read_dir(from)? {
+    let entries = match std::fs::read_dir(from) {
+        Ok(entries) => entries,
+        // The planner already counts an absent folder as no saves.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0, notes)),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
