@@ -50,7 +50,7 @@ pub fn diagnose_minecraft_session(
         Err(error) => record_could_not_analyze(
             ctx,
             session_id,
-            format!("the crash packs could not be loaded: {error}"),
+            format!("the crash rules could not be loaded: {error}"),
         ),
     }
 }

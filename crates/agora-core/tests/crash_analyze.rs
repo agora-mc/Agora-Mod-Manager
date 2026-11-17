@@ -275,7 +275,7 @@ fn an_empty_file_and_an_unrecognised_file_name_nobody_and_say_so() {
         .reason
         .as_deref()
         .unwrap()
-        .contains("recognised"));
+        .contains("recognise"));
 }
 
 #[test]

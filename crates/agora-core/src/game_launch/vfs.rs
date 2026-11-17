@@ -448,7 +448,7 @@ mod windows {
             WAIT_OBJECT_0 => {}
             WAIT_TIMEOUT => {
                 return Err(format!(
-                    "agora_vfs.dll loaded but did not confirm its hooks within {} seconds (see {})",
+                    "agora_vfs.dll loaded but did not finish starting within {} seconds (see {})",
                     STEP_TIMEOUT.as_secs(),
                     vfs.log.display()
                 ));
@@ -478,14 +478,14 @@ mod windows {
                 let mut code = 0u32;
                 GetExitCodeProcess(process, &mut code);
                 Err(format!(
-                    "the game process ended (exit code {code:#x}) before agora_vfs.dll confirmed \
-                     its hooks (blocked by security software, or its hooks could not be \
-                     installed; see {})",
+                    "the game process ended (exit code {code:#x}) before agora_vfs.dll finished \
+                     starting (blocked by security software, or it could not load; \
+                     see {})",
                     vfs.log.display()
                 ))
             }
             WAIT_TIMEOUT => Err(format!(
-                "agora_vfs.dll did not confirm its hooks within {} seconds (see {})",
+                "agora_vfs.dll did not finish starting within {} seconds (see {})",
                 STEP_TIMEOUT.as_secs(),
                 vfs.log.display()
             )),

@@ -1349,7 +1349,7 @@ pub fn plan(
     if !cycle.is_empty() {
         cycle.sort();
         warnings.push(format!(
-            "the deployment manifest names contradictory winners for some files, so {} mod(s) have no manifest order and are placed by rule: {}",
+            "the deployment manifest names contradictory winners for some files, so Agora placed {} mod(s) by rule: {}",
             cycle.len(),
             cycle.join(", ")
         ));
@@ -1626,7 +1626,7 @@ fn provenance(entry: &VortexMod) -> VortexProvenance {
         fileid: entry.nexus_file_id,
         version: entry.version.clone(),
         name: Some(entry.name.clone()),
-        note: "provenance claimed by Vortex, not verified".into(),
+        note: "source claimed by Vortex, not verified".into(),
     }
 }
 
@@ -2686,7 +2686,7 @@ pub fn run(
                     }
                 } else if plan.saves.files > 0 {
                     report.next_steps.push(format!(
-                        "{} save file(s) were not copied (they are under Documents, which needs --copy-saves). To copy them by hand, copy the files in {} into {}",
+                        "Agora did not copy {} save file(s) (they are under Documents, which needs --copy-saves). To copy them by hand, copy the files in {} into {}",
                         plan.saves.files,
                         plan.saves
                             .from
@@ -2715,7 +2715,7 @@ pub fn run(
     );
     if !plan.disagreements.is_empty() {
         report.next_steps.push(format!(
-            "{} file(s) are supplied by a different mod than Vortex's rules alone would pick; the deployment manifest was followed, and the plan lists each one",
+            "A different mod supplies {} file(s) than Vortex's rules alone would pick; the deployment manifest was followed, and the plan lists each one",
             plan.disagreements.len()
         ));
     }

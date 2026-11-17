@@ -1336,6 +1336,6 @@ fn vortex_provenance_text(provenance: &agora_core::content_store::VortexProvenan
             modid: Some(id), ..
         } => format!("Nexus mod {id} (not checked)"),
         VortexProvenance::Claimed { modid: None, .. } => "No Nexus mod ID in the store".to_string(),
-        VortexProvenance::Absent => "No provenance in the store".to_string(),
+        VortexProvenance::Absent => "No source in the store".to_string(),
     }
 }

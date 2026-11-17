@@ -519,7 +519,7 @@ pub async fn games_plugins_update_masterlist(
     instance_id: String,
     list_id: Option<String>,
 ) -> Result<MasterlistView, GamesError> {
-    run_blocking(app, "Updating the sorter's data", move |ctx| {
+    run_blocking(app, "Updating LOOT's data", move |ctx| {
         game_definition!(&ctx, &instance_id, definition);
         match load_order::update_sorter(&ctx, &instance_id, definition, list_id.as_deref())
             .map_err(core_failed)?
@@ -527,7 +527,7 @@ pub async fn games_plugins_update_masterlist(
             Some(status) => Ok(MasterlistView::from_status(&status)),
             None => Err(GamesError::new(
                 "NO_SORTER_UPDATE",
-                "This list has no sorter update to run.",
+                "This list has no LOOT update to run.",
             )),
         }
     })
@@ -550,7 +550,7 @@ pub async fn games_plugins_sorter_notes(
     instance_id: String,
     list_id: Option<String>,
 ) -> Result<SorterNotesView, GamesError> {
-    run_blocking(app, "Reading the sorter's notes", move |ctx| {
+    run_blocking(app, "Reading LOOT's notes", move |ctx| {
         game_definition!(&ctx, &instance_id, definition);
         let notes =
             load_order::refresh_sorter_notes(&ctx, &instance_id, definition, list_id.as_deref())

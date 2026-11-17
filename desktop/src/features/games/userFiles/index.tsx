@@ -128,7 +128,7 @@ export function RecoverySection({ gameId, frame }: { gameId: string; frame: Sect
                 </ul>
                 {restoreState?.status === 'error' && (
                   <p role="alert" className="text-destructive">
-                    The files were not put back: {restoreState.message}
+                    Agora could not put these files back: {restoreState.message}
                   </p>
                 )}
                 {restoreState?.status === 'done' && (

@@ -158,7 +158,7 @@ export function runDetailLines(outcome: RunReport): string[] {
     lines.push(`It runs this way because: ${outcome.captureReason}`);
   }
   if (outcome.unchangedDropped > 0) {
-    lines.push(`${outcome.unchangedDropped} file(s) the tool opened but did not change were left out of the output.`);
+    lines.push(`Left out ${outcome.unchangedDropped} file(s) the tool opened but did not change.`);
   }
   if (outcome.copiedLayer) {
     lines.push(`${outcome.copiedLayer}’s own files were copied for this run, so the tool could rewrite them. The mod itself is unchanged.`);
@@ -201,7 +201,7 @@ export function toolsSummary(known: readonly string[]): string {
   const found = known.length > 0
     ? `Agora finds ${knownExamples(known)} in your mods by itself.`
     : 'Tools come from your mods.';
-  return `Programs that work on your mods: patchers, editors and sorters. ${found} What a tool writes is kept for this instance, so you can roll back, compare or remove it without touching your mods.`;
+  return `Programs that work on your mods: patchers, editors and sorting tools. ${found} What a tool writes is kept for this instance, so you can roll back, compare or remove it without touching your mods.`;
 }
 
 /** The empty state's body: tools appear when they are installed as mods. */

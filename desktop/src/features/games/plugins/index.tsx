@@ -841,8 +841,8 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
           <DialogHeader>
             <DialogTitle>Sort plugins</DialogTitle>
             <DialogDescription>
-              Free plugins are put in the order the list's sorter recommends, or below their masters when the sorter
-              has nothing saved. Nothing is written until you apply. Locked and always-loaded plugins stay where they
+              Free plugins are put in the order LOOT recommends, or below their masters when there is nothing
+              saved to sort by. Nothing is written until you apply. Locked and always-loaded plugins stay where they
               are.
               {ruleCount > 0 && ` Your ${ruleCount} load order ${ruleCount === 1 ? 'rule is' : 'rules are'} kept.`}
             </DialogDescription>

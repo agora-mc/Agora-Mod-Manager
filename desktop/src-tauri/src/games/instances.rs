@@ -1155,7 +1155,7 @@ fn spawn_exit_watch(
                     let _ = agora_core::crash_live::record_could_not_analyze(
                         &ctx,
                         session,
-                        format!("the crash packs could not be loaded: {error}"),
+                        format!("the crash rules could not be loaded: {error}"),
                     );
                 }
             }

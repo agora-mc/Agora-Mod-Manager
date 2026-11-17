@@ -200,14 +200,14 @@ describe('check a crash log', () => {
     mocks.listCrashAnswers.mockResolvedValue(list({ answers: [], latestVerdict: null }));
     mocks.analyzeCrashText.mockResolvedValue({
       status: 'nothing_to_read',
-      reason: 'no installed crash pack recognised this file',
+      reason: 'the installed crash rules did not recognise this file',
     });
     render(<CrashAnswerOverview instanceId="inst" />);
     fireEvent.click(await screen.findByRole('button', { name: 'Check a crash log' }));
     fireEvent.change(screen.getByPlaceholderText('Paste the crash log here'), { target: { value: 'not a crash log' } });
     fireEvent.click(screen.getByRole('button', { name: 'Check this text' }));
 
-    expect(await screen.findByText(/Agora couldn't analyze this crash: no installed crash pack recognised this file/)).toBeInTheDocument();
+    expect(await screen.findByText(/Agora couldn't analyze this crash: the installed crash rules did not recognise this file/)).toBeInTheDocument();
   });
 });
 

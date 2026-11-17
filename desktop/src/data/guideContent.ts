@@ -945,10 +945,10 @@ export const GUIDE_TOPICS: GuideTopic[] = [
         },
         {
           title: 'Load order and launching',
-          body: 'The game reads its plugins in an order, and a plugin\'s masters must load above it. The instance\'s Plugins tab lists them and flags Problems with the load order, including the sorter\'s own notes. Sort… puts them in the order the list\'s sorter recommends. When the instance has a loader such as SKSE, Launch starts the game through it.',
+          body: 'The game reads its plugins in an order, and a plugin\'s masters must load above it. The instance\'s Plugins tab lists them and flags Problems with the load order, including LOOT\'s own notes. Sort… puts them in the order LOOT recommends. When the instance has a loader such as SKSE, Launch starts the game through it.',
           steps: [
             'Open the instance\'s Plugins tab and press Sort….',
-            'If the sorter has nothing saved yet, its note says to update the masterlist first; the Plugins tab has a button for it. Without it, Sort only puts each plugin below its masters.',
+            'If there is nothing saved to sort by yet, the note says to update the masterlist first; the Plugins tab has a button for it. Without it, Sort only puts each plugin below its masters.',
             'Read the preview. Nothing is written until you choose Apply, and locked or always-loaded plugins stay where they are.',
             'On Overview, read the Launch checks, then press Launch. Each finding says what is wrong, why it matters and what to do. While the game runs, the same button reads Stop and ends the session.',
           ],
@@ -987,7 +987,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
           body: 'Start with the page closest to the problem.',
           bullets: [
             'Overview > Launch checks says what stopped a launch, and Check again re-runs them. Launch anyway under Advanced options skips them, but the game may then crash, so we suggest it only when you know why a check is wrong.',
-            'The Plugins tab lists Problems with the load order, including anything the sorter\'s masterlist says.',
+            'The Plugins tab lists Problems with the load order, including anything LOOT\'s masterlist says.',
             'If Agora cannot tell where an item\'s files go, a dialog names the top-level entries it found and the item is not added. Check that you downloaded the main file rather than a patch or a nested archive, then add it again.',
             'If Agora was closed while a tool ran, the Tools tab says A tool swap was interrupted and offers Put the Data folder back. Do that before you launch.',
             'Settings > (your game) > Recovery lists game files that are still swapped and offers Put the files back.',

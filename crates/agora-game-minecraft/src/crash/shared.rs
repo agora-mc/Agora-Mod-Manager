@@ -33,7 +33,7 @@ pub(crate) fn collect_lines(
             Err(error) => {
                 if lines.is_empty() {
                     return Err(BuiltInParserError::new(format!(
-                        "could not read the artifact: {}",
+                        "could not read the crash log: {}",
                         error.message
                     )));
                 }

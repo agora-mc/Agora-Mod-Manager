@@ -14,7 +14,7 @@ pub const MAX_ID_LEN: usize = 64;
 
 /// An identifier was empty, too long, or contained disallowed characters.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("invalid {kind} id {value:?}: use 1-{MAX_ID_LEN} characters from a-z, 0-9, '-', '_' and at most one ':' namespace separator, starting with a letter or digit")]
+#[error("invalid {kind} id {value:?}: use 1-{MAX_ID_LEN} characters from a-z, 0-9, '-', '_' and at most one ':' separator, starting with a letter or digit")]
 pub struct IdError {
     pub kind: &'static str,
     pub value: String,

@@ -31,12 +31,12 @@ use crate::lock_manager::LockResource;
 
 /// What a sort says when the list has duplicates, so its sorter cannot judge it.
 pub const DUPLICATES_BY_MASTERS_ONLY: &str =
-    "Sorted by masters only. A plugin is listed twice, so the list's sorter was not asked.";
+    "Sorted by masters only. A plugin is listed twice, so the sorting tool was not asked.";
 
 /// What a sort says when its sorter has an update hook but no saved data yet. The masters-only
 /// sort still runs, so a master below its dependent is moved rather than called unfixable.
 pub const SORTER_NEEDS_DATA: &str =
-    "Sorted by masters only. The list's sorter has no masterlist yet; update it for a full sort.";
+    "Sorted by masters only. There is no masterlist yet; update it for a full sort.";
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadOrderError {
@@ -82,17 +82,17 @@ pub enum LoadOrderError {
     NoRoom { plugin: String, target: String },
     #[error("sort did not settle after {0} moves; nothing was written")]
     DidNotSettle(usize),
-    #[error("the list's sorter failed: {reason}")]
+    #[error("the sorting tool failed: {reason}")]
     Sorter { list: String, reason: String },
-    #[error("the list's sorter did not answer, though the list declares one")]
+    #[error("the sorting tool did not answer, though the list declares one")]
     NoSorterReply(String),
-    #[error("the list's sorter returned an order that {reason}; nothing was written")]
+    #[error("the sorting tool returned an order that {reason}; nothing was written")]
     SorterOrder { reason: String },
-    #[error("the list's sorter returned a note Agora cannot read: {reason}")]
+    #[error("the sorting tool returned a note Agora cannot read: {reason}")]
     SorterNote { reason: String },
-    #[error("the list's sorter update failed: {reason}")]
+    #[error("the sorting tool update failed: {reason}")]
     SorterUpdate { reason: String },
-    #[error("load order '{0}' declares no overlaps hook, so overlaps cannot be checked")]
+    #[error("load order '{0}' declares no overlaps support, so overlaps cannot be checked")]
     NoOverlaps(String),
     #[error("the list's overlaps reader failed: {reason}")]
     Overlaps { list: String, reason: String },

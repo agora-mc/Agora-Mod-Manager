@@ -253,7 +253,7 @@ fn the_same_fragment_as_a_picked_file_is_nothing_to_read() {
         assert!(output.answer.trust_notes.is_empty(), "{label}");
         let reason = output.files[0].reason.as_deref().unwrap_or_default();
         assert!(
-            reason.contains("no installed crash pack recognised"),
+            reason.contains("the installed crash rules did not recognise"),
             "{label}: {reason}"
         );
     }
@@ -323,7 +323,7 @@ fn a_snippet_parser_can_never_claim_a_collected_file() {
     assert!(!has_snippet_note(&output));
     let reason = output.files[0].reason.as_deref().unwrap_or_default();
     assert!(
-        reason.contains("no installed crash pack recognised"),
+        reason.contains("the installed crash rules did not recognise"),
         "{reason}"
     );
 }
