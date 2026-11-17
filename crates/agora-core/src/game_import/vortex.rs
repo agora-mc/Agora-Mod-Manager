@@ -208,6 +208,15 @@ pub fn parse_state(store: &VortexStore) -> Result<VortexState, ImportError> {
                 }
                 let id = get_str(profile, "id").unwrap_or_else(|| profile_id.clone());
                 let name = get_str(profile, "name").unwrap_or_else(|| id.clone());
+                // The id names the profile's folder under Vortex's user data, so it is a folder
+                // name and never a path. An id that could escape that folder is refused before
+                // any read is joined to it.
+                if let Err(reason) = mo2::check_mod_folder_name(&id) {
+                    warnings.push(format!(
+                        "profile '{name}' in {game_id} has an id that is not a folder name ({reason}); it was skipped"
+                    ));
+                    continue;
+                }
                 let mut enabled = BTreeMap::new();
                 if let Some(mod_state) = profile.get("modState").and_then(Value::as_object) {
                     for (mod_id, entry) in mod_state {

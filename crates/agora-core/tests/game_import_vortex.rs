@@ -470,6 +470,29 @@ fn run_makes_an_instance_and_a_second_import_is_refused() {
 }
 
 #[test]
+fn a_profile_id_that_is_a_path_is_refused_before_a_read() {
+    let f = fixture();
+    // The id names the profile's folder under Vortex's user data. A path here would make every
+    // read look outside it.
+    let profiles = format!(
+        r#"{{"p1":{{"id":"../../escape","gameId":"{VORTEX_GAME}","name":"Main","modState":{{"mod-alpha":{{"enabled":true}}}},"features":{{}}}}}}"#
+    );
+    write_store(&f.store, &[("persistent###profiles", profiles)]);
+
+    let report = vortex::scan(&f.ctx, &f.inventory, &f.store).expect("the store scans");
+    let game = &report.games[0];
+    assert!(game.profiles.is_empty(), "{:?}", game.profiles);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("not a folder name")),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
 fn a_profile_that_does_not_exist_is_named() {
     let f = fixture();
     let mut request = request(&f, None);
