@@ -8982,6 +8982,23 @@ async fn run_command(
                         }
                     };
 
+                    if let Err(e) = agora_core::instance_runtime::ensure_game_not_running(
+                        ctx,
+                        &instance_id,
+                        "redeploying it",
+                    ) {
+                        if json {
+                            let out = serde_json::json!({
+                                "error": e,
+                                "exitCode": 1,
+                            });
+                            eprintln!("{}", serde_json::to_string_pretty(&out)?);
+                        } else {
+                            eprintln!("Error: {e}");
+                        }
+                        std::process::exit(1);
+                    }
+
                     if !json {
                         println!("Deploying as '{mode}'.");
                     }

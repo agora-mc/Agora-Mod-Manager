@@ -30,6 +30,7 @@
 //! coordination state must not be something a restore can roll back.
 
 use crate::app_paths::AppPaths;
+use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
 use crate::process_identity::{self, ProcessIdentity};
 use serde::{Deserialize, Serialize};
@@ -240,6 +241,118 @@ pub fn check_idle(paths: &AppPaths, instance_id: &str) -> LauncherResult<()> {
             })
         }
     }
+}
+
+/// What is known about whether an instance's game is using it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GameActivity {
+    /// A live game, a launch between the swap and the spawn, or a view/wrap of the instance.
+    Running,
+    /// Nothing says a game is using it.
+    Idle,
+    /// A record that answers the question cannot be read. The risky action must refuse.
+    CouldNotTell(String),
+}
+
+/// Whether this instance's game is using it, from one place for every caller.
+///
+/// Game-free: it reads the instance's own user-files journal (which names its game and store), the
+/// session ledger's open sessions, and the runtime lease the Minecraft launch publishes. An open
+/// session with a live owner is a launch that has not ended, which is the only record a Linux view
+/// writes; a game with no journaled files writes no journal either. An unreadable record is
+/// [`GameActivity::CouldNotTell`], never `Idle`: a missing or unreadable store must not be read as
+/// "no game is running".
+pub fn game_activity(ctx: &Ctx, instance_id: &str) -> GameActivity {
+    // The runtime lease. Minecraft publishes one; another game has none.
+    match read(&ctx.paths, instance_id) {
+        Err(error) => return GameActivity::CouldNotTell(error.to_string()),
+        Ok(Some(lease)) => match (lease.state, &lease.identity) {
+            (RuntimeState::Running, Some(identity))
+                if process_identity::verify(identity).is_ok() =>
+            {
+                return GameActivity::Running;
+            }
+            // A launch with nothing to verify was recorded but never finished starting. It blocks
+            // mutation exactly as `check_idle` says it must.
+            (RuntimeState::Running, None) | (RuntimeState::Starting, _) => {
+                return GameActivity::Running;
+            }
+            _ => {}
+        },
+        Ok(None) => {}
+    }
+
+    // The instance's user-files journal: live processes, a running-from folder, or a launch that
+    // swapped the files in and has not spawned yet.
+    match instance_game_and_store(ctx, instance_id) {
+        Ok(Some((game, store))) => match crate::game_user_files::details(ctx, &game, &store) {
+            Err(error) => return GameActivity::CouldNotTell(error.to_string()),
+            Ok(Some(details)) if details.instance == instance_id && details.running => {
+                return GameActivity::Running;
+            }
+            _ => {}
+        },
+        Ok(None) => {}
+        Err(error) => return GameActivity::CouldNotTell(error),
+    }
+
+    // The session ledger's open sessions. A live owner means the session has not ended; this is
+    // the only record a Linux view or a game with no journaled files writes.
+    match ledger_session_running(ctx, instance_id) {
+        Ok(true) => GameActivity::Running,
+        Ok(false) => GameActivity::Idle,
+        Err(error) => GameActivity::CouldNotTell(error),
+    }
+}
+
+/// Refuse a change while the instance's game may be using it. `action` completes the sentence
+/// "close the game before ...". Only proven idle passes: running and "could not tell" both refuse.
+pub fn ensure_game_not_running(ctx: &Ctx, instance_id: &str, action: &str) -> Result<(), String> {
+    match game_activity(ctx, instance_id) {
+        GameActivity::Idle => Ok(()),
+        GameActivity::Running => Err(format!(
+            "'{instance_id}' is running; close the game before {action}"
+        )),
+        GameActivity::CouldNotTell(reason) => Err(format!(
+            "could not tell whether '{instance_id}' is running ({reason}); refusing to {action}"
+        )),
+    }
+}
+
+fn instance_game_and_store(
+    ctx: &Ctx,
+    instance_id: &str,
+) -> Result<Option<(agora_game_api::GameId, agora_game_api::StoreId)>, String> {
+    // The manifest is the instance's own record and needs no database row. It names the game and
+    // store the user-files journal is keyed by.
+    match crate::game_instance::get_manifest(ctx, instance_id) {
+        Ok(manifest) => Ok(
+            crate::game_instance::session_store(&manifest.base, &manifest)
+                .map(|store| (manifest.game.clone(), store)),
+        ),
+        Err(crate::game_instance::InstanceError::NotFound(_)) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn ledger_session_running(ctx: &Ctx, instance_id: &str) -> Result<bool, String> {
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db())
+        .map_err(|error| format!("the session store could not be read: {error}"))?;
+    let open = crate::session_ledger::open_sessions_for_instance(&conn, instance_id)
+        .map_err(|error| format!("the session store could not be read: {error}"))?;
+    if open.is_empty() {
+        return Ok(false);
+    }
+    for session in &open {
+        if let (Some(pid), Some(started)) = (session.owner_pid, session.owner_start) {
+            if crate::session_ledger::Owner::is_alive(pid, started as u64) {
+                return Ok(true);
+            }
+        }
+    }
+    // A gone owner says nothing about the game. With a runtime record that cannot prove the game
+    // gone, the session may still be running (a delegated launch keeps no process identity).
+    Ok(game_has_record(&ctx.paths, instance_id) && !game_is_provably_gone(&ctx.paths, instance_id))
 }
 
 #[cfg(test)]

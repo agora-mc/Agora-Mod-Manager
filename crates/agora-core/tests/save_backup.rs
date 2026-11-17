@@ -31,6 +31,7 @@ impl Harness {
         let user = TempDir::new().unwrap();
         std::env::set_var("AGORA_TEST_USER_DATA_ROOT", user.path());
         let ctx = CoreContext::for_testing(data.path().join("app_data"));
+        agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
         Self {
             _lock: lock,
             _data: data,

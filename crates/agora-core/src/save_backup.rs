@@ -539,7 +539,9 @@ pub fn restore(
         return Err(SaveBackupError::InvalidBackupId(backup_id.to_string()));
     }
     // Hold the instance lock across the whole restore, exactly as a snapshot restore does, and
-    // refuse while the game is running: writing saves under a live game corrupts them.
+    // refuse while the game is running: writing saves under a live game corrupts them. The one
+    // activity check also sees an open session with no journaled files and a Linux view session,
+    // and refuses when a store that would answer cannot be read.
     let _guard = ctx
         .lock_manager
         .acquire(
@@ -547,8 +549,8 @@ pub fn restore(
             "restore_save_backup",
         )
         .map_err(|error| SaveBackupError::Other(error.to_string()))?;
-    crate::instance_runtime::check_idle(&ctx.paths, instance_id)
-        .map_err(|error| SaveBackupError::Other(error.to_string()))?;
+    crate::instance_runtime::ensure_game_not_running(ctx, instance_id, "restoring its saves")
+        .map_err(SaveBackupError::Other)?;
     let root = backup_root(ctx, instance_id)?;
     let dir = root.join(backup_id);
     if !dir.is_dir() {

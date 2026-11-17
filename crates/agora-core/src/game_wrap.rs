@@ -271,6 +271,16 @@ pub fn wrap(ctx: &Ctx, live: &LivePacks<'_>, command: &[String]) -> Result<WrapO
         .ok_or_else(|| WrapError::Definition(record.game.as_str().to_string()))?
         .clone();
 
+    // One view or wrap of an instance at a time: a second one would delete the live view's work
+    // folder and rewrite the lower layer under its mount. The same check refuses while a saved
+    // restore, a loadout apply or a redeploy would be unsafe.
+    crate::instance_runtime::ensure_game_not_running(
+        ctx,
+        &instance_id,
+        "starting another view of it",
+    )
+    .map_err(|reason| WrapError::Instance(game_instance::InstanceError::Other(reason)))?;
+
     let (install, app_id) = instance_install(ctx, &instance_id)?;
     let prefix = steam::proton_prefix(&install, &app_id);
     let store = game_instance::session_store(

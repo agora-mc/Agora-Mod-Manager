@@ -418,19 +418,21 @@ fn diff(old: &GameLoadout, new: &GameLoadout) -> Vec<LoadoutChange> {
     changes
 }
 
-/// Whether the instance's game is running, so an apply must be refused.
+/// Whether the instance's game is running, so an apply must be refused. The one activity check
+/// sees an open session with no journaled files and a Linux view session, and an unreadable store
+/// is an error, never "not running".
 fn game_is_running(
     ctx: &Ctx,
     instance_id: &str,
-    definition: &GameDefinition,
+    _definition: &GameDefinition,
 ) -> Result<bool, String> {
-    let manifest = game_instance::get_manifest(ctx, instance_id).map_err(|e| e.to_string())?;
-    let Some(store) = game_instance::session_store(&manifest.base, &manifest) else {
-        return Ok(false);
-    };
-    let status =
-        crate::game_user_files::status(ctx, &definition.id, &store).map_err(|e| e.to_string())?;
-    Ok(status.is_some_and(|status| status.running && status.instance == instance_id))
+    match crate::instance_runtime::game_activity(ctx, instance_id) {
+        crate::instance_runtime::GameActivity::Idle => Ok(false),
+        crate::instance_runtime::GameActivity::Running => Ok(true),
+        crate::instance_runtime::GameActivity::CouldNotTell(reason) => Err(format!(
+            "could not tell whether '{instance_id}' is running: {reason}"
+        )),
+    }
 }
 
 /// Apply a game-instance profile: record the undo point, then restore every
