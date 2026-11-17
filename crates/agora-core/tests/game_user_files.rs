@@ -888,6 +888,72 @@ fn interrupted_swap_restores_correctly() {
 // Gate 7: First launch with no instance copy keeps user file unchanged
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
+#[test]
+fn a_symlinked_user_file_stays_a_symlink() {
+    let harness = TestHarness::new();
+    let def = test_skyrim_definition();
+    let real = harness
+        .local_dir()
+        .join("Skyrim Special Edition")
+        .join("Plugins.txt");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    let target = harness
+        .user_data_dir
+        .path()
+        .join("elsewhere")
+        .join("RealPlugins.txt");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, "player original\n").unwrap();
+    std::os::unix::fs::symlink(&target, &real).unwrap();
+
+    let copy = harness
+        .instance_dir("link")
+        .join("user")
+        .join("Plugins.txt");
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::write(&copy, "instance list\n").unwrap();
+
+    swap_in(
+        &harness.ctx,
+        "link",
+        &def,
+        &StoreId::steam(),
+        &harness.running_from,
+    )
+    .unwrap();
+    assert!(
+        std::fs::symlink_metadata(&real)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "swap_in replaced the player's link with a regular file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "instance list\n",
+        "the instance's file was not written through the link"
+    );
+
+    std::fs::write(&real, "game changed\n").unwrap();
+    finish_starting(&harness.ctx, &def.id, &StoreId::steam()).unwrap();
+    restore(&harness.ctx, &def, &StoreId::steam()).unwrap();
+
+    assert!(
+        std::fs::symlink_metadata(&real)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "restore replaced the player's link with a regular file"
+    );
+    assert_eq!(std::fs::read_link(&real).unwrap(), target);
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "player original\n"
+    );
+    assert_eq!(std::fs::read_to_string(&copy).unwrap(), "game changed\n");
+}
+
 #[test]
 fn first_launch_no_instance_copy_keeps_user_file_unchanged() {
     let harness = TestHarness::new();

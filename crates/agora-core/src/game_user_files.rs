@@ -314,6 +314,22 @@ fn hash_bytes(bytes: &[u8]) -> String {
 /// that is replaced keeps its permissions, so another attribute Agora has no business changing is
 /// not lost on either platform.
 fn write_user_file(path: &Path, bytes: &[u8]) -> Result<(), UserFilesError> {
+    // A symlinked user file is the player's setup: write through to the file it points at so the
+    // link stays a link. The atomic rename below would otherwise replace the link itself with a
+    // regular file. A dangling or cyclic link is refused with the reason and left as it is.
+    if std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        let target = std::fs::canonicalize(path).map_err(|source| UserFilesError::Write {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                source.kind(),
+                format!("the file is a symbolic link that cannot be resolved: {source}"),
+            ),
+        })?;
+        return write_user_file(&target, bytes);
+    }
     let Some(parent) = path.parent() else {
         return Err(UserFilesError::Other(format!(
             "cannot write '{}': it has no folder",
