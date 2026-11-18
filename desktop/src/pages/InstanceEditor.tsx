@@ -44,6 +44,8 @@ import {
   getCachedInstanceUpdates,
   exportInstancePack,
   exportSourcelessMods,
+  exportServerEnvironment,
+  listWorlds,
   formatError,
   inspectJavaExecutable,
   pickOpenFile,
@@ -123,6 +125,8 @@ import {
   type MemoryRecommendation,
   type HealthReport,
   type LoaderChangePlan,
+  type ExportResult,
+  type WorldInfo,
 } from '../lib/tauri';
 import { InstanceTemplatePanel } from '../components/InstanceTemplatePanel';
 import { LoadoutProfilesPanel } from '../components/LoadoutProfilesPanel';
@@ -387,6 +391,11 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
   const modsRegionRef = useRef<HTMLDivElement>(null);
   const statusBannerRef = useRef<HTMLDivElement>(null);
   const [exportBusy, setExportBusy] = useState(false);
+  const [serverExportBusy, setServerExportBusy] = useState(false);
+  const [serverWorlds, setServerWorlds] = useState<WorldInfo[]>([]);
+  const [serverWorld, setServerWorld] = useState('');
+  const [serverAllowUnverified, setServerAllowUnverified] = useState(false);
+  const [serverExportResult, setServerExportResult] = useState<ExportResult | null>(null);
   // The file the last pack or lockfile was saved to, for "Show in folder".
   const [savedExportPath, setSavedExportPath] = useState<string | null>(null);
   const [instanceCustomIcon, setInstanceCustomIcon] = useState<string | null>(null);
@@ -554,6 +563,21 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
     if (error) banner.scrollIntoView?.({ block: 'nearest' });
     else showToast(message, 'success');
   }, [error, status]);
+
+  useEffect(() => {
+    if (activeTab !== 'export') return;
+    let cancelled = false;
+    void listWorlds(instanceId)
+      .then((worlds) => {
+        if (!cancelled) setServerWorlds(Array.isArray(worlds) ? worlds : []);
+      })
+      .catch(() => {
+        // A world list failure only means the picker stays on the default.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, instanceId]);
 
   useEffect(() => {
     setContentRowsLoaded(false);
@@ -1477,6 +1501,30 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
       setError(formatError(e));
     } finally {
       setExportBusy(false);
+    }
+  };
+
+  const handleExportServer = async () => {
+    setServerExportBusy(true);
+    setError(null);
+    setStatus(null);
+    setServerExportResult(null);
+    try {
+      const dir = await pickDirectory('Choose a folder for the server export');
+      if (!dir) return;
+      const result = await exportServerEnvironment(
+        instanceId,
+        dir,
+        serverWorld || null,
+        serverAllowUnverified,
+      );
+      setServerExportResult(result);
+      setSavedExportPath(dir);
+      setStatus(`Server exported to: ${dir}`);
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setServerExportBusy(false);
     }
   };
 
@@ -3156,6 +3204,79 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                   <p key={idx} className="text-muted-foreground">
                     {diff.path}: {diff.kind} {diff.expectedSha256 && `(expected ${diff.expectedSha256})`} {diff.actualSha256 && `(got ${diff.actualSha256})`}
                   </p>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Card 4: server export */}
+          <div className="rounded-xl border border-border bg-card p-4 space-y-3">
+            <div className="flex items-start justify-between gap-2">
+              <h4 className="font-semibold text-sm">Export as a Minecraft server</h4>
+              <span className="rounded-full bg-muted text-muted-foreground text-xs font-semibold px-2 py-0.5 shrink-0">
+                Dedicated server
+              </span>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Writes a folder you can start with <span className="font-medium text-foreground">start.bat</span> (Windows)
+              or <span className="font-medium text-foreground">./start.sh</span> (Linux/macOS): your mods with
+              client-only ones removed, configs, the world you pick, the loader, and an
+              <span className="font-medium text-foreground"> eula.txt </span>
+              you must accept yourself. The server uses this instance's memory setting.
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Fabric and Quilt installers come from the loader's official Maven repository and are
+              checked against the <span className="font-medium text-foreground">.sha512</span> published
+              beside them; Forge and NeoForge are checked against Agora's pinned catalog. The first
+              start runs the installer, so it downloads the loader and the Minecraft server jar then.
+              Only allow an unverified download if the repository publishes no hash file at all.
+            </p>
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                <span className="font-medium text-foreground">World</span>
+                <select
+                  value={serverWorld}
+                  onChange={(event) => setServerWorld(event.target.value)}
+                  className="rounded-lg border border-input bg-background px-2 py-1 text-xs"
+                >
+                  <option value="">Most recently played</option>
+                  {serverWorlds.map((world) => (
+                    <option key={world.folder} value={world.folder}>
+                      {world.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={serverAllowUnverified}
+                  onChange={(event) => setServerAllowUnverified(event.target.checked)}
+                />
+                Allow an unverified loader download
+              </label>
+            </div>
+            <button
+              onClick={() => void handleExportServer()}
+              disabled={serverExportBusy}
+              className="rounded-lg border border-input bg-background hover:bg-accent px-3 py-1.5 text-sm font-medium disabled:opacity-50"
+            >
+              {serverExportBusy ? 'Exporting…' : 'Export server folder…'}
+            </button>
+            {serverExportResult && (
+              <div className="rounded-lg bg-accent/20 p-3 text-xs text-muted-foreground space-y-1">
+                <p>
+                  {serverExportResult.server_mods} of {serverExportResult.total_mods} mods kept
+                  {serverExportResult.removed_client_only.length > 0 &&
+                    `; client-only removed: ${serverExportResult.removed_client_only.join(', ')}`}
+                  {serverExportResult.world && `; world: ${serverExportResult.world}`}.
+                </p>
+                {serverExportResult.loader_artifact && (
+                  <p>Loader: {serverExportResult.loader_artifact}</p>
+                )}
+                <p>Accept the EULA in eula.txt before the first start.</p>
+                {serverExportResult.notes.map((note, index) => (
+                  <p key={index}>{note}</p>
                 ))}
               </div>
             )}

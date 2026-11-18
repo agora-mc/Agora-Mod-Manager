@@ -2581,6 +2581,12 @@ export interface ExportResult {
   removed_client_only: string[];
   server_jar_downloaded: boolean;
   start_scripts_created: boolean;
+  loader_downloaded: boolean;
+  loader_artifact: string | null;
+  world: string | null;
+  java_major: number | null;
+  eula_file_written: boolean;
+  notes: string[];
 }
 
 export const listSnapshots = (instanceId: string) =>
@@ -3193,8 +3199,18 @@ export const detectLaunchers = () =>
 export const cloneInstance = (instanceId: string, newName: string, prefs: ClonePrefs) =>
   invoke<string>('clone_instance_cmd', { instanceId, newName, prefs });
 
-export const exportServerEnvironment = (instanceId: string, destPath: string) =>
-  invoke<ExportResult>('export_server_environment', { instanceId, destPath });
+export const exportServerEnvironment = (
+  instanceId: string,
+  destPath: string,
+  world: string | null = null,
+  allowUnverifiedLoader = false,
+) =>
+  invoke<ExportResult>('export_server_environment', {
+    instanceId,
+    destPath,
+    world,
+    allowUnverifiedLoader,
+  });
 
 // ---------------------------------------------------------------------------
 // Phase 8: Pack install

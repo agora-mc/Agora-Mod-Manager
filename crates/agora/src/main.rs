@@ -344,7 +344,18 @@ enum Commands {
         action: PackCmd,
     },
     /// Export an instance to a standalone server environment.
-    Export { instance: String, dest: PathBuf },
+    Export {
+        instance: String,
+        dest: PathBuf,
+        /// World folder under the instance's saves/ to host.
+        /// Defaults to the most recently played world.
+        #[arg(long)]
+        world: Option<String>,
+        /// Download the loader's server launcher even when no published hash
+        /// pins it.
+        #[arg(long)]
+        allow_unverified_loader: bool,
+    },
     /// Manage loadout profiles for an instance (enable/disable sets of content).
     Loadout {
         #[command(subcommand)]
@@ -6320,7 +6331,12 @@ async fn run_command(
         Commands::Technic { action } => {
             cli_govniche::run_technic_command(action, ctx, output_fmt).await?
         }
-        Commands::Export { instance, dest } => {
+        Commands::Export {
+            instance,
+            dest,
+            world,
+            allow_unverified_loader,
+        } => {
             let instance_dir = agora_core::paths::instance_dir(data_dir, &instance)?;
             if !instance_dir.exists() {
                 anyhow::bail!("Instance '{}' not found", instance);
@@ -6328,14 +6344,14 @@ async fn run_command(
             std::fs::create_dir_all(&dest).map_err(|e| {
                 anyhow::anyhow!("Cannot create destination '{}': {}", dest.display(), e)
             })?;
-            let manifest_path = agora_core::paths::instance_manifest_path(data_dir, &instance)?;
-            let manifest = agora_core::helpers::read_manifest(&manifest_path)?;
-            let result = agora_game_minecraft::server_export::export_server_environment(
-                &instance_dir,
+            let result = agora_game_minecraft::server_export::export_ready_server(
+                ctx,
+                &instance,
                 &dest,
-                &manifest.loader,
-                &manifest.minecraft_version,
+                world.as_deref(),
+                allow_unverified_loader,
             )
+            .await
             .map_err(|e| anyhow::anyhow!("Export failed: {e}"))?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -6347,6 +6363,19 @@ async fn run_command(
                     result.removed_client_only.len(),
                     dest.display()
                 );
+                if let Some(world) = &result.world {
+                    println!("World: {world}");
+                }
+                if let Some(artifact) = &result.loader_artifact {
+                    println!("Loader: {artifact}");
+                }
+                if result.start_scripts_created {
+                    println!("Start: start.bat (Windows) or ./start.sh (Linux/macOS)");
+                }
+                println!("Accept the EULA in eula.txt before the first start.");
+                for note in &result.notes {
+                    println!("Note: {note}");
+                }
             }
         }
         Commands::Loadout { action } => {
