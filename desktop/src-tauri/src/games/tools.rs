@@ -654,6 +654,7 @@ pub async fn games_tools_save_inputs(
 /// Run a tool in the instance. `refusal` is the reason the virtual file system gave, when the user has
 /// chosen the tier that runs instead of it; `confirm_swap` says the swap's costs were shown and accepted.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn games_tools_run(
     app: tauri::AppHandle,
     instance_id: String,
@@ -967,6 +968,7 @@ pub async fn games_tools_use_output(
 
 /// Run one of the person's own tools through the same pipeline as a declared one.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn games_user_tools_run(
     app: tauri::AppHandle,
     instance_id: String,

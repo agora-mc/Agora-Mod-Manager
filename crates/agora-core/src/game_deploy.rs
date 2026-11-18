@@ -1541,7 +1541,7 @@ pub(crate) fn deploy_checked_while_running<E>(
 ) -> Result<Result<(DeployOutcome, DeploymentPlan), DeployError>, E> {
     let guard = match guard_for(ctx, instance_id, "deploy", allow_while_running) {
         Ok(guard) => guard,
-        Err(error) => return Ok(Err(error.into())),
+        Err(error) => return Ok(Err(error)),
     };
     deploy_checked_locked(ctx, &guard, definition, mode, before_build)
 }
@@ -3555,7 +3555,7 @@ pub fn add_to_instance_while_running(
     allow_while_running: bool,
 ) -> Result<AddToInstance, AddToInstanceError> {
     let guard = guard_for(ctx, instance_id, "content-add", allow_while_running)
-        .map_err(|error| AddToInstanceError::Deploy(error.into()))?;
+        .map_err(AddToInstanceError::Deploy)?;
     add_to_instance_locked(ctx, &guard, item_id)
 }
 

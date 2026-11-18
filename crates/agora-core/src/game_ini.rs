@@ -645,6 +645,7 @@ pub fn set_value(
 }
 
 /// [`set_value`], with the user's explicit answer to a running game.
+#[allow(clippy::too_many_arguments)]
 pub fn set_value_while_running(
     ctx: &Ctx,
     instance_id: &str,
