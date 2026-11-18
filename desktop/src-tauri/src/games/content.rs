@@ -383,6 +383,10 @@ pub(super) fn content_error(error: ContentError) -> GamesError {
                 "This item is used by {instances}. Remove it from those instances first, then remove it here."
             ),
         ),
+        ContentError::UnreadableSnapshots {
+            message, snapshots, ..
+        } => GamesError::new("UNREADABLE_SNAPSHOTS", message)
+            .with_details(serde_json::json!({ "snapshots": snapshots })),
         other => GamesError::new(CORE_FAILED, other.to_string()),
     }
 }
@@ -541,11 +545,19 @@ pub async fn games_content_verify(
 pub async fn games_content_remove(
     app: tauri::AppHandle,
     item_id: String,
+    ignore_unreadable_snapshots: Option<bool>,
 ) -> Result<(), GamesError> {
     let item_id = checked_id(&item_id)?;
     tokio::task::spawn_blocking(move || -> Result<(), GamesError> {
         let ctx = crate::core_context(&app)?;
-        content_store::remove_item(&ctx, &item_id).map_err(content_error)
+        content_store::remove_item_with_options(
+            &ctx,
+            &item_id,
+            content_store::RemoveOptions {
+                ignore_unreadable_snapshots: ignore_unreadable_snapshots.unwrap_or(false),
+            },
+        )
+        .map_err(content_error)
     })
     .await
     .map_err(|_| GamesError::new(TASK_FAILED, "Removing the item did not finish."))?

@@ -49,6 +49,74 @@ pub struct GameSnapshotData {
     pub content_refs: Vec<String>,
 }
 
+/// The error code a caller gets when the game is running or cannot be proven
+/// idle. It is the one case with an override, so front ends branch on it.
+pub const ERR_SNAPSHOT_NOT_IDLE: &str = "ERR_SNAPSHOT_NOT_IDLE";
+
+/// One snapshot that names a content item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotReference {
+    pub instance_id: String,
+    pub snapshot_id: String,
+    pub label: Option<String>,
+    pub created_at: String,
+    pub path: String,
+    /// The exact command that deletes this snapshot.
+    pub command: String,
+    pub in_trash: bool,
+}
+
+/// One snapshot whose manifest cannot be read, so it might name any item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnreadableSnapshotReference {
+    pub instance_id: String,
+    pub snapshot_id: String,
+    pub created_at: String,
+    pub path: String,
+    pub error: String,
+    /// The exact command that deletes this snapshot.
+    pub command: String,
+    pub in_trash: bool,
+}
+
+/// What a content-removal check found.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotContentUsage {
+    /// Readable snapshots that name the item.
+    pub using: Vec<SnapshotReference>,
+    /// Snapshots that cannot be read; they might name the item.
+    pub unreadable: Vec<UnreadableSnapshotReference>,
+}
+
+/// Why a game-instance restore did not run.
+#[derive(Debug, thiserror::Error)]
+pub enum GameRestoreError {
+    #[error("'{instance_id}' is running; close the game before restoring a snapshot")]
+    Running { instance_id: String },
+    #[error("could not tell whether '{instance_id}' is running: {reason}; nothing was changed")]
+    CouldNotTell { instance_id: String, reason: String },
+    #[error("{0}")]
+    Other(String),
+}
+
+impl GameRestoreError {
+    /// The stable code the CLI and desktop branch on.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Running { .. } | Self::CouldNotTell { .. } => ERR_SNAPSHOT_NOT_IDLE,
+            Self::Other(_) => "ERR_SNAPSHOT",
+        }
+    }
+}
+
+impl From<String> for GameRestoreError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
 /// What a restore did.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -377,7 +445,7 @@ pub fn restore(
     definition: &GameDefinition,
     snapshot_id: &str,
     force_while_running: bool,
-) -> Result<GameRestoreOutcome, String> {
+) -> Result<GameRestoreOutcome, GameRestoreError> {
     let _lock = ctx
         .lock_manager
         .acquire(
@@ -401,7 +469,7 @@ pub fn restore_locked(
     definition: &GameDefinition,
     snapshot_id: &str,
     force_while_running: bool,
-) -> Result<GameRestoreOutcome, String> {
+) -> Result<GameRestoreOutcome, GameRestoreError> {
     let dir = ctx
         .paths
         .instance_dir(instance_id)
@@ -411,15 +479,20 @@ pub fn restore_locked(
         Ok(false) => false,
         Ok(true) if force_while_running => true,
         Ok(true) => {
-            return Err(format!(
-                "'{instance_id}' is running; close the game before restoring a snapshot"
-            ))
+            return Err(GameRestoreError::Running {
+                instance_id: instance_id.to_string(),
+            })
         }
         Err(error) if force_while_running => {
             eprintln!("[snapshot] restoring '{instance_id}' despite: {error}");
             true
         }
-        Err(error) => return Err(format!("{error}; nothing was changed")),
+        Err(reason) => {
+            return Err(GameRestoreError::CouldNotTell {
+                instance_id: instance_id.to_string(),
+                reason,
+            })
+        }
     };
 
     // Validate everything before a single live file moves.
@@ -433,10 +506,10 @@ pub fn restore_locked(
 
     let missing = missing_content(ctx, &data.content_refs);
     if !missing.is_empty() {
-        return Err(format!(
+        return Err(GameRestoreError::Other(format!(
             "snapshot {snapshot_id} needs content the store no longer holds: {}; nothing was changed",
             missing.join(", ")
-        ));
+        )));
     }
 
     // The undo point records the current state, including the current rules, so
@@ -461,14 +534,14 @@ pub fn restore_locked(
         Err(error) => {
             let rollback = snapshot::restore_snapshot_data(&dir, &undo.id);
             let _ = std::fs::remove_file(pending_path(&dir));
-            return Err(match rollback {
+            return Err(GameRestoreError::Other(match rollback {
                 Ok(_) => format!("{error}; the instance was put back as it was"),
                 Err(rollback) => format!(
                     "{error}; putting the instance back also failed ({rollback}). Restore \
                      snapshot {} to try again.",
                     undo.id
                 ),
-            });
+            }));
         }
     };
 
@@ -488,7 +561,7 @@ pub fn restore_locked(
         let rules_back =
             game_load_order::replace_all_load_after_rules(ctx, instance_id, &undo_rules);
         let _ = std::fs::remove_file(pending_path(&dir));
-        return Err(match (files, rules_back) {
+        return Err(GameRestoreError::Other(match (files, rules_back) {
             (Ok(_), Ok(())) => format!(
                 "the snapshot's rules could not be restored ({error}); the instance was put back as it was"
             ),
@@ -498,7 +571,7 @@ pub fn restore_locked(
                  {} holds the previous state.",
                 undo.id
             ),
-        });
+        }));
     }
     let _ = std::fs::remove_file(pending_path(&dir));
 
@@ -542,10 +615,36 @@ pub fn snapshot_data(
         .map_err(|e| format!("snapshot {snapshot_id} records unreadable game state: {e}"))
 }
 
+/// One instance's snapshot folder.
+struct SnapshotFolder {
+    instance_id: String,
+    instance_dir: PathBuf,
+    snapshots_dir: PathBuf,
+    in_trash: bool,
+}
+
+fn delete_command(instance_id: &str, snapshot_id: &str, in_trash: bool) -> String {
+    if in_trash {
+        format!(
+            "restore the instance from Recently deleted, then run: agora snapshots delete              {instance_id} {snapshot_id}"
+        )
+    } else {
+        format!("agora snapshots delete {instance_id} {snapshot_id}")
+    }
+}
+
+fn folder_instance_id(dir: &Path, fallback: String) -> String {
+    std::fs::read_to_string(dir.join("instance_manifest.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<game_instance::GameInstanceManifest>(&text).ok())
+        .map(|manifest| manifest.instance_id)
+        .unwrap_or(fallback)
+}
+
 /// Every snapshot folder under the data root: live instances and the game
 /// instances waiting in Recently deleted (their snapshot store travels with
 /// them, so a restore still needs their content).
-fn snapshot_folders(ctx: &Ctx) -> Result<Vec<(String, std::path::PathBuf)>, String> {
+fn snapshot_folders(ctx: &Ctx) -> Result<Vec<SnapshotFolder>, String> {
     let mut folders = Vec::new();
     let mut roots: Vec<(std::path::PathBuf, bool)> = vec![(ctx.paths.instances_root(), false)];
     roots.push((ctx.paths.recently_deleted_games_root(), true));
@@ -566,6 +665,7 @@ fn snapshot_folders(ctx: &Ctx) -> Result<Vec<(String, std::path::PathBuf)>, Stri
                     root.display()
                 )
             })?;
+            let fallback = entry.file_name().to_string_lossy().into_owned();
             let dir = if in_trash {
                 entry.path().join("instance")
             } else {
@@ -576,65 +676,83 @@ fn snapshot_folders(ctx: &Ctx) -> Result<Vec<(String, std::path::PathBuf)>, Stri
             }
             let snapshots = dir.join(".agora_snapshots");
             if snapshots.is_dir() {
-                let label = if in_trash {
-                    format!("{} (Recently deleted)", dir.display())
+                let instance_id = if in_trash {
+                    folder_instance_id(&dir, fallback)
                 } else {
-                    dir.display().to_string()
+                    fallback
                 };
-                folders.push((label, snapshots));
+                folders.push(SnapshotFolder {
+                    instance_id,
+                    instance_dir: dir,
+                    snapshots_dir: snapshots,
+                    in_trash,
+                });
             }
         }
     }
     Ok(folders)
 }
 
-/// The snapshots that name a content item, as readable descriptions, or a
-/// refusal when a snapshot manifest cannot be read.
+/// The snapshots that name a content item, and the ones that cannot be read.
 ///
-/// Fails closed: an unreadable manifest might name any item, so removal must
-/// treat the answer as "still needed", never as "unused".
-pub fn snapshots_using_content(ctx: &Ctx, item_id: &str) -> Result<Vec<String>, String> {
-    let mut using = Vec::new();
-    for (instance_label, snapshots_dir) in snapshot_folders(ctx)? {
-        let entries = std::fs::read_dir(&snapshots_dir).map_err(|error| {
+/// Fails closed on a folder that cannot be listed: if the answer cannot be
+/// determined, removal must treat it as "still needed".
+pub fn snapshots_using_content(ctx: &Ctx, item_id: &str) -> Result<SnapshotContentUsage, String> {
+    let mut usage = SnapshotContentUsage::default();
+    for folder in snapshot_folders(ctx)? {
+        let entries = snapshot::list_snapshots(&folder.instance_dir).map_err(|error| {
             format!(
-                "cannot list snapshots at '{}': {error}",
-                snapshots_dir.display()
+                "cannot list snapshots for instance '{}': {error}",
+                folder.instance_id
             )
         })?;
         for entry in entries {
-            let entry = entry.map_err(|error| {
-                format!(
-                    "cannot read a snapshot entry at '{}': {error}",
-                    snapshots_dir.display()
-                )
-            })?;
-            let path = entry.path();
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            if path.extension().and_then(|e| e.to_str()) != Some("json")
-                || name.ends_with(".agora-verified.json")
-                || name == "live-file-index.json"
-                || name == "mutation-journal.json"
-            {
+            let json = folder.snapshots_dir.join(format!("{}.json", entry.id));
+            let path = if json.is_file() {
+                json
+            } else {
+                folder.snapshots_dir.join(format!("{}.zip", entry.id))
+            };
+            let command = delete_command(&folder.instance_id, &entry.id, folder.in_trash);
+            if let Some(error) = &entry.unreadable {
+                usage.unreadable.push(UnreadableSnapshotReference {
+                    instance_id: folder.instance_id.clone(),
+                    snapshot_id: entry.id.clone(),
+                    created_at: entry.created_at.clone(),
+                    path: path.display().to_string(),
+                    error: error.clone(),
+                    command,
+                    in_trash: folder.in_trash,
+                });
                 continue;
             }
-            let Some(id) = path.file_stem().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            let aux = snapshot::snapshot_aux(snapshots_dir.parent().unwrap_or(&snapshots_dir), id)
-                .map_err(|error| {
-                    format!(
-                        "snapshot manifest '{}' cannot be read, so nothing is deleted: {error}",
-                        path.display()
-                    )
-                })?;
-            if aux.content_refs.iter().any(|content| content == item_id) {
-                using.push(format!("snapshot '{id}' of {instance_label}"));
+            match snapshot::snapshot_aux(&folder.instance_dir, &entry.id) {
+                Ok(aux) => {
+                    if aux.content_refs.iter().any(|content| content == item_id) {
+                        usage.using.push(SnapshotReference {
+                            instance_id: folder.instance_id.clone(),
+                            snapshot_id: entry.id.clone(),
+                            label: entry.label.clone(),
+                            created_at: entry.created_at.clone(),
+                            path: path.display().to_string(),
+                            command,
+                            in_trash: folder.in_trash,
+                        });
+                    }
+                }
+                // `list_snapshots` called it readable, so this is a race or a
+                // partly written side file. Treat it as unreadable: fail closed.
+                Err(error) => usage.unreadable.push(UnreadableSnapshotReference {
+                    instance_id: folder.instance_id.clone(),
+                    snapshot_id: entry.id.clone(),
+                    created_at: entry.created_at.clone(),
+                    path: path.display().to_string(),
+                    error,
+                    command,
+                    in_trash: folder.in_trash,
+                }),
             }
         }
     }
-    Ok(using)
+    Ok(usage)
 }

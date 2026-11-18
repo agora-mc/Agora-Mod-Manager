@@ -296,7 +296,11 @@ fn restore_is_refused_while_running_and_allowed_with_the_override() {
     let generation = agora_core::instance_runtime::publish_starting(&h.ctx.paths, &h.id).unwrap();
     let error = game_snapshot::restore(&h.ctx, &h.id, &h.def, &snap.id, false)
         .expect_err("a running game refuses the restore");
-    assert!(error.contains("running"), "{error}");
+    assert!(error.to_string().contains("running"), "{error}");
+    assert_eq!(
+        error.code(),
+        agora_core::game_snapshot::ERR_SNAPSHOT_NOT_IDLE
+    );
     assert_eq!(h.read_user_file("Plugins.txt"), b"*B.esp\n");
 
     let outcome =
@@ -316,7 +320,13 @@ fn a_snapshot_that_names_an_item_keeps_it_from_being_removed() {
 
     let error =
         content_store::remove_item(&h.ctx, &item).expect_err("a snapshot still needs the item");
-    assert!(format!("{error}").contains(&item), "{error}");
+    let message = format!("{error}");
+    assert!(message.contains(&item), "{message}");
+    assert!(message.contains("snapshot"), "{message}");
+    assert!(
+        message.contains("agora snapshots delete"),
+        "names the delete command: {message}"
+    );
     assert!(h.ctx.paths.content_item_path(&item).is_file());
 }
 
@@ -329,6 +339,14 @@ fn an_unreadable_snapshot_blocks_removal_and_is_listed() {
     h.clear_layers();
 
     let snapshots = h.dir().join(".agora_snapshots");
+    // Remove the readable snapshot that also names the item, so the unreadable
+    // one is the only thing standing between the item and removal.
+    for snapshot in snapshot::list_snapshots(&h.dir()).unwrap() {
+        if !snapshot.is_unreadable() {
+            snapshot::delete_snapshot(&h.dir(), &snapshot.id).unwrap();
+        }
+    }
+    std::fs::create_dir_all(&snapshots).unwrap();
     std::fs::write(snapshots.join("broken.json"), b"{not json").unwrap();
 
     let listed = snapshot::list_snapshots(&h.dir()).unwrap();
@@ -344,8 +362,38 @@ fn an_unreadable_snapshot_blocks_removal_and_is_listed() {
 
     let error = content_store::remove_item(&h.ctx, &item)
         .expect_err("an unreadable snapshot refuses removal");
-    assert!(format!("{error}").contains("unreadable"), "{error}");
+    let content_store::ContentError::UnreadableSnapshots {
+        message,
+        snapshots: snapshot_refs,
+        ..
+    } = error
+    else {
+        panic!("expected the unreadable-snapshot refusal, got {error:?}");
+    };
+    assert!(message.contains("broken"), "{message}");
+    assert!(
+        message.contains("agora snapshots delete"),
+        "names the delete command: {message}"
+    );
+    let broken_ref = snapshot_refs
+        .iter()
+        .find(|snapshot| snapshot.snapshot_id == "broken")
+        .expect("the refusal names the snapshot");
+    assert_eq!(broken_ref.instance_id, h.id);
+    assert!(broken_ref.command.contains("agora snapshots delete"));
     assert!(h.ctx.paths.content_item_path(&item).is_file());
+
+    // The explicit override proceeds and leaves the unreadable snapshot alone.
+    content_store::remove_item_with_options(
+        &h.ctx,
+        &item,
+        content_store::RemoveOptions {
+            ignore_unreadable_snapshots: true,
+        },
+    )
+    .expect("the explicit override removes the item");
+    assert!(!h.ctx.paths.content_item_path(&item).is_file());
+    assert!(snapshots.join("broken.json").exists());
 }
 
 #[test]
@@ -364,7 +412,7 @@ fn a_missing_content_object_refuses_the_restore_by_name() {
 
     let error = game_snapshot::restore(&h.ctx, &h.id, &h.def, &snap.id, false)
         .expect_err("a missing object refuses the restore");
-    assert!(error.contains(&item), "{error}");
+    assert!(error.to_string().contains(&item), "{error}");
 }
 
 #[test]

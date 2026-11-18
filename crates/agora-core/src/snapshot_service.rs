@@ -152,7 +152,10 @@ impl SnapshotService {
                 snapshot_id,
                 force_while_running,
             )
-            .map_err(snapshot_error)?;
+            .map_err(|error| LauncherError::Generic {
+                code: error.code().into(),
+                message: error.to_string(),
+            })?;
             return Ok(outcome.outcome);
         }
 

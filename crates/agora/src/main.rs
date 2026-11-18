@@ -1222,6 +1222,10 @@ enum ContentCmd {
     Remove {
         /// Item ID or unique prefix to remove.
         item: String,
+        /// Remove it even when a snapshot manifest cannot be read. The ignored
+        /// snapshots are named on stderr and can no longer restore the item.
+        #[arg(long)]
+        ignore_unreadable_snapshots: bool,
     },
     /// Show or change whether instances share mod files, and optionally convert existing ones.
     Share {
@@ -7432,8 +7436,17 @@ async fn run_command(
                         }
                     }
                 }
-                ContentCmd::Remove { item } => {
-                    match agora_core::content_store::remove_item(ctx, &item) {
+                ContentCmd::Remove {
+                    item,
+                    ignore_unreadable_snapshots,
+                } => {
+                    match agora_core::content_store::remove_item_with_options(
+                        ctx,
+                        &item,
+                        agora_core::content_store::RemoveOptions {
+                            ignore_unreadable_snapshots,
+                        },
+                    ) {
                         Ok(()) => {
                             if json {
                                 let out = serde_json::json!({

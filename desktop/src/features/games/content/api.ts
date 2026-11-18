@@ -103,8 +103,13 @@ export const addToStore = (sourcePath: string, name: string | null, gameId: stri
 export const verifyStored = (itemId: string, full: boolean) =>
   invoke<VerifyReport>('games_content_verify', { itemId, full });
 
-/** Remove an item from the store. Refused while an instance uses it. */
-export const removeStored = (itemId: string) => invoke<void>('games_content_remove', { itemId });
+/**
+ * Remove an item from the store. Refused while an instance or a snapshot uses
+ * it. `ignoreUnreadableSnapshots` is the explicit override for snapshots whose
+ * manifests cannot be read; the core names each one it ignored.
+ */
+export const removeStored = (itemId: string, ignoreUnreadableSnapshots = false) =>
+  invoke<void>('games_content_remove', { itemId, ignoreUnreadableSnapshots });
 
 /** The content layers an instance has, in load order. Rejects if the reply is not that list. */
 export async function listInstanceContent(instanceId: string): Promise<InstanceContentList> {

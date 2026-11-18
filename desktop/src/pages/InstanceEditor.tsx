@@ -47,6 +47,7 @@ import {
   exportServerEnvironment,
   listWorlds,
   formatError,
+  errorCode,
   inspectJavaExecutable,
   pickOpenFile,
   getCustomIcon,
@@ -2744,7 +2745,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                           await run(false);
                         } catch (e) {
                           const message = formatError(e);
-                          const gameMayBeRunning = /is running|could not tell whether/i.test(message);
+                          const gameMayBeRunning = errorCode(e) === 'ERR_SNAPSHOT_NOT_IDLE';
                           if (gameMayBeRunning && await confirm({
                             title: 'The game is running',
                             body: `${message}

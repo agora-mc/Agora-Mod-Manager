@@ -171,9 +171,16 @@ export async function listUnusedItems(): Promise<UnusedListing> {
   return reply as UnusedListing;
 }
 
-/** Remove one item from the store. Refused while an instance uses it, or when a manifest is unreadable. */
-export async function removeLibraryItem(itemId: string): Promise<void> {
-  await removeStored(itemId);
+/**
+ * Remove one item from the store. Refused while an instance uses it, or when a
+ * snapshot manifest is unreadable. Pass `ignoreUnreadableSnapshots` only after
+ * the person chose to leave those snapshots unable to restore the item.
+ */
+export async function removeLibraryItem(
+  itemId: string,
+  ignoreUnreadableSnapshots = false,
+): Promise<void> {
+  await removeStored(itemId, ignoreUnreadableSnapshots);
 }
 
 /** Every instance of every game, for the Add-to-instance picker. */
