@@ -3072,6 +3072,38 @@ plus the reason. A 4xx refusal, including `invalid_grant`, never falls back: the
 in again. A refresh that cannot be renewed for any other reason keeps the stored credential and
 fails the launch as before.
 
+### 22.6 DPAPI Is the Declared Windows Backend (refines 22.3)
+
+22.3 introduced DPAPI as what Windows uses once a keyring write fails. The review found the code
+still treated it as a fallback: a Windows write tried Credential Manager first, and when that
+predictably failed for a Microsoft credential it left the old keyring entry in place. `load_secret`
+then preferred that stale entry over the file the failed write had just produced (M2).
+
+**On Windows with the platform-default data root, the DPAPI file is the declared backend.** A
+write goes straight to the file and does not attempt Credential Manager; a successful write then
+deletes any keyring entry for the same service and account. This removes the "old entry shadows a
+new file" state rather than merely reading around it. The same rule covers the GitHub token: it
+fits the keyring, but two credential stores on one platform is the inconsistency that produced
+the bug, so it moves to the DPAPI file too.
+
+**On macOS and Linux the OS keyring remains primary.** A write that the keyring rejects now
+deletes the stale keyring entry after the file is durable. Independently, a read prefers an
+existing fallback file over the keyring: a successful keyring write removes the file, so a file
+that remains is the newer copy. Either mechanism alone would fix M2; both together survive a
+delete that the platform refuses.
+
+**A relocated or portable root keeps the device-key scheme**, which is obfuscation rather than
+OS protection: the key travels beside the ciphertext so the profile still opens on another
+machine. `AGORA_DATA_DIR` on Windows is such a root, so its Microsoft credential is the
+device-key file; the Settings warning for `EncryptedFile` says so. This is the documented choice
+the review asked for, not a silent downgrade: a DPAPI blob from a moved root would simply stop
+working.
+
+**A failed DPAPI call is an error.** `encrypt_fallback` no longer steps down to the device-key
+scheme when `CryptProtectData` fails on an eligible root; writing a weaker file under the same
+name would make the Settings report wrong. Relocated and portable roots take the weaker branch by
+design, as above.
+
 ---
 
 ## 23. RELIABILITY, RECOVERY & REPRODUCIBILITY

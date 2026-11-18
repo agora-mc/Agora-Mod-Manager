@@ -58,7 +58,7 @@ Keep these rules in mind:
 - Use disposable instances when learning destructive commands.
 - `instance delete` moves the instance to Recently deleted, where it can be restored for 30 days (or the time set in Settings > General > Storage); then it goes to the OS trash. `snapshots restore`, `snapshots delete`, `lockfile import`, and some install conflict choices can replace or remove files.
 - Never place access tokens or account codes in command history, log files, or bug reports.
-- `--data-dir` isolates files under the Agora data root, but Microsoft credentials use the operating-system credential store. `auth status`, `auth login`, and `auth logout` therefore inspect or change the same credential entry used by the desktop app. The exception is a portable copy (a `portable.txt` beside the executable, with no `AGORA_DATA_DIR` override), which never uses the operating-system store and keeps its credentials encrypted in its own data folder.
+- `--data-dir` isolates files under the Agora data root. On Windows the Microsoft credential is a file inside that root (DPAPI-protected for the normal root, device-key encrypted for a relocated one), so a disposable root holds its own sign-in and neither the desktop app nor an installed copy is changed. On macOS and Linux the credential is in the operating-system store: `auth status`, `auth login`, and `auth logout` then inspect or change the same entry the desktop app uses, whatever root is selected. A portable copy (a `portable.txt` beside the executable, with no `AGORA_DATA_DIR` override) never uses the operating-system store; it keeps its credentials encrypted in its own data folder, which is obfuscation rather than OS protection because the key travels with them.
 
 ## Global syntax
 
@@ -833,7 +833,9 @@ Sessions created before Agora moved to its own Microsoft application cannot be r
 
 More than one account can be signed in. `auth login` with a different account adds it and makes it the active one; the previous account stays signed in. `auth list` marks the active account with `*`, and `auth switch` changes which one launches use. `auth logout` signs out the active account, and the next signed-in account becomes active; `--account` signs out a particular one.
 
-Authentication is not scoped by `--data-dir`. `auth logout` removes the shared operating-system credential entry and can sign the desktop app out even when the CLI uses a disposable data root.
+On Windows the sign-in is stored in a file under the selected data root: DPAPI-protected for the normal root, device-key encrypted for a relocated or portable one. `--data-dir` therefore gives a disposable root its own sign-in. On macOS and Linux authentication is not scoped by `--data-dir`: `auth logout` removes the shared operating-system credential entry and can sign the desktop app out even when the CLI uses a disposable data root.
+
+More than one signed-in account is kept in one encrypted record, replaced in a single write. A refresh that finishes while you switch accounts updates the account it refreshed instead of making it active again, and a corrupt saved-account list is reported as an error rather than shown as "no accounts".
 
 ### Settings
 
