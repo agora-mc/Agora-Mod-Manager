@@ -633,7 +633,7 @@ async fn refresh_oauth_token(
 /// (`invalid_grant` or `expired_token`) that should clear stored credentials.
 fn is_msa_permanent_refresh_error(body: &str) -> bool {
     matches!(
-        oauth_error_code(&body).as_deref(),
+        oauth_error_code(body).as_deref(),
         Some("invalid_grant") | Some("expired_token")
     )
 }
@@ -1170,7 +1170,21 @@ fn clear_account_credentials(uuid: &str) -> LauncherResult<()> {
 /// the credentials sit in a file guarded only by its permissions -- the state
 /// MASTER_SPEC 7.5.2 requires Settings to warn about.
 pub fn credentials_backend() -> agora_core::auth::CredentialBackend {
-    agora_core::auth::credential_backend(KEYRING_SERVICE, ACCOUNT_STORE_ACCOUNT, ACCOUNT_STORE_FILE)
+    let current = agora_core::auth::credential_backend(
+        KEYRING_SERVICE,
+        ACCOUNT_STORE_ACCOUNT,
+        ACCOUNT_STORE_FILE,
+    );
+    if current != agora_core::auth::CredentialBackend::None {
+        return current;
+    }
+    // Before the first read migrates them, the active account still lives in
+    // the old slot. Report that store so Settings does not lose its warning.
+    agora_core::auth::credential_backend(
+        KEYRING_SERVICE,
+        KEYRING_ACCOUNT,
+        CREDENTIALS_FALLBACK_FILE,
+    )
 }
 
 pub fn load_credentials() -> LauncherResult<Option<MsaCredentials>> {

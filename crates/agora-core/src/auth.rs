@@ -709,16 +709,17 @@ pub fn store_token_bundle(bundle: &GitHubTokenBundle) -> LauncherResult<()> {
         return Ok(());
     }
 
-    if !os_protected_is_primary() && keyring_for_token() {
-        if matches!(
+    if !os_protected_is_primary()
+        && keyring_for_token()
+        && matches!(
             keyring_write(KEYRING_SERVICE, KEYRING_ACCOUNT, &json),
             KeyringWrite::Ok
-        ) {
-            if let Some(path) = fallback_token_path() {
-                let _ = std::fs::remove_file(path);
-            }
-            return Ok(());
+        )
+    {
+        if let Some(path) = fallback_token_path() {
+            let _ = std::fs::remove_file(path);
         }
+        return Ok(());
     }
 
     let path = fallback_token_path().ok_or_else(|| LauncherError::Generic {
@@ -1744,13 +1745,14 @@ pub fn store_secret(
     // credential, and Microsoft's own token caches do the same. Writing the
     // keyring first there would leave a stale entry that `load_secret` has to
     // prefer over a newer file.
-    if !os_protected_is_primary() && keyring_for_secret() {
-        if matches!(keyring_write(service, account, value), KeyringWrite::Ok) {
-            if let Some(path) = fallback_secret_path(fallback_file) {
-                let _ = std::fs::remove_file(path);
-            }
-            return Ok(());
+    if !os_protected_is_primary()
+        && keyring_for_secret()
+        && matches!(keyring_write(service, account, value), KeyringWrite::Ok)
+    {
+        if let Some(path) = fallback_secret_path(fallback_file) {
+            let _ = std::fs::remove_file(path);
         }
+        return Ok(());
     }
 
     let path = fallback_secret_path(fallback_file).ok_or_else(|| LauncherError::Generic {
