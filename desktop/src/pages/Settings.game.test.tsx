@@ -123,6 +123,37 @@ describe('Settings for Minecraft', () => {
     expect(within(pages()).getByRole('tab', { name: 'Plugins' })).toBeInTheDocument();
   });
 
+  it('shows the saved-account repair notice with a Repair button', async () => {
+    answer({
+      msa_get_status: {
+        username: 'Bob',
+        uuid: 'bbbb2222',
+        expires: '2099-01-01T00:00:00Z',
+        needs_reauth: false,
+        reauth_message: null,
+      },
+      msa_list_accounts: [
+        { uuid: 'bbbb2222', username: 'Bob', active: true, needs_reauth: false },
+        { uuid: 'aaaa1111', username: 'Alice', active: false, needs_reauth: false },
+      ],
+      msa_account_store_status: {
+        needs_repair: true,
+        corrupt_file: 'C:/Agora/msa-accounts.enc.corrupt-20260101T000000Z',
+        detected_at: '2026-01-01T00:00:00Z',
+        message:
+          'The saved account list could not be read. The active account still works, but accounts cannot be switched or added until it is repaired. Run `agora auth repair`.',
+      },
+    });
+    renderSettings('minecraft');
+
+    fireEvent.click(within(sections()).getByRole('tab', { name: 'Accounts' }));
+    const notice = await screen.findByTestId('account-store-repair');
+    expect(notice).toHaveTextContent(/still works/);
+    expect(notice).toHaveTextContent(/msa-accounts\.enc\.corrupt-/);
+    expect(within(notice).getByRole('button', { name: 'Repair accounts' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Use for launching' })).toBeDisabled();
+  });
+
   it('opens a Minecraft-only deep link as General, without switching the game', async () => {
     const { requestSettingsSection } = await import('../lib/settingsSection');
     requestSettingsSection({ tab: 'launching', page: 'java' });

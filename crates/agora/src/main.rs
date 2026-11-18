@@ -1885,6 +1885,8 @@ enum AuthCmd {
         /// Username or UUID.
         account: String,
     },
+    /// Rebuild the saved account list after it could not be read.
+    Repair,
 }
 
 /// Find a signed-in account by username (case-insensitive) or UUID.
@@ -4881,62 +4883,71 @@ async fn run_auth_command(
                 println!("Signed in as {}", account.username);
             }
         }
-        AuthCmd::Status => match agora_game_minecraft::msa::load_credentials()? {
-            Some(account) => {
-                if account.needs_reauth() {
-                    // Stored by the pre-migration flow: no refresh token
-                    // Agora now holds can renew it.
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "status": "sign_in_required",
-                                "username": account.username,
-                                "reason": agora_game_minecraft::msa::LEGACY_CREDENTIALS_MESSAGE,
-                            })
-                        );
+        AuthCmd::Status => {
+            let store_status = agora_game_minecraft::msa::account_store_status();
+            if store_status.needs_repair {
+                eprintln!(
+                    "[auth] {}",
+                    agora_game_minecraft::msa::ACCOUNT_STORE_REPAIR_MESSAGE
+                );
+            }
+            match agora_game_minecraft::msa::load_credentials()? {
+                Some(account) => {
+                    if account.needs_reauth() {
+                        // Stored by the pre-migration flow: no refresh token
+                        // Agora now holds can renew it.
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "status": "sign_in_required",
+                                    "username": account.username,
+                                    "reason": agora_game_minecraft::msa::LEGACY_CREDENTIALS_MESSAGE,
+                                })
+                            );
+                        } else {
+                            println!("Signed in as {} — sign-in required", account.username);
+                            println!("{}", agora_game_minecraft::msa::LEGACY_CREDENTIALS_MESSAGE);
+                        }
+                    } else if account.is_expired() {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({"status": "expired", "username": account.username})
+                            );
+                        } else {
+                            println!(
+                                "Signed in as {} (expired — run 'agora auth login')",
+                                account.username
+                            );
+                        }
                     } else {
-                        println!("Signed in as {} — sign-in required", account.username);
-                        println!("{}", agora_game_minecraft::msa::LEGACY_CREDENTIALS_MESSAGE);
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "status": "valid",
+                                    "username": account.username,
+                                    "expires": account.expires,
+                                })
+                            );
+                        } else {
+                            println!(
+                                "Signed in as {} (expires {})",
+                                account.username, account.expires
+                            );
+                        }
                     }
-                } else if account.is_expired() {
+                }
+                None => {
                     if json {
-                        println!(
-                            "{}",
-                            serde_json::json!({"status": "expired", "username": account.username})
-                        );
+                        println!("{}", serde_json::json!({"status": "not_authenticated"}));
                     } else {
-                        println!(
-                            "Signed in as {} (expired — run 'agora auth login')",
-                            account.username
-                        );
-                    }
-                } else {
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "status": "valid",
-                                "username": account.username,
-                                "expires": account.expires,
-                            })
-                        );
-                    } else {
-                        println!(
-                            "Signed in as {} (expires {})",
-                            account.username, account.expires
-                        );
+                        println!("Not authenticated. Run 'agora auth login'.");
                     }
                 }
             }
-            None => {
-                if json {
-                    println!("{}", serde_json::json!({"status": "not_authenticated"}));
-                } else {
-                    println!("Not authenticated. Run 'agora auth login'.");
-                }
-            }
-        },
+        }
         AuthCmd::Logout { account } => {
             let next = match account {
                 Some(query) => {
@@ -4988,6 +4999,39 @@ async fn run_auth_command(
                 println!("{}", serde_json::to_string_pretty(&active)?);
             } else {
                 println!("Now using {}.", active.username);
+            }
+        }
+        AuthCmd::Repair => {
+            let report = agora_game_minecraft::msa::repair_account_store()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if !report.repaired {
+                for note in &report.notes {
+                    println!("{note}");
+                }
+            } else {
+                println!("Rebuilt the saved account list.");
+                for account in &report.accounts {
+                    println!(
+                        "{} {}{}",
+                        if account.active { "*" } else { " " },
+                        account.username,
+                        if account.needs_reauth {
+                            " (sign in again)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                for note in &report.notes {
+                    println!("{note}");
+                }
+                for unresolved in &report.unresolved {
+                    println!("Could not recover {unresolved}; sign in again to restore it.");
+                }
+                for kept in &report.corrupt_files {
+                    println!("The unreadable data was kept as {kept}.");
+                }
             }
         }
     }

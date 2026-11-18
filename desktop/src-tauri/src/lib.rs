@@ -460,6 +460,8 @@ pub fn run() {
             commands::msa_complete_login,
             commands::msa_cancel_login,
             commands::msa_get_status,
+            commands::msa_account_store_status,
+            commands::msa_repair_accounts,
             commands::credential_storage_status,
             commands::msa_refresh,
             commands::msa_logout,

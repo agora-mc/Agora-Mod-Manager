@@ -3053,7 +3053,18 @@ the active credential; if it was switched away from, the new token updates its p
 it was signed out during the refresh, the result is dropped rather than resurrecting the account.
 A permanent `invalid_grant` clears that account's credential wherever it sits. Sign-out skips an
 index entry whose credential is missing instead of failing after already clearing the active
-account, and a corrupt index or store is reported as an error, never read as empty.
+account, and a corrupt index or store is never read as empty.
+
+**A corrupt list does not lock the player out.** The active account still loads and launches from
+the recovery copy (or the old active slot during migration). The unreadable data is renamed beside
+itself with a timestamp and never deleted. Switching, adding, signing out or removing an account is
+refused with `ERR_MSA_ACCOUNTS_NEED_REPAIR` until `repair_account_store` rebuilds the one store from
+the accounts it can still read: the recovery copy, a readable old index, the old active slot, and
+(for the file backend) any parked credential files on disk. Entries whose credential cannot be read
+stay listed as needing a fresh sign-in and are named in the repair report. Every store write also
+writes a recovery copy of the same committed state, so the primary being corrupt costs at most the
+transaction in flight, not the active account. The player is warned once per process and the
+desktop Accounts page carries a Repair button; `agora auth repair` is the same operation.
 
 The one-blob design depends on 22.3: Windows Credential Manager's 2.5 KB cap was the reason each
 account used to get its own entry, and Windows now writes the DPAPI-protected file instead. The

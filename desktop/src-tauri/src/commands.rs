@@ -4030,6 +4030,24 @@ pub async fn credential_storage_status(
     })
 }
 
+/// Whether the saved account list needs repair, and what to tell the user.
+#[tauri::command]
+pub async fn msa_account_store_status(
+) -> LauncherResult<agora_game_minecraft::msa::AccountStoreStatus> {
+    tokio::task::spawn_blocking(agora_game_minecraft::msa::account_store_status)
+        .await
+        .map_err(|_| LauncherError::LocalStateFailed)
+}
+
+/// Rebuild the saved account list from the accounts still readable.
+#[tauri::command]
+pub async fn msa_repair_accounts() -> LauncherResult<agora_game_minecraft::msa::AccountRepairReport>
+{
+    tokio::task::spawn_blocking(agora_game_minecraft::msa::repair_account_store)
+        .await
+        .map_err(|_| LauncherError::LocalStateFailed)?
+}
+
 /// Refresh expired MSA credentials.
 #[tauri::command]
 pub async fn msa_refresh(

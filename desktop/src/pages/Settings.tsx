@@ -68,6 +68,9 @@ import {
   msaListAccounts,
   msaRemoveAccount,
   msaSwitchAccount,
+  msaAccountStoreStatus,
+  msaRepairAccounts,
+  type AccountStoreStatus,
   type MsaAccountSummary,
 } from '../lib/tauri';
 import { WindowSizeEditor } from '../components/WindowSizeEditor';
@@ -425,15 +428,20 @@ export function Settings({
   }, []);
 
   const [msaAccounts, setMsaAccounts] = useState<MsaAccountSummary[]>([]);
-  // Reload the active account and the list together: signing out or in can
-  // change which account is active.
+  const [accountStoreStatus, setAccountStoreStatus] = useState<AccountStoreStatus | null>(null);
+  const [repairBusy, setRepairBusy] = useState(false);
+  const needsAccountRepair = accountStoreStatus?.needs_repair === true;
+  // Reload the active account, the list and the repair state together: signing
+  // out, switching or a repair can change all three.
   const refreshMsaAccounts = useCallback(async () => {
-    const [creds, accounts] = await Promise.all([
+    const [creds, accounts, storeStatus] = await Promise.all([
       msaGetStatus().catch(() => null),
       msaListAccounts().catch(() => [] as MsaAccountSummary[]),
+      msaAccountStoreStatus().catch(() => null),
     ]);
     setMsaCreds(creds);
     setMsaAccounts(Array.isArray(accounts) ? accounts : []);
+    setAccountStoreStatus(storeStatus);
   }, []);
 
   // Load MSA status on mount
@@ -441,13 +449,15 @@ export function Settings({
     let cancelled = false;
     (async () => {
       try {
-        const [creds, accounts] = await Promise.all([
+        const [creds, accounts, storeStatus] = await Promise.all([
           msaGetStatus(),
           msaListAccounts().catch(() => [] as MsaAccountSummary[]),
+          msaAccountStoreStatus().catch(() => null),
         ]);
         if (!cancelled) {
           setMsaCreds(creds);
           setMsaAccounts(Array.isArray(accounts) ? accounts : []);
+          setAccountStoreStatus(storeStatus);
         }
       } catch {
         if (!cancelled) setMsaCreds(null);
@@ -678,11 +688,63 @@ export function Settings({
     }
   };
 
+  const handleRepairAccounts = async () => {
+    setRepairBusy(true);
+    try {
+      const report = await msaRepairAccounts();
+      await refreshMsaAccounts();
+      showToast(
+        report.repaired
+          ? 'Rebuilt the saved account list. The unreadable copy was kept.'
+          : 'The saved account list was already readable.',
+        'success',
+      );
+    } catch (e) {
+      showToast(formatError(e), 'error');
+    } finally {
+      setRepairBusy(false);
+    }
+  };
+
+  const accountRepairNotice = needsAccountRepair ? (
+    <div
+      className="rounded-lg border border-amber-500/50 bg-amber-500/10 p-3 text-xs"
+      data-testid="account-store-repair"
+      role="alert"
+    >
+      <p className="font-medium text-amber-700 dark:text-amber-300">
+        The saved account list needs repair
+      </p>
+      <p className="mt-1 text-muted-foreground">
+        {accountStoreStatus?.message ??
+          'The saved account list could not be read. The active account still works, but accounts cannot be switched or added until it is repaired.'}
+      </p>
+      <p className="mt-1 text-muted-foreground">
+        Launching with the active account still works. Switching account, signing in another
+        account, and signing out are off until this is repaired.
+      </p>
+      {accountStoreStatus?.corrupt_file && (
+        <p className="mt-1 break-all text-muted-foreground">
+          The unreadable data was kept as <span className="font-mono">{accountStoreStatus.corrupt_file}</span>.
+        </p>
+      )}
+      <button
+        type="button"
+        onClick={() => void handleRepairAccounts()}
+        disabled={repairBusy}
+        className="mt-2 rounded-lg border border-input bg-background px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-50"
+      >
+        {repairBusy ? 'Repairing…' : 'Repair accounts'}
+      </button>
+    </div>
+  ) : null;
+
   const otherMsaAccounts = (
     <OtherMsaAccounts
       accounts={msaAccounts.filter((account) => !account.active)}
       onSwitch={handleMsaSwitch}
       onRemove={handleMsaRemove}
+      disabled={needsAccountRepair}
     />
   );
 
@@ -1712,7 +1774,7 @@ export function Settings({
               {msaError && <p className="text-xs text-destructive">{msaError}</p>}
               <button
                 onClick={handleMsaSignIn}
-                disabled={msaBusy}
+                disabled={msaBusy || needsAccountRepair}
                 className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
               >
                 {msaBusy ? 'Waiting…' : 'Sign in with Microsoft'}
@@ -1727,6 +1789,7 @@ export function Settings({
             Required for direct launch mode. Used to authenticate with Minecraft services.
           </p>
           <DegradedCredentialNotice backend={credentialStorage?.microsoft} portable={isPortable} />
+          {accountRepairNotice}
           {otherMsaAccounts}
           {!msaCreds.needs_reauth && msaPrompt && (
             <MsaDeviceFlowPanel
@@ -1740,7 +1803,7 @@ export function Settings({
             {!msaCreds.needs_reauth && (
               <button
                 onClick={handleMsaSignIn}
-                disabled={msaBusy}
+                disabled={msaBusy || needsAccountRepair}
                 className="rounded-lg border border-input px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-50"
               >
                 {msaBusy ? 'Waiting…' : 'Add another account'}
@@ -1748,7 +1811,8 @@ export function Settings({
             )}
             <button
               onClick={handleMsaSignOut}
-              className="text-xs text-muted-foreground hover:text-foreground underline"
+              disabled={needsAccountRepair}
+              className="text-xs text-muted-foreground hover:text-foreground underline disabled:opacity-50"
             >
               Sign out {msaCreds.username}
             </button>
@@ -1759,6 +1823,7 @@ export function Settings({
           <p className="text-xs text-muted-foreground">
             Sign in with your Microsoft account to enable direct in-app launching (without the Mojang launcher).
           </p>
+          {accountRepairNotice}
           {otherMsaAccounts}
 
           {msaPrompt && (
@@ -1772,7 +1837,7 @@ export function Settings({
           {msaError && <p className="text-xs text-destructive">{msaError}</p>}
           <button
             onClick={handleMsaSignIn}
-            disabled={msaBusy}
+            disabled={msaBusy || needsAccountRepair}
             className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {msaBusy ? 'Waiting…' : 'Sign in with Microsoft'}
@@ -2766,10 +2831,13 @@ function OtherMsaAccounts({
   accounts,
   onSwitch,
   onRemove,
+  disabled = false,
 }: {
   accounts: MsaAccountSummary[];
   onSwitch: (uuid: string) => Promise<void>;
   onRemove: (uuid: string) => Promise<void>;
+  /** The saved account list needs repair; the backend refuses these too. */
+  disabled?: boolean;
 }) {
   if (accounts.length === 0) return null;
   return (
@@ -2786,14 +2854,16 @@ function OtherMsaAccounts({
               <button
                 type="button"
                 onClick={() => void onSwitch(account.uuid)}
-                className="rounded-md border border-input px-2 py-1 text-xs font-medium hover:bg-accent"
+                disabled={disabled}
+                className="rounded-md border border-input px-2 py-1 text-xs font-medium hover:bg-accent disabled:opacity-50"
               >
                 Use for launching
               </button>
               <button
                 type="button"
                 onClick={() => void onRemove(account.uuid)}
-                className="rounded-md px-2 py-1 text-xs text-muted-foreground hover:text-foreground underline"
+                disabled={disabled}
+                className="rounded-md px-2 py-1 text-xs text-muted-foreground hover:text-foreground underline disabled:opacity-50"
               >
                 Remove
               </button>

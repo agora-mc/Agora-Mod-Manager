@@ -2448,6 +2448,30 @@ export const msaSwitchAccount = (uuid: string) =>
 export const msaRemoveAccount = (uuid: string) =>
   invoke<void>('msa_remove_account', { uuid });
 
+/** Whether the saved account list needs repair, and why. */
+export interface AccountStoreStatus {
+  needs_repair: boolean;
+  /** The corrupt file (or encrypted quarantine copy) that was kept. */
+  corrupt_file: string | null;
+  detected_at: string | null;
+  message: string | null;
+}
+export const msaAccountStoreStatus = () =>
+  invoke<AccountStoreStatus>('msa_account_store_status');
+
+/** What a repair recovered and what it could not. */
+export interface AccountRepairReport {
+  repaired: boolean;
+  accounts: MsaAccountSummary[];
+  /** Entries still listed but whose credential could not be read. */
+  unresolved: string[];
+  notes: string[];
+  /** Every corrupt file kept aside; repair never deletes them. */
+  corrupt_files: string[];
+}
+export const msaRepairAccounts = () =>
+  invoke<AccountRepairReport>('msa_repair_accounts');
+
 export const computeGcArgs = (
   javaVersion: number,
   requestedHeapMb: number,

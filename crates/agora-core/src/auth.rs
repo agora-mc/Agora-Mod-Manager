@@ -1600,6 +1600,16 @@ pub fn fallback_secret_present(fallback_file: &str) -> bool {
     fallback_secret_path(fallback_file).is_some_and(|path| path.exists())
 }
 
+/// The directory holding the encrypted credential files and their device key.
+///
+/// Exposed so a caller that owns a non-secret recovery marker (the MSA account
+/// store) can put it beside the files it describes, including under
+/// `AGORA_DATA_DIR` or a portable root. Returns `None` only when no data root
+/// can be resolved at all.
+pub fn credential_storage_dir() -> Option<std::path::PathBuf> {
+    fallback_data_dir()
+}
+
 /// Whether the OS keyring may be used for the GitHub token.
 fn keyring_for_token() -> bool {
     #[cfg(test)]

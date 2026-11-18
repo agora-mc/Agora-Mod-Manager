@@ -823,6 +823,7 @@ agora auth status
 agora auth list
 agora auth switch <USERNAME_OR_UUID>
 agora auth logout [--account <USERNAME_OR_UUID>]
+agora auth repair
 ```
 
 These commands manage the Microsoft/Xbox/Minecraft identity used for direct launch. They are separate from the GitHub account used by desktop governance features.
@@ -835,7 +836,9 @@ More than one account can be signed in. `auth login` with a different account ad
 
 On Windows the sign-in is stored in a file under the selected data root: DPAPI-protected for the normal root, device-key encrypted for a relocated or portable one. `--data-dir` therefore gives a disposable root its own sign-in. On macOS and Linux authentication is not scoped by `--data-dir`: `auth logout` removes the shared operating-system credential entry and can sign the desktop app out even when the CLI uses a disposable data root.
 
-More than one signed-in account is kept in one encrypted record, replaced in a single write. A refresh that finishes while you switch accounts updates the account it refreshed instead of making it active again, and a corrupt saved-account list is reported as an error rather than shown as "no accounts".
+More than one signed-in account is kept in one encrypted record, replaced in a single write, with a recovery copy. A refresh that finishes while you switch accounts updates the account it refreshed instead of making it active again.
+
+If the saved account list cannot be read, launching still uses the active account and the command prints one warning. The unreadable data is never deleted: it is renamed aside with a timestamp. Switching accounts, signing in another account, signing out, and removing an account are refused with the reason until you run `agora auth repair`, which rebuilds the list from the accounts it can still read. It names any entry it could not recover (that account needs a fresh sign-in) and where the unreadable copy was kept. `auth status` also reports the repair state. The desktop Accounts page shows the same notice with a **Repair accounts** button.
 
 ### Settings
 
