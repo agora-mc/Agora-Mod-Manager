@@ -1052,8 +1052,10 @@ pub fn get_setting(conn: &Connection, key: &str) -> anyhow::Result<Option<serde_
 /// (on for the first-party endpoints, off for `network_plugins_enabled`).
 /// Lockdown Mode (`network_lockdown_enabled`) overrides every endpoint.
 ///
-/// An undeclared key keeps the legacy behaviour (missing means on) because
-/// callers outside the registry used to rely on it; no gate uses such a key.
+/// A network switch must be a declared boolean. An undeclared key, a declared
+/// key of another type, or a store that cannot be read all mean **denied**; a
+/// misspelled switch name is a code bug and is logged once rather than quietly
+/// becoming permission.
 pub fn is_network_enabled(conn: &Connection, key: &str) -> bool {
     // Lockdown Mode blocks every network endpoint regardless of the per-endpoint
     // toggle, so the backend never sends outbound feature requests while on.
@@ -1062,11 +1064,10 @@ pub fn is_network_enabled(conn: &Connection, key: &str) -> bool {
     }
     match crate::settings_registry::read_bool(conn, key) {
         Ok(Some(enabled)) => enabled,
-        Ok(None) => get_setting(conn, key)
-            .ok()
-            .flatten()
-            .map(|v| is_value_enabled(&v))
-            .unwrap_or(true),
+        Ok(None) => {
+            crate::settings_registry::report_undeclared_switch(key);
+            false
+        }
         // Could not tell: that is not permission.
         Err(_) => false,
     }
@@ -1097,17 +1098,11 @@ pub fn is_lockdown_enabled(conn: &Connection) -> bool {
 
 /// Whether Lockdown Mode forbids network access, failing closed.
 ///
-/// `is_value_enabled` is shared with the per-endpoint toggles, where returning
-/// `true` for an unexpected shape means *enabled* and is the permissive
-/// default. For lockdown the same `true` means *deny*, so one helper produced
-/// opposite security outcomes for the two uses: an unrecognised string
-/// (`"yes"`) or a failed read silently turned lockdown **off**.
-///
-/// This parses lockdown on its own terms. Strict booleans and the
-/// documented legacy strings are honoured; a value that is present but not
-/// understood, or a store that cannot be read, denies rather than guessing —
-/// a kill switch that fails open is not a kill switch. A cleanly absent
-/// setting keeps the documented default of off.
+/// This parses lockdown on its own terms. Strict booleans and the documented
+/// legacy strings are honoured; a value that is present but not understood, or
+/// a store that cannot be read, denies rather than guessing — a kill switch
+/// that fails open is not a kill switch. A cleanly absent setting keeps the
+/// documented default of off.
 pub fn lockdown_denies_network(conn: &Connection) -> crate::error::LauncherResult<bool> {
     let raw = get_setting(conn, "network_lockdown_enabled").map_err(|error| {
         crate::error::LauncherError::Generic {
@@ -1138,17 +1133,6 @@ pub fn lockdown_denies_network(conn: &Connection) -> crate::error::LauncherResul
                  Network access is blocked until it is corrected in Settings."
             ),
         }),
-    }
-}
-
-/// Parse a stored setting value as a boolean, accepting both JSON booleans
-/// and legacy JSON strings `"true"` / `"false"`. Returns `true` for unknown
-/// or unexpected shapes (aligned with the fail-open default).
-fn is_value_enabled(v: &serde_json::Value) -> bool {
-    match v {
-        serde_json::Value::Bool(b) => *b,
-        serde_json::Value::String(s) => s == "true",
-        _ => true,
     }
 }
 
@@ -2348,34 +2332,61 @@ mod tests {
         assert_eq!(val, Some(serde_json::json!("v2")));
     }
 
-    // ---- is_network_enabled: both JSON booleans and legacy strings ----
+    // ---- is_network_enabled: declared switches only, fail closed ----
 
     #[test]
-    fn test_is_network_enabled_missing_default_true() {
+    fn an_undeclared_switch_reads_as_off() {
         let (conn, _path) = test_db();
-        // A key that was never set should default to enabled (fail-open).
-        assert!(is_network_enabled(&conn, "nonexistent_network_key"));
+        // A misspelled or undeclared key is a code bug: it must never be
+        // treated as permission, even if a row says `true`.
+        set_setting(
+            &conn,
+            "network_nonexistent_switch",
+            &serde_json::Value::Bool(true),
+        )
+        .unwrap();
+        assert!(!is_network_enabled(&conn, "network_nonexistent_switch"));
+        // A declared key that is not a boolean is not a switch either.
+        assert!(!is_network_enabled(&conn, "launch_mode"));
     }
 
     #[test]
     fn test_is_network_enabled_json_bool_true() {
         let (conn, _path) = test_db();
-        set_setting(&conn, "test_key", &serde_json::Value::Bool(true)).unwrap();
-        assert!(is_network_enabled(&conn, "test_key"));
+        set_setting(
+            &conn,
+            "network_mojang_metadata_enabled",
+            &serde_json::Value::Bool(true),
+        )
+        .unwrap();
+        assert!(is_network_enabled(&conn, "network_mojang_metadata_enabled"));
     }
 
     #[test]
     fn test_is_network_enabled_json_bool_false() {
         let (conn, _path) = test_db();
-        set_setting(&conn, "test_key", &serde_json::Value::Bool(false)).unwrap();
-        assert!(!is_network_enabled(&conn, "test_key"));
+        set_setting(
+            &conn,
+            "network_mojang_metadata_enabled",
+            &serde_json::Value::Bool(false),
+        )
+        .unwrap();
+        assert!(!is_network_enabled(
+            &conn,
+            "network_mojang_metadata_enabled"
+        ));
     }
 
     #[test]
     fn test_is_network_enabled_string_true() {
         let (conn, _path) = test_db();
-        set_setting(&conn, "test_key", &serde_json::Value::String("true".into())).unwrap();
-        assert!(is_network_enabled(&conn, "test_key"));
+        set_setting(
+            &conn,
+            "network_mojang_metadata_enabled",
+            &serde_json::Value::String("true".into()),
+        )
+        .unwrap();
+        assert!(is_network_enabled(&conn, "network_mojang_metadata_enabled"));
     }
 
     #[test]
@@ -2383,31 +2394,58 @@ mod tests {
         let (conn, _path) = test_db();
         set_setting(
             &conn,
-            "test_key",
+            "network_mojang_metadata_enabled",
             &serde_json::Value::String("false".into()),
         )
         .unwrap();
-        assert!(!is_network_enabled(&conn, "test_key"));
+        assert!(!is_network_enabled(
+            &conn,
+            "network_mojang_metadata_enabled"
+        ));
     }
 
     #[test]
     fn test_is_network_enabled_roundtrip_bool() {
         let (conn, _path) = test_db();
-        // Write as boolean, read back
-        set_setting(&conn, "rt_key", &serde_json::Value::Bool(false)).unwrap();
-        assert!(!is_network_enabled(&conn, "rt_key"));
-        set_setting(&conn, "rt_key", &serde_json::Value::Bool(true)).unwrap();
-        assert!(is_network_enabled(&conn, "rt_key"));
+        set_setting(
+            &conn,
+            "network_mojang_metadata_enabled",
+            &serde_json::Value::Bool(false),
+        )
+        .unwrap();
+        assert!(!is_network_enabled(
+            &conn,
+            "network_mojang_metadata_enabled"
+        ));
+        set_setting(
+            &conn,
+            "network_mojang_metadata_enabled",
+            &serde_json::Value::Bool(true),
+        )
+        .unwrap();
+        assert!(is_network_enabled(&conn, "network_mojang_metadata_enabled"));
     }
 
     #[test]
     fn test_is_network_enabled_roundtrip_string() {
         let (conn, _path) = test_db();
-        // Write as string, read back
-        set_setting(&conn, "rt_key", &serde_json::Value::String("false".into())).unwrap();
-        assert!(!is_network_enabled(&conn, "rt_key"));
-        set_setting(&conn, "rt_key", &serde_json::Value::String("true".into())).unwrap();
-        assert!(is_network_enabled(&conn, "rt_key"));
+        set_setting(
+            &conn,
+            "network_mojang_metadata_enabled",
+            &serde_json::Value::String("false".into()),
+        )
+        .unwrap();
+        assert!(!is_network_enabled(
+            &conn,
+            "network_mojang_metadata_enabled"
+        ));
+        set_setting(
+            &conn,
+            "network_mojang_metadata_enabled",
+            &serde_json::Value::String("true".into()),
+        )
+        .unwrap();
+        assert!(is_network_enabled(&conn, "network_mojang_metadata_enabled"));
     }
 
     // ---- Lockdown Mode (global network block) ----

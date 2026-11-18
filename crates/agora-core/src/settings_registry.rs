@@ -260,7 +260,7 @@ const REGISTRY: &[SettingDef] = &[
     string_setting("game_instance_default.*"),
     json_setting("game.*"),
     bool_setting!("health_silenced_*", false, false),
-    string_setting("crash_answer_dismissed.*"),
+    string_setting("crash_answer_dismissed_*"),
 ];
 
 /// Look a key up in the registry. Exact keys win over patterns.
@@ -404,6 +404,23 @@ fn read_typed(definition: &SettingDef, raw: Option<Value>) -> Option<Value> {
             }
         },
         SettingKind::Json => raw,
+    }
+}
+
+/// Report a key that the network gate named but the registry does not declare
+/// as a boolean switch. This is a code bug; the read still denies, and the
+/// message is printed once per process so a hot path is not flooded.
+pub fn report_undeclared_switch(key: &str) {
+    static REPORTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let reported = REPORTED.get_or_init(|| Mutex::new(HashSet::new()));
+    let first = reported
+        .lock()
+        .map(|mut seen| seen.insert(key.to_string()))
+        .unwrap_or(false);
+    if first {
+        eprintln!(
+            "[settings] {key} is named as a network switch but is not a declared boolean;              treating it as off"
+        );
     }
 }
 
@@ -562,6 +579,7 @@ mod tests {
         assert!(is_registered("curated_source_anything_enabled"));
         assert!(is_registered("game.skyrim-se.deployment"));
         assert!(is_registered("game_instance_default.skyrim-se"));
+        assert!(is_registered("crash_answer_dismissed_instance-1"));
         assert!(!is_registered("a_key_agora_never_declared"));
     }
 

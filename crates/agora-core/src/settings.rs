@@ -59,23 +59,17 @@ impl SettingsService {
         })
     }
 
-    /// Set a setting value by key. A declared setting is validated first and
-    /// stored in its declared shape; an undeclared key is stored as given so
-    /// presentation state (and plugins' own keys) keep working. Use
-    /// [`set_registered`](Self::set_registered) to refuse undeclared keys.
+    /// Set a setting value by key. The key must be declared in the registry and
+    /// the value must match its type; undeclared keys and wrong types are
+    /// refused with the reason and nothing is stored. Use
+    /// [`set_registered`](Self::set_registered) when the caller wants the value
+    /// as stored (a legacy boolean `0` becomes `false`).
     pub fn set(&self, key: &str, value: &serde_json::Value) -> LauncherResult<()> {
-        let stored = if crate::settings_registry::is_registered(key) {
-            crate::settings_registry::validate(key, value)?
-        } else {
-            value.clone()
-        };
-        self.store(key, &stored)
+        self.set_registered(key, value).map(|_| ())
     }
 
     /// Set a declared setting, refusing an undeclared key or a value of the
-    /// wrong type. Returns the value as stored (a legacy boolean `0` becomes
-    /// `false`). The CLI uses this: a typo must not silently create a setting
-    /// nothing will ever read.
+    /// wrong type. Returns the value as stored.
     pub fn set_registered(
         &self,
         key: &str,

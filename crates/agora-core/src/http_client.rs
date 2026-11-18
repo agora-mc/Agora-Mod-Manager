@@ -244,7 +244,7 @@ impl ClientCategory {
     ///
     /// This is the single definition that client construction and
     /// [`Self::index`] are both derived from — see [`HttpClients`].
-    const ALL: [ClientCategory; 17] = [
+    pub(crate) const ALL: [ClientCategory; 17] = [
         ClientCategory::MojangMetadata,
         ClientCategory::MojangContent,
         ClientCategory::Loader,

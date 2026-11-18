@@ -1533,16 +1533,14 @@ impl PluginService {
     /// Agora contacts a publisher without being asked. Off by default, like
     /// everything else here that reaches the network.
     pub fn automatic_updates_enabled(&self) -> bool {
-        self.inner
-            .conn()
-            .ok()
-            .and_then(|conn| {
-                crate::db::get_setting(&conn, PLUGIN_UPDATES_ENABLED_SETTING)
-                    .ok()
-                    .flatten()
-            })
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false)
+        let Ok(conn) = self.inner.conn() else {
+            return false;
+        };
+        match crate::settings_registry::read_bool(&conn, PLUGIN_UPDATES_ENABLED_SETTING) {
+            Ok(Some(enabled)) => enabled,
+            // Missing, undeclared or unreadable: automatic updates stay off.
+            Ok(None) | Err(_) => false,
+        }
     }
 
     /// Check every plugin that has somewhere to check, if that was asked for.
