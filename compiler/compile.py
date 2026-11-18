@@ -3721,6 +3721,70 @@ def build_catalog_bundle(db_path: Path, db_bytes: bytes, *, skip_sign: bool) -> 
 
 
 # ---------------------------------------------------------------------------
+# Audit log (§4.6, §24.1)
+# ---------------------------------------------------------------------------
+
+
+def _read_json_strict(path: Path, what: str) -> Any:
+    """Read a JSON file, failing with a clear message instead of starting over.
+
+    The audit log is append-only; a file that cannot be read must stop the
+    compile so nobody silently replaces the record with an empty one.
+    """
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"cannot read the {what} at {path} ({exc}); fix or restore it from git "
+            "before compiling, the compiler will not start a new one over it"
+        ) from exc
+
+
+def _write_json_atomic(path: Path, data: Any) -> None:
+    """Write JSON through a temporary file and rename, so a crash never leaves half a file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def _read_audit_log(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"log_format_version": 1, "entries": []}
+    data = _read_json_strict(path, "audit log")
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+        raise ValueError(f"audit log {path} has no 'entries' list; refusing to rewrite it")
+    data.setdefault("log_format_version", 1)
+    return data
+
+
+def _governance_event_audit_rows(state_path: Path | None) -> list[tuple[str, str, str]]:
+    """Audit rows for the governance events recorded in the state file."""
+    if state_path is None or not state_path.exists():
+        return []
+    state = _read_json_strict(state_path, "governance state")
+    rows: list[tuple[str, str, str]] = []
+    for event in state.get("events", []) if isinstance(state, dict) else []:
+        if not isinstance(event, dict):
+            continue
+        timestamp = event.get("detected_at")
+        if not isinstance(timestamp, str) or not timestamp:
+            continue
+        event_type = str(event.get("event_type") or "governance_event")
+        reactions = event.get("affected_reactions") or []
+        details = (
+            f"{event.get('item_id', '?')}: {event.get('status', 'pending')}, "
+            f"{len(reactions)} reaction(s) held back (event {event.get('event_id', '?')})"
+        )
+        rows.append((timestamp, event_type, details))
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Main compile routine
 # ---------------------------------------------------------------------------
 
@@ -4015,13 +4079,7 @@ def compile_registry(
     audit_log_path = REGISTRY_DIR / "governance" / "audit_log.json"
     total_items = mod_count + pack_count + other_count
     total_crash_sigs = sig_count
-    if audit_log_path.exists():
-        with audit_log_path.open("r", encoding="utf-8") as fh:
-            audit_data = json.load(fh)
-    else:
-        audit_data = {"log_format_version": 1, "entries": []}
-    if "log_format_version" not in audit_data:
-        audit_data["log_format_version"] = 1
+    audit_data = _read_audit_log(audit_log_path)
     if no_governance_write or (_governance_mode is not None and _governance_mode != GovernanceMode.MONITOR):
         logger.info("Governance audit log writes disabled; leaving audit log unchanged.")
     else:
@@ -4042,15 +4100,16 @@ def compile_registry(
             oldest_2000 = audit_data["entries"][:2000]
             audit_data["entries"] = audit_data["entries"][-8000:]
             if archive_path.exists():
-                with archive_path.open("r", encoding="utf-8") as fh:
-                    archive_data = json.load(fh)
+                archive_data = _read_json_strict(archive_path, "audit log archive")
+                if not isinstance(archive_data, list):
+                    raise ValueError(f"audit log archive {archive_path} is not a list; refusing to rewrite it")
                 archive_data.extend(oldest_2000)
             else:
                 archive_data = oldest_2000
-            with archive_path.open("w", encoding="utf-8") as fh:
-                json.dump(archive_data, fh, indent=2)
-        with audit_log_path.open("w", encoding="utf-8") as fh:
-            json.dump(audit_data, fh, indent=2)
+            # The archive is written before the shortened log, so a crash between
+            # the two writes duplicates entries rather than losing them.
+            _write_json_atomic(archive_path, archive_data)
+        _write_json_atomic(audit_log_path, audit_data)
         logger.info("Wrote audit log to %s", audit_log_path)
 
     # Register audit log path in system_config.
@@ -4080,10 +4139,16 @@ def compile_registry(
         "details TEXT)"
     )
     audit_conn.execute("DELETE FROM audit_log")
+    # The registry table is the public record `agora registry audit-log` shows:
+    # the compiler's own entries plus every governance event (vote surges and
+    # their resolution), which live in the governance state file.
     rows = [
         (e["timestamp"], e["action"], e.get("details"))
         for e in audit_data.get("entries", [])
     ]
+    _gov_state_for_audit = _gov_state_out if _gov_state_out.exists() else _gov_state_in
+    rows.extend(_governance_event_audit_rows(_gov_state_for_audit))
+    rows.sort(key=lambda row: row[0])
     audit_conn.executemany(
         "INSERT INTO audit_log (timestamp, action, details) VALUES (?, ?, ?)",
         rows,

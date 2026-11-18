@@ -3277,6 +3277,8 @@ Per the E8 user decision (expand to match section 4.6), the compiler (compiler/c
 eason, details. Action types cover: compile (every nightly run), AUTO_FLAG (velocity circuit breaker), POLL_CREATED, POLL_CLOSED, IMMUNITY_APPLIED, IMMUNITY_REMOVED, ARCHIVED, RESTORED, BLACKLIST_UPDATED, REACTION_SCRUBBED, SIGNATURE_REJECTED (client-side). The root audit_log object carries log_format_version: 1. Rotation per section 4.6: at 10,000 entries, the oldest 2,000 move to 
 egistry/governance/audit_log_archive.{YYYYMMDD}.json (new archive file per day; existing archive appended to).
 
+**As built (2026-11-18).** The governance pipeline records its decisions as events in `governance-state.json` (§24.3–24.4), not in `audit_log.json`, which holds only the compiler's own `compile` entries (written in monitor mode). The registry's `audit_log` table, which `agora registry audit-log` reads, is built from both: the `compile` entries plus one row per governance event (event type, item, status, reactions held back), in time order. The compiler refuses to compile over an `audit_log.json` or archive it cannot read, instead of starting a new log, and writes both files through a temporary file and rename. The two archives that held only test entries (`dummy_*`) were removed.
+
 ### 24.2 Triage Poll Resolution Bugs (fixed 2026-07-05) (formerly §19.8)
 
 Per the A4 fixes during the 2026-07-05 audit:

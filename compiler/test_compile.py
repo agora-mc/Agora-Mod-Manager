@@ -2253,5 +2253,51 @@ class OfficialPluginDigestTests(unittest.TestCase):
         self.assertEqual(described["tree_sha256"], self.GOLDEN)
 
 
+class AuditLogTests(unittest.TestCase):
+    """The audit log is append-only: unreadable files stop the compile."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_missing_log_starts_empty(self):
+        data = _compile._read_audit_log(self.tmp / "audit_log.json")
+        self.assertEqual(data, {"log_format_version": 1, "entries": []})
+
+    def test_corrupt_log_is_refused_not_reset(self):
+        path = self.tmp / "audit_log.json"
+        path.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            _compile._read_audit_log(path)
+        self.assertEqual(path.read_text(encoding="utf-8"), "{not json")
+
+    def test_log_without_entries_list_is_refused(self):
+        path = self.tmp / "audit_log.json"
+        path.write_text('{"entries": {}}', encoding="utf-8")
+        with self.assertRaises(ValueError):
+            _compile._read_audit_log(path)
+
+    def test_atomic_write_leaves_no_temp_file(self):
+        path = self.tmp / "audit_log.json"
+        _compile._write_json_atomic(path, {"entries": [1]})
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"entries": [1]})
+        self.assertEqual([p.name for p in self.tmp.iterdir()], ["audit_log.json"])
+
+    def test_governance_events_become_audit_rows(self):
+        state = self.tmp / "governance-state.json"
+        state.write_text(json.dumps({"schema_version": 1, "events": [
+            {"event_id": "e1", "item_id": "sodium", "event_type": "vote_surge",
+             "status": "pending", "detected_at": "2026-11-01T00:00:00+00:00",
+             "affected_reactions": [1, 2, 3]},
+            {"event_id": "e2", "item_id": "iris"},
+        ]}), encoding="utf-8")
+        rows = _compile._governance_event_audit_rows(state)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "2026-11-01T00:00:00+00:00")
+        self.assertEqual(rows[0][1], "vote_surge")
+        self.assertIn("sodium: pending, 3 reaction(s)", rows[0][2])
+        self.assertEqual(_compile._governance_event_audit_rows(None), [])
+
+
 if __name__ == "__main__":
     unittest.main()
