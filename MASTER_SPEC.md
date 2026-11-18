@@ -5295,3 +5295,219 @@ as HTML.
   where the other pre-launch findings do.
 - **Crash doctor:** a crash whose evidence names a record or plugin that lost a conflict may cite
   the conflict as a finding (`core.overlap` facts), never as certain.
+
+## 32. CONSOLIDATION BEFORE THE FIRST RELEASE
+
+Status: designed 2026-11-17, owner decision 2026-11-16 that this ships in the multi-game PR. Source:
+two whole-codebase reviews (foundations and Minecraft, 2026-11-16) found the code works, but
+several jobs are done in many places that each made their own choices. This section says which one
+way each job is done from now on. It changes no behaviour a player can see, except the bug fixes
+it names. Wave 1 (locks, typed settings, database safety net, registry bundle, instance guard,
+offline sign-in, server export, game-instance recovery) lands first; this section builds on it.
+
+### 32.1 Rules for the whole section
+- **One way per job, and a check that keeps it that way.** Each item below ends with a guard
+  (a type the compiler enforces, or a count in `scripts/check_architecture.py` that may only go
+  down), so the duplicates do not grow back.
+- **Moves and behaviour changes never share a commit.** A commit that moves code changes nothing
+  else, so a reviewer can trust "moved" without reading it twice.
+- **Stored data keeps working.** Every format change has a migration that runs behind the Wave 1
+  database safety net (copy before migrating, restore on failure), and a test that opens data
+  written by the code before it.
+- **Where this section disagrees with the review, it says so and why** (32.7, 32.8, 32.9, 32.10).
+
+### 32.2 Order
+The splits and sweeps that touch every file run alone, one after another, while nothing else is in
+flight, so nobody has to merge against them. The rest runs in parallel by file area.
+
+| Step | Work | Runs |
+|---|---|---|
+| A1 | Split the CLI and desktop command files (32.6) | alone, first |
+| A2 | `Ctx` owns process state and database access (32.9); the error and duplicate counts in the architecture check (32.10, 32.3) | alone, after A1 |
+| B1 | One relative-path type and one archive reader (32.3) | parallel |
+| B2 | One instance model (32.7) | parallel |
+| B3 | One content store (32.8) | parallel |
+| C1 | Staged apply primitive and typed install request; the install pipeline and direct installs move onto it (32.4, 32.5) | after B1 |
+| C2 | Imports, pack install, pack update, launcher import and curated packs move onto staged apply | after C1 |
+| D1 | Typed errors where callers branch, startup recovery in one place, smaller operation manager (32.10, 32.11) | last |
+
+### 32.3 One relative-path type and one archive reader
+Today about 25 functions each decide what a safe relative path or file name is, and 15 places open
+zip files, each with its own limits. `agora_game_api::id::RelPath` already exists but is weaker than
+the strictest of them (`content_store::validate_entry_path`).
+- **`RelPath` becomes the strict one,** keeping its name (it is used widely): no `..`, no absolute
+  path or drive letter, no empty or `.` component, no `:` (also blocks NTFS alternate streams), no
+  NUL, no component ending in a dot or space, no Windows reserved name (`CON`, `NUL`, `COM1`...,
+  with any extension), backslashes read as `/`. These rules apply on every platform, because packs
+  and instances move between systems; a refused name is reported with the file and the rule.
+  `RelPath::join_under(root)` gives the full path and refuses a symlink or junction on the way
+  where today's code checks for one.
+- **`FileName`** is the one-component form, for the places that take a single name.
+- **`validate_path_set`** (two names that are the same file on a case-insensitive disk) moves next
+  to them and is used by every multi-file writer.
+- **One archive reader** (`agora_core::archive::SafeArchive`): every entry name parsed into
+  `RelPath`, and limits on entry count, total unpacked size, per-entry size and compression ratio.
+  Limits come in named presets (pack, backup, plugin package, jar metadata, runtime), with today's
+  values carried over; the slice lists every old value and the preset it went to.
+- **Guard:** the architecture check counts private path validators and direct `ZipArchive::new`
+  calls outside `archive.rs`; both may only go down.
+
+### 32.4 Staged apply: one way to put files into an instance
+Nine paths write files into a Minecraft instance today, each with its own staging, backup and
+rollback. The install pipeline's `apply_transaction` is the most careful, but even its journal
+lives only in memory, so a crash halfway through leaves a half-applied instance that nothing
+repairs.
+- **`agora_core::staged_apply`:** `Stage::begin(&guard, root)` takes the Wave 1 instance guard,
+  so files cannot be applied to an instance without holding it (the compiler enforces this).
+  Add, replace, remove and rename operations take `RelPath`s; sources are bytes, a staged file, or
+  a content-store object.
+- **Staging lives on the same disk as the target** (`<root>/.agora_stage/<id>`), so commits are
+  renames, not copies.
+- **The journal is written and flushed to disk before the first change.** Commit moves replaced
+  and removed files into the stage's backup folder, puts the new files in place, writes the
+  manifest last, marks the journal committed, then cleans up. On failure, rollback undoes the
+  steps in reverse.
+- **Startup recovery:** a leftover journal that is not marked committed is rolled back, never
+  forward. A committed one only has its cleanup finished. Recovery reports what it did.
+- **Who uses it:** C1 moves the install pipeline and the direct installs onto it (add, remove,
+  manual and pinned installs, `commit_verified_artifact`). C2 moves the importers (`import.rs`,
+  `agora_pack_import`), `pack_install`, `pack_update::apply_merge`, `launcher_import_service` and
+  `curated_pack`. Game instances already deploy through their generated layer (§26) and are out of
+  scope.
+- **Tests:** a simulated crash after each commit step leaves either the old instance or the new
+  one, never a mix, after recovery.
+- **Guard:** direct file writes (`fs::write`, `fs::copy`, `File::create`, `rename`) under an
+  instance folder outside `staged_apply` are counted, and may only go down.
+
+### 32.5 Typed install request
+`install_artifact_pinned` takes 14 positional arguments, among them five optional hash strings and
+a `source: &str` that decides provenance. A swapped pair compiles; a malformed digest can read as
+"no hash".
+- **`InstallRequest { instance, target, source: InstallSource, hashes: ExpectedHashes, policy }`.**
+  `InstallSource` is an enum (registry entry, Modrinth version, CurseForge file, direct URL, local
+  file, pack entry), and provenance comes from the variant. The string stored in the manifest is
+  derived from it, so stored data does not change.
+- **Digests are types** (`Sha1`, `Sha256`, `Sha512`, parsed from hex). A malformed digest is an
+  error at the edge, never "none published".
+- **Before renaming the five hash fields,** the slice writes down what each one means in today's
+  code (published by the source, pinned by the registry, required by a pack). The new names say
+  exactly that; a field whose meaning duplicates another is merged, with the reason in the report.
+
+### 32.6 Thin adapters: split the two big files
+`crates/agora/src/main.rs` (17k lines) and `desktop/src-tauri/src/commands.rs` (8.4k lines).
+- **CLI:** one module per top-level command group under `crates/agora/src/cli/`, each holding its
+  clap types and handlers. `main.rs` keeps startup and dispatch only.
+- **Desktop:** one module per feature under `desktop/src-tauri/src/commands/`. Command names do not
+  change.
+- **Proof that only moves happened:** the full `--help` tree is identical before and after (dumped
+  by walking every subcommand), `check_tauri_bindings.py --check` passes unchanged, and all tests
+  pass.
+- **Logic found in the adapters** that belongs in core is listed in the report and moved in a
+  separate commit, one item at a time, each with a test in core.
+- **Guard:** no file in either adapter grows past 2,000 lines.
+
+### 32.7 One instance model
+Core has two instance tables (`user_instances` for Minecraft, `game_instances` for the rest), two
+loadout modules and duplicated delete triggers.
+- **One identity table, `instances`:** id, game, name, created, last launched, locked. Each game's
+  own columns move to a detail table keyed by the instance id with `ON DELETE CASCADE`: Minecraft's
+  versions and Java settings to `minecraft_instances`, other games' base description to
+  `game_instance_bases`. Every table that refers to an instance points at `instances`, so deleting
+  an instance is one delete, and the hand-written triggers go away. Foreign keys are already on for
+  every connection (`db.rs:16`).
+- **Core's instance type** carries the identity. Minecraft's detail type moves to
+  `agora-game-minecraft`, so core holds no Minecraft knowledge here (the table itself stays in
+  core's migrations, as it is today).
+- **Loadouts:** one service in core. Each game contributes the sections it records: Minecraft its
+  content set, game instances their plugin lists, INIs, rules and save choice (the `.agora_loadouts`
+  store is already shared).
+- **Snapshots:** the hard-coded Minecraft folder list (`snapshot.rs` `TRACKED_ENTRIES`) becomes
+  something Minecraft declares, the same way game definitions declare their folders (the Wave 1
+  recovery slice adds the game-instance side).
+- **Migration:** existing rows are copied into the new tables in one transaction, behind the
+  safety net. Tests open a database written by the old schema, with instances of both kinds, then
+  delete one and see every dependent row go.
+- **Different from the review:** none here; this is its recommendation.
+
+### 32.8 One content store
+Mod files live in `content/objects` (SHA-256 named, with its own garbage collection), and snapshots
+keep a second store, `snapshot-objects`, that re-reads every manifest to decide what to delete.
+- **One object store:** `content/objects`, with a reference index in the database
+  (`content_refs`: object, owner kind, owner id, path). Placing, snapshotting and restoring add or
+  remove references.
+- **Garbage collection** deletes only objects with no references, under the store lock, after a
+  grace period. If the index cannot be read, nothing is deleted.
+- **Migration:** snapshot objects are moved (not copied, to save disk) into the main store,
+  re-hashing each one; any object whose content does not match its name is kept in place and
+  reported. The migration can be resumed: each object is moved, then referenced, so a crash halfway
+  through just continues on the next run.
+- **Different from the review:** it named three stores. The third, `plugins/blobs`, is not
+  content-addressed: it is a per-plugin key-value store with a quota (§30.13), where a key's bytes
+  change in place. Folding it into an object store would add references and garbage collection to
+  something that needs neither, so it stays as it is.
+- **Tests:** removing a mod while a snapshot still holds it keeps the object; deleting the last
+  snapshot frees it; with an unreadable index, nothing is deleted.
+
+### 32.9 `Ctx` owns process state and database access
+Configuration lives in process-wide statics beside `Ctx`: the network gate slot, the proxy, the
+program name, and the GitHub client, semaphore and cooldown. Code opens the local database in 229
+places, and the network gate opens a connection for every HTTP request to read settings.
+- **Statics:**
+  - Configuration moves into `Ctx`: `ctx.net` holds the gate, proxy and HTTP clients; the program
+    name moves too.
+  - Statics that guard a resource shared by the whole process stay: token refresh, temp-name
+    counters, the base-rename lock.
+  - Test-only hooks (pause points, call counters) are compiled only for tests.
+  - Guard: any new `static` outside an allowlist fails the architecture check.
+- **Database:** `ctx.db` is the one way in. `ctx.db.open()` applies the pragmas that
+  `local_state_connection` applies today, and settings are read through the Wave 1 settings
+  registry, cached in `Ctx` and refreshed on write. The network gate stops opening a connection per
+  request.
+- **Different from the review:** it suggested one shared connection. With async code, one
+  connection behind a lock makes every database call wait on every other, and it deadlocks when a
+  lock is held across an `await`. SQLite in WAL mode handles many short connections well, so opening
+  stays per use, through one function. A pool is added only if a measurement shows opening is
+  costly.
+
+### 32.10 Typed errors where code branches on them
+Today there are 1,156 `LauncherError::Generic { code, message }` constructions, 319 functions that
+return `Result<_, String>`, and callers that compare code strings (e.g. the plugin dispatcher deciding whether a failure was the network gate, `plugins/dispatch.rs`).
+- **What reaches the user does not change:** the desktop and CLI receive `{code, message,
+  suggested_action}` as today, and the UI matches on code strings in about 27 places, so codes are a stable
+  contract. A test lists every code the UI and CLI match on and checks that each one still exists.
+- **Typed errors per area,** using `thiserror`: install, instance, guard and locks, network,
+  registry, plugins, games. Each converts into `LauncherError` with its stable code. Any caller
+  that branches on a failure matches the typed variant, never a string.
+- **The rest stay as they are:** a `Generic` that is only shown to the user and never branched on
+  is converted when its area is next touched, not in a blanket sweep. Guard: the architecture check
+  counts `Generic {` and `Result<_, String>` per crate; the counts may only go down, and D1 brings
+  every count down by converting every site a caller branches on.
+- **Different from the review:** it suggested replacing every `Generic`. Converting about 1,100
+  shown-only errors would change no behaviour, touch nearly every file, and collide with all
+  parallel work. The value is in the places where code decides something from an error. Those are
+  all converted, and the counts keep the rest shrinking.
+
+### 32.11 Operations and crash journals
+`OperationManager` (955 lines) tracks running work in memory. Several features keep their own
+crash journal on disk.
+- **The operation manager stays the in-memory list of running work,** with cancel and progress
+  for the UI. APIs nothing calls are removed.
+- **One startup recovery registry:** every feature with a journal (staged apply, tool swaps, trash,
+  user files, plugin installs, launcher import jobs, content conversion) registers a recovery
+  function. It runs once at startup in a fixed order and reports what it did in one list, which
+  the desktop and `agora doctor` show. Journals that are already on disk and tested keep their
+  formats.
+- **Different from the review:** it suggested making the operation manager the one persisted
+  journal. These journals record different things (a file swap, a trash move, an import job), and
+  their recovery is already written and tested. Rewriting them all into one format risks the code
+  that protects players' files, for little gain. What players actually need is that every
+  recovery runs and is reported, and the registry gives them that.
+
+### 32.12 Done means
+- Every guard in this section is in `scripts/check_architecture.py` and passes.
+- Full gates on Windows and Linux; CI green; the `--help` tree and Tauri bindings unchanged except
+  where a slice says why.
+- **Migration tests:** the instance model, the content store and the settings each open data
+  written by the previous code.
+- **Crash tests:** staged apply (each step) and the content-store migration (halfway).
+- `docs/architecture/layer-ownership.md` and `docs/DEVELOPMENT.md` name the one way for each job.
