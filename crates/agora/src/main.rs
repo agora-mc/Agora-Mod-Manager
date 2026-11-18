@@ -4725,13 +4725,23 @@ async fn run_snapshots_command(
                     .map(|s| {
                         vec![
                             s.id.clone(),
-                            s.label.clone().unwrap_or_default(),
+                            s.label.clone().unwrap_or_else(|| {
+                                if s.is_unreadable() {
+                                    "unreadable".to_string()
+                                } else {
+                                    String::new()
+                                }
+                            }),
                             s.created_at.clone(),
                             s.file_count.to_string(),
+                            s.unreadable.clone().unwrap_or_default(),
                         ]
                     })
                     .collect();
-                print_table(&["ID", "Label", "Created", "Files"], &rows);
+                print_table(
+                    &["ID", "Label", "Created", "Files", "Unreadable because"],
+                    &rows,
+                );
             }
         }
         SnapshotsCmd::Create { instance, label } => {

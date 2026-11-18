@@ -2683,13 +2683,13 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                       {snap.unreadable && (
                         <span className="rounded-full bg-destructive/10 px-2 py-0.5 text-xs text-destructive" title={snap.unreadable}>Unreadable</span>
                       )}
-                      {snap.effective_origin === 'automatic' && (
+                      {!snap.unreadable && snap.effective_origin === 'automatic' && (
                         <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground" title="Taken by Agora before a change; only the last 5 are kept">Automatic</span>
                       )}
-                      {snap.effective_origin === 'lock' && (
+                      {!snap.unreadable && snap.effective_origin === 'lock' && (
                         <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-xs text-amber-700 dark:text-amber-300" title="Taken when the instance was locked. Revert returns to it until the next lock replaces it.">Lock</span>
                       )}
-                      {snap.effective_origin === 'migration' && (
+                      {!snap.unreadable && snap.effective_origin === 'migration' && (
                         <span className="rounded-full bg-sky-500/10 px-2 py-0.5 text-xs text-sky-700 dark:text-sky-300" title="Recovery point from a version move; kept">Migration</span>
                       )}
                       {snap.is_current_lkg && (
