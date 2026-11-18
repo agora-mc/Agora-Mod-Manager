@@ -1640,6 +1640,7 @@ async fn a_dependency_that_runs_code_installs_with_its_code_off_when_not_allowed
                 Consent {
                     capabilities: true,
                     scripts: false,
+                    previewed_digest: None,
                 },
                 &world.fetcher,
             )
@@ -2762,6 +2763,7 @@ async fn a_differently_signed_update_is_flagged_and_asks_about_its_code_again() 
             Consent {
                 capabilities: false,
                 scripts: false,
+                previewed_digest: None,
             },
         )
         .expect_err("a different publisher needs an explicit yes");
@@ -2776,6 +2778,7 @@ async fn a_differently_signed_update_is_flagged_and_asks_about_its_code_again() 
             Consent {
                 capabilities: true,
                 scripts: false,
+                previewed_digest: None,
             },
         )
         .unwrap();
@@ -3028,6 +3031,7 @@ async fn an_update_that_changes_only_an_imported_module_asks_again() {
             Consent {
                 capabilities: true,
                 scripts: false,
+                previewed_digest: None,
             },
         )
         .unwrap();
@@ -3057,6 +3061,7 @@ async fn an_update_that_changes_only_an_imported_module_asks_again() {
             Consent {
                 capabilities: true,
                 scripts: false,
+                previewed_digest: None,
             },
         )
         .unwrap();
@@ -3102,6 +3107,7 @@ async fn an_update_that_changes_only_a_data_file_is_new_code_too() {
             Consent {
                 capabilities: true,
                 scripts: false,
+                previewed_digest: None,
             },
         )
         .unwrap();
@@ -3135,6 +3141,7 @@ async fn an_official_update_that_adds_a_script_asks_again_with_no_new_capability
             Consent {
                 capabilities: true,
                 scripts: false,
+                previewed_digest: None,
             },
             &world.fetcher,
         )
@@ -3240,4 +3247,100 @@ fn a_package_with_duplicate_entries_hashes_what_it_extracts() {
         std::fs::read_to_string(destination.join("main.js")).unwrap(),
         String::from_utf8_lossy(last)
     );
+}
+
+/// The answer the user gives is for the package the preview showed. Installing
+/// different bytes under that answer must be refused, not silently grant what
+/// the replacement asks for.
+#[test]
+fn consent_is_bound_to_the_previewed_package_digest() {
+    let world = World::new();
+    let previewed = script_zip_with_files(
+        "acme.preview",
+        "1.0.0",
+        &[("util.js", "export const n = 1;\n")],
+    );
+    let changed = script_zip_with_files(
+        "acme.preview",
+        "1.0.0",
+        &[("util.js", "export const n = 2;\n")],
+    );
+    let preview = world.service.preview_package_bytes(&previewed).unwrap();
+    assert_eq!(
+        preview.package_digest.len(),
+        64,
+        "a SHA-256, lower-case hex"
+    );
+
+    let consent = Consent {
+        capabilities: true,
+        scripts: true,
+        previewed_digest: Some(preview.package_digest.clone()),
+    };
+    let error = world
+        .service
+        .install_package_bytes(&changed, consent.clone())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("changed since you approved it"),
+        "{error}"
+    );
+    assert!(world.service.list().is_empty(), "nothing may be installed");
+
+    world
+        .service
+        .install_package_bytes(&previewed, consent)
+        .unwrap();
+    assert_eq!(world.service.list().len(), 1);
+}
+
+/// The development-folder half of the same rule: an author's answer covers the
+/// manifest and files they previewed, not an edit made before the install.
+#[test]
+fn consent_is_bound_to_the_previewed_folder_digest() {
+    let world = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("dev");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(
+        folder.join("agora-plugin.json"),
+        r#"{
+            "manifest": 1,
+            "id": "acme.devpreview",
+            "name": "Dev preview",
+            "version": "1.0.0",
+            "license": "GPL-3.0-only",
+            "apiRange": ">=0.1, <0.2",
+            "entrypoint": "main.js",
+            "capabilities": { "required": ["instance:read"] }
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        folder.join("main.js"),
+        b"export function noop() { return 1; }\n",
+    )
+    .unwrap();
+
+    let preview = world.service.preview_folder(&folder).unwrap();
+    std::fs::write(
+        folder.join("main.js"),
+        b"export function noop() { return 2; }\n",
+    )
+    .unwrap();
+
+    let consent = Consent {
+        capabilities: true,
+        scripts: true,
+        previewed_digest: Some(preview.package_digest),
+    };
+    let error = world
+        .service
+        .add_development_folder(&folder, consent)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("changed since you approved it"),
+        "{error}"
+    );
+    assert!(world.service.list().is_empty(), "nothing may be registered");
 }

@@ -105,6 +105,7 @@ pub async fn run(service: &PluginService, action: OfficialCmd, json: bool) -> an
             let consent = agora_core::plugins::Consent {
                 capabilities: yes,
                 scripts: yes && !no_code,
+                previewed_digest: None,
             };
             let outcome = service
                 .install_official(plugin_id.as_str(), consent, &service.http_fetcher())

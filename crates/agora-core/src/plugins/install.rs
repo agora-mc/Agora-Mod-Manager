@@ -215,6 +215,14 @@ pub struct InstallPreview {
     /// package is never marked here.
     #[serde(default)]
     pub official: bool,
+    /// Identifies the bytes this preview described: SHA-256 of the package, or
+    /// of the folder's manifest and files for a development folder.
+    ///
+    /// The install prompt passes it back, and the installer refuses a package
+    /// that no longer matches, so a yes given for one package cannot be used
+    /// for a different one that replaced it between preview and install.
+    #[serde(default)]
+    pub package_digest: String,
 }
 
 impl InstallPreview {
@@ -524,6 +532,7 @@ pub fn preview_package_bytes(
         existing,
         contents.file_count,
         contents.uncompressed_bytes,
+        package_digest(bytes),
     ))
 }
 
@@ -534,10 +543,19 @@ pub fn preview_folder(
 ) -> LauncherResult<InstallPreview> {
     let manifest = read_folder_manifest(folder)?;
     let code_digest = script_digest(&manifest, folder)?;
+    let digest = folder_digest(folder)?;
     // A development folder is never enrolled for updates: the author is the
     // one editing it, and an update that overwrote their working copy would be
     // the opposite of helpful.
-    Ok(build_preview(manifest, None, code_digest, existing, 0, 0))
+    Ok(build_preview(
+        manifest,
+        None,
+        code_digest,
+        existing,
+        0,
+        0,
+        digest,
+    ))
 }
 
 fn build_preview(
@@ -547,6 +565,7 @@ fn build_preview(
     existing: Option<&ExistingInstall<'_>>,
     file_count: usize,
     uncompressed_bytes: u64,
+    package_digest: String,
 ) -> InstallPreview {
     let (required, optional, unsupported) = describe(&manifest.capabilities);
     let runs_code = !manifest.is_declarative_only();
@@ -583,6 +602,7 @@ fn build_preview(
         manifest,
         also_installs: Vec::new(),
         official: false,
+        package_digest,
     }
 }
 
@@ -947,6 +967,42 @@ fn finish_script_digest(files: &std::collections::BTreeMap<String, String>) -> S
     hex::encode(hasher.finalize())
 }
 
+/// SHA-256 of a package's bytes, as the preview read them.
+///
+/// Consent names the package it was given for. The installer hashes the bytes
+/// it is about to unpack and refuses when it is not the previewed package, so
+/// a file swapped between the prompt and the install cannot ride on the old
+/// answer.
+pub fn package_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// The folder counterpart of [`package_digest`]: the manifest plus every file
+/// the loader could read, by relative path and content.
+///
+/// A development folder is edited in place. The author's answer covers the
+/// manifest and files they previewed, not whatever the folder holds when the
+/// install runs.
+pub fn folder_digest(folder: &Path) -> LauncherResult<String> {
+    use sha2::{Digest, Sha256};
+    let manifest = std::fs::read(folder.join(MANIFEST_FILENAME)).map_err(|e| {
+        io_error(format!(
+            "could not read {MANIFEST_FILENAME} in {}: {e}",
+            folder.display()
+        ))
+    })?;
+    let mut files = std::collections::BTreeMap::new();
+    let mut entries = 0usize;
+    let mut total = 0u64;
+    collect_script_files(folder, folder, &mut files, &mut entries, &mut total)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&manifest);
+    hasher.update([0]);
+    hasher.update(finish_script_digest(&files).as_bytes());
+    Ok(hex::encode(hasher.finalize()))
+}
+
 /// Resolve which capabilities a fresh install should be granted.
 pub fn grant_for(manifest: &PluginManifest) -> LauncherResult<CapabilitySet> {
     CapabilitySet::resolve(&manifest.capabilities).map_err(|e| LauncherError::Generic {
@@ -1230,7 +1286,7 @@ mod tests {
     #[test]
     fn a_first_install_is_not_a_data_migration() {
         let manifest: PluginManifest = serde_json::from_str(&manifest_json("acme.one")).unwrap();
-        let preview = build_preview(manifest, None, None, None, 2, 100);
+        let preview = build_preview(manifest, None, None, None, 2, 100, String::new());
         assert!(!preview.migrates_data);
         assert!(preview.replaces_version.is_none());
     }
@@ -1258,6 +1314,7 @@ mod tests {
             }),
             2,
             100,
+            String::new(),
         );
         assert!(preview.migrates_data);
         assert_eq!(preview.replaces_version.as_deref(), Some("1.0.0"));
@@ -1295,7 +1352,7 @@ mod tests {
             "capabilities": { "required": ["instance:read"] }
         }))
         .unwrap();
-        let preview = build_preview(same, None, None, Some(&existing), 2, 100);
+        let preview = build_preview(same, None, None, Some(&existing), 2, 100, String::new());
         assert!(
             !preview.requires_capability_consent(),
             "re-granting what is already granted is not a new decision"
@@ -1312,7 +1369,7 @@ mod tests {
             "capabilities": { "required": ["instance:read", "content:write"] }
         }))
         .unwrap();
-        let preview = build_preview(wider, None, None, Some(&existing), 2, 100);
+        let preview = build_preview(wider, None, None, Some(&existing), 2, 100, String::new());
         assert_eq!(
             preview.added_capabilities,
             vec!["content:write".to_string()]
@@ -1335,7 +1392,7 @@ mod tests {
             "capabilities": { "required": ["instance:read"], "optional": ["content:read"] }
         }))
         .unwrap();
-        let preview = build_preview(manifest, None, None, None, 2, 100);
+        let preview = build_preview(manifest, None, None, None, 2, 100, String::new());
         assert_eq!(
             preview.added_capabilities,
             vec!["instance:read".to_string(), "content:read".to_string()]

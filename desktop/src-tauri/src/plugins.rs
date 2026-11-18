@@ -138,10 +138,15 @@ pub async fn set_plugin_scripts_allowed(
 /// The answers the install prompt collected. `allow_scripts` is the separate
 /// "<name> runs code. Allow it?" choice; when the page does not send it, the
 /// answer to the permission prompt stands for both.
-fn consent(accept_capabilities: bool, allow_scripts: Option<bool>) -> Consent {
+fn consent(
+    accept_capabilities: bool,
+    allow_scripts: Option<bool>,
+    previewed_digest: Option<String>,
+) -> Consent {
     Consent {
         capabilities: accept_capabilities,
         scripts: allow_scripts.unwrap_or(accept_capabilities),
+        previewed_digest,
     }
 }
 
@@ -234,17 +239,19 @@ pub async fn preview_plugin_folder(app: AppHandle, path: String) -> LauncherResu
 }
 
 /// Install a package. `accept_capabilities` is the user's answer to the
-/// prompt the preview produced; without it the core service refuses.
+/// prompt the preview produced; `package_digest` is the digest of the preview
+/// itself, so core can refuse bytes that changed after the prompt.
 #[tauri::command]
 pub async fn install_plugin_package(
     app: AppHandle,
     path: String,
     accept_capabilities: bool,
     allow_scripts: Option<bool>,
+    package_digest: Option<String>,
 ) -> LauncherResult<PluginSummary> {
     service(&app)?.install_package(
         &PathBuf::from(path),
-        consent(accept_capabilities, allow_scripts),
+        consent(accept_capabilities, allow_scripts, package_digest),
     )
 }
 
@@ -266,7 +273,7 @@ pub async fn plugin_apply_update(
     service(&app)?
         .apply_update(
             &parse_id(&plugin_id)?,
-            consent(accept_capabilities, allow_scripts),
+            consent(accept_capabilities, allow_scripts, None),
         )
         .await
 }
@@ -293,7 +300,7 @@ pub async fn install_official_plugin(
     service
         .install_official(
             &plugin_id,
-            consent(accept_capabilities, allow_scripts),
+            consent(accept_capabilities, allow_scripts, None),
             &service.http_fetcher(),
         )
         .await
@@ -331,10 +338,11 @@ pub async fn add_plugin_development_folder(
     path: String,
     accept_capabilities: bool,
     allow_scripts: Option<bool>,
+    package_digest: Option<String>,
 ) -> LauncherResult<PluginSummary> {
     service(&app)?.add_development_folder(
         &PathBuf::from(path),
-        consent(accept_capabilities, allow_scripts),
+        consent(accept_capabilities, allow_scripts, package_digest),
     )
 }
 

@@ -88,6 +88,7 @@ function preview(over: Partial<InstallPreview>): InstallPreview {
     migratesData: false,
     fileCount: 2,
     uncompressedBytes: 10,
+    packageDigest: 'digest-1',
     ...over,
   } as unknown as InstallPreview;
 }
@@ -150,7 +151,7 @@ describe('the install prompt for a plugin with code', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Install without running code' }));
 
     await waitFor(() =>
-      expect(mocks.install).toHaveBeenCalledWith('C:/plugin.zip', true, false),
+      expect(mocks.install).toHaveBeenCalledWith('C:/plugin.zip', true, false, 'digest-1'),
     );
   });
 
@@ -158,7 +159,7 @@ describe('the install prompt for a plugin with code', () => {
     await openPrompt(true);
     fireEvent.click(await screen.findByRole('button', { name: 'Install and allow code' }));
     await waitFor(() =>
-      expect(mocks.install).toHaveBeenCalledWith('C:/plugin.zip', true, true),
+      expect(mocks.install).toHaveBeenCalledWith('C:/plugin.zip', true, true, 'digest-1'),
     );
   });
 

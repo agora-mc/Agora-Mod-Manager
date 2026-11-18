@@ -2590,17 +2590,33 @@ fn has_native_path(arguments: &[String]) -> bool {
         .any(|argument| argument.starts_with("-Djava.library.path="))
 }
 
+/// Split a launch-argument string into arguments.
+///
+/// Quoting follows the Windows command-line model that launchers write
+/// (`CommandLineToArgvW`): whitespace separates, double quotes group, and a
+/// quote may open mid-argument (`-javaagent:"C:\Tools\agent.jar"`). Single
+/// quotes group too, for launchers on other platforms.
+///
+/// Backslashes are path characters, not escapes. `CommandLineToArgvW` gives
+/// them special meaning only immediately before a quote; doing that here broke
+/// every Windows path, turning a UNC prefix (`\\server\share`) into
+/// `\server\share` and making a quoted path that ends in `\` look like an
+/// escaped closing quote. Outside a quoted group a backslash still makes a
+/// following quote literal, so `-Dfoo=\"bar\"` keeps its old meaning; inside a
+/// group every backslash is literal and the matching quote closes normally.
 pub fn parse_argument_string(value: &str) -> LauncherResult<Vec<String>> {
     let mut arguments = Vec::new();
     let mut current = String::new();
     let mut quote = None;
     let mut characters = value.chars().peekable();
     while let Some(character) = characters.next() {
-        if character == '\\' {
-            let escapable = characters
+        // Outside a quoted group only a quote can be escaped. Backslashes are
+        // never escapes of themselves: `\\` is two path characters, not one.
+        if character == '\\' && quote.is_none() {
+            if characters
                 .peek()
-                .is_some_and(|next| Some(*next) == quote || *next == '\\');
-            if escapable {
+                .is_some_and(|next| matches!(*next, '\'' | '"'))
+            {
                 current.push(characters.next().expect("peeked character"));
             } else {
                 current.push(character);
