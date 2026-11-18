@@ -412,3 +412,26 @@ fn the_launch_locked_path_does_not_retake_the_instance_lock() {
         .unwrap();
     agora_core::game_deploy::set_deployment_locked(&h.ctx, &guard, None).unwrap();
 }
+
+/// Switching the folder a running game saves into is what the guard is for. The choice is
+/// refused under a live session and allowed only with the explicit override.
+#[test]
+fn a_save_choice_is_refused_by_a_live_session_unless_overridden() {
+    let h = Harness::new();
+    let def = skyrim();
+    h.make_instance("live");
+    h.open_view_session("live");
+
+    let refused = agora_core::game_saves::set_choice_while_running(
+        &h.ctx,
+        "live",
+        &def,
+        SavesChoice::Own,
+        false,
+    )
+    .expect_err("a live session must refuse the save choice");
+    assert!(refused.to_string().contains("running"), "{refused}");
+
+    agora_core::game_saves::set_choice_while_running(&h.ctx, "live", &def, SavesChoice::Own, true)
+        .expect("the override must allow the save choice");
+}

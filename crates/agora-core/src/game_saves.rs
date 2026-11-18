@@ -22,6 +22,7 @@ use crate::game_deploy::write_instance_manifest_atomic;
 use crate::game_ini::{self, IniError, IniSource};
 use crate::game_instance::{self, GameInstanceManifest, InstanceError, SavesChoice};
 use crate::game_user_files::resolve_user_file_source;
+use crate::instance_runtime::InstanceGuard;
 
 const STATE_FILE: &str = "saves_state.json";
 /// The longest plain instance id used as a folder name as it is. Longer ids are shortened and
@@ -358,8 +359,27 @@ pub fn set_choice(
     definition: &GameDefinition,
     choice: SavesChoice,
 ) -> Result<SavesChange, SavesError> {
+    set_choice_while_running(ctx, instance_id, definition, choice, false)
+}
+
+/// [`set_choice`], with the user's explicit answer to a running game.
+pub fn set_choice_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    choice: SavesChoice,
+    allow_while_running: bool,
+) -> Result<SavesChange, SavesError> {
     let scope = manifest_of(ctx, instance_id)?.save_scope;
-    set_choice_inner(ctx, instance_id, definition, choice, true, scope.as_deref())
+    set_choice_with(
+        ctx,
+        instance_id,
+        definition,
+        choice,
+        true,
+        scope.as_deref(),
+        allow_while_running,
+    )
 }
 
 /// [`set_choice`]; with `create_folder` false it does not make the instance's own save folder. That
@@ -373,11 +393,31 @@ pub(crate) fn set_choice_inner(
     create_folder: bool,
     scope: Option<&str>,
 ) -> Result<SavesChange, SavesError> {
-    let store = game_ini::store_of(ctx, instance_id)?;
-    let _locks = game_ini::lock_for_edit(ctx, instance_id, definition, &store)?;
-    set_choice_locked(
+    set_choice_with(
         ctx,
         instance_id,
+        definition,
+        choice,
+        create_folder,
+        scope,
+        false,
+    )
+}
+
+fn set_choice_with(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    choice: SavesChoice,
+    create_folder: bool,
+    scope: Option<&str>,
+    allow_while_running: bool,
+) -> Result<SavesChange, SavesError> {
+    let store = game_ini::store_of(ctx, instance_id)?;
+    let guard = game_ini::guard_for_ini(ctx, instance_id, definition, &store, allow_while_running)?;
+    set_choice_locked(
+        ctx,
+        &guard,
         definition,
         &store,
         choice,
@@ -386,17 +426,18 @@ pub(crate) fn set_choice_inner(
     )
 }
 
-/// [`set_choice_inner`] for a caller that already holds the instance and user-files locks taken by
-/// [`game_ini::lock_for_edit`] (a loadout apply holds the instance lock for the whole change).
+/// [`set_choice_inner`] for a caller that already holds the instance guard (a loadout apply
+/// holds it for the whole change).
 pub(crate) fn set_choice_locked(
     ctx: &Ctx,
-    instance_id: &str,
+    guard: &InstanceGuard,
     definition: &GameDefinition,
     store: &StoreId,
     choice: SavesChoice,
     create_folder: bool,
     scope: Option<&str>,
 ) -> Result<SavesChange, SavesError> {
+    let instance_id = guard.instance_id();
     let manifest = manifest_of(ctx, instance_id)?;
     let rule = no_rule_is_an_error(definition, store)?.clone();
     let state_file = state_path(ctx, instance_id)?;
@@ -405,9 +446,9 @@ pub(crate) fn set_choice_locked(
 
     let setting = match choice {
         SavesChoice::Own => {
-            let (before, changed) = game_ini::edit_locked(
+            let (before, changed) = game_ini::edit_with_guard(
                 ctx,
-                instance_id,
+                guard,
                 definition,
                 store,
                 rule.ini.as_str(),
@@ -456,13 +497,8 @@ pub(crate) fn set_choice_locked(
         SavesChoice::Shared => match recorded {
             None => SettingChange::NothingRecorded,
             Some(state) => {
-                let change = game_ini::edit_locked(
-                    ctx,
-                    instance_id,
-                    definition,
-                    store,
-                    &state.ini,
-                    |doc| {
+                let change =
+                    game_ini::edit_with_guard(ctx, guard, definition, store, &state.ini, |doc| {
                         let now = doc.get(&state.section, &state.key);
                         if now.as_deref() != Some(state.set_to.as_str()) {
                             return Ok((SettingChange::LeftAlone { now }, false));
@@ -482,8 +518,7 @@ pub(crate) fn set_choice_locked(
                                 Ok((SettingChange::Removed, changed))
                             }
                         }
-                    },
-                )?;
+                    })?;
                 // The record is spent either way: a later `own` records afresh.
                 if state_file.exists() {
                     std::fs::remove_file(&state_file).map_err(|source| SavesError::Write {

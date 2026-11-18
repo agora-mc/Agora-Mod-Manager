@@ -761,7 +761,7 @@ fn guard_for(
 
 /// A refused guard for an INI edit, translated back to the INI-specific answer when the
 /// user-files journal can say which it is: a live session, or one that must be restored.
-fn guard_for_ini(
+pub(crate) fn guard_for_ini(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
@@ -793,43 +793,35 @@ fn user_files_lock_for_edit(
     )?)
 }
 
-/// The two locks an edit holds: the instance's, and the game's per-user files for the store, the
-/// lock a launch's swap takes. An edit takes the instance's first, as deployment does.
-pub(crate) fn lock_for_edit(
-    ctx: &Ctx,
-    instance_id: &str,
-    definition: &GameDefinition,
-    store: &StoreId,
-) -> Result<(LockGuard, LockGuard), IniError> {
-    let instance = ctx
-        .lock_manager
-        .acquire(LockResource::Instance(instance_id.to_string()), "ini-edit")?;
-    let user_files = ctx.lock_manager.acquire(
-        LockResource::GameUserFiles(definition.id.clone(), store.clone()),
-        "ini-edit",
-    )?;
-    Ok((instance, user_files))
-}
-
 /// Edit the instance's copy of `file` with `f`, which returns its own result and whether it changed
 /// the document. The copy is written only when the document changed.
 ///
-/// The caller holds the locks from [`lock_for_edit`]. Refused while the game's session is running,
+/// The caller holds the instance guard and the user-files lock. Refused while the game's session is running,
 /// and while an earlier session's swap has not been put back: either way the game's file is not the
 /// instance's to read or write. A copy that does not exist yet is seeded from the game's file, and
 /// that file must exist or the copy starts empty.
-pub(crate) fn edit_locked<T>(
+/// [`edit_locked`] for a caller that holds the instance guard. The guard's explicit
+/// override also skips the running-session check.
+pub(crate) fn edit_with_guard<T>(
     ctx: &Ctx,
-    instance_id: &str,
+    guard: &InstanceGuard,
     definition: &GameDefinition,
     store: &StoreId,
     file: &str,
     f: impl FnOnce(&mut IniDocument) -> Result<(T, bool), IniError>,
 ) -> Result<T, IniError> {
-    edit_locked_with_session_check(ctx, instance_id, definition, store, file, true, f)
+    edit_locked_with_session_check(
+        ctx,
+        guard.instance_id(),
+        definition,
+        store,
+        file,
+        !guard.allows_running(),
+        f,
+    )
 }
 
-/// [`edit_locked`] with the running-session check optional. The guard's explicit
+/// [`edit_with_guard`] with the running-session check optional. The guard's explicit
 /// override skips that check, but the instance lock is still held.
 fn edit_locked_with_session_check<T>(
     ctx: &Ctx,

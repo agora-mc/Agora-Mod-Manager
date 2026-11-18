@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ctx::Ctx;
 use crate::game_instance::{self, SavesChoice};
+use crate::instance_runtime::InstanceGuard;
 use crate::loadout::{
     self, LoadoutApplyError, LoadoutChange, LoadoutChangeKind, LoadoutProfile, LoadoutUpdate,
 };
@@ -452,23 +453,6 @@ fn diff(old: &GameLoadout, new: &GameLoadout) -> Vec<LoadoutChange> {
     changes
 }
 
-/// Whether the instance's game is running, so an apply must be refused. The one activity check
-/// sees an open session with no journaled files and a Linux view session, and an unreadable store
-/// is an error, never "not running".
-fn game_is_running(
-    ctx: &Ctx,
-    instance_id: &str,
-    _definition: &GameDefinition,
-) -> Result<bool, String> {
-    match crate::instance_runtime::game_activity(ctx, instance_id) {
-        crate::instance_runtime::GameActivity::Idle => Ok(false),
-        crate::instance_runtime::GameActivity::Running => Ok(true),
-        crate::instance_runtime::GameActivity::CouldNotTell(reason) => Err(format!(
-            "could not tell whether '{instance_id}' is running: {reason}"
-        )),
-    }
-}
-
 /// Apply a game-instance profile: record the undo point, then restore every
 /// section the profile holds. Refused while the game runs. `unlisted` is not
 /// used for content: a game profile records every content layer, and a layer it
@@ -487,21 +471,12 @@ pub fn apply_game_profile_with_undo(
         LoadoutApplyError::Profile(format!("'{profile_name}' is not a game-instance loadout"))
     })?;
 
-    let _lock = ctx
-        .lock_manager
-        .acquire(
-            LockResource::Instance(instance_id.to_string()),
-            "apply_game_loadout",
-        )
-        .map_err(|e| LoadoutApplyError::Profile(e.to_string()))?;
-
-    if !allow_while_running
-        && game_is_running(ctx, instance_id, definition).map_err(LoadoutApplyError::Profile)?
-    {
-        return Err(LoadoutApplyError::Profile(format!(
-            "'{instance_id}' is running; close the game before applying a loadout"
-        )));
+    let guard = if allow_while_running {
+        InstanceGuard::for_mutation_while_running(ctx, instance_id, "apply_game_loadout")
+    } else {
+        InstanceGuard::for_mutation(ctx, instance_id, "apply_game_loadout")
     }
+    .map_err(|error| LoadoutApplyError::Profile(error.to_string()))?;
 
     let undo = capture(ctx, instance_id, definition).map_err(LoadoutApplyError::UndoPoint)?;
     let undo = GameUndo {
@@ -512,9 +487,9 @@ pub fn apply_game_profile_with_undo(
         .map_err(|e| LoadoutApplyError::UndoPoint(e.to_string()))?;
     write_atomic(&undo_path(&dir), &bytes).map_err(LoadoutApplyError::UndoPoint)?;
 
-    if let Err(error) = apply_state(ctx, instance_id, definition, &state) {
-        let rollback =
-            apply_state(ctx, instance_id, definition, &undo.state).map_err(|e| e.to_string());
+    if let Err(error) = apply_state(ctx, &guard, instance_id, definition, &state) {
+        let rollback = apply_state(ctx, &guard, instance_id, definition, &undo.state)
+            .map_err(|e| e.to_string());
         return Err(LoadoutApplyError::Apply { error, rollback });
     }
     Ok(())
@@ -535,13 +510,14 @@ pub fn undo_game_apply(
         .map_err(|e| format!("No loadout apply to undo for '{instance_id}': {e}"))?;
     let undo: GameUndo =
         serde_json::from_slice(&bytes).map_err(|e| format!("Invalid undo point: {e}"))?;
-    apply_state(ctx, instance_id, definition, &undo.state)?;
+    apply_state(ctx, &_guard, instance_id, definition, &undo.state)?;
     fs::remove_file(undo_path(&dir)).map_err(|e| format!("Cannot clear the undo point: {e}"))?;
     Ok(undo.profile)
 }
 
 fn apply_state(
     ctx: &Ctx,
+    guard: &InstanceGuard,
     instance_id: &str,
     definition: &GameDefinition,
     state: &GameLoadout,
@@ -628,7 +604,7 @@ fn apply_state(
         };
         crate::game_saves::set_choice_locked(
             ctx,
-            instance_id,
+            guard,
             definition,
             &store,
             state.saves,
