@@ -236,6 +236,27 @@ pub struct LaunchResult {
     pub offline_notice: Option<String>,
 }
 
+/// The identity a direct launch uses when Microsoft cannot be reached.
+///
+/// The game's version JSON substitutes `--username ${auth_player_name}`,
+/// `--uuid ${auth_uuid}`, `--accessToken ${auth_access_token}` and
+/// `--userType ${user_type}` (see `launch_planner::substitute`). A local session
+/// needs the stored name and UUID -- the UUID also keys the client's cached
+/// skin -- and the token is a non-secret placeholder. `legacy` is the same type
+/// the delegated path already uses for an account Agora does not own. Online
+/// servers reject this session, which the note says.
+fn offline_launch_identity(credentials: &crate::msa::MsaCredentials) -> LaunchIdentity {
+    LaunchIdentity {
+        username: credentials.username.clone(),
+        access_token: crate::msa::OFFLINE_ACCESS_TOKEN.into(),
+        uuid: credentials.uuid.clone(),
+        user_type: "legacy".into(),
+        client_id: String::new(),
+        xuid: String::new(),
+        user_properties: "{}".into(),
+    }
+}
+
 /// Core-owned launch lifecycle service.
 #[derive(Clone)]
 pub struct LaunchService {
@@ -398,18 +419,7 @@ impl LaunchService {
                     crate::msa::load_credentials()?.ok_or(LauncherError::MsaAuthRequired)?;
                 let note = crate::msa::offline_play_note(&error);
                 progress.offline(&note);
-                (
-                    LaunchIdentity {
-                        username: credentials.username,
-                        access_token: crate::msa::OFFLINE_ACCESS_TOKEN.into(),
-                        uuid: credentials.uuid,
-                        user_type: "legacy".into(),
-                        client_id: String::new(),
-                        xuid: String::new(),
-                        user_properties: "{}".into(),
-                    },
-                    Some(note),
-                )
+                (offline_launch_identity(&credentials), Some(note))
             }
         } else {
             (
@@ -1607,6 +1617,29 @@ mod tests {
     fn rejects_path_traversal_instance_ids() {
         assert!(validate_instance_id("../outside").is_err());
         assert!(validate_instance_id("safe-instance").is_ok());
+    }
+
+    #[test]
+    fn an_offline_launch_uses_the_stored_profile_and_no_real_token() {
+        let creds = crate::msa::MsaCredentials {
+            username: "StoredPlayer".into(),
+            uuid: "1234567890abcdef1234567890abcdef".into(),
+            access_token: "a-real-token-that-must-not-be-used".into(),
+            refresh_token: "a-real-refresh-token".into(),
+            expires: chrono::Utc::now() + chrono::Duration::hours(1),
+            client_id: crate::msa::AGORA_MSA_CLIENT_ID.into(),
+            auth_version: crate::msa::MSA_AUTH_VERSION,
+        };
+
+        let identity = offline_launch_identity(&creds);
+        assert_eq!(identity.username, "StoredPlayer");
+        assert_eq!(identity.uuid, "1234567890abcdef1234567890abcdef");
+        assert_eq!(identity.access_token, crate::msa::OFFLINE_ACCESS_TOKEN);
+        assert_ne!(identity.access_token, creds.access_token);
+        assert_ne!(identity.access_token, creds.refresh_token);
+        assert_eq!(identity.user_type, "legacy");
+        assert!(identity.client_id.is_empty());
+        assert!(identity.xuid.is_empty());
     }
 
     #[tokio::test]
