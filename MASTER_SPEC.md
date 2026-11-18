@@ -3082,9 +3082,9 @@ then preferred that stale entry over the file the failed write had just produced
 **On Windows with the platform-default data root, the DPAPI file is the declared backend.** A
 write goes straight to the file and does not attempt Credential Manager; a successful write then
 deletes any keyring entry for the same service and account. This removes the "old entry shadows a
-new file" state rather than merely reading around it. The same rule covers the GitHub token: it
-fits the keyring, but two credential stores on one platform is the inconsistency that produced
-the bug, so it moves to the DPAPI file too.
+new file" state rather than merely reading around it. On that same platform-default Windows root
+the rule covers the GitHub token too: it fits Credential Manager, but two credential stores on
+one platform is the inconsistency that produced the bug, so it moves to the DPAPI file as well.
 
 **On macOS and Linux the OS keyring remains primary.** A write that the keyring rejects now
 deletes the stale keyring entry after the file is durable. Independently, a read prefers an
