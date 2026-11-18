@@ -528,18 +528,9 @@ pub fn undo_game_apply(
     definition: &GameDefinition,
 ) -> Result<String, String> {
     let dir = instance_dir(ctx, instance_id)?;
-    let _lock = ctx
-        .lock_manager
-        .acquire(
-            LockResource::Instance(instance_id.to_string()),
-            "undo_game_loadout",
-        )
-        .map_err(|e| e.to_string())?;
-    if game_is_running(ctx, instance_id, definition)? {
-        return Err(format!(
-            "'{instance_id}' is running; close the game before undoing a loadout"
-        ));
-    }
+    let _guard =
+        crate::instance_runtime::InstanceGuard::for_mutation(ctx, instance_id, "undo_game_loadout")
+            .map_err(|error| error.to_string())?;
     let bytes = fs::read(undo_path(&dir))
         .map_err(|e| format!("No loadout apply to undo for '{instance_id}': {e}"))?;
     let undo: GameUndo =

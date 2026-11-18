@@ -1034,15 +1034,15 @@ pub fn rename(ctx: &Ctx, id: &str, name: &str) -> Result<(), InstanceError> {
     if name.is_empty() {
         return Err(InstanceError::Other("Give the instance a name.".into()));
     }
-    // The manifest is rewritten whole, so this takes the lock every other writer of it takes: a
-    // deploy or a delete in flight is waited for rather than overwritten.
-    let _lock = ctx
-        .lock_manager
-        .acquire(
-            crate::lock_manager::LockResource::Instance(id.to_string()),
-            "rename",
-        )
-        .map_err(|e| InstanceError::Other(e.to_string()))?;
+    // The manifest is rewritten whole, so this takes the same guard every other writer of it
+    // takes: a deploy or a delete in flight is waited for rather than overwritten, and a game
+    // that is using the instance is refused.
+    let _guard = crate::instance_runtime::InstanceGuard::for_mutation(ctx, id, "rename").map_err(
+        |error| match error.code().as_str() {
+            "ERR_INSTANCE_RUNNING" => InstanceError::Running(id.to_string()),
+            _ => InstanceError::Other(error.to_string()),
+        },
+    )?;
     let db_path = ctx.paths.local_state_db();
     let conn = crate::db::local_state_connection(&db_path)
         .map_err(|e| InstanceError::Other(e.to_string()))?;
