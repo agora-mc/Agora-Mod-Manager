@@ -5,12 +5,15 @@ use crate::java::JavaInstallation;
 use crate::launch::LoaderInfo;
 use crate::launch_planner::{BuildCommandRequest, LaunchIdentity, ResolveRequest};
 use crate::runtime_manager::RuntimeProgress;
+use agora_core::app_paths::AppPaths;
 use agora_core::ctx::Ctx;
 use agora_core::error::{LauncherError, LauncherResult};
+use agora_core::instance_runtime;
 use agora_core::lkg::LaunchOutcome;
+use agora_core::lock_manager::LockResource;
 use agora_core::models::InstanceManifest;
 use agora_core::network::NetworkPolicy;
-use agora_core::process_identity::ProcessIdentity;
+use agora_core::process_identity::{self, ProcessIdentity};
 use agora_core::process_session_manager::ProcessSession;
 use agora_core::task_scheduler::BlockingPriority;
 use std::io::{Read, Seek, SeekFrom};
@@ -249,7 +252,7 @@ impl LaunchService {
     ) -> LauncherResult<LaunchResult> {
         validate_instance_id(&request.instance_id)?;
         let _lock = self.ctx.lock_manager.acquire(
-            agora_core::lock_manager::LockResource::Instance(request.instance_id.clone()),
+            LockResource::Instance(request.instance_id.clone()),
             "launch",
         )?;
         self.launch_locked(request, progress).await
@@ -291,7 +294,7 @@ impl LaunchService {
     ) -> LauncherResult<LaunchResult> {
         validate_instance_id(&request.instance_id)?;
         let _lock = self.ctx.lock_manager.acquire(
-            agora_core::lock_manager::LockResource::Instance(request.instance_id.clone()),
+            LockResource::Instance(request.instance_id.clone()),
             "launch-recovery",
         )?;
         match action {
@@ -716,10 +719,10 @@ impl LaunchService {
 
         progress.phase("materializing", "Materializing verified launch artifacts");
         let materialize_started = Instant::now();
-        let _materialization_lock = self.ctx.lock_manager.acquire(
-            agora_core::lock_manager::LockResource::Materialization,
-            "launch-materialize",
-        )?;
+        let _materialization_lock = self
+            .ctx
+            .lock_manager
+            .acquire(LockResource::Materialization, "launch-materialize")?;
         // Asset verification can report thousands of updates in a second; keep
         // the first, last and roughly ten per second so adapters stay cheap.
         let last_files_report = Mutex::new(
@@ -824,12 +827,12 @@ impl LaunchService {
         // game is gone — the safe answer, because a dead launcher says nothing
         // about whether Minecraft is still writing to this instance.
         let lease_generation =
-            agora_core::instance_runtime::publish_starting(&self.ctx.paths, &request.instance_id)?;
-        let child = match crate::launch_planner::spawn(&prepared) {
+            instance_runtime::publish_starting(&self.ctx.paths, &request.instance_id)?;
+        let mut child = match crate::launch_planner::spawn(&prepared) {
             Ok(child) => child,
             Err(error) => {
                 // Nothing was spawned, so the lease is definitively ours to drop.
-                let _ = agora_core::instance_runtime::clear(
+                let _ = instance_runtime::clear(
                     &self.ctx.paths,
                     &request.instance_id,
                     Some(&lease_generation),
@@ -841,8 +844,15 @@ impl LaunchService {
             code: "ERR_NO_PID".into(),
             message: "Spawned process has no PID.".into(),
         })?;
-        let process_identity = agora_core::process_identity::capture(pid)?;
-        agora_core::instance_runtime::publish_running(
+        let process_identity = capture_game_identity(
+            &self.ctx.paths,
+            &request.instance_id,
+            &lease_generation,
+            pid,
+            &mut child,
+        )
+        .await?;
+        instance_runtime::publish_running(
             &self.ctx.paths,
             &request.instance_id,
             &lease_generation,
@@ -917,7 +927,7 @@ impl LaunchService {
         // above the lease is deliberately left in place: we no longer know
         // whether the process is alive, and `check_idle` will verify the
         // recorded identity and clear it once the process is provably gone.
-        let _ = agora_core::instance_runtime::clear(
+        let _ = instance_runtime::clear(
             &self.ctx.paths,
             &request.instance_id,
             Some(&lease_generation),
@@ -1485,6 +1495,29 @@ pub(crate) fn wrapper_command(game_dir: &std::path::Path) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Learn the spawned game's identity so the running lease can be verified.
+///
+/// If that fails the launch cannot be tracked. Stop the just-spawned process
+/// and release our lease instead of leaving it `Starting` forever with a game
+/// nobody is watching.
+async fn capture_game_identity(
+    paths: &AppPaths,
+    instance_id: &str,
+    lease_generation: &str,
+    pid: u32,
+    child: &mut tokio::process::Child,
+) -> LauncherResult<ProcessIdentity> {
+    match process_identity::capture(pid) {
+        Ok(identity) => Ok(identity),
+        Err(error) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = instance_runtime::clear(paths, instance_id, Some(lease_generation));
+            Err(error)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1493,6 +1526,54 @@ mod tests {
     fn rejects_path_traversal_instance_ids() {
         assert!(validate_instance_id("../outside").is_err());
         assert!(validate_instance_id("safe-instance").is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_capture_failure_after_spawn_releases_the_lease_and_stops_the_child() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::from_root(tmp.path().to_path_buf());
+        std::fs::create_dir_all(paths.locks_root()).unwrap();
+        let generation = instance_runtime::publish_starting(&paths, "demo").unwrap();
+
+        let mut child = blocker_command().spawn().expect("start the blocker");
+        // A PID no process has forces the same failure a vanished spawn gives.
+        let error = capture_game_identity(&paths, "demo", &generation, u32::MAX, &mut child)
+            .await
+            .expect_err("a pid that does not exist cannot be captured");
+        assert!(
+            matches!(error, LauncherError::ProcessCaptureFailed { .. }),
+            "unexpected error: {error:?}"
+        );
+
+        assert!(
+            instance_runtime::read(&paths, "demo").unwrap().is_none(),
+            "a failed capture must not leave a Starting lease"
+        );
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "the untracked child must be stopped"
+        );
+    }
+
+    /// A single process that blocks until killed, so the test leaves nothing behind.
+    fn blocker_command() -> tokio::process::Command {
+        #[cfg(windows)]
+        {
+            let mut command = tokio::process::Command::new("powershell");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 60",
+            ]);
+            command
+        }
+        #[cfg(unix)]
+        {
+            let mut command = tokio::process::Command::new("sleep");
+            command.arg("60");
+            command
+        }
     }
 
     #[test]
