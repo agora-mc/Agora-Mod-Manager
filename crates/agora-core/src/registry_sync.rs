@@ -373,7 +373,7 @@ fn load_remembered_trust(app_data_dir: &Path, base: &RegistryTrust) -> Remembere
     };
 
     let mut certificates: Vec<KeyCertificate> = Vec::new();
-    let mut revoked: Vec<String> = Vec::new();
+    let mut revoked: Vec<String> = base.revoked().to_vec();
     for line in text.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         match fields.as_slice() {
