@@ -3040,6 +3040,86 @@ new sign-in; importing it from the keyring was rejected because that import woul
 after every portable sign-out. The Settings notice names portable mode as the reason for the
 degraded storage, because on a portable copy it is the reason.
 
+### 22.5 One Account Store, One Write, and Offline Play (supersedes 22.4 on account storage)
+
+The active Microsoft account, every parked account and the list that names them are now one
+JSON secret (`msa-accounts-store`) replaced in one write. The previous layout kept the active
+slot, a slot per parked account and an index as separate secrets with no shared lock, so a
+refresh, an account switch and a sign-out could interleave: a refresh could overwrite a switch
+(M1), a corrupt index was read as an empty list and orphaned parked tokens (L2), and a failed
+read of the active slot let sign-in overwrite it (L3). A single record removes the ordering
+question entirely: there is no step at which the list and the credentials it names can
+disagree, and a crash leaves the previous complete store or the new one. `MSA_STORE_MUTEX`
+serializes read-modify-write inside the process; the refresh path holds it only around the load
+and the commit, never across the network call.
+
+The refresh commit is reconciled, not blind: if the refreshed account is still active it replaces
+the active credential; if it was switched away from, the new token updates its parked entry; if
+it was signed out during the refresh, the result is dropped rather than resurrecting the account.
+A permanent `invalid_grant` clears that account's credential wherever it sits. Sign-out skips an
+index entry whose credential is missing instead of failing after already clearing the active
+account, and a corrupt index or store is never read as empty.
+
+**A corrupt list does not lock the player out.** The active account still loads and launches from
+the recovery copy (or the old active slot during migration). The unreadable data is renamed beside
+itself with a timestamp and never deleted. Switching, adding, signing out or removing an account is
+refused with `ERR_MSA_ACCOUNTS_NEED_REPAIR` until `repair_account_store` rebuilds the one store from
+the accounts it can still read: the recovery copy, a readable old index, the old active slot, and
+(for the file backend) any parked credential files on disk. Entries whose credential cannot be read
+stay listed as needing a fresh sign-in and are named in the repair report. Every store write also
+writes a recovery copy of the same committed state, so the primary being corrupt costs at most the
+transaction in flight, not the active account. The player is warned once per process and the
+desktop Accounts page carries a Repair button; `agora auth repair` is the same operation.
+
+The one-blob design depends on 22.3: Windows Credential Manager's 2.5 KB cap was the reason each
+account used to get its own entry, and Windows now writes the DPAPI-protected file instead. The
+other keyrings and the encrypted-file fallback accept the combined record.
+
+The first read migrates the old active/parked/index secrets into the store and then removes them;
+legacy secrets are read strictly, so a corrupt one is an error. A crash between the new write and
+the old cleanup is harmless because every read looks for the new store first.
+
+**Offline play.** A direct launch whose Microsoft refresh fails for lack of network (DNS,
+connect, timeout, a 5xx), because Lockdown Mode is on, or because the Microsoft switch is off
+continues with the stored profile (name and UUID) and a placeholder access token. The game's
+argument contract accepts this for a local session; only single-player works. The launch result
+and both adapters carry `Playing offline: online servers and Realms will not accept this session.`
+plus the reason. A 4xx refusal, including `invalid_grant`, never falls back: the player must sign
+in again. A refresh that cannot be renewed for any other reason keeps the stored credential and
+fails the launch as before.
+
+### 22.6 DPAPI Is the Declared Windows Backend (refines 22.3)
+
+22.3 introduced DPAPI as what Windows uses once a keyring write fails. The review found the code
+still treated it as a fallback: a Windows write tried Credential Manager first, and when that
+predictably failed for a Microsoft credential it left the old keyring entry in place. `load_secret`
+then preferred that stale entry over the file the failed write had just produced (M2).
+
+**On Windows with the platform-default data root, the DPAPI file is the declared backend.** A
+write goes straight to the file and does not attempt Credential Manager; a successful write then
+deletes any keyring entry for the same service and account. This removes the "old entry shadows a
+new file" state rather than merely reading around it. On that same platform-default Windows root
+the rule covers the GitHub token too: it fits Credential Manager, but two credential stores on
+one platform is the inconsistency that produced the bug, so it moves to the DPAPI file as well.
+
+**On macOS and Linux the OS keyring remains primary.** A write that the keyring rejects now
+deletes the stale keyring entry after the file is durable. Independently, a read prefers an
+existing fallback file over the keyring: a successful keyring write removes the file, so a file
+that remains is the newer copy. Either mechanism alone would fix M2; both together survive a
+delete that the platform refuses.
+
+**A relocated or portable root keeps the device-key scheme**, which is obfuscation rather than
+OS protection: the key travels beside the ciphertext so the profile still opens on another
+machine. `AGORA_DATA_DIR` on Windows is such a root, so its Microsoft credential is the
+device-key file; the Settings warning for `EncryptedFile` says so. This is the documented choice
+the review asked for, not a silent downgrade: a DPAPI blob from a moved root would simply stop
+working.
+
+**A failed DPAPI call is an error.** `encrypt_fallback` no longer steps down to the device-key
+scheme when `CryptProtectData` fails on an eligible root; writing a weaker file under the same
+name would make the Settings report wrong. Relocated and portable roots take the weaker branch by
+design, as above.
+
 ---
 
 ## 23. RELIABILITY, RECOVERY & REPRODUCIBILITY

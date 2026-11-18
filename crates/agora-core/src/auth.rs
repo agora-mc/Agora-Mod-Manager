@@ -260,6 +260,110 @@ fn clear_test_secret(service: &str, account: &str) -> bool {
     false
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A stand-in for the OS credential store, so a test can create a stale entry
+    /// and make the next write fail the way Windows Credential Manager does when
+    /// the secret does not fit. Only consulted while installed.
+    static FAKE_KEYRING: std::cell::RefCell<Option<FakeKeyring>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct FakeKeyring {
+    entries: std::collections::HashMap<(String, String), String>,
+    fail_writes: bool,
+}
+
+#[cfg(test)]
+struct FakeKeyringGuard(Option<FakeKeyring>);
+
+#[cfg(test)]
+impl Drop for FakeKeyringGuard {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        FAKE_KEYRING.with(|cell| *cell.borrow_mut() = previous);
+    }
+}
+
+/// Install the fake keyring with one stale entry. `fail_writes` models a store
+/// that rejects the replacement but still serves the old value.
+#[cfg(test)]
+fn install_fake_keyring(
+    service: &str,
+    account: &str,
+    value: &str,
+    fail_writes: bool,
+) -> FakeKeyringGuard {
+    let previous = FAKE_KEYRING.with(|cell| {
+        cell.borrow_mut().replace(FakeKeyring {
+            entries: std::collections::HashMap::from([(
+                (service.to_string(), account.to_string()),
+                value.to_string(),
+            )]),
+            fail_writes,
+        })
+    });
+    FakeKeyringGuard(previous)
+}
+
+#[cfg(test)]
+fn fake_keyring_active() -> bool {
+    FAKE_KEYRING.with(|cell| cell.borrow().is_some())
+}
+
+#[cfg(test)]
+fn fake_keyring_lookup(service: &str, account: &str) -> Option<Option<String>> {
+    FAKE_KEYRING.with(|cell| {
+        cell.borrow().as_ref().map(|keyring| {
+            keyring
+                .entries
+                .get(&(service.to_string(), account.to_string()))
+                .cloned()
+        })
+    })
+}
+
+#[cfg(test)]
+fn fake_keyring_store(service: &str, account: &str, value: &str) -> KeyringWrite {
+    FAKE_KEYRING.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let keyring = borrow.as_mut().expect("fake keyring is installed");
+        if keyring.fail_writes {
+            return KeyringWrite::Error("simulated credential-store rejection".into());
+        }
+        keyring.entries.insert(
+            (service.to_string(), account.to_string()),
+            value.to_string(),
+        );
+        KeyringWrite::Ok
+    })
+}
+
+#[cfg(test)]
+fn fake_keyring_insert(service: &str, account: &str, value: &str) {
+    FAKE_KEYRING.with(|cell| {
+        if let Some(keyring) = cell.borrow_mut().as_mut() {
+            keyring.entries.insert(
+                (service.to_string(), account.to_string()),
+                value.to_string(),
+            );
+        }
+    });
+}
+
+#[cfg(test)]
+fn fake_keyring_delete(service: &str, account: &str) {
+    FAKE_KEYRING.with(|cell| {
+        if let Some(keyring) = cell.borrow_mut().as_mut() {
+            keyring
+                .entries
+                .remove(&(service.to_string(), account.to_string()));
+        }
+    });
+}
+
 /// PBKDF2 iterations for key derivation in the keyring fallback.
 const PBKDF2_ITERATIONS: u32 = 200_000;
 
@@ -605,15 +709,17 @@ pub fn store_token_bundle(bundle: &GitHubTokenBundle) -> LauncherResult<()> {
         return Ok(());
     }
 
-    if keyring_for_token() {
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT) {
-            if entry.set_password(&json).is_ok() {
-                if let Some(path) = fallback_token_path() {
-                    let _ = std::fs::remove_file(path);
-                }
-                return Ok(());
-            }
+    if !os_protected_is_primary()
+        && keyring_for_token()
+        && matches!(
+            keyring_write(KEYRING_SERVICE, KEYRING_ACCOUNT, &json),
+            KeyringWrite::Ok
+        )
+    {
+        if let Some(path) = fallback_token_path() {
+            let _ = std::fs::remove_file(path);
         }
+        return Ok(());
     }
 
     let path = fallback_token_path().ok_or_else(|| LauncherError::Generic {
@@ -636,6 +742,10 @@ pub fn store_token_bundle(bundle: &GitHubTokenBundle) -> LauncherResult<()> {
         "Failed to write fallback token file.",
     )?;
 
+    if keyring_for_token() {
+        let _ = keyring_delete(KEYRING_SERVICE, KEYRING_ACCOUNT);
+    }
+
     Ok(())
 }
 
@@ -644,28 +754,34 @@ pub fn store_token_bundle(bundle: &GitHubTokenBundle) -> LauncherResult<()> {
 /// Handles legacy bare access tokens: if the stored value is not valid JSON,
 /// it is treated as a plain access token and wrapped in a bundle.
 pub fn load_token_bundle() -> Option<GitHubTokenBundle> {
+    // A file that exists is the newer copy: a successful keyring write removes
+    // it, so a failed keyring write is the only way both can exist.
     let raw = if let Some(stored) = load_test_token() {
         stored
-    } else if keyring_for_token() {
-        keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
-            .ok()
-            .and_then(|entry| entry.get_password().ok())
     } else {
-        None
-    };
-
-    let raw = raw.or_else(|| {
-        let path = fallback_token_path()?;
-        if !path.exists() {
-            return None;
+        let from_file = fallback_token_path().and_then(|path| {
+            if !path.exists() {
+                return None;
+            }
+            let data = std::fs::read(&path).ok()?;
+            // Deliberately no cleanup on failure. A missing device key and a
+            // device key we merely failed to read are the same `None` here, so
+            // deleting would turn a transient read error into permanent
+            // credential loss. An undecryptable file is inert, and the next
+            // store overwrites it.
+            decrypt_fallback(&data, TOKEN_KEY_CONTEXT)
+        });
+        if from_file.is_some() {
+            from_file
+        } else if keyring_for_token() {
+            match keyring_read(KEYRING_SERVICE, KEYRING_ACCOUNT) {
+                KeyringRead::Value(value) => Some(value),
+                KeyringRead::Missing | KeyringRead::Unavailable | KeyringRead::Error(_) => None,
+            }
+        } else {
+            None
         }
-        let data = std::fs::read(&path).ok()?;
-        // Deliberately no cleanup on failure. A missing device key and a device
-        // key we merely failed to read are the same `None` here, so deleting
-        // would turn a transient read error into permanent credential loss. An
-        // undecryptable file is inert, and the next store overwrites it.
-        decrypt_fallback(&data, TOKEN_KEY_CONTEXT)
-    });
+    };
 
     let raw = raw?;
 
@@ -692,12 +808,8 @@ pub fn clear_token_bundle() -> Result<(), String> {
     }
     let mut keyring_error = None;
     if keyring_for_token() {
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT) {
-            match entry.delete_password() {
-                Ok(()) | Err(keyring::Error::NoEntry) => {}
-                Err(error) if keyring_backend_unavailable(&error) => {}
-                Err(error) => keyring_error = Some(error),
-            }
+        if let KeyringWrite::Error(error) = keyring_delete(KEYRING_SERVICE, KEYRING_ACCOUNT) {
+            keyring_error = Some(error);
         }
     }
 
@@ -1355,19 +1467,36 @@ fn os_protection_eligible() -> bool {
     crate::app_paths::AppPaths::data_root_is_platform_default()
 }
 
-/// Encrypt a credential for the fallback file, preferring OS protection.
+/// Whether OS protection is this platform's declared backend (not a fallback).
 ///
-/// Falls back to the device-key scheme when the platform has no OS protection,
-/// when the data root is relocated, or when the OS call itself fails — a
-/// credential that is stored less well is better than one that is not stored.
+/// Windows Credential Manager caps a credential below what a Microsoft sign-in
+/// needs, so the OS-protected file is the normal store there and writes do not
+/// try the keyring first. A relocated or portable root is deliberately excluded
+/// (see [`os_protection_eligible`]): its credentials must still work on another
+/// machine.
+fn os_protected_is_primary() -> bool {
+    os_protection::AVAILABLE && os_protection_eligible()
+}
+
+/// Encrypt a credential for the file, using OS protection when this platform
+/// declares it and the device-key scheme otherwise.
+///
+/// A failing DPAPI call is an error, not a silent step down: the files this
+/// platform writes are declared OS-protected, and storing a weaker copy under
+/// the same name would make the Settings report wrong. Relocated and portable
+/// roots take the device-key branch by design.
 fn encrypt_fallback(value: &str, key_context: &[u8]) -> LauncherResult<Vec<u8>> {
     if os_protection_eligible() {
-        if let Some(protected) = os_protection::protect(value.as_bytes(), key_context) {
-            let mut out = Vec::with_capacity(OS_PROTECTED_MAGIC.len() + protected.len());
-            out.extend_from_slice(OS_PROTECTED_MAGIC);
-            out.extend_from_slice(&protected);
-            return Ok(out);
-        }
+        let protected = os_protection::protect(value.as_bytes(), key_context).ok_or_else(|| {
+            LauncherError::Generic {
+                code: "ERR_AUTH_DPAPI_WRITE".into(),
+                message: "Windows could not protect the credential for this account.".into(),
+            }
+        })?;
+        let mut out = Vec::with_capacity(OS_PROTECTED_MAGIC.len() + protected.len());
+        out.extend_from_slice(OS_PROTECTED_MAGIC);
+        out.extend_from_slice(&protected);
+        return Ok(out);
     }
     encrypt_token(value, &derive_fallback_key_for(key_context)?)
 }
@@ -1461,13 +1590,41 @@ fn fallback_secret_path(file_name: &str) -> Option<std::path::PathBuf> {
     Some(fallback_data_dir()?.join(file_name))
 }
 
+/// Whether a fallback file for this credential name exists, without reading it.
+///
+/// Lets a caller distinguish "nothing stored" from "a file is there but did not
+/// decrypt". [`load_secret`] reports both as `None` by design, and a caller that
+/// must fail closed (an account store) needs the difference. The OS keyring is
+/// not consulted: an entry that cannot be read there is already an error.
+pub fn fallback_secret_present(fallback_file: &str) -> bool {
+    fallback_secret_path(fallback_file).is_some_and(|path| path.exists())
+}
+
+/// The directory holding the encrypted credential files and their device key.
+///
+/// Exposed so a caller that owns a non-secret recovery marker (the MSA account
+/// store) can put it beside the files it describes, including under
+/// `AGORA_DATA_DIR` or a portable root. Returns `None` only when no data root
+/// can be resolved at all.
+pub fn credential_storage_dir() -> Option<std::path::PathBuf> {
+    fallback_data_dir()
+}
+
 /// Whether the OS keyring may be used for the GitHub token.
 fn keyring_for_token() -> bool {
+    #[cfg(test)]
+    if fake_keyring_active() {
+        return true;
+    }
     !using_test_token_store() && !portable_credentials()
 }
 
 /// Whether the OS keyring may be used for a secret (Microsoft sign-in).
 fn keyring_for_secret() -> bool {
+    #[cfg(test)]
+    if fake_keyring_active() {
+        return true;
+    }
     !using_test_secret_store() && !portable_credentials()
 }
 
@@ -1510,6 +1667,78 @@ fn keyring_backend_unavailable(error: &keyring::Error) -> bool {
     matches!(error, keyring::Error::PlatformFailure(_))
 }
 
+/// What the OS credential store said, with a backend gap kept separate from a
+/// real refusal so a missing service is not reported as a credential error.
+enum KeyringRead {
+    Value(String),
+    Missing,
+    Unavailable,
+    Error(String),
+}
+
+/// The outcome of a keyring write or delete.
+enum KeyringWrite {
+    Ok,
+    Unavailable,
+    Error(String),
+}
+
+fn keyring_read(service: &str, account: &str) -> KeyringRead {
+    #[cfg(test)]
+    if let Some(stored) = fake_keyring_lookup(service, account) {
+        return match stored {
+            Some(value) => KeyringRead::Value(value),
+            None => KeyringRead::Missing,
+        };
+    }
+    let entry = match keyring::Entry::new(service, account) {
+        Ok(entry) => entry,
+        Err(error) if keyring_backend_unavailable(&error) => return KeyringRead::Unavailable,
+        Err(error) => return KeyringRead::Error(error.to_string()),
+    };
+    match entry.get_password() {
+        Ok(value) => KeyringRead::Value(value),
+        Err(keyring::Error::NoEntry) => KeyringRead::Missing,
+        Err(error) if keyring_backend_unavailable(&error) => KeyringRead::Unavailable,
+        Err(error) => KeyringRead::Error(error.to_string()),
+    }
+}
+
+fn keyring_write(service: &str, account: &str, value: &str) -> KeyringWrite {
+    #[cfg(test)]
+    if fake_keyring_active() {
+        return fake_keyring_store(service, account, value);
+    }
+    let entry = match keyring::Entry::new(service, account) {
+        Ok(entry) => entry,
+        Err(error) if keyring_backend_unavailable(&error) => return KeyringWrite::Unavailable,
+        Err(error) => return KeyringWrite::Error(error.to_string()),
+    };
+    match entry.set_password(value) {
+        Ok(()) => KeyringWrite::Ok,
+        Err(error) if keyring_backend_unavailable(&error) => KeyringWrite::Unavailable,
+        Err(error) => KeyringWrite::Error(error.to_string()),
+    }
+}
+
+fn keyring_delete(service: &str, account: &str) -> KeyringWrite {
+    #[cfg(test)]
+    if fake_keyring_active() {
+        fake_keyring_delete(service, account);
+        return KeyringWrite::Ok;
+    }
+    let entry = match keyring::Entry::new(service, account) {
+        Ok(entry) => entry,
+        Err(error) if keyring_backend_unavailable(&error) => return KeyringWrite::Unavailable,
+        Err(error) => return KeyringWrite::Error(error.to_string()),
+    };
+    match entry.delete_password() {
+        Ok(()) | Err(keyring::Error::NoEntry) => KeyringWrite::Ok,
+        Err(error) if keyring_backend_unavailable(&error) => KeyringWrite::Unavailable,
+        Err(error) => KeyringWrite::Error(error.to_string()),
+    }
+}
+
 pub fn store_secret(
     service: &str,
     account: &str,
@@ -1520,15 +1749,20 @@ pub fn store_secret(
     if store_test_secret(service, account, value) {
         return Ok(());
     }
-    if keyring_for_secret() {
-        if let Ok(entry) = keyring::Entry::new(service, account) {
-            if entry.set_password(value).is_ok() {
-                if let Some(path) = fallback_secret_path(fallback_file) {
-                    let _ = std::fs::remove_file(path);
-                }
-                return Ok(());
-            }
+
+    // On Windows the DPAPI file is the declared backend, not a fallback: the
+    // Credential Manager cap makes it the only store that fits a Microsoft
+    // credential, and Microsoft's own token caches do the same. Writing the
+    // keyring first there would leave a stale entry that `load_secret` has to
+    // prefer over a newer file.
+    if !os_protected_is_primary()
+        && keyring_for_secret()
+        && matches!(keyring_write(service, account, value), KeyringWrite::Ok)
+    {
+        if let Some(path) = fallback_secret_path(fallback_file) {
+            let _ = std::fs::remove_file(path);
         }
+        return Ok(());
     }
 
     let path = fallback_secret_path(fallback_file).ok_or_else(|| LauncherError::Generic {
@@ -1547,7 +1781,16 @@ pub fn store_secret(
         &encrypted,
         "ERR_AUTH_FALLBACK_WRITE",
         "Failed to write encrypted credentials.",
-    )
+    )?;
+
+    // The file is durable and is the copy a reader prefers now (see
+    // `load_secret`). Remove any older keyring entry so an older build, or a
+    // read that consulted the keyring first, cannot resurrect the stale value.
+    // A delete that is itself refused is not fatal: the file still wins.
+    if keyring_for_secret() {
+        let _ = keyring_delete(service, account);
+    }
+    Ok(())
 }
 
 pub fn load_secret(
@@ -1559,20 +1802,11 @@ pub fn load_secret(
     if let Some(stored) = load_test_secret(service, account) {
         return Ok(stored);
     }
-    let mut keyring_error = None;
-    if keyring_for_secret() {
-        match keyring::Entry::new(service, account) {
-            Ok(entry) => match entry.get_password() {
-                Ok(value) => return Ok(Some(value)),
-                Err(keyring::Error::NoEntry) => {}
-                Err(error) if keyring_backend_unavailable(&error) => {}
-                Err(error) => keyring_error = Some(error.to_string()),
-            },
-            Err(error) if keyring_backend_unavailable(&error) => {}
-            Err(error) => keyring_error = Some(error.to_string()),
-        }
-    }
 
+    // The file wins when it exists. `store_secret` only leaves one behind when
+    // the keyring write did not succeed, so its presence means it is the newer
+    // copy; a successful keyring write removes it. This is what stops a stale
+    // keyring entry shadowing the value a failed write just stored (M2).
     if let Some(path) = fallback_secret_path(fallback_file) {
         if path.exists() {
             let encrypted = std::fs::read(&path).map_err(|_| LauncherError::Generic {
@@ -1587,6 +1821,15 @@ pub fn load_secret(
             if let Some(value) = decrypt_fallback(&encrypted, key_context) {
                 return Ok(Some(value));
             }
+        }
+    }
+
+    let mut keyring_error = None;
+    if keyring_for_secret() {
+        match keyring_read(service, account) {
+            KeyringRead::Value(value) => return Ok(Some(value)),
+            KeyringRead::Missing | KeyringRead::Unavailable => {}
+            KeyringRead::Error(error) => keyring_error = Some(error),
         }
     }
 
@@ -1605,12 +1848,8 @@ pub fn clear_secret(service: &str, account: &str, fallback_file: &str) -> Launch
     }
     let mut keyring_error = None;
     if keyring_for_secret() {
-        if let Ok(entry) = keyring::Entry::new(service, account) {
-            match entry.delete_password() {
-                Ok(()) | Err(keyring::Error::NoEntry) => {}
-                Err(error) if keyring_backend_unavailable(&error) => {}
-                Err(error) => keyring_error = Some(error),
-            }
+        if let KeyringWrite::Error(error) = keyring_delete(service, account) {
+            keyring_error = Some(error);
         }
     }
     if let Some(path) = fallback_secret_path(fallback_file) {
@@ -1657,32 +1896,34 @@ pub enum CredentialBackend {
 /// degraded path was actually in use. MASTER_SPEC 7.5.2 requires warning the
 /// user when their credential is stored this way, which needs this signal.
 pub fn credential_backend(service: &str, account: &str, fallback_file: &str) -> CredentialBackend {
-    if keyring_for_secret() {
-        if let Ok(entry) = keyring::Entry::new(service, account) {
-            if entry.get_password().is_ok() {
-                return CredentialBackend::Keyring;
-            }
+    // Same order as `load_secret`: a file that exists is the newer copy.
+    if let Some(path) = fallback_secret_path(fallback_file) {
+        if path.is_file() {
+            return stored_file_backend(&path);
         }
     }
-    match fallback_secret_path(fallback_file) {
-        Some(path) if path.is_file() => stored_file_backend(&path),
-        _ => CredentialBackend::None,
+    if keyring_for_secret() && matches!(keyring_read(service, account), KeyringRead::Value(_)) {
+        return CredentialBackend::Keyring;
     }
+    CredentialBackend::None
 }
 
 /// Which backend holds the GitHub token.
 pub fn github_credential_backend() -> CredentialBackend {
-    if keyring_for_token() {
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT) {
-            if entry.get_password().is_ok() {
-                return CredentialBackend::Keyring;
-            }
+    if let Some(path) = fallback_token_path() {
+        if path.is_file() {
+            return stored_file_backend(&path);
         }
     }
-    match fallback_token_path() {
-        Some(path) if path.is_file() => stored_file_backend(&path),
-        _ => CredentialBackend::None,
+    if keyring_for_token()
+        && matches!(
+            keyring_read(KEYRING_SERVICE, KEYRING_ACCOUNT),
+            KeyringRead::Value(_)
+        )
+    {
+        return CredentialBackend::Keyring;
     }
+    CredentialBackend::None
 }
 
 /// Classify an existing fallback file by how it is actually protected.
@@ -2813,6 +3054,105 @@ mod tests {
         assert_eq!(
             credential_backend("svc", "acct", "creds.enc"),
             CredentialBackend::EncryptedFile
+        );
+    }
+
+    #[test]
+    fn a_rejected_keyring_write_deletes_the_stale_entry_and_the_file_wins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _fallback = use_real_fallback_dir(dir.path());
+        let _keyring = install_fake_keyring("svc", "acct", "stale", true);
+
+        store_secret("svc", "acct", "creds.enc", MSA_CONTEXT, "fresh")
+            .expect("a rejected keyring write must fall back to the file");
+
+        assert_eq!(
+            fake_keyring_lookup("svc", "acct"),
+            Some(None),
+            "the stale entry must be removed after the file is written"
+        );
+        assert_eq!(
+            load_secret("svc", "acct", "creds.enc", MSA_CONTEXT)
+                .expect("load")
+                .as_deref(),
+            Some("fresh")
+        );
+    }
+
+    #[test]
+    fn a_newer_file_is_read_before_a_stale_keyring_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _fallback = use_real_fallback_dir(dir.path());
+        let _keyring = install_fake_keyring("svc", "acct", "stale", true);
+        store_secret("svc", "acct", "creds.enc", MSA_CONTEXT, "fresh").expect("store");
+
+        // Both now exist: put an older value back in the keyring.
+        fake_keyring_insert("svc", "acct", "stale");
+
+        assert_eq!(
+            load_secret("svc", "acct", "creds.enc", MSA_CONTEXT)
+                .expect("load")
+                .as_deref(),
+            Some("fresh"),
+            "a newer fallback file must not be shadowed by an older keyring entry"
+        );
+        assert_eq!(
+            credential_backend("svc", "acct", "creds.enc"),
+            CredentialBackend::EncryptedFile
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_writes_the_dpapi_file_and_removes_the_keyring_copy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _fallback = use_real_fallback_dir(dir.path());
+        let _os = force_os_protection();
+        let _keyring = install_fake_keyring("svc", "acct", "old-keyring-value", true);
+
+        store_secret("svc", "acct", "creds.enc", MSA_CONTEXT, "value").expect("store");
+
+        let stored = std::fs::read(dir.path().join("creds.enc")).expect("read");
+        assert!(
+            stored.starts_with(OS_PROTECTED_MAGIC.as_slice()),
+            "Windows must write the OS-protected file as its declared backend"
+        );
+        assert_eq!(
+            fake_keyring_lookup("svc", "acct"),
+            Some(None),
+            "the keyring copy must be removed after the DPAPI write"
+        );
+        assert!(!dir.path().join(DEVICE_KEY_FILE).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_stores_the_github_token_in_the_dpapi_file_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _fallback = use_real_fallback_dir(dir.path());
+        let _os = force_os_protection();
+        let _keyring = install_fake_keyring(KEYRING_SERVICE, KEYRING_ACCOUNT, "old", true);
+        let bundle = GitHubTokenBundle {
+            access_token: "gho_dpapi".into(),
+            refresh_token: None,
+            access_expires_at: None,
+            refresh_expires_at: None,
+            token_type: None,
+            scope: None,
+        };
+
+        store_token_bundle(&bundle).expect("store token bundle");
+
+        let stored =
+            std::fs::read(fallback_token_path().expect("token path")).expect("read token file");
+        assert!(stored.starts_with(OS_PROTECTED_MAGIC.as_slice()));
+        assert_eq!(
+            fake_keyring_lookup(KEYRING_SERVICE, KEYRING_ACCOUNT),
+            Some(None)
+        );
+        assert_eq!(
+            github_credential_backend(),
+            CredentialBackend::OsProtectedFile
         );
     }
 

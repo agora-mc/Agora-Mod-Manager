@@ -100,4 +100,11 @@ Agora has no factory-reset command. Resetting is destructive, so rename rather t
 4. Rename the root folder.
 5. Run `agora paths` and `agora registry sync` to confirm a clean profile is created, then remove the renamed copy once you no longer need it.
 
-Microsoft credentials live in the operating-system credential store, so neither `--data-dir` nor `AGORA_DATA_DIR` isolates them. Renaming the root doesn't sign you out, and `agora auth logout` removes the shared entry the desktop app also uses. A portable copy is the exception: it keeps its credentials encrypted inside its own data folder.
+Where Microsoft credentials live depends on the platform and the root:
+
+- **Windows, normal data root:** a DPAPI-protected file inside the data root. Only this Windows account on this machine can decrypt it. Renaming the root, or using `--data-dir`, gives you a root with its own sign-in.
+- **Windows, relocated or portable root:** a file encrypted with a device key stored beside it in the same folder. That is obfuscation, not OS protection: anyone who can read the folder can read the sign-in. The Settings notice says so. This is deliberate, because a DPAPI file would stop working if the profile moved to another machine or Windows account.
+- **macOS and Linux:** the operating-system credential store. Neither `--data-dir` nor `AGORA_DATA_DIR` isolates it, and `agora auth logout` removes the shared entry the desktop app also uses.
+- **Portable copy (`portable.txt`):** both sign-ins stay in the copy's own folder, encrypted with a device key that travels with them.
+
+All signed-in Microsoft accounts are kept together in one encrypted record that is replaced in a single write. A killed process leaves either the previous complete record or the new one, and an unreadable record is reported as an error rather than shown as an empty account list.

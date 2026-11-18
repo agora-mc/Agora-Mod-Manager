@@ -57,6 +57,14 @@ export function LaunchProgressPanel({
           )}
         </div>
       </div>
+      {progress.notice && (
+        <p
+          className="mt-1 text-amber-600 dark:text-amber-400"
+          data-testid="launch-offline-notice"
+        >
+          {progress.notice}
+        </p>
+      )}
       {showBar && (
         <div
           className="mt-2 h-1.5 overflow-hidden rounded-full bg-background"
