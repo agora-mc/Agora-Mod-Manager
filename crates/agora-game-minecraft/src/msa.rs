@@ -1115,8 +1115,49 @@ pub async fn refresh_credentials(
 
     let oauth = refresh_oauth_token(clients, &creds.refresh_token).await?;
     let refreshed = run_minecraft_chain(clients, &oauth, false).await?;
-    store_credentials(&refreshed)?;
+    commit_refreshed(&refreshed)?;
     Ok(refreshed)
+}
+
+/// Persist a refresh without overwriting an account switch that happened while
+/// the network call was in flight.
+///
+/// If the refreshed account is still active, it becomes the stored active one.
+/// If it was switched away from, the new token goes into its parked entry. If it
+/// was signed out during the refresh, the result is dropped: a refresh must not
+/// resurrect an account the user removed.
+fn commit_refreshed(refreshed: &MsaCredentials) -> LauncherResult<()> {
+    let _guard = store_guard();
+    let mut store = read_store_unlocked()?;
+    if store
+        .active
+        .as_ref()
+        .is_some_and(|active| same_account(&active.uuid, &refreshed.uuid))
+    {
+        store.active = Some(refreshed.clone());
+    } else if let Some(position) = store.parked_position(&refreshed.uuid) {
+        store.parked[position].credentials = Some(refreshed.clone());
+    } else {
+        return Ok(());
+    }
+    write_store_unlocked(&store)
+}
+
+/// Forget the credential Microsoft says is no longer valid, wherever it sits.
+fn clear_account_credentials(uuid: &str) -> LauncherResult<()> {
+    let _guard = store_guard();
+    let mut store = read_store_unlocked()?;
+    if store
+        .active
+        .as_ref()
+        .is_some_and(|active| same_account(&active.uuid, uuid))
+    {
+        store.active = None;
+    }
+    if let Some(position) = store.parked_position(uuid) {
+        store.parked[position].credentials = None;
+    }
+    write_store_unlocked(&store)
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,11 +1170,7 @@ pub async fn refresh_credentials(
 /// the credentials sit in a file guarded only by its permissions -- the state
 /// MASTER_SPEC 7.5.2 requires Settings to warn about.
 pub fn credentials_backend() -> agora_core::auth::CredentialBackend {
-    agora_core::auth::credential_backend(
-        KEYRING_SERVICE,
-        KEYRING_ACCOUNT,
-        CREDENTIALS_FALLBACK_FILE,
-    )
+    agora_core::auth::credential_backend(KEYRING_SERVICE, ACCOUNT_STORE_ACCOUNT, ACCOUNT_STORE_FILE)
 }
 
 pub fn load_credentials() -> LauncherResult<Option<MsaCredentials>> {
@@ -1150,57 +1187,70 @@ pub fn load_credentials() -> LauncherResult<Option<MsaCredentials>> {
         return Ok(Some(credentials));
     }
 
-    let Some(json) = agora_core::auth::load_secret(
-        KEYRING_SERVICE,
-        KEYRING_ACCOUNT,
-        CREDENTIALS_FALLBACK_FILE,
-        CREDENTIALS_KEY_CONTEXT,
-    )?
-    else {
-        return Ok(None);
-    };
-    serde_json::from_str(&json)
-        .map(Some)
-        .map_err(|e| LauncherError::Generic {
-            code: "ERR_MSA_STORED_PARSE".into(),
-            message: format!("Failed to parse stored credentials: {e}"),
-        })
+    let _guard = store_guard();
+    Ok(read_store_unlocked()?.active)
 }
 
-/// Store credentials in the OS keyring as JSON.
+/// Store credentials as the active account. The parked accounts are kept.
 pub fn store_credentials(creds: &MsaCredentials) -> LauncherResult<()> {
-    let json = serde_json::to_string(creds).map_err(|e| LauncherError::Generic {
-        code: "ERR_MSA_STORED_SERIALIZE".into(),
-        message: format!("Failed to serialize credentials: {e}"),
-    })?;
-    agora_core::auth::store_secret(
-        KEYRING_SERVICE,
-        KEYRING_ACCOUNT,
-        CREDENTIALS_FALLBACK_FILE,
-        CREDENTIALS_KEY_CONTEXT,
-        &json,
-    )
+    let _guard = store_guard();
+    let mut store = read_store_unlocked()?;
+    store.active = Some(creds.clone());
+    store.remove_parked(&creds.uuid);
+    write_store_unlocked(&store)
 }
 
 /// Clear the active account's stored credentials. Other signed-in accounts
 /// are untouched; [`sign_out_active`] is the user-facing sign-out.
 pub fn clear_credentials() -> LauncherResult<()> {
-    agora_core::auth::clear_secret(KEYRING_SERVICE, KEYRING_ACCOUNT, CREDENTIALS_FALLBACK_FILE)
+    let _guard = store_guard();
+    let mut store = read_store_unlocked()?;
+    store.active = None;
+    write_store_unlocked(&store)
 }
 
 // ---------------------------------------------------------------------------
-// More than one account
+// More than one account: one transactional store
 // ---------------------------------------------------------------------------
 //
-// The active account keeps the original slot, so launching, refreshing and
-// status checks read exactly what they always did. Every other signed-in
-// account has a slot of its own, named after its Minecraft UUID, and a small
-// index records which ones exist. One slot per account rather than one blob for
-// all of them: Windows Credential Manager caps an entry at 2.5 KB, and a single
-// credential already takes most of that.
+// The active account, every parked account and the list that names them live in
+// one JSON secret, replaced in one write. A single record is what makes the
+// update transactional: there is no order in which an index could name an
+// account whose credential was never written, and a crash leaves either the
+// previous complete store or the new one. The earlier layout used three kinds
+// of secret and no shared lock, so a refresh, a switch and a sign-out could
+// interleave and orphan tokens.
+//
+// One blob is only viable because Windows now writes the DPAPI-protected file
+// rather than Credential Manager (see `agora_core::auth`); its 2.5 KB cap was
+// why an account used to get a slot of its own. Other platforms' keyrings and
+// the encrypted-file fallback have no comparable limit.
+//
+// `read_store_unlocked` migrates the old layout on first read. A crash after the
+// new store is written but before the old secrets are removed is harmless: the
+// new store is found on the next read and the old copies are inert.
+const ACCOUNT_STORE_ACCOUNT: &str = "msa-accounts-store";
+const ACCOUNT_STORE_FILE: &str = "msa-accounts-store.enc";
+const ACCOUNT_STORE_KEY_CONTEXT: &[u8] = b"agora-msa-accounts-store";
 
+/// The old layout, read only so an existing install keeps its accounts.
 const ACCOUNT_INDEX_ACCOUNT: &str = "msa-accounts";
 const ACCOUNT_INDEX_FILE: &str = "msa-accounts.enc";
+
+/// Serializes every read-modify-write of the account store in this process.
+///
+/// The refresh path takes it around the load and the commit only, never across
+/// the network call, so a switch is never blocked on Microsoft. A poisoned lock
+/// still yields the guard: the store is the consistency boundary, and refusing
+/// to read it would be worse than carrying on.
+static MSA_STORE_MUTEX: LazyLock<std::sync::Mutex<()>> =
+    LazyLock::new(|| std::sync::Mutex::new(()));
+
+fn store_guard() -> std::sync::MutexGuard<'static, ()> {
+    MSA_STORE_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// A signed-in account as the account switcher shows it. No tokens.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1211,6 +1261,53 @@ pub struct MsaAccountSummary {
     pub active: bool,
     /// Signed in with an older Agora; needs one fresh sign-in.
     pub needs_reauth: bool,
+}
+
+/// The single secret that holds every account.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AccountStore {
+    #[serde(default)]
+    active: Option<MsaCredentials>,
+    #[serde(default)]
+    parked: Vec<ParkedAccount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ParkedAccount {
+    uuid: String,
+    username: String,
+    /// `None` when the index entry survived but its credential did not. It is
+    /// still shown, as needing sign-in, rather than silently dropped.
+    #[serde(default)]
+    credentials: Option<MsaCredentials>,
+}
+
+impl AccountStore {
+    fn parked_position(&self, uuid: &str) -> Option<usize> {
+        self.parked
+            .iter()
+            .position(|entry| same_account(&entry.uuid, uuid))
+    }
+
+    fn remove_parked(&mut self, uuid: &str) -> Option<ParkedAccount> {
+        let position = self.parked_position(uuid)?;
+        Some(self.parked.remove(position))
+    }
+
+    fn add_parked(&mut self, creds: &MsaCredentials) {
+        self.remove_parked(&creds.uuid);
+        self.parked.push(ParkedAccount {
+            uuid: creds.uuid.clone(),
+            username: creds.username.clone(),
+            credentials: Some(creds.clone()),
+        });
+    }
+
+    fn first_usable_parked(&self) -> Option<usize> {
+        self.parked
+            .iter()
+            .position(|entry| entry.credentials.is_some())
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1234,124 +1331,207 @@ fn same_account(a: &str, b: &str) -> bool {
     a.replace('-', "").eq_ignore_ascii_case(&b.replace('-', ""))
 }
 
-fn load_index() -> LauncherResult<Vec<AccountIndexEntry>> {
-    let Some(json) = agora_core::auth::load_secret(
-        KEYRING_SERVICE,
-        ACCOUNT_INDEX_ACCOUNT,
-        ACCOUNT_INDEX_FILE,
-        CREDENTIALS_KEY_CONTEXT,
-    )?
-    else {
-        return Ok(Vec::new());
-    };
-    Ok(serde_json::from_str(&json).unwrap_or_default())
+fn parse_credentials(json: &str, what: &str) -> LauncherResult<MsaCredentials> {
+    serde_json::from_str(json).map_err(|error| {
+        err(
+            "ERR_MSA_ACCOUNT_STORE",
+            format!("Agora could not read {what} from its stored accounts: {error}"),
+        )
+    })
 }
 
-fn store_index(entries: &[AccountIndexEntry]) -> LauncherResult<()> {
-    if entries.is_empty() {
+/// Read the one store, migrating the old layout on first use.
+///
+/// The caller holds [`MSA_STORE_MUTEX`]. An existing store that cannot be read
+/// is an error, never an empty list: treating it as empty would hide every
+/// account and orphan its tokens.
+fn read_store_unlocked() -> LauncherResult<AccountStore> {
+    if let Some(json) = agora_core::auth::load_secret(
+        KEYRING_SERVICE,
+        ACCOUNT_STORE_ACCOUNT,
+        ACCOUNT_STORE_FILE,
+        ACCOUNT_STORE_KEY_CONTEXT,
+    )? {
+        return serde_json::from_str(&json).map_err(|error| {
+            err(
+                "ERR_MSA_ACCOUNT_STORE",
+                format!("Agora could not read its saved accounts: {error}"),
+            )
+        });
+    }
+    if agora_core::auth::fallback_secret_present(ACCOUNT_STORE_FILE) {
+        return Err(err(
+            "ERR_MSA_ACCOUNT_STORE",
+            "The saved accounts are present but could not be read. Sign in again, or remove the \
+             account store file from Agora's data folder if you accept losing those sessions.",
+        ));
+    }
+    migrate_legacy_store()
+}
+
+fn write_store_unlocked(store: &AccountStore) -> LauncherResult<()> {
+    if store.active.is_none() && store.parked.is_empty() {
         return agora_core::auth::clear_secret(
             KEYRING_SERVICE,
-            ACCOUNT_INDEX_ACCOUNT,
-            ACCOUNT_INDEX_FILE,
+            ACCOUNT_STORE_ACCOUNT,
+            ACCOUNT_STORE_FILE,
         );
     }
-    let json = serde_json::to_string(entries).map_err(|e| {
+    let json = serde_json::to_string(store).map_err(|error| {
         err(
-            "ERR_MSA_STORED_SERIALIZE",
-            format!("Failed to serialize the account list: {e}"),
+            "ERR_MSA_ACCOUNT_STORE",
+            format!("Failed to serialize the saved accounts: {error}"),
         )
     })?;
     agora_core::auth::store_secret(
         KEYRING_SERVICE,
-        ACCOUNT_INDEX_ACCOUNT,
-        ACCOUNT_INDEX_FILE,
-        CREDENTIALS_KEY_CONTEXT,
+        ACCOUNT_STORE_ACCOUNT,
+        ACCOUNT_STORE_FILE,
+        ACCOUNT_STORE_KEY_CONTEXT,
         &json,
     )
 }
 
-fn load_parked(uuid: &str) -> LauncherResult<Option<MsaCredentials>> {
-    let (account, file) = account_slot(uuid)?;
-    let Some(json) =
-        agora_core::auth::load_secret(KEYRING_SERVICE, &account, &file, CREDENTIALS_KEY_CONTEXT)?
-    else {
-        return Ok(None);
-    };
-    Ok(serde_json::from_str(&json).ok())
-}
-
-/// Copy a credential into its own slot and list it.
-fn park(creds: &MsaCredentials) -> LauncherResult<()> {
-    let (account, file) = account_slot(&creds.uuid)?;
-    let json = serde_json::to_string(creds).map_err(|e| {
-        err(
-            "ERR_MSA_STORED_SERIALIZE",
-            format!("Failed to serialize credentials: {e}"),
-        )
-    })?;
-    agora_core::auth::store_secret(
+/// Read the old active/parked/index secrets into one store, then replace them.
+fn migrate_legacy_store() -> LauncherResult<AccountStore> {
+    let active = match agora_core::auth::load_secret(
         KEYRING_SERVICE,
-        &account,
-        &file,
+        KEYRING_ACCOUNT,
+        CREDENTIALS_FALLBACK_FILE,
         CREDENTIALS_KEY_CONTEXT,
-        &json,
-    )?;
-    let mut index = load_index()?;
-    index.retain(|entry| !same_account(&entry.uuid, &creds.uuid));
-    index.push(AccountIndexEntry {
-        uuid: creds.uuid.clone(),
-        username: creds.username.clone(),
-    });
-    store_index(&index)
-}
+    )? {
+        Some(json) => Some(parse_credentials(&json, "the active account")?),
+        None => None,
+    };
 
-fn unpark(uuid: &str) -> LauncherResult<()> {
-    let (account, file) = account_slot(uuid)?;
-    agora_core::auth::clear_secret(KEYRING_SERVICE, &account, &file)?;
-    let mut index = load_index()?;
-    index.retain(|entry| !same_account(&entry.uuid, uuid));
-    store_index(&index)
-}
-
-/// Store a freshly signed-in account as the active one. A different account
-/// that was active stays signed in, parked in its own slot.
-fn store_signed_in_account(creds: &MsaCredentials) -> LauncherResult<()> {
-    if let Ok(Some(current)) = load_credentials() {
-        if !same_account(&current.uuid, &creds.uuid) {
-            park(&current)?;
+    let entries = match agora_core::auth::load_secret(
+        KEYRING_SERVICE,
+        ACCOUNT_INDEX_ACCOUNT,
+        ACCOUNT_INDEX_FILE,
+        CREDENTIALS_KEY_CONTEXT,
+    )? {
+        Some(json) => serde_json::from_str::<Vec<AccountIndexEntry>>(&json).map_err(|error| {
+            err(
+                "ERR_MSA_ACCOUNT_INDEX",
+                format!(
+                    "The saved account list is corrupt ({error}). Agora will not treat it as \
+                     empty and orphan those accounts; sign in again, or remove msa-accounts.enc \
+                     from Agora's data folder if you accept losing those sessions."
+                ),
+            )
+        })?,
+        None if agora_core::auth::fallback_secret_present(ACCOUNT_INDEX_FILE) => {
+            return Err(err(
+                "ERR_MSA_ACCOUNT_INDEX",
+                "The saved account list is present but could not be read. Agora will not treat it \
+                 as empty and orphan those accounts.",
+            ))
         }
-    }
-    store_credentials(creds)?;
-    // Signing in again to a parked account makes it active; drop the copy.
-    if load_index()?
-        .iter()
-        .any(|entry| same_account(&entry.uuid, &creds.uuid))
-    {
-        unpark(&creds.uuid)?;
-    }
-    Ok(())
-}
+        None => Vec::new(),
+    };
 
-/// Every signed-in account, the active one first.
-pub fn list_accounts() -> LauncherResult<Vec<MsaAccountSummary>> {
-    let mut accounts = Vec::new();
-    let active = load_credentials()?;
-    if let Some(creds) = &active {
-        accounts.push(summary(creds, true));
-    }
-    for entry in load_index()? {
+    let mut parked = Vec::new();
+    for entry in entries {
         if active
             .as_ref()
             .is_some_and(|creds| same_account(&creds.uuid, &entry.uuid))
         {
             continue;
         }
-        let needs_reauth = load_parked(&entry.uuid)?
+        let (account, file) = account_slot(&entry.uuid)?;
+        let credentials =
+            match agora_core::auth::load_secret(
+                KEYRING_SERVICE,
+                &account,
+                &file,
+                CREDENTIALS_KEY_CONTEXT,
+            )? {
+                Some(json) => Some(parse_credentials(&json, "a saved account")?),
+                None if agora_core::auth::fallback_secret_present(&file) => return Err(err(
+                    "ERR_MSA_ACCOUNT_STORE",
+                    "A saved account's credential is present but could not be read. Agora will \
+                     not treat the account list as empty.",
+                )),
+                None => None,
+            };
+        parked.push(ParkedAccount {
+            uuid: entry.uuid,
+            username: entry.username,
+            credentials,
+        });
+    }
+
+    let store = AccountStore { active, parked };
+    if store.active.is_some() || !store.parked.is_empty() {
+        write_store_unlocked(&store)?;
+        clear_legacy_store(&store);
+    }
+    Ok(store)
+}
+
+/// Best-effort removal of the old secrets after the new store is durable.
+///
+/// Failure here leaves inert copies behind, never a second source of truth:
+/// every read looks for the new store first.
+fn clear_legacy_store(store: &AccountStore) {
+    let _ =
+        agora_core::auth::clear_secret(KEYRING_SERVICE, KEYRING_ACCOUNT, CREDENTIALS_FALLBACK_FILE);
+    let _ =
+        agora_core::auth::clear_secret(KEYRING_SERVICE, ACCOUNT_INDEX_ACCOUNT, ACCOUNT_INDEX_FILE);
+    let mut uuids: Vec<&str> = store
+        .parked
+        .iter()
+        .map(|entry| entry.uuid.as_str())
+        .collect();
+    if let Some(active) = &store.active {
+        uuids.push(active.uuid.as_str());
+    }
+    for uuid in uuids {
+        if let Ok((account, file)) = account_slot(uuid) {
+            let _ = agora_core::auth::clear_secret(KEYRING_SERVICE, &account, &file);
+        }
+    }
+}
+
+/// Store a freshly signed-in account as the active one. A different account
+/// that was active stays signed in, parked in the same store.
+fn store_signed_in_account(creds: &MsaCredentials) -> LauncherResult<()> {
+    let _guard = store_guard();
+    let mut store = read_store_unlocked()?;
+    if let Some(current) = store.active.clone() {
+        if !same_account(&current.uuid, &creds.uuid) {
+            store.add_parked(&current);
+        }
+    }
+    store.remove_parked(&creds.uuid);
+    store.active = Some(creds.clone());
+    write_store_unlocked(&store)
+}
+
+/// Every signed-in account, the active one first.
+pub fn list_accounts() -> LauncherResult<Vec<MsaAccountSummary>> {
+    let _guard = store_guard();
+    let store = read_store_unlocked()?;
+    let mut accounts = Vec::new();
+    if let Some(creds) = &store.active {
+        accounts.push(summary(creds, true));
+    }
+    for entry in &store.parked {
+        if store
+            .active
+            .as_ref()
+            .is_some_and(|creds| same_account(&creds.uuid, &entry.uuid))
+        {
+            continue;
+        }
+        let needs_reauth = entry
+            .credentials
+            .as_ref()
             .map(|creds| creds.needs_reauth())
             .unwrap_or(true);
         accounts.push(MsaAccountSummary {
-            uuid: entry.uuid,
-            username: entry.username,
+            uuid: entry.uuid.clone(),
+            username: entry.username.clone(),
             active: false,
             needs_reauth,
         });
@@ -1361,45 +1541,79 @@ pub fn list_accounts() -> LauncherResult<Vec<MsaAccountSummary>> {
 
 /// Make another signed-in account the one launches use.
 ///
-/// Ordered so an interruption at any point leaves both accounts stored
-/// somewhere: the current account is parked before the chosen one replaces it,
-/// and the chosen one's parked copy is removed last.
+/// One write replaces the whole store, so an interruption leaves either the
+/// old active account or the new one, and every parked credential stays in
+/// place.
 pub fn switch_account(uuid: &str) -> LauncherResult<MsaAccountSummary> {
-    let target = load_parked(uuid)?.ok_or_else(|| {
-        err(
-            "ERR_MSA_ACCOUNT",
-            "That account is not signed in to Agora any more.",
-        )
-    })?;
-    if let Some(current) = load_credentials()? {
+    let _guard = store_guard();
+    let mut store = read_store_unlocked()?;
+    let target = store
+        .parked
+        .iter()
+        .find(|entry| same_account(&entry.uuid, uuid))
+        .and_then(|entry| entry.credentials.clone())
+        .ok_or_else(|| {
+            err(
+                "ERR_MSA_ACCOUNT",
+                "That account is not signed in to Agora any more.",
+            )
+        })?;
+
+    if let Some(current) = store.active.clone() {
         if same_account(&current.uuid, uuid) {
-            unpark(uuid)?;
+            store.remove_parked(uuid);
+            write_store_unlocked(&store)?;
             return Ok(summary(&current, true));
         }
-        park(&current)?;
+        store.add_parked(&current);
     }
-    store_credentials(&target)?;
-    unpark(uuid)?;
+    store.remove_parked(uuid);
+    store.active = Some(target.clone());
+    write_store_unlocked(&store)?;
     Ok(summary(&target, true))
 }
 
 /// Forget one account. Removing the active account makes the next signed-in
 /// account active, so launching keeps working when there is one.
 pub fn remove_account(uuid: &str) -> LauncherResult<()> {
-    match load_credentials()? {
-        Some(current) if same_account(&current.uuid, uuid) => sign_out_active().map(|_| ()),
-        _ => unpark(uuid),
+    let _guard = store_guard();
+    let mut store = read_store_unlocked()?;
+    if store
+        .active
+        .as_ref()
+        .is_some_and(|current| same_account(&current.uuid, uuid))
+    {
+        store.active = None;
+        if let Some(position) = store.first_usable_parked() {
+            let next = store.parked.remove(position);
+            store.active = next.credentials;
+        }
+        return write_store_unlocked(&store);
     }
+    store.remove_parked(uuid);
+    write_store_unlocked(&store)
 }
 
 /// Sign the active account out. Returns the account that became active in its
 /// place, if another one is signed in.
+///
+/// An entry whose credential is missing is skipped rather than treated as the
+/// next account: it cannot be launched, and reporting that as an error after
+/// the active account was already cleared left the user signed out anyway.
 pub fn sign_out_active() -> LauncherResult<Option<MsaAccountSummary>> {
-    clear_credentials()?;
-    let Some(next) = load_index()?.into_iter().next() else {
-        return Ok(None);
+    let _guard = store_guard();
+    let mut store = read_store_unlocked()?;
+    store.active = None;
+    let next = match store.first_usable_parked() {
+        Some(position) => {
+            let entry = store.parked.remove(position);
+            store.active = entry.credentials;
+            store.active.as_ref().map(|creds| summary(creds, true))
+        }
+        None => None,
     };
-    switch_account(&next.uuid).map(Some)
+    write_store_unlocked(&store)?;
+    Ok(next)
 }
 
 fn summary(creds: &MsaCredentials, active: bool) -> MsaAccountSummary {
@@ -1653,7 +1867,7 @@ async fn get_valid_credentials_inner(
         Ok(result) => result,
         Err(LauncherError::MsaAuthRequired) => {
             // Permanent: invalid_grant or expired_token
-            let _ = clear_credentials();
+            let _ = clear_account_credentials(&creds.uuid);
             return MsaCredentialOutcome::SignInRequired;
         }
         Err(e) => {
@@ -1662,7 +1876,7 @@ async fn get_valid_credentials_inner(
         }
     };
 
-    match store_credentials(&refreshed) {
+    match commit_refreshed(&refreshed) {
         Ok(()) => MsaCredentialOutcome::Valid(refreshed),
         Err(e) => MsaCredentialOutcome::RefreshFailed(e),
     }
@@ -2095,11 +2309,306 @@ mod tests {
             .collect()
     }
 
+    /// Start from an empty secret directory without creating the new store.
+    fn legacy_test_dir() -> TestMsaCredDir {
+        let dir = tempfile::tempdir().expect("temp dir for legacy MSA test credentials");
+        std::env::set_var("AGORA_TEST_SECRET_DIR", dir.path());
+        TestMsaCredDir(dir)
+    }
+
+    fn store_legacy(service: &str, account: &str, file: &str, value: &str) {
+        agora_core::auth::store_secret(service, account, file, CREDENTIALS_KEY_CONTEXT, value)
+            .expect("store legacy credential");
+    }
+
+    fn store_legacy_active(creds: &MsaCredentials) {
+        store_legacy(
+            KEYRING_SERVICE,
+            KEYRING_ACCOUNT,
+            CREDENTIALS_FALLBACK_FILE,
+            &serde_json::to_string(creds).unwrap(),
+        );
+    }
+
+    fn store_legacy_parked(creds: &MsaCredentials) {
+        let (account, file) = account_slot(&creds.uuid).unwrap();
+        store_legacy(
+            KEYRING_SERVICE,
+            &account,
+            &file,
+            &serde_json::to_string(creds).unwrap(),
+        );
+    }
+
+    fn store_legacy_index(entries: &[&MsaCredentials]) {
+        let index: Vec<AccountIndexEntry> = entries
+            .iter()
+            .map(|creds| AccountIndexEntry {
+                uuid: creds.uuid.clone(),
+                username: creds.username.clone(),
+            })
+            .collect();
+        store_legacy(
+            KEYRING_SERVICE,
+            ACCOUNT_INDEX_ACCOUNT,
+            ACCOUNT_INDEX_FILE,
+            &serde_json::to_string(&index).unwrap(),
+        );
+    }
+
+    fn store_legacy_index_raw(json: &str) {
+        store_legacy(
+            KEYRING_SERVICE,
+            ACCOUNT_INDEX_ACCOUNT,
+            ACCOUNT_INDEX_FILE,
+            json,
+        );
+    }
+
+    fn store_new_raw(json: &str) {
+        store_legacy(
+            KEYRING_SERVICE,
+            ACCOUNT_STORE_ACCOUNT,
+            ACCOUNT_STORE_FILE,
+            json,
+        );
+    }
+
+    fn stored_file_contents(file: &str) -> Vec<u8> {
+        let dir = std::env::var("AGORA_TEST_SECRET_DIR").unwrap();
+        std::fs::read(std::path::Path::new(&dir).join(file)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn migrating_the_old_slots_keeps_every_account() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = legacy_test_dir();
+        let alice = account("aaaa1111", "Alice");
+        let bob = account("bbbb2222", "Bob");
+        let cara = account("cccc3333", "Cara");
+        store_legacy_active(&alice);
+        store_legacy_parked(&bob);
+        store_legacy_parked(&cara);
+        store_legacy_index(&[&bob, &cara]);
+
+        assert_eq!(
+            names(),
+            vec![
+                ("Alice".into(), true),
+                ("Bob".into(), false),
+                ("Cara".into(), false)
+            ]
+        );
+
+        // The migrated store is a real store, not a read-through of the old slots.
+        switch_account("cccc3333").unwrap();
+        assert_eq!(load_credentials().unwrap().unwrap().username, "Cara");
+        let stored = agora_core::auth::load_secret(
+            KEYRING_SERVICE,
+            ACCOUNT_STORE_ACCOUNT,
+            ACCOUNT_STORE_FILE,
+            ACCOUNT_STORE_KEY_CONTEXT,
+        )
+        .unwrap()
+        .expect("migration must write the one store");
+        assert!(stored.contains("Cara"));
+    }
+
+    #[tokio::test]
+    async fn a_crash_after_the_migration_write_does_not_duplicate_or_resurrect_accounts() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = legacy_test_dir();
+        let alice = account("aaaa1111", "Alice");
+        store_legacy_active(&alice);
+        store_legacy_index(&[]);
+        assert_eq!(names(), vec![("Alice".into(), true)]);
+
+        // Simulate a crash between writing the new store and removing the old
+        // slots: both now exist, and the old ones name a different account.
+        let ghost = account("dddd4444", "Ghost");
+        store_legacy_active(&ghost);
+        store_legacy_index(&[&ghost]);
+
+        assert_eq!(
+            names(),
+            vec![("Alice".into(), true)],
+            "the new store is authoritative and the leftovers are inert"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_index_is_reported_and_never_read_as_empty() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = legacy_test_dir();
+        let bob = account("bbbb2222", "Bob");
+        store_legacy_active(&account("aaaa1111", "Alice"));
+        store_legacy_parked(&bob);
+        store_legacy_index_raw("{ this is not the account list");
+
+        let error = list_accounts().expect_err("a corrupt index must be an error");
+        assert_eq!(error.code(), "ERR_MSA_ACCOUNT_INDEX", "{error:?}");
+        let (account, file) = account_slot(&bob.uuid).unwrap();
+        assert!(
+            agora_core::auth::fallback_secret_present(&file),
+            "the parked token must not be deleted or forgotten"
+        );
+        let _ = account;
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_store_is_reported_and_never_read_as_empty() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = legacy_test_dir();
+        store_new_raw("{ not a store");
+
+        let error = list_accounts().expect_err("a corrupt store must be an error");
+        assert_eq!(error.code(), "ERR_MSA_ACCOUNT_STORE", "{error:?}");
+        assert!(load_credentials().is_err());
+    }
+
+    #[tokio::test]
+    async fn signing_out_skips_an_entry_without_a_parked_credential() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = legacy_test_dir();
+        let bob = account("bbbb2222", "Bob");
+        let cara = account("cccc3333", "Cara");
+        store_legacy_active(&account("aaaa1111", "Alice"));
+        // Bob is in the index but his parked credential is missing.
+        store_legacy_index(&[&bob, &cara]);
+        store_legacy_parked(&cara);
+
+        let next = sign_out_active()
+            .expect("a missing parked credential must not fail sign-out")
+            .expect("Cara becomes active");
+        assert_eq!(next.username, "Cara");
+        assert_eq!(names(), vec![("Cara".into(), true), ("Bob".into(), false)]);
+        assert!(list_accounts().unwrap()[1].needs_reauth);
+    }
+
+    #[tokio::test]
+    async fn signing_in_does_not_overwrite_an_active_account_it_cannot_read() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = legacy_test_dir();
+        store_new_raw("{ not a store");
+        let before = stored_file_contents(ACCOUNT_STORE_FILE);
+
+        let error = store_signed_in_account(&account("bbbb2222", "Bob"))
+            .expect_err("a failed read must stop the write");
+        assert_eq!(error.code(), "ERR_MSA_ACCOUNT_STORE", "{error:?}");
+        assert_eq!(
+            stored_file_contents(ACCOUNT_STORE_FILE),
+            before,
+            "the unreadable store must be left exactly as it was"
+        );
+    }
+
+    struct BlockingRefreshHttp {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl MsaRefreshHttp for BlockingRefreshHttp {
+        async fn refresh_credentials(
+            &self,
+            _clients: &HttpClients,
+            credentials: &MsaCredentials,
+        ) -> LauncherResult<MsaCredentials> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(MsaCredentials {
+                access_token: "refreshed_token".into(),
+                refresh_token: "refreshed_refresh".into(),
+                expires: Utc::now() + chrono::Duration::hours(1),
+                ..credentials.clone()
+            })
+        }
+    }
+
+    async fn expired_alice_with_parked_bob() -> (TestMsaCredDir, MsaCredentials, MsaCredentials) {
+        let td = write_test_msa_creds(&expired_creds());
+        let alice = MsaCredentials {
+            username: "Alice".into(),
+            uuid: "aaaa1111".into(),
+            ..expired_creds()
+        };
+        let bob = account("bbbb2222", "Bob");
+        store_credentials(&alice).unwrap();
+        store_signed_in_account(&bob).unwrap();
+        switch_account("aaaa1111").unwrap();
+        (td, alice, bob)
+    }
+
+    #[tokio::test]
+    async fn a_refresh_racing_a_switch_does_not_overwrite_the_switch() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let (_td, _alice, _bob) = expired_alice_with_parked_bob().await;
+        let http = BlockingRefreshHttp {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        };
+
+        let clients = test_clients();
+        let refresh = get_valid_credentials_inner(&http, &clients);
+        tokio::pin!(refresh);
+        tokio::select! {
+            outcome = &mut refresh => panic!("refresh finished before the switch: {outcome:?}"),
+            _ = http.started.notified() => {}
+        }
+
+        switch_account("bbbb2222").expect("switch while the refresh waits");
+        http.release.notify_one();
+        let outcome = refresh.await;
+        assert!(
+            matches!(outcome, MsaCredentialOutcome::Valid(_)),
+            "{outcome:?}"
+        );
+
+        assert_eq!(
+            load_credentials().unwrap().unwrap().username,
+            "Bob",
+            "the refresh must not overwrite the account the user switched to"
+        );
+        switch_account("aaaa1111").unwrap();
+        assert_eq!(
+            load_credentials().unwrap().unwrap().access_token,
+            "refreshed_token",
+            "the refreshed token belongs in Alice's parked entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_does_not_resurrect_an_account_signed_out_during_it() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let (_td, _alice, _bob) = expired_alice_with_parked_bob().await;
+        let http = BlockingRefreshHttp {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        };
+
+        let clients = test_clients();
+        let refresh = get_valid_credentials_inner(&http, &clients);
+        tokio::pin!(refresh);
+        tokio::select! {
+            outcome = &mut refresh => panic!("refresh finished before sign-out: {outcome:?}"),
+            _ = http.started.notified() => {}
+        }
+
+        remove_account("aaaa1111").expect("sign Alice out while the refresh waits");
+        http.release.notify_one();
+        let outcome = refresh.await;
+        assert!(
+            matches!(outcome, MsaCredentialOutcome::Valid(_)),
+            "{outcome:?}"
+        );
+
+        assert_eq!(names(), vec![("Bob".into(), true)]);
+    }
+
     #[tokio::test]
     async fn signing_in_a_second_account_keeps_the_first() {
         let _test_lock = TEST_MSA_MUTEX.lock().await;
         let _td = write_test_msa_creds(&account("aaaa1111", "Alice"));
-        let _ = store_index(&[]);
 
         store_signed_in_account(&account("bbbb2222", "Bob")).unwrap();
         assert_eq!(names(), vec![("Bob".into(), true), ("Alice".into(), false)]);
@@ -2111,14 +2620,12 @@ mod tests {
         // Signing in to the parked account makes it active without a copy.
         store_signed_in_account(&account("aaaa1111", "Alice")).unwrap();
         assert_eq!(names(), vec![("Alice".into(), true), ("Bob".into(), false)]);
-        let _ = store_index(&[]);
     }
 
     #[tokio::test]
     async fn switching_and_removing_accounts() {
         let _test_lock = TEST_MSA_MUTEX.lock().await;
         let _td = write_test_msa_creds(&account("aaaa1111", "Alice"));
-        let _ = store_index(&[]);
         store_signed_in_account(&account("bbbb2222", "Bob")).unwrap();
         store_signed_in_account(&account("cccc3333", "Cara")).unwrap();
 

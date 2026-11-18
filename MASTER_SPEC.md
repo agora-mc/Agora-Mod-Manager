@@ -3035,6 +3035,43 @@ new sign-in; importing it from the keyring was rejected because that import woul
 after every portable sign-out. The Settings notice names portable mode as the reason for the
 degraded storage, because on a portable copy it is the reason.
 
+### 22.5 One Account Store, One Write, and Offline Play (supersedes 22.4 on account storage)
+
+The active Microsoft account, every parked account and the list that names them are now one
+JSON secret (`msa-accounts-store`) replaced in one write. The previous layout kept the active
+slot, a slot per parked account and an index as separate secrets with no shared lock, so a
+refresh, an account switch and a sign-out could interleave: a refresh could overwrite a switch
+(M1), a corrupt index was read as an empty list and orphaned parked tokens (L2), and a failed
+read of the active slot let sign-in overwrite it (L3). A single record removes the ordering
+question entirely: there is no step at which the list and the credentials it names can
+disagree, and a crash leaves the previous complete store or the new one. `MSA_STORE_MUTEX`
+serializes read-modify-write inside the process; the refresh path holds it only around the load
+and the commit, never across the network call.
+
+The refresh commit is reconciled, not blind: if the refreshed account is still active it replaces
+the active credential; if it was switched away from, the new token updates its parked entry; if
+it was signed out during the refresh, the result is dropped rather than resurrecting the account.
+A permanent `invalid_grant` clears that account's credential wherever it sits. Sign-out skips an
+index entry whose credential is missing instead of failing after already clearing the active
+account, and a corrupt index or store is reported as an error, never read as empty.
+
+The one-blob design depends on 22.3: Windows Credential Manager's 2.5 KB cap was the reason each
+account used to get its own entry, and Windows now writes the DPAPI-protected file instead. The
+other keyrings and the encrypted-file fallback accept the combined record.
+
+The first read migrates the old active/parked/index secrets into the store and then removes them;
+legacy secrets are read strictly, so a corrupt one is an error. A crash between the new write and
+the old cleanup is harmless because every read looks for the new store first.
+
+**Offline play.** A direct launch whose Microsoft refresh fails for lack of network (DNS,
+connect, timeout, a 5xx), because Lockdown Mode is on, or because the Microsoft switch is off
+continues with the stored profile (name and UUID) and a placeholder access token. The game's
+argument contract accepts this for a local session; only single-player works. The launch result
+and both adapters carry `Playing offline: online servers and Realms will not accept this session.`
+plus the reason. A 4xx refusal, including `invalid_grant`, never falls back: the player must sign
+in again. A refresh that cannot be renewed for any other reason keeps the stored credential and
+fails the launch as before.
+
 ---
 
 ## 23. RELIABILITY, RECOVERY & REPRODUCIBILITY

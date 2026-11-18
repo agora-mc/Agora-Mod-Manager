@@ -1461,6 +1461,16 @@ fn fallback_secret_path(file_name: &str) -> Option<std::path::PathBuf> {
     Some(fallback_data_dir()?.join(file_name))
 }
 
+/// Whether a fallback file for this credential name exists, without reading it.
+///
+/// Lets a caller distinguish "nothing stored" from "a file is there but did not
+/// decrypt". [`load_secret`] reports both as `None` by design, and a caller that
+/// must fail closed (an account store) needs the difference. The OS keyring is
+/// not consulted: an entry that cannot be read there is already an error.
+pub fn fallback_secret_present(fallback_file: &str) -> bool {
+    fallback_secret_path(fallback_file).is_some_and(|path| path.exists())
+}
+
 /// Whether the OS keyring may be used for the GitHub token.
 fn keyring_for_token() -> bool {
     !using_test_token_store() && !portable_credentials()
