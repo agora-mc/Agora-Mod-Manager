@@ -253,6 +253,15 @@ pub fn save_icon(ctx: &Ctx, item_id_or_prefix: &str, bytes: &[u8]) -> Result<boo
     let _lock = ctx
         .lock_manager
         .acquire(LockResource::ContentStore, "content-icon")?;
+    save_icon_locked(ctx, item_id_or_prefix, bytes)
+}
+
+/// [`save_icon`] for a caller that already holds the content-store lock.
+fn save_icon_locked(
+    ctx: &Ctx,
+    item_id_or_prefix: &str,
+    bytes: &[u8],
+) -> Result<bool, ContentError> {
     let item = content_store::get_item(ctx, item_id_or_prefix)?;
     let sha256 = content_store::store_object_bytes_locked(ctx, bytes)?;
     let mut metadata = metadata_of(&item);
@@ -272,7 +281,11 @@ pub async fn fetch_icon(
         Ok(image) => image,
         Err(_) => return Ok(false),
     };
-    save_icon(ctx, item_id_or_prefix, &image.bytes)
+    let _lock = ctx
+        .lock_manager
+        .acquire_async(LockResource::ContentStore, "content-icon")
+        .await?;
+    save_icon_locked(ctx, item_id_or_prefix, &image.bytes)
 }
 
 /// Fetch `url` once and save it on every readable item that came from the catalog entry
@@ -299,7 +312,8 @@ pub async fn fetch_icon_for_catalog(
     // together, so a sweep cannot delete the icon in between.
     let _lock = ctx
         .lock_manager
-        .acquire(LockResource::ContentStore, "content-icons")?;
+        .acquire_async(LockResource::ContentStore, "content-icons")
+        .await?;
     let sha256 = content_store::store_object_bytes_locked(ctx, &image.bytes)?;
     let mut saved = 0;
     for item in matches {

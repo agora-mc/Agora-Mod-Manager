@@ -471,12 +471,16 @@ pub async fn sweep_all_updates(ctx: Ctx) -> Result<SweepSummary, String> {
         }
 
         // Respect per-instance lock like maintenance.rs:66-80.
-        let lock = match ctx.lock_manager.acquire_with_timeout(
-            agora_core::lock_manager::LockResource::Instance(row.instance_id.clone()),
-            "update-sweep",
-            Duration::from_millis(25),
-            None,
-        ) {
+        let lock = match ctx
+            .lock_manager
+            .acquire_with_timeout_async(
+                agora_core::lock_manager::LockResource::Instance(row.instance_id.clone()),
+                "update-sweep",
+                Duration::from_millis(25),
+                None,
+            )
+            .await
+        {
             Ok(lock) => lock,
             Err(_) => {
                 summary.skipped += 1;
@@ -500,12 +504,15 @@ pub async fn sweep_all_updates(ctx: Ctx) -> Result<SweepSummary, String> {
             Ok(updates) => {
                 // Re-take the lock to write, so the comparison and the write
                 // cannot be split by the very operation being guarded against.
-                let write_lock = ctx.lock_manager.acquire_with_timeout(
-                    agora_core::lock_manager::LockResource::Instance(row.instance_id.clone()),
-                    "update-sweep-commit",
-                    Duration::from_millis(250),
-                    None,
-                );
+                let write_lock = ctx
+                    .lock_manager
+                    .acquire_with_timeout_async(
+                        agora_core::lock_manager::LockResource::Instance(row.instance_id.clone()),
+                        "update-sweep-commit",
+                        Duration::from_millis(250),
+                        None,
+                    )
+                    .await;
                 if write_lock.is_err() {
                     // Something is operating on this instance right now; its
                     // own refresh will be newer than ours.

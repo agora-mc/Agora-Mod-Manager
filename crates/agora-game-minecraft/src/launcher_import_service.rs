@@ -1520,10 +1520,11 @@ impl LauncherImportService {
         let lock = self
             .ctx
             .lock_manager
-            .acquire(
+            .acquire_async(
                 agora_core::lock_manager::LockResource::Instance(dest_id.clone()),
                 "launcher-import-execute",
             )
+            .await
             .map_err(|e| LauncherError::Generic {
                 code: "ERR_LOCK_ACQUIRE".into(),
                 message: format!("Cannot lock instance '{}': {e}", dest_id),

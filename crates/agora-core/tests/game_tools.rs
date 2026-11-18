@@ -4372,17 +4372,21 @@ fn user_tool_edits_wait_for_the_instance_lock() {
     f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
     let id = f.id().to_string();
     let hold = |duration: Duration| {
-        // Take the lock on the helper thread, not this one: a thread may
-        // re-enter its own lock, so holding it here would not contend.
+        // The holder must be another thread; wait until it actually holds the
+        // lock, or the contender can win the race and not wait at all.
         let manager = f.ctx.lock_manager.clone();
         let held_id = id.clone();
-        std::thread::spawn(move || {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
             let guard = manager
                 .acquire(LockResource::Instance(held_id), "test")
                 .unwrap();
+            ready_tx.send(()).unwrap();
             std::thread::sleep(duration);
             drop(guard);
-        })
+        });
+        ready_rx.recv().unwrap();
+        handle
     };
 
     let released = hold(Duration::from_millis(700));

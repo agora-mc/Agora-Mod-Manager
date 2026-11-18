@@ -659,7 +659,14 @@ pub async fn install(
             std::fs::write(&file_path, &bytes).map_err(|e| generic("ERR_CATALOG_WRITE", e))?;
 
             // The objects a verify found damaged are replaced by this import, not trusted.
-            let outcome = content_store::add_archive_replacing(
+            let _content_lock = ctx
+                .lock_manager
+                .acquire_async(
+                    crate::lock_manager::LockResource::ContentStore,
+                    "content-add",
+                )
+                .await?;
+            let outcome = content_store::add_archive_replacing_locked(
                 ctx,
                 &file_path,
                 Some(&request.item.name),

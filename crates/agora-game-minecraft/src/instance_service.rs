@@ -1381,20 +1381,30 @@ impl InstanceService {
         } else {
             (new_id.as_str(), source_id.as_str())
         };
-        let _first_lock = match self.ctx.lock_manager.acquire(
-            agora_core::lock_manager::LockResource::Instance(first_id.to_owned()),
-            "clone",
-        ) {
+        let _first_lock = match self
+            .ctx
+            .lock_manager
+            .acquire_async(
+                agora_core::lock_manager::LockResource::Instance(first_id.to_owned()),
+                "clone",
+            )
+            .await
+        {
             Ok(l) => l,
             Err(e) => {
                 op.fail(e.to_string());
                 return Err(e);
             }
         };
-        let _second_lock = match self.ctx.lock_manager.acquire(
-            agora_core::lock_manager::LockResource::Instance(second_id.to_owned()),
-            "clone",
-        ) {
+        let _second_lock = match self
+            .ctx
+            .lock_manager
+            .acquire_async(
+                agora_core::lock_manager::LockResource::Instance(second_id.to_owned()),
+                "clone",
+            )
+            .await
+        {
             Ok(l) => l,
             Err(e) => {
                 op.fail(e.to_string());
@@ -1727,10 +1737,14 @@ impl InstanceService {
             .ctx
             .operation_manager
             .register_for_instance("Create instance", &instance_id);
-        let _lock = self.ctx.lock_manager.acquire(
-            agora_core::lock_manager::LockResource::Instance(instance_id.clone()),
-            "create",
-        )?;
+        let _lock = self
+            .ctx
+            .lock_manager
+            .acquire_async(
+                agora_core::lock_manager::LockResource::Instance(instance_id.clone()),
+                "create",
+            )
+            .await?;
         let dir = self.ctx.paths.instance_dir(&instance_id)?;
         if dir.exists() {
             op.fail(format!("An instance named '{instance_id}' already exists."));

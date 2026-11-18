@@ -640,10 +640,14 @@ pub async fn execute_migration(
         Ok(id) => id,
         Err(error) => return failed("precondition", error.to_string()),
     };
-    let _guard = match ctx.lock_manager.acquire(
-        agora_core::lock_manager::LockResource::Instance(instance_id.clone()),
-        "version-migration",
-    ) {
+    let _guard = match ctx
+        .lock_manager
+        .acquire_async(
+            agora_core::lock_manager::LockResource::Instance(instance_id.clone()),
+            "version-migration",
+        )
+        .await
+    {
         Ok(guard) => guard,
         Err(error) => return failed("lock", error.to_string()),
     };

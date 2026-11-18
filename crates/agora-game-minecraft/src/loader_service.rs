@@ -114,10 +114,14 @@ impl LoaderService {
         target_version: &str,
     ) -> LauncherResult<LoaderChangeResult> {
         let instance_id = self.sanitize_instance_id(instance_id)?;
-        let _lock = self.ctx.lock_manager.acquire(
-            agora_core::lock_manager::LockResource::Instance(instance_id.clone()),
-            "change-loader",
-        )?;
+        let _lock = self
+            .ctx
+            .lock_manager
+            .acquire_async(
+                agora_core::lock_manager::LockResource::Instance(instance_id.clone()),
+                "change-loader",
+            )
+            .await?;
         self.change_loader_version_locked(&instance_id, target_version, false)
             .await
     }
@@ -132,10 +136,14 @@ impl LoaderService {
         allow_indeterminate: bool,
     ) -> LauncherResult<LoaderChangeResult> {
         let instance_id = self.sanitize_instance_id(instance_id)?;
-        let _lock = self.ctx.lock_manager.acquire(
-            agora_core::lock_manager::LockResource::Instance(instance_id.clone()),
-            "change-loader",
-        )?;
+        let _lock = self
+            .ctx
+            .lock_manager
+            .acquire_async(
+                agora_core::lock_manager::LockResource::Instance(instance_id.clone()),
+                "change-loader",
+            )
+            .await?;
         self.change_loader_version_locked(&instance_id, target_version, allow_indeterminate)
             .await
     }
@@ -399,10 +407,14 @@ impl LoaderService {
             ProgressPhase::Installing,
             format!("Ensuring {} {}", tuple.loader, tuple.loader_version),
         ));
-        let _lock = self.ctx.lock_manager.acquire(
-            agora_core::lock_manager::LockResource::LoaderInstall,
-            "loader-install",
-        )?;
+        let _lock = self
+            .ctx
+            .lock_manager
+            .acquire_async(
+                agora_core::lock_manager::LockResource::LoaderInstall,
+                "loader-install",
+            )
+            .await?;
 
         let conn = match agora_core::db::local_state_connection(&self.ctx.paths.local_state_db()) {
             Ok(c) => c,

@@ -664,10 +664,15 @@ impl ImportService {
         }
 
         // ── Phase 5: DB registration (atomic — no cancellation check) ──
-        let _lock = match self.ctx.lock_manager.acquire(
-            agora_core::lock_manager::LockResource::Instance(result.instance_id.clone()),
-            "import-register",
-        ) {
+        let _lock = match self
+            .ctx
+            .lock_manager
+            .acquire_async(
+                agora_core::lock_manager::LockResource::Instance(result.instance_id.clone()),
+                "import-register",
+            )
+            .await
+        {
             Ok(l) => l,
             Err(e) => {
                 let _ = rollback();
