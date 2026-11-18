@@ -279,20 +279,34 @@ def _github_request(
     raise last_exc or RuntimeError(f"GitHub API {method} {path} exhausted retries")
 
 
-def _load_poll_blacklist() -> set[str]:
-    """Read registry/governance/poll_blacklist.json. Returns empty set on any error.
+def _load_poll_blacklist(*, allow_partial: bool = False) -> set[str]:
+    """Read registry/governance/poll_blacklist.json or stop the run.
 
-    The schema is `{"usernames": ["name1", "name2"]}`.
+    The file is committed, so a missing or malformed copy means something
+    broke. Treating it as empty would count votes from blacklisted users.
+    The schema is ``{"usernames": ["name1", "name2"]}``.
     """
     path = REGISTRY_DIR / "governance" / "poll_blacklist.json"
     try:
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
-        names = data.get("usernames", [])
-        return {str(n).lower() for n in names if isinstance(n, str)}
     except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Could not load poll_blacklist.json (%s); treating as empty.", exc)
+        message = f"cannot read poll blacklist {path}: {exc}"
+        if not allow_partial:
+            raise GovernanceError(message) from exc
+        logger.warning("%s; continuing because partial governance is allowed.", message)
         return set()
+    names = data.get("usernames") if isinstance(data, dict) else None
+    if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+        message = (
+            f"malformed poll blacklist {path}: expected an object with a "
+            "'usernames' list of strings"
+        )
+        if not allow_partial:
+            raise GovernanceError(message)
+        logger.warning("%s; continuing because partial governance is allowed.", message)
+        return set()
+    return {name.lower() for name in names}
 
 
 # ---------------------------------------------------------------------------
@@ -3852,7 +3866,9 @@ def compile_registry(
     if _governance_mode == GovernanceMode.OFF:
         logger.info("Governance mode=off; zero governance reads.")
     elif _gh_token:
-        _blacklist = _load_poll_blacklist()
+        _blacklist = _load_poll_blacklist(
+            allow_partial=allow_partial_governance,
+        )
         _governance_results = run_governance_pipeline(
             [item for _, item in all_items],
             mode=_governance_mode,

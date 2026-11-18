@@ -32,7 +32,7 @@ stops with an error naming the source when:
 
 - a GitHub issues, reactions, or user-profile request fails or returns a
   non-success status;
-- `vote_issues.json`, the input governance state, or
+- `vote_issues.json`, `poll_blacklist.json`, the input governance state, or
   `quarantine_decisions.json` is missing, unreadable, or malformed;
 - the state file names a different `governance_repository` or `policy` than
   the run was configured for;

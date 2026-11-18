@@ -472,57 +472,56 @@ class TestGetRegistryRepo(unittest.TestCase):
 class TestLoadPollBlacklist(unittest.TestCase):
     """Tests for _load_poll_blacklist."""
 
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._patch = mock.patch.object(_compile, "REGISTRY_DIR", Path(self._tmp.name))
+        self._patch.start()
+        self.target = Path(self._tmp.name) / "governance" / "poll_blacklist.json"
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def _write(self, text: str) -> None:
+        self.target.write_text(text, encoding="utf-8")
+
     def test_valid_json_returns_lowercase_set(self):
         """Valid JSON with usernames is returned as a lowercase set."""
-        blacklist_dir = _compile.REGISTRY_DIR / "governance"
-        target = blacklist_dir / "poll_blacklist.json"
-        # Back up if exists.
-        backup = None
-        if target.exists():
-            backup = target.read_bytes()
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(json.dumps({"usernames": ["Alice", "BOB"]}), encoding="utf-8")
-            result = _compile._load_poll_blacklist()
-            self.assertEqual(result, {"alice", "bob"})
-        finally:
-            if backup is not None:
-                target.write_bytes(backup)
-            else:
-                target.unlink(missing_ok=True)
+        self._write(json.dumps({"usernames": ["Alice", "BOB"]}))
+        self.assertEqual(_compile._load_poll_blacklist(), {"alice", "bob"})
 
-    def test_missing_file_returns_empty_set(self):
-        """When the file does not exist, returns empty set (no crash)."""
-        blacklist_dir = _compile.REGISTRY_DIR / "governance"
-        target = blacklist_dir / "poll_blacklist.json"
-        backup = None
-        if target.exists():
-            backup = target.read_bytes()
-        try:
-            target.unlink(missing_ok=True)
-            result = _compile._load_poll_blacklist()
-            self.assertEqual(result, set())
-        finally:
-            if backup is not None:
-                target.write_bytes(backup)
+    def test_missing_file_stops_the_run_and_names_the_file(self):
+        """A committed governance input must exist; absence is not an empty poll list."""
+        with self.assertRaisesRegex(_compile.GovernanceError, "poll_blacklist.json"):
+            _compile._load_poll_blacklist()
 
-    def test_malformed_json_returns_empty_set(self):
-        """Invalid JSON returns empty set (no crash)."""
-        blacklist_dir = _compile.REGISTRY_DIR / "governance"
-        target = blacklist_dir / "poll_blacklist.json"
-        backup = None
-        if target.exists():
-            backup = target.read_bytes()
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text("{not valid json!!!", encoding="utf-8")
-            result = _compile._load_poll_blacklist()
-            self.assertEqual(result, set())
-        finally:
-            if backup is not None:
-                target.write_bytes(backup)
-            else:
-                target.unlink(missing_ok=True)
+    def test_malformed_json_stops_the_run_and_names_the_file(self):
+        """Invalid JSON must stop rather than count blacklisted users' votes."""
+        self._write("{not valid json!!!")
+        with self.assertRaisesRegex(_compile.GovernanceError, "poll_blacklist.json"):
+            _compile._load_poll_blacklist()
+
+    def test_wrong_shape_stops_the_run(self):
+        """A JSON object without a usernames list is malformed."""
+        self._write(json.dumps({"names": ["alice"]}))
+        with self.assertRaisesRegex(_compile.GovernanceError, "usernames"):
+            _compile._load_poll_blacklist()
+
+    def test_override_returns_empty_and_logs_when_missing(self):
+        """The maintainer override logs the skipped input and proceeds."""
+        with self.assertLogs("compiler", level="WARNING") as logs:
+            result = _compile._load_poll_blacklist(allow_partial=True)
+        self.assertEqual(result, set())
+        self.assertTrue(any("poll_blacklist.json" in line for line in logs.output))
+
+    def test_override_returns_empty_and_logs_when_malformed(self):
+        """The maintainer override logs the skipped malformed input and proceeds."""
+        self._write("{not valid json!!!")
+        with self.assertLogs("compiler", level="WARNING") as logs:
+            result = _compile._load_poll_blacklist(allow_partial=True)
+        self.assertEqual(result, set())
+        self.assertTrue(any("poll_blacklist.json" in line for line in logs.output))
 
 
 # ---------------------------------------------------------------------------
