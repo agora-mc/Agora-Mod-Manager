@@ -3057,7 +3057,7 @@ Keeping instances safe to change: safe operations, Last Known Good, content-addr
 3. **React dialogs return user decisions and do not execute business operations.** A dialog's only side effect is calling `onConfirm()` or `onCancel()`. The parent component dispatches backend commands.
 4. **Process state survives navigation.** Running-instance identity, PID, console subscription, and exit status live in a controller that outlives page components. React may query backend state after remount.
 5. **User-changing operations are previewable and reversible.** Every manifest mutation produces a plan that shows what changes before execution. Snapshots enable rollback.
-6. **Existing snapshots become the basis of last-known-good recovery.** A successful launch establishes LKG state. Changes since LKG are visible. One-click restore returns to LKG.
+6. **Existing snapshots become the basis of Last Known Good recovery.** A successful launch establishes LKG state. Changes since LKG are visible. One-click restore returns to LKG.
 7. **Desktop UX work must include meaningful integration tests.** Mocked UI tests, Rust integration tests, and native smoke checks are separate layers. A test that only asserts the page rendered is not sufficient.
 
 #### 19.13.3 Release C install-transaction architecture
@@ -3188,7 +3188,7 @@ unreadable with the reason and retention leaves it alone. The Minecraft folder
 list has moved out of core into the Minecraft package, which declares it, so
 core holds no game's folders.
 
-**Game-instance last-known-good and backups.** A game-instance launch takes a
+**Game-instance Last Known Good and backups.** A game-instance launch takes a
 pre-launch snapshot after deployment settles the state, and skips it when the
 content hash of the declared state is unchanged since the newest snapshot. When
 the session ends, the session ledger's verdict is mapped to §23.2's classes

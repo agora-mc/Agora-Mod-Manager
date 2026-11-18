@@ -437,7 +437,7 @@ pub struct LkgDiff {
 fn fingerprint_entries(entries: &[(String, Option<String>)], data: &GameSnapshotData) -> String {
     let mut hasher = sha2::Sha256::new();
     use sha2::Digest;
-    hasher.update(b"agora-game-lkg-state-v1");
+    hasher.update(b"agora-instance-lkg-state-v1");
     for (path, hash) in entries {
         hasher.update((path.len() as u64).to_le_bytes());
         hasher.update(path.as_bytes());

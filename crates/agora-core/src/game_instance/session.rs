@@ -43,6 +43,7 @@ pub struct StopOutcome {
 /// executable), which is not the launched program when a framework loader starts the game and
 /// exits. `session_id` is [`LaunchedInstance::session_id`](super::LaunchedInstance). Recording is
 /// best effort: the report comes back whether or not it could be written.
+#[allow(clippy::too_many_arguments)]
 pub fn watch_session(
     ctx: &Ctx,
     instance_id: &str,

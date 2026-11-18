@@ -2046,9 +2046,7 @@ fn import_game_backup(
     })();
 
     let _ = fs::remove_dir_all(&staging_dir);
-    if let Err(error) = write_result {
-        return Err(error);
-    }
+    write_result?;
     let _ = crate::snapshot::mark_instance_mutated(instance_dir);
     Ok(manifest.snapshot.clone())
 }
