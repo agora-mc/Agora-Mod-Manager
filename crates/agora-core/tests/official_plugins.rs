@@ -3283,3 +3283,54 @@ fn consent_is_bound_to_the_previewed_package_digest() {
         .unwrap();
     assert_eq!(world.service.list().len(), 1);
 }
+
+/// The development-folder half of the same rule: an author's answer covers the
+/// manifest and files they previewed, not an edit made before the install.
+#[test]
+fn consent_is_bound_to_the_previewed_folder_digest() {
+    let world = World::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("dev");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(
+        folder.join("agora-plugin.json"),
+        r#"{
+            "manifest": 1,
+            "id": "acme.devpreview",
+            "name": "Dev preview",
+            "version": "1.0.0",
+            "license": "GPL-3.0-only",
+            "apiRange": ">=0.1, <0.2",
+            "entrypoint": "main.js",
+            "capabilities": { "required": ["instance:read"] }
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        folder.join("main.js"),
+        b"export function noop() { return 1; }\n",
+    )
+    .unwrap();
+
+    let preview = world.service.preview_folder(&folder).unwrap();
+    std::fs::write(
+        folder.join("main.js"),
+        b"export function noop() { return 2; }\n",
+    )
+    .unwrap();
+
+    let consent = Consent {
+        capabilities: true,
+        scripts: true,
+        previewed_digest: Some(preview.package_digest),
+    };
+    let error = world
+        .service
+        .add_development_folder(&folder, consent)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("changed since you approved it"),
+        "{error}"
+    );
+    assert!(world.service.list().is_empty(), "nothing may be registered");
+}
