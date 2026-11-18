@@ -70,8 +70,9 @@ Before sharing diagnostic output, remove tokens, webhook URLs, private usernames
 
 The compiler requires every catalog vote issue to carry the `registry-vote`
 label before it will parse reactions on it as votes. This applies to both the
-active governance pipeline (`run_governance_pipeline`, driven by
-`registry/governance/vote_issues.json`) and the legacy Pass 1 vote harvest.
+active governance pipeline (`run_governance_pipeline` in
+`compiler/governance.py`, driven by `registry/governance/vote_issues.json`).
+The compiler has a single governance implementation; there is no legacy pass.
 
 Consequences of an unlabeled vote issue:
 
