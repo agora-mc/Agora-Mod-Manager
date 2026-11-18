@@ -725,6 +725,11 @@ impl CoreContext {
         Ok(registry.into_connection())
     }
 
+    /// The verified catalog's digest, or `None` when there is no catalog.
+    pub fn registry_digest(&self) -> LauncherResult<Option<String>> {
+        crate::registry_sync::verified_registry_digest(self.paths.root(), &self.registry_trust)
+    }
+
     pub fn paths(&self) -> &AppPaths {
         &self.paths
     }

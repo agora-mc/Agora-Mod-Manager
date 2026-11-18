@@ -819,6 +819,39 @@ fn cached_catalog_summary(app_data_dir: &Path) -> Option<CachedCatalogSummary> {
     })
 }
 
+/// The digest of the verified catalog, for cache keys and lockfile revisions.
+///
+/// A bundle answers with the SHA-256 its signed header names, after checking the
+/// readable database against it. A pre-bundle cache is hashed only after its
+/// signature verifies. `None` means there is no catalog to digest.
+pub fn verified_registry_digest(
+    app_data_dir: &Path,
+    trust: &RegistryTrust,
+) -> LauncherResult<Option<String>> {
+    let bundle_path =
+        paths::registry_bundle_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
+    if bundle_path.exists() {
+        let header = load_header(&bundle_path, trust).map_err(|error| LauncherError::Generic {
+            code: "ERR_REGISTRY_SIGNATURE_INVALID".into(),
+            message: format!("The catalog bundle could not be used: {error}."),
+        })?;
+        ensure_database(app_data_dir, &bundle_path, &header, None, trust)?;
+        return Ok(Some(header.db_sha256.to_ascii_lowercase()));
+    }
+
+    let db_path =
+        paths::registry_db_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let db_bytes = std::fs::read(&db_path).map_err(|_| LauncherError::RegistryMissing)?;
+    let sig_bytes = paths::registry_sig_path(app_data_dir)
+        .ok()
+        .and_then(|path| std::fs::read(path).ok());
+    verify_legacy_pair(trust, &db_bytes, sig_bytes.as_deref())?;
+    Ok(Some(hex::encode(Sha256::digest(&db_bytes))))
+}
+
 /// Return the current registry status without performing a network check.
 pub fn get_status(app_data_dir: &Path, local_state_path: &Path) -> RegistryStatus {
     let cached = cached_catalog_summary(app_data_dir);
@@ -2329,6 +2362,27 @@ mod tests {
         assert!(
             !db_path.exists(),
             "reported as quarantined, but the tampered db is still at registry.db"
+        );
+    }
+
+    /// Cache keys use the signed payload hash, so they cannot be made to
+    /// disagree with the bytes the launcher is allowed to read.
+    #[test]
+    fn the_verified_digest_is_the_signed_payload_hash() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(12);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let header = fresh_header(&key, &payload);
+        write_bundle(dir.path(), "registry.bundle", &key, &header, &payload);
+
+        assert_eq!(
+            verified_registry_digest(dir.path(), &trust).unwrap(),
+            Some(header.db_sha256.clone())
+        );
+        assert_eq!(
+            verified_registry_digest(tempfile::TempDir::new().unwrap().path(), &trust,).unwrap(),
+            None
         );
     }
 

@@ -29,7 +29,6 @@ use agora_core::http_client::{self, ClientCategory, HttpClients};
 use agora_core::models::{InstalledMod, InstanceManifest, ModVersionCandidate};
 use agora_core::registry::{self, ManifestDeps};
 use serde::Deserialize;
-use sha2::Digest;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
@@ -512,17 +511,10 @@ impl Resolver {
     // ------------------------------------------------------------------
 
     fn compute_registry_revision(&self) -> LauncherResult<String> {
-        let path = self.ctx.paths.registry_db();
-        if !path.is_file() {
-            return Ok("registry-unavailable".into());
-        }
-        let bytes = std::fs::read(&path).map_err(|e| LauncherError::Generic {
-            code: "ERR_REGISTRY_READ".into(),
-            message: format!("Could not read registry: {e}"),
-        })?;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(bytes);
-        Ok(format!("{:x}", hasher.finalize()))
+        Ok(self
+            .ctx
+            .registry_digest()?
+            .unwrap_or_else(|| "registry-unavailable".into()))
     }
 
     // ------------------------------------------------------------------
