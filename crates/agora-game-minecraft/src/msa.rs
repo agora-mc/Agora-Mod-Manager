@@ -1135,6 +1135,9 @@ fn commit_refreshed(refreshed: &MsaCredentials) -> LauncherResult<()> {
         return Ok(());
     }
     let mut store = read_store_unlocked()?;
+    if repair_pending() {
+        return Ok(());
+    }
     if store
         .active
         .as_ref()
@@ -1156,6 +1159,9 @@ fn clear_account_credentials(uuid: &str) -> LauncherResult<()> {
         return Ok(());
     }
     let mut store = read_store_unlocked()?;
+    if repair_pending() {
+        return Ok(());
+    }
     if store
         .active
         .as_ref()
@@ -1212,6 +1218,7 @@ pub fn store_credentials(creds: &MsaCredentials) -> LauncherResult<()> {
     let _guard = store_guard();
     ensure_accounts_writable()?;
     let mut store = read_store_unlocked()?;
+    ensure_accounts_writable()?;
     store.active = Some(creds.clone());
     store.remove_parked(&creds.uuid);
     write_store_unlocked(&store)
@@ -1223,6 +1230,7 @@ pub fn clear_credentials() -> LauncherResult<()> {
     let _guard = store_guard();
     ensure_accounts_writable()?;
     let mut store = read_store_unlocked()?;
+    ensure_accounts_writable()?;
     store.active = None;
     write_store_unlocked(&store)
 }
@@ -2069,6 +2077,7 @@ fn store_signed_in_account(creds: &MsaCredentials) -> LauncherResult<()> {
     let _guard = store_guard();
     ensure_accounts_writable()?;
     let mut store = read_store_unlocked()?;
+    ensure_accounts_writable()?;
     if let Some(current) = store.active.clone() {
         if !same_account(&current.uuid, &creds.uuid) {
             store.add_parked(&current);
@@ -2095,6 +2104,7 @@ pub fn switch_account(uuid: &str) -> LauncherResult<MsaAccountSummary> {
     let _guard = store_guard();
     ensure_accounts_writable()?;
     let mut store = read_store_unlocked()?;
+    ensure_accounts_writable()?;
     let target = store
         .parked
         .iter()
@@ -2127,6 +2137,7 @@ pub fn remove_account(uuid: &str) -> LauncherResult<()> {
     let _guard = store_guard();
     ensure_accounts_writable()?;
     let mut store = read_store_unlocked()?;
+    ensure_accounts_writable()?;
     if store
         .active
         .as_ref()
@@ -2153,6 +2164,7 @@ pub fn sign_out_active() -> LauncherResult<Option<MsaAccountSummary>> {
     let _guard = store_guard();
     ensure_accounts_writable()?;
     let mut store = read_store_unlocked()?;
+    ensure_accounts_writable()?;
     store.active = None;
     let next = match store.first_usable_parked() {
         Some(position) => {
@@ -3082,6 +3094,23 @@ mod tests {
             .expect_err("adding an account must be refused");
         assert_eq!(add_error.code(), ACCOUNT_STORE_NEEDS_REPAIR_CODE);
         assert!(add_error.to_string().contains("repair"));
+    }
+
+    #[tokio::test]
+    async fn a_first_switch_on_an_unread_index_is_still_refused() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = legacy_test_dir();
+        let alice = account("aaaa1111", "Alice");
+        let bob = account("bbbb2222", "Bob");
+        store_legacy_active(&alice);
+        store_legacy_parked(&bob);
+        store_legacy_index_raw("{ this is not the account list");
+
+        // No earlier read: the detection happens inside this call.
+        let error = switch_account("bbbb2222").expect_err("switching must be refused");
+        assert_eq!(error.code(), ACCOUNT_STORE_NEEDS_REPAIR_CODE);
+
+        assert_eq!(load_credentials().unwrap().unwrap().username, "Alice");
     }
 
     #[tokio::test]
