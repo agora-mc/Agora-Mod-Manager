@@ -107,6 +107,24 @@ impl OverridePolicy {
             }
         }
     }
+
+    /// Whether a path in a pack's index `files` list is refused outright.
+    ///
+    /// The `files` list is where a pack's mods live, so a `.jar` there is its
+    /// payload and is allowed. What no pack needs is a native executable or
+    /// script (Minecraft never runs one) or a file Agora keeps for itself.
+    /// Shared by the override extractor and the `files` loop so the two cannot
+    /// drift apart, which is how a `.bat` used to get in through `files`.
+    pub fn refuses_pack_file(self, path: &str) -> bool {
+        let path = as_created(path);
+        if is_agora_owned(path) {
+            return true;
+        }
+        let lower = path.to_ascii_lowercase();
+        agora_plugin_api::provider::BANNED_EXTENSIONS
+            .iter()
+            .any(|ext| lower.ends_with(ext))
+    }
 }
 
 /// The name a path gets on disk. Windows drops trailing dots and spaces

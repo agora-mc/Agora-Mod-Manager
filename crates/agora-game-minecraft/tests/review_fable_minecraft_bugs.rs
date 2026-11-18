@@ -110,7 +110,6 @@ side = "CLIENT"
 /// in the index's `files` (bytes carried inside the pack) is only checked for
 /// path traversal, so it lands in the instance; so would `.agora/...`.
 #[test]
-#[ignore = "review finding M3: fixed by slice W1-import-small"]
 fn an_mrpack_cannot_place_a_banned_file_through_its_files_list() {
     use sha1::Digest as _;
     let payload: &[u8] = b"@echo off\r\necho hello\r\n";

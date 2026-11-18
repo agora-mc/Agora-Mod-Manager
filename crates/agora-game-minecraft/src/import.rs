@@ -278,12 +278,25 @@ fn mrpack_override_path(
     Some(relative_archive_path(relative))
 }
 
-fn validate_override_extension(path: &Path, policy: OverridePolicy) -> LauncherResult<()> {
-    if policy.forbids(&manifest_path_key(path)) {
+/// What a pack-supplied path may not be. Shared by the overrides loop and the
+/// index's `files` loop so the two cannot disagree; that disagreement is what
+/// let a `.bat` be refused under `overrides/` and written through `files`.
+///
+/// `carries_mods` is true for the `files` list, which is where a pack's `.jar`
+/// payload belongs. An overrides archive never carries mods, so it applies the
+/// stricter rule (`.jar` and `.class` included).
+fn validate_pack_file(
+    path: &Path,
+    policy: OverridePolicy,
+    carries_mods: bool,
+) -> LauncherResult<()> {
+    let key = manifest_path_key(path);
+    let refused = policy.refuses_pack_file(&key) || (!carries_mods && policy.forbids(&key));
+    if refused {
         return Err(import_error(
             "ERR_SECURITY_VIOLATION",
             format!(
-                "Pack overrides cannot contain executable files or mods: '{}'.",
+                "A pack cannot place executable files, mods, or Agora's own files here: '{}'.",
                 path.display()
             ),
         ));
@@ -973,6 +986,7 @@ pub fn import_mrpack_inner(
                 );
             }
             let relative_path = relative_archive_path(&file_entry.path);
+            validate_pack_file(&relative_path, override_policy, true)?;
             assert_safe_path(target_dir, &relative_path)?;
             let dest = target_dir.join(&relative_path);
             if let Some(parent) = dest.parent() {
@@ -1070,7 +1084,7 @@ pub fn import_mrpack_inner(
             if entry.is_dir() || superseded.contains(&manifest_path_key(&relative_path)) {
                 continue;
             }
-            validate_override_extension(&relative_path, override_policy)?;
+            validate_pack_file(&relative_path, override_policy, false)?;
             assert_safe_path(target_dir, &relative_path)?;
 
             override_files += 1;
@@ -2827,7 +2841,7 @@ fn extract_technic_extra_entry<R: Read>(
     if key.is_empty() || !policy.admits(&key) {
         return Ok(());
     }
-    validate_override_extension(&relative, policy)?;
+    validate_pack_file(&relative, policy, false)?;
     assert_safe_path(instance_dir, &relative)?;
     let dest = instance_dir.join(&relative);
     if let Some(parent) = dest.parent() {
