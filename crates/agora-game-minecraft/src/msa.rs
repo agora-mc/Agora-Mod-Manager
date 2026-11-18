@@ -24,6 +24,7 @@
 //! handed to the game, and only the *Microsoft* refresh token is persisted for
 //! renewal.
 
+use agora_core::auth;
 use agora_core::db;
 use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::http_client::{self, ClientCategory, HttpClients};
@@ -1169,22 +1170,15 @@ fn clear_account_credentials(uuid: &str) -> LauncherResult<()> {
 /// `CredentialBackend::EncryptedFile` means the OS keyring was unavailable and
 /// the credentials sit in a file guarded only by its permissions -- the state
 /// MASTER_SPEC 7.5.2 requires Settings to warn about.
-pub fn credentials_backend() -> agora_core::auth::CredentialBackend {
-    let current = agora_core::auth::credential_backend(
-        KEYRING_SERVICE,
-        ACCOUNT_STORE_ACCOUNT,
-        ACCOUNT_STORE_FILE,
-    );
-    if current != agora_core::auth::CredentialBackend::None {
+pub fn credentials_backend() -> auth::CredentialBackend {
+    let current =
+        auth::credential_backend(KEYRING_SERVICE, ACCOUNT_STORE_ACCOUNT, ACCOUNT_STORE_FILE);
+    if current != auth::CredentialBackend::None {
         return current;
     }
     // Before the first read migrates them, the active account still lives in
     // the old slot. Report that store so Settings does not lose its warning.
-    agora_core::auth::credential_backend(
-        KEYRING_SERVICE,
-        KEYRING_ACCOUNT,
-        CREDENTIALS_FALLBACK_FILE,
-    )
+    auth::credential_backend(KEYRING_SERVICE, KEYRING_ACCOUNT, CREDENTIALS_FALLBACK_FILE)
 }
 
 pub fn load_credentials() -> LauncherResult<Option<MsaCredentials>> {
@@ -1360,7 +1354,7 @@ fn parse_credentials(json: &str, what: &str) -> LauncherResult<MsaCredentials> {
 /// is an error, never an empty list: treating it as empty would hide every
 /// account and orphan its tokens.
 fn read_store_unlocked() -> LauncherResult<AccountStore> {
-    if let Some(json) = agora_core::auth::load_secret(
+    if let Some(json) = auth::load_secret(
         KEYRING_SERVICE,
         ACCOUNT_STORE_ACCOUNT,
         ACCOUNT_STORE_FILE,
@@ -1373,7 +1367,7 @@ fn read_store_unlocked() -> LauncherResult<AccountStore> {
             )
         });
     }
-    if agora_core::auth::fallback_secret_present(ACCOUNT_STORE_FILE) {
+    if auth::fallback_secret_present(ACCOUNT_STORE_FILE) {
         return Err(err(
             "ERR_MSA_ACCOUNT_STORE",
             "The saved accounts are present but could not be read. Sign in again, or remove the \
@@ -1385,11 +1379,7 @@ fn read_store_unlocked() -> LauncherResult<AccountStore> {
 
 fn write_store_unlocked(store: &AccountStore) -> LauncherResult<()> {
     if store.active.is_none() && store.parked.is_empty() {
-        return agora_core::auth::clear_secret(
-            KEYRING_SERVICE,
-            ACCOUNT_STORE_ACCOUNT,
-            ACCOUNT_STORE_FILE,
-        );
+        return auth::clear_secret(KEYRING_SERVICE, ACCOUNT_STORE_ACCOUNT, ACCOUNT_STORE_FILE);
     }
     let json = serde_json::to_string(store).map_err(|error| {
         err(
@@ -1397,7 +1387,7 @@ fn write_store_unlocked(store: &AccountStore) -> LauncherResult<()> {
             format!("Failed to serialize the saved accounts: {error}"),
         )
     })?;
-    agora_core::auth::store_secret(
+    auth::store_secret(
         KEYRING_SERVICE,
         ACCOUNT_STORE_ACCOUNT,
         ACCOUNT_STORE_FILE,
@@ -1408,7 +1398,7 @@ fn write_store_unlocked(store: &AccountStore) -> LauncherResult<()> {
 
 /// Read the old active/parked/index secrets into one store, then replace them.
 fn migrate_legacy_store() -> LauncherResult<AccountStore> {
-    let active = match agora_core::auth::load_secret(
+    let active = match auth::load_secret(
         KEYRING_SERVICE,
         KEYRING_ACCOUNT,
         CREDENTIALS_FALLBACK_FILE,
@@ -1418,7 +1408,7 @@ fn migrate_legacy_store() -> LauncherResult<AccountStore> {
         None => None,
     };
 
-    let entries = match agora_core::auth::load_secret(
+    let entries = match auth::load_secret(
         KEYRING_SERVICE,
         ACCOUNT_INDEX_ACCOUNT,
         ACCOUNT_INDEX_FILE,
@@ -1434,7 +1424,7 @@ fn migrate_legacy_store() -> LauncherResult<AccountStore> {
                 ),
             )
         })?,
-        None if agora_core::auth::fallback_secret_present(ACCOUNT_INDEX_FILE) => {
+        None if auth::fallback_secret_present(ACCOUNT_INDEX_FILE) => {
             return Err(err(
                 "ERR_MSA_ACCOUNT_INDEX",
                 "The saved account list is present but could not be read. Agora will not treat it \
@@ -1454,14 +1444,9 @@ fn migrate_legacy_store() -> LauncherResult<AccountStore> {
         }
         let (account, file) = account_slot(&entry.uuid)?;
         let credentials =
-            match agora_core::auth::load_secret(
-                KEYRING_SERVICE,
-                &account,
-                &file,
-                CREDENTIALS_KEY_CONTEXT,
-            )? {
+            match auth::load_secret(KEYRING_SERVICE, &account, &file, CREDENTIALS_KEY_CONTEXT)? {
                 Some(json) => Some(parse_credentials(&json, "a saved account")?),
-                None if agora_core::auth::fallback_secret_present(&file) => return Err(err(
+                None if auth::fallback_secret_present(&file) => return Err(err(
                     "ERR_MSA_ACCOUNT_STORE",
                     "A saved account's credential is present but could not be read. Agora will \
                      not treat the account list as empty.",
@@ -1488,10 +1473,8 @@ fn migrate_legacy_store() -> LauncherResult<AccountStore> {
 /// Failure here leaves inert copies behind, never a second source of truth:
 /// every read looks for the new store first.
 fn clear_legacy_store(store: &AccountStore) {
-    let _ =
-        agora_core::auth::clear_secret(KEYRING_SERVICE, KEYRING_ACCOUNT, CREDENTIALS_FALLBACK_FILE);
-    let _ =
-        agora_core::auth::clear_secret(KEYRING_SERVICE, ACCOUNT_INDEX_ACCOUNT, ACCOUNT_INDEX_FILE);
+    let _ = auth::clear_secret(KEYRING_SERVICE, KEYRING_ACCOUNT, CREDENTIALS_FALLBACK_FILE);
+    let _ = auth::clear_secret(KEYRING_SERVICE, ACCOUNT_INDEX_ACCOUNT, ACCOUNT_INDEX_FILE);
     let mut uuids: Vec<&str> = store
         .parked
         .iter()
@@ -1502,7 +1485,7 @@ fn clear_legacy_store(store: &AccountStore) {
     }
     for uuid in uuids {
         if let Ok((account, file)) = account_slot(uuid) {
-            let _ = agora_core::auth::clear_secret(KEYRING_SERVICE, &account, &file);
+            let _ = auth::clear_secret(KEYRING_SERVICE, &account, &file);
         }
     }
 }
@@ -2331,7 +2314,7 @@ mod tests {
     }
 
     fn store_legacy(service: &str, account: &str, file: &str, value: &str) {
-        agora_core::auth::store_secret(service, account, file, CREDENTIALS_KEY_CONTEXT, value)
+        auth::store_secret(service, account, file, CREDENTIALS_KEY_CONTEXT, value)
             .expect("store legacy credential");
     }
 
@@ -2417,7 +2400,7 @@ mod tests {
         // The migrated store is a real store, not a read-through of the old slots.
         switch_account("cccc3333").unwrap();
         assert_eq!(load_credentials().unwrap().unwrap().username, "Cara");
-        let stored = agora_core::auth::load_secret(
+        let stored = auth::load_secret(
             KEYRING_SERVICE,
             ACCOUNT_STORE_ACCOUNT,
             ACCOUNT_STORE_FILE,
@@ -2463,7 +2446,7 @@ mod tests {
         assert_eq!(error.code(), "ERR_MSA_ACCOUNT_INDEX", "{error:?}");
         let (account, file) = account_slot(&bob.uuid).unwrap();
         assert!(
-            agora_core::auth::fallback_secret_present(&file),
+            auth::fallback_secret_present(&file),
             "the parked token must not be deleted or forgotten"
         );
         let _ = account;
