@@ -151,10 +151,20 @@ fn an_mrpack_cannot_place_a_banned_file_through_its_files_list() {
 /// by `parse_argument_string`, which treats `\\` as an escaped backslash
 /// everywhere, so a Windows network path loses its leading backslash.
 #[test]
-#[ignore = "review finding L1: fixed by slice W1-import-small"]
 fn a_unc_path_survives_launch_argument_parsing() {
     let parsed =
         agora_game_minecraft::launch_planner::parse_argument_string(r"\\nas\tools\wrap.exe --fast")
             .unwrap();
     assert_eq!(parsed, vec![r"\\nas\tools\wrap.exe", "--fast"]);
+}
+
+/// A quoted path that ends in a directory separator is a path, not an escaped
+/// closing quote. The parser used to leave the quote open and refuse the whole
+/// command.
+#[test]
+fn a_quoted_path_ending_in_a_backslash_survives_launch_argument_parsing() {
+    let parsed =
+        agora_game_minecraft::launch_planner::parse_argument_string(r#""C:\Tools With Spaces\""#)
+            .unwrap();
+    assert_eq!(parsed, vec![r"C:\Tools With Spaces\"]);
 }
