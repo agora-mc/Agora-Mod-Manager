@@ -10,14 +10,14 @@ use crate::lock_manager::LockManager;
 use crate::operation_manager::OperationManager;
 use crate::paths;
 use crate::registry_bundle::{
-    self, BundleError, CatalogHeader, KeyCertificate, RegistryKey, RegistryKeyRole, RegistryTrust,
-    VerifiedBundle,
+    self, BundleError, CatalogHeader, KeyCertificate, KeyRevocation, RegistryKey, RegistryKeyRole,
+    RegistryTrust, VerifiedBundle,
 };
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -348,17 +348,26 @@ fn quarantine_aside(path: &Path, kind: &str) -> std::io::Result<()> {
 /// file is a line log, so a truncated final line only loses that line.
 ///
 /// ```text
-/// v1 key <key_id> <public_key> <signed_by> <signature>
-/// v1 revoke <key_id>
+/// v1 key <key_id> <public_key> <role> <signed_by> <signature>
+/// v1 revoke <revoked_key_id> <signed_by> <signature>
 /// ```
 ///
-/// A key line is a certificate, not a bare key: a garbage or forged line is
-/// ignored unless it is signed by a key this client already trusts. A
-/// revocation line can only shrink trust, so reading a forged one is safe.
+/// Every line is a signed statement. On load each one is re-verified against the
+/// keys trusted at that point in the log: a key line is a certificate signed by
+/// a recovery key, and a revocation line is a revocation statement signed by a
+/// recovery key. A forged line is ignored.
 #[derive(Debug, Default)]
 struct RememberedTrust {
     keys: Vec<RegistryKey>,
-    revoked: Vec<String>,
+    revocations: Vec<KeyRevocation>,
+}
+
+fn parse_role(raw: &str) -> Option<RegistryKeyRole> {
+    match raw {
+        "primary" => Some(RegistryKeyRole::Primary),
+        "recovery" => Some(RegistryKeyRole::Recovery),
+        _ => None,
+    }
 }
 
 fn load_remembered_trust(app_data_dir: &Path, base: &RegistryTrust) -> RememberedTrust {
@@ -372,83 +381,114 @@ fn load_remembered_trust(app_data_dir: &Path, base: &RegistryTrust) -> Remembere
         return RememberedTrust::default();
     };
 
-    let mut certificates: Vec<KeyCertificate> = Vec::new();
-    let mut revoked: Vec<String> = base.revoked().to_vec();
+    let mut trusted: BTreeMap<String, ed25519_dalek::VerifyingKey> = BTreeMap::new();
+    let mut roles: BTreeMap<String, RegistryKeyRole> = BTreeMap::new();
+    let mut revoked: BTreeSet<String> = base.revoked_ids().into_iter().collect();
+    for key in base.keys() {
+        if revoked.contains(&key.id) {
+            continue;
+        }
+        if let Some(verifying) = verifying_key_hex(&key.public_key_hex) {
+            trusted.insert(key.id.clone(), verifying);
+            roles.insert(key.id.clone(), key.role);
+        }
+    }
+
+    let mut remembered_keys: Vec<RegistryKey> = Vec::new();
+    let mut remembered_revocations: Vec<KeyRevocation> = Vec::new();
     for line in text.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         match fields.as_slice() {
-            ["v1", "key", id, public_key, signed_by, signature] => {
-                certificates.push(KeyCertificate {
+            ["v1", "key", id, public_key, role, signed_by, signature] => {
+                let Some(role) = parse_role(role) else {
+                    continue;
+                };
+                let certificate = KeyCertificate {
                     key_id: (*id).to_string(),
                     public_key: (*public_key).to_string(),
+                    role,
+                    signed_by: (*signed_by).to_string(),
+                    signature: (*signature).to_string(),
+                };
+                // Revocations win: a revoked id cannot be introduced again.
+                if revoked.contains(&certificate.key_id) {
+                    continue;
+                }
+                let Some(signer) = trusted.get(&certificate.signed_by).copied() else {
+                    continue;
+                };
+                if roles.get(&certificate.signed_by) != Some(&RegistryKeyRole::Recovery) {
+                    continue;
+                }
+                if revoked.contains(&certificate.signed_by) {
+                    continue;
+                }
+                if registry_bundle::key_id_for_public_key(&certificate.public_key)
+                    != certificate.key_id
+                {
+                    continue;
+                }
+                let Some(signature) = decode_hex_signature(&certificate.signature) else {
+                    continue;
+                };
+                use ed25519_dalek::Verifier;
+                let message = KeyCertificate::signed_bytes(
+                    &certificate.key_id,
+                    &certificate.public_key,
+                    certificate.role,
+                    &certificate.signed_by,
+                );
+                if signer.verify(&message, &signature).is_err() {
+                    continue;
+                }
+                let Some(verifying) = verifying_key_hex(&certificate.public_key) else {
+                    continue;
+                };
+                trusted.insert(certificate.key_id.clone(), verifying);
+                roles.insert(certificate.key_id.clone(), certificate.role);
+                remembered_keys.push(
+                    RegistryKey::from_hex(certificate.public_key.clone())
+                        .with_role(certificate.role),
+                );
+            }
+            ["v1", "revoke", revoked_id, signed_by, signature] => {
+                if revoked_id == signed_by {
+                    continue;
+                }
+                let Some(signer) = trusted.get(*signed_by).copied() else {
+                    continue;
+                };
+                if roles.get(*signed_by) != Some(&RegistryKeyRole::Recovery) {
+                    continue;
+                }
+                if revoked.contains(*signed_by) {
+                    continue;
+                }
+                let Some(decoded) = decode_hex_signature(signature) else {
+                    continue;
+                };
+                use ed25519_dalek::Verifier;
+                let message = KeyRevocation::signed_bytes(revoked_id, signed_by);
+                if signer.verify(&message, &decoded).is_err() {
+                    continue;
+                }
+                revoked.insert((*revoked_id).to_string());
+                trusted.remove(*revoked_id);
+                roles.remove(*revoked_id);
+                remembered_revocations.push(KeyRevocation {
+                    revoked_key_id: (*revoked_id).to_string(),
                     signed_by: (*signed_by).to_string(),
                     signature: (*signature).to_string(),
                 });
             }
-            ["v1", "revoke", id] => revoked.push((*id).to_string()),
             // A truncated line, an older version, or junk: ignore it.
             _ => {}
         }
     }
 
-    // Revocations win, so apply them before certificates are allowed to
-    // introduce anything. A certificate signed by a revoked key is ignored.
-    let mut trusted: BTreeMap<String, ed25519_dalek::VerifyingKey> = BTreeMap::new();
-    for key in base.keys() {
-        if revoked.iter().any(|id| id == &key.id) {
-            continue;
-        }
-        if let Some(verifying) = verifying_key_hex(&key.public_key_hex) {
-            trusted.insert(key.id.clone(), verifying);
-        }
-    }
-    let mut remembered: Vec<RegistryKey> = Vec::new();
-    for _ in 0..=certificates.len() {
-        let mut added = false;
-        for certificate in &certificates {
-            if trusted.contains_key(&certificate.key_id) {
-                continue;
-            }
-            let Some(signer) = trusted.get(&certificate.signed_by).copied() else {
-                continue;
-            };
-            if revoked.iter().any(|id| id == &certificate.signed_by) {
-                continue;
-            }
-            if registry_bundle::key_id_for_public_key(&certificate.public_key) != certificate.key_id
-            {
-                continue;
-            }
-            let Some(signature) = decode_hex_signature(&certificate.signature) else {
-                continue;
-            };
-            use ed25519_dalek::Verifier;
-            let message = KeyCertificate::signed_bytes(
-                &certificate.key_id,
-                &certificate.public_key,
-                &certificate.signed_by,
-            );
-            if signer.verify(&message, &signature).is_err() {
-                continue;
-            }
-            let Some(verifying) = verifying_key_hex(&certificate.public_key) else {
-                continue;
-            };
-            trusted.insert(certificate.key_id.clone(), verifying);
-            remembered.push(
-                RegistryKey::from_hex(certificate.public_key.clone())
-                    .with_role(RegistryKeyRole::Primary),
-            );
-            added = true;
-        }
-        if !added {
-            break;
-        }
-    }
-
     RememberedTrust {
-        keys: remembered,
-        revoked,
+        keys: remembered_keys,
+        revocations: remembered_revocations,
     }
 }
 
@@ -457,14 +497,14 @@ fn load_remembered_trust(app_data_dir: &Path, base: &RegistryTrust) -> Remembere
 fn effective_trust(app_data_dir: &Path, base: &RegistryTrust) -> RegistryTrust {
     let remembered = load_remembered_trust(app_data_dir, base);
     let mut trust = base.clone();
-    trust.merge_remembered(remembered.keys, remembered.revoked);
+    trust.merge_remembered(remembered.keys, remembered.revocations);
     trust
 }
 
-/// Persist the keys a verified bundle introduced and the revocations it made.
-///
-/// Only complete lines are appended, and the file is never rewritten, so a
-/// crash cannot lose an earlier revocation. Duplicate lines are harmless.
+/// Persist the keys a verified bundle introduced and the revocations a recovery
+/// key signed. Only complete lines are appended, and the file is never
+/// rewritten, so a crash cannot lose an earlier revocation. Duplicate lines are
+/// harmless.
 fn remember_bundle_trust(app_data_dir: &Path, verified: &VerifiedBundle) -> LauncherResult<()> {
     if verified.header.is_expired_at(Utc::now()) {
         return Ok(());
@@ -477,32 +517,31 @@ fn remember_bundle_trust(app_data_dir: &Path, verified: &VerifiedBundle) -> Laun
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let mut lines = String::new();
     for certificate in &verified.newly_trusted {
-        if verified
-            .header
-            .revoked_key_ids
-            .iter()
-            .any(|id| id == &certificate.key_id)
-        {
-            continue;
-        }
         let marker = format!("v1 key {} ", certificate.key_id);
         if existing.lines().any(|line| line.starts_with(&marker)) {
             continue;
         }
         lines.push_str(&format!(
-            "v1 key {} {} {} {}\n",
+            "v1 key {} {} {} {} {}\n",
             certificate.key_id,
             certificate.public_key,
+            certificate.role.as_str(),
             certificate.signed_by,
             certificate.signature
         ));
     }
-    for id in &verified.header.revoked_key_ids {
-        let marker = format!("v1 revoke {id}");
+    for revocation in &verified.accepted_revocations {
+        let marker = format!(
+            "v1 revoke {} {} {}",
+            revocation.revoked_key_id, revocation.signed_by, revocation.signature
+        );
         if existing.lines().any(|line| line == marker) {
             continue;
         }
-        lines.push_str(&format!("v1 revoke {id}\n"));
+        lines.push_str(&format!(
+            "v1 revoke {} {} {}\n",
+            revocation.revoked_key_id, revocation.signed_by, revocation.signature
+        ));
     }
     if lines.is_empty() {
         return Ok(());
@@ -679,6 +718,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// from. The registry connection is opened `SQLITE_OPEN_READ_ONLY`, so the only
 /// writer is `ensure_database` itself (install/recovery) and the debug seed.
 /// Re-hashing a multi-megabyte catalog on every open is what this avoids.
+///
+/// Process-global so every opener shares it. Move it into `Ctx` with the planned
+/// `Ctx` cleanup (MASTER_SPEC section 32.9 when that section lands).
 #[derive(Debug, Clone)]
 struct DatabaseHashMemo {
     len: u64,
@@ -1779,7 +1821,7 @@ mod tests {
             db_len: payload.len() as u64,
             db_sha256: hex::encode(Sha256::digest(payload)),
             certificates: Vec::new(),
-            revoked_key_ids: Vec::new(),
+            revocations: Vec::new(),
         }
     }
 
@@ -2151,26 +2193,18 @@ mod tests {
     /// accepted; the same bundle without the certificate is not.
     #[test]
     fn a_new_key_is_accepted_through_an_old_key_and_refused_without_it() {
-        use ed25519_dalek::Signer;
         let dir = tempfile::TempDir::new().unwrap();
         let old = test_key(8);
         let new = test_key(9);
         let payload = sample_db();
         let mut header = fresh_header(&new, &payload);
-        let old_id = registry_bundle::key_id_for_public_key(&test_public(&old));
-        let new_id = registry_bundle::key_id_for_public_key(&test_public(&new));
-        let certificate_message =
-            registry_bundle::KeyCertificate::signed_bytes(&new_id, &test_public(&new), &old_id);
-        header.certificates.push(registry_bundle::KeyCertificate {
-            key_id: new_id,
-            public_key: test_public(&new),
-            signed_by: old_id,
-            signature: hex::encode(old.sign(&certificate_message).to_bytes()),
-        });
+        header
+            .certificates
+            .push(certificate(&old, &test_public(&new)));
         let bundle = signed_bundle(&new, &header, &payload);
         fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &bundle).unwrap();
 
-        let trust_old = RegistryTrust::with_key(test_public(&old));
+        let trust_old = RegistryTrust::with_roles([(RegistryKeyRole::Recovery, test_public(&old))]);
         assert!(open_verified_registry_with_trust(dir.path(), &trust_old).is_ok());
 
         let mut without_certificate = header.clone();
@@ -2184,16 +2218,33 @@ mod tests {
         assert!(open_verified_registry_with_trust(dir.path(), &trust_old).is_err());
     }
 
-    fn certificate(old: &ed25519_dalek::SigningKey, new_public: &str) -> KeyCertificate {
+    fn certificate(recovery: &ed25519_dalek::SigningKey, new_public: &str) -> KeyCertificate {
         use ed25519_dalek::Signer;
-        let old_id = registry_bundle::key_id_for_public_key(&test_public(old));
+        let signed_by = registry_bundle::key_id_for_public_key(&test_public(recovery));
         let new_id = registry_bundle::key_id_for_public_key(new_public);
-        let message = KeyCertificate::signed_bytes(&new_id, new_public, &old_id);
+        let message =
+            KeyCertificate::signed_bytes(&new_id, new_public, RegistryKeyRole::Primary, &signed_by);
         KeyCertificate {
             key_id: new_id,
             public_key: new_public.to_string(),
-            signed_by: old_id,
-            signature: hex::encode(old.sign(&message).to_bytes()),
+            role: RegistryKeyRole::Primary,
+            signed_by,
+            signature: hex::encode(recovery.sign(&message).to_bytes()),
+        }
+    }
+
+    fn revocation(
+        recovery: &ed25519_dalek::SigningKey,
+        revoked: &ed25519_dalek::SigningKey,
+    ) -> KeyRevocation {
+        use ed25519_dalek::Signer;
+        let revoked_key_id = registry_bundle::key_id_for_public_key(&test_public(revoked));
+        let signed_by = registry_bundle::key_id_for_public_key(&test_public(recovery));
+        let message = KeyRevocation::signed_bytes(&revoked_key_id, &signed_by);
+        KeyRevocation {
+            revoked_key_id,
+            signed_by,
+            signature: hex::encode(recovery.sign(&message).to_bytes()),
         }
     }
 
@@ -2204,15 +2255,16 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let stolen = test_key(20);
         let primary = test_key(21);
-        let trust = RegistryTrust::with_keys([test_public(&stolen), test_public(&primary)]);
+        let recovery = test_key(28);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&stolen)),
+            (RegistryKeyRole::Primary, test_public(&primary)),
+        ]);
         let payload = sample_db();
 
         let mut revoking = fresh_header(&primary, &payload);
-        revoking
-            .revoked_key_ids
-            .push(registry_bundle::key_id_for_public_key(&test_public(
-                &stolen,
-            )));
+        revoking.revocations.push(revocation(&recovery, &stolen));
         let revoking_bundle = signed_bundle(&primary, &revoking, &payload);
         install_bundle_bytes(dir.path(), &revoking, &revoking_bundle, &trust).unwrap();
 
@@ -2238,7 +2290,7 @@ mod tests {
         let old = test_key(22);
         let new = test_key(23);
         let payload = sample_db();
-        let old_trust = RegistryTrust::with_key(test_public(&old));
+        let old_trust = RegistryTrust::with_roles([(RegistryKeyRole::Recovery, test_public(&old))]);
 
         let mut introduced = fresh_header(&new, &payload);
         introduced
@@ -2269,7 +2321,7 @@ mod tests {
         let old = test_key(24);
         let attacker = test_key(25);
         let payload = sample_db();
-        let trust = RegistryTrust::with_key(test_public(&old));
+        let trust = RegistryTrust::with_roles([(RegistryKeyRole::Recovery, test_public(&old))]);
         let mut forged = fresh_header(&attacker, &payload);
         forged
             .certificates
@@ -2302,11 +2354,19 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         let dir = tempfile::TempDir::new().unwrap();
         let primary = test_key(26);
         let stolen = test_key(27);
-        let trust = RegistryTrust::with_keys([test_public(&primary), test_public(&stolen)]);
-        let stolen_id = registry_bundle::key_id_for_public_key(&test_public(&stolen));
+        let recovery = test_key(29);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&primary)),
+            (RegistryKeyRole::Primary, test_public(&stolen)),
+        ]);
+        let statement = revocation(&recovery, &stolen);
         fs::write(
             paths::registry_trust_state_path(dir.path()).unwrap(),
-            format!("v1 revoke {stolen_id}\nv1 rev"),
+            format!(
+                "v1 revoke {} {} {}\nv1 rev",
+                statement.revoked_key_id, statement.signed_by, statement.signature
+            ),
         )
         .unwrap();
 
@@ -2322,6 +2382,80 @@ v1 key deadbeef deadbeef deadbeef deadbeef
             open_verified_registry_with_trust(dir.path(), &trust).is_err(),
             "the complete revocation line before the truncation still applies"
         );
+    }
+
+    /// A forged revocation line cannot remove a key: the signer is not a trusted
+    /// recovery key, so load ignores the line.
+    #[test]
+    fn a_forged_revocation_line_is_ignored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = test_key(30);
+        let recovery = test_key(31);
+        let attacker = test_key(32);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&primary)),
+        ]);
+        let forged = revocation(&attacker, &primary);
+        fs::write(
+            paths::registry_trust_state_path(dir.path()).unwrap(),
+            format!(
+                "v1 revoke {} {} {}\n",
+                forged.revoked_key_id, forged.signed_by, forged.signature
+            ),
+        )
+        .unwrap();
+
+        let payload = sample_db();
+        let header = fresh_header(&primary, &payload);
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            signed_bundle(&primary, &header, &payload),
+        )
+        .unwrap();
+        assert!(
+            open_verified_registry_with_trust(dir.path(), &trust).is_ok(),
+            "a revocation not signed by a recovery key must not remove the primary"
+        );
+    }
+
+    /// A primary-signed revocation is ignored and never remembered.
+    #[test]
+    fn a_primary_signed_revocation_is_not_remembered() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = test_key(33);
+        let recovery = test_key(34);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&primary)),
+        ]);
+        let payload = sample_db();
+        let mut header = fresh_header(&primary, &payload);
+        // The primary signs the revocation message itself. The signature is
+        // valid, but the role forbids it.
+        header.revocations.push(revocation(&primary, &recovery));
+        let bundle = signed_bundle(&primary, &header, &payload);
+        install_bundle_bytes(dir.path(), &header, &bundle, &trust).unwrap();
+
+        let state = fs::read_to_string(paths::registry_trust_state_path(dir.path()).unwrap())
+            .unwrap_or_default();
+        assert!(
+            !state.lines().any(|line| line.starts_with("v1 revoke ")),
+            "an ignored revocation must not be written to the state: {state}"
+        );
+
+        // The recovery key can still certify the next primary.
+        let new = test_key(35);
+        let mut next = fresh_header(&new, &payload);
+        next.certificates
+            .push(certificate(&recovery, &test_public(&new)));
+        let next_bundle = signed_bundle(&new, &next, &payload);
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            &next_bundle,
+        )
+        .unwrap();
+        assert!(open_verified_registry_with_trust(dir.path(), &trust).is_ok());
     }
 
     /// The app and the CLI share one data folder. Their staging files must never

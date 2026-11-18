@@ -318,7 +318,7 @@ fn sign_registry(root: &Path, key: &SigningKey, sign: bool) {
         db_len: payload.len() as u64,
         db_sha256: hex::encode(Sha256::digest(&payload)),
         certificates: Vec::new(),
-        revoked_key_ids: Vec::new(),
+        revocations: Vec::new(),
     };
     let header_bytes = registry_bundle::header_bytes(&header);
     let signature = if sign {

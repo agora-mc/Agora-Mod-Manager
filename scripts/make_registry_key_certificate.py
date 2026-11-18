@@ -2,12 +2,12 @@
 """Write a catalog key rotation certificate.
 
 A catalog bundle names the key that signed it. A client accepts a new key only
-when the bundle also carries a certificate: a statement, signed by a key the
-client already trusts, that says "this id belongs to this public key". Sign the
+when the bundle also carries a certificate: a statement, signed by a *recovery*
+key, that says "this id belongs to this public key with this role". Sign the
 first catalog with the new key, pass the certificate with
-``AGORA_REGISTRY_KEY_CERTIFICATES``, and clients that trust the old key accept
-it. A later catalog signed by the new key can list the old id in
-``AGORA_REGISTRY_REVOKED_KEY_IDS`` to retire it.
+``AGORA_REGISTRY_KEY_CERTIFICATES``, and clients that trust the recovery key
+accept it. A revocation must be a separate statement signed by a recovery key,
+made with ``scripts/make_registry_revocation.py``.
 
 Usage:
 
@@ -56,6 +56,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--new-public-key", required=True, help="hex Ed25519 public key")
     parser.add_argument(
+        "--role",
+        choices=("primary", "recovery"),
+        default="primary",
+        help="role of the introduced key (default: primary)",
+    )
+    parser.add_argument(
         "--signing-key",
         default=os.environ.get("AGORA_REGISTRY_OLD_PRIVATE_KEY")
         or os.environ.get("ED25519_OLD_PRIVATE_KEY"),
@@ -84,6 +90,7 @@ def main() -> int:
     certificate = {
         "key_id": key_id(new_public),
         "public_key": new_public.hex(),
+        "role": args.role,
         "signed_by": key_id(old_public),
     }
     message = (
@@ -91,6 +98,8 @@ def main() -> int:
         + certificate["key_id"].encode("ascii")
         + b"\n"
         + certificate["public_key"].encode("ascii")
+        + b"\n"
+        + certificate["role"].encode("ascii")
         + b"\n"
         + certificate["signed_by"].encode("ascii")
     )

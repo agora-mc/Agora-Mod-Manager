@@ -4907,15 +4907,63 @@ def _load_key_certificates() -> list[dict[str, Any]]:
     for item in raw:
         if not isinstance(item, dict):
             raise ValueError("each key certificate must be an object")
-        for field in ("key_id", "public_key", "signed_by", "signature"):
+        for field in ("key_id", "public_key", "role", "signed_by", "signature"):
             if not isinstance(item.get(field), str) or not item[field].strip():
                 raise ValueError(f"key certificate is missing {field}")
+        if item["role"] not in ("primary", "recovery"):
+            raise ValueError("a key certificate role must be primary or recovery")
         if catalog_key_id(bytes.fromhex(item["public_key"])) != item["key_id"]:
             raise ValueError("key certificate id does not match its public key")
         certificates.append(
-            {key: item[key] for key in ("key_id", "public_key", "signed_by", "signature")}
+            {
+                key: item[key]
+                for key in ("key_id", "public_key", "role", "signed_by", "signature")
+            }
         )
     return certificates
+
+
+def _load_revocations() -> list[dict[str, str]]:
+    """Optional revocation statements signed by the offline recovery key.
+
+    ``AGORA_REGISTRY_REVOCATIONS`` names a JSON file holding an array;
+    ``AGORA_REGISTRY_REVOCATION`` holds one object. The compiler only checks the
+    shape: the client verifies each signature against a trusted recovery key.
+    A bare list of key ids is not accepted.
+    """
+    if os.environ.get("AGORA_REGISTRY_REVOKED_KEY_IDS"):
+        raise ValueError(
+            "AGORA_REGISTRY_REVOKED_KEY_IDS is no longer accepted: a revocation "
+            "must be a statement signed by a recovery key. Use "
+            "AGORA_REGISTRY_REVOCATIONS."
+        )
+    path = os.environ.get("AGORA_REGISTRY_REVOCATIONS")
+    if path:
+        raw: Any = json.loads(Path(path).read_text(encoding="utf-8"))
+    elif os.environ.get("AGORA_REGISTRY_REVOCATION"):
+        raw = json.loads(os.environ["AGORA_REGISTRY_REVOCATION"])
+    else:
+        return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise ValueError("revocations must be a JSON object or array")
+    revocations: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("each revocation must be an object")
+        for field in ("revoked_key_id", "signed_by", "signature"):
+            if not isinstance(item.get(field), str) or not item[field].strip():
+                raise ValueError(f"revocation is missing {field}")
+        if item["revoked_key_id"] == item["signed_by"]:
+            raise ValueError("a key may not revoke itself")
+        revocations.append(
+            {
+                key: item[key]
+                for key in ("revoked_key_id", "signed_by", "signature")
+            }
+        )
+    return revocations
 
 
 def _read_built_at(db_path: Path) -> str | None:
@@ -4981,13 +5029,9 @@ def build_catalog_bundle(db_path: Path, db_bytes: bytes, *, skip_sign: bool) -> 
     certificates = _load_key_certificates()
     if certificates:
         header["certificates"] = certificates
-    revoked = [
-        key.strip()
-        for key in os.environ.get("AGORA_REGISTRY_REVOKED_KEY_IDS", "").split(",")
-        if key.strip()
-    ]
-    if revoked:
-        header["revoked_key_ids"] = revoked
+    revocations = _load_revocations()
+    if revocations:
+        header["revocations"] = revocations
 
     header_bytes = json.dumps(
         header, sort_keys=True, separators=(",", ":"), ensure_ascii=False

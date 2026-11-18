@@ -404,7 +404,7 @@ The launcher maintains **two separate SQLite databases**:
 |---|---|---|---|
 | `registry.db` | App data directory, downloaded from GitHub Release Assets | Curated catalog, crash signatures, social metrics | Read-only at runtime |
 | `registry.bundle` | Same directory as `registry.db` | Signed catalog header plus the SQLite payload; the launcher installs this one file | Read-only at runtime |
-| `registry.trust` | Same directory as `registry.bundle` | Keys and revocations learned from verified catalogs; only ever grows | Read-only at runtime |
+| `registry.trust` | Same directory as `registry.bundle` | Recovery-signed certificates and revocation statements learned from verified catalogs; only ever grows, and every line is re-verified on load | Read-only at runtime |
 | `local_state.db` | App data directory | User settings, instances, telemetry, approvals | Read-write |
 
 ### Table: `registry_items`
@@ -500,7 +500,7 @@ The Tauri app tracks the currently cached `registry.db` release tag (e.g., `regi
 
 The bundle header also carries `issued_at` and `expires_at`. An expired catalog is still readable for browsing and diagnosis, but the app marks it stale and refuses to install or update curated content or official plugins from it. `registry.db` and `registry.db.sig` remain published for the web export, but the launcher installs the bundle as one unit and refuses the two-file form: there is no state in which the database and the signature it was verified against come from different builds. The previous bundle is promoted when the current one is incomplete or damaged.
 
-Clients trust a compiled-in list of public keys, each named by an id derived from the key and carrying a role: a primary key signs catalogs, and an offline recovery key may sign a certificate or a revocation but never a catalog. A new key is introduced by a certificate inside a bundle, signed by a key the client already trusts; a compromised key is retired by listing it in the bundle's `revoked_key_ids` and by shipping a client build that no longer trusts it. The client persists introduced keys and revocations in `registry.trust` next to the cached bundle, and never removes a revocation, so a later bundle signed by a retired key is refused even when it omits the revocation list. Rotation and retirement are operators' procedures, documented in [`docs/RELEASING.md`](docs/RELEASING.md#catalog-signing-rotation-and-expiry).
+Clients trust a compiled-in list of public keys, each named by an id derived from the key and carrying a role. A primary key signs catalogs and nothing else. An offline recovery key is the only key that may sign a certificate (which introduces a key, with its role, into the client's trust) or a revocation statement. A certificate or revocation signed by a primary is ignored. A recovery key may be revoked only by another recovery key, never by itself. The client persists the recovery-signed statements in `registry.trust` next to the cached bundle, re-verifies every line on load, and never removes a revocation, so a later bundle signed by a retired key is refused even when it omits the revocation. A leaked recovery key is fixed only by a client release with a new compiled recovery key. Rotation and retirement are operators' procedures, documented in [`docs/RELEASING.md`](docs/RELEASING.md#catalog-signing-rotation-and-expiry).
 
 If offline, the app skips the update check and uses the last cached DB. A "Limited Offline Mode" banner appears if the DB is older than 7 days.
 

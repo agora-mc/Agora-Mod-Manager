@@ -4588,7 +4588,7 @@ mod game_catalog_tests {
             db_len: payload.len() as u64,
             db_sha256: hex::encode(sha2::Sha256::digest(&payload)),
             certificates: Vec::new(),
-            revoked_key_ids: Vec::new(),
+            revocations: Vec::new(),
         };
         let header_bytes = crate::registry_bundle::header_bytes(&header);
         let signature = key

@@ -36,6 +36,8 @@ import build_docs_web as bdw
 import check_package_docs as cpd
 import check_registry_keys as crk
 import generate_registry_key as grk
+import make_registry_key_certificate as mk
+import make_registry_revocation as mr
 import pin_hashes
 import stage_cli_sidecar
 import stage_vfs_files
@@ -4238,82 +4240,94 @@ class TestGenAddrlibNames(unittest.TestCase):
                 gan.generate(root, Path(temporary) / "names.js")
 
 
-class TestRegistryKeyReleaseCheck(unittest.TestCase):
-    def test_two_valid_keys_with_both_roles_pass(self):
-        keys = [
-            {"role": "primary", "public_key_hex": "1" * 64},
-            {"role": "recovery", "public_key_hex": "2" * 64},
-        ]
-        self.assertEqual(crk.check(keys), [])
-
-    def test_a_placeholder_recovery_slot_fails_the_release(self):
-        keys = [
-            {"role": "primary", "public_key_hex": "1" * 64},
-            {"role": "recovery", "public_key_hex": crk.PLACEHOLDER},
-        ]
-        problems = crk.check(keys)
-        self.assertTrue(any("placeholder" in problem for problem in problems), problems)
-
-    def test_one_key_is_not_enough(self):
-        problems = crk.check([{"role": "primary", "public_key_hex": "1" * 64}])
-        self.assertTrue(any("fewer than two" in problem for problem in problems), problems)
-        self.assertTrue(any("recovery" in problem for problem in problems), problems)
-
-    def test_an_invalid_key_is_refused(self):
-        keys = [
-            {"role": "primary", "public_key_hex": "not-hex"},
-            {"role": "recovery", "public_key_hex": "2" * 64},
-        ]
-        problems = crk.check(keys)
-        self.assertTrue(any("32-byte" in problem for problem in problems), problems)
-
-    def test_the_source_file_is_read(self):
+@unittest.skipUnless(nacl is not None, "PyNaCl is required to sign a test statement")
+class TestRecoverySignedStatements(unittest.TestCase):
+    def test_a_certificate_carries_and_signs_its_role(self):
+        recovery = nacl.signing.SigningKey(bytes([7]) * 32)
+        new = nacl.signing.SigningKey(bytes([8]) * 32)
+        new_public = new.verify_key.encode(encoder=nacl.encoding.RawEncoder)
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "keys.json"
-            path.write_text(
-                json.dumps(
-                    [
-                        {"role": "primary", "public_key_hex": "1" * 64},
-                        {"role": "recovery", "public_key_hex": "2" * 64},
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            keys = crk._from_source(path)
-            self.assertEqual(len(keys), 2)
-            self.assertEqual(crk.check(keys), [])
-
-
-@unittest.skipUnless(nacl is not None, "PyNaCl is required to generate a test key")
-class TestGenerateRegistryKey(unittest.TestCase):
-    def test_it_prints_only_the_public_half_and_writes_the_private_half(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            destination = Path(tmp) / "recovery.key"
-            stdout = io.StringIO()
-            with (
-                mock.patch.object(
-                    sys,
-                    "argv",
-                    ["generate_registry_key.py", "--private-key-out", str(destination)],
-                ),
-                contextlib.redirect_stdout(stdout),
+            out = Path(tmp) / "cert.json"
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "make_registry_key_certificate.py",
+                    "--new-public-key",
+                    new_public.hex(),
+                    "--role",
+                    "recovery",
+                    "--signing-key",
+                    bytes(recovery).hex(),
+                    "--out",
+                    str(out),
+                ],
             ):
-                self.assertEqual(grk.main(), 0)
-            printed = stdout.getvalue().strip().splitlines()[0]
-            self.assertRegex(printed, r"^[0-9a-f]{64}$")
-            private = destination.read_text(encoding="ascii").strip()
-            self.assertRegex(private, r"^[0-9a-f]{64}$")
-            self.assertNotEqual(printed, private)
+                self.assertEqual(mk.main(), 0)
+            certificate = json.loads(out.read_text(encoding="utf-8"))[0]
+            self.assertEqual(certificate["role"], "recovery")
+            message = (
+                mk.CERT_DOMAIN
+                + certificate["key_id"].encode()
+                + b"\n"
+                + certificate["public_key"].encode()
+                + b"\n"
+                + b"recovery"
+                + b"\n"
+                + certificate["signed_by"].encode()
+            )
+            recovery.verify_key.verify(
+                message, bytes.fromhex(certificate["signature"])
+            )
 
-    def test_it_refuses_to_write_inside_the_repository(self):
-        destination = Path(grk.REPO_ROOT) / "should-not-exist-recovery.key"
-        with mock.patch.object(
-            sys,
-            "argv",
-            ["generate_registry_key.py", "--private-key-out", str(destination)],
-        ):
-            self.assertEqual(grk.main(), 1)
-        self.assertFalse(destination.exists())
+    def test_a_revocation_is_signed_by_the_recovery_key(self):
+        recovery = nacl.signing.SigningKey(bytes([9]) * 32)
+        revoked = nacl.signing.SigningKey(bytes([10]) * 32)
+        revoked_public = revoked.verify_key.encode(encoder=nacl.encoding.RawEncoder)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "revoke.json"
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "make_registry_revocation.py",
+                    "--revoked-public-key",
+                    revoked_public.hex(),
+                    "--signing-key",
+                    bytes(recovery).hex(),
+                    "--out",
+                    str(out),
+                ],
+            ):
+                self.assertEqual(mr.main(), 0)
+            statement = json.loads(out.read_text(encoding="utf-8"))[0]
+            recovery.verify_key.verify(
+                mr.REVOKE_DOMAIN
+                + statement["revoked_key_id"].encode()
+                + b"\n"
+                + statement["signed_by"].encode(),
+                bytes.fromhex(statement["signature"]),
+            )
+
+    def test_a_recovery_key_may_not_revoke_itself(self):
+        recovery = nacl.signing.SigningKey(bytes([11]) * 32)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "revoke.json"
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "make_registry_revocation.py",
+                    "--revoked-public-key",
+                    recovery.verify_key.encode(encoder=nacl.encoding.RawEncoder).hex(),
+                    "--signing-key",
+                    bytes(recovery).hex(),
+                    "--out",
+                    str(out),
+                ],
+            ):
+                self.assertEqual(mr.main(), 1)
+            self.assertFalse(out.exists())
 
 
 @unittest.skipUnless(nacl is not None, "PyNaCl is required to sign a test bundle")

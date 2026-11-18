@@ -35,6 +35,8 @@ const MIN_BUNDLE_LEN: usize = MAGIC_LEN + 4 + 2 + SIGNATURE_LENGTH;
 pub const SIGN_DOMAIN: &[u8] = b"AGORA-CATALOG-HEADER-V1\n";
 /// Domain separation for a key certificate.
 pub const CERT_DOMAIN: &[u8] = b"AGORA-CATALOG-KEY-CERT-V1\n";
+/// Domain separation for a key revocation statement.
+pub const REVOKE_DOMAIN: &[u8] = b"AGORA-CATALOG-KEY-REVOKE-V1\n";
 /// The only bundle format this build understands.
 pub const BUNDLE_FORMAT: u32 = 1;
 
@@ -46,14 +48,24 @@ pub const BUNDLE_FORMAT: u32 = 1;
 /// check refuses a build with fewer than two valid keys.
 const DEFAULT_REGISTRY_KEYS_JSON: &str = include_str!("../registry-keys.json");
 
-/// What a compiled-in key is allowed to sign.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a key is allowed to sign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RegistryKeyRole {
-    /// Signs catalogs in CI.
+    /// Signs catalogs in CI; may not certify or revoke another key.
     Primary,
-    /// Kept offline; signs a certificate, never a catalog. The certificate can
-    /// authorize a replacement primary, whose catalog carries a revocation.
+    /// Kept offline; signs certificates and revocation statements, never a
+    /// catalog.
     Recovery,
+}
+
+impl RegistryKeyRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Recovery => "recovery",
+        }
+    }
 }
 
 /// One trusted public key: the id is derived from the key, so operators never
@@ -87,8 +99,9 @@ impl RegistryKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryTrust {
     keys: Vec<RegistryKey>,
-    /// Keys a verified catalog has retired. This list only grows.
-    revoked: Vec<String>,
+    /// Verified revocation statements remembered from earlier catalogs. This
+    /// list only grows.
+    revocations: Vec<KeyRevocation>,
     permit_unsigned_debug: bool,
 }
 
@@ -107,7 +120,7 @@ impl RegistryTrust {
             .collect();
         Self {
             keys,
-            revoked: Vec::new(),
+            revocations: Vec::new(),
             permit_unsigned_debug: false,
         }
     }
@@ -116,7 +129,7 @@ impl RegistryTrust {
     pub fn with_key(public_key_hex: impl Into<String>) -> Self {
         Self {
             keys: vec![RegistryKey::from_hex(public_key_hex)],
-            revoked: Vec::new(),
+            revocations: Vec::new(),
             permit_unsigned_debug: false,
         }
     }
@@ -132,7 +145,7 @@ impl RegistryTrust {
                 .into_iter()
                 .map(|key| RegistryKey::from_hex(key.into()))
                 .collect(),
-            revoked: Vec::new(),
+            revocations: Vec::new(),
             permit_unsigned_debug: false,
         }
     }
@@ -148,7 +161,7 @@ impl RegistryTrust {
                 .into_iter()
                 .map(|(role, key)| RegistryKey::from_hex(key.into()).with_role(role))
                 .collect(),
-            revoked: Vec::new(),
+            revocations: Vec::new(),
             permit_unsigned_debug: false,
         }
     }
@@ -160,7 +173,7 @@ impl RegistryTrust {
     pub fn unverified_debug() -> Self {
         Self {
             keys: Vec::new(),
-            revoked: Vec::new(),
+            revocations: Vec::new(),
             permit_unsigned_debug: cfg!(debug_assertions),
         }
     }
@@ -170,16 +183,16 @@ impl RegistryTrust {
     pub fn merge_remembered(
         &mut self,
         keys: impl IntoIterator<Item = RegistryKey>,
-        revoked: impl IntoIterator<Item = String>,
+        revocations: impl IntoIterator<Item = KeyRevocation>,
     ) {
         for key in keys {
             if !self.keys.iter().any(|known| known.id == key.id) {
                 self.keys.push(key);
             }
         }
-        for id in revoked {
-            if !self.revoked.contains(&id) {
-                self.revoked.push(id);
+        for revocation in revocations {
+            if !self.revocations.iter().any(|known| known == &revocation) {
+                self.revocations.push(revocation);
             }
         }
     }
@@ -188,8 +201,15 @@ impl RegistryTrust {
         &self.keys
     }
 
-    pub fn revoked(&self) -> &[String] {
-        &self.revoked
+    pub fn revocations(&self) -> &[KeyRevocation] {
+        &self.revocations
+    }
+
+    pub fn revoked_ids(&self) -> Vec<String> {
+        self.revocations
+            .iter()
+            .map(|revocation| revocation.revoked_key_id.clone())
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -198,9 +218,22 @@ impl RegistryTrust {
 
     /// A stable name for this key set, used to key the verified-header cache.
     pub fn fingerprint(&self) -> String {
-        let mut ids: Vec<&str> = self.keys.iter().map(|key| key.id.as_str()).collect();
+        let mut ids: Vec<String> = self
+            .keys
+            .iter()
+            .map(|key| format!("{}:{}", key.id, key.role.as_str()))
+            .collect();
         ids.sort_unstable();
-        let mut revoked: Vec<&str> = self.revoked.iter().map(String::as_str).collect();
+        let mut revoked: Vec<String> = self
+            .revocations
+            .iter()
+            .map(|revocation| {
+                format!(
+                    "{}:{}:{}",
+                    revocation.revoked_key_id, revocation.signed_by, revocation.signature
+                )
+            })
+            .collect();
         revoked.sort_unstable();
         format!("{}|{}", ids.join(","), revoked.join(","))
     }
@@ -273,11 +306,14 @@ pub fn key_id_for_public_key(public_key_hex: &str) -> String {
     hex::encode(&digest[..8])
 }
 
-/// One statement that `key_id` belongs to `public_key`, signed by `signed_by`.
+/// One statement that `key_id` belongs to `public_key` with `role`, signed by
+/// the recovery key `signed_by`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeyCertificate {
     pub key_id: String,
     pub public_key: String,
+    /// The role the introduced key is trusted with. Part of the signed bytes.
+    pub role: RegistryKeyRole,
     pub signed_by: String,
     /// Lowercase hex, 64 bytes.
     pub signature: String,
@@ -285,11 +321,39 @@ pub struct KeyCertificate {
 
 impl KeyCertificate {
     /// The exact bytes a certificate signature covers.
-    pub fn signed_bytes(key_id: &str, public_key: &str, signed_by: &str) -> Vec<u8> {
+    pub fn signed_bytes(
+        key_id: &str,
+        public_key: &str,
+        role: RegistryKeyRole,
+        signed_by: &str,
+    ) -> Vec<u8> {
         let mut message = CERT_DOMAIN.to_vec();
         message.extend_from_slice(key_id.trim().as_bytes());
         message.push(b'\n');
         message.extend_from_slice(public_key.trim().as_bytes());
+        message.push(b'\n');
+        message.extend_from_slice(role.as_str().as_bytes());
+        message.push(b'\n');
+        message.extend_from_slice(signed_by.trim().as_bytes());
+        message
+    }
+}
+
+/// One statement that `revoked_key_id` must no longer be trusted, signed by the
+/// recovery key `signed_by`. A key may not revoke itself.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KeyRevocation {
+    pub revoked_key_id: String,
+    pub signed_by: String,
+    /// Lowercase hex, 64 bytes.
+    pub signature: String,
+}
+
+impl KeyRevocation {
+    /// The exact bytes a revocation signature covers.
+    pub fn signed_bytes(revoked_key_id: &str, signed_by: &str) -> Vec<u8> {
+        let mut message = REVOKE_DOMAIN.to_vec();
+        message.extend_from_slice(revoked_key_id.trim().as_bytes());
         message.push(b'\n');
         message.extend_from_slice(signed_by.trim().as_bytes());
         message
@@ -318,9 +382,10 @@ pub struct CatalogHeader {
     /// Keys this bundle introduces, each signed by an already-trusted key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub certificates: Vec<KeyCertificate>,
-    /// Key ids the signer says must no longer be used.
+    /// Revocations carried by this catalog. Each is a statement signed by a
+    /// recovery key, not a bare id the catalog signer can invent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub revoked_key_ids: Vec<String>,
+    pub revocations: Vec<KeyRevocation>,
 }
 
 impl CatalogHeader {
@@ -510,29 +575,54 @@ pub struct VerifiedBundle {
     pub header: CatalogHeader,
     pub payload: Vec<u8>,
     /// Certificates this verification actually accepted, so the client can
-    /// remember the keys they introduced. A certificate signed by an unknown
-    /// or revoked key is not in this list.
+    /// remember the keys they introduced. A certificate signed by an unknown,
+    /// primary or revoked key is not in this list.
     pub newly_trusted: Vec<KeyCertificate>,
+    /// Revocations a recovery key signed, to remember with their signatures.
+    pub accepted_revocations: Vec<KeyRevocation>,
 }
 
 /// Verify a bundle against the client's trust set.
 pub fn verify_bundle(bytes: &[u8], trust: &RegistryTrust) -> Result<VerifiedBundle, BundleError> {
     let parsed = parse_bundle(bytes)?;
-    let trusted = trusted_keys(&parsed.header, trust)?;
-    let signing_key = trusted
+    let mut revoked: std::collections::BTreeSet<String> = trust.revoked_ids().into_iter().collect();
+    let mut accepted_revocations: Vec<KeyRevocation> = Vec::new();
+
+    // A revocation is a separately signed statement. Collect every one a
+    // recovery key vouches for, then rebuild trust without the revoked keys.
+    // Revocations only ever grow this set, so the loop terminates.
+    loop {
+        let current = build_trusted(trust, &parsed.header.certificates, &revoked);
+        let mut grew = false;
+        for revocation in &parsed.header.revocations {
+            if verify_revocation(revocation, &current, &revoked) {
+                if revoked.insert(revocation.revoked_key_id.clone()) {
+                    grew = true;
+                }
+                if !accepted_revocations.iter().any(|known| known == revocation) {
+                    accepted_revocations.push(revocation.clone());
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let final_trust = build_trusted(trust, &parsed.header.certificates, &revoked);
+    let signing_key = final_trust
         .keys
         .get(&parsed.header.key_id)
         .ok_or_else(|| BundleError::UnknownKey(parsed.header.key_id.clone()))?;
+    if final_trust.roles.get(&parsed.header.key_id) == Some(&RegistryKeyRole::Recovery) {
+        return Err(BundleError::KeyNotForCatalog(parsed.header.key_id));
+    }
 
     use ed25519_dalek::Verifier;
     let signature = Signature::from_bytes(&parsed.signature);
     signing_key
         .verify(&header_signing_bytes(parsed.header_bytes), &signature)
         .map_err(|_| BundleError::SignatureInvalid)?;
-
-    if trusted.roles.get(&parsed.header.key_id) == Some(&RegistryKeyRole::Recovery) {
-        return Err(BundleError::KeyNotForCatalog(parsed.header.key_id));
-    }
 
     let digest = Sha256::digest(parsed.payload);
     let expected = parsed.header.db_sha256.to_ascii_lowercase();
@@ -543,7 +633,8 @@ pub fn verify_bundle(bytes: &[u8], trust: &RegistryTrust) -> Result<VerifiedBund
     Ok(VerifiedBundle {
         header: parsed.header,
         payload: parsed.payload.to_vec(),
-        newly_trusted: trusted.newly_trusted,
+        newly_trusted: final_trust.newly_trusted,
+        accepted_revocations,
     })
 }
 
@@ -553,80 +644,65 @@ struct TrustedKeys {
     newly_trusted: Vec<KeyCertificate>,
 }
 
-/// Build the trusted key set for a header: compiled-in keys, then certificates
-/// signed by an already-trusted key, then the header's revocations.
-fn trusted_keys(header: &CatalogHeader, trust: &RegistryTrust) -> Result<TrustedKeys, BundleError> {
-    let mut trusted: BTreeMap<String, VerifyingKey> = BTreeMap::new();
+/// Build the keys trusted under `revoked`: compiled/remembered keys, then
+/// certificates signed by a recovery key that is still trusted.
+///
+/// A certificate signed by a primary is ignored: a primary may sign catalogs
+/// and nothing else.
+fn build_trusted(
+    trust: &RegistryTrust,
+    certificates: &[KeyCertificate],
+    revoked: &std::collections::BTreeSet<String>,
+) -> TrustedKeys {
+    let mut keys: BTreeMap<String, VerifyingKey> = BTreeMap::new();
     let mut roles: BTreeMap<String, RegistryKeyRole> = BTreeMap::new();
     for key in trust.keys() {
+        if revoked.contains(&key.id) {
+            continue;
+        }
         if let Some(verifying) = verifying_key(&key.public_key_hex) {
-            trusted.insert(key.id.clone(), verifying);
+            keys.insert(key.id.clone(), verifying);
             roles.insert(key.id.clone(), key.role);
         }
     }
 
-    // Retire keys before they can vouch for anything else. A bundle signed by a
-    // trusted key is allowed to say an old key is compromised; certificates
-    // that key signed must stop counting from that point. The client's
-    // remembered revocations from earlier verified bundles count too.
-    let mut revoked: Vec<&str> = trust.revoked.iter().map(String::as_str).collect();
-    revoked.extend(header.revoked_key_ids.iter().map(String::as_str));
-    for id in &revoked {
-        trusted.remove(*id);
-    }
-    if revoked.iter().any(|id| *id == header.key_id) {
-        return Err(BundleError::RevokedKey(header.key_id.clone()));
-    }
-
-    // Certificates can chain, so repeat until nothing new is trusted. The
-    // certificate count bounds the loop, so a cycle cannot spin.
     let mut newly_trusted = Vec::new();
-    for _ in 0..=header.certificates.len() {
+    for _ in 0..=certificates.len() {
         let mut added = false;
-        for certificate in &header.certificates {
-            if trusted.contains_key(&certificate.key_id) {
+        for certificate in certificates {
+            if keys.contains_key(&certificate.key_id) || revoked.contains(&certificate.key_id) {
                 continue;
             }
-            let Some(signer) = trusted.get(&certificate.signed_by).copied() else {
+            let Some(signer) = keys.get(&certificate.signed_by).copied() else {
                 continue;
             };
-            // Re-checked here because a certificate earlier in this list can
-            // name a revoked signer and the set was filtered before the loop.
-            if revoked.iter().any(|id| *id == certificate.signed_by) {
+            if roles.get(&certificate.signed_by) != Some(&RegistryKeyRole::Recovery) {
                 continue;
             }
-            let expected_id = key_id_for_public_key(&certificate.public_key);
-            if expected_id != certificate.key_id {
-                return Err(BundleError::CertificateInvalid(format!(
-                    "key id {} does not match its public key",
-                    certificate.key_id
-                )));
+            if revoked.contains(&certificate.signed_by) {
+                continue;
             }
-            let signature = decode_signature(&certificate.signature).ok_or_else(|| {
-                BundleError::CertificateInvalid(format!(
-                    "key {} has an unreadable signature",
-                    certificate.key_id
-                ))
-            })?;
+            if key_id_for_public_key(&certificate.public_key) != certificate.key_id {
+                continue;
+            }
+            let Some(signature) = decode_signature(&certificate.signature) else {
+                continue;
+            };
             use ed25519_dalek::Verifier;
             let message = KeyCertificate::signed_bytes(
                 &certificate.key_id,
                 &certificate.public_key,
+                certificate.role,
                 &certificate.signed_by,
             );
             if signer.verify(&message, &signature).is_err() {
-                return Err(BundleError::CertificateInvalid(format!(
-                    "key {} was not signed by {}",
-                    certificate.key_id, certificate.signed_by
-                )));
+                continue;
             }
-            let verifying = verifying_key(&certificate.public_key).ok_or_else(|| {
-                BundleError::CertificateInvalid(format!(
-                    "key {} is not a valid Ed25519 public key",
-                    certificate.key_id
-                ))
-            })?;
-            trusted.insert(certificate.key_id.clone(), verifying);
+            let Some(verifying) = verifying_key(&certificate.public_key) else {
+                continue;
+            };
+            keys.insert(certificate.key_id.clone(), verifying);
+            roles.insert(certificate.key_id.clone(), certificate.role);
             newly_trusted.push(certificate.clone());
             added = true;
         }
@@ -635,11 +711,42 @@ fn trusted_keys(header: &CatalogHeader, trust: &RegistryTrust) -> Result<Trusted
         }
     }
 
-    Ok(TrustedKeys {
-        keys: trusted,
+    TrustedKeys {
+        keys,
         roles,
         newly_trusted,
-    })
+    }
+}
+
+/// A revocation counts only when a trusted recovery key signed it, it does not
+/// revoke its own signer, and neither is already revoked.
+fn verify_revocation(
+    revocation: &KeyRevocation,
+    trusted: &TrustedKeys,
+    revoked: &std::collections::BTreeSet<String>,
+) -> bool {
+    if revocation.revoked_key_id == revocation.signed_by {
+        return false;
+    }
+    if trusted.roles.get(&revocation.signed_by) != Some(&RegistryKeyRole::Recovery) {
+        return false;
+    }
+    if revoked.contains(&revocation.signed_by) || revoked.contains(&revocation.revoked_key_id) {
+        return false;
+    }
+    let Some(signer) = trusted.keys.get(&revocation.signed_by) else {
+        return false;
+    };
+    let Some(signature) = decode_signature(&revocation.signature) else {
+        return false;
+    };
+    use ed25519_dalek::Verifier;
+    signer
+        .verify(
+            &KeyRevocation::signed_bytes(&revocation.revoked_key_id, &revocation.signed_by),
+            &signature,
+        )
+        .is_ok()
 }
 
 fn verifying_key(public_key_hex: &str) -> Option<VerifyingKey> {
@@ -679,7 +786,7 @@ mod tests {
             db_len: payload.len() as u64,
             db_sha256: hex::encode(Sha256::digest(payload)),
             certificates: Vec::new(),
-            revoked_key_ids: Vec::new(),
+            revocations: Vec::new(),
         }
     }
 
@@ -787,150 +894,249 @@ mod tests {
         ));
     }
 
+    fn certificate(signer: &SigningKey, new: &SigningKey, role: RegistryKeyRole) -> KeyCertificate {
+        let key_id = key_id_for_public_key(&public(new));
+        let signed_by = key_id_for_public_key(&public(signer));
+        let message = KeyCertificate::signed_bytes(&key_id, &public(new), role, &signed_by);
+        KeyCertificate {
+            key_id,
+            public_key: public(new),
+            role,
+            signed_by,
+            signature: hex::encode(signer.sign(&message).to_bytes()),
+        }
+    }
+
+    fn revocation(signer: &SigningKey, revoked: &SigningKey) -> KeyRevocation {
+        let revoked_key_id = key_id_for_public_key(&public(revoked));
+        let signed_by = key_id_for_public_key(&public(signer));
+        let message = KeyRevocation::signed_bytes(&revoked_key_id, &signed_by);
+        KeyRevocation {
+            revoked_key_id,
+            signed_by,
+            signature: hex::encode(signer.sign(&message).to_bytes()),
+        }
+    }
+
     #[test]
-    fn a_new_key_signed_by_an_old_trusted_key_is_accepted() {
+    fn a_recovery_key_certifies_a_new_primary() {
         let payload = b"the signed catalog";
-        let old = key(8);
+        let recovery = key(8);
         let new = key(9);
         let mut header = header_for(&new, payload);
-        let cert_message = KeyCertificate::signed_bytes(
-            &key_id_for_public_key(&public(&new)),
-            &public(&new),
-            &key_id_for_public_key(&public(&old)),
-        );
-        header.certificates.push(KeyCertificate {
-            key_id: key_id_for_public_key(&public(&new)),
-            public_key: public(&new),
-            signed_by: key_id_for_public_key(&public(&old)),
-            signature: hex::encode(old.sign(&cert_message).to_bytes()),
-        });
-        let bundle = sign(&new, &header, payload);
-
-        let verified = verify_bundle(&bundle, &RegistryTrust::with_key(public(&old)))
-            .expect("the old trusted key vouched for the new one");
-        assert_eq!(verified.header.key_id, header.key_id);
-    }
-
-    #[test]
-    fn a_new_key_without_a_certificate_is_refused() {
-        let payload = b"the signed catalog";
-        let new = key(10);
-        let header = header_for(&new, payload);
-        let bundle = sign(&new, &header, payload);
-        assert!(matches!(
-            verify_bundle(&bundle, &RegistryTrust::with_key(public(&key(11)))),
-            Err(BundleError::UnknownKey(_))
-        ));
-    }
-
-    #[test]
-    fn a_certificate_signed_by_an_old_key_is_still_refused_when_the_old_key_is_revoked() {
-        let payload = b"the signed catalog";
-        let old = key(12);
-        let new = key(13);
-        let mut header = header_for(&new, payload);
-        let cert_message = KeyCertificate::signed_bytes(
-            &key_id_for_public_key(&public(&new)),
-            &public(&new),
-            &key_id_for_public_key(&public(&old)),
-        );
-        header.certificates.push(KeyCertificate {
-            key_id: key_id_for_public_key(&public(&new)),
-            public_key: public(&new),
-            signed_by: key_id_for_public_key(&public(&old)),
-            signature: hex::encode(old.sign(&cert_message).to_bytes()),
-        });
         header
-            .revoked_key_ids
-            .push(key_id_for_public_key(&public(&old)));
+            .certificates
+            .push(certificate(&recovery, &new, RegistryKeyRole::Primary));
         let bundle = sign(&new, &header, payload);
 
+        let trust = RegistryTrust::with_roles([(RegistryKeyRole::Recovery, public(&recovery))]);
+        let verified =
+            verify_bundle(&bundle, &trust).expect("a recovery key may introduce a primary");
+        assert_eq!(verified.newly_trusted.len(), 1);
+        assert_eq!(verified.newly_trusted[0].role, RegistryKeyRole::Primary);
+    }
+
+    #[test]
+    fn a_primary_key_cannot_certify_another_key() {
+        let payload = b"the signed catalog";
+        let primary = key(10);
+        let attacker = key(11);
+        let mut header = header_for(&primary, payload);
+        header
+            .certificates
+            .push(certificate(&primary, &attacker, RegistryKeyRole::Primary));
+        let bundle = sign(&primary, &header, payload);
+
+        let trust = RegistryTrust::with_roles([(RegistryKeyRole::Primary, public(&primary))]);
+        let verified = verify_bundle(&bundle, &trust)
+            .expect("the catalog itself is validly signed by the compiled primary");
+        assert!(
+            verified.newly_trusted.is_empty(),
+            "a primary-signed certificate must be ignored"
+        );
+
+        let later = header_for(&attacker, payload);
+        let later_bundle = sign(&attacker, &later, payload);
         assert!(matches!(
-            verify_bundle(&bundle, &RegistryTrust::with_key(public(&old))),
+            verify_bundle(&later_bundle, &trust),
             Err(BundleError::UnknownKey(_))
         ));
     }
 
     #[test]
-    fn a_recovery_key_cannot_sign_a_catalog() {
+    fn a_primary_key_cannot_certify_or_revoke_a_recovery_key() {
         let payload = b"the signed catalog";
-        let recovery = key(17);
-        let header = header_for(&recovery, payload);
-        let bundle = sign(&recovery, &header, payload);
-        let trust = RegistryTrust::with_roles([(RegistryKeyRole::Recovery, public(&recovery))]);
-        assert!(matches!(
-            verify_bundle(&bundle, &trust),
-            Err(BundleError::KeyNotForCatalog(_))
-        ));
+        let primary = key(12);
+        let recovery = key(13);
+        let mut header = header_for(&primary, payload);
+        header.revocations.push(revocation(&primary, &recovery));
+        let bundle = sign(&primary, &header, payload);
+
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Primary, public(&primary)),
+            (RegistryKeyRole::Recovery, public(&recovery)),
+        ]);
+        let verified = verify_bundle(&bundle, &trust).unwrap();
+        assert!(
+            verified.accepted_revocations.is_empty(),
+            "a primary-signed revocation must be ignored"
+        );
+
+        // The recovery key is still able to certify the next primary.
+        let mut next = header_for(&primary, payload);
+        next.certificates
+            .push(certificate(&recovery, &key(14), RegistryKeyRole::Primary));
+        let next_bundle = sign(&primary, &next, payload);
+        let next_verified = verify_bundle(&next_bundle, &trust)
+            .expect("the recovery key was not revoked by the primary");
+        assert_eq!(next_verified.newly_trusted.len(), 1);
     }
 
     #[test]
-    fn a_recovery_key_can_sign_a_certificate_for_a_new_catalog_key() {
+    fn a_recovery_key_can_revoke_a_primary_and_it_is_reported() {
         let payload = b"the signed catalog";
-        let recovery = key(18);
-        let primary = key(19);
-        let new = key(20);
-        let mut header = header_for(&primary, payload);
-        let cert_message = KeyCertificate::signed_bytes(
-            &key_id_for_public_key(&public(&new)),
-            &public(&new),
-            &key_id_for_public_key(&public(&recovery)),
-        );
-        header.certificates.push(KeyCertificate {
-            key_id: key_id_for_public_key(&public(&new)),
-            public_key: public(&new),
-            signed_by: key_id_for_public_key(&public(&recovery)),
-            signature: hex::encode(recovery.sign(&cert_message).to_bytes()),
-        });
-        let bundle = sign(&primary, &header, payload);
+        let recovery = key(15);
+        let old_primary = key(16);
+        let current = key(17);
+        let mut header = header_for(&current, payload);
+        header.revocations.push(revocation(&recovery, &old_primary));
+        let bundle = sign(&current, &header, payload);
+
         let trust = RegistryTrust::with_roles([
             (RegistryKeyRole::Recovery, public(&recovery)),
-            (RegistryKeyRole::Primary, public(&primary)),
+            (RegistryKeyRole::Primary, public(&old_primary)),
+            (RegistryKeyRole::Primary, public(&current)),
         ]);
-        let verified = verify_bundle(&bundle, &trust)
-            .expect("the recovery key may introduce a key, the primary signs the catalog");
-        assert_eq!(verified.newly_trusted.len(), 1);
+        let verified = verify_bundle(&bundle, &trust).unwrap();
+        assert_eq!(verified.accepted_revocations.len(), 1);
         assert_eq!(
-            verified.newly_trusted[0].key_id,
-            key_id_for_public_key(&public(&new))
+            verified.accepted_revocations[0].revoked_key_id,
+            key_id_for_public_key(&public(&old_primary))
         );
     }
 
     #[test]
     fn a_revoked_signing_key_is_refused() {
         let payload = b"the signed catalog";
-        let signing = key(14);
+        let signing = key(18);
+        let recovery = key(19);
         let mut header = header_for(&signing, payload);
-        header.revoked_key_ids.push(header.key_id.clone());
+        header.revocations.push(revocation(&recovery, &signing));
         let bundle = sign(&signing, &header, payload);
+
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, public(&recovery)),
+            (RegistryKeyRole::Primary, public(&signing)),
+        ]);
         assert!(matches!(
-            verify_bundle(&bundle, &RegistryTrust::with_key(public(&signing))),
-            Err(BundleError::RevokedKey(_))
+            verify_bundle(&bundle, &trust),
+            Err(BundleError::UnknownKey(_))
         ));
     }
 
     #[test]
-    fn a_certificate_whose_id_does_not_match_its_key_is_refused() {
+    fn a_recovery_key_cannot_revoke_itself() {
         let payload = b"the signed catalog";
-        let old = key(15);
-        let new = key(16);
+        let primary = key(20);
+        let recovery = key(21);
+        let mut header = header_for(&primary, payload);
+        header.revocations.push(revocation(&recovery, &recovery));
+        let bundle = sign(&primary, &header, payload);
+
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Primary, public(&primary)),
+            (RegistryKeyRole::Recovery, public(&recovery)),
+        ]);
+        let verified = verify_bundle(&bundle, &trust).unwrap();
+        assert!(verified.accepted_revocations.is_empty());
+
+        // Still able to certify.
+        let mut next = header_for(&primary, payload);
+        next.certificates
+            .push(certificate(&recovery, &key(22), RegistryKeyRole::Primary));
+        assert!(verify_bundle(&sign(&primary, &next, payload), &trust).is_ok());
+    }
+
+    #[test]
+    fn one_recovery_key_can_revoke_another() {
+        let payload = b"the signed catalog";
+        let primary = key(23);
+        let first = key(24);
+        let second = key(25);
+        let mut header = header_for(&primary, payload);
+        header.revocations.push(revocation(&first, &second));
+        let bundle = sign(&primary, &header, payload);
+
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Primary, public(&primary)),
+            (RegistryKeyRole::Recovery, public(&first)),
+            (RegistryKeyRole::Recovery, public(&second)),
+        ]);
+        let verified = verify_bundle(&bundle, &trust).unwrap();
+        assert_eq!(verified.accepted_revocations.len(), 1);
+
+        // The revoked recovery key can no longer certify.
+        let mut next = header_for(&primary, payload);
+        next.certificates
+            .push(certificate(&second, &key(26), RegistryKeyRole::Primary));
+        let next_bundle = sign(&primary, &next, payload);
+        let next_trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Primary, public(&primary)),
+            (RegistryKeyRole::Recovery, public(&first)),
+        ]);
+        let mut remembered = next_trust.clone();
+        remembered.merge_remembered(Vec::new(), vec![revocation(&first, &second)]);
+        let verified = verify_bundle(&next_bundle, &remembered).unwrap();
+        assert!(
+            verified.newly_trusted.is_empty(),
+            "a certificate signed by a revoked recovery key must be ignored"
+        );
+
+        let later = header_for(&key(26), payload);
+        let later_bundle = sign(&key(26), &later, payload);
+        assert!(matches!(
+            verify_bundle(&later_bundle, &remembered),
+            Err(BundleError::UnknownKey(_))
+        ));
+    }
+
+    #[test]
+    fn a_new_key_without_a_certificate_is_refused() {
+        let payload = b"the signed catalog";
+        let new = key(27);
+        let header = header_for(&new, payload);
+        let bundle = sign(&new, &header, payload);
+        assert!(matches!(
+            verify_bundle(&bundle, &RegistryTrust::with_key(public(&key(28)))),
+            Err(BundleError::UnknownKey(_))
+        ));
+    }
+
+    #[test]
+    fn a_certificate_whose_id_does_not_match_its_key_is_ignored() {
+        let payload = b"the signed catalog";
+        let recovery = key(29);
+        let new = key(30);
         let mut header = header_for(&new, payload);
         let wrong_id = "0000000000000000".to_string();
-        let cert_message = KeyCertificate::signed_bytes(
+        let message = KeyCertificate::signed_bytes(
             &wrong_id,
             &public(&new),
-            &key_id_for_public_key(&public(&old)),
+            RegistryKeyRole::Primary,
+            &key_id_for_public_key(&public(&recovery)),
         );
         header.certificates.push(KeyCertificate {
             key_id: wrong_id,
             public_key: public(&new),
-            signed_by: key_id_for_public_key(&public(&old)),
-            signature: hex::encode(old.sign(&cert_message).to_bytes()),
+            role: RegistryKeyRole::Primary,
+            signed_by: key_id_for_public_key(&public(&recovery)),
+            signature: hex::encode(recovery.sign(&message).to_bytes()),
         });
         let bundle = sign(&new, &header, payload);
+        let trust = RegistryTrust::with_roles([(RegistryKeyRole::Recovery, public(&recovery))]);
         assert!(matches!(
-            verify_bundle(&bundle, &RegistryTrust::with_key(public(&old))),
-            Err(BundleError::CertificateInvalid(_))
+            verify_bundle(&bundle, &trust),
+            Err(BundleError::UnknownKey(_))
         ));
     }
 }

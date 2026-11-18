@@ -322,8 +322,11 @@ The client trusts a compiled-in list of Ed25519 public keys, each named by the
 first 16 hex characters of its SHA-256 and each carrying a role:
 
 - **primary** signs catalogs in CI;
-- **recovery** is kept offline and may only sign a certificate or a revocation,
+- **recovery** is kept offline and signs certificates and revocation statements,
   never a catalog.
+
+A primary key signs catalogs and nothing else: it cannot introduce another key
+or revoke one. A recovery key is the only key that may change trust.
 
 A release build must carry at least one of each, or
 `python scripts/check_registry_keys.py` fails the release. The defaults live in
@@ -351,12 +354,14 @@ a separate id in sync.
 
 ### What the client remembers
 
-Next to the cached bundle the client keeps `registry.trust`, a line log of the
-keys a verified catalog introduced (each line is its certificate) and the key ids
-it revoked. A new entry is written before a verified bundle is installed, and
-the log only grows: a revocation is never removed. Every later verification
-starts from the compiled keys plus remembered keys minus remembered revocations.
-A compiled-in key that was revoked stays revoked.
+Next to the cached bundle the client keeps `registry.trust`, a line log of
+recovery-signed statements: certificates that introduced keys, and revocation
+statements with their signatures. A new entry is written before a verified
+bundle is installed, and the log only grows: a revocation is never removed.
+Every remembered line is re-verified on load against the recovery keys trusted at
+that point, so a forged revocation line is ignored, not obeyed. Every later
+verification starts from the compiled keys plus remembered keys minus
+remembered revocations. A compiled-in key that was revoked stays revoked.
 
 A missing or unreadable state file falls back to the compiled keys and whatever
 complete lines can still be read (a truncated final line loses only that line).
@@ -365,28 +370,33 @@ from a compiled key, so a garbage or forged state file cannot widen trust.
 
 ### Rotating a key
 
-Rotation is a trust statement, not a client update:
+Rotation is a trust statement, not a client update. The recovery key is the only
+key that may certify or revoke:
 
-1. Generate the new key pair offline. Put the public key in the next client's
-   `AGORA_REGISTRY_PUBKEYS`, and keep the old key in that list for at least one
-   release cycle.
-2. Sign a key certificate with the old private key:
-   `python scripts/make_registry_key_certificate.py --new-public-key <hex> --out key-certificate.json`
-3. Compile the catalog with the **new** private key in `ED25519_PRIVATE_KEY` and
-   `AGORA_REGISTRY_KEY_CERTIFICATES=key-certificate.json`. Clients that trust the
-   old key accept the new key from the certificate in the signed bundle.
-4. When every supported client knows the new key, remove the old key from the
-   compiled-in list and from `AGORA_REGISTRY_PUBKEYS`.
+1. Generate the new primary key pair offline. Put the public key in the next
+   client's `AGORA_REGISTRY_PUBKEYS`, and keep the old key in that list for at
+   least one release cycle.
+2. Sign a certificate with the **recovery** private key:
+   `python scripts/make_registry_key_certificate.py --new-public-key <hex> --role primary --out key-certificate.json`
+3. Sign a revocation of the old primary with the same recovery key:
+   `python scripts/make_registry_revocation.py --revoked-public-key <old hex> --out revocation.json`
+4. Compile the catalog with the **new** private key in `ED25519_PRIVATE_KEY`,
+   `AGORA_REGISTRY_KEY_CERTIFICATES=key-certificate.json`, and
+   `AGORA_REGISTRY_REVOCATIONS=revocation.json`. The new primary signs the
+   catalog; the recovery-signed statements inside it are what clients trust.
+5. When every supported client knows the new primary, remove the old key from
+   the compiled-in list and from `AGORA_REGISTRY_PUBKEYS`.
 
-A **compromised** key is retired by compiling a catalog with
-`AGORA_REGISTRY_REVOKED_KEY_IDS=<old-id>` (signed by the primary, or introduced
-by a certificate signed by the recovery key) and by shipping a client build
-without it. The client remembers the revocation in
-`registry.trust` next to the cached bundle, so a later bundle signed by the old
-key is refused even if it leaves the revocation list out. Until every client
-has that build, an attacker holding the old private key can still sign a bundle
-those clients accept; a short expiry limits how long such a bundle remains
-current. Never weaken or skip signature verification during a rotation.
+A **compromised primary** is retired by a recovery-signed revocation (step 3)
+and a recovery-signed certificate for its replacement (step 2); a stolen primary
+cannot revoke the recovery key or certify anything itself. The client remembers
+the revocation in `registry.trust`, so a later bundle signed by the old primary
+is refused even if it omits the revocation. A **compromised recovery key** cannot
+be fixed in-band: ship a client release with a new compiled recovery key. A
+recovery key may be revoked by another recovery key, and may never revoke
+itself. Until every client has that build, an attacker holding an old key can
+still sign a bundle those clients accept; a short expiry limits how long such a
+bundle remains current. Never weaken or skip signature verification.
 
 ### Expiry and stale catalogs
 
@@ -414,6 +424,8 @@ open.
 - [ ] Loader/runtime catalog inputs are current and pinned.
 - [ ] Compiler tests pass.
 - [ ] The catalog is signed with the production primary key.
+- [ ] Any certificate or revocation in the bundle is signed by the recovery key,
+      not the primary.
 - [ ] The public keys expected by released clients match the signing key, and
       `python scripts/check_registry_keys.py` passes (primary and recovery).
 - [ ] `registry.bundle` is present and its header names the expected key id.
