@@ -36,7 +36,6 @@ use crate::game_registry::{GameInventory, IdentifiedInstall, RuntimeResolution};
 use crate::game_saves::{self, SavesError};
 use crate::game_tools::{self, ToolError};
 use crate::game_user_tools;
-use crate::lock_manager::LockResource;
 
 /// The `overwrite` files that no tool claims become one content layer with this name.
 pub const OVERWRITE_LAYER_NAME: &str = "MO2 overwrite";

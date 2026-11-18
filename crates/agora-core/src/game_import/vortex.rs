@@ -51,7 +51,6 @@ use crate::game_instance::{self, GameInstanceManifest, SavesChoice};
 use crate::game_load_order;
 use crate::game_plugins;
 use crate::game_registry::{GameInventory, IdentifiedInstall, RuntimeResolution};
-use crate::lock_manager::LockResource;
 
 /// Where Vortex's own files were read from, and what the state says. This is the parsed store,
 /// before anything is matched to an Agora install.
@@ -2706,15 +2705,7 @@ pub fn run(
                 "vortex-import-plugins",
             )
             .map_err(|error| ImportError::Other(error.to_string()))?;
-            game_plugins::import_list_in_locked(
-                ctx,
-                &guard,
-                &def,
-                None,
-                &lines,
-                &managed,
-                &[],
-            )?;
+            game_plugins::import_list_in_locked(ctx, &guard, &def, None, &lines, &managed, &[])?;
             report.plugins_written = Some(lines.len());
             // The profile's LOOT `after` entries become Agora's load-after rules. The rule add
             // checks masters and cycles against the instance as well; a refused rule is reported
