@@ -90,6 +90,14 @@ export async function installGamesMock(page: Page, table: GamesMockTable): Promi
           warnings: [],
         },
         set_content_sharing: null,
+        // The Settings page's Accounts section asks whether the saved account list needs
+        // repair. A healthy store is the default; a spec that needs the notice passes one.
+        msa_account_store_status: {
+          needs_repair: false,
+          corrupt_file: null,
+          detected_at: null,
+          message: null,
+        },
         // The shell asks for recognised downloads on every page for the Library badge. A null
         // list is a failed read; an empty one is "nothing new", which is what these specs mean.
         downloads_list: [],
