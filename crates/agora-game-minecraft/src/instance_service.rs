@@ -892,18 +892,26 @@ impl InstanceService {
             });
         }
         let conn = self.connection()?;
-        agora_core::db::rename_instance(&conn, &instance_id, name.trim()).map_err(|error| {
-            LauncherError::Generic {
+        // The manifest carries the name too (exports and pack identity read it),
+        // and it is the record the row follows, so it is written first. If the
+        // row cannot follow, the manifest is put back: a rename is never visible
+        // in only one place.
+        let manifest_path = self.ctx.paths.instance_manifest(&instance_id)?;
+        let write_manifest = agora_core::helpers::atomic_write_manifest;
+        let previous = read_manifest(&manifest_path)?;
+        if let Some(manifest) = &previous {
+            let mut renamed = manifest.clone();
+            renamed.name = name.trim().to_string();
+            write_manifest(&manifest_path, &renamed)?;
+        }
+        if let Err(error) = agora_core::db::rename_instance(&conn, &instance_id, name.trim()) {
+            if let Some(manifest) = &previous {
+                let _ = write_manifest(&manifest_path, manifest);
+            }
+            return Err(LauncherError::Generic {
                 code: "ERR_LOCAL_STATE_FAILED".into(),
                 message: error.to_string(),
-            }
-        })?;
-        // The manifest carries the name too (exports and pack identity read it);
-        // keep it in step so a rename is never visible in only one place.
-        let manifest_path = self.ctx.paths.instance_manifest(&instance_id)?;
-        if let Some(mut manifest) = read_manifest(&manifest_path)? {
-            manifest.name = name.trim().to_string();
-            agora_core::helpers::atomic_write_manifest(&manifest_path, &manifest)?;
+            });
         }
         self.record_change(&instance_id, "rename");
         Ok(())

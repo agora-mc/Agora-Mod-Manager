@@ -2016,7 +2016,7 @@ pub fn update_instance_loader_version(
     Ok(affected as u64)
 }
 
-/// Overwrite the manifest-derived columns of an instance row (Minecraft
+/// Overwrite the manifest-derived columns of an instance row (name, Minecraft
 /// version, loader, loader version, locked flag) with the manifest's values.
 ///
 /// For paths that replace `instance_manifest.json` wholesale (snapshot
@@ -2030,14 +2030,16 @@ pub fn sync_instance_row_from_manifest(
 ) -> anyhow::Result<u64> {
     let affected = conn.execute(
         "UPDATE user_instances
-         SET minecraft_version = ?1, loader = ?2, loader_version = ?3, is_locked = ?4
+         SET minecraft_version = ?1, loader = ?2, loader_version = ?3, is_locked = ?4,
+             name = COALESCE(NULLIF(TRIM(?6), ''), name)
          WHERE instance_id = ?5",
         rusqlite::params![
             manifest.minecraft_version,
             manifest.loader,
             manifest.loader_version,
             manifest.is_locked,
-            instance_id
+            instance_id,
+            manifest.name
         ],
     )?;
     Ok(affected as u64)
@@ -3871,5 +3873,71 @@ mod tests {
             .expect("waits for the lock instead of failing");
         assert!(started.elapsed() >= std::time::Duration::from_millis(200));
         release.join().unwrap();
+    }
+
+    #[test]
+    fn row_resync_follows_the_manifest_name_and_versions() {
+        let (conn, _path) = test_db();
+        let row = InstanceRow {
+            instance_id: "resync".into(),
+            name: "Old Name".into(),
+            minecraft_version: "1.20.1".into(),
+            loader: "fabric".into(),
+            loader_version: "0.15.0".into(),
+            is_modpack: false,
+            is_locked: false,
+            last_launched_at: None,
+            jvm_memory_mb: 4096,
+            jvm_memory_mode: "manual".into(),
+            jvm_gc: "auto".into(),
+            jvm_custom_args: String::new(),
+            jvm_always_pre_touch: false,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            java_path: None,
+            java_incompatible_override: false,
+            icon_path: None,
+            launch_mode_override: "delegated".into(),
+            import_source: None,
+            total_play_ms: 0,
+        };
+        upsert_instance(&conn, &row).unwrap();
+        let mut manifest: crate::models::InstanceManifest =
+            serde_json::from_value(serde_json::json!({
+                "instance_id": "resync",
+                "name": "Restored Name",
+                "minecraft_version": "1.21.1",
+                "loader": "fabric",
+                "loader_version": "0.16.9",
+                "is_locked": true,
+                "mods": []
+            }))
+            .unwrap();
+        assert_eq!(
+            sync_instance_row_from_manifest(&conn, "resync", &manifest).unwrap(),
+            1
+        );
+        let (name, version, locked): (String, String, bool) = conn
+            .query_row(
+                "SELECT name, minecraft_version, is_locked FROM user_instances WHERE instance_id = 'resync'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (name.as_str(), version.as_str(), locked),
+            ("Restored Name", "1.21.1", true)
+        );
+
+        // A manifest with no usable name keeps the row's name.
+        manifest.name = "  ".into();
+        sync_instance_row_from_manifest(&conn, "resync", &manifest).unwrap();
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM user_instances WHERE instance_id = 'resync'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "Restored Name");
     }
 }
