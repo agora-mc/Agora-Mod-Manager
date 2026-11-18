@@ -2376,21 +2376,28 @@ async fn async_main() {
     // newer Agora, so it must run before core initializes (and possibly repairs
     // or refuses) anything.
     if let Commands::Doctor = &cli.command {
-        if let Err(error) = run_doctor(&paths, json) {
-            let code = exit_code_from_error(&error);
-            if json {
-                eprintln!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "error": error.to_string(),
-                        "exitCode": code,
-                    }))
-                    .unwrap()
-                );
-            } else {
-                eprintln!("Error: {error}");
+        match run_doctor(&paths, json) {
+            // Damage is reported on standard output (human or JSON); the exit
+            // code is the machine-readable part. Ten is the same local-state
+            // failure code a failing database command uses.
+            Ok(false) => std::process::exit(10),
+            Ok(true) => {}
+            Err(error) => {
+                let code = exit_code_from_error(&error);
+                if json {
+                    eprintln!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "error": error.to_string(),
+                            "exitCode": code,
+                        }))
+                        .unwrap()
+                    );
+                } else {
+                    eprintln!("Error: {error}");
+                }
+                std::process::exit(code);
             }
-            std::process::exit(code);
         }
         return;
     }
@@ -2463,7 +2470,11 @@ async fn async_main() {
 /// recovered from a damaged one: it names the file, the schema version, the
 /// integrity result, the backups that can be restored, and the old files kept
 /// aside.
-fn run_doctor(paths: &agora_core::app_paths::AppPaths, json: bool) -> anyhow::Result<()> {
+///
+/// Returns `false` when it found a problem (damage, an unreadable store, or a
+/// database from a newer Agora). The caller exits 10 in that case, keeping the
+/// whole report on standard output.
+fn run_doctor(paths: &agora_core::app_paths::AppPaths, json: bool) -> anyhow::Result<bool> {
     use agora_core::db::{inspect_local_state, LocalStateIntegrity};
     let info = inspect_local_state(&paths.local_state_db());
     let mut backups = info.backups.clone();
@@ -2477,6 +2488,15 @@ fn run_doctor(paths: &agora_core::app_paths::AppPaths, json: bool) -> anyhow::Re
     let newer = info
         .schema_version
         .is_some_and(|version| version > info.supported_version);
+    let unreadable_schema =
+        !matches!(info.integrity, LocalStateIntegrity::Missing) && info.schema_version.is_none();
+    let problems = matches!(
+        info.integrity,
+        LocalStateIntegrity::Corrupt(_) | LocalStateIntegrity::Unreadable(_)
+    ) || unreadable_schema
+        || newer
+        || info.backups_error.is_some()
+        || info.kept_aside_error.is_some();
     if json {
         println!(
             "{}",
@@ -2487,6 +2507,7 @@ fn run_doctor(paths: &agora_core::app_paths::AppPaths, json: bool) -> anyhow::Re
                 "schemaVersion": info.schema_version,
                 "supportedVersion": info.supported_version,
                 "databaseIsNewer": newer,
+                "problems": problems,
                 "backups": backups.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
                 "backupsError": info.backups_error,
                 "backupsKept": agora_core::db::LOCAL_STATE_BACKUP_RETENTION,
@@ -2494,7 +2515,7 @@ fn run_doctor(paths: &agora_core::app_paths::AppPaths, json: bool) -> anyhow::Re
                 "keptAsideError": info.kept_aside_error,
             }))?
         );
-        return Ok(());
+        return Ok(!problems);
     }
     println!("Local database: {}", info.path.display());
     match info.integrity {
@@ -2555,7 +2576,15 @@ fn run_doctor(paths: &agora_core::app_paths::AppPaths, json: bool) -> anyhow::Re
             println!("- {}", path.display());
         }
     }
-    Ok(())
+    if problems {
+        println!(
+            "Agora found problems with the local database (exit code 10). The report above \
+             names every one."
+        );
+    } else {
+        println!("Agora found no problems with the local database.");
+    }
+    Ok(!problems)
 }
 
 fn run_data_migration(

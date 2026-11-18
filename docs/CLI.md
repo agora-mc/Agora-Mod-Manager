@@ -984,6 +984,8 @@ The CLI maps many core failures to stable semantic ranges.
 
 Scripts should still inspect structured error output because several distinct errors share a range.
 
+`agora doctor` prints its whole report (human or `--json`) and exits `0` when the local database is healthy or not created yet. It exits `10` when it finds damage, a store it cannot read, or a database written by a newer Agora. The JSON report always includes `problems: true` or `false`, so a script can read the reason without parsing the message.
+
 Most ordinary lookups for a nonexistent instance currently return generic exit code `1`, not `11`.
 
 ## Support checklist
