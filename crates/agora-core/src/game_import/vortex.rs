@@ -2700,11 +2700,21 @@ pub fn run(
                 .filter(|line| line.managed)
                 .map(|line| line.name.clone())
                 .collect();
-            let _lock = ctx.lock_manager.acquire(
-                LockResource::Instance(instance_id.clone()),
+            let guard = crate::instance_runtime::InstanceGuard::for_mutation(
+                ctx,
+                &instance_id,
                 "vortex-import-plugins",
+            )
+            .map_err(|error| ImportError::Other(error.to_string()))?;
+            game_plugins::import_list_in_locked(
+                ctx,
+                &guard,
+                &def,
+                None,
+                &lines,
+                &managed,
+                &[],
             )?;
-            game_plugins::import_list(ctx, &instance_id, &def, &lines, &managed, &[])?;
             report.plugins_written = Some(lines.len());
             // The profile's LOOT `after` entries become Agora's load-after rules. The rule add
             // checks masters and cycles against the instance as well; a refused rule is reported

@@ -1550,14 +1550,17 @@ pub fn run(
                 .filter(|l| l.managed)
                 .map(|l| l.name.clone())
                 .collect();
-            let _lock = ctx.lock_manager.acquire(
-                LockResource::Instance(instance_id.clone()),
-                "mo2-import-plugins",
-            )?;
-            game_plugins::import_list(
+            let guard = crate::instance_runtime::InstanceGuard::for_mutation(
                 ctx,
                 &instance_id,
+                "mo2-import-plugins",
+            )
+            .map_err(|error| ImportError::Other(error.to_string()))?;
+            game_plugins::import_list_in_locked(
+                ctx,
+                &guard,
                 &def,
+                None,
                 &lines,
                 &managed,
                 &plan.plugins.locked,
