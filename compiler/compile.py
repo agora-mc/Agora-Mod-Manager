@@ -30,11 +30,9 @@ from urllib.parse import urlparse
 import requests
 
 from governance import (
-    COMMUNITY_REVIEW_LABEL,
     GovernanceError,
     GovernanceMode,
     GovernancePolicy,
-    REGISTRY_VOTE_LABEL,
     enrich_governance_tables,
     enrich_registry_item_scores,
     resolve_governance_repo,
