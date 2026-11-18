@@ -14,9 +14,9 @@ use agora_game_api::{
 
 use crate::content_store::{self, ContentError, ContentItem, ContentSource};
 use crate::ctx::Ctx;
-use crate::instance_runtime::InstanceGuard;
 use crate::game_deploy::{self, DeployError};
 use crate::game_instance::{self, InstanceError};
+use crate::instance_runtime::InstanceGuard;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ThunderstoreInstallError {
@@ -115,12 +115,9 @@ pub fn install_thunderstore(
     instance_id: &str,
     item_id: &str,
 ) -> Result<ThunderstoreInstallOutcome, ThunderstoreInstallError> {
-    let guard = InstanceGuard::for_mutation(ctx, instance_id, "content-add")
-        .map_err(|error| {
-            ThunderstoreInstallError::Deploy(crate::game_deploy::DeployError::Other(
-                error.to_string(),
-            ))
-        })?;
+    let guard = InstanceGuard::for_mutation(ctx, instance_id, "content-add").map_err(|error| {
+        ThunderstoreInstallError::Deploy(crate::game_deploy::DeployError::Other(error.to_string()))
+    })?;
     install_thunderstore_locked(ctx, &guard, item_id)
 }
 

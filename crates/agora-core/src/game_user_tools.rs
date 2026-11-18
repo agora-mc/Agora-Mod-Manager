@@ -23,9 +23,9 @@ use agora_game_api::{fold_path_case, GameDefinition, GamePath, ToolDefinition};
 use serde::{Deserialize, Serialize};
 
 use crate::ctx::Ctx;
-use crate::instance_runtime::InstanceGuard;
 use crate::game_deploy::{self, DeployMode, FileSource};
 use crate::game_instance::{self, GameInstanceManifest};
+use crate::instance_runtime::InstanceGuard;
 use crate::lock_manager::LockResource;
 
 const USER_TOOLS_FILE: &str = "user_tools.json";

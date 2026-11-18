@@ -292,9 +292,17 @@ fn an_ini_edit_is_refused_by_a_live_session_unless_overridden() {
     );
     h.open_view_session("live");
 
-    let refused =
-        agora_core::game_ini::set_value_while_running(&h.ctx, "live", &def, "user/Skyrim.ini", "General", "Value", "2", false)
-            .expect_err("a live session must refuse the edit");
+    let refused = agora_core::game_ini::set_value_while_running(
+        &h.ctx,
+        "live",
+        &def,
+        "user/Skyrim.ini",
+        "General",
+        "Value",
+        "2",
+        false,
+    )
+    .expect_err("a live session must refuse the edit");
     assert!(refused.to_string().contains("running"), "{refused}");
 
     agora_core::game_ini::set_value_while_running(
@@ -313,7 +321,9 @@ fn an_ini_edit_is_refused_by_a_live_session_unless_overridden() {
 /// Reordering the plugin list under a live game is refused, and allowed only with the override.
 #[test]
 fn a_plugin_list_edit_is_refused_by_a_live_session_unless_overridden() {
-    use agora_game_api::{LoadOrderDefinition, LoadOrderFormat, LoadOrderItems, LoadOrderRules, RelPath};
+    use agora_game_api::{
+        LoadOrderDefinition, LoadOrderFormat, LoadOrderItems, LoadOrderRules, RelPath,
+    };
 
     let h = Harness::new();
     let mut def = skyrim();
@@ -360,7 +370,14 @@ fn a_plugin_list_edit_is_refused_by_a_live_session_unless_overridden() {
     assert!(refused.to_string().contains("running"), "{refused}");
 
     agora_core::game_plugins::import_list_in_while_running(
-        &h.ctx, "live", &def, None, &lines, &[], &[], true,
+        &h.ctx,
+        "live",
+        &def,
+        None,
+        &lines,
+        &[],
+        &[],
+        true,
     )
     .expect("the override must allow the reorder");
 }
@@ -391,12 +408,7 @@ fn the_launch_locked_path_does_not_retake_the_instance_lock() {
 
     let guard = agora_core::instance_runtime::InstanceGuard::for_mutation(&h.ctx, "live", "launch")
         .unwrap();
-    agora_core::game_plugins::sync_without_content_locked(
-        &h.ctx,
-        &guard,
-        &def,
-        &StoreId::steam(),
-    )
-    .unwrap();
+    agora_core::game_plugins::sync_without_content_locked(&h.ctx, &guard, &def, &StoreId::steam())
+        .unwrap();
     agora_core::game_deploy::set_deployment_locked(&h.ctx, &guard, None).unwrap();
 }

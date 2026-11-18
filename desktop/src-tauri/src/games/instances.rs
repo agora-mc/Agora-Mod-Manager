@@ -453,7 +453,8 @@ pub async fn games_instance_set_deployment(
     mode: String,
     while_running: Option<bool>,
 ) -> Result<InstanceDeployment, GamesError> {
-    blocking(move || set_deployment(&app, &instance_id, &mode, while_running.unwrap_or(false))).await
+    blocking(move || set_deployment(&app, &instance_id, &mode, while_running.unwrap_or(false)))
+        .await
 }
 
 /// The Steam launch-options status the Linux instance page shows: whether the Agora wrapper is
@@ -962,13 +963,8 @@ fn set_deployment(
 ) -> Result<InstanceDeployment, GamesError> {
     let chosen = parse_deployment(mode)?;
     let ctx = crate::core_context(app)?;
-    agora_core::game_deploy::set_deployment_while_running(
-        &ctx,
-        instance_id,
-        chosen,
-        while_running,
-    )
-    .map_err(core_failed)?;
+    agora_core::game_deploy::set_deployment_while_running(&ctx, instance_id, chosen, while_running)
+        .map_err(core_failed)?;
     Ok(InstanceDeployment {
         instance_id: instance_id.to_string(),
         deployment: chosen.map(|mode| mode.as_str().to_string()),

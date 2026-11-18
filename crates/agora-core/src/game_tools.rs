@@ -27,7 +27,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::ctx::Ctx;
-use crate::instance_runtime::InstanceGuard;
 use crate::event_sink::CancellationToken;
 use crate::game_base::BaseManifest;
 use crate::game_deploy::{
@@ -45,6 +44,7 @@ use crate::game_tool_swap::{self, SwapError, SwapJournal};
 use crate::game_user_files::{self, UserFilesError};
 use crate::game_user_tools::UserTool;
 use crate::install_watch::{InstallChanges, InstallWatch};
+use crate::instance_runtime::InstanceGuard;
 
 /// Failed runs kept in `failed-<run>` folders, the newest first (MASTER_SPEC §26.9).
 pub const FAILED_RUNS_KEPT: usize = 3;
@@ -1263,7 +1263,15 @@ pub fn set_tool_input(
     input_id: &str,
     value: &str,
 ) -> Result<(), ToolError> {
-    set_tool_input_while_running(ctx, instance_id, definition, tool_id, input_id, value, false)
+    set_tool_input_while_running(
+        ctx,
+        instance_id,
+        definition,
+        tool_id,
+        input_id,
+        value,
+        false,
+    )
 }
 
 /// [`set_tool_input`], with the user's explicit answer to a running game.

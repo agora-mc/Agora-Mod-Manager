@@ -19,9 +19,9 @@ use sha2::{Digest, Sha256};
 use crate::content_store::place::copy_owned;
 use crate::content_store::protect;
 use crate::ctx::Ctx;
-use crate::instance_runtime::InstanceGuard;
 use crate::game_base::{get_modified_unix_ms, BaseManifest};
 use crate::game_discovery::volume::VolumeDetector;
+use crate::instance_runtime::InstanceGuard;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1528,14 +1528,7 @@ pub(crate) fn deploy_checked<E>(
     mode: DeployMode,
     before_build: impl FnOnce(&DeploymentPlan) -> Result<(), E>,
 ) -> Result<Result<(DeployOutcome, DeploymentPlan), DeployError>, E> {
-    deploy_checked_while_running(
-        ctx,
-        instance_id,
-        definition,
-        mode,
-        false,
-        before_build,
-    )
+    deploy_checked_while_running(ctx, instance_id, definition, mode, false, before_build)
 }
 
 pub(crate) fn deploy_checked_while_running<E>(
@@ -3262,7 +3255,14 @@ pub fn add_content(
     mount_path: Option<&str>,
     source_path: Option<&str>,
 ) -> Result<Layer, DeployError> {
-    add_content_while_running(ctx, instance_id, item_id_or_prefix, mount_path, source_path, false)
+    add_content_while_running(
+        ctx,
+        instance_id,
+        item_id_or_prefix,
+        mount_path,
+        source_path,
+        false,
+    )
 }
 
 /// [`add_content`], with the user's explicit answer to a running game.

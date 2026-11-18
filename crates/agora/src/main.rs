@@ -6667,7 +6667,10 @@ async fn run_command(
                 }
             }
         },
-        Commands::Games { action, while_running } => match action {
+        Commands::Games {
+            action,
+            while_running,
+        } => match action {
             GamesCmd::Discover => {
                 let report = agora_core::game_discovery::discover_with_folders(&ctx.paths);
                 if json {
@@ -11616,7 +11619,7 @@ fn instance_tools_command(
                 &tool,
                 while_running,
             )
-                .unwrap_or_else(|e| fail(e.to_string()));
+            .unwrap_or_else(|e| fail(e.to_string()));
             if json {
                 println!("{}", serde_json::to_string_pretty(&state)?);
             } else {
@@ -11630,14 +11633,9 @@ fn instance_tools_command(
         }
         InstanceToolsCmd::Remove { tool, .. } => {
             let tool = tool_id(&tool);
-            let removed = game_tools::remove_while_running(
-                ctx,
-                &instance_id,
-                game_def,
-                &tool,
-                while_running,
-            )
-                .unwrap_or_else(|e| fail(e.to_string()));
+            let removed =
+                game_tools::remove_while_running(ctx, &instance_id, game_def, &tool, while_running)
+                    .unwrap_or_else(|e| fail(e.to_string()));
             if json {
                 let out = serde_json::json!({
                     "instance_id": instance_id,
@@ -12352,9 +12350,9 @@ fn ini_command(
         &value,
         while_running,
     ) {
-            Ok(changed) => changed,
-            Err(e) => fail(e.to_string()),
-        };
+        Ok(changed) => changed,
+        Err(e) => fail(e.to_string()),
+    };
     if json {
         let out = serde_json::json!({
             "status": "ok",

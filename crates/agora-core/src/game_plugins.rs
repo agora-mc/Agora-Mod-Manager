@@ -22,8 +22,8 @@ use agora_game_api::{
 use serde::{Deserialize, Serialize};
 
 use crate::ctx::Ctx;
-use crate::instance_runtime::InstanceGuard;
 use crate::game_deploy::{DeploymentPlan, FileSource};
+use crate::instance_runtime::InstanceGuard;
 
 const STATE_FILE: &str = "plugin_list_state.json";
 
