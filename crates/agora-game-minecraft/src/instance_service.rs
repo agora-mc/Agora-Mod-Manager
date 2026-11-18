@@ -3651,13 +3651,22 @@ $#
         fn instance_held_by_another_operation_is_refused_and_untouched() {
             let (ctx, root) = context();
             seed(&ctx, "pack");
-            let _held = ctx
-                .lock_manager
-                .acquire(
-                    agora_core::lock_manager::LockResource::Instance("pack".into()),
-                    "launch",
-                )
-                .unwrap();
+            // Hold it on another thread: a thread may re-enter its own lock.
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let manager = ctx.lock_manager.clone();
+            let holder = std::thread::spawn(move || {
+                let _held = manager
+                    .acquire(
+                        agora_core::lock_manager::LockResource::Instance("pack".into()),
+                        "launch",
+                    )
+                    .unwrap();
+                ready_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            });
+            ready_rx.recv().unwrap();
+
             let service = InstanceService::new(ctx.clone());
             assert!(service.delete("pack").is_err());
             assert!(ctx
@@ -3668,6 +3677,9 @@ $#
                 .is_file());
             assert_eq!(service.list().unwrap().len(), 1);
             assert!(service.list_recently_deleted(DAYS).unwrap().is_empty());
+
+            let _ = release_tx.send(());
+            holder.join().unwrap();
             let _ = std::fs::remove_dir_all(root);
         }
 
