@@ -192,6 +192,16 @@ Press a button on the controller while the Agora window is focused (make sure to
 
 In Settings, under Appearance, use **Reset appearance** for colors and text, or **Reset layout** for the sidebar. Neither one touches your instances.
 
+### A message says the local database is damaged or from a newer version
+
+Agora checks its own local database (`local_state.db`) every time it starts. It never deletes a damaged or newer file.
+
+- **Damaged database:** Agora moves the file aside as `local_state.db.corrupt-<time>` and restores the newest copy from the `backups` folder that passes its integrity check. If no backup passes, it starts with a fresh database. A notice says which happened and where the old file is.
+- **Database from a newer Agora:** Agora does not migrate it down or overwrite it. It says which version wrote it and offers to start with a fresh database, keeping the old file as `local_state.db.newer-v<version>-<time>`. Choosing No leaves everything unchanged and Agora closes.
+- **Backup could not be written:** before migrating, Agora copies the database into `backups/`. If that copy fails, it stops and asks whether to migrate without a backup. The safe answer is No.
+
+`agora doctor` (see [CLI](CLI.md)) prints the database path, its schema version, its integrity result, the backups it can restore, and every file kept aside.
+
 ### Checking for a new version
 
 Open Settings and go to **Software Updates**, then select **Check for Updates**. This also shows the version you're on, which is useful when asking for help. Portable copies update by hand: close Agora and replace the program file from a newer portable ZIP, keeping `portable.txt` and your `data` folder.

@@ -1,10 +1,76 @@
 use crate::models::InstanceRow;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Expected schema version for the mutable local SQLite database.
 /// Migrations are applied sequentially on startup.
-pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 27;
+pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 28;
+
+/// How many pre-migration database backups are kept.
+pub const LOCAL_STATE_BACKUP_RETENTION: usize = 3;
+
+/// Folder beside the database where pre-migration backups live.
+pub const LOCAL_STATE_BACKUP_DIR: &str = "backups";
+
+/// Error code for a database written by a newer Agora.
+pub const ERR_LOCAL_STATE_NEWER: &str = "ERR_LOCAL_STATE_NEWER";
+
+/// Error code for a failed pre-migration backup.
+pub const ERR_LOCAL_STATE_BACKUP_FAILED: &str = "ERR_LOCAL_STATE_BACKUP_FAILED";
+
+/// Choices an adapter may make at startup where the safe default is to stop.
+///
+/// Both are explicit user overrides, never automatic: the default for each is
+/// to refuse and report, because overwriting or migrating without a copy is
+/// exactly the case this safety net exists to prevent.
+#[derive(Debug, Clone, Default)]
+pub struct LocalStateOpenOptions {
+    /// A database from a newer Agora may be kept aside and a fresh database
+    /// started in its place. The old file is never deleted.
+    pub accept_newer_schema: bool,
+    /// Migrate even when the pre-migration backup could not be written.
+    pub accept_missing_backup: bool,
+}
+
+/// What startup did to the local database, for the adapter to tell the player.
+#[derive(Debug, Clone, Default)]
+pub struct LocalStateStartupReport {
+    /// Set when a corrupt database was moved aside and either restored from a
+    /// backup or replaced with a fresh one.
+    pub recovered_corrupt: Option<CorruptRecovery>,
+    /// Set when a newer-schema database was kept aside under an explicit
+    /// override and a fresh database started.
+    pub newer_schema_kept: Option<NewerSchemaKept>,
+    /// The pre-migration backup, when one was made.
+    pub backup_path: Option<PathBuf>,
+    /// Old backups removed by retention in this run.
+    pub removed_backups: Vec<PathBuf>,
+    /// The schema version found before migration.
+    pub migrated_from: i64,
+    /// The schema version recorded after migration.
+    pub migrated_to: i64,
+}
+
+/// A corrupt database kept on disk and how startup recovered from it.
+#[derive(Debug, Clone)]
+pub struct CorruptRecovery {
+    /// Where the corrupt file was moved. It is never deleted.
+    pub kept_at: PathBuf,
+    /// The backup it was restored from, or `None` when a fresh database was
+    /// started because no backup passed the integrity check.
+    pub restored_from: Option<PathBuf>,
+}
+
+/// A newer-schema database kept on disk under an explicit override.
+#[derive(Debug, Clone)]
+pub struct NewerSchemaKept {
+    pub found: i64,
+    pub supported: i64,
+    /// Where the newer database was moved. It is never deleted.
+    pub kept_at: PathBuf,
+}
 
 /// Open a read-write connection to the local state database.
 ///
@@ -60,18 +126,117 @@ pub fn registry_connection(db_path: &std::path::Path) -> anyhow::Result<Connecti
 
 /// Initialize the local SQLite database on first run and apply migrations.
 pub fn init_local_state_db(db_path: &std::path::Path) -> anyhow::Result<()> {
+    init_local_state_db_with(db_path, &LocalStateOpenOptions::default()).map(|_| ())
+}
+
+/// Initialize the local database, applying the same safety net as
+/// [`init_local_state_db`] and reporting what was done.
+///
+/// The order is deliberate: check integrity before opening the database for
+/// writing, recover a corrupt file before touching it, refuse a newer schema
+/// before any step can run, then copy the database before migrating. A backup
+/// is not made for a brand-new (empty) database: there is nothing to keep, and
+/// an empty backup restored later would be worse than none.
+pub fn init_local_state_db_with(
+    db_path: &std::path::Path,
+    options: &LocalStateOpenOptions,
+) -> anyhow::Result<LocalStateStartupReport> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let conn = local_state_connection(db_path)?;
-    // Two processes starting at once (the desktop app and an agent's CLI call,
-    // say, right after an update) would otherwise both read the old schema
-    // version and both apply the same migrations. IMMEDIATE takes the write
-    // lock before that read, so the second waits and then finds nothing to do.
-    // The default-setting seeding below reads before it writes too, so it stays
-    // inside the same transaction.
-    let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
-    run_migrations(&tx)?;
+    let mut report = LocalStateStartupReport::default();
+
+    // 1. Integrity check, and recovery before anything writes to the file.
+    if db_path.exists() {
+        match check_integrity(db_path)? {
+            Integrity::Ok => {}
+            Integrity::Corrupt(reason) => {
+                let kept_at = quarantine_database(db_path, "corrupt")?;
+                let restored_from = restore_newest_backup(db_path)?;
+                report.recovered_corrupt = Some(CorruptRecovery {
+                    kept_at,
+                    restored_from,
+                });
+                let _ = reason;
+            }
+        }
+    }
+
+    // 2. Open only after recovery. A newer database is never migrated down or
+    //    overwritten; it is moved aside only under an explicit override.
+    let mut conn = local_state_connection(db_path)?;
+    let target = LOCAL_STATE_SCHEMA_VERSION;
+    let found = schema_version(&conn)?;
+    if found > target {
+        if !options.accept_newer_schema {
+            return Err(local_state_error(
+                ERR_LOCAL_STATE_NEWER,
+                format!(
+                    "local_state.db at {} was written by a newer Agora (schema version {found}); \
+                     this build supports up to {target}. The database was not changed. Keep the \
+                     newer Agora, or start with a fresh database and keep this file: run the CLI \
+                     with --fresh-database, or choose \"Start with a fresh database\" when the \
+                     desktop offers it.",
+                    db_path.display()
+                ),
+            ));
+        }
+        drop(conn);
+        let kept_at = quarantine_database(db_path, &format!("newer-v{found}"))?;
+        report.newer_schema_kept = Some(NewerSchemaKept {
+            found,
+            supported: target,
+            kept_at,
+        });
+        conn = local_state_connection(db_path)?;
+    }
+
+    // 3. Back up before any pending step, then migrate. Each step commits on
+    //    its own, so the last successful version stays recorded on failure.
+    let current = schema_version(&conn)?;
+    report.migrated_from = current;
+    // A truly empty file (a first run, or a fresh database after recovery) has
+    // nothing to preserve. Anything with schema in it is copied before a step
+    // runs, including a very old database with no `schema_version` table.
+    if current < target && !database_is_empty(&conn)? {
+        match backup_before_migration(&conn, db_path, current) {
+            Ok((path, removed)) => {
+                report.backup_path = Some(path);
+                report.removed_backups = removed;
+            }
+            Err(error) if options.accept_missing_backup => {
+                let _ = error;
+            }
+            Err(error) => {
+                return Err(local_state_error(
+                    ERR_LOCAL_STATE_BACKUP_FAILED,
+                    format!(
+                        "Could not back up local_state.db before migrating it: {error}. Nothing \
+                         was changed and the existing database is still in place. Free disk space \
+                         or fix the backups folder, or migrate without a backup with \
+                         --migrate-without-backup (CLI) or the desktop's confirmation."
+                    ),
+                ));
+            }
+        }
+    }
+    if current < target {
+        run_migrations(&conn)?;
+    }
+    report.migrated_to = schema_version(&conn)?;
+
+    seed_default_settings(&conn)?;
+    Ok(report)
+}
+
+/// Write the default settings that must exist on every database.
+///
+/// Runs in its own transaction so two processes starting at once cannot leave
+/// it half-done. Reads through the typed registry: a key that is declared and
+/// absent takes its declared default, so seeding only stores what the defaults
+/// table expects.
+fn seed_default_settings(conn: &Connection) -> anyhow::Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
 
     // Network feature toggles default to enabled for backward compatibility.
     // Pre-existing keys default to enabled for backward compatibility.
@@ -85,8 +250,8 @@ pub fn init_local_state_db(db_path: &std::path::Path) -> anyhow::Result<()> {
         "network_server_ping_enabled",
         "network_log_upload_enabled",
     ] {
-        if get_setting(&conn, key).ok().flatten().is_none() {
-            set_setting(&conn, key, &serde_json::Value::Bool(true))?;
+        if get_setting(conn, key).ok().flatten().is_none() {
+            set_setting(conn, key, &serde_json::Value::Bool(true))?;
         }
     }
 
@@ -99,8 +264,8 @@ pub fn init_local_state_db(db_path: &std::path::Path) -> anyhow::Result<()> {
         "network_mojang_content_enabled",
         "network_loader_enabled",
     ] {
-        if get_setting(&conn, key).ok().flatten().is_none() {
-            set_setting(&conn, key, &serde_json::Value::Bool(true))?;
+        if get_setting(conn, key).ok().flatten().is_none() {
+            set_setting(conn, key, &serde_json::Value::Bool(true))?;
         }
     }
 
@@ -122,8 +287,8 @@ pub fn init_local_state_db(db_path: &std::path::Path) -> anyhow::Result<()> {
         // works whenever plugins are on.
         "plugin_updates_enabled",
     ] {
-        if get_setting(&conn, key).ok().flatten().is_none() {
-            set_setting(&conn, key, &serde_json::Value::Bool(false))?;
+        if get_setting(conn, key).ok().flatten().is_none() {
+            set_setting(conn, key, &serde_json::Value::Bool(false))?;
         }
     }
 
@@ -131,18 +296,345 @@ pub fn init_local_state_db(db_path: &std::path::Path) -> anyhow::Result<()> {
     // freshness (mods rarely release more than once a day) against Modrinth
     // traffic for users who open the launcher many times a day. 0 disables
     // automatic refresh (manual "Check for updates" only).
-    if get_setting(&conn, "update_sweep_interval_hours")
+    if get_setting(conn, "update_sweep_interval_hours")
         .ok()
         .flatten()
         .is_none()
     {
-        set_setting(&conn, "update_sweep_interval_hours", &serde_json::json!(12))?;
+        set_setting(conn, "update_sweep_interval_hours", &serde_json::json!(12))?;
     }
 
-    crate::settings_registry::migrate(&conn)?;
+    crate::settings_registry::migrate(conn)?;
 
     tx.commit()?;
     Ok(())
+}
+
+fn local_state_error(code: &str, message: String) -> anyhow::Error {
+    anyhow::Error::new(crate::error::LauncherError::Generic {
+        code: code.to_string(),
+        message,
+    })
+}
+
+enum Integrity {
+    Ok,
+    Corrupt(String),
+}
+
+/// Whether a SQLite error says the file is damaged rather than merely busy.
+///
+/// Only these errors may trigger recovery. "Busy" or "cannot open" is "could
+/// not tell", which must not be mistaken for "corrupt" and overwrite a file.
+fn is_definite_corruption(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if matches!(
+                inner.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            )
+    )
+}
+
+/// Run `PRAGMA quick_check` and report whether the file is usable.
+///
+/// quick_check reads every page and its b-tree links but not indexes. It is
+/// the same shape as `integrity_check` at a fraction of the cost, which is why
+/// startup can afford it on every open.
+fn check_integrity(db_path: &Path) -> anyhow::Result<Integrity> {
+    let result: rusqlite::Result<Vec<String>> = (|| {
+        let conn = Connection::open(db_path)?;
+        let mut statement = conn.prepare("PRAGMA quick_check")?;
+        let mut rows = statement.query([])?;
+        let mut problems = Vec::new();
+        while let Some(row) = rows.next()? {
+            let line: String = row.get(0)?;
+            if !line.eq_ignore_ascii_case("ok") {
+                problems.push(line);
+            }
+        }
+        Ok(problems)
+    })();
+    match result {
+        Ok(problems) if problems.is_empty() => Ok(Integrity::Ok),
+        Ok(problems) => Ok(Integrity::Corrupt(problems.join("; "))),
+        Err(error) if is_definite_corruption(&error) => Ok(Integrity::Corrupt(error.to_string())),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A sortable timestamp with the process id and a per-process counter, so two
+/// backups made in the same millisecond — even by different processes — never
+/// collide in a shared folder.
+fn unique_stamp() -> String {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    format!(
+        "{}-p{}-{:04}",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f"),
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed) % 10_000
+    )
+}
+
+fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut name = db_path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn rename_if_present(from: &Path, to: &Path) -> anyhow::Result<()> {
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Move a database (and its WAL sidecars) aside, never deleting it.
+fn quarantine_database(db_path: &Path, label: &str) -> anyhow::Result<PathBuf> {
+    let name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("local_state.db");
+    let kept_at = db_path.with_file_name(format!("{name}.{label}-{}", unique_stamp()));
+    rename_if_present(db_path, &kept_at)?;
+    for suffix in ["-wal", "-shm"] {
+        rename_if_present(
+            &sidecar_path(db_path, suffix),
+            &sidecar_path(&kept_at, suffix),
+        )?;
+    }
+    Ok(kept_at)
+}
+
+/// Whether the database holds no SQLite objects at all (a brand-new file).
+fn database_is_empty(conn: &Connection) -> anyhow::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+          WHERE type IN ('table', 'index', 'view', 'trigger')
+            AND name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count == 0)
+}
+
+/// The schema version recorded, or 0 when the table does not exist yet.
+fn schema_version(conn: &Connection) -> anyhow::Result<i64> {
+    let present: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'",
+        [],
+        |row| row.get(0),
+    )?;
+    if present == 0 {
+        return Ok(0);
+    }
+    Ok(conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+fn backups_dir(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(LOCAL_STATE_BACKUP_DIR)
+}
+
+/// Pre-migration backups, oldest first (the names start with a sortable time).
+fn list_backup_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("local_state-") && name.ends_with(".db") && entry.path().is_file() {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Copy the database with `VACUUM INTO`, verify the copy, and retain three.
+fn backup_before_migration(
+    conn: &Connection,
+    db_path: &Path,
+    from_version: i64,
+) -> anyhow::Result<(PathBuf, Vec<PathBuf>)> {
+    let dir = backups_dir(db_path);
+    std::fs::create_dir_all(&dir)?;
+    let destination = dir.join(format!("local_state-{}-v{from_version}.db", unique_stamp()));
+    let destination_text = destination
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("backup path is not valid UTF-8"))?;
+    conn.execute("VACUUM INTO ?1", rusqlite::params![destination_text])
+        .map_err(|error| anyhow::anyhow!("writing {} failed: {error}", destination.display()))?;
+    match check_integrity(&destination)? {
+        Integrity::Ok => {}
+        Integrity::Corrupt(reason) => {
+            let _ = std::fs::remove_file(&destination);
+            anyhow::bail!(
+                "the backup written to {} failed its integrity check: {reason}",
+                destination.display()
+            );
+        }
+    }
+    let removed = prune_backups(&dir)?;
+    Ok((destination, removed))
+}
+
+/// Keep the newest [LOCAL_STATE_BACKUP_RETENTION] backups.
+///
+/// Older files are deleted after a new backup is written. A failed delete is
+/// left alone rather than stopping the migration: the copies are still valid
+/// and a later run tries again.
+fn prune_backups(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut files = list_backup_files(dir)?;
+    let mut removed = Vec::new();
+    while files.len() > LOCAL_STATE_BACKUP_RETENTION {
+        let oldest = files.remove(0);
+        if std::fs::remove_file(&oldest).is_ok() {
+            removed.push(oldest);
+        }
+    }
+    Ok(removed)
+}
+
+/// What `agora doctor` can say about the local database without opening it for
+/// writing or changing anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalStateIntegrity {
+    Ok,
+    Corrupt(String),
+    Missing,
+    /// The file exists but could not be read. This is not the same as "ok".
+    Unreadable(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalStateInspection {
+    pub path: PathBuf,
+    pub integrity: LocalStateIntegrity,
+    /// The recorded schema version, or `None` when it could not be read.
+    pub schema_version: Option<i64>,
+    pub supported_version: i64,
+    /// Pre-migration backups, oldest first.
+    pub backups: Vec<PathBuf>,
+    /// Set when the backups folder could not be read; an empty list then means
+    /// "could not tell", not "none".
+    pub backups_error: Option<String>,
+    /// Corrupt or newer databases kept aside by a previous start.
+    pub kept_aside: Vec<PathBuf>,
+    /// Set when the folder could not be read, as above.
+    pub kept_aside_error: Option<String>,
+}
+
+/// Inspect the local database for reporting. Read-only: nothing is migrated,
+/// copied, renamed or deleted.
+pub fn inspect_local_state(db_path: &Path) -> LocalStateInspection {
+    let mut inspection = LocalStateInspection {
+        path: db_path.to_path_buf(),
+        integrity: LocalStateIntegrity::Missing,
+        schema_version: None,
+        supported_version: LOCAL_STATE_SCHEMA_VERSION,
+        backups: Vec::new(),
+        backups_error: None,
+        kept_aside: Vec::new(),
+        kept_aside_error: None,
+    };
+    match list_backup_files(&backups_dir(db_path)) {
+        Ok(backups) => inspection.backups = backups,
+        Err(error) => inspection.backups_error = Some(error.to_string()),
+    }
+    match list_kept_aside(db_path) {
+        Ok(kept) => inspection.kept_aside = kept,
+        Err(error) => inspection.kept_aside_error = Some(error.to_string()),
+    }
+    if !db_path.exists() {
+        return inspection;
+    }
+    inspection.integrity = match check_integrity(db_path) {
+        Ok(Integrity::Ok) => LocalStateIntegrity::Ok,
+        Ok(Integrity::Corrupt(reason)) => LocalStateIntegrity::Corrupt(reason),
+        Err(error) => LocalStateIntegrity::Unreadable(error.to_string()),
+    };
+    if matches!(inspection.integrity, LocalStateIntegrity::Ok) {
+        inspection.schema_version = Connection::open(db_path)
+            .ok()
+            .and_then(|conn| schema_version(&conn).ok());
+    }
+    inspection
+}
+
+fn list_kept_aside(db_path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("local_state.db");
+    let prefixes = [format!("{name}.corrupt-"), format!("{name}.newer-v")];
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if prefixes.iter().any(|prefix| file_name.starts_with(prefix)) && entry.path().is_file() {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Restore the newest backup that passes `quick_check`.
+///
+/// Each candidate is copied to a temporary sibling first, checked, then renamed
+/// into place, so a backup that fails the check is never used and the live path
+/// never holds a half-copied file.
+fn restore_newest_backup(db_path: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let mut backups = list_backup_files(&backups_dir(db_path))?;
+    backups.reverse();
+    for backup in backups {
+        let candidate = db_path.with_file_name(format!(
+            "{}.restore-{}",
+            db_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("local_state.db"),
+            unique_stamp()
+        ));
+        if std::fs::copy(&backup, &candidate).is_err() {
+            continue;
+        }
+        let usable = matches!(check_integrity(&candidate), Ok(Integrity::Ok));
+        if usable {
+            let _ = std::fs::remove_file(sidecar_path(db_path, "-wal"));
+            let _ = std::fs::remove_file(sidecar_path(db_path, "-shm"));
+            match std::fs::rename(&candidate, db_path) {
+                Ok(()) => return Ok(Some(backup)),
+                Err(_) => {
+                    let _ = std::fs::remove_file(&candidate);
+                    continue;
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&candidate);
+    }
+    Ok(None)
 }
 
 /// The global AlwaysPreTouch switch from Settings, if the user set one.
@@ -168,866 +660,1081 @@ pub fn global_always_pre_touch(conn: &Connection) -> Option<bool> {
 }
 
 /// Apply sequential migrations up to [LOCAL_STATE_SCHEMA_VERSION].
+///
+/// Each step runs in its own transaction, which also records the step's
+/// version, so a failure leaves the last successful version recorded and the
+/// database usable. When no step is pending, nothing is executed at all.
 pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
+    run_migration_steps(conn, MIGRATIONS, LOCAL_STATE_SCHEMA_VERSION)
+}
+
+/// Apply migrations only up to `target`. Tests use this to build a database as
+/// an earlier release wrote it, then open it with [`init_local_state_db`].
+#[doc(hidden)]
+pub fn run_migrations_to(conn: &Connection, target: i64) -> anyhow::Result<()> {
+    run_migration_steps(conn, MIGRATIONS, target)
+}
+
+struct MigrationStep {
+    version: i64,
+    name: &'static str,
+    run: fn(&Connection) -> anyhow::Result<()>,
+}
+
+const MIGRATIONS: &[MigrationStep] = &[
+    MigrationStep {
+        version: 1,
+        name: "initial schema",
+        run: migrate_v1,
+    },
+    MigrationStep {
+        version: 2,
+        name: "flag submissions",
+        run: migrate_v2,
+    },
+    MigrationStep {
+        version: 3,
+        name: "crash investigator tables",
+        run: migrate_v3,
+    },
+    MigrationStep {
+        version: 4,
+        name: "java path and incompatibility override",
+        run: migrate_v4,
+    },
+    MigrationStep {
+        version: 5,
+        name: "gc selector baseline",
+        run: migrate_v5,
+    },
+    MigrationStep {
+        version: 6,
+        name: "import provenance and jobs",
+        run: migrate_v6,
+    },
+    MigrationStep {
+        version: 7,
+        name: "import quarantine path",
+        run: migrate_v7,
+    },
+    MigrationStep {
+        version: 8,
+        name: "modrinth content metadata cache",
+        run: migrate_v8,
+    },
+    MigrationStep {
+        version: 9,
+        name: "instance memory policy",
+        run: migrate_v9,
+    },
+    MigrationStep {
+        version: 10,
+        name: "retire browse curated only",
+        run: migrate_v10,
+    },
+    MigrationStep {
+        version: 11,
+        name: "update caches",
+        run: migrate_v11,
+    },
+    MigrationStep {
+        version: 12,
+        name: "pack file inventory",
+        run: migrate_v12,
+    },
+    MigrationStep {
+        version: 13,
+        name: "launch history",
+        run: migrate_v13,
+    },
+    MigrationStep {
+        version: 14,
+        name: "plugin installs and storage",
+        run: migrate_v14,
+    },
+    MigrationStep {
+        version: 15,
+        name: "plugin trust",
+        run: migrate_v15,
+    },
+    MigrationStep {
+        version: 16,
+        name: "instance pack gaps",
+        run: migrate_v16,
+    },
+    MigrationStep {
+        version: 17,
+        name: "lifetime play time",
+        run: migrate_v17,
+    },
+    MigrationStep {
+        version: 18,
+        name: "game instances",
+        run: migrate_v18,
+    },
+    MigrationStep {
+        version: 19,
+        name: "official plugins",
+        run: migrate_v19,
+    },
+    MigrationStep {
+        version: 20,
+        name: "plugin script consent",
+        run: migrate_v20,
+    },
+    MigrationStep {
+        version: 21,
+        name: "consent code hash",
+        run: migrate_v21,
+    },
+    MigrationStep {
+        version: 22,
+        name: "game play time",
+        run: migrate_v22,
+    },
+    MigrationStep {
+        version: 23,
+        name: "session ledger",
+        run: migrate_v23,
+    },
+    MigrationStep {
+        version: 24,
+        name: "session answers",
+        run: migrate_v24,
+    },
+    MigrationStep {
+        version: 25,
+        name: "crash log results",
+        run: migrate_v25,
+    },
+    MigrationStep {
+        version: 26,
+        name: "crash save backups",
+        run: migrate_v26,
+    },
+    MigrationStep {
+        version: 27,
+        name: "load order rules",
+        run: migrate_v27,
+    },
+    MigrationStep {
+        version: 28,
+        name: "pre-touch column",
+        run: migrate_v28,
+    },
+];
+
+/// Apply every step up to `target`, skipping any already recorded.
+///
+/// A step opens `BEGIN IMMEDIATE` when the caller has no transaction open, so
+/// two processes starting at once cannot apply the same step twice; inside an
+/// existing transaction it uses a savepoint instead. The version is re-read
+/// under that lock before running, which is what makes the second starter skip.
+fn run_migration_steps(
+    conn: &Connection,
+    steps: &[MigrationStep],
+    target: i64,
+) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_version (
              version INTEGER PRIMARY KEY
          );",
     )?;
-
-    let current: i64 = conn.query_row(
+    let mut current: i64 = conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
         [],
         |row| row.get(0),
     )?;
-    let target = LOCAL_STATE_SCHEMA_VERSION;
-
-    if current < 1 {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS user_settings (
-                 key TEXT PRIMARY KEY,
-                 value_json TEXT NOT NULL
-             );
-
-             CREATE TABLE IF NOT EXISTS user_instances (
-                 instance_id TEXT PRIMARY KEY,
-                 name TEXT NOT NULL,
-                 minecraft_version TEXT NOT NULL,
-                 loader TEXT NOT NULL,
-                 loader_version TEXT NOT NULL,
-                 is_modpack BOOLEAN NOT NULL DEFAULT 0,
-                 is_locked BOOLEAN NOT NULL DEFAULT 0,
-                 last_launched_at TEXT,
-                 jvm_memory_mb INTEGER NOT NULL DEFAULT 4096,
-                 jvm_memory_mode TEXT NOT NULL DEFAULT 'manual',
-                  jvm_gc TEXT NOT NULL DEFAULT 'auto',
-                 jvm_custom_args TEXT NOT NULL DEFAULT '',
-                 jvm_always_pre_touch INTEGER NOT NULL DEFAULT 1,
-                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
-             );
-
-             CREATE TABLE IF NOT EXISTS local_crash_telemetry (
-                 mod_a_id TEXT NOT NULL,
-                 mod_b_id TEXT NOT NULL,
-                 crash_count INTEGER NOT NULL DEFAULT 1,
-                 last_seen_at TEXT NOT NULL,
-                 PRIMARY KEY (mod_a_id, mod_b_id)
-             );
-
-              CREATE TABLE IF NOT EXISTS mcp_approval_grants (
-                  tool_name TEXT NOT NULL,
-                  instance_id TEXT NOT NULL,
-                  state TEXT NOT NULL,
-                  granted_at TEXT NOT NULL,
-                  expires_at TEXT,
-                  PRIMARY KEY (tool_name, instance_id)
-              );
-
-              CREATE TABLE IF NOT EXISTS flag_submissions (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  timestamp INTEGER NOT NULL
-              );",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (1)",
-            [],
-        )?;
+    if current > target {
+        anyhow::bail!("local_state.db schema version {current} is newer than supported {target}");
     }
-
-    // Migration v2: add flag_submissions table for comment-flag rate limiting (§5.5).
-    if current < 2 {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS flag_submissions (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 timestamp INTEGER NOT NULL
-             );",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (2)",
-            [],
-        )?;
-    }
-
-    // Migration v3: add crash-investigator tables for dynamic scoring algorithm.
-    if current < 3 {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS crash_events (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 instance_id TEXT NOT NULL,
-                 fingerprint TEXT NOT NULL,
-                 exception_class TEXT NOT NULL,
-                 top_frames_json TEXT NOT NULL,
-                 signature_name TEXT,
-                 occurred_at TEXT NOT NULL
-             );
-
-             CREATE TABLE IF NOT EXISTS crash_survivals (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 instance_id TEXT NOT NULL,
-                 occurred_at TEXT NOT NULL
-             );
-
-             CREATE TABLE IF NOT EXISTS crash_survival_mods (
-                 survival_id INTEGER NOT NULL,
-                 mod_id TEXT NOT NULL,
-                 PRIMARY KEY (survival_id, mod_id),
-                 FOREIGN KEY (survival_id) REFERENCES crash_survivals(id)
-             );
-
-             CREATE TABLE IF NOT EXISTS crash_attribution (
-                 fingerprint TEXT NOT NULL,
-                 mod_id TEXT NOT NULL,
-                 confirm_count INTEGER NOT NULL DEFAULT 0,
-                 last_confirmed_at TEXT,
-                 PRIMARY KEY (fingerprint, mod_id)
-             );
-
-             CREATE TABLE IF NOT EXISTS crash_ruled_out (
-                 fingerprint TEXT NOT NULL,
-                 mod_id TEXT NOT NULL,
-                 ruled_out_at TEXT NOT NULL,
-                 PRIMARY KEY (fingerprint, mod_id)
-             );",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (3)",
-            [],
-        )?;
-    }
-
-    // Migration: add jvm_always_pre_touch column to existing databases.
-    if current >= 1 {
-        let _ = conn.execute(
-            "ALTER TABLE user_instances ADD COLUMN jvm_always_pre_touch INTEGER NOT NULL DEFAULT 1",
-            [],
-        );
-    }
-
-    // Migration v4: add java_path and java_incompatible_override columns.
-    if current < 4 {
-        let _ = conn.execute("ALTER TABLE user_instances ADD COLUMN java_path TEXT", []);
-        let _ = conn.execute(
-            "ALTER TABLE user_instances ADD COLUMN java_incompatible_override INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        // Default java_runtime_mode setting to 'automatic'
-        let current_mode = get_setting(conn, "java_runtime_mode").ok().flatten();
-        if current_mode.is_none() {
-            set_setting(conn, "java_runtime_mode", &serde_json::json!("automatic"))?;
+    for step in steps {
+        if step.version <= current || step.version > target {
+            continue;
         }
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (4)",
-            [],
-        )?;
+        let token = format!("migration_v{}", step.version);
+        let standalone = conn.is_autocommit();
+        if standalone {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+        } else {
+            conn.execute_batch(&format!("SAVEPOINT {token}"))?;
+        }
+        let outcome = (|| -> anyhow::Result<bool> {
+            let recorded: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |row| row.get(0),
+            )?;
+            if step.version <= recorded {
+                return Ok(false);
+            }
+            (step.run)(conn)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
+                rusqlite::params![step.version],
+            )?;
+            Ok(true)
+        })();
+        match outcome {
+            Ok(applied) => {
+                if standalone {
+                    conn.execute_batch("COMMIT")?;
+                } else {
+                    conn.execute_batch(&format!("RELEASE {token}"))?;
+                }
+                if applied {
+                    current = step.version;
+                }
+            }
+            Err(error) => {
+                if standalone {
+                    let _ = conn.execute_batch("ROLLBACK");
+                } else {
+                    let _ = conn.execute_batch(&format!("ROLLBACK TO {token}; RELEASE {token}"));
+                }
+                return Err(error.context(format!(
+                    "local_state.db migration v{} ({}) failed; version {current} is still recorded",
+                    step.version, step.name
+                )));
+            }
+        }
     }
+    Ok(())
+}
 
+/// Add a column only when it is missing, failing on a real ALTER error.
+///
+/// Migrations are replayed by tests and can run over a table that already has
+/// the column (a fresh v1 table, or a database whose version row was lost).
+/// Treating "duplicate column" as success keeps both cases working; any other
+/// error is reported rather than swallowed.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    alter_sql: &str,
+) -> anyhow::Result<()> {
+    let present: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+        rusqlite::params![column],
+        |row| row.get(0),
+    )?;
+    if present == 0 {
+        conn.execute(alter_sql, [])?;
+    }
+    Ok(())
+}
+
+fn migrate_v1(conn: &Connection) -> anyhow::Result<()> {
+    // initial schema
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS user_settings (
+             key TEXT PRIMARY KEY,
+             value_json TEXT NOT NULL
+         );
+
+         CREATE TABLE IF NOT EXISTS user_instances (
+             instance_id TEXT PRIMARY KEY,
+             name TEXT NOT NULL,
+             minecraft_version TEXT NOT NULL,
+             loader TEXT NOT NULL,
+             loader_version TEXT NOT NULL,
+             is_modpack BOOLEAN NOT NULL DEFAULT 0,
+             is_locked BOOLEAN NOT NULL DEFAULT 0,
+             last_launched_at TEXT,
+             jvm_memory_mb INTEGER NOT NULL DEFAULT 4096,
+             jvm_memory_mode TEXT NOT NULL DEFAULT 'manual',
+              jvm_gc TEXT NOT NULL DEFAULT 'auto',
+             jvm_custom_args TEXT NOT NULL DEFAULT '',
+             jvm_always_pre_touch INTEGER NOT NULL DEFAULT 1,
+             created_at TEXT NOT NULL DEFAULT (datetime('now'))
+         );
+
+         CREATE TABLE IF NOT EXISTS local_crash_telemetry (
+             mod_a_id TEXT NOT NULL,
+             mod_b_id TEXT NOT NULL,
+             crash_count INTEGER NOT NULL DEFAULT 1,
+             last_seen_at TEXT NOT NULL,
+             PRIMARY KEY (mod_a_id, mod_b_id)
+         );
+
+          CREATE TABLE IF NOT EXISTS mcp_approval_grants (
+              tool_name TEXT NOT NULL,
+              instance_id TEXT NOT NULL,
+              state TEXT NOT NULL,
+              granted_at TEXT NOT NULL,
+              expires_at TEXT,
+              PRIMARY KEY (tool_name, instance_id)
+          );
+
+          CREATE TABLE IF NOT EXISTS flag_submissions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              timestamp INTEGER NOT NULL
+          );",
+    )?;
+    Ok(())
+}
+
+fn migrate_v2(conn: &Connection) -> anyhow::Result<()> {
+    // flag submissions
+    // Migration v2: add flag_submissions table for comment-flag rate limiting (§5.5).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS flag_submissions (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             timestamp INTEGER NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
+fn migrate_v3(conn: &Connection) -> anyhow::Result<()> {
+    // crash investigator tables
+    // Migration v3: add crash-investigator tables for dynamic scoring algorithm.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS crash_events (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             instance_id TEXT NOT NULL,
+             fingerprint TEXT NOT NULL,
+             exception_class TEXT NOT NULL,
+             top_frames_json TEXT NOT NULL,
+             signature_name TEXT,
+             occurred_at TEXT NOT NULL
+         );
+
+         CREATE TABLE IF NOT EXISTS crash_survivals (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             instance_id TEXT NOT NULL,
+             occurred_at TEXT NOT NULL
+         );
+
+         CREATE TABLE IF NOT EXISTS crash_survival_mods (
+             survival_id INTEGER NOT NULL,
+             mod_id TEXT NOT NULL,
+             PRIMARY KEY (survival_id, mod_id),
+             FOREIGN KEY (survival_id) REFERENCES crash_survivals(id)
+         );
+
+         CREATE TABLE IF NOT EXISTS crash_attribution (
+             fingerprint TEXT NOT NULL,
+             mod_id TEXT NOT NULL,
+             confirm_count INTEGER NOT NULL DEFAULT 0,
+             last_confirmed_at TEXT,
+             PRIMARY KEY (fingerprint, mod_id)
+         );
+
+         CREATE TABLE IF NOT EXISTS crash_ruled_out (
+             fingerprint TEXT NOT NULL,
+             mod_id TEXT NOT NULL,
+             ruled_out_at TEXT NOT NULL,
+             PRIMARY KEY (fingerprint, mod_id)
+         );",
+    )?;
+    Ok(())
+}
+
+fn migrate_v4(conn: &Connection) -> anyhow::Result<()> {
+    // java path and incompatibility override
+    // Migration v4: add java_path and java_incompatible_override columns.
+    add_column_if_missing(
+        conn,
+        "user_instances",
+        "java_path",
+        "ALTER TABLE user_instances ADD COLUMN java_path TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "user_instances",
+        "java_incompatible_override",
+        "ALTER TABLE user_instances ADD COLUMN java_incompatible_override INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // Default java_runtime_mode setting to 'automatic'
+    let current_mode = get_setting(conn, "java_runtime_mode").ok().flatten();
+    if current_mode.is_none() {
+        set_setting(conn, "java_runtime_mode", &serde_json::json!("automatic"))?;
+    }
+    Ok(())
+}
+
+fn migrate_v5(_conn: &Connection) -> anyhow::Result<()> {
+    // gc selector baseline
     // Migration v5: new instances use the hardware- and Java-aware GC
     // selector. Existing explicit choices remain untouched.
-    if current < 5 {
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (5)",
-            [],
-        )?;
-    }
+    Ok(())
+}
 
+fn migrate_v6(conn: &Connection) -> anyhow::Result<()> {
+    // import provenance and jobs
     // Migration v6: launcher migration provenance, per-instance launch policy,
     // and crash-recoverable import jobs.
-    if current < 6 {
-        let _ = conn.execute("ALTER TABLE user_instances ADD COLUMN icon_path TEXT", []);
-        let _ = conn.execute(
-            "ALTER TABLE user_instances ADD COLUMN launch_mode_override TEXT NOT NULL DEFAULT 'auto'",
-            [],
-        );
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS instance_imports (
-                 instance_id TEXT PRIMARY KEY,
-                 launcher_kind TEXT NOT NULL,
-                 installation_key TEXT NOT NULL,
-                 source_instance_key TEXT NOT NULL,
-                 source_path TEXT NOT NULL,
-                 source_metadata_json TEXT NOT NULL DEFAULT '{}',
-                 imported_settings_json TEXT NOT NULL DEFAULT '{}',
-                 source_fingerprint TEXT NOT NULL,
-                 imported_at TEXT NOT NULL,
-                 updated_at TEXT NOT NULL,
-                 last_result TEXT NOT NULL DEFAULT 'imported',
-                 FOREIGN KEY (instance_id) REFERENCES user_instances(instance_id) ON DELETE CASCADE
-             );
-             CREATE TABLE IF NOT EXISTS instance_import_files (
-                 instance_id TEXT NOT NULL,
-                 relative_path TEXT NOT NULL,
-                 sha256 TEXT NOT NULL,
-                 size INTEGER NOT NULL,
-                 source_modified_ns INTEGER,
-                 PRIMARY KEY (instance_id, relative_path),
-                 FOREIGN KEY (instance_id) REFERENCES instance_imports(instance_id) ON DELETE CASCADE
-             );
-             CREATE TABLE IF NOT EXISTS instance_import_jobs (
-                 job_id TEXT PRIMARY KEY,
-                 instance_id TEXT NOT NULL,
-                 launcher_kind TEXT NOT NULL,
-                 source_instance_key TEXT NOT NULL,
-                 staging_path TEXT NOT NULL,
-                 final_path TEXT NOT NULL,
-                 state TEXT NOT NULL,
-                 plan_fingerprint TEXT NOT NULL,
-                 error TEXT,
-                 created_at TEXT NOT NULL,
-                 updated_at TEXT NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_instance_import_source
-                 ON instance_imports (launcher_kind, installation_key, source_instance_key);
-             CREATE INDEX IF NOT EXISTS idx_instance_import_jobs_state
-                 ON instance_import_jobs (state);",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (6)",
-            [],
-        )?;
-    }
+    add_column_if_missing(
+        conn,
+        "user_instances",
+        "icon_path",
+        "ALTER TABLE user_instances ADD COLUMN icon_path TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "user_instances",
+        "launch_mode_override",
+        "ALTER TABLE user_instances ADD COLUMN launch_mode_override TEXT NOT NULL DEFAULT 'auto'",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS instance_imports (
+             instance_id TEXT PRIMARY KEY,
+             launcher_kind TEXT NOT NULL,
+             installation_key TEXT NOT NULL,
+             source_instance_key TEXT NOT NULL,
+             source_path TEXT NOT NULL,
+             source_metadata_json TEXT NOT NULL DEFAULT '{}',
+             imported_settings_json TEXT NOT NULL DEFAULT '{}',
+             source_fingerprint TEXT NOT NULL,
+             imported_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             last_result TEXT NOT NULL DEFAULT 'imported',
+             FOREIGN KEY (instance_id) REFERENCES user_instances(instance_id) ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS instance_import_files (
+             instance_id TEXT NOT NULL,
+             relative_path TEXT NOT NULL,
+             sha256 TEXT NOT NULL,
+             size INTEGER NOT NULL,
+             source_modified_ns INTEGER,
+             PRIMARY KEY (instance_id, relative_path),
+             FOREIGN KEY (instance_id) REFERENCES instance_imports(instance_id) ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS instance_import_jobs (
+             job_id TEXT PRIMARY KEY,
+             instance_id TEXT NOT NULL,
+             launcher_kind TEXT NOT NULL,
+             source_instance_key TEXT NOT NULL,
+             staging_path TEXT NOT NULL,
+             final_path TEXT NOT NULL,
+             state TEXT NOT NULL,
+             plan_fingerprint TEXT NOT NULL,
+             error TEXT,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_instance_import_source
+             ON instance_imports (launcher_kind, installation_key, source_instance_key);
+         CREATE INDEX IF NOT EXISTS idx_instance_import_jobs_state
+             ON instance_import_jobs (state);",
+    )?;
+    Ok(())
+}
 
+fn migrate_v7(conn: &Connection) -> anyhow::Result<()> {
+    // import quarantine path
     // Migration v7: persist the exact update quarantine so crash recovery
     // never has to guess among similarly named directories.
-    if current < 7 {
-        let _ = conn.execute(
-            "ALTER TABLE instance_import_jobs ADD COLUMN quarantine_path TEXT",
-            [],
-        );
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (7)",
-            [],
-        )?;
-    }
+    add_column_if_missing(
+        conn,
+        "instance_import_jobs",
+        "quarantine_path",
+        "ALTER TABLE instance_import_jobs ADD COLUMN quarantine_path TEXT",
+    )?;
+    Ok(())
+}
 
+fn migrate_v8(conn: &Connection) -> anyhow::Result<()> {
+    // modrinth content metadata cache
     // Migration v8: cache installed Modrinth project metadata by the physical
     // content identity so unchanged rows never trigger another API fetch.
-    if current < 8 {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS modrinth_content_metadata_cache (
-                 cache_key TEXT PRIMARY KEY,
-                 project_id TEXT NOT NULL,
-                 title TEXT NOT NULL,
-                 author TEXT,
-                 icon_url TEXT,
-                 fetched_at TEXT NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_modrinth_content_cache_project
-                 ON modrinth_content_metadata_cache (project_id);",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (8)",
-            [],
-        )?;
-    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS modrinth_content_metadata_cache (
+             cache_key TEXT PRIMARY KEY,
+             project_id TEXT NOT NULL,
+             title TEXT NOT NULL,
+             author TEXT,
+             icon_url TEXT,
+             fetched_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_modrinth_content_cache_project
+             ON modrinth_content_metadata_cache (project_id);",
+    )?;
+    Ok(())
+}
 
+fn migrate_v9(conn: &Connection) -> anyhow::Result<()> {
+    // instance memory policy
     // Migration v9: explicit automatic/manual instance memory policy. Existing
     // rows remain manual because their previous 4 GB value does not prove intent.
-    if current < 9 {
-        let _ = conn.execute(
-            "ALTER TABLE user_instances ADD COLUMN jvm_memory_mode TEXT NOT NULL DEFAULT 'manual'",
-            [],
-        );
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (9)",
-            [],
-        )?;
-    }
+    add_column_if_missing(
+        conn,
+        "user_instances",
+        "jvm_memory_mode",
+        "ALTER TABLE user_instances ADD COLUMN jvm_memory_mode TEXT NOT NULL DEFAULT 'manual'",
+    )?;
+    Ok(())
+}
 
+fn migrate_v10(conn: &Connection) -> anyhow::Result<()> {
+    // retire browse curated only
     // Migration v10: retire `browse_curated_only`. Live third-party browsing is
     // already off by default and has its own per-source toggles, so the master
     // switch was a second way of saying the same thing. Anyone who had turned it
     // on wanted no live browsing, so fold that intent into the toggles it
     // suppressed before dropping the key — otherwise removing it would silently
     // re-enable a source they had opted out of.
-    if current < 10 {
-        let curated_only = matches!(
-            get_setting(conn, "browse_curated_only").ok().flatten(),
-            Some(serde_json::Value::Bool(true))
-        );
-        if curated_only {
-            set_setting(conn, "modrinth_enabled", &serde_json::json!(false))?;
-            set_setting(conn, "technic_enabled", &serde_json::json!(false))?;
-        }
-        conn.execute(
-            "DELETE FROM user_settings WHERE key = 'browse_curated_only'",
-            [],
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (10)",
-            [],
-        )?;
+    let curated_only = matches!(
+        get_setting(conn, "browse_curated_only").ok().flatten(),
+        Some(serde_json::Value::Bool(true))
+    );
+    if curated_only {
+        set_setting(conn, "modrinth_enabled", &serde_json::json!(false))?;
+        set_setting(conn, "technic_enabled", &serde_json::json!(false))?;
     }
+    conn.execute(
+        "DELETE FROM user_settings WHERE key = 'browse_curated_only'",
+        [],
+    )?;
+    Ok(())
+}
 
+fn migrate_v11(conn: &Connection) -> anyhow::Result<()> {
+    // update caches
     // Migration v11: persist update-check results and candidate lists so they
     // survive restart and can be read back without network. Mirrors the
     // modrinth_content_metadata_cache pattern from v8 (db.rs:370, modrinth.rs:94,147).
-    if current < 11 {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS instance_update_cache (
-                 instance_id TEXT PRIMARY KEY,
-                 updates_json TEXT NOT NULL,
-                 checked_at TEXT NOT NULL,
-                 FOREIGN KEY(instance_id) REFERENCES user_instances(instance_id) ON DELETE CASCADE
-             );
-             CREATE INDEX IF NOT EXISTS idx_instance_update_cache_checked_at
-                 ON instance_update_cache (checked_at);
-             CREATE TABLE IF NOT EXISTS update_candidate_cache (
-                 cache_key TEXT PRIMARY KEY,
-                 candidates_json TEXT NOT NULL,
-                 fetched_at TEXT NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_update_candidate_cache_fetched_at
-                 ON update_candidate_cache (fetched_at);",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (11)",
-            [],
-        )?;
-    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS instance_update_cache (
+             instance_id TEXT PRIMARY KEY,
+             updates_json TEXT NOT NULL,
+             checked_at TEXT NOT NULL,
+             FOREIGN KEY(instance_id) REFERENCES user_instances(instance_id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_instance_update_cache_checked_at
+             ON instance_update_cache (checked_at);
+         CREATE TABLE IF NOT EXISTS update_candidate_cache (
+             cache_key TEXT PRIMARY KEY,
+             candidates_json TEXT NOT NULL,
+             fetched_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_update_candidate_cache_fetched_at
+             ON update_candidate_cache (fetched_at);",
+    )?;
+    Ok(())
+}
 
+fn migrate_v12(conn: &Connection) -> anyhow::Result<()> {
+    // pack file inventory
     // Migration v12: inventory of files contributed by the instance's pack.
     // Full list lives here in the DB; only the content hash is stored in the
     // manifest so manifests stay small even for large packs, while drift can
     // still be detected if the DB is lost. Follows instance_import_files
     // (db.rs:334) for table shape and accessor placement.
-    if current < 12 {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS instance_pack_files (
-                 instance_id TEXT NOT NULL,
-                 relative_path TEXT NOT NULL,
-                 sha256 TEXT NOT NULL,
-                 size INTEGER NOT NULL,
-                 PRIMARY KEY (instance_id, relative_path),
-                 FOREIGN KEY (instance_id) REFERENCES user_instances(instance_id) ON DELETE CASCADE
-             );
-             CREATE INDEX IF NOT EXISTS idx_instance_pack_files_instance
-                 ON instance_pack_files (instance_id);",
-        )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS instance_pack_files (
+             instance_id TEXT NOT NULL,
+             relative_path TEXT NOT NULL,
+             sha256 TEXT NOT NULL,
+             size INTEGER NOT NULL,
+             PRIMARY KEY (instance_id, relative_path),
+             FOREIGN KEY (instance_id) REFERENCES user_instances(instance_id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_instance_pack_files_instance
+             ON instance_pack_files (instance_id);",
+    )?;
+    Ok(())
+}
+
+fn migrate_v13(conn: &Connection) -> anyhow::Result<()> {
+    // launch history
+    // Local-only launch history. Nothing here leaves the machine; it exists
+    // so the launcher can answer "did that change make startup worse?"
+    // without anyone running a service to collect it.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS launch_history (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             instance_id TEXT NOT NULL,
+             started_at TEXT NOT NULL,
+             prep_ms INTEGER,
+             duration_ms INTEGER,
+             outcome TEXT,
+             enabled_mod_count INTEGER NOT NULL DEFAULT 0,
+             minecraft_version TEXT NOT NULL DEFAULT '',
+             loader TEXT NOT NULL DEFAULT '',
+             peak_memory_mb INTEGER,
+             FOREIGN KEY (instance_id) REFERENCES user_instances(instance_id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_launch_history_instance
+             ON launch_history (instance_id, started_at DESC);",
+    )?;
+    Ok(())
+}
+
+fn migrate_v14(conn: &Connection) -> anyhow::Result<()> {
+    // plugin installs and storage
+    // Community plugins. `plugin_installs` is the record of what the user
+    // consented to: which plugins exist, which are switched on, and which
+    // capabilities they were granted at install time. Capabilities are
+    // stored alongside the manifest rather than re-read from it on every
+    // load, so a plugin cannot quietly widen its own permissions by
+    // shipping an update that asks for more — the grant has to be renewed.
+    //
+    // `plugin_storage` holds both halves of a plugin's state, split by
+    // `kind` so that plugin-written `data` can never overwrite a `setting`
+    // the host declared and validates.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS plugin_installs (
+             plugin_id TEXT PRIMARY KEY,
+             version TEXT NOT NULL,
+             manifest_json TEXT NOT NULL,
+             granted_capabilities TEXT NOT NULL DEFAULT '[]',
+             source_kind TEXT NOT NULL,
+             source_path TEXT,
+             install_dir TEXT NOT NULL,
+             enabled INTEGER NOT NULL DEFAULT 0,
+             installed_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             data_version INTEGER NOT NULL DEFAULT 1,
+             last_error TEXT
+         );
+
+         CREATE TABLE IF NOT EXISTS plugin_storage (
+             plugin_id TEXT NOT NULL,
+             kind TEXT NOT NULL,
+             instance_id TEXT NOT NULL DEFAULT '',
+             key TEXT NOT NULL,
+             value_json TEXT NOT NULL,
+             PRIMARY KEY (plugin_id, kind, instance_id, key),
+             FOREIGN KEY (plugin_id) REFERENCES plugin_installs(plugin_id) ON DELETE CASCADE
+         );
+
+         CREATE TABLE IF NOT EXISTS plugin_data_checkpoints (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             plugin_id TEXT NOT NULL,
+             from_version TEXT NOT NULL,
+             data_version INTEGER NOT NULL,
+             captured_at TEXT NOT NULL,
+             payload_json TEXT NOT NULL,
+             FOREIGN KEY (plugin_id) REFERENCES plugin_installs(plugin_id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_plugin_checkpoints
+             ON plugin_data_checkpoints (plugin_id, captured_at DESC);",
+    )?;
+    Ok(())
+}
+
+fn migrate_v15(conn: &Connection) -> anyhow::Result<()> {
+    // plugin trust
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS plugin_trust (
+             plugin_id TEXT PRIMARY KEY,
+             update_url TEXT NOT NULL,
+             keys_json TEXT NOT NULL,
+             highest_sequence INTEGER NOT NULL DEFAULT 0,
+             last_checked_at TEXT,
+             last_result TEXT,
+             FOREIGN KEY (plugin_id) REFERENCES plugin_installs(plugin_id) ON DELETE CASCADE
+         );",
+    )?;
+    Ok(())
+}
+
+fn migrate_v16(conn: &Connection) -> anyhow::Result<()> {
+    // instance pack gaps
+    // Pack entries the instance still lacks (failed, or waiting on a user
+    // action). Kept here so the instance page can say "not ready" after a
+    // restart, when the import report is gone. No uniqueness on purpose:
+    // the list is replaced as a whole, and an unnamed entry must not
+    // collide with another one.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS instance_pack_gaps (
+             instance_id TEXT NOT NULL,
+             filename TEXT NOT NULL,
+             display_name TEXT NOT NULL,
+             status TEXT NOT NULL,
+             reason TEXT,
+             FOREIGN KEY (instance_id) REFERENCES user_instances(instance_id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_instance_pack_gaps_instance
+             ON instance_pack_gaps (instance_id);",
+    )?;
+    Ok(())
+}
+
+fn migrate_v17(conn: &Connection) -> anyhow::Result<()> {
+    // lifetime play time
+    // Lifetime play time. `launch_history` is trimmed to its newest rows,
+    // so the total has to live with the instance. Seeded from whatever
+    // history survives, which is the best figure available.
+    add_column_if_missing(
+        conn,
+        "user_instances",
+        "total_play_ms",
+        "ALTER TABLE user_instances ADD COLUMN total_play_ms INTEGER NOT NULL DEFAULT 0",
+    )?;
+    conn.execute(
+        "UPDATE user_instances
+            SET total_play_ms = COALESCE(
+                (SELECT SUM(duration_ms) FROM launch_history
+                  WHERE launch_history.instance_id = user_instances.instance_id),
+                0)",
+        [],
+    )?;
+    Ok(())
+}
+
+fn migrate_v18(conn: &Connection) -> anyhow::Result<()> {
+    // game instances
+    // Instances of games other than Minecraft (MASTER_SPEC section 26). Created here, after
+    // master's versions 16 and 17, so a database that already ran this branch's earlier
+    // version 16 still gets master's pack-gap table and play-time column; both statements are
+    // idempotent.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS game_instances (
+             instance_id TEXT PRIMARY KEY,
+             game TEXT NOT NULL,
+             name TEXT NOT NULL,
+             base_json TEXT NOT NULL,
+             created_at TEXT NOT NULL DEFAULT (datetime('now')),
+             last_launched_at TEXT
+         );
+         CREATE TABLE IF NOT EXISTS instance_pack_gaps (
+             instance_id TEXT NOT NULL,
+             filename TEXT NOT NULL,
+             display_name TEXT NOT NULL,
+             status TEXT NOT NULL,
+             reason TEXT,
+             FOREIGN KEY (instance_id) REFERENCES user_instances(instance_id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_instance_pack_gaps_instance
+             ON instance_pack_gaps (instance_id);",
+    )?;
+    Ok(())
+}
+
+fn migrate_v19(conn: &Connection) -> anyhow::Result<()> {
+    // official plugins
+    // Which installed plugins were installed from a signed registry entry
+    // (official plugins). A table beside `plugin_installs` rather than
+    // columns on it, so the manifest-derived record stays exactly what the
+    // package said and "official" is only ever what the installer wrote
+    // here. A plain install replaces the plugin's row and clears this one.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS plugin_official (
+             plugin_id TEXT PRIMARY KEY,
+             entry_id TEXT NOT NULL,
+             entry_version TEXT NOT NULL,
+             entry_sha256 TEXT NOT NULL,
+             tree_sha256 TEXT NOT NULL,
+             recorded_at TEXT NOT NULL,
+             FOREIGN KEY (plugin_id) REFERENCES plugin_installs(plugin_id) ON DELETE CASCADE
+         );",
+    )?;
+    Ok(())
+}
+
+fn migrate_v20(conn: &Connection) -> anyhow::Result<()> {
+    // plugin script consent
+    // Whether the user allowed an installed plugin's code to run. One row per
+    // plugin with code; no row means never allowed. Beside `plugin_installs`
+    // rather than in it, so the manifest-derived record stays exactly what
+    // the package said and permission is only what the user chose.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS plugin_script_consent (
+             plugin_id TEXT PRIMARY KEY,
+             allowed INTEGER NOT NULL,
+             decided_at TEXT NOT NULL,
+             FOREIGN KEY (plugin_id) REFERENCES plugin_installs(plugin_id) ON DELETE CASCADE
+         );",
+    )?;
+    Ok(())
+}
+
+fn migrate_v21(conn: &Connection) -> anyhow::Result<()> {
+    // consent code hash
+    // Which code the consent was given for. Without it a code-less version
+    // in between would let a later version inherit an answer given for
+    // different code. A digest of the manifest's entrypoint is enough to
+    // tell "the code the user allowed" from "new code".
+    // The table may already carry the column when an older schema_version
+    // row was lost (the migration tests delete rows to replay history), so
+    // add it only when it is missing.
+    let has_code_hash: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('plugin_script_consent') WHERE name = 'code_hash'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_code_hash == 0 {
         conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (12)",
+            "ALTER TABLE plugin_script_consent ADD COLUMN code_hash TEXT",
             [],
         )?;
-    }
-
-    if current < 13 {
-        // Local-only launch history. Nothing here leaves the machine; it exists
-        // so the launcher can answer "did that change make startup worse?"
-        // without anyone running a service to collect it.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS launch_history (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 instance_id TEXT NOT NULL,
-                 started_at TEXT NOT NULL,
-                 prep_ms INTEGER,
-                 duration_ms INTEGER,
-                 outcome TEXT,
-                 enabled_mod_count INTEGER NOT NULL DEFAULT 0,
-                 minecraft_version TEXT NOT NULL DEFAULT '',
-                 loader TEXT NOT NULL DEFAULT '',
-                 peak_memory_mb INTEGER,
-                 FOREIGN KEY (instance_id) REFERENCES user_instances(instance_id) ON DELETE CASCADE
-             );
-             CREATE INDEX IF NOT EXISTS idx_launch_history_instance
-                 ON launch_history (instance_id, started_at DESC);",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (13)",
-            [],
-        )?;
-    }
-
-    if current < 14 {
-        // Community plugins. `plugin_installs` is the record of what the user
-        // consented to: which plugins exist, which are switched on, and which
-        // capabilities they were granted at install time. Capabilities are
-        // stored alongside the manifest rather than re-read from it on every
-        // load, so a plugin cannot quietly widen its own permissions by
-        // shipping an update that asks for more — the grant has to be renewed.
-        //
-        // `plugin_storage` holds both halves of a plugin's state, split by
-        // `kind` so that plugin-written `data` can never overwrite a `setting`
-        // the host declared and validates.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS plugin_installs (
-                 plugin_id TEXT PRIMARY KEY,
-                 version TEXT NOT NULL,
-                 manifest_json TEXT NOT NULL,
-                 granted_capabilities TEXT NOT NULL DEFAULT '[]',
-                 source_kind TEXT NOT NULL,
-                 source_path TEXT,
-                 install_dir TEXT NOT NULL,
-                 enabled INTEGER NOT NULL DEFAULT 0,
-                 installed_at TEXT NOT NULL,
-                 updated_at TEXT NOT NULL,
-                 data_version INTEGER NOT NULL DEFAULT 1,
-                 last_error TEXT
-             );
-
-             CREATE TABLE IF NOT EXISTS plugin_storage (
-                 plugin_id TEXT NOT NULL,
-                 kind TEXT NOT NULL,
-                 instance_id TEXT NOT NULL DEFAULT '',
-                 key TEXT NOT NULL,
-                 value_json TEXT NOT NULL,
-                 PRIMARY KEY (plugin_id, kind, instance_id, key),
-                 FOREIGN KEY (plugin_id) REFERENCES plugin_installs(plugin_id) ON DELETE CASCADE
-             );
-
-             CREATE TABLE IF NOT EXISTS plugin_data_checkpoints (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 plugin_id TEXT NOT NULL,
-                 from_version TEXT NOT NULL,
-                 data_version INTEGER NOT NULL,
-                 captured_at TEXT NOT NULL,
-                 payload_json TEXT NOT NULL,
-                 FOREIGN KEY (plugin_id) REFERENCES plugin_installs(plugin_id) ON DELETE CASCADE
-             );
-             CREATE INDEX IF NOT EXISTS idx_plugin_checkpoints
-                 ON plugin_data_checkpoints (plugin_id, captured_at DESC);",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (14)",
-            [],
-        )?;
-    }
-
-    if current < 15 {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS plugin_trust (
-                 plugin_id TEXT PRIMARY KEY,
-                 update_url TEXT NOT NULL,
-                 keys_json TEXT NOT NULL,
-                 highest_sequence INTEGER NOT NULL DEFAULT 0,
-                 last_checked_at TEXT,
-                 last_result TEXT,
-                 FOREIGN KEY (plugin_id) REFERENCES plugin_installs(plugin_id) ON DELETE CASCADE
-             );",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (15)",
-            [],
-        )?;
-    }
-
-    if current < 16 {
-        // Pack entries the instance still lacks (failed, or waiting on a user
-        // action). Kept here so the instance page can say "not ready" after a
-        // restart, when the import report is gone. No uniqueness on purpose:
-        // the list is replaced as a whole, and an unnamed entry must not
-        // collide with another one.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS instance_pack_gaps (
-                 instance_id TEXT NOT NULL,
-                 filename TEXT NOT NULL,
-                 display_name TEXT NOT NULL,
-                 status TEXT NOT NULL,
-                 reason TEXT,
-                 FOREIGN KEY (instance_id) REFERENCES user_instances(instance_id) ON DELETE CASCADE
-             );
-             CREATE INDEX IF NOT EXISTS idx_instance_pack_gaps_instance
-                 ON instance_pack_gaps (instance_id);",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (16)",
-            [],
-        )?;
-    }
-
-    if current < 17 {
-        // Lifetime play time. `launch_history` is trimmed to its newest rows,
-        // so the total has to live with the instance. Seeded from whatever
-        // history survives, which is the best figure available.
-        let _ = conn.execute(
-            "ALTER TABLE user_instances ADD COLUMN total_play_ms INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        conn.execute(
-            "UPDATE user_instances
-                SET total_play_ms = COALESCE(
-                    (SELECT SUM(duration_ms) FROM launch_history
-                      WHERE launch_history.instance_id = user_instances.instance_id),
-                    0)",
-            [],
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (17)",
-            [],
-        )?;
-    }
-
-    if current < 18 {
-        // Instances of games other than Minecraft (MASTER_SPEC section 26). Created here, after
-        // master's versions 16 and 17, so a database that already ran this branch's earlier
-        // version 16 still gets master's pack-gap table and play-time column; both statements are
-        // idempotent.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS game_instances (
-                 instance_id TEXT PRIMARY KEY,
-                 game TEXT NOT NULL,
-                 name TEXT NOT NULL,
-                 base_json TEXT NOT NULL,
-                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                 last_launched_at TEXT
-             );
-             CREATE TABLE IF NOT EXISTS instance_pack_gaps (
-                 instance_id TEXT NOT NULL,
-                 filename TEXT NOT NULL,
-                 display_name TEXT NOT NULL,
-                 status TEXT NOT NULL,
-                 reason TEXT,
-                 FOREIGN KEY (instance_id) REFERENCES user_instances(instance_id) ON DELETE CASCADE
-             );
-             CREATE INDEX IF NOT EXISTS idx_instance_pack_gaps_instance
-                 ON instance_pack_gaps (instance_id);",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (18)",
-            [],
-        )?;
-    }
-
-    if current < 19 {
-        // Which installed plugins were installed from a signed registry entry
-        // (official plugins). A table beside `plugin_installs` rather than
-        // columns on it, so the manifest-derived record stays exactly what the
-        // package said and "official" is only ever what the installer wrote
-        // here. A plain install replaces the plugin's row and clears this one.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS plugin_official (
-                 plugin_id TEXT PRIMARY KEY,
-                 entry_id TEXT NOT NULL,
-                 entry_version TEXT NOT NULL,
-                 entry_sha256 TEXT NOT NULL,
-                 tree_sha256 TEXT NOT NULL,
-                 recorded_at TEXT NOT NULL,
-                 FOREIGN KEY (plugin_id) REFERENCES plugin_installs(plugin_id) ON DELETE CASCADE
-             );",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (19)",
-            [],
-        )?;
-    }
-
-    if current < 20 {
-        // Whether the user allowed an installed plugin's code to run. One row per
-        // plugin with code; no row means never allowed. Beside `plugin_installs`
-        // rather than in it, so the manifest-derived record stays exactly what
-        // the package said and permission is only what the user chose.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS plugin_script_consent (
-                 plugin_id TEXT PRIMARY KEY,
-                 allowed INTEGER NOT NULL,
-                 decided_at TEXT NOT NULL,
-                 FOREIGN KEY (plugin_id) REFERENCES plugin_installs(plugin_id) ON DELETE CASCADE
-             );",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (20)",
-            [],
-        )?;
-    }
-
-    if current < 21 {
-        // Which code the consent was given for. Without it a code-less version
-        // in between would let a later version inherit an answer given for
-        // different code. A digest of the manifest's entrypoint is enough to
-        // tell "the code the user allowed" from "new code".
-        // The table may already carry the column when an older schema_version
-        // row was lost (the migration tests delete rows to replay history), so
-        // add it only when it is missing.
-        let has_code_hash: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('plugin_script_consent') WHERE name = 'code_hash'",
-            [],
-            |row| row.get(0),
-        )?;
-        if has_code_hash == 0 {
-            conn.execute(
-                "ALTER TABLE plugin_script_consent ADD COLUMN code_hash TEXT",
-                [],
-            )?;
-        }
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (21)",
-            [],
-        )?;
-    }
-
-    if current < 22 {
-        // How long the player has spent in a generic game instance, and when it last ended.
-        // `last_launched_at` (v18) is when the session began; the total is summed on a normal or
-        // stopped exit, so a crash does not count a night of idle time. The columns are added only
-        // when missing, because a migration test can replay history over a table that already has
-        // them.
-        let has_total: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('game_instances') WHERE name = 'total_play_ms'",
-            [],
-            |row| row.get(0),
-        )?;
-        if has_total == 0 {
-            conn.execute(
-                "ALTER TABLE game_instances ADD COLUMN total_play_ms INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
-        }
-        let has_played: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('game_instances') WHERE name = 'last_played_at'",
-            [],
-            |row| row.get(0),
-        )?;
-        if has_played == 0 {
-            conn.execute(
-                "ALTER TABLE game_instances ADD COLUMN last_played_at TEXT",
-                [],
-            )?;
-        }
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (22)",
-            [],
-        )?;
-    }
-
-    if current < 23 {
-        // The session ledger (MASTER_SPEC section 30.4). `launch_history` was Minecraft-only, tied
-        // to `user_instances` by a foreign key, so a game instance could not have a row. The table
-        // is rebuilt without that key and gains the ledger columns; two triggers keep the old
-        // promise that history cannot outlive the instance (deleting either kind of instance
-        // deletes its rows and manifests). Manifests are stored once per distinct manifest.
-        // The triggers go first: replaying this step over a database that already has them would
-        // otherwise fail when the table they name is dropped.
-        conn.execute_batch(
-            "DROP TRIGGER IF EXISTS launch_history_minecraft_instance_gone;
-             DROP TRIGGER IF EXISTS launch_history_game_instance_gone;
-             DROP TABLE IF EXISTS launch_history_v23;
-             CREATE TABLE launch_history_v23 (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 instance_id TEXT NOT NULL,
-                 started_at TEXT NOT NULL,
-                 prep_ms INTEGER,
-                 duration_ms INTEGER,
-                 outcome TEXT,
-                 enabled_mod_count INTEGER NOT NULL DEFAULT 0,
-                 minecraft_version TEXT NOT NULL DEFAULT '',
-                 loader TEXT NOT NULL DEFAULT '',
-                 peak_memory_mb INTEGER,
-                 session_id TEXT,
-                 ended_at TEXT,
-                 exit_json TEXT,
-                 stop_requested INTEGER NOT NULL DEFAULT 0,
-                 verdict TEXT,
-                 manifest_hash TEXT,
-                 owner_pid INTEGER,
-                 owner_start INTEGER
-             );
-             INSERT INTO launch_history_v23
-                 (id, instance_id, started_at, prep_ms, duration_ms, outcome, enabled_mod_count,
-                  minecraft_version, loader, peak_memory_mb)
-             SELECT id, instance_id, started_at, prep_ms, duration_ms, outcome, enabled_mod_count,
-                    minecraft_version, loader, peak_memory_mb
-               FROM launch_history;
-             DROP TABLE launch_history;
-             ALTER TABLE launch_history_v23 RENAME TO launch_history;
-             CREATE INDEX IF NOT EXISTS idx_launch_history_instance
-                 ON launch_history (instance_id, started_at DESC);
-             CREATE UNIQUE INDEX IF NOT EXISTS idx_launch_history_session
-                 ON launch_history (session_id) WHERE session_id IS NOT NULL;
-             CREATE TABLE IF NOT EXISTS launch_manifests (
-                 instance_id TEXT NOT NULL,
-                 hash TEXT NOT NULL,
-                 data BLOB NOT NULL,
-                 raw_len INTEGER NOT NULL,
-                 PRIMARY KEY (instance_id, hash)
-             ) WITHOUT ROWID;
-             CREATE TRIGGER IF NOT EXISTS launch_history_minecraft_instance_gone
-                 AFTER DELETE ON user_instances
-             BEGIN
-                 DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
-                 DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
-             END;
-             CREATE TRIGGER IF NOT EXISTS launch_history_game_instance_gone
-                 AFTER DELETE ON game_instances
-             BEGIN
-                 DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
-                 DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
-             END;",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (23)",
-            [],
-        )?;
-    }
-
-    if current < 24 {
-        // The answer the crash doctor reached for one finished session (MASTER_SPEC §30.4). It is
-        // kept beside the history row, never inside it, so a failed analysis is still a row with a
-        // reason. Answers are trimmed with their session row by `launch_history::prune_history`,
-        // and the triggers below delete them with their instance exactly as they delete history.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS session_answers (
-                 session_id TEXT PRIMARY KEY,
-                 instance_id TEXT NOT NULL,
-                 created_at TEXT NOT NULL,
-                 answer_json TEXT NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_session_answers_instance
-                 ON session_answers (instance_id, created_at DESC);
-             DROP TRIGGER IF EXISTS launch_history_minecraft_instance_gone;
-             DROP TRIGGER IF EXISTS launch_history_game_instance_gone;
-             CREATE TRIGGER launch_history_minecraft_instance_gone
-                 AFTER DELETE ON user_instances
-             BEGIN
-                 DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
-                 DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
-                 DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
-             END;
-             CREATE TRIGGER launch_history_game_instance_gone
-                 AFTER DELETE ON game_instances
-             BEGIN
-                 DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
-                 DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
-                 DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
-             END;",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (24)",
-            [],
-        )?;
-    }
-
-    if current < 25 {
-        // The compact result of one older crash log, keyed by its content hash so a sweep never
-        // analyses the same file twice (MASTER_SPEC §30.4). The log's bytes are never copied; only
-        // this small record is kept, and it lives exactly as long as its instance.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS crash_log_results (
-                 instance_id TEXT NOT NULL,
-                 content_hash TEXT NOT NULL,
-                 source_id TEXT NOT NULL,
-                 plugin_id TEXT NOT NULL,
-                 name TEXT NOT NULL,
-                 relative_path TEXT NOT NULL,
-                 modified_at TEXT,
-                 analyzed_at TEXT NOT NULL,
-                 record_json TEXT NOT NULL,
-                 PRIMARY KEY (instance_id, content_hash)
-             );
-             CREATE INDEX IF NOT EXISTS idx_crash_log_results_instance
-                 ON crash_log_results (instance_id, modified_at DESC);
-             DROP TRIGGER IF EXISTS launch_history_minecraft_instance_gone;
-             DROP TRIGGER IF EXISTS launch_history_game_instance_gone;
-             CREATE TRIGGER launch_history_minecraft_instance_gone
-                 AFTER DELETE ON user_instances
-             BEGIN
-                 DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
-                 DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
-                 DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
-                 DELETE FROM crash_log_results WHERE instance_id = OLD.instance_id;
-             END;
-             CREATE TRIGGER launch_history_game_instance_gone
-                 AFTER DELETE ON game_instances
-             BEGIN
-                 DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
-                 DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
-                 DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
-                 DELETE FROM crash_log_results WHERE instance_id = OLD.instance_id;
-             END;",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (25)",
-            [],
-        )?;
-    }
-
-    if current < 26 {
-        // The save backup taken before one session's crash test (MASTER_SPEC §30.4). Keyed by
-        // session so the Restore button survives clearing user settings; the backup itself lives
-        // in the instance folder, and this row only says which one belongs to the session.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS crash_save_backups (
-                 session_id TEXT PRIMARY KEY,
-                 instance_id TEXT NOT NULL,
-                 backup_id TEXT NOT NULL,
-                 created_at TEXT NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_crash_save_backups_instance
-                 ON crash_save_backups (instance_id, created_at DESC);
-             DROP TRIGGER IF EXISTS launch_history_minecraft_instance_gone;
-             DROP TRIGGER IF EXISTS launch_history_game_instance_gone;
-             CREATE TRIGGER launch_history_minecraft_instance_gone
-                 AFTER DELETE ON user_instances
-             BEGIN
-                 DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
-                 DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
-                 DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
-                 DELETE FROM crash_log_results WHERE instance_id = OLD.instance_id;
-                 DELETE FROM crash_save_backups WHERE instance_id = OLD.instance_id;
-             END;
-             CREATE TRIGGER launch_history_game_instance_gone
-                 AFTER DELETE ON game_instances
-             BEGIN
-                 DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
-                 DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
-                 DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
-                 DELETE FROM crash_log_results WHERE instance_id = OLD.instance_id;
-                 DELETE FROM crash_save_backups WHERE instance_id = OLD.instance_id;
-             END;",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (26)",
-            [],
-        )?;
-    }
-
-    if current < 27 {
-        // The load-after rules a player sets for one instance's list (MASTER_SPEC §31.4). They
-        // live beside the instance rather than in the plugin list, so turning a mod off and on
-        // keeps them, and a rule whose item leaves the list stays and reads as unused. The
-        // triggers delete them with their instance, exactly as the other per-session tables are.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS plugin_load_order_rules (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 instance_id TEXT NOT NULL,
-                 list_id TEXT NOT NULL,
-                 item TEXT NOT NULL COLLATE NOCASE,
-                 after_item TEXT NOT NULL COLLATE NOCASE,
-                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                 UNIQUE (instance_id, list_id, item, after_item)
-             );
-             CREATE INDEX IF NOT EXISTS idx_plugin_load_order_rules_instance
-                 ON plugin_load_order_rules (instance_id, list_id, id);
-             DROP TRIGGER IF EXISTS launch_history_minecraft_instance_gone;
-             DROP TRIGGER IF EXISTS launch_history_game_instance_gone;
-             CREATE TRIGGER launch_history_minecraft_instance_gone
-                 AFTER DELETE ON user_instances
-             BEGIN
-                 DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
-                 DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
-                 DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
-                 DELETE FROM crash_log_results WHERE instance_id = OLD.instance_id;
-                 DELETE FROM crash_save_backups WHERE instance_id = OLD.instance_id;
-                 DELETE FROM plugin_load_order_rules WHERE instance_id = OLD.instance_id;
-             END;
-             CREATE TRIGGER launch_history_game_instance_gone
-                 AFTER DELETE ON game_instances
-             BEGIN
-                 DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
-                 DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
-                 DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
-                 DELETE FROM crash_log_results WHERE instance_id = OLD.instance_id;
-                 DELETE FROM crash_save_backups WHERE instance_id = OLD.instance_id;
-                 DELETE FROM plugin_load_order_rules WHERE instance_id = OLD.instance_id;
-             END;",
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_version (version) VALUES (27)",
-            [],
-        )?;
-    }
-
-    if current > target {
-        anyhow::bail!("local_state.db schema version {current} is newer than supported {target}");
     }
     Ok(())
+}
+
+fn migrate_v22(conn: &Connection) -> anyhow::Result<()> {
+    // game play time
+    // How long the player has spent in a generic game instance, and when it last ended.
+    // `last_launched_at` (v18) is when the session began; the total is summed on a normal or
+    // stopped exit, so a crash does not count a night of idle time. The columns are added only
+    // when missing, because a migration test can replay history over a table that already has
+    // them.
+    let has_total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('game_instances') WHERE name = 'total_play_ms'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_total == 0 {
+        conn.execute(
+            "ALTER TABLE game_instances ADD COLUMN total_play_ms INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    let has_played: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('game_instances') WHERE name = 'last_played_at'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_played == 0 {
+        conn.execute(
+            "ALTER TABLE game_instances ADD COLUMN last_played_at TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_v23(conn: &Connection) -> anyhow::Result<()> {
+    // session ledger
+    // The session ledger (MASTER_SPEC section 30.4). `launch_history` was Minecraft-only, tied
+    // to `user_instances` by a foreign key, so a game instance could not have a row. The table
+    // is rebuilt without that key and gains the ledger columns; two triggers keep the old
+    // promise that history cannot outlive the instance (deleting either kind of instance
+    // deletes its rows and manifests). Manifests are stored once per distinct manifest.
+    // The triggers go first: replaying this step over a database that already has them would
+    // otherwise fail when the table they name is dropped.
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS launch_history_minecraft_instance_gone;
+         DROP TRIGGER IF EXISTS launch_history_game_instance_gone;
+         DROP TABLE IF EXISTS launch_history_v23;
+         CREATE TABLE launch_history_v23 (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             instance_id TEXT NOT NULL,
+             started_at TEXT NOT NULL,
+             prep_ms INTEGER,
+             duration_ms INTEGER,
+             outcome TEXT,
+             enabled_mod_count INTEGER NOT NULL DEFAULT 0,
+             minecraft_version TEXT NOT NULL DEFAULT '',
+             loader TEXT NOT NULL DEFAULT '',
+             peak_memory_mb INTEGER,
+             session_id TEXT,
+             ended_at TEXT,
+             exit_json TEXT,
+             stop_requested INTEGER NOT NULL DEFAULT 0,
+             verdict TEXT,
+             manifest_hash TEXT,
+             owner_pid INTEGER,
+             owner_start INTEGER
+         );
+         INSERT INTO launch_history_v23
+             (id, instance_id, started_at, prep_ms, duration_ms, outcome, enabled_mod_count,
+              minecraft_version, loader, peak_memory_mb)
+         SELECT id, instance_id, started_at, prep_ms, duration_ms, outcome, enabled_mod_count,
+                minecraft_version, loader, peak_memory_mb
+           FROM launch_history;
+         DROP TABLE launch_history;
+         ALTER TABLE launch_history_v23 RENAME TO launch_history;
+         CREATE INDEX IF NOT EXISTS idx_launch_history_instance
+             ON launch_history (instance_id, started_at DESC);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_launch_history_session
+             ON launch_history (session_id) WHERE session_id IS NOT NULL;
+         CREATE TABLE IF NOT EXISTS launch_manifests (
+             instance_id TEXT NOT NULL,
+             hash TEXT NOT NULL,
+             data BLOB NOT NULL,
+             raw_len INTEGER NOT NULL,
+             PRIMARY KEY (instance_id, hash)
+         ) WITHOUT ROWID;
+         CREATE TRIGGER IF NOT EXISTS launch_history_minecraft_instance_gone
+             AFTER DELETE ON user_instances
+         BEGIN
+             DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+             DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS launch_history_game_instance_gone
+             AFTER DELETE ON game_instances
+         BEGIN
+             DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+             DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+         END;",
+    )?;
+    Ok(())
+}
+
+fn migrate_v24(conn: &Connection) -> anyhow::Result<()> {
+    // session answers
+    // The answer the crash doctor reached for one finished session (MASTER_SPEC §30.4). It is
+    // kept beside the history row, never inside it, so a failed analysis is still a row with a
+    // reason. Answers are trimmed with their session row by `launch_history::prune_history`,
+    // and the triggers below delete them with their instance exactly as they delete history.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_answers (
+             session_id TEXT PRIMARY KEY,
+             instance_id TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             answer_json TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_session_answers_instance
+             ON session_answers (instance_id, created_at DESC);
+         DROP TRIGGER IF EXISTS launch_history_minecraft_instance_gone;
+         DROP TRIGGER IF EXISTS launch_history_game_instance_gone;
+         CREATE TRIGGER launch_history_minecraft_instance_gone
+             AFTER DELETE ON user_instances
+         BEGIN
+             DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+             DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+             DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
+         END;
+         CREATE TRIGGER launch_history_game_instance_gone
+             AFTER DELETE ON game_instances
+         BEGIN
+             DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+             DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+             DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
+         END;",
+    )?;
+    Ok(())
+}
+
+fn migrate_v25(conn: &Connection) -> anyhow::Result<()> {
+    // crash log results
+    // The compact result of one older crash log, keyed by its content hash so a sweep never
+    // analyses the same file twice (MASTER_SPEC §30.4). The log's bytes are never copied; only
+    // this small record is kept, and it lives exactly as long as its instance.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS crash_log_results (
+             instance_id TEXT NOT NULL,
+             content_hash TEXT NOT NULL,
+             source_id TEXT NOT NULL,
+             plugin_id TEXT NOT NULL,
+             name TEXT NOT NULL,
+             relative_path TEXT NOT NULL,
+             modified_at TEXT,
+             analyzed_at TEXT NOT NULL,
+             record_json TEXT NOT NULL,
+             PRIMARY KEY (instance_id, content_hash)
+         );
+         CREATE INDEX IF NOT EXISTS idx_crash_log_results_instance
+             ON crash_log_results (instance_id, modified_at DESC);
+         DROP TRIGGER IF EXISTS launch_history_minecraft_instance_gone;
+         DROP TRIGGER IF EXISTS launch_history_game_instance_gone;
+         CREATE TRIGGER launch_history_minecraft_instance_gone
+             AFTER DELETE ON user_instances
+         BEGIN
+             DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+             DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+             DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
+             DELETE FROM crash_log_results WHERE instance_id = OLD.instance_id;
+         END;
+         CREATE TRIGGER launch_history_game_instance_gone
+             AFTER DELETE ON game_instances
+         BEGIN
+             DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+             DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+             DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
+             DELETE FROM crash_log_results WHERE instance_id = OLD.instance_id;
+         END;",
+    )?;
+    Ok(())
+}
+
+fn migrate_v26(conn: &Connection) -> anyhow::Result<()> {
+    // crash save backups
+    // The save backup taken before one session's crash test (MASTER_SPEC §30.4). Keyed by
+    // session so the Restore button survives clearing user settings; the backup itself lives
+    // in the instance folder, and this row only says which one belongs to the session.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS crash_save_backups (
+             session_id TEXT PRIMARY KEY,
+             instance_id TEXT NOT NULL,
+             backup_id TEXT NOT NULL,
+             created_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_crash_save_backups_instance
+             ON crash_save_backups (instance_id, created_at DESC);
+         DROP TRIGGER IF EXISTS launch_history_minecraft_instance_gone;
+         DROP TRIGGER IF EXISTS launch_history_game_instance_gone;
+         CREATE TRIGGER launch_history_minecraft_instance_gone
+             AFTER DELETE ON user_instances
+         BEGIN
+             DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+             DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+             DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
+             DELETE FROM crash_log_results WHERE instance_id = OLD.instance_id;
+             DELETE FROM crash_save_backups WHERE instance_id = OLD.instance_id;
+         END;
+         CREATE TRIGGER launch_history_game_instance_gone
+             AFTER DELETE ON game_instances
+         BEGIN
+             DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+             DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+             DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
+             DELETE FROM crash_log_results WHERE instance_id = OLD.instance_id;
+             DELETE FROM crash_save_backups WHERE instance_id = OLD.instance_id;
+         END;",
+    )?;
+    Ok(())
+}
+
+fn migrate_v27(conn: &Connection) -> anyhow::Result<()> {
+    // load order rules
+    // The load-after rules a player sets for one instance's list (MASTER_SPEC §31.4). They
+    // live beside the instance rather than in the plugin list, so turning a mod off and on
+    // keeps them, and a rule whose item leaves the list stays and reads as unused. The
+    // triggers delete them with their instance, exactly as the other per-session tables are.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS plugin_load_order_rules (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             instance_id TEXT NOT NULL,
+             list_id TEXT NOT NULL,
+             item TEXT NOT NULL COLLATE NOCASE,
+             after_item TEXT NOT NULL COLLATE NOCASE,
+             created_at TEXT NOT NULL DEFAULT (datetime('now')),
+             UNIQUE (instance_id, list_id, item, after_item)
+         );
+         CREATE INDEX IF NOT EXISTS idx_plugin_load_order_rules_instance
+             ON plugin_load_order_rules (instance_id, list_id, id);
+         DROP TRIGGER IF EXISTS launch_history_minecraft_instance_gone;
+         DROP TRIGGER IF EXISTS launch_history_game_instance_gone;
+         CREATE TRIGGER launch_history_minecraft_instance_gone
+             AFTER DELETE ON user_instances
+         BEGIN
+             DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+             DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+             DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
+             DELETE FROM crash_log_results WHERE instance_id = OLD.instance_id;
+             DELETE FROM crash_save_backups WHERE instance_id = OLD.instance_id;
+             DELETE FROM plugin_load_order_rules WHERE instance_id = OLD.instance_id;
+         END;
+         CREATE TRIGGER launch_history_game_instance_gone
+             AFTER DELETE ON game_instances
+         BEGIN
+             DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+             DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+             DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
+             DELETE FROM crash_log_results WHERE instance_id = OLD.instance_id;
+             DELETE FROM crash_save_backups WHERE instance_id = OLD.instance_id;
+             DELETE FROM plugin_load_order_rules WHERE instance_id = OLD.instance_id;
+         END;",
+    )?;
+    Ok(())
+}
+
+fn migrate_v28(conn: &Connection) -> anyhow::Result<()> {
+    // Every user_instances table created at v1 has this column, but a database
+    // that predates the column and recorded its version some other way does
+    // not. Add it when missing; never swallow a real failure.
+    add_column_if_missing(
+        conn,
+        "user_instances",
+        "jvm_always_pre_touch",
+        "ALTER TABLE user_instances ADD COLUMN jvm_always_pre_touch INTEGER NOT NULL DEFAULT 1",
+    )
 }
 
 /// Read a JSON-encoded setting from user_settings.
@@ -2139,11 +2846,55 @@ mod tests {
     /// Helper: create a unique temp-file-backed test database with migrations applied.
     fn test_db() -> (Connection, PathBuf) {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("agora-test-{}-{}.db", std::process::id(), n));
-        let _ = std::fs::remove_file(&path);
+        // Each database gets its own folder, so a replay's `backups/` folder is
+        // not shared with another test running at the same time.
+        let dir = std::env::temp_dir().join(format!("agora-test-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).expect("create test db folder");
+        let path = dir.join("local_state.db");
         init_local_state_db(&path).expect("failed to init test db");
         let conn = Connection::open(&path).expect("failed to open test db");
         (conn, path)
+    }
+
+    fn a_good_step(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch("CREATE TABLE kept (value TEXT); INSERT INTO kept VALUES ('yes');")?;
+        Ok(())
+    }
+
+    fn a_failing_step(_conn: &Connection) -> anyhow::Result<()> {
+        anyhow::bail!("invented failure")
+    }
+
+    #[test]
+    fn a_failing_step_leaves_the_earlier_version_recorded_and_the_database_usable() {
+        let conn = Connection::open_in_memory().unwrap();
+        let steps = [
+            MigrationStep {
+                version: 1,
+                name: "good",
+                run: a_good_step,
+            },
+            MigrationStep {
+                version: 2,
+                name: "bad",
+                run: a_failing_step,
+            },
+        ];
+        let error = run_migration_steps(&conn, &steps, 2).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("invented failure"),
+            "{error:#}"
+        );
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 1, "the last successful version stays recorded");
+        let kept: String = conn
+            .query_row("SELECT value FROM kept", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept, "yes", "the earlier step's work is still there");
     }
 
     // ---- normalize_pair (pure, no DB) ----

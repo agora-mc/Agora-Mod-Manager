@@ -146,9 +146,30 @@ impl CoreContext {
     /// app. The key decides which installed plugins count as official.
     pub fn initialize_with_registry_trust(
         paths: AppPaths,
-        mut game_builder: crate::game_registry::GameRegistryBuilder,
+        game_builder: crate::game_registry::GameRegistryBuilder,
         registry_trust: crate::plugins::official::RegistryTrust,
     ) -> LauncherResult<(Self, Vec<String>)> {
+        Self::initialize_with_local_state_options(
+            paths,
+            game_builder,
+            registry_trust,
+            &crate::db::LocalStateOpenOptions::default(),
+        )
+        .map(|(ctx, warnings, _report)| (ctx, warnings))
+    }
+
+    /// [`Self::initialize_with_registry_trust`] with the startup choices for the
+    /// local database, returning what startup did to it.
+    ///
+    /// Adapters use this to offer the explicit overrides (a newer-schema
+    /// database, or a failed pre-migration backup) and to tell the player when
+    /// a corrupt database was recovered.
+    pub fn initialize_with_local_state_options(
+        paths: AppPaths,
+        mut game_builder: crate::game_registry::GameRegistryBuilder,
+        registry_trust: crate::plugins::official::RegistryTrust,
+        local_state_options: &crate::db::LocalStateOpenOptions,
+    ) -> LauncherResult<(Self, Vec<String>, crate::db::LocalStateStartupReport)> {
         let mut warnings = Vec::new();
 
         // 1. Create required directories.
@@ -162,17 +183,46 @@ impl CoreContext {
         crate::network_gate::install(Arc::new(crate::network_gate::SettingsGate::new(
             db_path.clone(),
         )));
-        crate::db::init_local_state_db(&db_path).map_err(|e| {
-            let msg = format!(
-                "Failed to initialize local state database at {}: {e}",
-                db_path.display()
-            );
-            // Log the path without secrets or token data.
-            LauncherError::Generic {
-                code: "ERR_LOCAL_STATE_FAILED".into(),
-                message: msg,
+        let local_state_report = crate::db::init_local_state_db_with(&db_path, local_state_options)
+            .map_err(|e| {
+                // A typed error already says what happened and what the player
+                // can do (a newer schema, a failed backup), so keep its code.
+                if let Some(known) = e.downcast_ref::<LauncherError>() {
+                    return known.clone();
+                }
+                let msg = format!(
+                    "Failed to initialize local state database at {}: {e}",
+                    db_path.display()
+                );
+                // Log the path without secrets or token data.
+                LauncherError::Generic {
+                    code: "ERR_LOCAL_STATE_FAILED".into(),
+                    message: msg,
+                }
+            })?;
+        if let Some(recovery) = &local_state_report.recovered_corrupt {
+            match &recovery.restored_from {
+                Some(backup) => warnings.push(format!(
+                    "The local database was damaged. It was kept at {} and the newest good \
+                     backup ({}) was restored.",
+                    recovery.kept_at.display(),
+                    backup.display()
+                )),
+                None => warnings.push(format!(
+                    "The local database was damaged and no good backup was found. It was kept \
+                     at {} and Agora started with a fresh database.",
+                    recovery.kept_at.display()
+                )),
             }
-        })?;
+        }
+        if let Some(newer) = &local_state_report.newer_schema_kept {
+            warnings.push(format!(
+                "The local database (schema version {}) was written by a newer Agora. It was \
+                 kept at {} and Agora started with a fresh database.",
+                newer.found,
+                newer.kept_at.display()
+            ));
+        }
 
         // The plugin runtime is created later, but a scripted package needs a
         // stable handle to it now. The handle is empty until the plugin service
@@ -582,7 +632,7 @@ impl CoreContext {
             Err(error) => warnings.push(format!("Cannot load game catalogs: {error}")),
         }
 
-        Ok((ctx, warnings))
+        Ok((ctx, warnings, local_state_report))
     }
 
     /// Create a context for testing with temporary paths.

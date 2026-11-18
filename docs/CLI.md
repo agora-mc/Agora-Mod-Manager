@@ -75,6 +75,8 @@ Global options:
 | `--output <human|json>` | Select output format |
 | `--registry-repo <OWNER/REPO>` | Override the catalog repository for development or testing |
 | `--log-file <PATH>` | Append CLI diagnostics to a chosen file |
+| `--fresh-database` | Keep a `local_state.db` written by a newer Agora aside and start with a fresh database. Without it, startup refuses the newer file and changes nothing |
+| `--migrate-without-backup` | Migrate even when the pre-migration database backup cannot be written. Without it, startup stops and leaves the database unchanged |
 | `--help` | Show help |
 | `--version` | Show the CLI version |
 
@@ -169,10 +171,23 @@ agora plugin install package ./example-plugin.zip
 | Command | Purpose |
 | --- | --- |
 | `agora paths` | Print resolved application, database, cache, runtime, and instance paths |
+| `agora doctor` | Report the local database's path, schema version, integrity, backups, and files kept aside after recovery. It reads only: nothing is migrated, copied, renamed or deleted, and it works even when startup would refuse the database |
 | `agora list-instances` | List local instances |
 | `agora get-instance <ID>` | Print one instance |
 | `agora inventory <INSTANCE>` | Inspect installed content |
 | `agora health <INSTANCE>` | Run the local health scanner |
+
+### The local database safety net
+
+Every command that needs launcher state opens `local_state.db` under the data root. Before it does anything else, startup:
+
+- runs `PRAGMA quick_check` (a few milliseconds on a realistic database) and treats a damaged file as damaged rather than as empty;
+- moves a corrupt file aside, never deleting it, and restores the newest `backups/` copy that passes the check; when no backup passes, it starts with a fresh database and says where the damaged file is;
+- refuses a database written by a newer Agora unless `--fresh-database` is given, keeping the newer file beside the database;
+- before any pending migration, copies the database with `VACUUM INTO` to `backups/local_state-<time>-v<version>.db`. The newest three backups are kept; older ones are deleted after a new backup is written. If the copy cannot be written, startup stops unless `--migrate-without-backup` is given;
+- applies migrations one step at a time, each in its own transaction that also records the step's version, so a failed step leaves the last successful version recorded and the database usable.
+
+`agora doctor` reports all of this without changing anything, including files kept aside as `local_state.db.corrupt-*` and `local_state.db.newer-v*`.
 
 ### Games
 
