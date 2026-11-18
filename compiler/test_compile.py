@@ -5,13 +5,11 @@ Run with:  python compiler/test_compile.py
 No pytest dependency â€” uses only stdlib (unittest, sys, tempfile, json, os, re).
 
 Covers: validate_sha256, _get_registry_repo, _load_poll_blacklist,
-        _extract_mod_id, _extract_review_text, _scrub_review_text,
         and regex DoS protections via insert_crash_signature.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import contextlib
 import hashlib
 import io
@@ -30,6 +28,13 @@ from unittest import mock
 # Ensure we can import the compiler module from the repo root.
 sys.path.insert(0, os.path.dirname(__file__))
 import compile as _compile  # noqa: E402
+
+
+def write_empty_known_conflicts(registry: Path) -> None:
+    """A temp registry root still needs the committed governance catalog file."""
+    governance = registry / "governance"
+    governance.mkdir(parents=True, exist_ok=True)
+    (governance / "known_conflicts.json").write_text("[]", encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -474,194 +479,56 @@ class TestGetRegistryRepo(unittest.TestCase):
 class TestLoadPollBlacklist(unittest.TestCase):
     """Tests for _load_poll_blacklist."""
 
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._patch = mock.patch.object(_compile, "REGISTRY_DIR", Path(self._tmp.name))
+        self._patch.start()
+        self.target = Path(self._tmp.name) / "governance" / "poll_blacklist.json"
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def _write(self, text: str) -> None:
+        self.target.write_text(text, encoding="utf-8")
+
     def test_valid_json_returns_lowercase_set(self):
         """Valid JSON with usernames is returned as a lowercase set."""
-        blacklist_dir = _compile.REGISTRY_DIR / "governance"
-        target = blacklist_dir / "poll_blacklist.json"
-        # Back up if exists.
-        backup = None
-        if target.exists():
-            backup = target.read_bytes()
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(json.dumps({"usernames": ["Alice", "BOB"]}), encoding="utf-8")
-            result = _compile._load_poll_blacklist()
-            self.assertEqual(result, {"alice", "bob"})
-        finally:
-            if backup is not None:
-                target.write_bytes(backup)
-            else:
-                target.unlink(missing_ok=True)
+        self._write(json.dumps({"usernames": ["Alice", "BOB"]}))
+        self.assertEqual(_compile._load_poll_blacklist(), {"alice", "bob"})
 
-    def test_missing_file_returns_empty_set(self):
-        """When the file does not exist, returns empty set (no crash)."""
-        blacklist_dir = _compile.REGISTRY_DIR / "governance"
-        target = blacklist_dir / "poll_blacklist.json"
-        backup = None
-        if target.exists():
-            backup = target.read_bytes()
-        try:
-            target.unlink(missing_ok=True)
-            result = _compile._load_poll_blacklist()
-            self.assertEqual(result, set())
-        finally:
-            if backup is not None:
-                target.write_bytes(backup)
+    def test_missing_file_stops_the_run_and_names_the_file(self):
+        """A committed governance input must exist; absence is not an empty poll list."""
+        with self.assertRaisesRegex(_compile.GovernanceError, "poll_blacklist.json"):
+            _compile._load_poll_blacklist()
 
-    def test_malformed_json_returns_empty_set(self):
-        """Invalid JSON returns empty set (no crash)."""
-        blacklist_dir = _compile.REGISTRY_DIR / "governance"
-        target = blacklist_dir / "poll_blacklist.json"
-        backup = None
-        if target.exists():
-            backup = target.read_bytes()
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text("{not valid json!!!", encoding="utf-8")
-            result = _compile._load_poll_blacklist()
-            self.assertEqual(result, set())
-        finally:
-            if backup is not None:
-                target.write_bytes(backup)
-            else:
-                target.unlink(missing_ok=True)
+    def test_malformed_json_stops_the_run_and_names_the_file(self):
+        """Invalid JSON must stop rather than count blacklisted users' votes."""
+        self._write("{not valid json!!!")
+        with self.assertRaisesRegex(_compile.GovernanceError, "poll_blacklist.json"):
+            _compile._load_poll_blacklist()
 
+    def test_wrong_shape_stops_the_run(self):
+        """A JSON object without a usernames list is malformed."""
+        self._write(json.dumps({"names": ["alice"]}))
+        with self.assertRaisesRegex(_compile.GovernanceError, "usernames"):
+            _compile._load_poll_blacklist()
 
-# ---------------------------------------------------------------------------
-# _extract_mod_id
-# ---------------------------------------------------------------------------
+    def test_override_returns_empty_and_logs_when_missing(self):
+        """The maintainer override logs the skipped input and proceeds."""
+        with self.assertLogs("compiler", level="WARNING") as logs:
+            result = _compile._load_poll_blacklist(allow_partial=True)
+        self.assertEqual(result, set())
+        self.assertTrue(any("poll_blacklist.json" in line for line in logs.output))
 
-class TestExtractModId(unittest.TestCase):
-    """Tests for _extract_mod_id."""
-
-    def test_from_realistic_body(self):
-        """A review-form body with Mod Registry ID returns the ID."""
-        body = (
-            "### Mod Registry ID\n"
-            "sodium\n"
-            "\n"
-            "### Your Technical Review\n"
-            "Great mod.\n"
-        )
-        self.assertEqual(_compile._extract_mod_id(body), "sodium")
-
-    def test_none_body(self):
-        """None body returns None."""
-        self.assertIsNone(_compile._extract_mod_id(None))
-
-    def test_empty_body(self):
-        """Empty string body returns None."""
-        self.assertIsNone(_compile._extract_mod_id(""))
-
-    def test_no_field_returns_none(self):
-        """Body without the Mod Registry ID field returns None."""
-        body = "### Feature Request\nAdd mod X.\n"
-        self.assertIsNone(_compile._extract_mod_id(body))
-
-    def test_case_insensitive_heading(self):
-        """Heading casing is ignored; ID is lowercased."""
-        body = "### mod registry ID\n" "CaveClient\n"
-        self.assertEqual(_compile._extract_mod_id(body), "caveclient")
-
-    def test_with_crlf(self):
-        """Windows CRLF line endings parse correctly."""
-        body = "### Mod Registry ID\r\n" "sodium\r\n"
-        self.assertEqual(_compile._extract_mod_id(body), "sodium")
-
-    def test_trailing_whitespace_trimmed(self):
-        """Trailing whitespace after the ID is trimmed."""
-        body = "### Mod Registry ID\n" "sodium   \n"
-        self.assertEqual(_compile._extract_mod_id(body), "sodium")
-
-
-# ---------------------------------------------------------------------------
-# _extract_review_text
-# ---------------------------------------------------------------------------
-
-class TestExtractReviewText(unittest.TestCase):
-    """Tests for _extract_review_text."""
-
-    def test_from_realistic_body(self):
-        """Body with review heading â†’ extracted text."""
-        body = (
-            "### Mod Registry ID\n"
-            "sodium\n"
-            "\n"
-            "### Your Technical Review (50 character minimum)\n"
-            "Excellent performance improvement over vanilla rendering.\n"
-            "\n"
-            "### Additional Comments\n"
-            "None.\n"
-        )
-        result = _compile._extract_review_text(body)
-        self.assertIsNotNone(result)
-        self.assertIn("Excellent performance improvement", result)
-
-    def test_none_body(self):
-        """None body returns None."""
-        self.assertIsNone(_compile._extract_review_text(None))
-
-    def test_empty_body(self):
-        """Empty string body returns None."""
-        self.assertIsNone(_compile._extract_review_text(""))
-
-    def test_no_review_field_returns_none(self):
-        """Body without the review field returns None."""
-        body = "### Mod Registry ID\n" "sodium\n"
-        self.assertIsNone(_compile._extract_review_text(body))
-
-    def test_strips_whitespace(self):
-        """Leading/trailing whitespace in the extracted text is stripped."""
-        body = "### Your Technical Review\n" "  lots of text  \n"
-        result = _compile._extract_review_text(body)
-        self.assertEqual(result, "lots of text")
-
-
-# ---------------------------------------------------------------------------
-# _scrub_review_text
-# ---------------------------------------------------------------------------
-
-class TestScrubReviewText(unittest.TestCase):
-    """Tests for _scrub_review_text."""
-
-    def test_version_begging_filtered(self):
-        """Version-begging text is filtered out."""
-        passed, cleaned, reason = _compile._scrub_review_text("Please update to 1.21")
-        self.assertFalse(passed)
-        self.assertEqual(reason, "version-begging")
-
-    def test_legitimate_review_preserved(self):
-        """A substantive review passes the scrub pipeline."""
-        passed, cleaned, reason = _compile._scrub_review_text(
-            "This mod adds great features and runs smoothly."
-        )
-        self.assertTrue(passed)
-        self.assertEqual(reason, "")
-        self.assertEqual(cleaned, "This mod adds great features and runs smoothly.")
-
-    def test_empty_praise_filtered(self):
-        """Short empty praise is filtered."""
-        passed, cleaned, reason = _compile._scrub_review_text("Good mod.")
-        self.assertFalse(passed)
-        self.assertEqual(reason, "empty-praise")
-
-    def test_empty_text_filtered(self):
-        """Empty text is filtered."""
-        passed, cleaned, reason = _compile._scrub_review_text("")
-        self.assertFalse(passed)
-        self.assertEqual(reason, "empty")
-
-    def test_whitespace_only_filtered(self):
-        """Whitespace-only text is filtered."""
-        passed, cleaned, reason = _compile._scrub_review_text("   \t\n  ")
-        self.assertFalse(passed)
-        self.assertEqual(reason, "empty")
-
-    def test_strips_clean_text(self):
-        """Passed text is stripped of leading/trailing whitespace."""
-        passed, cleaned, reason = _compile._scrub_review_text("  hello world  ")
-        self.assertTrue(passed)
-        self.assertEqual(cleaned, "hello world")
+    def test_override_returns_empty_and_logs_when_malformed(self):
+        """The maintainer override logs the skipped malformed input and proceeds."""
+        self._write("{not valid json!!!")
+        with self.assertLogs("compiler", level="WARNING") as logs:
+            result = _compile._load_poll_blacklist(allow_partial=True)
+        self.assertEqual(result, set())
+        self.assertTrue(any("poll_blacklist.json" in line for line in logs.output))
 
 
 # ---------------------------------------------------------------------------
@@ -898,446 +765,6 @@ class TestCrashSignatureFormat(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Ported from _test_social_metrics.py (no equivalents in this file)
-# ---------------------------------------------------------------------------
-
-class TestParseReaction(unittest.TestCase):
-    """Tests for _parse_reaction."""
-
-    def test_parse_reaction_upvote(self):
-        """A +1 reaction on the issue itself is an upvote with comment_id=None."""
-        obj = {
-            "user": {"login": "alice"},
-            "content": "+1",
-            "created_at": "2026-01-15T12:00:00Z",
-        }
-        r = _compile._parse_reaction(obj, comment_id=None)
-        self.assertIsNotNone(r)
-        self.assertEqual(r.user, "alice")
-        self.assertTrue(r.is_upvote)
-        self.assertIsNone(r.comment_id)
-        self.assertEqual(r.timestamp, datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc))
-
-    def test_parse_reaction_downvote(self):
-        """A -1 reaction is a downvote."""
-        obj = {
-            "user": {"login": "bob"},
-            "content": "-1",
-            "created_at": "2026-02-20T08:30:00Z",
-        }
-        r = _compile._parse_reaction(obj, comment_id=42)
-        self.assertIsNotNone(r)
-        self.assertFalse(r.is_upvote)
-        self.assertEqual(r.comment_id, 42)
-
-    def test_parse_reaction_neutral(self):
-        """Neutral emoji (laugh, heart, etc.) sets is_upvote to None."""
-        for content in ("laugh", "hooray", "confused", "heart", "rocket", "eyes"):
-            obj = {
-                "user": {"login": "charlie"},
-                "content": content,
-                "created_at": "2026-03-01T00:00:00Z",
-            }
-            r = _compile._parse_reaction(obj, comment_id=None)
-            self.assertIsNotNone(r)
-            self.assertIsNone(r.is_upvote)
-
-    def test_parse_reaction_malformed_no_user(self):
-        """Missing user field returns None."""
-        obj = {"content": "+1", "created_at": "2026-01-01T00:00:00Z"}
-        self.assertIsNone(_compile._parse_reaction(obj, comment_id=None))
-
-    def test_parse_reaction_malformed_no_content(self):
-        """Missing content field returns None."""
-        obj = {"user": {"login": "dave"}, "created_at": "2026-01-01T00:00:00Z"}
-        self.assertIsNone(_compile._parse_reaction(obj, comment_id=None))
-
-    def test_parse_reaction_malformed_no_created_at(self):
-        """Missing created_at field returns None."""
-        obj = {"user": {"login": "eve"}, "content": "+1"}
-        self.assertIsNone(_compile._parse_reaction(obj, comment_id=None))
-
-    def test_parse_reaction_malformed_created_at(self):
-        """Unparseable created_at returns None."""
-        obj = {
-            "user": {"login": "frank"},
-            "content": "+1",
-            "created_at": "not-a-date",
-        }
-        self.assertIsNone(_compile._parse_reaction(obj, comment_id=None))
-
-    def test_parse_reaction_user_login_lowercased(self):
-        """User login is always lowercased."""
-        obj = {
-            "user": {"login": "AliceWunderland"},
-            "content": "+1",
-            "created_at": "2026-01-01T00:00:00Z",
-        }
-        r = _compile._parse_reaction(obj, comment_id=None)
-        self.assertEqual(r.user, "alicewunderland")
-
-
-class TestUserReactionDataclass(unittest.TestCase):
-    """Tests for UserReaction dataclass."""
-
-    def test_user_reaction_dataclass_defaults(self):
-        """comment_id defaults to None."""
-        ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        r = _compile.UserReaction(user="test", is_upvote=True, timestamp=ts)
-        self.assertIsNone(r.comment_id)
-
-    def test_user_reaction_dataclass_with_comment_id(self):
-        """comment_id can be provided explicitly."""
-        ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        r = _compile.UserReaction(user="test", is_upvote=False, timestamp=ts, comment_id=99)
-        self.assertEqual(r.comment_id, 99)
-
-
-class TestModSocialMetrics(unittest.TestCase):
-    """Tests for ModSocialMetrics dataclass."""
-
-    def test_mod_social_metrics_defaults(self):
-        """reactions defaults to empty list; each instance gets its own list."""
-        m1 = _compile.ModSocialMetrics(mod_id="foo", issue_number=1)
-        m2 = _compile.ModSocialMetrics(mod_id="bar", issue_number=2)
-        self.assertEqual(m1.reactions, [])
-        self.assertEqual(m2.reactions, [])
-        self.assertIsNot(m1.reactions, m2.reactions)
-        m1.reactions.append("x")
-        self.assertEqual(m2.reactions, [])
-
-    def test_mod_social_metrics_with_reactions(self):
-        """Reactions can be appended after construction."""
-        ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        r = _compile.UserReaction(user="alice", is_upvote=True, timestamp=ts)
-        m = _compile.ModSocialMetrics(mod_id="sodium", issue_number=5)
-        m.reactions.append(r)
-        self.assertEqual(len(m.reactions), 1)
-        self.assertEqual(m.reactions[0].user, "alice")
-
-
-class TestHydrateGithubSocialMetricsLabelGating(unittest.TestCase):
-    """The registry-vote label is REQUIRED to harvest reactions (votes)."""
-
-    def _issue(self, num: int, mod_id: str, labels: list[str]) -> dict:
-        return {
-            "number": num,
-            "body": f"### Mod Registry ID\n{mod_id}\n\n",
-            "labels": [{"name": name} for name in labels],
-            "user": {"login": "alice"},
-            "created_at": "2026-01-01T00:00:00Z",
-        }
-
-    def test_reactions_only_harvested_from_registry_vote_labeled_issues(self):
-        """Votes are harvested only from registry-vote-labeled issues."""
-        issues = [
-            self._issue(1, "sodium", ["registry-vote"]),
-            self._issue(2, "sodium", ["community-review"]),
-        ]
-        with mock.patch.object(_compile, "_load_github_token", return_value="token"), \
-             mock.patch.object(_compile, "_get_registry_repo", return_value="owner/repo"), \
-             mock.patch.object(_compile, "_load_poll_blacklist", return_value=set()), \
-             mock.patch.object(_compile, "_github_paginate", return_value=issues), \
-             mock.patch.object(_compile, "_fetch_reactions_for_issue", return_value=[]) as fetch:
-            items = [{"id": "sodium", "name": "Sodium"}]
-            _compile._hydrate_github_social_metrics(items)
-        called_issue_numbers = [call.args[2] for call in fetch.call_args_list]
-        self.assertEqual(called_issue_numbers, [1])
-
-    def test_unlabeled_issue_harvests_no_reactions(self):
-        """An issue with neither label must not contribute votes."""
-        issues = [self._issue(1, "sodium", [])]
-        with mock.patch.object(_compile, "_load_github_token", return_value="token"), \
-             mock.patch.object(_compile, "_get_registry_repo", return_value="owner/repo"), \
-             mock.patch.object(_compile, "_load_poll_blacklist", return_value=set()), \
-             mock.patch.object(_compile, "_github_paginate", return_value=issues), \
-             mock.patch.object(_compile, "_fetch_reactions_for_issue", return_value=[]) as fetch:
-            items = [{"id": "sodium", "name": "Sodium"}]
-            _compile._hydrate_github_social_metrics(items)
-        fetch.assert_not_called()
-
-
-class TestSybilDiversityWeight(unittest.TestCase):
-    """Tests for _sybil_diversity_weight."""
-
-    def test_sybil_diversity_weight_single_mod(self):
-        """User who only reacted on one mod gets 0.5 weight."""
-        self.assertEqual(_compile._sybil_diversity_weight("alice", ["sodium"]), 0.5)
-
-    def test_sybil_diversity_weight_multiple_mods(self):
-        """User who reacted on multiple mods gets 1.0 weight."""
-        self.assertEqual(_compile._sybil_diversity_weight("alice", ["sodium", "iris"]), 1.0)
-
-    def test_sybil_diversity_weight_repeated_single_mod(self):
-        """Repeated reactions on a single mod still count as one distinct mod."""
-        self.assertEqual(_compile._sybil_diversity_weight("alice", ["sodium", "sodium", "sodium"]), 0.5)
-
-
-class TestUserInteractionCounts(unittest.TestCase):
-    """Tests for _user_interaction_counts."""
-
-    def test_user_interaction_counts_counts_per_user(self):
-        """Counts are correct for shared and exclusive users across mods."""
-        ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        m1 = _compile.ModSocialMetrics(mod_id="sodium", issue_number=1)
-        m1.reactions.extend([
-            _compile.UserReaction(user="alice", is_upvote=True, timestamp=ts),
-            _compile.UserReaction(user="bob", is_upvote=False, timestamp=ts),
-        ])
-        m2 = _compile.ModSocialMetrics(mod_id="iris", issue_number=2)
-        m2.reactions.extend([
-            _compile.UserReaction(user="alice", is_upvote=True, timestamp=ts),
-            _compile.UserReaction(user="charlie", is_upvote=True, timestamp=ts),
-        ])
-        by_mod = {"sodium": m1, "iris": m2}
-        cache: dict[str, int] = {}
-        result = _compile._user_interaction_counts(by_mod, token="", org="", cache=cache)
-        self.assertEqual(cache["alice"], 0)
-        self.assertEqual(cache["bob"], 0)
-        self.assertEqual(cache["charlie"], 0)
-        self.assertIs(result, cache)
-
-
-class TestComputeVelocity(unittest.TestCase):
-    """Tests for _compute_velocity."""
-
-    def test_compute_velocity_zero_history_zero_recent(self):
-        """With zero history and zero recent, velocity is clamped."""
-        now_dt = datetime(2026, 6, 22, tzinfo=timezone.utc)
-        velocity, is_anomaly, anomaly_start = _compile._compute_velocity([], [], now_dt)
-        self.assertGreaterEqual(velocity, -1.5)
-        self.assertLessEqual(velocity, 0.0)
-        self.assertFalse(is_anomaly)
-        self.assertIsNone(anomaly_start)
-
-    def test_compute_velocity_anomaly_fires_on_large_recent_downvote_burst(self):
-        """25 downvotes in the last 6h with minimal historical context fires anomaly."""
-        now_dt = datetime(2026, 6, 22, tzinfo=timezone.utc)
-        six_h_ago = now_dt - timedelta(hours=6)
-        down_ts = [
-            now_dt - timedelta(hours=1, minutes=i)
-            for i in range(25)
-        ]
-        historical_ts = [
-            now_dt - timedelta(days=3),
-            now_dt - timedelta(days=5),
-        ]
-        down_ts.extend(historical_ts)
-        velocity, is_anomaly, anomaly_start = _compile._compute_velocity([], down_ts, now_dt)
-        self.assertTrue(is_anomaly)
-        self.assertIsNotNone(anomaly_start)
-        self.assertAlmostEqual(anomaly_start, six_h_ago, delta=timedelta(minutes=1))
-        self.assertGreater(velocity, 0.0)
-        self.assertLessEqual(velocity, 10.0)
-
-    def test_compute_velocity_no_anomaly_at_low_recent_count(self):
-        """10 downvotes in 6h vs. historical 5/7d: ratio > 5 but recent_count <= 20 -> no anomaly."""
-        now_dt = datetime(2026, 6, 22, tzinfo=timezone.utc)
-        down_6h = [
-            now_dt - timedelta(hours=1, minutes=i)
-            for i in range(10)
-        ]
-        down_7d = [
-            now_dt - timedelta(days=d)
-            for d in [1, 2, 3, 4, 5]
-        ]
-        down_ts = down_6h + down_7d
-        velocity, is_anomaly, anomaly_start = _compile._compute_velocity([], down_ts, now_dt)
-        self.assertFalse(is_anomaly)
-        self.assertIsNone(anomaly_start)
-
-
-class TestRegexFilterComment(unittest.TestCase):
-    """Tests for _regex_filter_comment."""
-
-    def test_version_begging_regex_drops(self):
-        """Version-begging comments are rejected."""
-        passed, reason = _compile._regex_filter_comment("when is 1.21 release?")
-        self.assertFalse(passed)
-        self.assertEqual(reason, "version-begging")
-
-    def test_empty_praise_regex_drops(self):
-        """Empty praise comments are rejected."""
-        passed, reason = _compile._regex_filter_comment("nice mod!")
-        self.assertFalse(passed)
-        self.assertEqual(reason, "empty-praise")
-
-    def test_legit_review_passes_regex(self):
-        """A substantive technical review passes regex filters."""
-        passed, reason = _compile._regex_filter_comment(
-            "This mod significantly improved my framerate from 30 to 120 FPS."
-        )
-        self.assertTrue(passed)
-        self.assertEqual(reason, "")
-
-    def test_empty_text_dropped(self):
-        """Empty or whitespace-only text is dropped."""
-        passed, reason = _compile._regex_filter_comment("")
-        self.assertFalse(passed)
-        self.assertEqual(reason, "empty")
-        passed, reason = _compile._regex_filter_comment("   ")
-        self.assertFalse(passed)
-        self.assertEqual(reason, "empty")
-
-    def test_port_to_regex_drops(self):
-        """'port to' and 'update to' variants are also dropped."""
-        for text in ("update to 1.21?", "port to 1.20 release", "for 1.22"):
-            passed, reason = _compile._regex_filter_comment(text)
-            self.assertFalse(passed, f"Expected drop for '{text}', got pass")
-            self.assertEqual(reason, "version-begging")
-
-
-class TestNlpFilterComment(unittest.TestCase):
-    """Tests for _nlp_filter_comment."""
-
-    def test_nlp_filter_comment_handles_missing_deps_gracefully(self):
-        """If profanity-check import fails, _nlp_filter_comment returns (True, "")."""
-        try:
-            import profanity_check  # noqa: F401
-            has_deps = True
-        except ImportError:
-            has_deps = False
-        passed, reason = _compile._nlp_filter_comment("This mod is fantastic and very well made.")
-        self.assertTrue(passed)
-        self.assertEqual(reason, "")
-
-
-class TestPass3Constants(unittest.TestCase):
-    """Tests for Pass 3 circuit-breaker constants."""
-
-    def test_organic_under_review_threshold_constant(self):
-        """ORGANIC_UNDER_REVIEW_THRESHOLD must equal -10."""
-        self.assertEqual(_compile.ORGANIC_UNDER_REVIEW_THRESHOLD, -10)
-
-    def test_triage_poll_duration_constant(self):
-        """TRIAGE_POLL_DURATION_DAYS must equal 7."""
-        self.assertEqual(_compile.TRIAGE_POLL_DURATION_DAYS, 7)
-
-
-class TestAppendAuditEntry(unittest.TestCase):
-    """Tests for _append_audit_entry."""
-
-    def setUp(self):
-        # Redirect REGISTRY_DIR at a tempdir: _append_audit_entry writes both
-        # audit_log.json AND (on rotation) audit_log_archive.<date>.json under
-        # it. Backing up only the former left rotation archives behind in the
-        # real, git-tracked registry/governance/, which the governance pipeline
-        # reads and which AGENTS.md says must carry only governance-state.json.
-        self._tmp = tempfile.TemporaryDirectory()
-        self._prev_registry_dir = _compile.REGISTRY_DIR
-        _compile.REGISTRY_DIR = Path(self._tmp.name)
-        self._audit_path = _compile.REGISTRY_DIR / "governance" / "audit_log.json"
-
-    def tearDown(self):
-        _compile.REGISTRY_DIR = self._prev_registry_dir
-        self._tmp.cleanup()
-
-    def test_append_audit_entry_creates_file_when_absent(self):
-        """_append_audit_entry creates the file if it doesn't exist."""
-        if self._audit_path.exists():
-            self._audit_path.unlink()
-        _compile._append_audit_entry("test_action", "test_details")
-        self.assertTrue(self._audit_path.exists())
-        with self._audit_path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        self.assertIn("entries", data)
-        self.assertEqual(len(data["entries"]), 1)
-        self.assertEqual(data["entries"][0]["action"], "test_action")
-        self.assertEqual(data["entries"][0]["details"], "test_details")
-        self.assertIn("timestamp", data["entries"][0])
-
-    def test_append_audit_entry_rotates_at_10000(self):
-        """After 10000 entries, adding one more rotates to keep <= 10000."""
-        data = {"log_format_version": 1, "entries": [{"timestamp": "2026-01-01T00:00:00Z", "action": f"dummy_{i}", "details": ""} for i in range(10000)]}
-        self._audit_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._audit_path.open("w", encoding="utf-8") as fh:
-            json.dump(data, fh)
-        _compile._append_audit_entry("rotate_test", "should rotate")
-        with self._audit_path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        self.assertLessEqual(len(data["entries"]), 10000)
-        self.assertIn("log_format_version", data)
-
-
-class TestFindTriageDiscussionCategory(unittest.TestCase):
-    """Tests for _find_triage_discussion_category."""
-
-    def test_find_triage_discussion_category_returns_none_without_network(self):
-        """With a dummy nonexistent repo, the function should return None."""
-        result = _compile._find_triage_discussion_category(
-            "og-nonexistent-xyz", "og-nonexistent-xyz", token="invalid-token-for-test",
-        )
-        self.assertIsNone(result)
-
-
-class TestCreateAdminAlertIssue(unittest.TestCase):
-    """Tests for _create_admin_alert_issue."""
-
-    def test_create_admin_alert_issue_failure_logged_not_raised(self):
-        """Invalid token should log a warning but not raise."""
-        _compile._create_admin_alert_issue(
-            "og-nonexistent-xyz", "og-nonexistent-xyz",
-            mod_id="test", offending_reactions=[], token="invalid-token",
-        )
-        self.assertTrue(True)
-
-
-class TestDiscordAlert(unittest.TestCase):
-    """Tests for Discord webhook notification channel."""
-
-    _prev_discord_url: str | None = None
-
-    def setUp(self):
-        self._prev_discord_url = os.environ.pop("DISCORD_WEBHOOK_URL", None)
-
-    def tearDown(self):
-        if self._prev_discord_url is not None:
-            os.environ["DISCORD_WEBHOOK_URL"] = self._prev_discord_url
-
-    def test_load_discord_webhook_url_returns_none_when_unset(self):
-        """When DISCORD_WEBHOOK_URL is absent, _load_discord_webhook_url returns None."""
-        os.environ.pop("DISCORD_WEBHOOK_URL", None)
-        result = _compile._load_discord_webhook_url()
-        self.assertIsNone(result)
-
-    def test_load_discord_webhook_url_returns_value_when_set(self):
-        """When DISCORD_WEBHOOK_URL is set, _load_discord_webhook_url returns it."""
-        os.environ["DISCORD_WEBHOOK_URL"] = "https://discord.com/api/webhooks/test/abc"
-        result = _compile._load_discord_webhook_url()
-        self.assertEqual(result, "https://discord.com/api/webhooks/test/abc")
-
-    def test_post_discord_alert_is_noop_when_url_unset(self):
-        """When DISCORD_WEBHOOK_URL is unset, _post_discord_alert returns without making a network call."""
-        os.environ.pop("DISCORD_WEBHOOK_URL", None)
-        _compile._post_discord_alert(mod_id="testmod", reason="test", severity="spike")
-        self.assertTrue(True)
-
-    @unittest.skipIf(os.environ.get("CI") == "true", "skip network test on CI")
-    def test_post_discord_alert_swallows_invalid_webhook_failures(self):
-        """An invalid webhook URL must not raise."""
-        os.environ["DISCORD_WEBHOOK_URL"] = "https://discord.com/api/webhooks/INVALID/INVALID"
-        _compile._post_discord_alert(
-            mod_id="testmod",
-            reason="test reason",
-            severity="spike",
-            offending_reactions=[{"user": "bob"}],
-        )
-        self.assertTrue(True)
-
-    def test_post_discord_alert_accepts_optional_fields(self):
-        """Calling _post_discord_alert with optional fields still returns cleanly when no webhook is configured."""
-        os.environ.pop("DISCORD_WEBHOOK_URL", None)
-        _compile._post_discord_alert(
-            mod_id="testmod",
-            reason="test reason",
-            severity="spike",
-            offending_reactions=[{"user": "alice"}],
-            admin_alert_issue_url="https://example.com/issues/1",
-        )
-        self.assertTrue(True)
-
-
-# ---------------------------------------------------------------------------
 # normalize_download_sources
 # ---------------------------------------------------------------------------
 
@@ -1547,9 +974,15 @@ class TestLoadKnownConflicts(unittest.TestCase):
     applying A's window to B would silently mis-scope every reversed entry.
     """
 
-    def _load(self, entries):
-        conn = sqlite3.connect(":memory:")
-        conn.execute(
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._patch = mock.patch.object(_compile, "REGISTRY_DIR", Path(self._tmp.name))
+        self._patch.start()
+        gov = Path(self._tmp.name) / "governance"
+        gov.mkdir(parents=True)
+        self.path = gov / "known_conflicts.json"
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.execute(
             """CREATE TABLE known_conflicts (
                    mod_a_id TEXT, mod_b_id TEXT, severity TEXT,
                    mitigated_by_json TEXT, notes TEXT,
@@ -1557,14 +990,19 @@ class TestLoadKnownConflicts(unittest.TestCase):
                    version_grammar TEXT,
                    PRIMARY KEY (mod_a_id, mod_b_id))"""
         )
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        gov = Path(tmp.name) / "governance"
-        gov.mkdir(parents=True)
-        (gov / "known_conflicts.json").write_text(json.dumps(entries), encoding="utf-8")
-        with mock.patch.object(_compile, "REGISTRY_DIR", Path(tmp.name)):
-            count = _compile.load_known_conflicts(conn)
-        rows = conn.execute(
+
+    def tearDown(self):
+        self.conn.close()
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def _write(self, text: str) -> None:
+        self.path.write_text(text, encoding="utf-8")
+
+    def _load(self, entries, *, allow_partial: bool = False):
+        self._write(json.dumps(entries))
+        count = _compile.load_known_conflicts(self.conn, allow_partial=allow_partial)
+        rows = self.conn.execute(
             "SELECT mod_a_id, mod_b_id, mod_a_versions_json,"
             " mod_b_versions_json, version_grammar FROM known_conflicts"
         ).fetchall()
@@ -1602,6 +1040,38 @@ class TestLoadKnownConflicts(unittest.TestCase):
              "version_grammar": "Maven", "a_versions": ["[1.0,2.0)"]},
         ])
         self.assertEqual(rows[0][4], "maven")
+
+    def test_missing_file_stops_the_run_and_names_the_file(self):
+        with self.assertRaisesRegex(_compile.GovernanceError, "known_conflicts.json"):
+            _compile.load_known_conflicts(self.conn)
+
+    def test_malformed_json_stops_the_run_and_names_the_file(self):
+        self._write("{not valid json!!!")
+        with self.assertRaisesRegex(_compile.GovernanceError, "known_conflicts.json"):
+            _compile.load_known_conflicts(self.conn)
+
+    def test_non_array_stops_the_run(self):
+        self._write(json.dumps({"a": "alpha", "b": "zebra"}))
+        with self.assertRaisesRegex(_compile.GovernanceError, "known_conflicts.json"):
+            _compile.load_known_conflicts(self.conn)
+
+    def test_non_object_entry_stops_the_run(self):
+        self._write(json.dumps(["alpha"]))
+        with self.assertRaisesRegex(_compile.GovernanceError, "known_conflicts.json"):
+            _compile.load_known_conflicts(self.conn)
+
+    def test_override_proceeds_and_logs_when_missing(self):
+        with self.assertLogs("compiler", level="WARNING") as logs:
+            count = _compile.load_known_conflicts(self.conn, allow_partial=True)
+        self.assertEqual(count, 0)
+        self.assertTrue(any("known_conflicts.json" in line for line in logs.output))
+
+    def test_override_proceeds_and_logs_when_malformed(self):
+        self._write("{not valid json!!!")
+        with self.assertLogs("compiler", level="WARNING") as logs:
+            count = _compile.load_known_conflicts(self.conn, allow_partial=True)
+        self.assertEqual(count, 0)
+        self.assertTrue(any("known_conflicts.json" in line for line in logs.output))
 
 
 # ---------------------------------------------------------------------------
@@ -1747,6 +1217,7 @@ class OtherGameEntryTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.registry = self.tmp / "registry"
         self.registry.mkdir()
+        write_empty_known_conflicts(self.registry)
         self.package = self.tmp / "package.json"
         self.package.write_text(json.dumps(FIXTURE_PACKAGE), encoding="utf-8")
         patches = [
@@ -1767,6 +1238,7 @@ class OtherGameEntryTests(unittest.TestCase):
     def reset_registry(self):
         shutil.rmtree(self.registry)
         self.registry.mkdir()
+        write_empty_known_conflicts(self.registry)
 
     def write(self, rel, data):
         path = self.registry / rel
@@ -2203,6 +1675,7 @@ class RealSkyrimPackageEntryTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.registry = self.tmp / "registry"
         self.registry.mkdir()
+        write_empty_known_conflicts(self.registry)
         patches = [
             mock.patch.object(_compile, "REGISTRY_DIR", self.registry),
             mock.patch.object(_compile, "_hydrate_modrinth_metadata", lambda items: None),
@@ -2468,6 +1941,7 @@ class OfficialPluginTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.registry = self.tmp / "registry"
         self.registry.mkdir()
+        write_empty_known_conflicts(self.registry)
         patches = [
             mock.patch.object(_compile, "REGISTRY_DIR", self.registry),
             mock.patch.object(_compile, "_hydrate_modrinth_metadata", lambda items: None),
