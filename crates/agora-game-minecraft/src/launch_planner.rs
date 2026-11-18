@@ -93,7 +93,7 @@ impl LaunchHttpClients {
     }
 
     fn build_client(category: NetworkCategory) -> LauncherResult<reqwest::Client> {
-        reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 // Enforce redirect depth limit (previous() includes the
                 // original URL plus each followed redirect).
@@ -110,7 +110,8 @@ impl LaunchHttpClients {
                     attempt.stop()
                 }
             }))
-            .user_agent("AgoraPlanner/1.0")
+            .user_agent("AgoraPlanner/1.0");
+        agora_core::http_client::apply_proxy(builder)?
             .build()
             .map_err(|e| LauncherError::Generic {
                 code: "ERR_NETWORK".into(),

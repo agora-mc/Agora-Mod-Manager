@@ -43,19 +43,44 @@ impl SettingsService {
         })
     }
 
-    /// Get a setting value by key. Returns `Ok(None)` when the key does not
-    /// exist.
+    /// Get a setting value by key, through the typed registry when the key is
+    /// declared there. A declared switch that holds a value Agora cannot use
+    /// reads as its fail direction rather than as a different answer from the
+    /// one the network gate reached. Returns `Ok(None)` for an undeclared key
+    /// that does not exist.
     pub fn get(&self, key: &str) -> LauncherResult<Option<serde_json::Value>> {
         let conn = self.connection()?;
+        if crate::settings_registry::is_registered(key) {
+            return crate::settings_registry::read(&conn, key);
+        }
         get(&conn, key).map_err(|error| LauncherError::Generic {
             code: "ERR_LOCAL_STATE_FAILED".into(),
             message: error.to_string(),
         })
     }
 
-    /// Set a setting value by key. Serializes `value` to JSON text and
-    /// upserts it into `local_state.db`.
+    /// Set a setting value by key. The key must be declared in the registry and
+    /// the value must match its type; undeclared keys and wrong types are
+    /// refused with the reason and nothing is stored. Use
+    /// [`set_registered`](Self::set_registered) when the caller wants the value
+    /// as stored (a legacy boolean `0` becomes `false`).
     pub fn set(&self, key: &str, value: &serde_json::Value) -> LauncherResult<()> {
+        self.set_registered(key, value).map(|_| ())
+    }
+
+    /// Set a declared setting, refusing an undeclared key or a value of the
+    /// wrong type. Returns the value as stored.
+    pub fn set_registered(
+        &self,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> LauncherResult<serde_json::Value> {
+        let stored = crate::settings_registry::validate(key, value)?;
+        self.store(key, &stored)?;
+        Ok(stored)
+    }
+
+    fn store(&self, key: &str, value: &serde_json::Value) -> LauncherResult<()> {
         let conn = self.connection()?;
         let text = serde_json::to_string(value).map_err(|error| LauncherError::Generic {
             code: "ERR_LOCAL_STATE_FAILED".into(),

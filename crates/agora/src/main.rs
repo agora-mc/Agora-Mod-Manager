@@ -1575,7 +1575,7 @@ enum SettingsCmd {
     List,
     /// Get a single setting by key.
     Get { key: String },
-    /// Set a setting (value is parsed as JSON; falls back to string).
+    /// Set a declared setting (JSON value, checked against its type).
     Set { key: String, value: String },
 }
 
@@ -5522,14 +5522,14 @@ async fn run_settings_command(
             let parsed: serde_json::Value =
                 serde_json::from_str(&value).unwrap_or(serde_json::Value::String(value.clone()));
             let svc = SettingsService::new(ctx.clone());
-            svc.set(&key, &parsed)?;
+            let stored = svc.set_registered(&key, &parsed)?;
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({"status": "set", "key": key, "value": parsed})
+                    serde_json::json!({"status": "set", "key": key, "value": stored})
                 );
             } else {
-                println!("Set {} = {}", key, parsed);
+                println!("Set {} = {}", key, stored);
             }
         }
     }

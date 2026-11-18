@@ -1915,6 +1915,9 @@ pub async fn get_setting(
 }
 
 /// Upsert a JSON-encoded setting into `local_state.db`.
+///
+/// The key must be declared in core's typed registry. An undeclared key is a
+/// bug in the UI, not permission to create a setting nothing will read.
 #[tauri::command]
 pub async fn set_setting(
     app: tauri::AppHandle,
@@ -1924,11 +1927,64 @@ pub async fn set_setting(
 ) -> LauncherResult<()> {
     tokio::task::spawn_blocking(move || {
         let ctx = crate::core_context(&app)?;
-        let svc = agora_core::settings::SettingsService::new(ctx);
-        svc.set(&key, &value)
+        write_setting(&ctx, &key, &value)
     })
     .await
     .map_err(|_| LauncherError::LocalStateFailed)?
+}
+
+/// The body of the `set_setting` command, kept separate so the refusal is
+/// testable without a Tauri runtime.
+fn write_setting(
+    ctx: &agora_core::ctx::Ctx,
+    key: &str,
+    value: &serde_json::Value,
+) -> LauncherResult<()> {
+    agora_core::settings::SettingsService::new(ctx.clone())
+        .set_registered(key, value)
+        .map(|_| ())
+}
+
+#[cfg(test)]
+mod setting_command_tests {
+    use super::write_setting;
+    use agora_core::ctx::Ctx;
+
+    fn test_ctx() -> (Ctx, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "agora-desktop-setting-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let ctx = Ctx::for_testing(root.clone());
+        agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+        (ctx, root)
+    }
+
+    #[test]
+    fn the_desktop_command_refuses_an_undeclared_key_and_names_it() {
+        let (ctx, root) = test_ctx();
+        let error = write_setting(&ctx, "agora_never_declared", &serde_json::json!(true))
+            .expect_err("an undeclared key must be refused");
+        assert_eq!(error.code(), "ERR_SETTING_UNKNOWN");
+        assert!(
+            error.to_string().contains("agora_never_declared"),
+            "the refusal must name the key: {error}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_desktop_command_stores_a_declared_key() {
+        let (ctx, root) = test_ctx();
+        write_setting(&ctx, "allow_unverified_packs", &serde_json::json!(true))
+            .expect("a declared key is stored");
+        let value = agora_core::settings::SettingsService::new(ctx)
+            .get("allow_unverified_packs")
+            .unwrap();
+        assert_eq!(value, Some(serde_json::json!(true)));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 /// Check GitHub Releases for a registry.db update and download + verify it.
