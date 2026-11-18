@@ -1421,6 +1421,38 @@ fn launch_with_fake_policy(
     )
 }
 
+/// Wait for the fake game, then close the session ledger row the launch opened. The fake child
+/// is gone, but the ledger's owner is this test process; leaving the row open makes the shared
+/// activity answer call the instance running and refuses the next guarded change.
+fn finish_fake_session(
+    ctx: &CoreContext,
+    launched: &mut agora_core::game_instance::LaunchedInstance,
+) -> std::process::ExitStatus {
+    let status = launched.launched.child.wait().unwrap();
+    if let Some(session_id) = launched.session_id.as_deref() {
+        if let Ok(conn) = agora_core::db::local_state_connection(&ctx.paths.local_state_db()) {
+            let done = agora_core::session_ledger::SessionFinish {
+                ended_at: chrono::Utc::now().to_rfc3339(),
+                duration_ms: 0,
+                exit: agora_core::session_ledger::ExitObservation::unavailable("test launch"),
+                game_runtime_ms: Some(0),
+                normal_exit_codes: vec![0],
+                artifact: None,
+                froze: false,
+            };
+            let _ = agora_core::session_ledger::finish(&conn, session_id, &done);
+        }
+    }
+    status
+}
+
+fn close_fake_session(
+    ctx: &CoreContext,
+    launched: &mut agora_core::game_instance::LaunchedInstance,
+) {
+    let _ = finish_fake_session(ctx, launched);
+}
+
 /// A launcher whose spawn fails, after making the player's file read-only so the restore that
 /// follows also fails. Nothing real runs.
 struct FailSpawn {
@@ -1537,7 +1569,7 @@ fn a_vfs_game_runs_under_the_vfs_by_default() {
     let launcher = FakeLauncher::new(Ok("C:/Agora/agora_vfs.dll".into()), None);
 
     let mut launched = launch_with_fake(&ctx, &inst.instance_id, &def, None, &launcher).unwrap();
-    let _ = launched.launched.child.wait();
+    close_fake_session(&ctx, &mut launched);
 
     assert_eq!(launcher.attempts(), vec![(Some(DeployMode::Virtual), true)]);
     assert!(launched.prepared.notice.is_none());
@@ -1612,7 +1644,7 @@ fn falling_back_steps_down_from_a_missing_dll_and_says_why() {
 
     let mut launched =
         launch_with_fake_policy(&ctx, id, &def, None, VfsFailure::FallBack, &launcher).unwrap();
-    let _ = launched.launched.child.wait();
+    close_fake_session(&ctx, &mut launched);
 
     assert_eq!(launcher.attempts(), vec![(Some(DeployMode::Links), false)]);
     assert!(launched.prepared.vfs.is_none());
@@ -1630,7 +1662,7 @@ fn falling_back_steps_down_from_a_missing_dll_and_says_why() {
     agora_core::game_deploy::set_deployment(&ctx, id, Some(DeployMode::Virtual)).unwrap();
     let mut launched =
         launch_with_fake_policy(&ctx, id, &def, None, VfsFailure::FallBack, &launcher).unwrap();
-    let _ = launched.launched.child.wait();
+    close_fake_session(&ctx, &mut launched);
     assert_eq!(launched.prepared.deployment, Some(DeployMode::Links));
     assert!(launched.prepared.deployment_chosen);
     assert!(launched.prepared.notice.is_some());
@@ -1681,7 +1713,7 @@ fn asking_reports_a_dll_that_cannot_start_and_nothing_stays_running() {
     // Answering yes is a second launch from the next rung, which runs.
     let working = FakeLauncher::new(Ok("C:/Agora/agora_vfs.dll".into()), None);
     let mut launched = launch_with_fake(&ctx, id, &def, Some(DeployMode::Links), &working).unwrap();
-    let _ = launched.launched.child.wait();
+    close_fake_session(&ctx, &mut launched);
     assert_eq!(working.attempts(), vec![(Some(DeployMode::Links), false)]);
     assert_eq!(recorded_mode(&ctx, id), DeployMode::Links);
 }
@@ -1698,7 +1730,7 @@ fn falling_back_steps_down_from_a_dll_that_cannot_start_and_says_why() {
 
     let mut launched =
         launch_with_fake_policy(&ctx, id, &def, None, VfsFailure::FallBack, &launcher).unwrap();
-    let _ = launched.launched.child.wait();
+    close_fake_session(&ctx, &mut launched);
 
     // Tried the VFS first, then started again from links.
     assert_eq!(
@@ -1727,7 +1759,7 @@ fn falling_back_steps_down_from_a_dll_that_cannot_start_and_says_why() {
     agora_core::game_deploy::set_deployment(&ctx, id, Some(DeployMode::Virtual)).unwrap();
     let mut launched =
         launch_with_fake_policy(&ctx, id, &def, None, VfsFailure::FallBack, &launcher).unwrap();
-    let _ = launched.launched.child.wait();
+    close_fake_session(&ctx, &mut launched);
     assert_eq!(launched.prepared.deployment, Some(DeployMode::Links));
     assert!(launched.prepared.notice.is_some());
 }
@@ -1753,7 +1785,7 @@ fn a_chosen_rung_is_used_and_auto_clears_the_choice() {
     // `--deployment copies` for one launch.
     let mut launched =
         launch_with_fake(&ctx, id, &def, Some(DeployMode::Copies), &launcher).unwrap();
-    let _ = launched.launched.child.wait();
+    close_fake_session(&ctx, &mut launched);
     assert_eq!(launched.prepared.deployment, Some(DeployMode::Copies));
     assert!(launched.prepared.deployment_chosen);
     assert!(launched.prepared.vfs.is_none());
@@ -1767,7 +1799,7 @@ fn a_chosen_rung_is_used_and_auto_clears_the_choice() {
     // `set-deployment links` sticks, even though the VFS is available.
     agora_core::game_deploy::set_deployment(&ctx, id, Some(DeployMode::Links)).unwrap();
     let mut launched = launch_with_fake(&ctx, id, &def, None, &launcher).unwrap();
-    let _ = launched.launched.child.wait();
+    close_fake_session(&ctx, &mut launched);
     assert_eq!(launched.prepared.deployment, Some(DeployMode::Links));
     assert!(launched.prepared.deployment_chosen);
     assert_eq!(recorded_mode(&ctx, id), DeployMode::Links);
@@ -1775,7 +1807,7 @@ fn a_chosen_rung_is_used_and_auto_clears_the_choice() {
     // A launch override beats the instance's choice.
     let mut launched =
         launch_with_fake(&ctx, id, &def, Some(DeployMode::Virtual), &launcher).unwrap();
-    let _ = launched.launched.child.wait();
+    close_fake_session(&ctx, &mut launched);
     assert_eq!(launched.prepared.deployment, Some(DeployMode::Virtual));
     assert!(launched.prepared.vfs.is_some());
 
@@ -1788,7 +1820,7 @@ fn a_chosen_rung_is_used_and_auto_clears_the_choice() {
         "an unset choice is not written: {text}"
     );
     let mut launched = launch_with_fake(&ctx, id, &def, None, &launcher).unwrap();
-    let _ = launched.launched.child.wait();
+    close_fake_session(&ctx, &mut launched);
     assert_eq!(launched.prepared.deployment, Some(DeployMode::Virtual));
     assert!(!launched.prepared.deployment_chosen);
 
@@ -1808,7 +1840,7 @@ fn a_redirect_game_defaults_to_virtual_and_asks_or_falls_back_to_links_when_dll_
     // Found DLL: deploys and launches as Virtual
     let launcher = FakeLauncher::new(Ok("C:/Agora/agora_vfs.dll".into()), None);
     let mut launched = launch_with_fake(&ctx, &inst.instance_id, &def, None, &launcher).unwrap();
-    let _ = launched.launched.child.wait();
+    close_fake_session(&ctx, &mut launched);
     assert_eq!(launcher.attempts(), vec![(Some(DeployMode::Virtual), true)]);
     assert_eq!(launched.prepared.deployment, Some(DeployMode::Virtual));
     assert!(launched.prepared.notice.is_none());
@@ -1832,7 +1864,7 @@ fn a_redirect_game_defaults_to_virtual_and_asks_or_falls_back_to_links_when_dll_
         &launcher,
     )
     .unwrap();
-    let _ = launched.launched.child.wait();
+    close_fake_session(&ctx, &mut launched);
     assert_eq!(launcher.attempts(), vec![(Some(DeployMode::Links), false)]);
     assert_eq!(launched.prepared.deployment, Some(DeployMode::Links));
     assert!(
@@ -1886,7 +1918,7 @@ fn a_vfs_game_with_no_content_still_runs_under_the_vfs_and_asks_the_same_way() {
     // On a linked base only the VFS keeps the game's writes out of the store install.
     let launcher = FakeLauncher::new(Ok("C:/Agora/agora_vfs.dll".into()), None);
     let mut launched = launch_with_fake(&ctx, id, &def, None, &launcher).unwrap();
-    let _ = launched.launched.child.wait();
+    close_fake_session(&ctx, &mut launched);
     assert!(launched.prepared.deploy_outcome.is_some());
     assert!(launched.prepared.vfs.is_some());
     assert_eq!(launched.prepared.deployment, Some(DeployMode::Virtual));
@@ -1899,7 +1931,7 @@ fn a_vfs_game_with_no_content_still_runs_under_the_vfs_and_asks_the_same_way() {
     ));
     let mut launched =
         launch_with_fake_policy(&ctx, id, &def, None, VfsFailure::FallBack, &launcher).unwrap();
-    let _ = launched.launched.child.wait();
+    close_fake_session(&ctx, &mut launched);
     assert_eq!(launched.prepared.deployment, Some(DeployMode::Links));
     assert!(launched.prepared.notice.is_some());
 
@@ -1937,7 +1969,7 @@ fn a_redirect_game_with_no_content_runs_under_the_vfs_and_asks_the_same_way() {
     let launcher = FakeLauncher::new(Ok("C:/Agora/agora_vfs.dll".into()), None);
 
     let mut launched = launch_with_fake(&ctx, id, &def, None, &launcher).unwrap();
-    let _ = launched.launched.child.wait();
+    close_fake_session(&ctx, &mut launched);
     assert!(launched.prepared.deploy_outcome.is_some());
     assert!(launched.prepared.vfs.is_some());
     assert_eq!(launched.prepared.deployment, Some(DeployMode::Virtual));
@@ -1950,7 +1982,7 @@ fn a_redirect_game_with_no_content_runs_under_the_vfs_and_asks_the_same_way() {
     ));
     let mut launched =
         launch_with_fake_policy(&ctx, id, &def, None, VfsFailure::FallBack, &launcher).unwrap();
-    let _ = launched.launched.child.wait();
+    close_fake_session(&ctx, &mut launched);
     assert_eq!(launched.prepared.deployment, Some(DeployMode::Links));
     assert!(launched.prepared.notice.is_some());
 }
@@ -2053,7 +2085,7 @@ fn real_injection_a_write_to_a_deployed_file_lands_in_the_writable_layer() {
         "{:?}",
         launched.prepared.notice
     );
-    let status = launched.launched.child.wait().unwrap();
+    let status = finish_fake_session(&ctx, &mut launched);
     assert!(status.success(), "the game exited with {status}");
 
     let object = ctx.paths.content_object_path(&sha);
@@ -2097,7 +2129,7 @@ fn real_injection_a_delete_of_a_deployed_file_leaves_a_whiteout() {
         "{:?}",
         launched.prepared.notice
     );
-    let status = launched.launched.child.wait().unwrap();
+    let status = finish_fake_session(&ctx, &mut launched);
     assert!(status.success(), "cmd exited with {status}");
 
     let object = ctx.paths.content_object_path(&sha);
@@ -2186,7 +2218,7 @@ fn real_injection_loads_the_vfs_before_the_games_own_imports() {
         "{:?}",
         launched.prepared.notice
     );
-    let status = launched.launched.child.wait().unwrap();
+    let status = finish_fake_session(&ctx, &mut launched);
     assert!(status.success(), "the fixture exited with {status}");
 
     let log = read_vfs_log(&ctx, id);
@@ -2254,7 +2286,7 @@ fn real_injection_leaves_the_games_headers_as_they_were_on_disk() {
         "{:?}",
         launched.prepared.notice
     );
-    let status = launched.launched.child.wait().unwrap();
+    let status = finish_fake_session(&ctx, &mut launched);
     let log = read_vfs_log(&ctx, id);
     println!(
         "vfs log:
@@ -2458,7 +2490,7 @@ fn real_injection_a_bad_dll_ends_the_suspended_game_and_steps_down_or_fails() {
         .as_deref()
         .unwrap()
         .starts_with("the virtual file system could not start: "));
-    let status = launched.launched.child.wait().unwrap();
+    let status = finish_fake_session(&ctx, &mut launched);
     assert!(status.success());
 }
 
