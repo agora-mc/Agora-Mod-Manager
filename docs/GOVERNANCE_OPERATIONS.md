@@ -32,8 +32,9 @@ stops with an error naming the source when:
 
 - a GitHub issues, reactions, or user-profile request fails or returns a
   non-success status;
-- `vote_issues.json`, `poll_blacklist.json`, the input governance state, or
-  `quarantine_decisions.json` is missing, unreadable, or malformed;
+- `vote_issues.json`, `poll_blacklist.json`, `known_conflicts.json`, the input
+  governance state, or `quarantine_decisions.json` is missing, unreadable, or
+  malformed;
 - the state file names a different `governance_repository` or `policy` than
   the run was configured for;
 - pagination would exceed the safety rail while GitHub is still returning full

@@ -30,6 +30,13 @@ sys.path.insert(0, os.path.dirname(__file__))
 import compile as _compile  # noqa: E402
 
 
+def write_empty_known_conflicts(registry: Path) -> None:
+    """A temp registry root still needs the committed governance catalog file."""
+    governance = registry / "governance"
+    governance.mkdir(parents=True, exist_ok=True)
+    (governance / "known_conflicts.json").write_text("[]", encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # pack identity normalization
 # ---------------------------------------------------------------------------
@@ -967,9 +974,15 @@ class TestLoadKnownConflicts(unittest.TestCase):
     applying A's window to B would silently mis-scope every reversed entry.
     """
 
-    def _load(self, entries):
-        conn = sqlite3.connect(":memory:")
-        conn.execute(
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._patch = mock.patch.object(_compile, "REGISTRY_DIR", Path(self._tmp.name))
+        self._patch.start()
+        gov = Path(self._tmp.name) / "governance"
+        gov.mkdir(parents=True)
+        self.path = gov / "known_conflicts.json"
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.execute(
             """CREATE TABLE known_conflicts (
                    mod_a_id TEXT, mod_b_id TEXT, severity TEXT,
                    mitigated_by_json TEXT, notes TEXT,
@@ -977,14 +990,19 @@ class TestLoadKnownConflicts(unittest.TestCase):
                    version_grammar TEXT,
                    PRIMARY KEY (mod_a_id, mod_b_id))"""
         )
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        gov = Path(tmp.name) / "governance"
-        gov.mkdir(parents=True)
-        (gov / "known_conflicts.json").write_text(json.dumps(entries), encoding="utf-8")
-        with mock.patch.object(_compile, "REGISTRY_DIR", Path(tmp.name)):
-            count = _compile.load_known_conflicts(conn)
-        rows = conn.execute(
+
+    def tearDown(self):
+        self.conn.close()
+        self._patch.stop()
+        self._tmp.cleanup()
+
+    def _write(self, text: str) -> None:
+        self.path.write_text(text, encoding="utf-8")
+
+    def _load(self, entries, *, allow_partial: bool = False):
+        self._write(json.dumps(entries))
+        count = _compile.load_known_conflicts(self.conn, allow_partial=allow_partial)
+        rows = self.conn.execute(
             "SELECT mod_a_id, mod_b_id, mod_a_versions_json,"
             " mod_b_versions_json, version_grammar FROM known_conflicts"
         ).fetchall()
@@ -1022,6 +1040,38 @@ class TestLoadKnownConflicts(unittest.TestCase):
              "version_grammar": "Maven", "a_versions": ["[1.0,2.0)"]},
         ])
         self.assertEqual(rows[0][4], "maven")
+
+    def test_missing_file_stops_the_run_and_names_the_file(self):
+        with self.assertRaisesRegex(_compile.GovernanceError, "known_conflicts.json"):
+            _compile.load_known_conflicts(self.conn)
+
+    def test_malformed_json_stops_the_run_and_names_the_file(self):
+        self._write("{not valid json!!!")
+        with self.assertRaisesRegex(_compile.GovernanceError, "known_conflicts.json"):
+            _compile.load_known_conflicts(self.conn)
+
+    def test_non_array_stops_the_run(self):
+        self._write(json.dumps({"a": "alpha", "b": "zebra"}))
+        with self.assertRaisesRegex(_compile.GovernanceError, "known_conflicts.json"):
+            _compile.load_known_conflicts(self.conn)
+
+    def test_non_object_entry_stops_the_run(self):
+        self._write(json.dumps(["alpha"]))
+        with self.assertRaisesRegex(_compile.GovernanceError, "known_conflicts.json"):
+            _compile.load_known_conflicts(self.conn)
+
+    def test_override_proceeds_and_logs_when_missing(self):
+        with self.assertLogs("compiler", level="WARNING") as logs:
+            count = _compile.load_known_conflicts(self.conn, allow_partial=True)
+        self.assertEqual(count, 0)
+        self.assertTrue(any("known_conflicts.json" in line for line in logs.output))
+
+    def test_override_proceeds_and_logs_when_malformed(self):
+        self._write("{not valid json!!!")
+        with self.assertLogs("compiler", level="WARNING") as logs:
+            count = _compile.load_known_conflicts(self.conn, allow_partial=True)
+        self.assertEqual(count, 0)
+        self.assertTrue(any("known_conflicts.json" in line for line in logs.output))
 
 
 # ---------------------------------------------------------------------------
@@ -1167,6 +1217,7 @@ class OtherGameEntryTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.registry = self.tmp / "registry"
         self.registry.mkdir()
+        write_empty_known_conflicts(self.registry)
         self.package = self.tmp / "package.json"
         self.package.write_text(json.dumps(FIXTURE_PACKAGE), encoding="utf-8")
         patches = [
@@ -1187,6 +1238,7 @@ class OtherGameEntryTests(unittest.TestCase):
     def reset_registry(self):
         shutil.rmtree(self.registry)
         self.registry.mkdir()
+        write_empty_known_conflicts(self.registry)
 
     def write(self, rel, data):
         path = self.registry / rel
@@ -1623,6 +1675,7 @@ class RealSkyrimPackageEntryTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.registry = self.tmp / "registry"
         self.registry.mkdir()
+        write_empty_known_conflicts(self.registry)
         patches = [
             mock.patch.object(_compile, "REGISTRY_DIR", self.registry),
             mock.patch.object(_compile, "_hydrate_modrinth_metadata", lambda items: None),
@@ -1888,6 +1941,7 @@ class OfficialPluginTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.registry = self.tmp / "registry"
         self.registry.mkdir()
+        write_empty_known_conflicts(self.registry)
         patches = [
             mock.patch.object(_compile, "REGISTRY_DIR", self.registry),
             mock.patch.object(_compile, "_hydrate_modrinth_metadata", lambda items: None),

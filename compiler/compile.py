@@ -3205,28 +3205,53 @@ def _clean_version_window(raw) -> list:
     return out
 
 
-def load_known_conflicts(conn: sqlite3.Connection) -> int:
+def load_known_conflicts(conn: sqlite3.Connection, *, allow_partial: bool = False) -> int:
     """Ingest community-curated known conflicts from known_conflicts.json.
 
-    Returns the number of rows inserted.
+    The file is committed catalog data, so a missing or malformed copy stops
+    the compile rather than shipping a catalog whose conflict warnings have
+    silently disappeared. Returns the number of rows inserted.
     """
     path = REGISTRY_DIR / "governance" / "known_conflicts.json"
     try:
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Could not load known_conflicts.json (%s); skipping.", exc)
+        message = f"cannot read known conflicts {path}: {exc}"
+        if not allow_partial:
+            raise GovernanceError(message) from exc
+        logger.warning("%s; continuing because partial governance is allowed.", message)
         return 0
 
     if not isinstance(data, list):
-        logger.warning("known_conflicts.json is not a JSON array; skipping.")
+        message = f"malformed known conflicts {path}: expected a JSON array"
+        if not allow_partial:
+            raise GovernanceError(message)
+        logger.warning("%s; continuing because partial governance is allowed.", message)
         return 0
 
     cursor = conn.cursor()
     count = 0
-    for entry in data:
+    for index, entry in enumerate(data, 1):
+        if not isinstance(entry, dict):
+            message = (
+                f"malformed known conflicts {path}: entry {index} must be a JSON object"
+            )
+            if not allow_partial:
+                raise GovernanceError(message)
+            logger.warning("%s; continuing because partial governance is allowed.", message)
+            continue
         a = str(entry.get("a", "")).strip().lower()
         b = str(entry.get("b", "")).strip().lower()
+        if not a or not b:
+            message = (
+                f"malformed known conflicts {path}: entry {index} needs "
+                "non-empty 'a' and 'b'"
+            )
+            if not allow_partial:
+                raise GovernanceError(message)
+            logger.warning("%s; continuing because partial governance is allowed.", message)
+            continue
         severity = str(entry.get("severity", "")).strip().lower()
         mitigated_by = entry.get("mitigated_by")
         if not isinstance(mitigated_by, list):
@@ -3955,10 +3980,7 @@ def compile_registry(
     logger.info("Inserted %d crash signature(s), rejected %d", sig_count, rejected[0])
 
     # Known conflicts (mod pairs that conflict).
-    try:
-        load_known_conflicts(conn)
-    except Exception as exc:
-        logger.warning("Failed to load known conflicts: %s", exc)
+    load_known_conflicts(conn, allow_partial=allow_partial_governance)
 
     # Manual mod dependencies (from manifest ``mod_dependencies`` field).
     try:
