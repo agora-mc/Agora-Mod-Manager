@@ -14,7 +14,6 @@ use crate::game_instance::{
     self, check_id_exists, generate_instance_id_from_name, GameInstanceManifest, InstanceError,
 };
 use crate::game_saves::{self, SavesError};
-use crate::game_user_files;
 
 /// What a clone is asked to take from its source.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -163,22 +162,14 @@ pub fn clone_instance(
     let source_manifest = game_instance::get_manifest(ctx, source_id)?;
     let store = store_of(ctx, source_id)?;
 
-    let _lock = ctx
-        .lock_manager
-        .acquire(
-            crate::lock_manager::LockResource::Instance(source_id.to_string()),
-            "clone",
-        )
-        .map_err(|e| InstanceError::Other(e.to_string()))?;
-
-    // A running game is writing the files a clone would copy: wait for it to close. Judged with
-    // the lock held, because a launch that was starting when the clone was asked holds the same
-    // lock, and its game is running by the time the clone gets it.
-    if let Some(session) = game_user_files::status(ctx, &definition.id, &store)? {
-        if session.running && session.instance == source_id {
-            return Err(InstanceError::Running(source_id.to_string()));
-        }
-    }
+    // A running game is writing the files a clone would copy. The shared guard
+    // takes the instance lock and checks the one "is this game running" answer;
+    // it fails at once rather than waiting out the lock.
+    let _guard = crate::instance_runtime::InstanceGuard::for_mutation(ctx, source_id, "clone")
+        .map_err(|error| match error.code().as_str() {
+            "ERR_INSTANCE_RUNNING" => InstanceError::Running(source_id.to_string()),
+            _ => InstanceError::Other(error.to_string()),
+        })?;
 
     // The id is settled before any file is copied, so a taken name costs nothing.
     let conn = crate::db::local_state_connection(&ctx.paths.local_state_db())

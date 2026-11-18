@@ -20,15 +20,27 @@ pub enum WorldCmd {
         /// The world's folder name under saves/.
         world: String,
         name: String,
+        #[arg(
+            long,
+            help = "Change the world even while the game is running (the running game may overwrite it when it saves)"
+        )]
+        while_running: bool,
     },
     /// Copy a world next to itself.
-    Copy { instance: String, world: String },
+    Copy {
+        instance: String,
+        world: String,
+        #[arg(long, help = "Change the world even while the game is running")]
+        while_running: bool,
+    },
     /// Move a world to the system recycle bin.
     Delete {
         instance: String,
         world: String,
         #[arg(long, help = "Do not ask for confirmation")]
         yes: bool,
+        #[arg(long, help = "Change the world even while the game is running")]
+        while_running: bool,
     },
     /// Save a world as a zip archive.
     Export {
@@ -36,9 +48,16 @@ pub enum WorldCmd {
         world: String,
         #[arg(long, help = "Where to write the .zip")]
         out: PathBuf,
+        #[arg(long, help = "Read the world even while the game is running")]
+        while_running: bool,
     },
     /// Add a world from a zip archive.
-    Import { instance: String, archive: PathBuf },
+    Import {
+        instance: String,
+        archive: PathBuf,
+        #[arg(long, help = "Change the instance even while the game is running")]
+        while_running: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -56,9 +75,24 @@ pub enum ServerCmd {
         address: String,
         #[arg(long, help = "Name shown in the multiplayer list")]
         name: Option<String>,
+        #[arg(long, help = "Change the list even while the game is running")]
+        while_running: bool,
     },
     /// Remove the server at a position shown by `server list`.
-    Remove { instance: String, position: usize },
+    Remove {
+        instance: String,
+        position: usize,
+        #[arg(long, help = "Change the list even while the game is running")]
+        while_running: bool,
+    },
+}
+
+fn forge(service: &WorldService, while_running: bool) -> WorldService {
+    if while_running {
+        service.clone().while_running()
+    } else {
+        service.clone()
+    }
 }
 
 pub fn run_world_command(
@@ -104,14 +138,21 @@ pub fn run_world_command(
             instance,
             world,
             name,
+            while_running,
         } => {
+            let service = forge(&service, while_running);
             service.rename(&instance, &world, &name)?;
             done(
                 format!("Renamed '{world}' to \"{}\".", name.trim()),
                 serde_json::json!({ "world": world, "name": name.trim() }),
             )?;
         }
-        WorldCmd::Copy { instance, world } => {
+        WorldCmd::Copy {
+            instance,
+            world,
+            while_running,
+        } => {
+            let service = forge(&service, while_running);
             let folder = service.copy(&instance, &world)?;
             done(
                 format!("Copied '{world}' to '{folder}'."),
@@ -122,6 +163,7 @@ pub fn run_world_command(
             instance,
             world,
             yes,
+            while_running,
         } => {
             if !yes
                 && !crate::cli_tools::confirm(
@@ -131,7 +173,7 @@ pub fn run_world_command(
             {
                 anyhow::bail!("Cancelled.");
             }
-            service.delete(&instance, &world, trash)?;
+            forge(&service, while_running).delete(&instance, &world, trash)?;
             done(
                 format!("Moved '{world}' to the recycle bin."),
                 serde_json::json!({ "world": world, "deleted": true }),
@@ -141,14 +183,21 @@ pub fn run_world_command(
             instance,
             world,
             out,
+            while_running,
         } => {
+            let service = forge(&service, while_running);
             service.export(&instance, &world, &out)?;
             done(
                 format!("Saved '{world}' to {}.", out.display()),
                 serde_json::json!({ "world": world, "path": out }),
             )?;
         }
-        WorldCmd::Import { instance, archive } => {
+        WorldCmd::Import {
+            instance,
+            archive,
+            while_running,
+        } => {
+            let service = forge(&service, while_running);
             let folder = service.import(&instance, &archive)?;
             done(
                 format!("Imported the world as '{folder}'."),
@@ -234,21 +283,95 @@ pub async fn run_server_command(
             instance,
             address,
             name,
+            while_running,
         } => {
-            service.add_server(&instance, name.as_deref().unwrap_or(""), &address)?;
+            forge(&service, while_running).add_server(
+                &instance,
+                name.as_deref().unwrap_or(""),
+                &address,
+            )?;
             if !json {
                 println!("Added {address}.");
             }
         }
-        ServerCmd::Remove { instance, position } => {
+        ServerCmd::Remove {
+            instance,
+            position,
+            while_running,
+        } => {
             let index = position
                 .checked_sub(1)
                 .ok_or_else(|| anyhow::anyhow!("Positions start at 1."))?;
-            service.remove_server(&instance, index)?;
+            forge(&service, while_running).remove_server(&instance, index)?;
             if !json {
                 println!("Removed server {position}.");
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agora_core::ctx::Ctx;
+
+    fn ctx_with_world() -> (tempfile::TempDir, Ctx, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Ctx::for_testing(root.path().to_path_buf());
+        agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+        let world = ctx.paths.instance_dir("inst").unwrap().join("saves/Alpha");
+        std::fs::create_dir_all(&world).unwrap();
+        std::fs::write(world.join("level.dat"), b"level").unwrap();
+        (root, ctx, world)
+    }
+
+    fn trash_dir() -> agora_game_minecraft::instance_service::TrashFn {
+        std::sync::Arc::new(|path: &std::path::Path| {
+            std::fs::remove_dir_all(path).map_err(|error| {
+                agora_core::error::LauncherError::Generic {
+                    code: "ERR_TRASH".into(),
+                    message: error.to_string(),
+                }
+            })
+        })
+    }
+
+    /// The CLI world path goes through the core guard: a delegated session
+    /// blocks it, and `--while-running` is the explicit override.
+    #[test]
+    fn a_lease_blocks_the_cli_world_path_and_the_flag_overrides_it() {
+        let (_root, ctx, world) = ctx_with_world();
+        agora_core::instance_runtime::publish_starting(&ctx.paths, "inst").unwrap();
+        let trash = trash_dir();
+
+        let refused = run_world_command(
+            WorldCmd::Delete {
+                instance: "inst".into(),
+                world: "Alpha".into(),
+                yes: true,
+                while_running: false,
+            },
+            &ctx,
+            &trash,
+            OutputFormat::Human,
+        );
+        assert!(refused.is_err(), "the CLI world path ignored the lease");
+        assert!(world.join("level.dat").is_file());
+
+        run_world_command(
+            WorldCmd::Delete {
+                instance: "inst".into(),
+                world: "Alpha".into(),
+                yes: true,
+                while_running: true,
+            },
+            &ctx,
+            &trash,
+            OutputFormat::Human,
+        )
+        .unwrap();
+        assert!(!world.exists());
+        agora_core::instance_runtime::clear(&ctx.paths, "inst", None).unwrap();
+    }
 }

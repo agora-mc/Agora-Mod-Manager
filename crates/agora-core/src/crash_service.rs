@@ -7,7 +7,7 @@
 use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
 use crate::helpers::{rename_in_content_dir, set_enabled_in_all_arrays};
-use crate::lock_manager::LockResource;
+use crate::instance_runtime::InstanceGuard;
 use crate::models::InstanceManifest;
 use serde::Serialize;
 
@@ -32,10 +32,7 @@ impl CrashService {
         let sanitized = validate_instance_id(instance_id)?;
         validate_filename(filename)?;
 
-        let _guard = self
-            .ctx
-            .lock_manager
-            .acquire(LockResource::Instance(sanitized.clone()), "disable_mod")?;
+        let _guard = InstanceGuard::for_mutation(&self.ctx, &sanitized, "disable_mod")?;
 
         let mods_dir = self.ctx.paths.instance_dir(&sanitized)?.join("mods");
 
@@ -90,10 +87,7 @@ impl CrashService {
         let sanitized = validate_instance_id(instance_id)?;
         validate_filename(filename)?;
 
-        let _guard = self
-            .ctx
-            .lock_manager
-            .acquire(LockResource::Instance(sanitized.clone()), "enable_mod")?;
+        let _guard = InstanceGuard::for_mutation(&self.ctx, &sanitized, "enable_mod")?;
 
         let mods_dir = self.ctx.paths.instance_dir(&sanitized)?.join("mods");
 
@@ -137,10 +131,7 @@ impl CrashService {
     /// datapacks, saves). Returns an error if the file is not found.
     pub fn disable_artifact(&self, instance_id: &str, filename: &str) -> LauncherResult<()> {
         let sanitized = crate::paths::sanitize_id(instance_id);
-        let _guard = self.ctx.lock_manager.acquire(
-            LockResource::Instance(sanitized.clone()),
-            "disable_artifact",
-        )?;
+        let _guard = InstanceGuard::for_mutation(&self.ctx, &sanitized, "disable_artifact")?;
         let dir = self.ctx.paths.instance_dir(&sanitized)?;
 
         let renamed = rename_in_content_dir(&dir, filename, false).is_some();
@@ -178,10 +169,7 @@ impl CrashService {
     /// already enabled or not found.
     pub fn enable_artifact(&self, instance_id: &str, filename: &str) -> LauncherResult<()> {
         let sanitized = crate::paths::sanitize_id(instance_id);
-        let _guard = self
-            .ctx
-            .lock_manager
-            .acquire(LockResource::Instance(sanitized.clone()), "enable_artifact")?;
+        let _guard = InstanceGuard::for_mutation(&self.ctx, &sanitized, "enable_artifact")?;
         let dir = self.ctx.paths.instance_dir(&sanitized)?;
 
         let renamed = rename_in_content_dir(&dir, filename, true).is_some();

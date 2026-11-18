@@ -1487,6 +1487,11 @@ impl InstallPipeline {
     /// Execute a backend-owned, fully resolved plan with freshness checks,
     /// verified staging, recovery snapshot, reversible application, and a
     /// post-commit health gate.
+    ///
+    /// Test-only compatibility wrapper. Production callers own a context and go
+    /// through [`Self::execute_plan_with_scheduler`] with an
+    /// [`InstanceGuard`](agora_core::instance_runtime::InstanceGuard).
+    #[cfg(test)]
     pub async fn execute_plan(
         &self,
         plan: &ResolvedInstallPlan,
@@ -1495,7 +1500,21 @@ impl InstallPipeline {
         reporter: &dyn ProgressReporter,
         cancel: &CancellationToken,
     ) -> InstallOutcome {
+        // These tests change no instance a game could be using; the token is
+        // still required so the production entry point has one shape.
+        let root = instance_dir
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| instance_dir.to_path_buf());
+        let ctx = agora_core::ctx::Ctx::for_testing(root);
+        let guard = agora_core::instance_runtime::InstanceGuard::for_mutation_while_running(
+            &ctx,
+            &plan.intent.target_instance,
+            "test-install",
+        )
+        .unwrap();
         self.execute_plan_with_scheduler(
+            &guard,
             plan,
             instance_dir,
             current_registry_revision,
@@ -1509,8 +1528,10 @@ impl InstallPipeline {
     /// Execute a plan while routing the large synchronous phases through the
     /// shared bounded worker scheduler.  The compatibility wrapper above is
     /// retained for core-only callers and tests that do not own a context.
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute_plan_with_scheduler(
         &self,
+        guard: &agora_core::instance_runtime::InstanceGuard,
         plan: &ResolvedInstallPlan,
         instance_dir: &Path,
         current_registry_revision: &str,
@@ -1518,6 +1539,7 @@ impl InstallPipeline {
         cancel: &CancellationToken,
         resources: InstallExecutionResources<'_>,
     ) -> InstallOutcome {
+        let _ = guard;
         let scheduler = resources.scheduler;
         let registry_db_path = resources.registry_db_path;
         let loader_service = resources.loader_service;

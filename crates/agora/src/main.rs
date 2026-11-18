@@ -1366,6 +1366,11 @@ enum InstanceCmd {
             help = "Run the planned batch without asking"
         )]
         yes: bool,
+        #[arg(
+            long,
+            help = "Change the instance even while its game is running (the running game keeps the files it opened)"
+        )]
+        while_running: bool,
     },
 }
 
@@ -1639,6 +1644,11 @@ enum ModsCmd {
         abort_conflicts: bool,
         #[arg(long, help = "Resolve plan and print it without executing")]
         dry_run: bool,
+        #[arg(
+            long,
+            help = "Change the instance even while its game is running (the running game keeps the files it opened)"
+        )]
+        while_running: bool,
     },
     Remove {
         project: String,
@@ -1659,6 +1669,11 @@ enum ModsCmd {
         remove_anyway: bool,
         #[arg(long, help = "Resolve plan and print it without executing")]
         dry_run: bool,
+        #[arg(
+            long,
+            help = "Change the instance even while its game is running (the running game keeps the files it opened)"
+        )]
+        while_running: bool,
     },
     /// Search the curated registry for items matching a query.
     Search {
@@ -1701,6 +1716,11 @@ enum ModsCmd {
         abort_conflicts: bool,
         #[arg(long, help = "Resolve plan and print it without executing")]
         dry_run: bool,
+        #[arg(
+            long,
+            help = "Change the instance even while its game is running (the running game keeps the files it opened)"
+        )]
+        while_running: bool,
     },
     /// Update all installed items with a registry identity to their latest versions.
     UpdateAll {
@@ -1723,6 +1743,11 @@ enum ModsCmd {
         abort_conflicts: bool,
         #[arg(long, help = "Resolve plan and print it without executing")]
         dry_run: bool,
+        #[arg(
+            long,
+            help = "Change the instance even while its game is running (the running game keeps the files it opened)"
+        )]
+        while_running: bool,
     },
     /// Enable a previously disabled mod by renaming <file>.disabled back to <file>.
     Enable {
@@ -1973,6 +1998,11 @@ enum PackCmd {
         /// The newer .mrpack file.
         mrpack: PathBuf,
         #[arg(
+            long,
+            help = "Change the instance even while its game is running (the file the game already has open will not change on disk until it exits)"
+        )]
+        while_running: bool,
+        #[arg(
             long = "keep-ours",
             value_name = "KEY",
             help = "Keep the instance's file for this conflict (repeatable)"
@@ -2003,6 +2033,11 @@ enum LoadoutCmd {
         /// when there are any; `keep` leaves them on, `off` switches them off.
         #[arg(long = "others", value_enum)]
         others: Option<UnlistedModsArg>,
+        #[arg(
+            long,
+            help = "Apply the profile even while the game is running (the running game may overwrite its settings when it exits)"
+        )]
+        while_running: bool,
     },
     /// Save a loadout profile again so it records the instance's current setup.
     /// Shows what would change and asks first; `--yes` skips the question.
@@ -3456,6 +3491,15 @@ async fn run_plugin_command(
     Ok(())
 }
 
+fn install_service(ctx: &agora_core::ctx::Ctx, while_running: bool) -> InstallService {
+    let service = InstallService::new(ctx.clone());
+    if while_running {
+        service.while_running()
+    } else {
+        service
+    }
+}
+
 async fn run_mods_command(
     action: ModsCmd,
     data_dir: &Path,
@@ -3502,8 +3546,9 @@ async fn run_mods_command(
             replace_conflicts,
             abort_conflicts,
             dry_run,
+            while_running,
         } => {
-            let svc = InstallService::new(ctx.clone());
+            let svc = install_service(ctx, while_running);
             let requested_version = version.clone().unwrap_or_else(|| "selected".into());
             let optional_deps = resolve_optional_deps(include_optional, exclude_optional);
             let intent = agora_game_minecraft::install_pipeline::InstallIntent {
@@ -3676,8 +3721,9 @@ async fn run_mods_command(
             abort_conflicts,
             remove_anyway,
             dry_run,
+            while_running,
         } => {
-            let svc = InstallService::new(ctx.clone());
+            let svc = install_service(ctx, while_running);
             let load = svc.load_instance(&instance)?;
 
             let prepared = InstallService::prepare_removal(
@@ -3852,8 +3898,9 @@ async fn run_mods_command(
             replace_conflicts,
             abort_conflicts,
             dry_run,
+            while_running,
         } => {
-            let svc = InstallService::new(ctx.clone());
+            let svc = install_service(ctx, while_running);
             let target_version = version.clone().unwrap_or_else(|| "latest".into());
             let optional_deps = resolve_optional_deps(include_optional, exclude_optional);
             let intent = agora_game_minecraft::install_pipeline::InstallIntent {
@@ -4061,8 +4108,9 @@ async fn run_mods_command(
             replace_conflicts,
             abort_conflicts,
             dry_run,
+            while_running,
         } => {
-            let svc = InstallService::new(ctx.clone());
+            let svc = install_service(ctx, while_running);
             let load = svc.load_instance(&instance)?;
 
             let items: Vec<agora_game_minecraft::install_pipeline::BatchUpdateItem> = load
@@ -4479,7 +4527,8 @@ async fn run_instance_command(
             instance,
             apply,
             yes,
-        } => cli_updates::instance_updates(ctx, &instance, apply, yes, json).await?,
+            while_running,
+        } => cli_updates::instance_updates(ctx, &instance, apply, yes, while_running, json).await?,
     }
     Ok(())
 }
@@ -4685,9 +4734,19 @@ async fn run_pack_command(
             keep_ours,
             take_theirs,
             yes,
+            while_running,
         } => {
-            cli_updates::pack_update(ctx, &instance, &mrpack, &keep_ours, &take_theirs, yes, json)
-                .await?
+            cli_updates::pack_update(
+                ctx,
+                &instance,
+                &mrpack,
+                &keep_ours,
+                &take_theirs,
+                yes,
+                while_running,
+                json,
+            )
+            .await?
         }
     }
     Ok(())
@@ -5645,6 +5704,7 @@ async fn run_loadout_command(
             instance,
             name,
             others,
+            while_running,
         } => {
             let instance_dir = agora_core::paths::instance_dir(data_dir, &instance)?;
             if !instance_dir.exists() {
@@ -5658,14 +5718,21 @@ async fn run_loadout_command(
                     anyhow::anyhow!("The definition for game '{}' is missing", record.game)
                 })?;
                 agora_core::game_loadout::apply_game_profile_with_undo(
-                    ctx, &instance, definition, &name,
+                    ctx,
+                    &instance,
+                    definition,
+                    &name,
+                    while_running,
                 )
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             } else {
                 // Same core service the desktop uses: the lock, the running-game
                 // check and the undo point are not things a second front end skips.
-                let service =
+                let mut service =
                     agora_game_minecraft::loadout_service::LoadoutService::new(ctx.clone());
+                if while_running {
+                    service = service.while_running();
+                }
                 let unlisted = service.unlisted_mods(&instance, &name)?;
                 let choice = match (others, unlisted.is_empty()) {
                     (Some(choice), _) => choice.into(),
@@ -15788,6 +15855,7 @@ mod tests {
         fs::create_dir_all(&tmp).expect("create tmp");
 
         let ctx = CoreContext::for_testing(tmp.clone());
+        agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).expect("init db");
         let instance_dir = ctx.paths.instance_dir("test-instance").unwrap();
         fs::create_dir_all(instance_dir.join("mods")).expect("create mods dir");
         let mod_path = instance_dir.join("mods").join("test-mod.jar");

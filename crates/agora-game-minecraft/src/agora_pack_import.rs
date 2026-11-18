@@ -2224,7 +2224,11 @@ mod tests {
         sha512: Option<&str>,
         accept: bool,
     ) -> LauncherResult<InstalledMod> {
+        let guard =
+            agora_core::instance_runtime::InstanceGuard::for_mutation(ctx, "inst", "test-commit")
+                .unwrap();
         crate::install_service::InstallService::new(ctx.clone()).commit_verified_artifact(
+            &guard,
             "inst",
             "m.jar",
             "mod",
@@ -2809,7 +2813,11 @@ mod tests {
         pinned: &str,
         accept: bool,
     ) -> LauncherResult<InstalledMod> {
+        let guard =
+            agora_core::instance_runtime::InstanceGuard::for_mutation(ctx, "inst", "test-commit")
+                .unwrap();
         crate::install_service::InstallService::new(ctx.clone()).commit_verified_artifact(
+            &guard,
             "inst",
             "m.jar",
             "mod",
@@ -2856,8 +2864,12 @@ mod tests {
         let (ctx, root) = temp_ctx_with_instance();
         let bytes = b"jar bytes";
         let actual = sha256_hex(bytes);
+        let guard =
+            agora_core::instance_runtime::InstanceGuard::for_mutation(&ctx, "inst", "test-commit")
+                .unwrap();
         let stop = crate::install_service::InstallService::new(ctx.clone())
             .commit_verified_artifact(
+                &guard,
                 "inst",
                 "m.jar",
                 "mod",
@@ -2890,6 +2902,7 @@ mod tests {
         // A pin that is met is not listed as something to override.
         let one_met = crate::install_service::InstallService::new(ctx.clone())
             .commit_verified_artifact(
+                &guard,
                 "inst",
                 "m.jar",
                 "mod",

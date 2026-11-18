@@ -539,10 +539,8 @@ pub fn sync_instance_datapacks(
 /// the game is running (its worlds hold the data pack files open).
 pub fn sync_instance(ctx: &Ctx, instance_id: &str) -> LauncherResult<DatapackSyncReport> {
     let id = agora_core::paths::sanitize_id(instance_id);
-    let _guard = ctx
-        .lock_manager
-        .acquire(LockResource::Instance(id.clone()), "sync_datapacks")?;
-    agora_core::instance_runtime::check_idle(&ctx.paths, &id)?;
+    let _guard =
+        agora_core::instance_runtime::InstanceGuard::for_mutation(ctx, &id, "sync_datapacks")?;
     let dir = ctx.paths.instance_dir(&id)?;
     let manifest = agora_core::helpers::read_manifest(&ctx.paths.instance_manifest(&id)?)?;
     Ok(sync_instance_datapacks(&dir, &manifest))
@@ -976,6 +974,7 @@ mod tests {
 
     fn service_instance(tmp: &Path) -> (agora_core::ctx::CoreContext, PathBuf) {
         let ctx = agora_core::ctx::CoreContext::for_testing(tmp.to_path_buf());
+        agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
         let dir = ctx.paths.instance_dir("inst").unwrap();
         fs::create_dir_all(dir.join("datapacks")).unwrap();
         fs::write(dir.join("datapacks").join("vm.zip"), b"pack-bytes").unwrap();

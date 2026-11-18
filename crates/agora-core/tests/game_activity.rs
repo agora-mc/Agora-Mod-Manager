@@ -177,7 +177,7 @@ fn a_loadout_apply_is_refused_by_an_open_session_with_no_journaled_files() {
     game_loadout::save_game_profile(&h.ctx, "live", "base", state).unwrap();
     h.open_view_session("live");
 
-    let error = game_loadout::apply_game_profile_with_undo(&h.ctx, "live", &def, "base")
+    let error = game_loadout::apply_game_profile_with_undo(&h.ctx, "live", &def, "base", false)
         .expect_err("an open session must refuse the apply");
     assert!(
         error.to_string().contains("running"),

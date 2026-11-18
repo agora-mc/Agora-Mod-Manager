@@ -8,16 +8,31 @@
 use crate::install_service::InstallService;
 use agora_core::ctx::Ctx;
 use agora_core::error::{LauncherError, LauncherResult};
+use agora_core::instance_runtime::InstanceGuard;
 use agora_core::loadout::{self, LoadoutApplyError, LoadoutUpdate, UnlistedMods};
 use agora_core::lock_manager::LockResource;
 
 pub struct LoadoutService {
     ctx: Ctx,
+    /// The user's explicit answer to a running game: apply the loadout anyway.
+    /// The instance lock is still taken.
+    allow_while_running: bool,
 }
 
 impl LoadoutService {
     pub fn new(ctx: Ctx) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            allow_while_running: false,
+        }
+    }
+
+    /// Allow applying a loadout while the instance's game is running. Only for
+    /// a caller that has explicitly confirmed it; the instance lock is still
+    /// taken.
+    pub fn while_running(mut self) -> Self {
+        self.allow_while_running = true;
+        self
     }
 
     /// Apply a saved profile to an instance.
@@ -37,12 +52,12 @@ impl LoadoutService {
         unlisted: UnlistedMods,
     ) -> LauncherResult<()> {
         let instance_dir = self.ctx.paths.instance_dir(instance_id)?;
-        let _guard = self.ctx.lock_manager.acquire(
-            LockResource::Instance(instance_id.to_string()),
-            "apply_loadout",
-        )?;
+        let _guard = if self.allow_while_running {
+            InstanceGuard::for_mutation_while_running(&self.ctx, instance_id, "apply_loadout")?
+        } else {
+            InstanceGuard::for_mutation(&self.ctx, instance_id, "apply_loadout")?
+        };
         InstallService::new(self.ctx.clone()).check_not_locked(instance_id)?;
-        agora_core::instance_runtime::check_idle(&self.ctx.paths, instance_id)?;
         loadout::apply_profile_with_undo(&instance_dir, profile_name, unlisted).map_err(apply_error)
     }
 

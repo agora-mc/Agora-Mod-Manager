@@ -421,17 +421,17 @@ agora instance purge <ENTRY_ID> --yes
 
 ```text
 agora world list <INSTANCE_ID>
-agora world rename <INSTANCE_ID> <WORLD_FOLDER> <NAME>
-agora world copy <INSTANCE_ID> <WORLD_FOLDER>
-agora world delete <INSTANCE_ID> <WORLD_FOLDER> [--yes]
-agora world export <INSTANCE_ID> <WORLD_FOLDER> --out <FILE.zip>
-agora world import <INSTANCE_ID> <FILE.zip>
+agora world rename <INSTANCE_ID> <WORLD_FOLDER> <NAME> [--while-running]
+agora world copy <INSTANCE_ID> <WORLD_FOLDER> [--while-running]
+agora world delete <INSTANCE_ID> <WORLD_FOLDER> [--yes] [--while-running]
+agora world export <INSTANCE_ID> <WORLD_FOLDER> --out <FILE.zip> [--while-running]
+agora world import <INSTANCE_ID> <FILE.zip> [--while-running]
 agora server list <INSTANCE_ID> [--ping]
-agora server add <INSTANCE_ID> <ADDRESS> [--name <NAME>]
-agora server remove <INSTANCE_ID> <POSITION>
+agora server add <INSTANCE_ID> <ADDRESS> [--name <NAME>] [--while-running]
+agora server remove <INSTANCE_ID> <POSITION> [--while-running]
 ```
 
-A world is named by its folder under `saves/`, which `world list` shows. `world rename` changes the name shown in game and keeps the folder, so data pack choices and `launch --world` keep pointing at it. `world delete` moves the world to the system recycle bin and asks first unless you pass `--yes`. `world import` accepts a zip holding the world at its root or inside one folder, and picks a free folder name.
+A world is named by its folder under `saves/`, which `world list` shows. `world rename` changes the name shown in game and keeps the folder, so data pack choices and `launch --world` keep pointing at it. `world delete` moves the world to the system recycle bin and asks first unless you pass `--yes`. `world import` accepts a zip holding the world at its root or inside one folder, and picks a free folder name. A world action is refused while the instance's game is running or starting, including a delegated session through the official launcher; `--while-running` is the explicit override, and the instance lock is still taken. The running game may overwrite the world when it saves.
 
 `server` edits the game's own multiplayer list (`servers.dat`), keeping the icons and other details the game stored. Positions start at 1, in the order `server list` prints. `--ping` also asks each server whether it is online, with its player count and latency, using the game's own status protocol (Minecraft 1.7 and later). Servers reachable only through a DNS `SRV` record show as offline. Pinging is covered by Lockdown Mode and the Server status switch on the Privacy page.
 
@@ -500,6 +500,7 @@ Common planning options:
 | `--remove-anyway` | `mod remove` only: remove the file even though an installed mod still requires it |
 | `--allow-replace` | Permit replacement of existing files |
 | `--skip-health-scan` | Skip the post-operation health gate |
+| `--while-running` | `mod install`, `mod remove`, `mod update`, `mod update-all` and `instance updates --apply`: change the instance even while its game is running. The running game keeps the files it already opened; these commands still take the instance lock |
 
 `--replace-conflicts` is broad. Review a dry-run first, especially on an established instance.
 
@@ -536,7 +537,7 @@ Minecraft only loads data packs from inside a world, so Agora copies enabled dat
 | `agora backup prune <INSTANCE> [--keep <N>] [--yes]` | Delete snapshots beyond the newest N (default 10) |
 | `agora export <INSTANCE> <DEST> [--world <FOLDER>] [--allow-unverified-loader]` | Export a standalone, ready-to-run server folder |
 | `agora pack update-preview <INSTANCE> <MRPACK>` | Show what a newer .mrpack would change. Changes nothing |
-| `agora pack update <INSTANCE> <MRPACK>` | Apply a newer .mrpack; asks for `--yes` and an answer to every conflict |
+| `agora pack update <INSTANCE> <MRPACK> [--while-running]` | Apply a newer .mrpack; asks for `--yes` and an answer to every conflict |
 | `agora migrate-data --from <PATH>` | Plan migration from an older CLI data root |
 | `agora migrate-data --from <PATH> --yes` | Execute the migration |
 
@@ -570,14 +571,14 @@ Agora's automatic pre-launch recovery snapshot is optimized for mod, configurati
 ```text
 agora loadout create <INSTANCE> <NAME>
 agora loadout list <INSTANCE>
-agora loadout apply <INSTANCE> <NAME> [--others keep|off]
+agora loadout apply <INSTANCE> <NAME> [--others keep|off] [--while-running]
 agora loadout update <INSTANCE> <NAME> [--yes]
 agora loadout delete <INSTANCE> <NAME>
 ```
 
-A loadout records the on/off state of mods, resource packs, shader packs, data packs and worlds. Applying one sets each item it records to that state. An enabled mod it does not list (one added since it was saved, say) is a choice: `--others keep` leaves it on and `--others off` switches it off. When there are such mods and no `--others` is given, apply refuses and names them, so nothing changes. Packs and worlds it does not list are left as they are. Apply refuses a locked instance, and an instance whose game is running or starting, and changes nothing in either case. Before switching, apply saves an undo point labelled `before-loadout` (only the newest is kept). `loadout update` saves a profile again from the instance's current setup, so a mod added since it was saved stops being unlisted. It lists what would change (added, turned on or off, or dropped because it is gone) and asks first on an interactive terminal. Without a terminal it changes nothing and names the changes; pass `--yes` once the person using this computer has agreed. It does not touch the instance, so a locked instance or a running game does not block it.
+A loadout records the on/off state of mods, resource packs, shader packs, data packs and worlds. Applying one sets each item it records to that state. An enabled mod it does not list (one added since it was saved, say) is a choice: `--others keep` leaves it on and `--others off` switches it off. When there are such mods and no `--others` is given, apply refuses and names them, so nothing changes. Packs and worlds it does not list are left as they are. Apply refuses a locked instance, and an instance whose game is running or starting, and changes nothing in either case. `--while-running` is the explicit override for the running-game check; the instance lock is still taken, and the running game may overwrite settings when it exits. Before switching, apply saves an undo point labelled `before-loadout` (only the newest is kept). `loadout update` saves a profile again from the instance's current setup, so a mod added since it was saved stops being unlisted. It lists what would change (added, turned on or off, or dropped because it is gone) and asks first on an interactive terminal. Without a terminal it changes nothing and names the changes; pass `--yes` once the person using this computer has agreed. It does not touch the instance, so a locked instance or a running game does not block it.
 
-For a game instance, the same commands work. Its loadout records the content items that are on, and, where the game has them, the plugin list (active set and order), the instance's INI copies, the load-after rules and the save choice. Applying it restores all of them after saving the setup it replaced as the undo point, and is refused while the game runs. A content item the profile does not name is switched off, as an unlisted mod is on Minecraft. Apply prints that the undo point was saved; `agora snapshots` covers Minecraft instances, whose undo point is a `before-loadout` snapshot.
+For a game instance, the same commands work. Its loadout records the content items that are on, and, where the game has them, the plugin list (active set and order), the instance's INI copies, the load-after rules and the save choice. Applying it restores all of them after saving the setup it replaced as the undo point, and is refused while the game runs unless `--while-running` says otherwise. A content item the profile does not name is switched off, as an unlisted mod is on Minecraft. Apply prints that the undo point was saved; `agora snapshots` covers Minecraft instances, whose undo point is a `before-loadout` snapshot.
 
 A loadout does not revert mod versions or configuration files.
 

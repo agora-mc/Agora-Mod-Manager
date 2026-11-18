@@ -2147,19 +2147,23 @@ pub fn apply_pack_update(
     instance_dir: &Path,
     mrpack_path: &Path,
     resolutions: &BTreeMap<String, ConflictResolution>,
+    allow_while_running: bool,
 ) -> Result<PackUpdateOutcome, String> {
     let sanitized = agora_core::paths::sanitize_id(instance_id);
     let staged_dir = ctx
         .paths
         .staging_dir(&format!("pack-update-{sanitized}"))
         .map_err(|e| e.to_string())?;
-    let _lock = ctx
-        .lock_manager
-        .acquire(
-            agora_core::lock_manager::LockResource::Instance(sanitized.clone()),
+    let _guard = if allow_while_running {
+        agora_core::instance_runtime::InstanceGuard::for_mutation_while_running(
+            ctx,
+            &sanitized,
             "pack-update",
         )
-        .map_err(|e| e.to_string())?;
+    } else {
+        agora_core::instance_runtime::InstanceGuard::for_mutation(ctx, &sanitized, "pack-update")
+    }
+    .map_err(|e| e.to_string())?;
     let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())
         .map_err(|e| e.to_string())?;
     let outcome = update_pack(

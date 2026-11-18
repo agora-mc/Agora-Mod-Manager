@@ -13,7 +13,6 @@ use agora_core::{
     error::{LauncherError, LauncherResult},
     helpers,
     library::{self as core_library},
-    lock_manager::LockResource,
     models::{InstalledMod, ProviderOrigin},
     paths, snapshot,
 };
@@ -521,14 +520,18 @@ pub fn stored_mod_fields(item: &store::ContentItem) -> LauncherResult<(String, S
 /// Adding the same item twice returns the existing entry.
 pub fn add_item_to_instance(
     ctx: &Ctx,
+    guard: &agora_core::instance_runtime::InstanceGuard,
     instance_id: &str,
     item_id: &str,
 ) -> LauncherResult<InstalledMod> {
     let sanitized = paths::sanitize_id(instance_id);
-    let _guard = ctx.lock_manager.acquire(
-        LockResource::Instance(sanitized.clone()),
-        "add_stored_content",
-    )?;
+    if guard.instance_id() != sanitized {
+        return Err(LauncherError::Generic {
+            code: "ERR_INSTANCE_GUARD".into(),
+            message: "The instance guard authorises a different instance; nothing was added."
+                .into(),
+        });
+    }
     let dir = ctx.paths.instance_dir(&sanitized)?;
     let manifest_path = ctx.paths.instance_manifest(&sanitized)?;
     if !manifest_path.exists() {

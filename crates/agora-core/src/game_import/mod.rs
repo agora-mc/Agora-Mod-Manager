@@ -2090,6 +2090,7 @@ pub fn mo2_run_profiles(
                 &instance_id,
                 &definition,
                 &profiles[0],
+                false,
             )
             .map_err(|e| ImportError::Other(e.to_string()))?;
             Ok(Mo2MultiReport {

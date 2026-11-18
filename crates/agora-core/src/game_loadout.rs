@@ -479,6 +479,7 @@ pub fn apply_game_profile_with_undo(
     instance_id: &str,
     definition: &GameDefinition,
     profile_name: &str,
+    allow_while_running: bool,
 ) -> Result<(), LoadoutApplyError> {
     let dir = instance_dir(ctx, instance_id).map_err(LoadoutApplyError::Profile)?;
     let profile = loadout::read_profile(&dir, profile_name).map_err(LoadoutApplyError::Profile)?;
@@ -494,7 +495,9 @@ pub fn apply_game_profile_with_undo(
         )
         .map_err(|e| LoadoutApplyError::Profile(e.to_string()))?;
 
-    if game_is_running(ctx, instance_id, definition).map_err(LoadoutApplyError::Profile)? {
+    if !allow_while_running
+        && game_is_running(ctx, instance_id, definition).map_err(LoadoutApplyError::Profile)?
+    {
         return Err(LoadoutApplyError::Profile(format!(
             "'{instance_id}' is running; close the game before applying a loadout"
         )));
@@ -832,7 +835,7 @@ mod tests {
         crate::game_load_order::replace_load_after_rules(&s.ctx, "test-instance", "plugins", &[])
             .unwrap();
 
-        apply_game_profile_with_undo(&s.ctx, "test-instance", &s.def, "base").unwrap();
+        apply_game_profile_with_undo(&s.ctx, "test-instance", &s.def, "base", false).unwrap();
 
         let restored = game_instance::get_manifest(&s.ctx, "test-instance").unwrap();
         assert!(restored.layers.layers()[0].enabled);
@@ -898,7 +901,7 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
 
-        let error = apply_game_profile_with_undo(&s.ctx, "test-instance", &s.def, "base")
+        let error = apply_game_profile_with_undo(&s.ctx, "test-instance", &s.def, "base", false)
             .expect_err("a running game refuses the apply");
         assert!(error.to_string().contains("running"), "{error}");
         assert!(

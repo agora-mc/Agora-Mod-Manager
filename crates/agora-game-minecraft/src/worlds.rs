@@ -12,7 +12,7 @@ use crate::instance_service::TrashFn;
 use agora_core as core_api;
 use agora_core::ctx::Ctx;
 use agora_core::error::{LauncherError, LauncherResult};
-use agora_core::lock_manager::{LockGuard, LockResource};
+use agora_core::instance_runtime::InstanceGuard;
 use base64::Engine;
 use core_api::app_paths::is_safe_file_name;
 use fastnbt::Value;
@@ -122,6 +122,9 @@ pub fn record_server_join(conn: &rusqlite::Connection, instance_id: &str, addres
 #[derive(Clone)]
 pub struct WorldService {
     ctx: Ctx,
+    /// The user's explicit answer to a running game: change its world anyway.
+    /// The instance lock is still taken.
+    allow_while_running: bool,
 }
 
 fn error(code: &str, message: impl Into<String>) -> LauncherError {
@@ -137,7 +140,18 @@ fn io_error(code: &str, what: &str, err: impl std::fmt::Display) -> LauncherErro
 
 impl WorldService {
     pub fn new(ctx: Ctx) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            allow_while_running: false,
+        }
+    }
+
+    /// Allow world changes while the instance's game is running. Only for a
+    /// caller that has explicitly confirmed it (the CLI's `--while-running`
+    /// flag or a desktop confirmation); the instance lock is still taken.
+    pub fn while_running(mut self) -> Self {
+        self.allow_while_running = true;
+        self
     }
 
     fn instance_dir(&self, instance_id: &str) -> LauncherResult<(String, PathBuf)> {
@@ -154,13 +168,17 @@ impl WorldService {
     }
 
     /// Lock the instance and make sure the game is not using it.
-    fn mutate(&self, instance_id: &str, operation: &str) -> LauncherResult<(LockGuard, PathBuf)> {
+    fn mutate(
+        &self,
+        instance_id: &str,
+        operation: &str,
+    ) -> LauncherResult<(InstanceGuard, PathBuf)> {
         let (id, dir) = self.instance_dir(instance_id)?;
-        let guard = self
-            .ctx
-            .lock_manager
-            .acquire(LockResource::Instance(id.clone()), operation)?;
-        core_api::instance_runtime::check_idle(&self.ctx.paths, &id)?;
+        let guard = if self.allow_while_running {
+            InstanceGuard::for_mutation_while_running(&self.ctx, &id, operation)?
+        } else {
+            InstanceGuard::for_mutation(&self.ctx, &id, operation)?
+        };
         Ok((guard, dir))
     }
 
@@ -938,6 +956,7 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, WorldService) {
         let root = tempfile::tempdir().unwrap();
         let ctx = Ctx::for_testing(root.path().to_path_buf());
+        agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
         let dir = ctx.paths.instance_dir("inst").unwrap();
         for (folder, name, played, mode) in
             [("Alpha", "Alpha Base", 100, 0), ("beta", "Beta", 200, 1)]
@@ -961,6 +980,33 @@ mod tests {
         assert_eq!(worlds[1].name, "Alpha Base");
         assert_eq!(worlds[1].version_name.as_deref(), Some("1.21.1"));
         assert!(worlds[1].size_bytes >= 1000);
+    }
+
+    #[test]
+    fn a_delegated_session_blocks_a_world_change_unless_the_user_overrides_it() {
+        let (_root, service) = fixture();
+        // A delegated launch publishes a lease but keeps no child handle.
+        agora_core::instance_runtime::publish_starting(&service.ctx.paths, "inst").unwrap();
+
+        let refused = service.rename("inst", "Alpha", "Blocked");
+        assert!(
+            refused.is_err(),
+            "a delegated session did not block the world change"
+        );
+
+        service
+            .clone()
+            .while_running()
+            .rename("inst", "Alpha", "Allowed")
+            .unwrap();
+        let world = service
+            .list("inst")
+            .unwrap()
+            .into_iter()
+            .find(|w| w.folder == "Alpha")
+            .unwrap();
+        assert_eq!(world.name, "Allowed");
+        agora_core::instance_runtime::clear(&service.ctx.paths, "inst", None).unwrap();
     }
 
     #[test]

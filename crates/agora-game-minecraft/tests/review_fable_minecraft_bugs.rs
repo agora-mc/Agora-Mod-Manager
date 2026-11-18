@@ -21,10 +21,10 @@ fn zip_with(path: &std::path::Path, entries: &[(&str, &[u8])]) {
 /// the instance lock or asking whether a game is using the instance. Worlds,
 /// servers, loadouts and data packs all refuse here (`check_idle`); these do not.
 #[test]
-#[ignore = "review finding H1: fixed by slice W1-mcguard"]
 fn removing_a_mod_is_refused_while_a_launch_is_in_progress() {
     let root = tempfile::tempdir().unwrap();
     let ctx = Ctx::for_testing(root.path().to_path_buf());
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
     let dir = ctx.paths.instance_dir("inst").unwrap();
     std::fs::create_dir_all(dir.join("mods")).unwrap();
     let jar = dir.join("mods/sodium.jar");
