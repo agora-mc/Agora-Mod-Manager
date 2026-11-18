@@ -3248,6 +3248,7 @@ async fn run_plugin_command(
                 agora_core::plugins::Consent {
                     capabilities: accepted,
                     scripts: allow_code,
+                    previewed_digest: Some(preview.package_digest.clone()),
                 },
             )?;
             if json {

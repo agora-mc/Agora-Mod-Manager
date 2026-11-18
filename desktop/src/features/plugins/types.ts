@@ -212,6 +212,11 @@ export interface InstallPreview {
   alsoInstalls?: InstallPreview[];
   /** Served from the signed official catalog, so the prompt recommends its code. */
   official?: boolean;
+  /**
+   * Identifies the bytes this preview described. Passed back with the install
+   * so core can refuse a package that changed after the prompt.
+   */
+  packageDigest?: string;
 }
 
 export type UpdateVerdict =

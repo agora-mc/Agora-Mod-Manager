@@ -63,7 +63,14 @@ export const installPluginPackage = (
   path: string,
   acceptCapabilities: boolean,
   allowScripts?: boolean,
-) => invoke<PluginSummary>('install_plugin_package', { path, acceptCapabilities, allowScripts });
+  packageDigest?: string,
+) =>
+  invoke<PluginSummary>('install_plugin_package', {
+    path,
+    acceptCapabilities,
+    allowScripts,
+    packageDigest,
+  });
 
 export const checkPluginUpdate = (pluginId: string) =>
   invoke<UpdateVerdict | null>('plugin_check_update', { pluginId });
@@ -103,11 +110,13 @@ export const addPluginDevelopmentFolder = (
   path: string,
   acceptCapabilities: boolean,
   allowScripts?: boolean,
+  packageDigest?: string,
 ) =>
   invoke<PluginSummary>('add_plugin_development_folder', {
     path,
     acceptCapabilities,
     allowScripts,
+    packageDigest,
   });
 
 export const setPluginEnabled = (pluginId: string, enabled: boolean) =>

@@ -1455,7 +1455,7 @@ impl PluginService {
         let mut installed: Vec<String> = Vec::new();
         let mut target_summary = None;
         for plan in &plans {
-            match self.install_verified(&plan.entry, &plan.bytes, consent) {
+            match self.install_verified(&plan.entry, &plan.bytes, consent.clone()) {
                 Ok(UpdateOutcome::Installed { plugin }) => {
                     installed.push(plan.entry.plugin_id.clone());
                     if !plan.is_dependency {

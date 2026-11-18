@@ -56,13 +56,17 @@ pub const PLUGINS_EMERGENCY_STOP_SETTING: &str = "plugins_emergency_stop";
 /// permissions" and, for a plugin that has code, "may it run that code". A plain
 /// `bool` converts to both answers at once, which is what every caller that does
 /// not offer the second choice means by "yes".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Consent {
     /// The capabilities and network hosts the preview listed.
     pub capabilities: bool,
     /// Running the plugin's scripts. Ignored for a plugin with no code, and for
     /// an update of a plugin that already has an answer: that answer stands.
     pub scripts: bool,
+    /// The `package_digest` of the preview this answer belongs to, when the
+    /// caller showed one. The installer refuses bytes that do not match, so a
+    /// yes given for one package cannot install a different one.
+    pub previewed_digest: Option<String>,
 }
 
 impl Consent {
@@ -71,7 +75,14 @@ impl Consent {
         Self {
             capabilities: true,
             scripts: false,
+            previewed_digest: None,
         }
+    }
+
+    /// Bind this answer to the preview it was given for.
+    pub fn for_preview(mut self, digest: impl Into<String>) -> Self {
+        self.previewed_digest = Some(digest.into());
+        self
     }
 }
 
@@ -80,6 +91,7 @@ impl From<bool> for Consent {
         Self {
             capabilities: answer,
             scripts: answer,
+            previewed_digest: None,
         }
     }
 }
@@ -1263,6 +1275,11 @@ impl PluginService {
         consent: impl Into<Consent>,
     ) -> LauncherResult<PluginSummary> {
         let consent = consent.into();
+        if let Some(expected) = consent.previewed_digest.as_deref() {
+            if install::package_digest(bytes) != expected {
+                return Err(preview_changed());
+            }
+        }
         let accept_capabilities = consent.capabilities;
         let contents = install::read_package_manifest_bytes(bytes)?;
         let manifest = contents.manifest;
@@ -1793,6 +1810,11 @@ impl PluginService {
         consent: impl Into<Consent>,
     ) -> LauncherResult<PluginSummary> {
         let consent = consent.into();
+        if let Some(expected) = consent.previewed_digest.as_deref() {
+            if install::folder_digest(folder)? != expected {
+                return Err(preview_changed());
+            }
+        }
         let accept_capabilities = consent.capabilities;
         let manifest = install::read_folder_manifest(folder)?;
 
@@ -2906,6 +2928,20 @@ fn wants_startup(manifest: &PluginManifest) -> bool {
 
 fn now(ctx: &Ctx) -> String {
     chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339()
+}
+
+/// The refusal for a package (or folder) that is not the one previewed.
+///
+/// Reached when the caller passed the digest of the answer it collected and the
+/// bytes it is now installing are different. Failing closed is the point: the
+/// capabilities and code the user agreed to may not be what this package has.
+fn preview_changed() -> LauncherError {
+    LauncherError::Generic {
+        code: "ERR_PLUGIN_PREVIEW_CHANGED".into(),
+        message: "The plugin changed since you approved it. Preview it again before \
+                  installing."
+            .into(),
+    }
 }
 
 /// The plugin id an archive claims, when it can be read cheaply.

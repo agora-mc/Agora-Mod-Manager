@@ -285,8 +285,18 @@ export function PluginManager() {
     setBusy(true);
     try {
       const summary = preview.development
-        ? await addPluginDevelopmentFolder(preview.path, true, allowCode)
-        : await installPluginPackage(preview.path, true, allowCode);
+        ? await addPluginDevelopmentFolder(
+            preview.path,
+            true,
+            allowCode,
+            preview.preview.packageDigest,
+          )
+        : await installPluginPackage(
+            preview.path,
+            true,
+            allowCode,
+            preview.preview.packageDigest,
+          );
       if (!isRecord(summary) || typeof summary.name !== 'string' || typeof summary.version !== 'string') {
         showToast('Agora did not return a usable installed plugin.', 'error');
         return;
