@@ -1412,6 +1412,12 @@ fn quarantine_file(path: &std::path::Path) -> Option<String> {
         if std::fs::rename(path, &target).is_ok() {
             return Some(target.to_string_lossy().into_owned());
         }
+        // Rename can be refused even though the directory is writable (an open
+        // handle on Windows, for example). Keep a copy rather than lose the
+        // evidence when repair later replaces the original.
+        if std::fs::copy(path, &target).is_ok() {
+            return Some(target.to_string_lossy().into_owned());
+        }
         return None;
     }
     None
@@ -3142,6 +3148,23 @@ mod tests {
         assert_eq!(names(), vec![("Bob".into(), true), ("Alice".into(), false)]);
         assert!(!account_store_status().needs_repair);
         assert!(kept.exists(), "repair must never delete the corrupt copy");
+    }
+
+    #[tokio::test]
+    async fn a_missing_primary_falls_back_to_the_recovery_copy() {
+        let _test_lock = TEST_MSA_MUTEX.lock().await;
+        let _td = write_test_msa_creds(&account("aaaa1111", "Alice"));
+        assert!(backup_path().is_file());
+        std::fs::remove_file(store_path()).expect("remove the primary");
+
+        assert_eq!(
+            load_credentials().unwrap().unwrap().username,
+            "Alice",
+            "a primary lost after the recovery copy was written still launches"
+        );
+        assert!(account_store_status().needs_repair);
+        assert!(repair_account_store().unwrap().repaired);
+        assert!(!account_store_status().needs_repair);
     }
 
     #[tokio::test]
