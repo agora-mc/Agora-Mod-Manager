@@ -917,6 +917,8 @@ fn a_plugin_edit_during_a_launch_start_does_not_restore_the_session() {
     let copy = h.copy_path(&inst);
     std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
     std::fs::write(&copy, "*Instance.esp\r\n").unwrap();
+    let item = h.item("mod", &[("Data/A.esp", b"a")]);
+    h.add(&inst, &item);
     let nowhere = h.tmp.path().join("no-such-running-from");
     agora_core::game_user_files::swap_in(
         &h.ctx,
@@ -928,11 +930,11 @@ fn a_plugin_edit_during_a_launch_start_does_not_restore_the_session() {
     .unwrap();
     assert_eq!(std::fs::read_to_string(&real).unwrap(), "*Instance.esp\r\n");
 
-    // The launch that swapped these in is this process and is still starting. A deploy (and the
-    // plugin sync inside it) must not take it for a stale session and put the files back.
-    let item = h.item("mod", &[("Data/A.esp", b"a")]);
-    h.add(&inst, &item);
-    h.deploy(&inst);
+    // The launch that swapped these in is this process and is still starting. A deploy must not
+    // take it for a stale session and put the files back; the shared guard refuses the deploy.
+    let error = deploy(&h.ctx, &inst.instance_id, &h.def, DeployMode::Links)
+        .expect_err("a deploy must not run under a starting launch");
+    assert!(error.to_string().contains("running"), "{error}");
 
     assert_eq!(
         std::fs::read_to_string(&real).unwrap(),
