@@ -21,6 +21,7 @@ use crate::ctx::Ctx;
 use crate::error::LauncherError;
 use crate::game_plugins::PluginListError;
 use crate::game_user_files::{self, Journal};
+use crate::instance_runtime::InstanceGuard;
 use crate::lock_manager::{LockGuard, LockResource};
 
 const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
@@ -631,11 +632,48 @@ pub fn set_value(
     key: &str,
     value: &str,
 ) -> Result<bool, IniError> {
+    set_value_while_running(
+        ctx,
+        instance_id,
+        definition,
+        file,
+        section,
+        key,
+        value,
+        false,
+    )
+}
+
+/// [`set_value`], with the user's explicit answer to a running game.
+pub fn set_value_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    file: &str,
+    section: &str,
+    key: &str,
+    value: &str,
+    allow_while_running: bool,
+) -> Result<bool, IniError> {
+    let guard = guard_for(ctx, instance_id, "ini-edit", allow_while_running)?;
+    set_value_locked(ctx, &guard, definition, file, section, key, value)
+}
+
+/// [`set_value`] for a caller that already holds the instance guard.
+pub fn set_value_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    file: &str,
+    section: &str,
+    key: &str,
+    value: &str,
+) -> Result<bool, IniError> {
     check_names(section, key)?;
     check_value(value)?;
-    let store = store_of(ctx, instance_id)?;
-    let _locks = lock_for_edit(ctx, instance_id, definition, &store)?;
-    edit_locked(ctx, instance_id, definition, &store, file, |doc| {
+    let store = store_of(ctx, guard.instance_id())?;
+    let _user_files = user_files_lock_for_edit(ctx, definition, &store)?;
+    edit_locked(ctx, guard.instance_id(), definition, &store, file, |doc| {
         let changed = doc.set(section, key, value)?;
         Ok((changed, changed))
     })
@@ -650,13 +688,67 @@ pub fn unset_value(
     section: &str,
     key: &str,
 ) -> Result<bool, IniError> {
+    unset_value_while_running(ctx, instance_id, definition, file, section, key, false)
+}
+
+/// [`unset_value`], with the user's explicit answer to a running game.
+pub fn unset_value_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    file: &str,
+    section: &str,
+    key: &str,
+    allow_while_running: bool,
+) -> Result<bool, IniError> {
+    let guard = guard_for(ctx, instance_id, "ini-edit", allow_while_running)?;
+    unset_value_locked(ctx, &guard, definition, file, section, key)
+}
+
+/// [`unset_value`] for a caller that already holds the instance guard.
+pub fn unset_value_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    file: &str,
+    section: &str,
+    key: &str,
+) -> Result<bool, IniError> {
     check_names(section, key)?;
-    let store = store_of(ctx, instance_id)?;
-    let _locks = lock_for_edit(ctx, instance_id, definition, &store)?;
-    edit_locked(ctx, instance_id, definition, &store, file, |doc| {
+    let store = store_of(ctx, guard.instance_id())?;
+    let _user_files = user_files_lock_for_edit(ctx, definition, &store)?;
+    edit_locked(ctx, guard.instance_id(), definition, &store, file, |doc| {
         let changed = doc.unset(section, key)?;
         Ok((changed, changed))
     })
+}
+
+fn guard_for(
+    ctx: &Ctx,
+    instance_id: &str,
+    operation: &str,
+    allow_while_running: bool,
+) -> Result<InstanceGuard, IniError> {
+    if allow_while_running {
+        Ok(InstanceGuard::for_mutation_while_running(
+            ctx,
+            instance_id,
+            operation,
+        )?)
+    } else {
+        Ok(InstanceGuard::for_mutation(ctx, instance_id, operation)?)
+    }
+}
+
+fn user_files_lock_for_edit(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    store: &StoreId,
+) -> Result<LockGuard, IniError> {
+    Ok(ctx.lock_manager.acquire(
+        LockResource::GameUserFiles(definition.id.clone(), store.clone()),
+        "ini-edit",
+    )?)
 }
 
 /// The two locks an edit holds: the instance's, and the game's per-user files for the store, the
