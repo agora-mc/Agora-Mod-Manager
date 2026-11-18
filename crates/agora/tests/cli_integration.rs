@@ -179,6 +179,7 @@ fn assert_json_stdout(output: &std::process::Output) -> serde_json::Value {
 const TOP_LEVEL_COMMANDS: &[&str] = &[
     "list-instances",
     "paths",
+    "doctor",
     "get-instance",
     "instance",
     "mod",
@@ -8424,4 +8425,136 @@ fn crash_list_reads_stored_answers_and_inspect_reads_a_report() {
     let parsed = assert_json_stdout(&inspected);
     assert_eq!(parsed["filename"], "crash-example.txt");
     assert_eq!(parsed["content"], "an example report\n");
+}
+
+#[test]
+fn doctor_reports_the_local_database_without_creating_it() {
+    let (_tmp, data_dir) = temp_data_dir();
+
+    let before = run_agora_json(&data_dir, &["doctor"]);
+    assert!(
+        before.status.success(),
+        "{}",
+        String::from_utf8_lossy(&before.stderr)
+    );
+    let parsed = assert_json_stdout(&before);
+    assert_eq!(parsed["integrity"], "missing");
+    assert_eq!(parsed["problems"], false);
+    assert!(
+        !data_dir.join("local_state.db").exists(),
+        "doctor is read-only and does not create the database"
+    );
+
+    let created = run_agora_json(&data_dir, &["list-instances"]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let after = run_agora_json(&data_dir, &["doctor"]);
+    assert!(
+        after.status.success(),
+        "{}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    let parsed = assert_json_stdout(&after);
+    assert_eq!(parsed["integrity"], "ok");
+    assert_eq!(parsed["problems"], false);
+    assert_eq!(
+        parsed["schemaVersion"],
+        agora_core::db::LOCAL_STATE_SCHEMA_VERSION
+    );
+    assert_eq!(
+        parsed["supportedVersion"],
+        agora_core::db::LOCAL_STATE_SCHEMA_VERSION
+    );
+}
+
+#[test]
+fn a_newer_database_is_refused_and_doctor_still_reports_it() {
+    let (_tmp, data_dir) = temp_data_dir();
+    let created = run_agora_json(&data_dir, &["list-instances"]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let db_path = data_dir.join("local_state.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("INSERT INTO schema_version (version) VALUES (999)", [])
+            .unwrap();
+    }
+
+    let refused = run_agora(&data_dir, &["list-instances"]);
+    assert!(!refused.status.success(), "a newer database is refused");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("newer Agora"), "{stderr}");
+    assert!(stderr.contains("--fresh-database"), "{stderr}");
+
+    let doctor = run_agora_json(&data_dir, &["doctor"]);
+    assert_eq!(
+        doctor.status.code(),
+        Some(10),
+        "doctor reports a newer database as a problem"
+    );
+    let parsed = assert_json_stdout(&doctor);
+    assert_eq!(parsed["databaseIsNewer"], true);
+    assert_eq!(parsed["problems"], true);
+    assert_eq!(parsed["schemaVersion"], 999);
+
+    let accepted = run_agora_json(&data_dir, &["--fresh-database", "list-instances"]);
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let doctor = run_agora_json(&data_dir, &["doctor"]);
+    assert!(
+        doctor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let parsed = assert_json_stdout(&doctor);
+    assert_eq!(parsed["problems"], false);
+    assert_eq!(
+        parsed["schemaVersion"],
+        agora_core::db::LOCAL_STATE_SCHEMA_VERSION
+    );
+    assert!(
+        parsed["keptAside"]
+            .as_array()
+            .is_some_and(|kept| !kept.is_empty()),
+        "the newer file is kept: {parsed}"
+    );
+}
+
+#[test]
+fn doctor_exits_ten_for_a_damaged_database_and_keeps_the_report() {
+    let (_tmp, data_dir) = temp_data_dir();
+    std::fs::write(data_dir.join("local_state.db"), b"not a sqlite database").unwrap();
+
+    let doctor = run_agora_json(&data_dir, &["doctor"]);
+    assert_eq!(
+        doctor.status.code(),
+        Some(10),
+        "doctor reports damage with the local-state code"
+    );
+    let parsed = assert_json_stdout(&doctor);
+    assert_eq!(parsed["integrity"], "corrupt");
+    assert_eq!(parsed["problems"], true);
+    assert!(parsed["schemaVersion"].is_null());
+    assert_eq!(
+        parsed["path"],
+        data_dir.join("local_state.db").display().to_string()
+    );
+
+    let human = run_agora(&data_dir, &["doctor"]);
+    assert_eq!(human.status.code(), Some(10));
+    assert!(
+        String::from_utf8_lossy(&human.stdout).contains("Integrity: corrupt"),
+        "the full human report is still printed"
+    );
 }

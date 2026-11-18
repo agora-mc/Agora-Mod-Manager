@@ -124,6 +124,101 @@ fn watch_external_changes(app: tauri::AppHandle, locks_root: std::path::PathBuf)
     }
 }
 
+/// Initialize core, asking before the two overrides the local database safety
+/// net requires: starting fresh over a database from a newer Agora, and
+/// migrating without a pre-migration backup.
+fn initialize_core_with_choices(
+    paths: agora_core::app_paths::AppPaths,
+) -> agora_core::error::LauncherResult<(
+    agora_core::ctx::CoreContext,
+    Vec<String>,
+    agora_core::db::LocalStateStartupReport,
+)> {
+    let mut options = agora_core::db::LocalStateOpenOptions::default();
+    loop {
+        match agora_core::ctx::CoreContext::initialize_with_local_state_options(
+            paths.clone(),
+            build_game_registry(),
+            agora_core::plugins::official::RegistryTrust::production(),
+            &options,
+        ) {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                let code = error.code();
+                if code == agora_core::db::ERR_LOCAL_STATE_NEWER {
+                    let accepted = rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Warning)
+                        .set_title("Agora's database is from a newer version")
+                        .set_description(format!(
+                            "{error}\n\nStart with a fresh database? The newer file is kept, \
+                             never deleted."
+                        ))
+                        .set_buttons(rfd::MessageButtons::YesNo)
+                        .show();
+                    if !matches!(accepted, rfd::MessageDialogResult::Yes) {
+                        return Err(error);
+                    }
+                    options.accept_newer_schema = true;
+                } else if code == agora_core::db::ERR_LOCAL_STATE_BACKUP_FAILED {
+                    let accepted = rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Warning)
+                        .set_title("Agora could not back up its database")
+                        .set_description(format!(
+                            "{error}\n\nMigrate without a backup? The database may not be \
+                             recoverable if the migration fails."
+                        ))
+                        .set_buttons(rfd::MessageButtons::YesNo)
+                        .show();
+                    if !matches!(accepted, rfd::MessageDialogResult::Yes) {
+                        return Err(error);
+                    }
+                    options.accept_missing_backup = true;
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+/// Tell the player, once, what startup did to the local database.
+fn show_startup_notices(report: &agora_core::db::LocalStateStartupReport) {
+    if let Some(recovery) = &report.recovered_corrupt {
+        let description = match &recovery.restored_from {
+            Some(backup) => format!(
+                "Agora found the local database damaged and restored the newest good backup.\n\n\
+                 The damaged file was kept at:\n{}\n\nThe backup restored was:\n{}",
+                recovery.kept_at.display(),
+                backup.display()
+            ),
+            None => format!(
+                "Agora found the local database damaged and no good backup was available, so it \
+                 started with a fresh database.\n\nThe damaged file was kept at:\n{}",
+                recovery.kept_at.display()
+            ),
+        };
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("Agora recovered the local database")
+            .set_description(description)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    }
+    if let Some(newer) = &report.newer_schema_kept {
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("Agora started with a fresh database")
+            .set_description(format!(
+                "The local database (schema version {}) was written by a newer Agora. It was \
+                 kept at:\n{}",
+                newer.found,
+                newer.kept_at.display()
+            ))
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    }
+}
+
 pub fn run() {
     agora_core::lock_manager::set_program_name("Agora app");
     // Minecraft is a game package; register it with core before any context
@@ -626,11 +721,12 @@ pub fn run() {
             // Keep one clone for startup maintenance after the managed state is
             // installed; maintenance is optional and must never delay setup.
             let startup_maintenance_ctx = match crate::paths::app_paths(app.handle()) {
-                Ok(paths) => match agora_core::ctx::CoreContext::initialize(paths, build_game_registry()) {
-                    Ok((ctx, warnings)) => {
+                Ok(paths) => match initialize_core_with_choices(paths) {
+                    Ok((ctx, warnings, report)) => {
                         for w in &warnings {
                             eprintln!("[core] {w}");
                         }
+                        show_startup_notices(&report);
                         let maintenance_ctx = ctx.clone();
                         watch_external_changes(
                             app.handle().clone(),
@@ -651,12 +747,12 @@ pub fn run() {
                     }
                     Err(e) => {
                         eprintln!("Failed to initialize core context: {e}");
-                        None
+                        return Err(Box::new(e));
                     }
                 },
                 Err(e) => {
                     eprintln!("Failed to resolve app data dir: {e}");
-                    None
+                    return Err(format!("Failed to resolve app data dir: {e}").into());
                 }
             };
 

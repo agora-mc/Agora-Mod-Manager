@@ -208,6 +208,20 @@ struct Cli {
 
     #[arg(long, global = true, help = "Append diagnostics to this log file")]
     log_file: Option<PathBuf>,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Keep a local database written by a newer Agora aside and start with a fresh one"
+    )]
+    fresh_database: bool,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Migrate even if the pre-migration database backup cannot be written"
+    )]
+    migrate_without_backup: bool,
 }
 
 #[derive(Subcommand)]
@@ -216,6 +230,8 @@ enum Commands {
     ListInstances,
     /// Print resolved Agora data, database, cache, runtime, and instance paths.
     Paths,
+    /// Report local database health, backups, and files kept aside after recovery.
+    Doctor,
     /// Print one instance by ID.
     GetInstance { id: String },
     /// Create, clone, lock, rename, repair, delete, or restore instances.
@@ -2356,14 +2372,53 @@ async fn async_main() {
         return;
     }
 
+    // `agora doctor` reports on a database that may be corrupt or written by a
+    // newer Agora, so it must run before core initializes (and possibly repairs
+    // or refuses) anything.
+    if let Commands::Doctor = &cli.command {
+        match run_doctor(&paths, json) {
+            // Damage is reported on standard output (human or JSON); the exit
+            // code is the machine-readable part. Ten is the same local-state
+            // failure code a failing database command uses.
+            Ok(false) => std::process::exit(10),
+            Ok(true) => {}
+            Err(error) => {
+                let code = exit_code_from_error(&error);
+                if json {
+                    eprintln!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "error": error.to_string(),
+                            "exitCode": code,
+                        }))
+                        .unwrap()
+                    );
+                } else {
+                    eprintln!("Error: {error}");
+                }
+                std::process::exit(code);
+            }
+        }
+        return;
+    }
+
     // A refused compiled package is a build bug, not user input. Skyrim is not
     // compiled in: it arrives through the installed official plugin.
     let mut registry_builder = agora_core::game_registry::GameRegistry::builder();
     agora_game_minecraft::register_into(&mut registry_builder)
         .expect("build bug: the Minecraft package was refused");
 
-    let (ctx, warnings) =
-        match agora_core::ctx::CoreContext::initialize(paths.clone(), registry_builder) {
+    let local_state_options = agora_core::db::LocalStateOpenOptions {
+        accept_newer_schema: cli.fresh_database,
+        accept_missing_backup: cli.migrate_without_backup,
+    };
+    let (ctx, warnings, _startup_report) =
+        match agora_core::ctx::CoreContext::initialize_with_local_state_options(
+            paths.clone(),
+            registry_builder,
+            agora_core::plugins::official::RegistryTrust::production(),
+            &local_state_options,
+        ) {
             Ok(result) => result,
             Err(error) => {
                 progress.log("error", &format!("Core initialization failed: {error}"));
@@ -2407,6 +2462,129 @@ async fn async_main() {
         }
         std::process::exit(code);
     }
+}
+
+/// Report the local database's health without changing it.
+///
+/// `agora doctor` is the place to look when startup refused the database or
+/// recovered from a damaged one: it names the file, the schema version, the
+/// integrity result, the backups that can be restored, and the old files kept
+/// aside.
+///
+/// Returns `false` when it found a problem (damage, an unreadable store, or a
+/// database from a newer Agora). The caller exits 10 in that case, keeping the
+/// whole report on standard output.
+fn run_doctor(paths: &agora_core::app_paths::AppPaths, json: bool) -> anyhow::Result<bool> {
+    use agora_core::db::{inspect_local_state, LocalStateIntegrity};
+    let info = inspect_local_state(&paths.local_state_db());
+    let mut backups = info.backups.clone();
+    backups.reverse();
+    let (integrity, detail) = match &info.integrity {
+        LocalStateIntegrity::Ok => ("ok", String::new()),
+        LocalStateIntegrity::Corrupt(reason) => ("corrupt", reason.clone()),
+        LocalStateIntegrity::Missing => ("missing", String::new()),
+        LocalStateIntegrity::Unreadable(reason) => ("unreadable", reason.clone()),
+    };
+    let newer = info
+        .schema_version
+        .is_some_and(|version| version > info.supported_version);
+    let unreadable_schema =
+        !matches!(info.integrity, LocalStateIntegrity::Missing) && info.schema_version.is_none();
+    let problems = matches!(
+        info.integrity,
+        LocalStateIntegrity::Corrupt(_) | LocalStateIntegrity::Unreadable(_)
+    ) || unreadable_schema
+        || newer
+        || info.backups_error.is_some()
+        || info.kept_aside_error.is_some();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "path": info.path.display().to_string(),
+                "integrity": integrity,
+                "integrityDetail": detail,
+                "schemaVersion": info.schema_version,
+                "supportedVersion": info.supported_version,
+                "databaseIsNewer": newer,
+                "problems": problems,
+                "backups": backups.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                "backupsError": info.backups_error,
+                "backupsKept": agora_core::db::LOCAL_STATE_BACKUP_RETENTION,
+                "keptAside": info.kept_aside.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                "keptAsideError": info.kept_aside_error,
+            }))?
+        );
+        return Ok(!problems);
+    }
+    println!("Local database: {}", info.path.display());
+    match info.integrity {
+        LocalStateIntegrity::Ok => println!("Integrity: ok"),
+        LocalStateIntegrity::Corrupt(ref reason) => {
+            println!("Integrity: corrupt ({reason})");
+            println!(
+                "The next start keeps this file aside and restores the newest backup that \
+                 passes the check, or starts with a fresh database if none does."
+            );
+        }
+        LocalStateIntegrity::Missing => {
+            println!("Integrity: not created yet (the next start creates it)")
+        }
+        LocalStateIntegrity::Unreadable(ref reason) => {
+            println!("Integrity: could not read ({reason}). This is not reported as healthy.")
+        }
+    }
+    match info.schema_version {
+        Some(version) if newer => println!(
+            "Schema version: {version} (this build supports up to {}). The next start refuses \
+             it unless --fresh-database is given.",
+            info.supported_version
+        ),
+        Some(version) => println!(
+            "Schema version: {version} (supported up to {})",
+            info.supported_version
+        ),
+        None => println!("Schema version: could not read"),
+    }
+    if let Some(error) = &info.backups_error {
+        println!(
+            "Backups: could not read the backups folder ({error}). This is not the same as \
+             \"none\"."
+        );
+    } else if backups.is_empty() {
+        println!("Backups: none yet");
+    } else {
+        println!(
+            "Backups (newest first; the newest {} are kept, older ones are deleted after a new \
+             backup is written):",
+            agora_core::db::LOCAL_STATE_BACKUP_RETENTION
+        );
+        for backup in &backups {
+            println!("- {}", backup.display());
+        }
+    }
+    if let Some(error) = &info.kept_aside_error {
+        println!(
+            "Files kept aside after a previous start: could not read the data folder ({error}). \
+             This is not the same as \"none\"."
+        );
+    } else if info.kept_aside.is_empty() {
+        println!("Files kept aside after a previous start: none");
+    } else {
+        println!("Files kept aside after a previous start (never deleted by Agora):");
+        for path in &info.kept_aside {
+            println!("- {}", path.display());
+        }
+    }
+    if problems {
+        println!(
+            "Agora found problems with the local database (exit code 10). The report above \
+             names every one."
+        );
+    } else {
+        println!("Agora found no problems with the local database.");
+    }
+    Ok(!problems)
 }
 
 fn run_data_migration(
@@ -5800,6 +5978,9 @@ async fn run_command(
     let json = output_fmt.is_json_output();
 
     match cli.command {
+        // Handled before core initialization so it can report on a database
+        // that core would repair or refuse.
+        Commands::Doctor => unreachable!("doctor runs before core initialization"),
         Commands::Paths => {
             let values = serde_json::json!({
                 "root": paths.root().display().to_string(),
@@ -15582,6 +15763,25 @@ mod tests {
             }
             _ => panic!("expected crash analyze"),
         }
+    }
+
+    #[test]
+    fn local_database_overrides_parse_as_global_flags() {
+        let cli = Cli::try_parse_from([
+            "agora",
+            "--fresh-database",
+            "--migrate-without-backup",
+            "paths",
+        ])
+        .expect("both overrides are global");
+        assert!(cli.fresh_database);
+        assert!(cli.migrate_without_backup);
+    }
+
+    #[test]
+    fn doctor_parses_as_a_command() {
+        let cli = Cli::try_parse_from(["agora", "doctor"]).expect("doctor is a command");
+        assert!(matches!(cli.command, Commands::Doctor));
     }
 
     #[test]
