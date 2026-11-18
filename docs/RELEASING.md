@@ -376,9 +376,11 @@ key that may certify or revoke:
 1. Generate the new primary key pair offline. Put the public key in the next
    client's `AGORA_REGISTRY_PUBKEYS`, and keep the old key in that list for at
    least one release cycle.
-2. Sign a certificate with the **recovery** private key:
+2. Sign a certificate with the **recovery** private key. The script reads
+   `AGORA_REGISTRY_OLD_PRIVATE_KEY` or `--signing-key`; keep the key offline:
    `python scripts/make_registry_key_certificate.py --new-public-key <hex> --role primary --out key-certificate.json`
-3. Sign a revocation of the old primary with the same recovery key:
+3. Sign a revocation of the old primary with the same recovery key. The script
+   reads `AGORA_REGISTRY_RECOVERY_PRIVATE_KEY` or `--signing-key`:
    `python scripts/make_registry_revocation.py --revoked-public-key <old hex> --out revocation.json`
 4. Compile the catalog with the **new** private key in `ED25519_PRIVATE_KEY`,
    `AGORA_REGISTRY_KEY_CERTIFICATES=key-certificate.json`, and
@@ -434,7 +436,10 @@ open.
 - [ ] Release assets use the expected names.
 - [ ] A current packaged desktop client can download and open the new catalog.
 
-The private signing key belongs only in the protected CI environment. Never place it in documentation, issue comments, artifacts, or local shell history.
+The primary private key belongs only in the protected CI environment. The
+recovery private key belongs offline, on the owner's machine, never in CI.
+Neither belongs in documentation, issue comments, artifacts, or local shell
+history.
 
 ## Rollback
 
