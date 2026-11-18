@@ -2485,6 +2485,9 @@ async fn async_main() {
 fn run_doctor(paths: &agora_core::app_paths::AppPaths, json: bool) -> anyhow::Result<bool> {
     use agora_core::db::{inspect_local_state, LocalStateIntegrity};
     let info = inspect_local_state(&paths.local_state_db());
+    // Reuse the check `agora auth status` runs rather than reading the marker
+    // here: the account store is not part of the local database.
+    let account = agora_game_minecraft::msa::account_store_status();
     let mut backups = info.backups.clone();
     backups.reverse();
     let (integrity, detail) = match &info.integrity {
@@ -2504,7 +2507,8 @@ fn run_doctor(paths: &agora_core::app_paths::AppPaths, json: bool) -> anyhow::Re
     ) || unreadable_schema
         || newer
         || info.backups_error.is_some()
-        || info.kept_aside_error.is_some();
+        || info.kept_aside_error.is_some()
+        || account.needs_repair;
     if json {
         println!(
             "{}",
@@ -2521,6 +2525,12 @@ fn run_doctor(paths: &agora_core::app_paths::AppPaths, json: bool) -> anyhow::Re
                 "backupsKept": agora_core::db::LOCAL_STATE_BACKUP_RETENTION,
                 "keptAside": info.kept_aside.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
                 "keptAsideError": info.kept_aside_error,
+                "accountStore": {
+                    "needsRepair": account.needs_repair,
+                    "corruptFile": account.corrupt_file,
+                    "detectedAt": account.detected_at,
+                    "message": account.message,
+                },
             }))?
         );
         return Ok(!problems);
@@ -2584,13 +2594,29 @@ fn run_doctor(paths: &agora_core::app_paths::AppPaths, json: bool) -> anyhow::Re
             println!("- {}", path.display());
         }
     }
+    if account.needs_repair {
+        println!("Account store: needs repair");
+        if let Some(path) = &account.corrupt_file {
+            print!("  The unreadable account list was kept as {path}");
+            if let Some(detected) = account.detected_at {
+                print!(" (detected {detected})");
+            }
+            println!();
+        }
+        println!(
+            "  The active account still works, but accounts cannot be switched or added until \
+             it is repaired. Run `agora auth repair`."
+        );
+    } else {
+        println!("Account store: ok");
+    }
     if problems {
         println!(
-            "Agora found problems with the local database (exit code 10). The report above \
+            "Agora found problems with the local state (exit code 10). The report above \
              names every one."
         );
     } else {
-        println!("Agora found no problems with the local database.");
+        println!("Agora found no problems with the local state.");
     }
     Ok(!problems)
 }

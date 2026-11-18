@@ -171,7 +171,7 @@ agora plugin install package ./example-plugin.zip
 | Command | Purpose |
 | --- | --- |
 | `agora paths` | Print resolved application, database, cache, runtime, and instance paths |
-| `agora doctor` | Report the local database's path, schema version, integrity, backups, and files kept aside after recovery. It reads only: nothing is migrated, copied, renamed or deleted, and it works even when startup would refuse the database |
+| `agora doctor` | Report the local database's path, schema version, integrity, backups, and files kept aside after recovery, plus whether the saved account list needs repair. It reads only: nothing is migrated, copied, renamed or deleted, and it works even when startup would refuse the database |
 | `agora list-instances` | List local instances |
 | `agora get-instance <ID>` | Print one instance |
 | `agora inventory <INSTANCE>` | Inspect installed content |
@@ -187,7 +187,7 @@ Every command that needs launcher state opens `local_state.db` under the data ro
 - before any pending migration, copies the database with `VACUUM INTO` to `backups/local_state-<time>-v<version>.db`. The newest three backups are kept; older ones are deleted after a new backup is written. If the copy cannot be written, startup stops unless `--migrate-without-backup` is given;
 - applies migrations one step at a time, each in its own transaction that also records the step's version, so a failed step leaves the last successful version recorded and the database usable.
 
-`agora doctor` reports all of this without changing anything, including files kept aside as `local_state.db.corrupt-*` and `local_state.db.newer-v*`.
+`agora doctor` reports all of this without changing anything, including files kept aside as `local_state.db.corrupt-*` and `local_state.db.newer-v*`. It also runs the same account-list check as `agora auth status` and reports a corrupt or quarantined account index, naming `agora auth repair`; that is a local-state problem too, so it exits `10`.
 
 ### Games
 
@@ -991,7 +991,7 @@ The CLI maps many core failures to stable semantic ranges.
 
 Scripts should still inspect structured error output because several distinct errors share a range.
 
-`agora doctor` prints its whole report (human or `--json`) and exits `0` when the local database is healthy or not created yet. It exits `10` when it finds damage, a store it cannot read, or a database written by a newer Agora. The JSON report always includes `problems: true` or `false`, so a script can read the reason without parsing the message.
+`agora doctor` prints its whole report (human or `--json`) and exits `0` when the local database is healthy or not created yet. It exits `10` when it finds damage, a store it cannot read, a database written by a newer Agora, or a saved account list that needs `agora auth repair`. The JSON report always includes `problems: true` or `false`, so a script can read the reason without parsing the message.
 
 Most ordinary lookups for a nonexistent instance currently return generic exit code `1`, not `11`.
 

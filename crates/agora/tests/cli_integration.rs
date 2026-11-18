@@ -263,6 +263,7 @@ const NESTED_COMMANDS: &[&[&str]] = &[
     &["auth", "logout"],
     &["auth", "list"],
     &["auth", "switch"],
+    &["auth", "repair"],
     &["world", "list"],
     &["world", "rename"],
     &["world", "copy"],
@@ -8556,5 +8557,50 @@ fn doctor_exits_ten_for_a_damaged_database_and_keeps_the_report() {
     assert!(
         String::from_utf8_lossy(&human.stdout).contains("Integrity: corrupt"),
         "the full human report is still printed"
+    );
+}
+
+#[test]
+fn doctor_reports_a_corrupt_account_store_and_points_at_repair() {
+    let (_tmp, data_dir) = temp_data_dir();
+    // The repair marker lives in the credential folder, which follows
+    // AGORA_DATA_DIR. Select the same root explicitly so `doctor` and the
+    // credential resolver agree on where the account store is.
+    let kept = data_dir.join("msa-accounts-store.enc.corrupt-20260101T000000Z");
+    std::fs::write(&kept, b"unreadable").unwrap();
+    std::fs::write(
+        data_dir.join("msa-accounts-store.repair.json"),
+        serde_json::json!({
+            "corrupt_file": kept.display().to_string(),
+            "detected_at": "2026-01-01T00:00:00Z",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let args = ["--json", "doctor"];
+    let mut cmd = agora_command(&data_dir, &args);
+    cmd.env("AGORA_DATA_DIR", &data_dir);
+    let output = run_command(cmd, &args);
+
+    assert_eq!(
+        output.status.code(),
+        Some(10),
+        "a corrupt account store is a local-state problem too: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed = assert_json_stdout(&output);
+    assert_eq!(parsed["accountStore"]["needsRepair"], true);
+    assert_eq!(
+        parsed["accountStore"]["corruptFile"],
+        kept.display().to_string()
+    );
+    assert_eq!(parsed["problems"], true);
+    assert!(
+        parsed["accountStore"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("agora auth repair"),
+        "the report names the repair command: {parsed}"
     );
 }
