@@ -145,21 +145,23 @@ mod tests {
 
     #[test]
     fn any_public_host_is_scoped_to_images() {
+        // A host that resolves, because an unresolvable name now blocks the
+        // request (SSRF fail-closed). The three cases still test the policy.
         assert!(http_client::check_request_url_with_policy(
             ClientCategory::CommunityImage,
-            "https://badges.example/a.svg",
+            "https://example.com/a.svg",
             HostPolicy::AnyPublicHost,
         )
         .is_ok());
         assert!(http_client::check_request_url_with_policy(
             ClientCategory::Modrinth,
-            "https://badges.example/a.svg",
+            "https://example.com/a.svg",
             HostPolicy::AnyPublicHost,
         )
         .is_err());
         assert!(http_client::check_request_url_with_policy(
             ClientCategory::CommunityImage,
-            "http://badges.example/a.svg",
+            "http://example.com/a.svg",
             HostPolicy::AnyPublicHost,
         )
         .is_err());

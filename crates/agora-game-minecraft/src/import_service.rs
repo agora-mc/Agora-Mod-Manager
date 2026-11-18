@@ -1014,7 +1014,12 @@ impl ImportService {
             });
         }
 
-        let client = reqwest::Client::new();
+        let client = agora_core::http_client::apply_proxy(reqwest::Client::builder())?
+            .build()
+            .map_err(|e| LauncherError::Generic {
+                code: "ERR_HTTP_CLIENT_BUILD".into(),
+                message: format!("Failed to build pack HTTP client: {e}"),
+            })?;
         let result = if manifest.override_source.is_some() {
             crate::pack_install::install_complex_pack(&self.ctx, &client, &manifest, &instance_dir)
                 .await
