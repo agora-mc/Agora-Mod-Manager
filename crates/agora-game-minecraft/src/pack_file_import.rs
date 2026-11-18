@@ -199,15 +199,22 @@ async fn import_agora_json(
             .with_progress_sink(create_progress(&instance_id)),
     );
     creating.create(req).await?;
-    let instances = InstanceService::new(ctx.clone());
     let mut report =
         agora_pack_import::install_agora_pack_mods(ctx, &instance_id, &name, pack, install_anyway)
             .await;
     if agora_pack_import::nothing_installed_for_lack_of_connection(&report) {
         // Nothing usable was made, so do not leave an empty instance behind.
         // It goes to the trash, and a later import starts clean.
-        match instances.delete(&instance_id) {
-            Ok(()) => {
+        // `delete` takes the instance lock synchronously; keep its wait off this
+        // async task's thread.
+        let delete_ctx = ctx.clone();
+        let delete_id = instance_id.clone();
+        let deleted = tokio::task::spawn_blocking(move || {
+            InstanceService::new(delete_ctx).delete(&delete_id)
+        })
+        .await;
+        match deleted {
+            Ok(Ok(())) => {
                 let subject = if report.total == 1 {
                     "This mod needs".to_string()
                 } else {
@@ -222,9 +229,12 @@ async fn import_agora_json(
                     ),
                 });
             }
-            Err(error) => report.warnings.push(format!(
+            Ok(Err(error)) => report.warnings.push(format!(
                 "The mods could not be downloaded for lack of a connection, and the new \
                  instance could not be removed ({error}). It was kept; try again when you're online."
+            )),
+            Err(error) => report.warnings.push(format!(
+                "Removing the new instance did not finish ({error}); it was kept. Try again when online."
             )),
         }
     }

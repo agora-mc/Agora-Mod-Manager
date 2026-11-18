@@ -59,6 +59,10 @@ pbkdf2 = { version = "0.12", features = ["hmac"] }
 base64 = { workspace = true }
 uuid = { workspace = true }
 sysinfo = { workspace = true }
+# OS advisory file locks (flock/LockFileEx). Already in the dependency graph via
+# rusty-leveldb, so this adds no crate and no download; the kernel releases the
+# lock when the process dies, so a crashed holder never leaves a stale lock.
+fs2 = "0.4"
 rand = { workspace = true }
 semver = { workspace = true }
 thiserror = { workspace = true }

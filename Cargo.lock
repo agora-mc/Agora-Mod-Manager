@@ -106,6 +106,7 @@ dependencies = [
  "dirs 5.0.1",
  "ed25519-dalek",
  "flate2",
+ "fs2",
  "hex",
  "junction",
  "keyring",

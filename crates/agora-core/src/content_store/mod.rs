@@ -961,7 +961,18 @@ pub fn add_archive_replacing(
     let _lock = ctx
         .lock_manager
         .acquire(LockResource::ContentStore, "content-add")?;
+    add_archive_replacing_locked(ctx, archive_path, name, replace, source)
+}
 
+/// [`add_archive_replacing`] for a caller that already holds the content-store
+/// lock. An async caller takes it with `acquire_async` before calling this.
+pub(crate) fn add_archive_replacing_locked(
+    ctx: &Ctx,
+    archive_path: &Path,
+    name: Option<&str>,
+    replace: &HashSet<String>,
+    source: impl FnOnce(&str, &str) -> ContentSource,
+) -> Result<AddOutcome, ContentError> {
     if !archive_path.exists() {
         return Err(ContentError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,

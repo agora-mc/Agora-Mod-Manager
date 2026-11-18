@@ -146,6 +146,29 @@ pub fn publish_running(
     generation: &str,
     identity: ProcessIdentity,
 ) -> LauncherResult<()> {
+    write_running(paths, instance_id, generation, Some(identity))
+}
+
+/// Record that the game is running although its OS identity could not be read.
+///
+/// The launcher is watching the child handle, so it can still clear the lease
+/// when the game exits. After an Agora restart there is no identity to verify:
+/// the lease is then treated as an unfinished launch (indeterminate), never as
+/// a free instance, until the user clears it.
+pub fn publish_running_unverified(
+    paths: &AppPaths,
+    instance_id: &str,
+    generation: &str,
+) -> LauncherResult<()> {
+    write_running(paths, instance_id, generation, None)
+}
+
+fn write_running(
+    paths: &AppPaths,
+    instance_id: &str,
+    generation: &str,
+    identity: Option<ProcessIdentity>,
+) -> LauncherResult<()> {
     write_lease(
         paths,
         &RuntimeLease {
@@ -153,7 +176,7 @@ pub fn publish_running(
             instance_id: instance_id.to_string(),
             generation: generation.to_string(),
             state: RuntimeState::Running,
-            identity: Some(identity),
+            identity,
             launcher_pid: std::process::id(),
             recorded_at: chrono::Utc::now().to_rfc3339(),
         },

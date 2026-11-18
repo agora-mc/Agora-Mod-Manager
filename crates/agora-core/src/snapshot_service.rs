@@ -366,15 +366,22 @@ mod tests {
             .lock_manager
             .acquire(LockResource::Instance(id.clone()), "install")
             .unwrap();
-        let error = ctx
-            .lock_manager
-            .acquire_with_timeout(
-                LockResource::Instance(id.clone()),
-                "restore_snapshot",
-                std::time::Duration::from_millis(200),
-                None,
-            )
-            .unwrap_err();
+        // Another task, not the holder: a holder may re-enter its own lock,
+        // but a different thread still waits.
+        let contender = ctx.lock_manager.clone();
+        let contender_id = id.clone();
+        let error = std::thread::spawn(move || {
+            contender
+                .acquire_with_timeout(
+                    LockResource::Instance(contender_id),
+                    "restore_snapshot",
+                    std::time::Duration::from_millis(200),
+                    None,
+                )
+                .unwrap_err()
+        })
+        .join()
+        .unwrap();
         assert!(format!("{error:?}").contains("Lock") || format!("{error:?}").contains("lock"));
         drop(held);
 

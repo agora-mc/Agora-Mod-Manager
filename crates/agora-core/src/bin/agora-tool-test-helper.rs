@@ -13,12 +13,15 @@
 //!   --stderr <text>       print a line to stderr
 //!   --sleep-ms <ms>       sleep before exiting
 //!   --exit <code>         exit with this code (default: 0)
+//!   --hold-lock <dir>     take the content-store lock under <dir>, print `locked`, and hold it
+//!                         until killed (for cross-process lock tests)
 //!
 //! It is also a stand-in for `redMod.exe`: when the first argument is `deploy` it records the
 //! arguments in `redmod-deploy-args.txt` and writes the staged script blob
 //! `r6/cache/modded/final.redscripts` beside its working folder, which is what a run captured
 //! into a staging folder needs. A real REDmod deploy does the same under `-root=`.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -42,6 +45,7 @@ fn run() -> Result<u8, String> {
     let mut deletes: Vec<PathBuf> = Vec::new();
     let mut sleep_ms = 0u64;
     let mut code = 0u8;
+    let mut hold_lock: Option<PathBuf> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -85,6 +89,11 @@ fn run() -> Result<u8, String> {
                     .parse()
                     .map_err(|_| "--exit needs a code between 0 and 255".to_string())?;
             }
+            "--hold-lock" => {
+                hold_lock = Some(PathBuf::from(
+                    args.next().ok_or("--hold-lock needs a directory")?,
+                ));
+            }
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -100,6 +109,21 @@ fn run() -> Result<u8, String> {
     for path in deletes {
         std::fs::remove_file(&path)
             .map_err(|e| format!("could not delete {}: {e}", path.display()))?;
+    }
+    if let Some(root) = hold_lock {
+        agora_core::lock_manager::set_program_name("Agora test helper");
+        let manager = agora_core::lock_manager::LockManager::new(root);
+        let _guard = manager
+            .acquire(
+                agora_core::lock_manager::LockResource::ContentStore,
+                "test-holder",
+            )
+            .map_err(|error| format!("could not hold the lock: {error}"))?;
+        println!("locked");
+        std::io::stdout()
+            .flush()
+            .map_err(|error| format!("could not flush stdout: {error}"))?;
+        std::thread::sleep(std::time::Duration::from_secs(60));
     }
     if sleep_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(sleep_ms));

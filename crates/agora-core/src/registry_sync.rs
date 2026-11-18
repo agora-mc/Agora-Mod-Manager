@@ -135,10 +135,12 @@ pub async fn check_and_download_update(
 
     // Acquire cross-process RegistryUpdate lock for the entire
     // check / download / atomic-replace / cached-tag update transaction.
-    let _registry_lock = lock_manager.acquire(
-        crate::lock_manager::LockResource::RegistryUpdate,
-        "registry-sync",
-    )?;
+    let _registry_lock = lock_manager
+        .acquire_async(
+            crate::lock_manager::LockResource::RegistryUpdate,
+            "registry-sync",
+        )
+        .await?;
 
     let latest = match query_latest_release(registry_repo, github_token.as_deref()).await {
         Ok(release) => release,
