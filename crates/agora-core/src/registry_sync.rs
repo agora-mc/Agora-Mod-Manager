@@ -2306,10 +2306,7 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         let stolen_id = registry_bundle::key_id_for_public_key(&test_public(&stolen));
         fs::write(
             paths::registry_trust_state_path(dir.path()).unwrap(),
-            format!(
-                "v1 revoke {stolen_id}
-v1 revoke truncated-without-a-newline"
-            ),
+            format!("v1 revoke {stolen_id}\nv1 rev"),
         )
         .unwrap();
 
