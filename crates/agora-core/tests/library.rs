@@ -24,6 +24,7 @@ use tempfile::TempDir;
 fn test_ctx() -> (TempDir, Ctx) {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = Ctx::for_testing(tmp.path().to_path_buf());
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
     (tmp, ctx)
 }
 
