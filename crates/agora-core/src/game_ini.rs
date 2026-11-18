@@ -656,7 +656,8 @@ pub fn set_value_while_running(
     value: &str,
     allow_while_running: bool,
 ) -> Result<bool, IniError> {
-    let guard = guard_for(ctx, instance_id, "ini-edit", allow_while_running)?;
+    let store = store_of(ctx, instance_id)?;
+    let guard = guard_for_ini(ctx, instance_id, definition, &store, allow_while_running)?;
     set_value_locked(ctx, &guard, definition, file, section, key, value)
 }
 
@@ -710,7 +711,8 @@ pub fn unset_value_while_running(
     key: &str,
     allow_while_running: bool,
 ) -> Result<bool, IniError> {
-    let guard = guard_for(ctx, instance_id, "ini-edit", allow_while_running)?;
+    let store = store_of(ctx, instance_id)?;
+    let guard = guard_for_ini(ctx, instance_id, definition, &store, allow_while_running)?;
     unset_value_locked(ctx, &guard, definition, file, section, key)
 }
 
@@ -754,6 +756,29 @@ fn guard_for(
         )?)
     } else {
         Ok(InstanceGuard::for_mutation(ctx, instance_id, operation)?)
+    }
+}
+
+/// A refused guard for an INI edit, translated back to the INI-specific answer when the
+/// user-files journal can say which it is: a live session, or one that must be restored.
+fn guard_for_ini(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    store: &StoreId,
+    allow_while_running: bool,
+) -> Result<InstanceGuard, IniError> {
+    match guard_for(ctx, instance_id, "ini-edit", allow_while_running) {
+        Ok(guard) => Ok(guard),
+        Err(IniError::Lock(error))
+            if !allow_while_running && error.code() == "ERR_INSTANCE_RUNNING" =>
+        {
+            match refuse_during_session(ctx, definition, store) {
+                Ok(()) => Err(IniError::Lock(error)),
+                Err(specific) => Err(specific),
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 
