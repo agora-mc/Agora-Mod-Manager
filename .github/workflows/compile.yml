@@ -196,6 +196,7 @@ jobs:
         with:
           name: registry-artifacts
           path: |
+            registry.bundle
             registry.db
             registry.db.sig
             registry-web.json

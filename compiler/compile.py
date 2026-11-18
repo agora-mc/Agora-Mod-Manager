@@ -4869,6 +4869,149 @@ PLACEHOLDER_SIGNATURE = (
 
 
 # ---------------------------------------------------------------------------
+# Signed catalog bundle
+# ---------------------------------------------------------------------------
+
+CATALOG_BUNDLE_MAGIC = b"AGORA-CATALOG-V1"
+CATALOG_HEADER_DOMAIN = b"AGORA-CATALOG-HEADER-V1\n"
+CATALOG_BUNDLE_FORMAT = 1
+CATALOG_DEFAULT_VALIDITY_DAYS = 90
+
+
+def catalog_key_id(public_key: bytes) -> str:
+    """The same id the client derives: the first 16 hex characters of SHA-256."""
+    return hashlib.sha256(public_key).hexdigest()[:16]
+
+
+def _load_key_certificates() -> list[dict[str, Any]]:
+    """Optional key certificates for rotation.
+
+    ``AGORA_REGISTRY_KEY_CERTIFICATES`` names a JSON file holding an array of
+    certificates; ``AGORA_REGISTRY_KEY_CERTIFICATE`` holds one object. A
+    certificate is only a statement, so the compiler checks its shape and that
+    its id matches its public key. The client verifies the signature against a
+    key it already trusts.
+    """
+    path = os.environ.get("AGORA_REGISTRY_KEY_CERTIFICATES")
+    if path:
+        raw: Any = json.loads(Path(path).read_text(encoding="utf-8"))
+    elif os.environ.get("AGORA_REGISTRY_KEY_CERTIFICATE"):
+        raw = json.loads(os.environ["AGORA_REGISTRY_KEY_CERTIFICATE"])
+    else:
+        return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise ValueError("key certificates must be a JSON object or array")
+    certificates: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("each key certificate must be an object")
+        for field in ("key_id", "public_key", "signed_by", "signature"):
+            if not isinstance(item.get(field), str) or not item[field].strip():
+                raise ValueError(f"key certificate is missing {field}")
+        if catalog_key_id(bytes.fromhex(item["public_key"])) != item["key_id"]:
+            raise ValueError("key certificate id does not match its public key")
+        certificates.append(
+            {key: item[key] for key in ("key_id", "public_key", "signed_by", "signature")}
+        )
+    return certificates
+
+
+def _read_built_at(db_path: Path) -> str | None:
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT value_json FROM system_config WHERE key = 'built_at'"
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    try:
+        value = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, str) and value else None
+
+
+def build_catalog_bundle(db_path: Path, db_bytes: bytes, *, skip_sign: bool) -> bytes:
+    """Wrap the database in one signed file.
+
+    The header is signed over its exact serialized bytes, so the Rust client can
+    verify without re-canonicalizing the JSON. ``registry.db.sig`` remains for
+    older clients and the web export; the launcher reads ``registry.bundle``.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        validity_days = int(
+            os.environ.get("AGORA_REGISTRY_VALIDITY_DAYS", CATALOG_DEFAULT_VALIDITY_DAYS)
+        )
+    except ValueError as exc:
+        raise ValueError("AGORA_REGISTRY_VALIDITY_DAYS must be an integer") from exc
+    if not 1 <= validity_days <= 3650:
+        raise ValueError("AGORA_REGISTRY_VALIDITY_DAYS must be between 1 and 3650")
+    expires = now + timedelta(days=validity_days)
+    tag = os.environ.get("AGORA_REGISTRY_TAG") or f"registry-{now:%Y-%m-%d}"
+    built_at = _read_built_at(db_path) or now.isoformat()
+
+    key = None if skip_sign else get_signing_key()
+    if not skip_sign and (key is None or nacl is None):
+        raise RuntimeError("no signing key available for the catalog bundle")
+    if key is not None and nacl is not None:
+        public_key = key.verify_key.encode(encoder=nacl.encoding.RawEncoder)
+        key_id = catalog_key_id(public_key)
+    else:
+        key_id = "0" * 16
+
+    header: dict[str, Any] = {
+        "format": CATALOG_BUNDLE_FORMAT,
+        "key_id": key_id,
+        "schema_version": SCHEMA_VERSION,
+        "tag": tag,
+        "built_at": built_at,
+        "issued_at": now.isoformat(),
+        "expires_at": expires.isoformat(),
+        "db_len": len(db_bytes),
+        "db_sha256": hashlib.sha256(db_bytes).hexdigest(),
+    }
+    certificates = _load_key_certificates()
+    if certificates:
+        header["certificates"] = certificates
+    revoked = [
+        key.strip()
+        for key in os.environ.get("AGORA_REGISTRY_REVOKED_KEY_IDS", "").split(",")
+        if key.strip()
+    ]
+    if revoked:
+        header["revoked_key_ids"] = revoked
+
+    header_bytes = json.dumps(
+        header, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    if key is not None and nacl is not None:
+        signature = key.sign(
+            CATALOG_HEADER_DOMAIN + header_bytes,
+            encoder=nacl.encoding.RawEncoder,
+        )[:64]
+    else:
+        signature = b"\0" * 64
+
+    return b"".join(
+        (
+            CATALOG_BUNDLE_MAGIC,
+            len(header_bytes).to_bytes(4, "little"),
+            header_bytes,
+            signature,
+            db_bytes,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main compile routine
 # ---------------------------------------------------------------------------
 
@@ -5296,6 +5439,20 @@ def compile_registry(
             logger.info("Wrote signature to %s", sig_path)
         except RuntimeError as exc:
             logger.error("Signing failed: %s", exc)
+            sys.exit(1)
+
+    # One signed file carries the database and its signature. The separate
+    # .sig stays for older clients and the web export.
+    bundle_path = output_path.with_suffix(".bundle")
+    try:
+        bundle_bytes = build_catalog_bundle(output_path, db_bytes, skip_sign=skip_sign)
+        bundle_path.write_bytes(bundle_bytes)
+        logger.info("Wrote signed catalog bundle to %s", bundle_path)
+        if skip_sign:
+            logger.warning("--skip-sign: %s carries a placeholder signature", bundle_path)
+    except (ValueError, RuntimeError, OSError) as exc:
+        logger.error("Could not write the signed catalog bundle: %s", exc)
+        if not skip_sign:
             sys.exit(1)
 
     # ------------------------------------------------------------------

@@ -305,6 +305,71 @@ After publishing:
 - Confirm update checks can see the release.
 - Monitor support channels for migration, signing, and installer failures.
 
+## Catalog signing, rotation and expiry
+
+The launcher installs one file, `registry.bundle`. It holds a signed header and
+the SQLite database as one unit, so a crash cannot leave a database and a
+signature that describe different builds. The header names the signing key id,
+the schema version, the build time, the issue and expiry times, and the
+database length and SHA-256. `registry.db` and `registry.db.sig` are still
+published for the web export and older clients, but the launcher never installs
+them as a pair.
+
+### Trusted keys
+
+The client trusts a compiled-in list of Ed25519 public keys, each named by the
+first 16 hex characters of its SHA-256. A release build can override the list at
+compile time:
+
+| Variable | Meaning |
+| --- | --- |
+| `AGORA_REGISTRY_PUBKEY` | One public key, hex (the older single-key variable) |
+| `AGORA_REGISTRY_PUBKEYS` | Comma-separated public keys, hex (takes precedence) |
+
+The compiler derives the key id from `ED25519_PRIVATE_KEY`; operators never keep
+a separate id in sync.
+
+### Rotating a key
+
+Rotation is a trust statement, not a client update:
+
+1. Generate the new key pair offline. Put the public key in the next client's
+   `AGORA_REGISTRY_PUBKEYS`, and keep the old key in that list for at least one
+   release cycle.
+2. Sign a key certificate with the old private key:
+   `python scripts/make_registry_key_certificate.py --new-public-key <hex> --out key-certificate.json`
+3. Compile the catalog with the **new** private key in `ED25519_PRIVATE_KEY` and
+   `AGORA_REGISTRY_KEY_CERTIFICATES=key-certificate.json`. Clients that trust the
+   old key accept the new key from the certificate in the signed bundle.
+4. When every supported client knows the new key, remove the old key from the
+   compiled-in list and from `AGORA_REGISTRY_PUBKEYS`.
+
+A **compromised** key is retired by shipping a client build without it, and by
+compiling catalogs with `AGORA_REGISTRY_REVOKED_KEY_IDS=<old-id>` so clients that
+trust the new key refuse certificates signed by the old one. Until every client
+has that build, an attacker holding the old private key can still sign a bundle
+those clients accept; a short expiry limits how long such a bundle remains
+current. Never weaken or skip signature verification during a rotation.
+
+### Expiry and stale catalogs
+
+The compiler sets `issued_at` and `expires_at`; the default validity is 90 days,
+set with `AGORA_REGISTRY_VALIDITY_DAYS` (1–3650). `AGORA_REGISTRY_TAG` overrides
+the display tag.
+
+An expired catalog is still **readable**: Browse, item details, crash
+signatures and governance history keep working, and the app says the catalog is
+stale. Anything that downloads or replaces software from catalog-provided URLs
+and hashes refuses it: curated mod and game installs, and official plugin
+install/update/rollback. The update flow itself still works, because that is how
+a fresh catalog arrives.
+
+A bundle built before the installed one is refused, and a cached bundle whose
+signed build stamp cannot be read refuses the update rather than being treated
+as older. The previous verified bundle is kept as `registry.bundle.prev`; a
+crash during replacement, or a damaged current bundle, restores it on the next
+open.
+
 ## Catalog release checklist
 
 - [ ] Curated manifests validate.
@@ -313,7 +378,9 @@ After publishing:
 - [ ] Compiler tests pass.
 - [ ] The catalog is signed with the production key.
 - [ ] The public key expected by released clients matches the signing key.
-- [ ] Catalog database and web export signatures verify.
+- [ ] `registry.bundle` is present and its header names the expected key id.
+- [ ] Catalog database, bundle and web export signatures verify.
+- [ ] The signed expiry is in the future and long enough for the release cadence.
 - [ ] Release assets use the expected names.
 - [ ] A current packaged desktop client can download and open the new catalog.
 

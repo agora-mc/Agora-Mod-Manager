@@ -6,6 +6,9 @@ dist
 *.tsbuildinfo
 registry.db
 registry.db.sig
+registry.bundle
+registry.bundle.prev
+registry.bundle.untrusted*
 *.log
 # Test fixtures are often logs; keep them tracked.
 !crates/*/tests/**/*.log

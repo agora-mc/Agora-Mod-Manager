@@ -248,9 +248,11 @@ jobs:
           AGORA_OAUTH_CLIENT_ID: ${{ vars.AGORA_OAUTH_CLIENT_ID || secrets.AGORA_OAUTH_CLIENT_ID }}
           AGORA_REGISTRY_REPO: ${{ github.repository }}
           VITE_AGORA_REPOSITORY: ${{ github.repository }}
-          # Public key (not a secret); read from the Actions variable when
-          # present and fall back to a secret for legacy setups.
+          # Public keys (not secrets); read from Actions variables when present
+          # and fall back to secrets for legacy setups. Agora's build trusts
+          # PUBKEYS when it is set, otherwise the single PUBKEY.
           AGORA_REGISTRY_PUBKEY: ${{ vars.AGORA_REGISTRY_PUBKEY || secrets.AGORA_REGISTRY_PUBKEY }}
+          AGORA_REGISTRY_PUBKEYS: ${{ vars.AGORA_REGISTRY_PUBKEYS || secrets.AGORA_REGISTRY_PUBKEYS }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           # A key generated with a passphrase cannot be decoded without it, and
           # tauri-action only reports that ~14 minutes into the build. Leave the

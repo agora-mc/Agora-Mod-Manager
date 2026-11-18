@@ -491,11 +491,15 @@ The Tauri app tracks the currently cached `registry.db` release tag (e.g., `regi
 **Update Check Flow:**
 1. Query GitHub Releases API: `GET /repos/{owner}/{repo}/releases/latest`.
 2. Compare the returned tag name with the locally cached tag.
-3. If newer: download `registry.db` and `registry.db.sig` from the release assets.
-4. Verify the Ed25519 signature.
-5. Replace the old DB atomically (write to `registry.db.tmp`, then `rename` to `registry.db`).
-6. Check `schema_version` and trigger any necessary app-side migrations.
+3. If newer: download the single signed `registry.bundle` release asset.
+4. Verify its header: the signing key id is in the client's trusted key list (or is introduced by a certificate signed by one), the Ed25519 signature covers the header bytes, the payload hashes to the signed SHA-256, and the schema version is supported.
+5. Replace the bundle with one rename, keeping the previous verified bundle as `registry.bundle.prev`, then extract `registry.db` from the signed payload.
+6. Refuse a bundle built before the installed one, and refuse an update when the installed bundle's signed build stamp cannot be read.
 7. Show a notification: *"Registry updated to <tag>. <N> new mods, <M> updated entries."*
+
+The bundle header also carries `issued_at` and `expires_at`. An expired catalog is still readable for browsing and diagnosis, but the app marks it stale and refuses to install or update curated content or official plugins from it. `registry.db` and `registry.db.sig` remain published for the web export and older clients, but the launcher installs the bundle as one unit: there is no state in which the database and the signature it was verified against come from different builds. The previous bundle is promoted when the current one is incomplete or damaged.
+
+Clients trust a compiled-in list of public keys, each named by an id derived from the key. A new key is introduced by a certificate inside a bundle, signed by a key the client already trusts; a compromised key is retired by shipping a client build that no longer trusts it and by listing it in the bundle's `revoked_key_ids`. Rotation and retirement are operators' procedures, documented in [`docs/RELEASING.md`](docs/RELEASING.md#catalog-signing-rotation-and-expiry).
 
 If offline, the app skips the update check and uses the last cached DB. A "Limited Offline Mode" banner appears if the DB is older than 7 days.
 
