@@ -25,9 +25,9 @@ use agora_game_api::{
 use serde::{Deserialize, Serialize};
 
 use crate::ctx::Ctx;
-use crate::instance_runtime::InstanceGuard;
 use crate::game_deploy::{self, DeployMode, DeploymentPlan};
 use crate::game_plugins::{self, PluginEntry, PluginListError};
+use crate::instance_runtime::InstanceGuard;
 
 /// What a sort says when the list has duplicates, so its sorter cannot judge it.
 pub const DUPLICATES_BY_MASTERS_ONLY: &str =
@@ -3561,6 +3561,30 @@ pub fn move_plugin(
         false,
         false,
         None,
+    )?
+    .0)
+}
+
+/// [`move_plugin`], with the user's explicit answer to a running game.
+pub fn move_plugin_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    plugin: &str,
+    target: &MoveTarget,
+    allow_while_running: bool,
+) -> Result<MoveReport, LoadOrderError> {
+    let guard = guard_for(ctx, instance_id, "plugins-order", allow_while_running)?;
+    Ok(move_inner(
+        ctx,
+        instance_id,
+        definition,
+        None,
+        plugin,
+        target,
+        false,
+        false,
+        Some(&guard),
     )?
     .0)
 }
