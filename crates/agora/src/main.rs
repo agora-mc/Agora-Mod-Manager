@@ -368,6 +368,10 @@ enum Commands {
     },
     /// Discover installed games across supported stores.
     Games {
+        /// Change an instance even while its game is running. Only commands that edit an
+        /// instance use it; the instance lock is still taken.
+        #[arg(long, global = true)]
+        while_running: bool,
         #[command(subcommand)]
         action: GamesCmd,
     },
@@ -6663,7 +6667,7 @@ async fn run_command(
                 }
             }
         },
-        Commands::Games { action } => match action {
+        Commands::Games { action, while_running } => match action {
             GamesCmd::Discover => {
                 let report = agora_core::game_discovery::discover_with_folders(&ctx.paths);
                 if json {
@@ -7705,7 +7709,12 @@ async fn run_command(
                             std::process::exit(1);
                         }
                     };
-                    match agora_core::game_deploy::set_deployment(ctx, &instance_id, chosen) {
+                    match agora_core::game_deploy::set_deployment_while_running(
+                        ctx,
+                        &instance_id,
+                        chosen,
+                        while_running,
+                    ) {
                         Ok(()) => {
                             let shown = chosen.map(|m| m.as_str()).unwrap_or("auto");
                             if json {
@@ -8575,21 +8584,23 @@ async fn run_command(
                         // Where the item went: the caller's own `--into`/`--from`, or what the
                         // game's content rules say (the same call the desktop makes).
                         let (added_item, layer) = if into.is_some() || from.is_some() {
-                            match agora_core::game_deploy::add_content(
+                            match agora_core::game_deploy::add_content_while_running(
                                 ctx,
                                 &instance_id,
                                 &item_id,
                                 into.as_deref(),
                                 from.as_deref(),
+                                while_running,
                             ) {
                                 Ok(layer) => (item_id.clone(), Box::new(layer)),
                                 Err(e) => exit_with_error(json, &e.to_string()),
                             }
                         } else {
-                            match agora_core::game_deploy::add_to_instance(
+                            match agora_core::game_deploy::add_to_instance_while_running(
                                 ctx,
                                 &instance_id,
                                 &item_id,
+                                while_running,
                             ) {
                                 Ok(AddToInstance::Added {
                                     item_id: added_item,
@@ -8830,7 +8841,12 @@ async fn run_command(
                         instance_id,
                         item_id,
                     } => {
-                        match agora_core::game_deploy::remove_content(ctx, &instance_id, &item_id) {
+                        match agora_core::game_deploy::remove_content_while_running(
+                            ctx,
+                            &instance_id,
+                            &item_id,
+                            while_running,
+                        ) {
                             Ok(()) => {
                                 if json {
                                     let out = serde_json::json!({
@@ -8864,11 +8880,12 @@ async fn run_command(
                         instance_id,
                         item_id,
                     } => {
-                        match agora_core::game_deploy::set_content_enabled(
+                        match agora_core::game_deploy::set_content_enabled_while_running(
                             ctx,
                             &instance_id,
                             &item_id,
                             true,
+                            while_running,
                         ) {
                             Ok(()) => {
                                 if json {
@@ -8904,11 +8921,12 @@ async fn run_command(
                         instance_id,
                         item_id,
                     } => {
-                        match agora_core::game_deploy::set_content_enabled(
+                        match agora_core::game_deploy::set_content_enabled_while_running(
                             ctx,
                             &instance_id,
                             &item_id,
                             false,
+                            while_running,
                         ) {
                             Ok(()) => {
                                 if json {
@@ -8959,11 +8977,12 @@ async fn run_command(
                             std::process::exit(1);
                         }
                         let new_index = position - 1;
-                        match agora_core::game_deploy::move_content(
+                        match agora_core::game_deploy::move_content_while_running(
                             ctx,
                             &instance_id,
                             &item_id,
                             new_index,
+                            while_running,
                         ) {
                             Ok(()) => {
                                 if json {
@@ -9019,11 +9038,12 @@ async fn run_command(
                                 std::process::exit(1);
                             }
                         };
-                        match agora_core::game_deploy::set_content_own_copy(
+                        match agora_core::game_deploy::set_content_own_copy_while_running(
                             ctx,
                             &instance_id,
                             &item_id,
                             own_copy,
+                            while_running,
                         ) {
                             Ok(()) => {
                                 if json {
@@ -9136,7 +9156,13 @@ async fn run_command(
                     if !json {
                         println!("Deploying as '{mode}'.");
                     }
-                    match agora_core::game_deploy::deploy(ctx, &instance_id, game_def, mode) {
+                    match agora_core::game_deploy::deploy_while_running(
+                        ctx,
+                        &instance_id,
+                        game_def,
+                        mode,
+                        while_running,
+                    ) {
                         Ok(agora_core::game_deploy::DeployOutcome::UpToDate { plugins }) => {
                             if json {
                                 let out = serde_json::json!({
@@ -9224,7 +9250,11 @@ async fn run_command(
                     }
                 }
                 GameInstanceCmd::Undeploy { instance_id } => {
-                    match agora_core::game_deploy::undeploy(ctx, &instance_id) {
+                    match agora_core::game_deploy::undeploy_while_running(
+                        ctx,
+                        &instance_id,
+                        while_running,
+                    ) {
                         Ok(harvest) => {
                             if json {
                                 let out = serde_json::json!({
@@ -9420,10 +9450,11 @@ async fn run_command(
                             value,
                             unset,
                         },
+                        while_running,
                     )?;
                 }
                 GameInstanceCmd::Tools { action } => {
-                    instance_tools_command(ctx, json, action)?;
+                    instance_tools_command(ctx, json, action, while_running)?;
                 }
                 GameInstanceCmd::Saves {
                     instance_id,
@@ -9444,7 +9475,7 @@ async fn run_command(
                     instance_id: None,
                     action: Some(order),
                 } if order.is_load_order_command() => {
-                    plugins_load_order_command(ctx, json, order)?;
+                    plugins_load_order_command(ctx, json, order, while_running)?;
                 }
                 GameInstanceCmd::Plugins {
                     instance_id,
@@ -9514,13 +9545,14 @@ async fn run_command(
                             }
                         }
                         Some((name, active)) => {
-                            match agora_core::game_plugins::set_active_in(
+                            match agora_core::game_plugins::set_active_in_while_running(
                                 ctx,
                                 &instance_id,
                                 game_def,
                                 list_id.as_deref(),
                                 &name,
                                 active,
+                                while_running,
                             ) {
                                 Ok(changed) => {
                                     let state = if active { "active" } else { "inactive" };
@@ -11403,6 +11435,7 @@ fn instance_tools_command(
     ctx: &agora_core::ctx::Ctx,
     json: bool,
     action: InstanceToolsCmd,
+    while_running: bool,
 ) -> anyhow::Result<()> {
     use agora_core::game_tools;
     use agora_game_api::ToolId;
@@ -11463,7 +11496,7 @@ fn instance_tools_command(
             let launcher = &agora_core::game_launch::SystemLauncher;
             // `confirmed` is passed true only on the paths below that showed the swap's costs and got a yes.
             let run_as = |capture: game_tools::CaptureMode, confirmed: bool| {
-                game_tools::run(
+                game_tools::run_while_running(
                     ctx,
                     &instance_id,
                     game_def,
@@ -11472,6 +11505,7 @@ fn instance_tools_command(
                     confirmed,
                     launcher,
                     &cancel,
+                    while_running,
                 )
             };
             let mut outcome = if capture == game_tools::CaptureMode::Swap {
@@ -11575,7 +11609,13 @@ fn instance_tools_command(
         }
         InstanceToolsCmd::Rollback { tool, .. } => {
             let tool = tool_id(&tool);
-            let state = game_tools::rollback(ctx, &instance_id, game_def, &tool)
+            let state = game_tools::rollback_while_running(
+                ctx,
+                &instance_id,
+                game_def,
+                &tool,
+                while_running,
+            )
                 .unwrap_or_else(|e| fail(e.to_string()));
             if json {
                 println!("{}", serde_json::to_string_pretty(&state)?);
@@ -11590,7 +11630,13 @@ fn instance_tools_command(
         }
         InstanceToolsCmd::Remove { tool, .. } => {
             let tool = tool_id(&tool);
-            let removed = game_tools::remove(ctx, &instance_id, game_def, &tool)
+            let removed = game_tools::remove_while_running(
+                ctx,
+                &instance_id,
+                game_def,
+                &tool,
+                while_running,
+            )
                 .unwrap_or_else(|e| fail(e.to_string()));
             if json {
                 let out = serde_json::json!({
@@ -12166,6 +12212,7 @@ fn ini_command(
     instance_id: &str,
     game_def: &agora_game_api::GameDefinition,
     request: IniRequest,
+    while_running: bool,
 ) -> anyhow::Result<()> {
     use agora_core::game_ini;
 
@@ -12242,8 +12289,15 @@ fn ini_command(
         if value.is_some() {
             fail("--unset takes no value".to_string());
         }
-        let changed = match game_ini::unset_value(ctx, instance_id, game_def, &file, &section, &key)
-        {
+        let changed = match game_ini::unset_value_while_running(
+            ctx,
+            instance_id,
+            game_def,
+            &file,
+            &section,
+            &key,
+            while_running,
+        ) {
             Ok(changed) => changed,
             Err(e) => fail(e.to_string()),
         };
@@ -12288,8 +12342,16 @@ fn ini_command(
         return Ok(());
     };
 
-    let changed =
-        match game_ini::set_value(ctx, instance_id, game_def, &file, &section, &key, &value) {
+    let changed = match game_ini::set_value_while_running(
+        ctx,
+        instance_id,
+        game_def,
+        &file,
+        &section,
+        &key,
+        &value,
+        while_running,
+    ) {
             Ok(changed) => changed,
             Err(e) => fail(e.to_string()),
         };
@@ -12640,6 +12702,7 @@ fn plugins_load_order_command(
     ctx: &agora_core::ctx::Ctx,
     json: bool,
     cmd: InstancePluginsCmd,
+    while_running: bool,
 ) -> anyhow::Result<()> {
     use agora_core::game_load_order::{self as load_order, MoveTarget};
 
@@ -12693,12 +12756,13 @@ fn plugins_load_order_command(
     let locking = matches!(cmd, InstancePluginsCmd::Lock { .. });
     match cmd {
         InstancePluginsCmd::Sort { dry_run, .. } => {
-            match load_order::sort_and_order_in(
+            match load_order::sort_and_order_in_while_running(
                 ctx,
                 &instance_id,
                 game_def,
                 list_id.as_deref(),
                 dry_run,
+                while_running,
             ) {
                 Ok((report, order)) => {
                     if json {
@@ -12774,22 +12838,24 @@ fn plugins_load_order_command(
                 _ => fail("name one target: --to N, --before PLUGIN or --after PLUGIN".to_string()),
             };
             let result = if break_rule {
-                load_order::move_plugin_in_breaking_rules(
+                load_order::move_plugin_in_breaking_rules_while_running(
                     ctx,
                     &instance_id,
                     game_def,
                     list_id.as_deref(),
                     &plugin,
                     &target,
+                    while_running,
                 )
             } else {
-                load_order::move_plugin_in(
+                load_order::move_plugin_in_while_running(
                     ctx,
                     &instance_id,
                     game_def,
                     list_id.as_deref(),
                     &plugin,
                     &target,
+                    while_running,
                 )
             };
             match result {
@@ -12820,13 +12886,14 @@ fn plugins_load_order_command(
             }
         }
         InstancePluginsCmd::Lock { plugin, .. } | InstancePluginsCmd::Unlock { plugin, .. } => {
-            match agora_core::game_plugins::set_locked_in(
+            match agora_core::game_plugins::set_locked_in_while_running(
                 ctx,
                 &instance_id,
                 game_def,
                 list_id.as_deref(),
                 &plugin,
                 locking,
+                while_running,
             ) {
                 Ok(changed) => {
                     if json {
@@ -16847,6 +16914,7 @@ mod tests {
             )
             .expect("should parse");
             let Commands::Games {
+                while_running: _,
                 action:
                     crate::GamesCmd::Catalog {
                         action:
@@ -16896,6 +16964,7 @@ mod tests {
         .expect("should parse");
         match cli.command {
             Commands::Games {
+                while_running: _,
                 action:
                     GamesCmd::Instance {
                         action:
@@ -16928,6 +16997,7 @@ mod tests {
         .expect("should parse");
         match cli.command {
             Commands::Games {
+                while_running: _,
                 action:
                     GamesCmd::Instance {
                         action:

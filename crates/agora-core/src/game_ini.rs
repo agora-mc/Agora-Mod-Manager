@@ -673,10 +673,18 @@ pub fn set_value_locked(
     check_value(value)?;
     let store = store_of(ctx, guard.instance_id())?;
     let _user_files = user_files_lock_for_edit(ctx, definition, &store)?;
-    edit_locked(ctx, guard.instance_id(), definition, &store, file, |doc| {
-        let changed = doc.set(section, key, value)?;
-        Ok((changed, changed))
-    })
+    edit_locked_with_session_check(
+        ctx,
+        guard.instance_id(),
+        definition,
+        &store,
+        file,
+        !guard.allows_running(),
+        |doc| {
+            let changed = doc.set(section, key, value)?;
+            Ok((changed, changed))
+        },
+    )
 }
 
 /// Remove a key from one of the instance's files. Returns whether the file changed.
@@ -717,10 +725,18 @@ pub fn unset_value_locked(
     check_names(section, key)?;
     let store = store_of(ctx, guard.instance_id())?;
     let _user_files = user_files_lock_for_edit(ctx, definition, &store)?;
-    edit_locked(ctx, guard.instance_id(), definition, &store, file, |doc| {
-        let changed = doc.unset(section, key)?;
-        Ok((changed, changed))
-    })
+    edit_locked_with_session_check(
+        ctx,
+        guard.instance_id(),
+        definition,
+        &store,
+        file,
+        !guard.allows_running(),
+        |doc| {
+            let changed = doc.unset(section, key)?;
+            Ok((changed, changed))
+        },
+    )
 }
 
 fn guard_for(
@@ -784,8 +800,24 @@ pub(crate) fn edit_locked<T>(
     file: &str,
     f: impl FnOnce(&mut IniDocument) -> Result<(T, bool), IniError>,
 ) -> Result<T, IniError> {
+    edit_locked_with_session_check(ctx, instance_id, definition, store, file, true, f)
+}
+
+/// [`edit_locked`] with the running-session check optional. The guard's explicit
+/// override skips that check, but the instance lock is still held.
+fn edit_locked_with_session_check<T>(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    store: &StoreId,
+    file: &str,
+    check_session: bool,
+    f: impl FnOnce(&mut IniDocument) -> Result<(T, bool), IniError>,
+) -> Result<T, IniError> {
     let (rel, mapping) = resolve_file(definition, store, file)?;
-    refuse_during_session(ctx, definition, store)?;
+    if check_session {
+        refuse_during_session(ctx, definition, store)?;
+    }
     let copy = join_rel(&instance_dir(ctx, instance_id)?, rel.as_str());
     let mut document = if copy.exists() {
         load(&copy)?

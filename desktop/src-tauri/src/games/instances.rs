@@ -451,8 +451,9 @@ pub async fn games_instance_set_deployment(
     app: tauri::AppHandle,
     instance_id: String,
     mode: String,
+    while_running: Option<bool>,
 ) -> Result<InstanceDeployment, GamesError> {
-    blocking(move || set_deployment(&app, &instance_id, &mode)).await
+    blocking(move || set_deployment(&app, &instance_id, &mode, while_running.unwrap_or(false))).await
 }
 
 /// The Steam launch-options status the Linux instance page shows: whether the Agora wrapper is
@@ -957,15 +958,17 @@ fn set_deployment(
     app: &tauri::AppHandle,
     instance_id: &str,
     mode: &str,
+    while_running: bool,
 ) -> Result<InstanceDeployment, GamesError> {
     let chosen = parse_deployment(mode)?;
     let ctx = crate::core_context(app)?;
-    let record = load_record(&ctx, instance_id)?;
-    let manifest = game_instance::get_manifest(&ctx, instance_id).map_err(map_error)?;
-    if is_running(&ctx, &record, &manifest)? {
-        return Err(running_error(instance_id));
-    }
-    agora_core::game_deploy::set_deployment(&ctx, instance_id, chosen).map_err(core_failed)?;
+    agora_core::game_deploy::set_deployment_while_running(
+        &ctx,
+        instance_id,
+        chosen,
+        while_running,
+    )
+    .map_err(core_failed)?;
     Ok(InstanceDeployment {
         instance_id: instance_id.to_string(),
         deployment: chosen.map(|mode| mode.as_str().to_string()),

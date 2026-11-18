@@ -25,9 +25,9 @@ use agora_game_api::{
 use serde::{Deserialize, Serialize};
 
 use crate::ctx::Ctx;
+use crate::instance_runtime::InstanceGuard;
 use crate::game_deploy::{self, DeployMode, DeploymentPlan};
 use crate::game_plugins::{self, PluginEntry, PluginListError};
-use crate::lock_manager::LockResource;
 
 /// What a sort says when the list has duplicates, so its sorter cannot judge it.
 pub const DUPLICATES_BY_MASTERS_ONLY: &str =
@@ -3335,7 +3335,7 @@ pub fn sort(
     definition: &GameDefinition,
     dry_run: bool,
 ) -> Result<SortReport, LoadOrderError> {
-    Ok(sort_inner(ctx, instance_id, definition, None, dry_run, false)?.0)
+    Ok(sort_inner(ctx, instance_id, definition, None, dry_run, false, None)?.0)
 }
 
 /// [`sort`] for one list; `None` names the game's first list.
@@ -3346,7 +3346,7 @@ pub fn sort_in(
     list_id: Option<&str>,
     dry_run: bool,
 ) -> Result<SortReport, LoadOrderError> {
-    Ok(sort_inner(ctx, instance_id, definition, list_id, dry_run, false)?.0)
+    Ok(sort_inner(ctx, instance_id, definition, list_id, dry_run, false, None)?.0)
 }
 
 /// [`sort`], then the instance's load order as it stands afterwards. Both read the installed
@@ -3357,7 +3357,7 @@ pub fn sort_and_order(
     definition: &GameDefinition,
     dry_run: bool,
 ) -> Result<(SortReport, LoadOrder), LoadOrderError> {
-    let (report, order) = sort_inner(ctx, instance_id, definition, None, dry_run, true)?;
+    let (report, order) = sort_inner(ctx, instance_id, definition, None, dry_run, true, None)?;
     Ok((report, order.expect("the order was asked for")))
 }
 
@@ -3369,8 +3369,45 @@ pub fn sort_and_order_in(
     list_id: Option<&str>,
     dry_run: bool,
 ) -> Result<(SortReport, LoadOrder), LoadOrderError> {
-    let (report, order) = sort_inner(ctx, instance_id, definition, list_id, dry_run, true)?;
+    let (report, order) = sort_inner(ctx, instance_id, definition, list_id, dry_run, true, None)?;
     Ok((report, order.expect("the order was asked for")))
+}
+
+/// [`sort_and_order_in`], with the user's explicit answer to a running game.
+pub fn sort_and_order_in_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    dry_run: bool,
+    allow_while_running: bool,
+) -> Result<(SortReport, LoadOrder), LoadOrderError> {
+    let guard = guard_for(ctx, instance_id, "plugins-order", allow_while_running)?;
+    let (report, order) = sort_inner(
+        ctx,
+        instance_id,
+        definition,
+        list_id,
+        dry_run,
+        true,
+        Some(&guard),
+    )?;
+    Ok((report, order.expect("the order was asked for")))
+}
+
+fn guard_for(
+    ctx: &Ctx,
+    instance_id: &str,
+    operation: &str,
+    allow_while_running: bool,
+) -> Result<InstanceGuard, LoadOrderError> {
+    if allow_while_running {
+        InstanceGuard::for_mutation_while_running(ctx, instance_id, operation)
+            .map_err(|error| LoadOrderError::Plugins(PluginListError::Lock(error)))
+    } else {
+        InstanceGuard::for_mutation(ctx, instance_id, operation)
+            .map_err(|error| LoadOrderError::Plugins(PluginListError::Lock(error)))
+    }
 }
 
 fn sort_inner(
@@ -3380,6 +3417,7 @@ fn sort_inner(
     list_id: Option<&str>,
     dry_run: bool,
     want_order: bool,
+    guard: Option<&InstanceGuard>,
 ) -> Result<(SortReport, Option<LoadOrder>), LoadOrderError> {
     let rule = rule_of(definition, list_id)?;
     if rule.rules.kind == "none" {
@@ -3388,13 +3426,14 @@ fn sort_inner(
     if rule.rules.kind != "script" {
         return Err(LoadOrderError::NoRules(definition.id.as_str().to_string()));
     }
-    let _lock = ctx
-        .lock_manager
-        .acquire(
-            LockResource::Instance(instance_id.to_string()),
-            "plugins-order",
-        )
-        .map_err(PluginListError::from)?;
+    let owned;
+    let _guard = match guard {
+        Some(guard) => guard,
+        None => {
+            owned = guard_for(ctx, instance_id, "plugins-order", false)?;
+            &owned
+        }
+    };
     let links = plan_for_order_in(ctx, instance_id, definition, Some(&rule.id))?;
     let listed = game_plugins::list_in(ctx, instance_id, definition, Some(&rule.id))?;
     let (installed, names) = installed_files(ctx, instance_id, definition, rule, links.as_ref())?;
@@ -3521,6 +3560,7 @@ pub fn move_plugin(
         target,
         false,
         false,
+        None,
     )?
     .0)
 }
@@ -3543,6 +3583,32 @@ pub fn move_plugin_in(
         target,
         false,
         false,
+        None,
+    )?
+    .0)
+}
+
+/// [`move_plugin_in`], with the user's explicit answer to a running game.
+pub fn move_plugin_in_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    plugin: &str,
+    target: &MoveTarget,
+    allow_while_running: bool,
+) -> Result<MoveReport, LoadOrderError> {
+    let guard = guard_for(ctx, instance_id, "plugins-order", allow_while_running)?;
+    Ok(move_inner(
+        ctx,
+        instance_id,
+        definition,
+        list_id,
+        plugin,
+        target,
+        false,
+        false,
+        Some(&guard),
     )?
     .0)
 }
@@ -3566,6 +3632,32 @@ pub fn move_plugin_in_breaking_rules(
         target,
         true,
         false,
+        None,
+    )?
+    .0)
+}
+
+/// [`move_plugin_in_breaking_rules`], with the user's explicit answer to a running game.
+pub fn move_plugin_in_breaking_rules_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    plugin: &str,
+    target: &MoveTarget,
+    allow_while_running: bool,
+) -> Result<MoveReport, LoadOrderError> {
+    let guard = guard_for(ctx, instance_id, "plugins-order", allow_while_running)?;
+    Ok(move_inner(
+        ctx,
+        instance_id,
+        definition,
+        list_id,
+        plugin,
+        target,
+        true,
+        false,
+        Some(&guard),
     )?
     .0)
 }
@@ -3588,6 +3680,7 @@ pub fn move_plugin_and_order(
         target,
         false,
         true,
+        None,
     )?;
     Ok((report, order.expect("the order was asked for")))
 }
@@ -3610,6 +3703,7 @@ pub fn move_plugin_and_order_in(
         target,
         false,
         true,
+        None,
     )?;
     Ok((report, order.expect("the order was asked for")))
 }
@@ -3626,15 +3720,17 @@ fn move_inner(
     target: &MoveTarget,
     break_rule: bool,
     want_order: bool,
+    guard: Option<&InstanceGuard>,
 ) -> Result<(MoveReport, Option<LoadOrder>), LoadOrderError> {
     let rule = rule_of(definition, list_id)?;
-    let _lock = ctx
-        .lock_manager
-        .acquire(
-            LockResource::Instance(instance_id.to_string()),
-            "plugins-order",
-        )
-        .map_err(PluginListError::from)?;
+    let owned;
+    let _guard = match guard {
+        Some(guard) => guard,
+        None => {
+            owned = guard_for(ctx, instance_id, "plugins-order", false)?;
+            &owned
+        }
+    };
     let links = plan_for_order_in(ctx, instance_id, definition, Some(&rule.id))?;
     let mut entries = order_of_with_view(
         ctx,

@@ -22,8 +22,8 @@ use agora_game_api::{
 use serde::{Deserialize, Serialize};
 
 use crate::ctx::Ctx;
+use crate::instance_runtime::InstanceGuard;
 use crate::game_deploy::{DeploymentPlan, FileSource};
-use crate::lock_manager::LockResource;
 
 const STATE_FILE: &str = "plugin_list_state.json";
 
@@ -889,13 +889,32 @@ pub fn sync_without_content(
     definition: &GameDefinition,
     store: &StoreId,
 ) -> Result<Option<PluginSyncReport>, PluginListError> {
+    sync_without_content_while_running(ctx, instance_id, definition, store, false)
+}
+
+/// [`sync_without_content`], with the user's explicit answer to a running game.
+pub fn sync_without_content_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    store: &StoreId,
+    allow_while_running: bool,
+) -> Result<Option<PluginSyncReport>, PluginListError> {
+    let guard = guard_for(ctx, instance_id, "plugins-sync", allow_while_running)?;
+    sync_without_content_locked(ctx, &guard, definition, store)
+}
+
+/// [`sync_without_content`] for a caller that already holds the instance guard.
+pub fn sync_without_content_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    store: &StoreId,
+) -> Result<Option<PluginSyncReport>, PluginListError> {
+    let instance_id = guard.instance_id();
     if definition.load_orders.is_empty() {
         return Ok(None);
     }
-    let _lock = ctx.lock_manager.acquire(
-        LockResource::Instance(instance_id.to_string()),
-        "plugins-sync",
-    )?;
     let mut all = PluginSyncReport::default();
     for rule in &definition.load_orders {
         if let Some(report) = sync_locked_in_with_view(
@@ -1045,6 +1064,33 @@ pub fn set_active_in(
     name: &str,
     active: bool,
 ) -> Result<bool, PluginListError> {
+    set_active_in_while_running(ctx, instance_id, definition, list_id, name, active, false)
+}
+
+/// [`set_active_in`], with the user's explicit answer to a running game.
+pub fn set_active_in_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    name: &str,
+    active: bool,
+    allow_while_running: bool,
+) -> Result<bool, PluginListError> {
+    let guard = guard_for(ctx, instance_id, "plugins-toggle", allow_while_running)?;
+    set_active_in_locked(ctx, &guard, definition, list_id, name, active)
+}
+
+/// [`set_active_in`] for a caller that already holds the instance guard.
+pub fn set_active_in_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    name: &str,
+    active: bool,
+) -> Result<bool, PluginListError> {
+    let instance_id = guard.instance_id();
     let rule = rule_of(definition, list_id)?;
     if !active
         && matches!(
@@ -1054,11 +1100,9 @@ pub fn set_active_in(
     {
         return Err(PluginListError::NoInactiveState(name.to_string()));
     }
-    let _lock = ctx.lock_manager.acquire(
-        LockResource::Instance(instance_id.to_string()),
-        "plugins-toggle",
-    )?;
-    ensure_copy_editable(ctx, instance_id, definition)?;
+    if !guard.allows_running() {
+        ensure_copy_editable(ctx, instance_id, definition)?;
+    }
 
     let dir = instance_dir(ctx, instance_id)?;
     let path = dir.join(rule.file.as_str());
@@ -1128,6 +1172,23 @@ fn ensure_copy_editable(
     Ok(())
 }
 
+fn guard_for(
+    ctx: &Ctx,
+    instance_id: &str,
+    operation: &str,
+    allow_while_running: bool,
+) -> Result<InstanceGuard, PluginListError> {
+    if allow_while_running {
+        Ok(InstanceGuard::for_mutation_while_running(
+            ctx,
+            instance_id,
+            operation,
+        )?)
+    } else {
+        Ok(InstanceGuard::for_mutation(ctx, instance_id, operation)?)
+    }
+}
+
 /// Write an instance's plugin list from an import (MASTER_SPEC §26.10). `lines` are the plugins in
 /// load order with whether each is active; `managed` are the ones a content layer deploys, so a
 /// later sync keeps their states rather than activating them; `locked` are the names the import
@@ -1154,6 +1215,46 @@ pub fn import_list_in(
     managed: &[String],
     locked: &[String],
 ) -> Result<(), PluginListError> {
+    import_list_in_while_running(
+        ctx,
+        instance_id,
+        definition,
+        list_id,
+        lines,
+        managed,
+        locked,
+        false,
+    )
+}
+
+/// [`import_list_in`], with the user's explicit answer to a running game.
+#[allow(clippy::too_many_arguments)]
+pub fn import_list_in_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    lines: &[(String, bool)],
+    managed: &[String],
+    locked: &[String],
+    allow_while_running: bool,
+) -> Result<(), PluginListError> {
+    let guard = guard_for(ctx, instance_id, "plugins-import", allow_while_running)?;
+    import_list_in_locked(ctx, &guard, definition, list_id, lines, managed, locked)
+}
+
+/// [`import_list_in`] for a caller that already holds the instance guard.
+#[allow(clippy::too_many_arguments)]
+pub fn import_list_in_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    lines: &[(String, bool)],
+    managed: &[String],
+    locked: &[String],
+) -> Result<(), PluginListError> {
+    let instance_id = guard.instance_id();
     let rule = rule_of(definition, list_id)?;
     if matches!(
         &rule.format,
@@ -1163,7 +1264,9 @@ pub fn import_list_in(
             return Err(PluginListError::NoInactiveState(name.clone()));
         }
     }
-    ensure_copy_editable(ctx, instance_id, definition)?;
+    if !guard.allows_running() {
+        ensure_copy_editable(ctx, instance_id, definition)?;
+    }
     let dir = instance_dir(ctx, instance_id)?;
     let path = dir.join(rule.file.as_str());
     let doc = match &rule.format {
@@ -1218,11 +1321,34 @@ pub fn set_locked_in(
     name: &str,
     locked: bool,
 ) -> Result<bool, PluginListError> {
+    set_locked_in_while_running(ctx, instance_id, definition, list_id, name, locked, false)
+}
+
+/// [`set_locked_in`], with the user's explicit answer to a running game.
+pub fn set_locked_in_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    name: &str,
+    locked: bool,
+    allow_while_running: bool,
+) -> Result<bool, PluginListError> {
+    let guard = guard_for(ctx, instance_id, "plugins-lock", allow_while_running)?;
+    set_locked_in_locked(ctx, &guard, definition, list_id, name, locked)
+}
+
+/// [`set_locked_in`] for a caller that already holds the instance guard.
+pub fn set_locked_in_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    name: &str,
+    locked: bool,
+) -> Result<bool, PluginListError> {
+    let instance_id = guard.instance_id();
     let rule = rule_of(definition, list_id)?;
-    let _lock = ctx.lock_manager.acquire(
-        LockResource::Instance(instance_id.to_string()),
-        "plugins-lock",
-    )?;
     let wanted = key(name.trim().as_bytes());
     let listed = list_in(ctx, instance_id, definition, Some(&rule.id))?;
     let Some(entry) = listed

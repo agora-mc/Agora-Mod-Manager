@@ -878,7 +878,7 @@ pub fn delete_with_options(
         None
     };
     if instance_dir.join("instance_manifest.json").exists() && !base_unreadable {
-        crate::game_deploy::undeploy_locked(ctx, id)?;
+        crate::game_deploy::undeploy_locked(ctx, &_guard)?;
     }
     // What is left is the empty folder Agora made for the farm; the instance is going, so it does.
     if let Some(folder) = deployment_folder {

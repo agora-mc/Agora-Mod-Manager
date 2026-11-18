@@ -361,6 +361,7 @@ pub fn ensure_game_not_running(ctx: &Ctx, instance_id: &str, action: &str) -> Re
 pub struct InstanceGuard {
     instance_id: String,
     lock: LockGuard,
+    allow_while_running: bool,
 }
 
 impl InstanceGuard {
@@ -423,6 +424,7 @@ impl InstanceGuard {
         Ok(Self {
             instance_id: instance_id.to_string(),
             lock,
+            allow_while_running,
         })
     }
 
@@ -445,7 +447,14 @@ impl InstanceGuard {
         Ok(Self {
             instance_id: instance_id.to_string(),
             lock,
+            allow_while_running,
         })
+    }
+
+    /// Whether the user explicitly allowed this change while the game runs. Services
+    /// that have their own running-session check use this to skip it as well.
+    pub fn allows_running(&self) -> bool {
+        self.allow_while_running
     }
 
     /// The instance this guard authorises changes to.

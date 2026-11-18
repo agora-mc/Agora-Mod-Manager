@@ -830,16 +830,19 @@ pub async fn games_plugins_set_active(
     plugin: String,
     active: bool,
     list_id: Option<String>,
+    while_running: Option<bool>,
 ) -> Result<PluginChange, GamesError> {
+    let while_running = while_running.unwrap_or(false);
     run_blocking(app, "Changing the plugin", move |ctx| {
         game_definition!(&ctx, &instance_id, definition);
-        let changed = game_plugins::set_active_in(
+        let changed = game_plugins::set_active_in_while_running(
             &ctx,
             &instance_id,
             definition,
             list_id.as_deref(),
             &plugin,
             active,
+            while_running,
         )
         .map_err(core_failed)?;
         // The change is saved: a failed re-read must not turn it into a reported failure.
@@ -863,16 +866,19 @@ pub async fn games_plugins_set_locked(
     plugin: String,
     locked: bool,
     list_id: Option<String>,
+    while_running: Option<bool>,
 ) -> Result<PluginChange, GamesError> {
+    let while_running = while_running.unwrap_or(false);
     run_blocking(app, "Changing the lock", move |ctx| {
         game_definition!(&ctx, &instance_id, definition);
-        let changed = game_plugins::set_locked_in(
+        let changed = game_plugins::set_locked_in_while_running(
             &ctx,
             &instance_id,
             definition,
             list_id.as_deref(),
             &plugin,
             locked,
+            while_running,
         )
         .map_err(core_failed)?;
         // The change is saved: a failed re-read must not turn it into a reported failure.
