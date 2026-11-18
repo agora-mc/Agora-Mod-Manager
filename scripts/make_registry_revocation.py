@@ -32,8 +32,7 @@ try:
     import nacl.encoding  # type: ignore
     import nacl.signing  # type: ignore
 except ImportError:
-    print("PyNaCl is required (pip install -r compiler/requirements.txt).", file=sys.stderr)
-    raise SystemExit(1)
+    nacl = None  # type: ignore
 
 REVOKE_DOMAIN = b"AGORA-CATALOG-KEY-REVOKE-V1\n"
 
@@ -52,6 +51,9 @@ def parse_seed(raw: str) -> bytes:
 
 
 def main() -> int:
+    if nacl is None:
+        print("PyNaCl is required (pip install -r compiler/requirements.txt).", file=sys.stderr)
+        return 1
     parser = argparse.ArgumentParser(description=__doc__)
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--revoked-key-id", help="16 hex key id to revoke")

@@ -33,8 +33,7 @@ try:
     import nacl.encoding  # type: ignore
     import nacl.signing  # type: ignore
 except ImportError:
-    print("PyNaCl is required (pip install -r compiler/requirements.txt).", file=sys.stderr)
-    raise SystemExit(1)
+    nacl = None  # type: ignore
 
 CERT_DOMAIN = b"AGORA-CATALOG-KEY-CERT-V1\n"
 
@@ -53,6 +52,9 @@ def parse_seed(raw: str) -> bytes:
 
 
 def main() -> int:
+    if nacl is None:
+        print("PyNaCl is required (pip install -r compiler/requirements.txt).", file=sys.stderr)
+        return 1
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--new-public-key", required=True, help="hex Ed25519 public key")
     parser.add_argument(
