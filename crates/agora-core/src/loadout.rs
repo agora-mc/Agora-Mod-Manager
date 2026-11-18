@@ -441,12 +441,14 @@ pub fn apply_profile_with_undo(
     instance_dir: &Path,
     profile_name: &str,
     unlisted: UnlistedMods,
+    entries: &[&str],
 ) -> Result<(), LoadoutApplyError> {
     let profile = read_profile(instance_dir, profile_name).map_err(LoadoutApplyError::Profile)?;
-    let undo = crate::snapshot::create_snapshot(instance_dir, Some(UNDO_SNAPSHOT_LABEL))
+    let undo = crate::snapshot::create_snapshot(instance_dir, Some(UNDO_SNAPSHOT_LABEL), entries)
         .map_err(LoadoutApplyError::UndoPoint)?;
     if let Err(error) = apply_profile_items(instance_dir, &profile, unlisted) {
-        let rollback = crate::snapshot::restore_snapshot(instance_dir, &undo.id).map(|_| ());
+        let rollback =
+            crate::snapshot::restore_snapshot(instance_dir, &undo.id, entries).map(|_| ());
         return Err(LoadoutApplyError::Apply { error, rollback });
     }
     crate::lkg::run_retention(instance_dir).map_err(LoadoutApplyError::Retention)
@@ -649,6 +651,18 @@ pub fn delete_profile(instance_dir: &Path, profile_name: &str) -> Result<(), Str
 mod tests {
     use super::*;
     use crate::models::InstalledMod;
+
+    /// The Minecraft scope a test fixture models.
+    const TRACKED: &[&str] = &[
+        "mods",
+        "config",
+        "resourcepacks",
+        "shaderpacks",
+        "datapacks",
+        "saves",
+        "options.txt",
+        "instance_manifest.json",
+    ];
 
     fn make_manifest(_instance_dir: &Path, mod_files: &[&str]) -> InstanceManifest {
         let mods: Vec<InstalledMod> = mod_files
@@ -1112,7 +1126,7 @@ mod tests {
         manifest.mods[1].enabled = false;
         write_manifest(&dir, &manifest).unwrap();
 
-        apply_profile_with_undo(&dir, "all-on", UnlistedMods::Off).unwrap();
+        apply_profile_with_undo(&dir, "all-on", UnlistedMods::Off, TRACKED).unwrap();
         assert!(dir.join("mods").join("lithium.jar").exists());
 
         let snapshots = crate::snapshot::list_snapshots(&dir).unwrap();
@@ -1120,7 +1134,7 @@ mod tests {
             .iter()
             .find(|s| s.label.as_deref() == Some(UNDO_SNAPSHOT_LABEL))
             .expect("apply must save an undo point labelled before-loadout");
-        crate::snapshot::restore_snapshot(&dir, &undo.id).unwrap();
+        crate::snapshot::restore_snapshot(&dir, &undo.id, TRACKED).unwrap();
 
         assert!(
             dir.join("mods").join("lithium.jar.disabled").exists(),
@@ -1134,7 +1148,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = setup_instance(&tmp, &["sodium.jar"]);
 
-        let err = apply_profile_with_undo(&dir, "missing", UnlistedMods::Off)
+        let err = apply_profile_with_undo(&dir, "missing", UnlistedMods::Off, TRACKED)
             .expect_err("unknown profile");
         assert!(matches!(err, LoadoutApplyError::Profile(_)), "got {err:?}");
         assert!(crate::snapshot::list_snapshots(&dir).unwrap().is_empty());

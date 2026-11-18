@@ -43,7 +43,13 @@ impl LoadoutService {
         )?;
         InstallService::new(self.ctx.clone()).check_not_locked(instance_id)?;
         agora_core::instance_runtime::check_idle(&self.ctx.paths, instance_id)?;
-        loadout::apply_profile_with_undo(&instance_dir, profile_name, unlisted).map_err(apply_error)
+        loadout::apply_profile_with_undo(
+            &instance_dir,
+            profile_name,
+            unlisted,
+            crate::snapshot_scope::tracked_entries(),
+        )
+        .map_err(apply_error)
     }
 
     /// The enabled mods that `profile_name` does not list, sorted. Applying the

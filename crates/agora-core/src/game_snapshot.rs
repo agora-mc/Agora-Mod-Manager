@@ -1,0 +1,640 @@
+//! Snapshots and restore for generic game instances (MASTER_SPEC §23, §26).
+//!
+//! A game instance's snapshot holds its own state, not its mod bytes: the instance
+//! manifest (whose content layers name content-store items by id), the plugin lists
+//! and INI copies the game definition declares, the shared loadout store, the save
+//! choice (in the manifest), and the load-after rules, which live in the database and
+//! are written into the snapshot as data. Content objects stay in the content store,
+//! so an 84 GB setup costs kilobytes here.
+//!
+//! The state files are captured individually as data, not by folder: a game may
+//! keep a plugin list beside its mods (Cyberpunk's `mods/modlist.txt`), and walking
+//! that folder would copy mod bytes. The scope is therefore declared by the game
+//! definition plus the two core-owned pieces (`instance_manifest.json` and
+//! `.agora_loadouts`), never hard-coded per game.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use agora_game_api::{GameDefinition, LayerSource, LoadOrderDestination};
+use serde::{Deserialize, Serialize};
+
+use crate::ctx::Ctx;
+use crate::game_instance;
+use crate::game_load_order::{self, LoadAfterRule};
+use crate::game_loadout::GameLoadoutRules;
+use crate::lock_manager::LockResource;
+use crate::snapshot::{
+    self, RestoreCoverageKind, RestoreOutcome, Snapshot, SnapshotAux, SnapshotInputFile,
+    SnapshotOrigin,
+};
+
+/// The instance manifest is always part of a game instance's state.
+const INSTANCE_MANIFEST_ROOT: &str = "instance_manifest.json";
+
+/// Set while a game-instance restore is writing its files. It names the undo
+/// snapshot, so an interrupted restore is recovered by restoring that snapshot
+/// rather than guessed at.
+const GAME_RESTORE_PENDING: &str = ".agora_instance_restore_pending";
+
+/// What a game-instance snapshot records besides its files.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameSnapshotData {
+    /// Every list's load-after rules, by list id.
+    #[serde(default)]
+    pub rules: Vec<GameLoadoutRules>,
+    /// Content-store item ids the captured state names.
+    #[serde(default)]
+    pub content_refs: Vec<String>,
+}
+
+/// What a restore did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameRestoreOutcome {
+    #[serde(flatten)]
+    pub outcome: RestoreOutcome,
+    /// The snapshot taken just before the restore, so the restore can be undone.
+    pub undo_snapshot_id: String,
+    /// True when the restore ran while the game was running or could not be
+    /// proven idle, because the caller explicitly overrode that refusal.
+    pub forced_while_not_idle: bool,
+}
+
+/// The game definition an instance belongs to, or a refusal naming the missing id.
+pub fn definition_for(ctx: &Ctx, instance_id: &str) -> Result<GameDefinition, String> {
+    let manifest = game_instance::get_manifest(ctx, instance_id).map_err(|e| e.to_string())?;
+    ctx.games.game(&manifest.game).cloned().ok_or_else(|| {
+        format!(
+            "the definition for game '{}' is not installed, so this instance's snapshot scope \
+                 cannot be declared",
+            manifest.game.as_str()
+        )
+    })
+}
+
+/// The files the game definition declares as an instance's state.
+fn declared_state_paths(definition: &GameDefinition) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    paths.insert(INSTANCE_MANIFEST_ROOT.to_string());
+    for rule in &definition.load_orders {
+        // A view-destination file is generated output, not instance state.
+        if rule.destination == LoadOrderDestination::Instance {
+            paths.insert(rule.file.as_str().to_string());
+        }
+    }
+    for mapping in &definition.user_files {
+        paths.insert(mapping.instance_path.as_str().to_string());
+    }
+    paths
+}
+
+/// Every file under `.agora_loadouts`, relative to the instance folder.
+fn loadout_state_paths(dir: &Path) -> Result<Vec<String>, String> {
+    let mut paths = Vec::new();
+    let root = crate::loadout::loadouts_dir(dir);
+    if !root.is_dir() {
+        return Ok(paths);
+    }
+    let mut stack = vec![root.clone()];
+    while let Some(folder) = stack.pop() {
+        let entries = std::fs::read_dir(&folder)
+            .map_err(|error| format!("cannot read {}: {error}", folder.display()))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("cannot read {}: {error}", folder.display()))?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() {
+                let relative = path
+                    .strip_prefix(dir)
+                    .map_err(|error| format!("cannot place {}: {error}", path.display()))?
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                paths.push(relative);
+            }
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn read_state_file(dir: &Path, relative: &str) -> Result<Option<Vec<u8>>, String> {
+    let path = dir.join(Path::new(relative));
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot read '{}': {error}", path.display())),
+    }
+}
+
+/// The state files, as data. A missing declared file is recorded as absent.
+fn capture_files(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+) -> Result<Vec<SnapshotInputFile>, String> {
+    let dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| e.to_string())?;
+    let mut paths = declared_state_paths(definition);
+    paths.extend(loadout_state_paths(&dir)?);
+    let mut files = Vec::with_capacity(paths.len());
+    for relative in paths {
+        snapshot::validate_relative_path(&relative)?;
+        files.push(SnapshotInputFile {
+            contents: read_state_file(&dir, &relative)?,
+            relative_path: relative,
+        });
+    }
+    Ok(files)
+}
+
+/// Read the state a snapshot records as data: every declared list's rules, and
+/// the content-store items the manifest and loadout profiles name.
+pub fn capture_data(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+) -> Result<GameSnapshotData, String> {
+    let manifest = game_instance::get_manifest(ctx, instance_id).map_err(|e| e.to_string())?;
+    let dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| e.to_string())?;
+
+    let mut refs = BTreeSet::new();
+    for layer in manifest.layers.layers() {
+        if let LayerSource::Content { content } = &layer.source {
+            refs.insert(content.clone());
+        }
+    }
+    for profile in crate::loadout::list_profiles(&dir)? {
+        if let Some(state) = &profile.game {
+            for item in &state.content {
+                refs.insert(item.item.clone());
+            }
+        }
+    }
+
+    let mut rules = Vec::with_capacity(definition.load_orders.len());
+    for rule in &definition.load_orders {
+        rules.push(GameLoadoutRules {
+            list: rule.id.clone(),
+            rules: game_load_order::load_after_rules(ctx, instance_id, &rule.id)
+                .map_err(|e| e.to_string())?,
+        });
+    }
+
+    Ok(GameSnapshotData {
+        rules,
+        content_refs: refs.into_iter().collect(),
+    })
+}
+
+fn aux_for(data: &GameSnapshotData) -> Result<SnapshotAux, String> {
+    Ok(SnapshotAux {
+        content_refs: data.content_refs.clone(),
+        state: Some(serde_json::to_value(data).map_err(|e| e.to_string())?),
+    })
+}
+
+fn pending_path(instance_dir: &Path) -> PathBuf {
+    instance_dir.join(GAME_RESTORE_PENDING)
+}
+
+fn read_pending(instance_dir: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(pending_path(instance_dir)) {
+        Ok(undo) if !undo.trim().is_empty() => Ok(Some(undo.trim().to_string())),
+        Ok(_) => Err(
+            "a restore was interrupted and its undo snapshot is not recorded; check the instance \
+             before trying again"
+                .into(),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "a restore may have been interrupted, and its marker cannot be read: {error}"
+        )),
+    }
+}
+
+fn refuse_if_pending(instance_dir: &Path, recovering: Option<&str>) -> Result<(), String> {
+    match read_pending(instance_dir)? {
+        Some(undo) if recovering == Some(undo.as_str()) => Ok(()),
+        Some(undo) => Err(format!(
+            "a previous restore was interrupted. Restore snapshot {undo} to put the instance \
+             back before taking another snapshot"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Take a snapshot of a game instance. Acquires the instance lock and refuses
+/// while the game may be running, like every other front-end snapshot.
+pub fn create(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    label: Option<&str>,
+    origin: SnapshotOrigin,
+) -> Result<Snapshot, String> {
+    let _lock = ctx
+        .lock_manager
+        .acquire(LockResource::Instance(instance_id.to_string()), "snapshot")
+        .map_err(|e| e.to_string())?;
+    crate::instance_runtime::ensure_game_not_running(ctx, instance_id, "take a snapshot")?;
+    let snapshot = create_locked(ctx, instance_id, definition, label, origin)?;
+    if let Err(error) = crate::lkg::run_retention(
+        &ctx.paths
+            .instance_dir(instance_id)
+            .map_err(|e| e.to_string())?,
+    ) {
+        eprintln!("[snapshot] retention after capture failed: {error}");
+    }
+    Ok(snapshot)
+}
+
+/// Take a snapshot while the caller already holds the instance lock.
+pub fn create_locked(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    label: Option<&str>,
+    origin: SnapshotOrigin,
+) -> Result<Snapshot, String> {
+    let dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| e.to_string())?;
+    refuse_if_pending(&dir, None)?;
+    let files = capture_files(ctx, instance_id, definition)?;
+    let data = capture_data(ctx, instance_id, definition)?;
+    let aux = aux_for(&data)?;
+    snapshot::create_snapshot_from_data(&dir, label, &files, origin, &aux)
+}
+
+/// Take an automatic recovery point before a change, for a caller that already
+/// holds the instance lock. A game whose definition is not installed has no
+/// declared scope, so the change proceeds without a snapshot and the reason is
+/// logged; every other failure refuses the change.
+pub fn snapshot_before_change_locked(
+    ctx: &Ctx,
+    instance_id: &str,
+    label: &str,
+) -> Result<(), String> {
+    let definition = match definition_for(ctx, instance_id) {
+        Ok(definition) => definition,
+        Err(error) => {
+            eprintln!(
+                "[snapshot] no automatic recovery point before '{label}' for '{instance_id}': {error}"
+            );
+            return Ok(());
+        }
+    };
+    create_locked(
+        ctx,
+        instance_id,
+        &definition,
+        Some(label),
+        SnapshotOrigin::Automatic,
+    )
+    .map(|_| ())
+    .map_err(|error| format!("could not take a recovery point before '{label}': {error}"))
+}
+
+/// The content-store items a snapshot named that can no longer be restored,
+/// by item id (and the missing object path when the item itself still exists).
+pub fn missing_content(ctx: &Ctx, refs: &[String]) -> Vec<String> {
+    let mut missing = Vec::new();
+    for item_id in refs {
+        let path = ctx.paths.content_item_path(item_id);
+        let item = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<crate::content_store::ContentItem>(&text).ok());
+        let Some(item) = item else {
+            missing.push(item_id.clone());
+            continue;
+        };
+        for file in &item.files {
+            if !ctx.paths.content_object_path(&file.sha256).is_file() {
+                missing.push(format!("{item_id} ({})", file.path.as_str()));
+            }
+        }
+    }
+    missing
+}
+
+fn pre_restore_label(at: chrono::DateTime<chrono::Utc>) -> String {
+    format!(
+        "pre-restore-{}",
+        at.with_timezone(&chrono::Local).format("%Y%m%d-%H%M%S")
+    )
+}
+
+fn activity_is_running(ctx: &Ctx, instance_id: &str) -> Result<bool, String> {
+    match crate::instance_runtime::game_activity(ctx, instance_id) {
+        crate::instance_runtime::GameActivity::Idle => Ok(false),
+        crate::instance_runtime::GameActivity::Running => Ok(true),
+        crate::instance_runtime::GameActivity::CouldNotTell(reason) => Err(format!(
+            "could not tell whether '{instance_id}' is running: {reason}"
+        )),
+    }
+}
+
+fn roots_of(paths: &[String]) -> Vec<String> {
+    let mut roots: Vec<String> = paths
+        .iter()
+        .filter_map(|path| path.split('/').next().map(str::to_string))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    roots.sort();
+    roots
+}
+
+/// Restore a game instance to a snapshot.
+///
+/// Takes a pre-restore snapshot first, verifies every state blob, writes the
+/// state files atomically, then writes every list's rules in one database
+/// transaction and marks the deployment for a rebuild. Refused while the game
+/// is running, unless `force_while_running` is set (the caller has told the user
+/// what that means). A content item the snapshot names but the store no longer
+/// holds refuses the restore, naming it, before anything is touched.
+pub fn restore(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    snapshot_id: &str,
+    force_while_running: bool,
+) -> Result<GameRestoreOutcome, String> {
+    let _lock = ctx
+        .lock_manager
+        .acquire(
+            LockResource::Instance(instance_id.to_string()),
+            "restore_game_snapshot",
+        )
+        .map_err(|e| e.to_string())?;
+    restore_locked(
+        ctx,
+        instance_id,
+        definition,
+        snapshot_id,
+        force_while_running,
+    )
+}
+
+/// Restore a game instance while the caller already holds the instance lock.
+pub fn restore_locked(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    snapshot_id: &str,
+    force_while_running: bool,
+) -> Result<GameRestoreOutcome, String> {
+    let dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| e.to_string())?;
+
+    let forced_while_not_idle = match activity_is_running(ctx, instance_id) {
+        Ok(false) => false,
+        Ok(true) if force_while_running => true,
+        Ok(true) => {
+            return Err(format!(
+                "'{instance_id}' is running; close the game before restoring a snapshot"
+            ))
+        }
+        Err(error) if force_while_running => {
+            eprintln!("[snapshot] restoring '{instance_id}' despite: {error}");
+            true
+        }
+        Err(error) => return Err(format!("{error}; nothing was changed")),
+    };
+
+    // Validate everything before a single live file moves.
+    refuse_if_pending(&dir, Some(snapshot_id))?;
+    let aux = snapshot::snapshot_aux(&dir, snapshot_id)?;
+    let state = aux
+        .state
+        .ok_or_else(|| format!("snapshot {snapshot_id} is not a game-instance snapshot"))?;
+    let data: GameSnapshotData = serde_json::from_value(state)
+        .map_err(|e| format!("snapshot {snapshot_id} records unreadable game state: {e}"))?;
+
+    let missing = missing_content(ctx, &data.content_refs);
+    if !missing.is_empty() {
+        return Err(format!(
+            "snapshot {snapshot_id} needs content the store no longer holds: {}; nothing was changed",
+            missing.join(", ")
+        ));
+    }
+
+    // The undo point records the current state, including the current rules, so
+    // undoing the restore puts back everything the restore replaces.
+    let current = capture_data(ctx, instance_id, definition)?;
+    let undo_aux = aux_for(&current)?;
+    let current_files = capture_files(ctx, instance_id, definition)?;
+    let undo = snapshot::create_snapshot_from_data(
+        &dir,
+        Some(&pre_restore_label(chrono::Utc::now())),
+        &current_files,
+        SnapshotOrigin::Automatic,
+        &undo_aux,
+    )?;
+
+    // Durable before the first write: an interruption names the snapshot that
+    // puts the instance back.
+    snapshot::atomic_write_pub(&pending_path(&dir), undo.id.as_bytes())?;
+
+    let restored = match snapshot::restore_snapshot_data(&dir, snapshot_id) {
+        Ok(restored) => restored,
+        Err(error) => {
+            let rollback = snapshot::restore_snapshot_data(&dir, &undo.id);
+            let _ = std::fs::remove_file(pending_path(&dir));
+            return Err(match rollback {
+                Ok(_) => format!("{error}; the instance was put back as it was"),
+                Err(rollback) => format!(
+                    "{error}; putting the instance back also failed ({rollback}). Restore \
+                     snapshot {} to try again.",
+                    undo.id
+                ),
+            });
+        }
+    };
+
+    let rules: Vec<(String, Vec<LoadAfterRule>)> = data
+        .rules
+        .iter()
+        .map(|list| (list.list.clone(), list.rules.clone()))
+        .collect();
+    if let Err(error) = game_load_order::replace_all_load_after_rules(ctx, instance_id, &rules) {
+        // Put the files and rules back: a restore either lands whole or not at all.
+        let files = snapshot::restore_snapshot_data(&dir, &undo.id);
+        let undo_rules: Vec<(String, Vec<LoadAfterRule>)> = current
+            .rules
+            .iter()
+            .map(|list| (list.list.clone(), list.rules.clone()))
+            .collect();
+        let rules_back =
+            game_load_order::replace_all_load_after_rules(ctx, instance_id, &undo_rules);
+        let _ = std::fs::remove_file(pending_path(&dir));
+        return Err(match (files, rules_back) {
+            (Ok(_), Ok(())) => format!(
+                "the snapshot's rules could not be restored ({error}); the instance was put back as it was"
+            ),
+            (files, rules_back) => format!(
+                "the snapshot's rules could not be restored ({error}); the attempt to put the \
+                 instance back also failed (files: {files:?}, rules: {rules_back:?}). Undo snapshot \
+                 {} holds the previous state.",
+                undo.id
+            ),
+        });
+    }
+    let _ = std::fs::remove_file(pending_path(&dir));
+
+    if let Err(error) = crate::game_deploy::mark_for_redeploy(ctx, instance_id) {
+        eprintln!(
+            "[snapshot] restored '{instance_id}' but could not mark its deployment for a rebuild: {error}"
+        );
+    }
+    if let Err(error) = crate::lkg::run_retention(&dir) {
+        eprintln!("[snapshot] retention after restore failed: {error}");
+    }
+
+    let outcome = RestoreOutcome {
+        snapshot_id: snapshot_id.to_string(),
+        coverage: RestoreCoverageKind::Exact,
+        restored_roots: roots_of(&restored),
+        preserved_roots: Vec::new(),
+        cleanup_warning: None,
+        preserved_recovery_dir: None,
+        undo_snapshot_id: Some(undo.id.clone()),
+    };
+    Ok(GameRestoreOutcome {
+        outcome,
+        undo_snapshot_id: undo.id,
+        forced_while_not_idle,
+    })
+}
+
+/// The state an instance's snapshot should record, for callers that want to
+/// compare or inspect it without restoring.
+pub fn snapshot_data(
+    instance_dir: &Path,
+    snapshot_id: &str,
+) -> Result<Option<GameSnapshotData>, String> {
+    let aux = snapshot::snapshot_aux(instance_dir, snapshot_id)?;
+    let Some(state) = aux.state else {
+        return Ok(None);
+    };
+    serde_json::from_value(state)
+        .map(Some)
+        .map_err(|e| format!("snapshot {snapshot_id} records unreadable game state: {e}"))
+}
+
+/// Every snapshot folder under the data root: live instances and the game
+/// instances waiting in Recently deleted (their snapshot store travels with
+/// them, so a restore still needs their content).
+fn snapshot_folders(ctx: &Ctx) -> Result<Vec<(String, std::path::PathBuf)>, String> {
+    let mut folders = Vec::new();
+    let mut roots: Vec<(std::path::PathBuf, bool)> = vec![(ctx.paths.instances_root(), false)];
+    roots.push((ctx.paths.recently_deleted_games_root(), true));
+    for (root, in_trash) in roots {
+        if !root.exists() {
+            continue;
+        }
+        let entries = std::fs::read_dir(&root).map_err(|error| {
+            format!(
+                "cannot list '{}' to check snapshot content references: {error}",
+                root.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "cannot read an entry in '{}' to check snapshot content references: {error}",
+                    root.display()
+                )
+            })?;
+            let dir = if in_trash {
+                entry.path().join("instance")
+            } else {
+                entry.path()
+            };
+            if !dir.is_dir() {
+                continue;
+            }
+            let snapshots = dir.join(".agora_snapshots");
+            if snapshots.is_dir() {
+                let label = if in_trash {
+                    format!("{} (Recently deleted)", dir.display())
+                } else {
+                    dir.display().to_string()
+                };
+                folders.push((label, snapshots));
+            }
+        }
+    }
+    Ok(folders)
+}
+
+/// The snapshots that name a content item, as readable descriptions, or a
+/// refusal when a snapshot manifest cannot be read.
+///
+/// Fails closed: an unreadable manifest might name any item, so removal must
+/// treat the answer as "still needed", never as "unused".
+pub fn snapshots_using_content(ctx: &Ctx, item_id: &str) -> Result<Vec<String>, String> {
+    let mut using = Vec::new();
+    for (instance_label, snapshots_dir) in snapshot_folders(ctx)? {
+        let entries = std::fs::read_dir(&snapshots_dir).map_err(|error| {
+            format!(
+                "cannot list snapshots at '{}': {error}",
+                snapshots_dir.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "cannot read a snapshot entry at '{}': {error}",
+                    snapshots_dir.display()
+                )
+            })?;
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if path.extension().and_then(|e| e.to_str()) != Some("json")
+                || name.ends_with(".agora-verified.json")
+                || name == "live-file-index.json"
+                || name == "mutation-journal.json"
+            {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let aux = snapshot::snapshot_aux(snapshots_dir.parent().unwrap_or(&snapshots_dir), id)
+                .map_err(|error| {
+                    format!(
+                        "snapshot manifest '{}' cannot be read, so nothing is deleted: {error}",
+                        path.display()
+                    )
+                })?;
+            if aux.content_refs.iter().any(|content| content == item_id) {
+                using.push(format!("snapshot '{id}' of {instance_label}"));
+            }
+        }
+    }
+    Ok(using)
+}

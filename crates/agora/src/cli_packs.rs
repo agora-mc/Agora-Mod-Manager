@@ -654,6 +654,7 @@ pub async fn run_backup(
                     agora_core::snapshot::create_snapshot_with_origin(
                         &instance_dir,
                         Some("backup export"),
+                        agora_game_minecraft::snapshot_scope::tracked_entries(),
                         agora_core::snapshot::SnapshotOrigin::User,
                     )
                     .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -661,9 +662,14 @@ pub async fn run_backup(
                 }
             };
             std::fs::create_dir_all(&out)?;
-            let path =
-                agora_core::backup::export_instance_backup(ctx, &instance, &snapshot_id, &out)
-                    .await?;
+            let path = agora_core::backup::export_instance_backup(
+                ctx,
+                &instance,
+                &snapshot_id,
+                &out,
+                agora_game_minecraft::snapshot_scope::tracked_entries(),
+            )
+            .await?;
             if json {
                 println!(
                     "{}",

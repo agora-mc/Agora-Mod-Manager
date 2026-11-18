@@ -506,7 +506,10 @@ pub fn run_retention(instance_dir: &Path) -> Result<(), String> {
                         .is_some_and(|label| label.starts_with("pre-restore-")),
                 is_loadout_undo: !snapshot.is_preserved()
                     && snapshot.label.as_deref() == Some(crate::loadout::UNDO_SNAPSHOT_LABEL),
-                is_preserved: snapshot.is_preserved(),
+                // A damaged snapshot is never evicted automatically: its
+                // contents cannot be judged, and silently deleting it would
+                // remove the only copy of something a person may still want.
+                is_preserved: snapshot.is_preserved() || snapshot.is_unreadable(),
                 is_protected: snapshot
                     .label
                     .as_deref()
@@ -556,9 +559,11 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    const TRACKED: &[&str] = &["mods", "config", "saves", "instance_manifest.json"];
+
     fn create_test_snapshot(instance_dir: &Path, label: &str) -> String {
         std::fs::write(instance_dir.join("instance_manifest.json"), b"{}\n").unwrap();
-        crate::snapshot::create_snapshot(instance_dir, Some(label))
+        crate::snapshot::create_snapshot(instance_dir, Some(label), TRACKED)
             .unwrap()
             .id
     }
@@ -972,7 +977,7 @@ mod tests {
 ",
         )
         .unwrap();
-        crate::snapshot::create_snapshot_with_origin(instance_dir, Some(label), origin)
+        crate::snapshot::create_snapshot_with_origin(instance_dir, Some(label), TRACKED, origin)
             .unwrap()
             .id
     }
@@ -1228,6 +1233,7 @@ mod tests {
                 file_count: 0,
                 size_estimate: 0,
                 origin: None,
+                unreadable: None,
             }
             .is_preserved()
         };

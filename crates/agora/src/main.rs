@@ -1851,6 +1851,10 @@ enum SnapshotsCmd {
     Restore {
         instance: String,
         snapshot_id: String,
+        /// Restore a game instance even though its game is running or could not
+        /// be proven idle. The running game may write over the restored files.
+        #[arg(long)]
+        force: bool,
     },
     Delete {
         instance: String,
@@ -2364,7 +2368,12 @@ async fn async_main() {
 
     let (ctx, warnings) =
         match agora_core::ctx::CoreContext::initialize(paths.clone(), registry_builder) {
-            Ok(result) => result,
+            Ok((ctx, warnings)) => (
+                ctx.with_minecraft_snapshot_entries(
+                    agora_game_minecraft::snapshot_scope::tracked_entries(),
+                ),
+                warnings,
+            ),
             Err(error) => {
                 progress.log("error", &format!("Core initialization failed: {error}"));
                 eprintln!("Error initializing Agora core: {error}");
@@ -4730,12 +4739,10 @@ async fn run_snapshots_command(
             if !instance_dir.exists() {
                 anyhow::bail!("Instance '{}' not found", instance);
             }
-            let snapshot = agora_core::snapshot::create_snapshot_with_origin(
-                &instance_dir,
-                label.as_deref(),
-                agora_core::snapshot::SnapshotOrigin::User,
-            )
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            // The same core service the desktop uses: it picks a game instance's
+            // declared scope, and takes the instance lock and idle check.
+            let snapshot = agora_core::snapshot_service::SnapshotService::new(ctx.clone())
+                .create(&instance, label.as_deref())?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&snapshot)?);
             } else {
@@ -4749,6 +4756,7 @@ async fn run_snapshots_command(
         SnapshotsCmd::Restore {
             instance,
             snapshot_id,
+            force,
         } => {
             let instance_dir = agora_core::paths::instance_dir(data_dir, &instance)?;
             if !instance_dir.exists() {
@@ -4758,7 +4766,7 @@ async fn run_snapshots_command(
             // the launch-exclusion check, and the undo snapshot are not
             // things a second front end gets to skip.
             let outcome = agora_core::snapshot_service::SnapshotService::new(ctx.clone())
-                .restore(&instance, &snapshot_id)?;
+                .restore_forcing(&instance, &snapshot_id, force)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
             } else {
@@ -16972,6 +16980,9 @@ mod tests {
         let mut games = agora_core::game_registry::GameRegistry::builder();
         agora_game_minecraft::register_into(&mut games).unwrap();
         let (ctx, _) = agora_core::ctx::CoreContext::initialize(paths.clone(), games).unwrap();
+        let ctx = ctx.with_minecraft_snapshot_entries(
+            agora_game_minecraft::snapshot_scope::tracked_entries(),
+        );
         let progress = super::CliProgressSink::new(&root.join("cli.log"), false).unwrap();
 
         let entry_id = "20200101T000000Z-test";

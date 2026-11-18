@@ -18,11 +18,53 @@ use crate::snapshot::{self, RestoreOutcome, Snapshot};
 
 pub struct SnapshotService {
     ctx: Ctx,
+    /// The tracked roots a Minecraft instance's snapshot covers. Core no longer
+    /// knows them; the Minecraft package declares them and the adapter passes
+    /// them here. A generic game instance ignores this and declares its own.
+    minecraft_entries: Vec<String>,
 }
 
 impl SnapshotService {
     pub fn new(ctx: Ctx) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            minecraft_entries: Vec::new(),
+        }
+    }
+
+    /// Supply the Minecraft tracked-entry set (declared by the Minecraft
+    /// package) for this service. Without it, a Minecraft snapshot is refused
+    /// rather than taken against an empty scope.
+    pub fn with_minecraft_entries(mut self, entries: &[&str]) -> Self {
+        self.minecraft_entries = entries.iter().map(|entry| (*entry).to_string()).collect();
+        self
+    }
+
+    fn require_minecraft_entries(&self) -> LauncherResult<Vec<&str>> {
+        let entries = if self.minecraft_entries.is_empty() {
+            &self.ctx.minecraft_snapshot_entries
+        } else {
+            &self.minecraft_entries
+        };
+        if entries.is_empty() {
+            return Err(LauncherError::Generic {
+                code: "ERR_SNAPSHOT_SCOPE".into(),
+                message: "the Minecraft snapshot scope was not supplied by this front end".into(),
+            });
+        }
+        Ok(entries.iter().map(String::as_str).collect())
+    }
+
+    /// Whether `instance_id` is a generic game instance rather than a
+    /// Minecraft one. A database that cannot be read is an error, never a
+    /// guess: the two kinds take different recovery paths.
+    fn is_game_instance(&self, instance_id: &str) -> LauncherResult<bool> {
+        crate::game_instance::get(&self.ctx, instance_id)
+            .map(|record| record.is_some())
+            .map_err(|error| LauncherError::Generic {
+                code: "ERR_LOCAL_STATE_FAILED".into(),
+                message: format!("cannot tell whether '{instance_id}' is a game instance: {error}"),
+            })
     }
 
     /// Capture a full snapshot of an instance.
@@ -32,11 +74,39 @@ impl SnapshotService {
             .ctx
             .lock_manager
             .acquire(LockResource::Instance(instance_id.to_string()), "snapshot")?;
+
+        // A game instance declares its own scope from its definition; capture
+        // the same way a change there takes an automatic snapshot.
+        if self.is_game_instance(instance_id)? {
+            let definition = crate::game_snapshot::definition_for(&self.ctx, instance_id)
+                .map_err(snapshot_error)?;
+            crate::instance_runtime::ensure_game_not_running(
+                &self.ctx,
+                instance_id,
+                "take a snapshot",
+            )
+            .map_err(snapshot_error)?;
+            let snapshot = crate::game_snapshot::create_locked(
+                &self.ctx,
+                instance_id,
+                &definition,
+                label,
+                snapshot::SnapshotOrigin::User,
+            )
+            .map_err(snapshot_error)?;
+            if let Err(error) = crate::lkg::run_retention(&instance_dir) {
+                eprintln!("[snapshot] retention after capture failed: {error}");
+            }
+            return Ok(snapshot);
+        }
+
         crate::instance_runtime::check_idle(&self.ctx.paths, instance_id)?;
+        let entries = self.require_minecraft_entries()?;
 
         let snapshot = snapshot::create_snapshot_with_origin(
             &instance_dir,
             label,
+            &entries,
             snapshot::SnapshotOrigin::User,
         )
         .map_err(snapshot_error)?;
@@ -54,12 +124,40 @@ impl SnapshotService {
     /// snapshot and the restore it protects cannot be separated by another
     /// mutation.
     pub fn restore(&self, instance_id: &str, snapshot_id: &str) -> LauncherResult<RestoreOutcome> {
+        self.restore_forcing(instance_id, snapshot_id, false)
+    }
+
+    /// [`restore`](Self::restore) with the caller's explicit answer for a game
+    /// that is running (or cannot be proven idle). Minecraft instances have no
+    /// such override; the flag is ignored for them.
+    pub fn restore_forcing(
+        &self,
+        instance_id: &str,
+        snapshot_id: &str,
+        force_while_running: bool,
+    ) -> LauncherResult<RestoreOutcome> {
         let instance_dir = self.ctx.paths.instance_dir(instance_id)?;
         let _guard = self.ctx.lock_manager.acquire(
             LockResource::Instance(instance_id.to_string()),
             "restore_snapshot",
         )?;
+
+        if self.is_game_instance(instance_id)? {
+            let definition = crate::game_snapshot::definition_for(&self.ctx, instance_id)
+                .map_err(snapshot_error)?;
+            let outcome = crate::game_snapshot::restore_locked(
+                &self.ctx,
+                instance_id,
+                &definition,
+                snapshot_id,
+                force_while_running,
+            )
+            .map_err(snapshot_error)?;
+            return Ok(outcome.outcome);
+        }
+
         crate::instance_runtime::check_idle(&self.ctx.paths, instance_id)?;
+        let entries = self.require_minecraft_entries()?;
 
         // Validate the target before capturing anything: an invalid request
         // should not cost the user a snapshot.
@@ -77,8 +175,8 @@ impl SnapshotService {
             },
         )?;
 
-        let outcome =
-            snapshot::restore_snapshot(&instance_dir, snapshot_id).map_err(snapshot_error)?;
+        let outcome = snapshot::restore_snapshot(&instance_dir, snapshot_id, &entries)
+            .map_err(snapshot_error)?;
         self.sync_row_from_restored_manifest(instance_id)?;
 
         if let Err(error) = crate::lkg::run_retention(&instance_dir) {
@@ -189,6 +287,27 @@ mod tests {
     use crate::test_root::RemoveOnDrop;
     use std::fs;
 
+    /// The Minecraft folders the fixtures model.
+    const TRACKED: &[&str] = &[
+        "mods",
+        "config",
+        "resourcepacks",
+        "shaderpacks",
+        "datapacks",
+        "saves",
+        "options.txt",
+        "instance_manifest.json",
+    ];
+    const PRELAUNCH: &[&str] = &[
+        "mods",
+        "config",
+        "resourcepacks",
+        "shaderpacks",
+        "datapacks",
+        "options.txt",
+        "instance_manifest.json",
+    ];
+
     #[test]
     fn pre_restore_label_stamps_the_local_clock_the_list_shows() {
         use chrono::TimeZone;
@@ -220,19 +339,19 @@ mod tests {
         fs::write(dir.join("mods").join("a.jar"), b"original").unwrap();
         fs::create_dir_all(dir.join("saves").join("world")).unwrap();
         fs::write(dir.join("saves").join("world").join("level.dat"), b"world").unwrap();
-        (guard, SnapshotService::new(ctx.clone()), ctx, instance_id)
+        (
+            guard,
+            SnapshotService::new(ctx.clone()).with_minecraft_entries(TRACKED),
+            ctx,
+            instance_id,
+        )
     }
 
     #[test]
     fn restore_takes_an_undo_snapshot_scoped_to_what_it_replaces() {
         let (_root, service, ctx, id) = service();
         let dir = ctx.paths.instance_dir(&id).unwrap();
-        let scoped = snapshot::create_snapshot_scoped(
-            &dir,
-            Some("pre-launch"),
-            snapshot::prelaunch_tracked_entries(),
-        )
-        .unwrap();
+        let scoped = snapshot::create_snapshot_scoped(&dir, Some("pre-launch"), PRELAUNCH).unwrap();
 
         fs::write(dir.join("mods").join("a.jar"), b"broken").unwrap();
         let outcome = service.restore(&id, &scoped.id).unwrap();
@@ -313,7 +432,7 @@ mod tests {
 
         // Snapshot the 26.2 state, then move the instance back to 26.1.2.
         write_manifest("26.2", "0.20.0", true);
-        let snap = snapshot::create_snapshot(&dir, Some("migration-26.2")).unwrap();
+        let snap = snapshot::create_snapshot(&dir, Some("migration-26.2"), TRACKED).unwrap();
         write_manifest("26.1.2", "0.19.5", false);
 
         service.restore(&id, &snap.id).unwrap();
@@ -332,7 +451,7 @@ mod tests {
     fn restore_refuses_while_a_launch_is_unaccounted_for() {
         let (_root, service, ctx, id) = service();
         let dir = ctx.paths.instance_dir(&id).unwrap();
-        let snap = snapshot::create_snapshot(&dir, None).unwrap();
+        let snap = snapshot::create_snapshot(&dir, None, TRACKED).unwrap();
         fs::write(dir.join("mods").join("a.jar"), b"changed").unwrap();
 
         crate::instance_runtime::publish_starting(&ctx.paths, &id).unwrap();
@@ -360,7 +479,7 @@ mod tests {
     fn restore_is_serialized_against_other_instance_mutations() {
         let (_root, service, ctx, id) = service();
         let dir = ctx.paths.instance_dir(&id).unwrap();
-        let snap = snapshot::create_snapshot(&dir, None).unwrap();
+        let snap = snapshot::create_snapshot(&dir, None, TRACKED).unwrap();
 
         let held = ctx
             .lock_manager

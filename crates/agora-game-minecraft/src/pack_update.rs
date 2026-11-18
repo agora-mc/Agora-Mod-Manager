@@ -1514,7 +1514,7 @@ pub fn apply_merge(
     // pack format introduces — is covered because the plan says so.
     let planned_writes = planned_write_paths(plan, resolutions);
     let scope = snapshot::recovery_scope_for_writes(
-        snapshot::default_tracked_entries(),
+        crate::snapshot_scope::tracked_entries(),
         planned_writes.iter().map(String::as_str),
     )?;
     let scope_refs: Vec<&str> = scope.iter().map(String::as_str).collect();
@@ -1590,7 +1590,11 @@ pub fn apply_merge(
     })();
 
     if let Err(error) = apply_result {
-        let restore = snapshot::restore_snapshot(instance_dir, &snapshot.id);
+        let restore = snapshot::restore_snapshot(
+            instance_dir,
+            &snapshot.id,
+            crate::snapshot_scope::tracked_entries(),
+        );
         return match restore {
             Ok(outcome) => {
                 // The snapshot restores copies. Put back the store links for everything the
@@ -2771,7 +2775,8 @@ mod tests {
         // so nothing changes at all.
         let staged = tmp.path().join("staged");
         write(&staged, "config/foo.toml", b"x"); // wrong file present
-        let before = snapshot::live_file_index(&inst).unwrap();
+        let before =
+            snapshot::live_file_index(&inst, crate::snapshot_scope::tracked_entries()).unwrap();
         let (conn, _dbtmp) = test_conn();
         seed_instance_row(&conn, "inst");
         let old_manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
@@ -2788,7 +2793,7 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("staged file missing"));
         assert_eq!(
-            snapshot::live_file_index(&inst).unwrap(),
+            snapshot::live_file_index(&inst, crate::snapshot_scope::tracked_entries()).unwrap(),
             before,
             "no mutation before the mandatory snapshot"
         );
@@ -2886,7 +2891,9 @@ mod tests {
 
         let (conn, _dbtmp) = test_conn();
         seed_instance_row(&conn, "inst");
-        let before = snapshot::live_metadata_fingerprint(&inst).unwrap();
+        let before =
+            snapshot::live_metadata_fingerprint(&inst, crate::snapshot_scope::tracked_entries())
+                .unwrap();
         let old_manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
         let theirs_struct = MrpackTheirs {
             files: theirs.clone(),
@@ -2921,7 +2928,9 @@ mod tests {
             &reconciled,
         )
         .unwrap();
-        let after = snapshot::live_metadata_fingerprint(&inst).unwrap();
+        let after =
+            snapshot::live_metadata_fingerprint(&inst, crate::snapshot_scope::tracked_entries())
+                .unwrap();
         assert_ne!(
             before, after,
             "a merge must be visible to the pre-launch snapshot reuse check"
@@ -3023,7 +3032,8 @@ mod tests {
         let staged = tmp.path().join("staged");
         write(&staged, "mods/a.jar", b"a-new");
 
-        let before = snapshot::live_file_index(&inst).unwrap();
+        let before =
+            snapshot::live_file_index(&inst, crate::snapshot_scope::tracked_entries()).unwrap();
         // Inject a failure after one file has been applied.
         PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = Some("apply-one"));
         let (conn, _dbtmp) = test_conn();
@@ -3069,7 +3079,7 @@ mod tests {
             "apply must restore on failure: {err}"
         );
         assert_eq!(
-            snapshot::live_file_index(&inst).unwrap(),
+            snapshot::live_file_index(&inst, crate::snapshot_scope::tracked_entries()).unwrap(),
             before,
             "instance must be exactly as it was before the merge"
         );
@@ -3112,7 +3122,8 @@ mod tests {
             b"from-the-pack",
         );
 
-        let before = snapshot::live_file_index(&inst).unwrap();
+        let before =
+            snapshot::live_file_index(&inst, crate::snapshot_scope::tracked_entries()).unwrap();
         PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = Some("apply-one"));
         let (conn, _dbtmp) = test_conn();
         seed_instance_row(&conn, "inst");
@@ -3162,7 +3173,7 @@ mod tests {
             "the override root was written but not rolled back"
         );
         assert_eq!(
-            snapshot::live_file_index(&inst).unwrap(),
+            snapshot::live_file_index(&inst, crate::snapshot_scope::tracked_entries()).unwrap(),
             before,
             "instance must be exactly as it was before the merge"
         );
@@ -3320,7 +3331,8 @@ mod tests {
             dependencies,
         );
 
-        let before_files = snapshot::live_file_index(&inst).unwrap();
+        let before_files =
+            snapshot::live_file_index(&inst, crate::snapshot_scope::tracked_entries()).unwrap();
         let before_manifest = fs::read(inst.join("instance_manifest.json")).unwrap();
         let before_runtime = agora_core::db::get_instance(&conn, "inst")
             .unwrap()
@@ -3363,7 +3375,7 @@ mod tests {
             other => panic!("expected runtime rejection, got {other:?}"),
         }
         assert_eq!(
-            snapshot::live_file_index(&inst).unwrap(),
+            snapshot::live_file_index(&inst, crate::snapshot_scope::tracked_entries()).unwrap(),
             before_files,
             "runtime rejection must not mutate instance files"
         );
@@ -3447,7 +3459,8 @@ mod tests {
             vec![],
             vec![("overrides/config/preview.toml", b"preview".as_slice())],
         );
-        let before_files = snapshot::live_file_index(&inst).unwrap();
+        let before_files =
+            snapshot::live_file_index(&inst, crate::snapshot_scope::tracked_entries()).unwrap();
         let before_manifest = fs::read(inst.join("instance_manifest.json")).unwrap();
 
         let preview = preview_pack_update(&conn, "inst", &inst, &mrpack).unwrap();
@@ -3458,7 +3471,7 @@ mod tests {
         assert_eq!(serialized["runtimeRequirement"]["loader"], "fabric");
         assert_eq!(serialized["runtimeRequirement"]["loaderVersion"], "0.15.0");
         assert_eq!(
-            snapshot::live_file_index(&inst).unwrap(),
+            snapshot::live_file_index(&inst, crate::snapshot_scope::tracked_entries()).unwrap(),
             before_files,
             "preview must not mutate the instance"
         );
@@ -4067,7 +4080,8 @@ mod tests {
             vec![("config/foo.toml", b"pack changed it too".as_slice())],
         );
 
-        let before = snapshot::live_file_index(&inst).unwrap();
+        let before =
+            snapshot::live_file_index(&inst, crate::snapshot_scope::tracked_entries()).unwrap();
         let outcome = update_pack(
             None,
             &conn,
@@ -4086,7 +4100,7 @@ mod tests {
             other => panic!("expected a refusal, got {other:?}"),
         }
         assert_eq!(
-            snapshot::live_file_index(&inst).unwrap(),
+            snapshot::live_file_index(&inst, crate::snapshot_scope::tracked_entries()).unwrap(),
             before,
             "a refusal must not touch the instance"
         );

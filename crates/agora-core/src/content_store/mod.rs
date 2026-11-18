@@ -2424,6 +2424,27 @@ pub fn remove_item(ctx: &Ctx, item_id_or_prefix: &str) -> Result<(), ContentErro
         });
     }
 
+    // A game-instance snapshot names its content-store items in its manifest. Removing an item a
+    // snapshot still holds would make that restore point unusable, so it refuses, naming the
+    // snapshots. An unreadable snapshot manifest refuses too: it might name any item.
+    match crate::game_snapshot::snapshots_using_content(ctx, &item_id) {
+        Ok(using) if using.is_empty() => {}
+        Ok(using) => {
+            return Err(ContentError::InUse {
+                item_id,
+                instances: using.join(", "),
+                instance_ids: Vec::new(),
+            })
+        }
+        Err(error) => {
+            return Err(ContentError::UnreadableManifest {
+                item_id,
+                manifest: "game-instance snapshots".into(),
+                error,
+            })
+        }
+    }
+
     // The target's own manifest is not parsed, so a corrupt item can still be removed. Another
     // item record that cannot be read cannot name this item (an item record holds files, not
     // references to other items), so it does not block the removal. It may still hold the hash of

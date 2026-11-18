@@ -500,6 +500,17 @@ pub fn apply_game_profile_with_undo(
         )));
     }
 
+    // The same automatic recovery point Minecraft takes before applying a
+    // loadout. The instance lock is already held.
+    crate::game_snapshot::create_locked(
+        ctx,
+        instance_id,
+        definition,
+        Some(crate::loadout::UNDO_SNAPSHOT_LABEL),
+        crate::snapshot::SnapshotOrigin::Automatic,
+    )
+    .map_err(LoadoutApplyError::UndoPoint)?;
+
     let undo = capture(ctx, instance_id, definition).map_err(LoadoutApplyError::UndoPoint)?;
     let undo = GameUndo {
         profile: profile.name.clone(),

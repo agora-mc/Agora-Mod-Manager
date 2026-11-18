@@ -836,8 +836,21 @@ fn test_content_removal_refused_when_in_use() {
         other => panic!("expected ContentError::InUse, got {other:?}"),
     }
 
-    // 2. Remove content from instance, now content removal succeeds
+    // 2. Remove content from the instance. The recovery points taken around
+    //    the change still name the item, so removal stays refused until they
+    //    are deleted: a snapshot must not lose the mod it could restore.
     remove_content(&ctx, &inst.instance_id, &item_id).unwrap();
+    let err = agora_core::content_store::remove_item(&ctx, &item_id)
+        .expect_err("a recovery point still names the item");
+    assert!(
+        format!("{err}").contains("snapshot"),
+        "names the snapshot: {err}"
+    );
+
+    let instance_dir = ctx.paths.instance_dir(&inst.instance_id).unwrap();
+    for snapshot in agora_core::snapshot::list_snapshots(&instance_dir).unwrap() {
+        agora_core::snapshot::delete_snapshot(&instance_dir, &snapshot.id).unwrap();
+    }
     agora_core::content_store::remove_item(&ctx, &item_id).expect("remove succeeds now");
 
     // 3. Corrupt manifest refuses removal (fail closed)

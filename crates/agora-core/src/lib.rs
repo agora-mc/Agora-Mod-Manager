@@ -53,6 +53,7 @@ pub mod game_plugins;
 pub mod game_registry;
 pub mod game_saves;
 pub mod game_script;
+pub mod game_snapshot;
 pub mod game_support;
 pub mod game_tool_copy;
 pub mod game_tool_swap;

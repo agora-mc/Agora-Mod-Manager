@@ -635,6 +635,8 @@ pub fn set_value(
     check_value(value)?;
     let store = store_of(ctx, instance_id)?;
     let _locks = lock_for_edit(ctx, instance_id, definition, &store)?;
+    crate::game_snapshot::snapshot_before_change_locked(ctx, instance_id, "before-ini-edit")
+        .map_err(IniError::Invalid)?;
     edit_locked(ctx, instance_id, definition, &store, file, |doc| {
         let changed = doc.set(section, key, value)?;
         Ok((changed, changed))
@@ -653,6 +655,8 @@ pub fn unset_value(
     check_names(section, key)?;
     let store = store_of(ctx, instance_id)?;
     let _locks = lock_for_edit(ctx, instance_id, definition, &store)?;
+    crate::game_snapshot::snapshot_before_change_locked(ctx, instance_id, "before-ini-edit")
+        .map_err(IniError::Invalid)?;
     edit_locked(ctx, instance_id, definition, &store, file, |doc| {
         let changed = doc.unset(section, key)?;
         Ok((changed, changed))

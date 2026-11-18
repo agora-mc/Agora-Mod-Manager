@@ -557,13 +557,15 @@ The installer commands are the installers' own documented CLI. Fabric: `server -
 ```text
 agora snapshots list <INSTANCE>
 agora snapshots create <INSTANCE> --label "Before update"
-agora snapshots restore <INSTANCE> <SNAPSHOT_ID>
+agora snapshots restore <INSTANCE> <SNAPSHOT_ID> [--force]
 agora snapshots delete <INSTANCE> <SNAPSHOT_ID>
 ```
 
-A restore replaces tracked instance state. Preserve valuable worlds separately and verify the intended snapshot ID before restoring.
+A restore replaces tracked instance state. Preserve valuable worlds separately and verify the intended snapshot ID before restoring. Every restore takes a pre-restore snapshot first, so the restore itself can be undone by restoring that `pre-restore-…` entry.
 
 Agora's automatic pre-launch recovery snapshot is optimized for mod, configuration, and layout recovery and does not include `saves/`. Full manual and transactional snapshots use a broader scope, but no local snapshot system should be the only backup for an irreplaceable world.
+
+The same commands work for a game instance (§26). Its snapshot holds the instance's own state — the manifest (content layers, save choice), the plugin lists and INI copies the game definition declares, the `.agora_loadouts` store, and the load-after rules — while mod files stay once in the content store, so a snapshot is small. A restore writes those files atomically, restores every list's rules in one database transaction, and marks the deployed folder for a rebuild at the next launch. It refuses while the game is running or cannot be proven idle; `--force` restores anyway, after the warning that the running game may overwrite it. A content item the snapshot names but the store no longer holds refuses the restore, naming the item, before anything changes. Content-store removal refuses while a game-instance snapshot still names the item (an unreadable snapshot refuses it too); delete those snapshots before removing the item. `snapshots list` shows a damaged snapshot as unreadable with the reason instead of hiding it, and keeps it out of automatic retention so it can be inspected or deleted by hand.
 
 ### Loadouts
 
@@ -577,7 +579,7 @@ agora loadout delete <INSTANCE> <NAME>
 
 A loadout records the on/off state of mods, resource packs, shader packs, data packs and worlds. Applying one sets each item it records to that state. An enabled mod it does not list (one added since it was saved, say) is a choice: `--others keep` leaves it on and `--others off` switches it off. When there are such mods and no `--others` is given, apply refuses and names them, so nothing changes. Packs and worlds it does not list are left as they are. Apply refuses a locked instance, and an instance whose game is running or starting, and changes nothing in either case. Before switching, apply saves an undo point labelled `before-loadout` (only the newest is kept). `loadout update` saves a profile again from the instance's current setup, so a mod added since it was saved stops being unlisted. It lists what would change (added, turned on or off, or dropped because it is gone) and asks first on an interactive terminal. Without a terminal it changes nothing and names the changes; pass `--yes` once the person using this computer has agreed. It does not touch the instance, so a locked instance or a running game does not block it.
 
-For a game instance, the same commands work. Its loadout records the content items that are on, and, where the game has them, the plugin list (active set and order), the instance's INI copies, the load-after rules and the save choice. Applying it restores all of them after saving the setup it replaced as the undo point, and is refused while the game runs. A content item the profile does not name is switched off, as an unlisted mod is on Minecraft. Apply prints that the undo point was saved; `agora snapshots` covers Minecraft instances, whose undo point is a `before-loadout` snapshot.
+For a game instance, the same commands work. Its loadout records the content items that are on, and, where the game has them, the plugin list (active set and order), the instance's INI copies, the load-after rules and the save choice. Applying it restores all of them after saving the setup it replaced as the undo point, and is refused while the game runs. A content item the profile does not name is switched off, as an unlisted mod is on Minecraft. Apply prints that the undo point was saved. For a game instance, applying also takes a `before-loadout` snapshot, which appears in `agora snapshots list` alongside the restore points; for a Minecraft instance the undo point is that snapshot.
 
 A loadout does not revert mod versions or configuration files.
 

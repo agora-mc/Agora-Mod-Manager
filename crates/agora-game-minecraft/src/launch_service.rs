@@ -1222,7 +1222,7 @@ fn create_or_reuse_snapshot(instance_dir: &Path) -> LauncherResult<String> {
     // launch failures; world data (`saves/`) is handled by install/import and
     // explicit backup snapshots instead of being re-walked and re-hashed on
     // every launch.
-    let scope = agora_core::snapshot::prelaunch_tracked_entries();
+    let scope = crate::snapshot_scope::prelaunch_tracked_entries();
     let Some(snapshot_id) = lkg.current_lkg_snapshot_id else {
         let snapshot_id = create_fresh_prelaunch_snapshot(instance_dir, scope)?;
         eprintln!(
@@ -1234,7 +1234,7 @@ fn create_or_reuse_snapshot(instance_dir: &Path) -> LauncherResult<String> {
 
     // O(1) reuse: the mutation journal is untouched since the snapshot was
     // verified, so no filesystem walk is needed to prove the state is current.
-    if agora_core::snapshot::prelaunch_snapshot_is_reusable(instance_dir, &snapshot_id) {
+    if agora_core::snapshot::prelaunch_snapshot_is_reusable(instance_dir, &snapshot_id, scope) {
         eprintln!(
             "[launch-timing] snapshot: O(1) journal reuse in {} ms",
             started.elapsed().as_millis()

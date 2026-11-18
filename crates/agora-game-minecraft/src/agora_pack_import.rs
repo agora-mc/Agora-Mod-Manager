@@ -1447,7 +1447,11 @@ fn record_pack_gaps(ctx: &Ctx, instance_id: &str, gaps: &[InstancePackGap]) -> R
 async fn snapshot_before_retry(ctx: &Ctx, instance_id: &str) -> LauncherResult<()> {
     let instance_dir = ctx.paths.instance_dir(instance_id)?;
     tokio::task::spawn_blocking(move || {
-        agora_core::snapshot::create_snapshot(&instance_dir, Some("Before adding pack mods"))
+        agora_core::snapshot::create_snapshot(
+            &instance_dir,
+            Some("Before adding pack mods"),
+            crate::snapshot_scope::tracked_entries(),
+        )
     })
     .await
     .map_err(|_| LauncherError::Generic {

@@ -110,6 +110,10 @@ pub struct CoreContext {
     pub process_session_manager: ProcessSessionManager,
     /// Registry of supported games and their packages.
     pub games: Arc<crate::game_registry::GameRegistry>,
+    /// The folders a Minecraft instance's snapshot covers, declared by the
+    /// Minecraft package and installed by the adapter. Core never hard-codes
+    /// them; a generic game instance declares its own scope instead.
+    pub minecraft_snapshot_entries: Vec<String>,
     /// The keys this context trusts for the signed catalog, and (in tests) the
     /// debug-only permission to open an unsigned cache.
     pub registry_trust: crate::registry_bundle::RegistryTrust,
@@ -578,6 +582,7 @@ impl CoreContext {
             task_scheduler: TaskScheduler::default(),
             process_session_manager: ProcessSessionManager::new(),
             games,
+            minecraft_snapshot_entries: Vec::new(),
             registry_trust: registry_trust.clone(),
         };
         ctx.extensions.insert(behaviour_runtime);
@@ -627,6 +632,7 @@ impl CoreContext {
             task_scheduler: TaskScheduler::default(),
             process_session_manager: ProcessSessionManager::new(),
             games: Arc::new(crate::game_registry::GameRegistry::empty()),
+            minecraft_snapshot_entries: Vec::new(),
             registry_trust: crate::registry_bundle::RegistryTrust::unverified_debug(),
         }
     }
@@ -634,6 +640,15 @@ impl CoreContext {
     /// Replace the game registry.
     pub fn with_games(mut self, games: Arc<crate::game_registry::GameRegistry>) -> Self {
         self.games = games;
+        self
+    }
+
+    /// Supply the Minecraft snapshot scope the Minecraft package declares.
+    /// Adapters call this so a Minecraft snapshot has a real scope; a generic
+    /// game instance still declares its own.
+    pub fn with_minecraft_snapshot_entries(mut self, entries: &[&str]) -> Self {
+        self.minecraft_snapshot_entries =
+            entries.iter().map(|entry| (*entry).to_string()).collect();
         self
     }
 

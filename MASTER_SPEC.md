@@ -3171,6 +3171,23 @@ Snapshots written before the field existed are classified by label. A single
 shared count used to let the next launch delete a user's or a migration's
 recovery point without warning.
 
+**Game instances (Wave 1 recovery).** A generic game instance (§26) gets the
+same manifest and object store, but its scope is declared rather than a folder
+walk. Core owns two pieces (`instance_manifest.json` and `.agora_loadouts`);
+the game definition adds its plugin-list files and INI copies. A state file may
+sit beside content (Cyberpunk's `mods/modlist.txt`), so those files are captured
+individually as data, never by sweeping their folder. The save choice is in the
+manifest and the load-after rules go into the snapshot as data, then restore in
+one database transaction. Mod bytes never enter the snapshot. A restore is
+refused while the game runs or cannot be proven idle (a CLI `--force` and a
+desktop confirmation override it), takes a pre-restore snapshot first, writes
+the files atomically, and marks the deployment for a rebuild. Content-store
+removal refuses while a game-instance snapshot still names the item, and an
+unreadable snapshot refuses too; `list_snapshots` lists a damaged snapshot as
+unreadable with the reason and retention leaves it alone. The Minecraft folder
+list has moved out of core into the Minecraft package, which declares it, so
+core holds no game's folders.
+
 ### 23.4 Health, Crash Doctor, Memory, Authentication, and Launch Reliability (formerly §19.19)
 
 Health reports separate blockers, warnings, and non-interrupting recommendations. Recommendation-only reports remain green and never stop launch. Warning mutes use stable structured keys with legacy-setting migration; blockers cannot be muted. A health scan carries an identity derived from the instance manifest plus observed mod-file and registry-database content hashes. Core launch reuses that scan only while the identity remains unchanged, preventing duplicate healthy scans without trusting stale frontend approval.

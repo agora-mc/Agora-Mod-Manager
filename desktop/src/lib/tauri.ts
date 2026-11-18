@@ -2482,6 +2482,8 @@ export interface Snapshot {
   is_lkg: boolean;
   is_current_lkg: boolean;
   is_pre_restore: boolean;
+  /** Set when the snapshot was found on disk but its manifest cannot be read. */
+  unreadable?: string;
 }
 
 /** One item a profile records, with the on/off state it was saved in. */
@@ -2614,10 +2616,15 @@ export interface RestoreOutcome {
   preservedRoots: string[];
   cleanupWarning?: string;
   preservedRecoveryDir?: string;
+  undoSnapshotId?: string;
 }
 
-export const restoreSnapshot = (instanceId: string, snapshotId: string) =>
-  invoke<RestoreOutcome>('restore_snapshot', { instanceId, snapshotId });
+export const restoreSnapshot = (
+  instanceId: string,
+  snapshotId: string,
+  force = false,
+) =>
+  invoke<RestoreOutcome>('restore_snapshot', { instanceId, snapshotId, force });
 
 /** One plain sentence describing what a restore covered, or null if it was a
  *  complete restore with nothing worth remarking on. */

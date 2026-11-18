@@ -946,10 +946,12 @@ fn an_unreadable_instance_copy_fails_the_deploy_instead_of_reading_as_empty() {
     let h = Harness::new();
     let inst = h.instance("unreadable");
     let copy = h.copy_path(&inst);
-    // A folder where the file belongs cannot be read as a list.
-    std::fs::create_dir_all(&copy).unwrap();
     let item = h.item("mod", &[("Data/A.esp", b"a")]);
     h.add(&inst, &item);
+    // A folder where the file belongs cannot be read as a list. It is made
+    // after the add so the automatic recovery point is not what refuses: the
+    // deploy's list read is under test.
+    std::fs::create_dir_all(&copy).unwrap();
     let err = deploy(&h.ctx, &inst.instance_id, &h.def, DeployMode::Links).unwrap_err();
     assert!(
         err.to_string().contains("cannot be read"),

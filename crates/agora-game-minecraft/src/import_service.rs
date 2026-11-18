@@ -908,6 +908,7 @@ impl ImportService {
                     match agora_core::snapshot::create_snapshot(
                         &instance_dir,
                         Some("Initial import state"),
+                        crate::snapshot_scope::tracked_entries(),
                     ) {
                         Ok(_) => {
                             let _ = agora_core::snapshot::mark_snapshot_ready(&instance_dir);

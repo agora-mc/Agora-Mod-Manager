@@ -101,6 +101,10 @@ pub struct BackupManifest {
     pub snapshot: crate::snapshot::Snapshot,
     pub files: Vec<BackupFileEntry>,
     pub exported_at: String,
+    /// The tracked roots the backup covered. Present on every backup this
+    /// version writes; absent in older artifacts, which are validated by path
+    /// safety alone.
+    #[serde(default)]
     pub scope_entries: Vec<String>,
 }
 
@@ -187,10 +191,27 @@ fn validate_backup_manifest(manifest: &BackupManifest) -> Result<(), String> {
             MAX_BACKUP_ENTRIES
         ));
     }
+    let mut scope = HashSet::new();
+    for root in &manifest.scope_entries {
+        crate::snapshot::validate_scope_root(root)?;
+        scope.insert(root.as_str());
+    }
     let mut seen = HashSet::new();
     let mut total: u64 = 0;
     for entry in &manifest.files {
         crate::snapshot::validate_relative_path(&entry.relative_path)?;
+        // A backup that names its scope must keep every file inside it. An
+        // older backup with no scope list is still confined to the instance
+        // folder by `validate_relative_path`.
+        if !scope.is_empty() {
+            let root = entry.relative_path.split('/').next().unwrap_or_default();
+            if !scope.contains(root) {
+                return Err(format!(
+                    "backup file {} is outside the backup's recorded scope",
+                    entry.relative_path
+                ));
+            }
+        }
         if !seen.insert(entry.relative_path.clone()) {
             return Err(format!(
                 "backup manifest contains duplicate path {}",
@@ -431,6 +452,7 @@ pub fn export_snapshot(
     instance_dir: &Path,
     snapshot_id: &str,
     export_dir: &Path,
+    tracked_entries: &[&str],
 ) -> Result<PathBuf, String> {
     crate::snapshot::validate_snapshot_id(snapshot_id)?;
     if !instance_dir.is_dir() {
@@ -504,9 +526,9 @@ pub fn export_snapshot(
             })
             .collect(),
         exported_at: chrono::Utc::now().to_rfc3339(),
-        scope_entries: crate::snapshot::TRACKED_ENTRIES
+        scope_entries: tracked_entries
             .iter()
-            .map(|entry| entry.to_string())
+            .map(|entry| (*entry).to_string())
             .collect(),
     };
     validate_backup_manifest(&backup_manifest)?;
@@ -1212,16 +1234,22 @@ pub async fn export_instance_backup(
     instance_id: &str,
     snapshot_id: &str,
     export_dir: &Path,
+    tracked_entries: &[&str],
 ) -> crate::error::LauncherResult<String> {
     let sanitized = crate::paths::sanitize_id(instance_id);
     let instance_dir = ctx.paths.instance_dir(&sanitized)?;
     let snapshot_id = snapshot_id.to_string();
     let export_dir = export_dir.to_path_buf();
+    let tracked_entries: Vec<String> = tracked_entries
+        .iter()
+        .map(|entry| (*entry).to_string())
+        .collect();
     ctx.task_scheduler
         .run_blocking(
             crate::task_scheduler::BlockingPriority::UserInitiated,
             move || {
-                export_snapshot(&instance_dir, &snapshot_id, &export_dir)
+                let tracked_refs: Vec<&str> = tracked_entries.iter().map(String::as_str).collect();
+                export_snapshot(&instance_dir, &snapshot_id, &export_dir, &tracked_refs)
                     .map(|path| path.to_string_lossy().into_owned())
             },
         )
@@ -1309,11 +1337,31 @@ pub fn backup_artifact_instance_id(artifact_path: &Path) -> crate::error::Launch
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::{
-        create_snapshot, create_snapshot_scoped, list_snapshots, prelaunch_tracked_entries,
-    };
+    use crate::snapshot::{create_snapshot, create_snapshot_scoped, list_snapshots};
     use std::fs;
     use tempfile::TempDir;
+
+    /// The Minecraft folders the fixtures model.
+    const TRACKED: &[&str] = &[
+        "mods",
+        "config",
+        "resourcepacks",
+        "shaderpacks",
+        "datapacks",
+        "saves",
+        "options.txt",
+        "instance_manifest.json",
+    ];
+    /// The pre-launch scope (no worlds).
+    const PRELAUNCH: &[&str] = &[
+        "mods",
+        "config",
+        "resourcepacks",
+        "shaderpacks",
+        "datapacks",
+        "options.txt",
+        "instance_manifest.json",
+    ];
 
     fn make_instance(tmp: &TempDir) -> PathBuf {
         let dir = tmp.path().join("instance");
@@ -1362,6 +1410,7 @@ mod tests {
             file_count: 1,
             size_estimate: 100,
             origin: None,
+            unreadable: None,
         }
     }
 
@@ -1502,11 +1551,11 @@ mod tests {
     fn export_and_import_round_trips_on_fresh_machine() {
         let tmp = TempDir::new().unwrap();
         let instance = make_instance(&tmp);
-        let snapshot = create_snapshot(&instance, Some("backup-test")).unwrap();
+        let snapshot = create_snapshot(&instance, Some("backup-test"), TRACKED).unwrap();
 
         let export_dir = tmp.path().join("export");
         std::fs::create_dir_all(&export_dir).unwrap();
-        let artifact = export_snapshot(&instance, &snapshot.id, &export_dir).unwrap();
+        let artifact = export_snapshot(&instance, &snapshot.id, &export_dir, TRACKED).unwrap();
         assert!(artifact.is_file());
         assert!(artifact
             .file_name()
@@ -1529,7 +1578,7 @@ mod tests {
         let listed = list_snapshots(&fresh_instance).unwrap();
         assert!(listed.iter().any(|entry| entry.id == snapshot.id));
         // And restoring it is what materialises the files.
-        crate::snapshot::restore_snapshot(&fresh_instance, &snapshot.id).unwrap();
+        crate::snapshot::restore_snapshot(&fresh_instance, &snapshot.id, TRACKED).unwrap();
         assert_eq!(
             std::fs::read(fresh_instance.join("mods").join("mod-a.jar")).unwrap(),
             b"mod a v1"
@@ -1550,10 +1599,11 @@ mod tests {
         let instance = tmp.path().join("instance");
         std::fs::create_dir_all(instance.join("mods")).unwrap();
         std::fs::write(instance.join("mods").join("mod-a.jar"), b"mod a v1").unwrap();
-        let snapshot = crate::snapshot::create_snapshot(&instance, Some("exportable")).unwrap();
+        let snapshot =
+            crate::snapshot::create_snapshot(&instance, Some("exportable"), TRACKED).unwrap();
         let export_dir = tmp.path().join("export");
         std::fs::create_dir_all(&export_dir).unwrap();
-        let artifact = export_snapshot(&instance, &snapshot.id, &export_dir).unwrap();
+        let artifact = export_snapshot(&instance, &snapshot.id, &export_dir, TRACKED).unwrap();
 
         // Now diverge the live tree, and add a file the artifact knows nothing
         // about. Both must survive the import untouched.
@@ -1580,7 +1630,7 @@ mod tests {
     fn export_fails_when_blob_is_missing_and_does_not_leave_partial() {
         let tmp = TempDir::new().unwrap();
         let instance = make_instance(&tmp);
-        let snapshot = create_snapshot(&instance, Some("to-corrupt")).unwrap();
+        let snapshot = create_snapshot(&instance, Some("to-corrupt"), TRACKED).unwrap();
 
         // Corrupt the blob store by deleting a blob.
         let index = crate::snapshot::snapshot_file_index(&instance, &snapshot.id).unwrap();
@@ -1590,7 +1640,7 @@ mod tests {
 
         let export_dir = tmp.path().join("export");
         std::fs::create_dir_all(&export_dir).unwrap();
-        let error = export_snapshot(&instance, &snapshot.id, &export_dir).unwrap_err();
+        let error = export_snapshot(&instance, &snapshot.id, &export_dir, TRACKED).unwrap_err();
         assert!(
             error.contains("missing") || error.contains("corrupted"),
             "error should mention missing/corrupted blob: {error}"
@@ -1615,10 +1665,10 @@ mod tests {
     fn import_rejects_path_traversal_in_artifact() {
         let tmp = TempDir::new().unwrap();
         let instance = make_instance(&tmp);
-        let snapshot = create_snapshot(&instance, Some("good")).unwrap();
+        let snapshot = create_snapshot(&instance, Some("good"), TRACKED).unwrap();
         let export_dir = tmp.path().join("export");
         std::fs::create_dir_all(&export_dir).unwrap();
-        let artifact = export_snapshot(&instance, &snapshot.id, &export_dir).unwrap();
+        let artifact = export_snapshot(&instance, &snapshot.id, &export_dir, TRACKED).unwrap();
 
         // Tamper with the artifact: rewrite the manifest to list an unsafe path,
         // and add a matching zip entry.  This simulates untrusted input — the
@@ -1692,10 +1742,10 @@ mod tests {
     fn import_rejects_unexpected_extra_file_in_zip() {
         let tmp = TempDir::new().unwrap();
         let instance = make_instance(&tmp);
-        let snapshot = create_snapshot(&instance, Some("good")).unwrap();
+        let snapshot = create_snapshot(&instance, Some("good"), TRACKED).unwrap();
         let export_dir = tmp.path().join("export");
         std::fs::create_dir_all(&export_dir).unwrap();
-        let artifact = export_snapshot(&instance, &snapshot.id, &export_dir).unwrap();
+        let artifact = export_snapshot(&instance, &snapshot.id, &export_dir, TRACKED).unwrap();
 
         // Tamper: add an extra file not listed in the manifest.
         let tampered_path = tmp.path().join("extra.zip");
@@ -1738,10 +1788,10 @@ mod tests {
     fn import_rejects_hash_mismatch() {
         let tmp = TempDir::new().unwrap();
         let instance = make_instance(&tmp);
-        let snapshot = create_snapshot(&instance, Some("good")).unwrap();
+        let snapshot = create_snapshot(&instance, Some("good"), TRACKED).unwrap();
         let export_dir = tmp.path().join("export");
         std::fs::create_dir_all(&export_dir).unwrap();
-        let artifact = export_snapshot(&instance, &snapshot.id, &export_dir).unwrap();
+        let artifact = export_snapshot(&instance, &snapshot.id, &export_dir, TRACKED).unwrap();
 
         // Tamper: flip a byte in a file's zip entry without updating the manifest hash.
         let tampered_path = tmp.path().join("hash_mismatch.zip");
@@ -1803,30 +1853,29 @@ mod tests {
     fn export_materialises_saves_and_import_restores_them() {
         let tmp = TempDir::new().unwrap();
         let instance = make_instance_with_saves(&tmp);
-        let snapshot = create_snapshot(&instance, Some("with-saves")).unwrap();
+        let snapshot = create_snapshot(&instance, Some("with-saves"), TRACKED).unwrap();
 
         let export_dir = tmp.path().join("export");
         std::fs::create_dir_all(&export_dir).unwrap();
-        let artifact = export_snapshot(&instance, &snapshot.id, &export_dir).unwrap();
+        let artifact = export_snapshot(&instance, &snapshot.id, &export_dir, TRACKED).unwrap();
 
         let fresh = TempDir::new().unwrap();
         let fresh_instance = fresh.path().join("fresh-with-saves");
         let imported = import_backup(&fresh_instance, &artifact).unwrap();
-        crate::snapshot::restore_snapshot(&fresh_instance, &imported.id).unwrap();
+        crate::snapshot::restore_snapshot(&fresh_instance, &imported.id, TRACKED).unwrap();
         assert_eq!(
             std::fs::read(fresh_instance.join("saves").join("world").join("level.dat")).unwrap(),
             b"world data"
         );
 
         // Also verify that a prelaunch-scoped snapshot excludes saves.
-        let pre_snapshot =
-            create_snapshot_scoped(&instance, Some("prelaunch"), prelaunch_tracked_entries())
-                .unwrap();
-        let pre_artifact = export_snapshot(&instance, &pre_snapshot.id, &export_dir).unwrap();
+        let pre_snapshot = create_snapshot_scoped(&instance, Some("prelaunch"), PRELAUNCH).unwrap();
+        let pre_artifact =
+            export_snapshot(&instance, &pre_snapshot.id, &export_dir, TRACKED).unwrap();
         let fresh2 = TempDir::new().unwrap();
         let fresh_instance2 = fresh2.path().join("fresh-prelaunch");
         let imported2 = import_backup(&fresh_instance2, &pre_artifact).unwrap();
-        crate::snapshot::restore_snapshot(&fresh_instance2, &imported2.id).unwrap();
+        crate::snapshot::restore_snapshot(&fresh_instance2, &imported2.id, TRACKED).unwrap();
         assert!(
             !fresh_instance2.join("saves").exists(),
             "prelaunch snapshot should not contain saves"
@@ -1837,8 +1886,8 @@ mod tests {
     fn retention_skipped_while_restore_marker_present() {
         let tmp = TempDir::new().unwrap();
         let instance = make_instance(&tmp);
-        let _a = create_snapshot(&instance, Some("a")).unwrap();
-        let b = create_snapshot(&instance, Some("b")).unwrap();
+        let _a = create_snapshot(&instance, Some("a"), TRACKED).unwrap();
+        let b = create_snapshot(&instance, Some("b"), TRACKED).unwrap();
         // Simulate a restore in progress.
         std::fs::write(
             instance.join(crate::snapshot::RESTORE_MARKER),
@@ -1866,11 +1915,11 @@ mod tests {
     fn run_backup_retention_deletes_by_count_and_never_deletes_only_copy() {
         let tmp = TempDir::new().unwrap();
         let instance = make_instance(&tmp);
-        let a = create_snapshot(&instance, Some("a")).unwrap();
+        let a = create_snapshot(&instance, Some("a"), TRACKED).unwrap();
         std::fs::write(instance.join("mods").join("mod-a.jar"), b"mod a v2").unwrap();
-        let b = create_snapshot(&instance, Some("b")).unwrap();
+        let b = create_snapshot(&instance, Some("b"), TRACKED).unwrap();
         std::fs::write(instance.join("mods").join("mod-a.jar"), b"mod a v3").unwrap();
-        let c = create_snapshot(&instance, Some("c")).unwrap();
+        let c = create_snapshot(&instance, Some("c"), TRACKED).unwrap();
 
         let policy = BackupRetentionPolicy::keep_last(1);
         let evicted = run_backup_retention(&instance, &policy).unwrap();
