@@ -5591,22 +5591,21 @@ pub async fn export_server_environment(
     _state: tauri::State<'_, LauncherState>,
     instance_id: String,
     dest_path: String,
+    world: Option<String>,
+    allow_unverified_loader: Option<bool>,
 ) -> LauncherResult<agora_game_minecraft::server_export::ExportResult> {
     let sanitized = paths::sanitize_id(&instance_id);
-    let instance_dir =
-        paths::instance_dir(&app, &sanitized).map_err(|e| LauncherError::Generic {
-            code: "ERR_PATH".into(),
-            message: e.to_string(),
-        })?;
-    let manifest = load_manifest(&app, &sanitized)?;
     let dest = std::path::PathBuf::from(&dest_path);
     std::fs::create_dir_all(&dest).ok();
-    agora_game_minecraft::server_export::export_server_environment(
-        &instance_dir,
+    let ctx = crate::core_context(&app)?;
+    agora_game_minecraft::server_export::export_ready_server(
+        &ctx,
+        &sanitized,
         &dest,
-        &manifest.loader,
-        &manifest.minecraft_version,
+        world.as_deref(),
+        allow_unverified_loader.unwrap_or(false),
     )
+    .await
     .map_err(|e| LauncherError::Generic {
         code: "ERR_EXPORT".into(),
         message: e.to_string(),
