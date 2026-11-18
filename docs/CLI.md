@@ -837,14 +837,17 @@ agora settings get <KEY>
 agora settings set <KEY> <VALUE>
 ```
 
-`settings set` parses the value as JSON and falls back to a string. Quote strings explicitly in scripts when the distinction matters:
+`settings set` parses the value as JSON and falls back to a string, then checks it against the setting's declared type in core's registry. An undeclared key is refused, and so is a value of the wrong type; the reason is printed and nothing is stored. Legacy boolean encodings (`0`, `1`, `"true"`, `"false"`) are accepted and stored as genuine booleans. Quote strings explicitly in scripts when the distinction matters:
 
 ```bash
 agora settings set launch_mode '"direct"'
 agora settings set always_pre_touch false
+agora settings set network_modrinth_enabled 0   # stored as false
 ```
 
-Unknown or internal setting keys may change between releases. Prefer dedicated commands when one exists.
+Every network and privacy switch fails closed: a stored value that cannot be read (for example a truncated string) is treated as off, and the network gate denies the request. A malformed Lockdown Mode value stays engaged. An invalid stored value is reported once and read as its fail direction; the registry migrates legacy encodings when the database is opened.
+
+Setting keys are declared in `crates/agora-core/src/settings_registry.rs`. Prefer dedicated commands when one exists.
 
 ### Crash investigation
 

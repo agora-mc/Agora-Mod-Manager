@@ -139,7 +139,7 @@ pub fn init_local_state_db(db_path: &std::path::Path) -> anyhow::Result<()> {
         set_setting(&conn, "update_sweep_interval_hours", &serde_json::json!(12))?;
     }
 
-    normalize_boolean_settings(&conn)?;
+    crate::settings_registry::migrate(&conn)?;
 
     tx.commit()?;
     Ok(())
@@ -165,56 +165,6 @@ pub fn global_always_pre_touch(conn: &Connection) -> Option<bool> {
             },
             _ => None,
         })
-}
-
-const BOOLEAN_SETTING_KEYS: &[&str] = &[
-    "modrinth_enabled",
-    "ai_mcp_enabled",
-    "always_pre_touch",
-    "install_auto_confirm_clean",
-    "install_always_auto_confirm",
-    "onboarding_complete",
-    "network_modrinth_enabled",
-    "network_modrinth_cdn_enabled",
-    "network_registry_sync_enabled",
-    "network_github_oauth_enabled",
-    "network_msa_enabled",
-    "network_adoptium_enabled",
-    "network_mojang_metadata_enabled",
-    "network_mojang_content_enabled",
-    "network_loader_enabled",
-    "network_server_ping_enabled",
-    "network_log_upload_enabled",
-    "network_lockdown_enabled",
-];
-
-/// Convert legacy boolean encodings to genuine JSON booleans on startup.
-fn normalize_boolean_settings(conn: &Connection) -> anyhow::Result<()> {
-    for key in BOOLEAN_SETTING_KEYS {
-        let Some(value) = get_setting(conn, key)? else {
-            continue;
-        };
-        let Some(normalized) = parse_boolean_value(&value) else {
-            continue;
-        };
-        if !matches!(value, serde_json::Value::Bool(_)) {
-            set_setting(conn, key, &serde_json::Value::Bool(normalized))?;
-        }
-    }
-    Ok(())
-}
-
-fn parse_boolean_value(value: &serde_json::Value) -> Option<bool> {
-    match value {
-        serde_json::Value::Bool(value) => Some(*value),
-        serde_json::Value::String(value) => match value.as_str() {
-            "true" | "1" => Some(true),
-            "false" | "0" => Some(false),
-            _ => None,
-        },
-        serde_json::Value::Number(value) => value.as_i64().map(|number| number == 1),
-        _ => None,
-    }
 }
 
 /// Apply sequential migrations up to [LOCAL_STATE_SCHEMA_VERSION].
@@ -1094,25 +1044,32 @@ pub fn get_setting(conn: &Connection, key: &str) -> anyhow::Result<Option<serde_
 }
 
 /// Check if a specific network feature is enabled in settings.
-/// Returns `true` if enabled (or setting not found, for backward compatibility),
-/// `false` if explicitly disabled, or if Lockdown Mode is enabled.
-/// Setting keys: `network_modrinth_enabled`, `network_modrinth_cdn_enabled`,
-/// `network_registry_sync_enabled`, `network_github_oauth_enabled`,
-/// `network_msa_enabled`, `network_adoptium_enabled`,
-/// `network_mojang_metadata_enabled`, `network_mojang_content_enabled`,
-/// `network_loader_enabled`. Lockdown Mode (`network_lockdown_enabled`) is a
-/// global override that disables every endpoint.
+///
+/// Declared switches read through the typed registry. A value that is present
+/// but unreadable (`0`, `null`, a truncated string) reads as that switch's fail
+/// direction — off for every network or privacy switch — and a read error
+/// denies rather than enabling. A cleanly absent row keeps the declared default
+/// (on for the first-party endpoints, off for `network_plugins_enabled`).
+/// Lockdown Mode (`network_lockdown_enabled`) overrides every endpoint.
+///
+/// An undeclared key keeps the legacy behaviour (missing means on) because
+/// callers outside the registry used to rely on it; no gate uses such a key.
 pub fn is_network_enabled(conn: &Connection, key: &str) -> bool {
     // Lockdown Mode blocks every network endpoint regardless of the per-endpoint
     // toggle, so the backend never sends outbound feature requests while on.
     if is_lockdown_enabled(conn) {
         return false;
     }
-    get_setting(conn, key)
-        .ok()
-        .flatten()
-        .map(|v| is_value_enabled(&v))
-        .unwrap_or(true)
+    match crate::settings_registry::read_bool(conn, key) {
+        Ok(Some(enabled)) => enabled,
+        Ok(None) => get_setting(conn, key)
+            .ok()
+            .flatten()
+            .map(|v| is_value_enabled(&v))
+            .unwrap_or(true),
+        // Could not tell: that is not permission.
+        Err(_) => false,
+    }
 }
 
 /// Whether Lockdown Mode (global network block) is enabled.

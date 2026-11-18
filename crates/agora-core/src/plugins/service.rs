@@ -628,9 +628,9 @@ impl PluginService {
         let Ok(conn) = self.inner.conn() else {
             return true;
         };
-        match crate::db::get_setting(&conn, PLUGINS_EMERGENCY_STOP_SETTING) {
+        match crate::settings_registry::read_bool(&conn, PLUGINS_EMERGENCY_STOP_SETTING) {
+            Ok(Some(engaged)) => engaged,
             Ok(None) => false,
-            Ok(Some(value)) => value.as_bool().unwrap_or(true),
             Err(_) => true,
         }
     }

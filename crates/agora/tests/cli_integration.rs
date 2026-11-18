@@ -717,7 +717,7 @@ fn settings_set_and_get_string() {
     let (_tmp, data_dir) = temp_data_dir();
 
     // Set — pass a JSON string literal so it is stored as a JSON string
-    let set = run_agora(&data_dir, &["settings", "set", "greeting", r#""hello""#]);
+    let set = run_agora(&data_dir, &["settings", "set", "java_path", r#""hello""#]);
     assert!(
         set.status.success(),
         "settings set failed:\n{}",
@@ -730,7 +730,7 @@ fn settings_set_and_get_string() {
     );
 
     // Get
-    let get = run_agora(&data_dir, &["settings", "get", "greeting"]);
+    let get = run_agora(&data_dir, &["settings", "get", "java_path"]);
     assert!(
         get.status.success(),
         "settings get failed:\n{}",
@@ -748,16 +748,16 @@ fn settings_set_and_get_json() {
     let (_tmp, data_dir) = temp_data_dir();
 
     // Set in JSON mode
-    let set = run_agora_json(&data_dir, &["settings", "set", "theme", r#""dark""#]);
+    let set = run_agora_json(&data_dir, &["settings", "set", "plugin_theme", r#""dark""#]);
     assert!(set.status.success(), "settings set --json failed");
 
     let set_parsed = assert_json_stdout(&set);
     assert_eq!(set_parsed["status"], "set");
-    assert_eq!(set_parsed["key"], "theme");
+    assert_eq!(set_parsed["key"], "plugin_theme");
     assert_eq!(set_parsed["value"], "dark");
 
     // Get in JSON mode
-    let get = run_agora_json(&data_dir, &["settings", "get", "theme"]);
+    let get = run_agora_json(&data_dir, &["settings", "get", "plugin_theme"]);
     let get_parsed = assert_json_stdout(&get);
     assert_eq!(get_parsed, "dark");
 }
@@ -766,10 +766,10 @@ fn settings_set_and_get_json() {
 fn settings_set_boolean() {
     let (_tmp, data_dir) = temp_data_dir();
 
-    let set = run_agora(&data_dir, &["settings", "set", "flag", "true"]);
+    let set = run_agora(&data_dir, &["settings", "set", "modrinth_enabled", "true"]);
     assert!(set.status.success(), "settings set boolean failed");
 
-    let get = run_agora_json(&data_dir, &["settings", "get", "flag"]);
+    let get = run_agora_json(&data_dir, &["settings", "get", "modrinth_enabled"]);
     let get_parsed = assert_json_stdout(&get);
     assert_eq!(get_parsed, serde_json::Value::Bool(true));
 }
@@ -778,15 +778,84 @@ fn settings_set_boolean() {
 fn settings_set_json_object_and_get() {
     let (_tmp, data_dir) = temp_data_dir();
 
-    let set = run_agora_json(&data_dir, &["settings", "set", "obj", r#"{"nested":42}"#]);
+    let set = run_agora_json(
+        &data_dir,
+        &["settings", "set", "health_preferences", r#"{"nested":42}"#],
+    );
     assert!(set.status.success(), "settings set object failed");
 
     let set_parsed = assert_json_stdout(&set);
     assert_eq!(set_parsed["value"]["nested"], 42);
 
-    let get = run_agora_json(&data_dir, &["settings", "get", "obj"]);
+    let get = run_agora_json(&data_dir, &["settings", "get", "health_preferences"]);
     let get_parsed = assert_json_stdout(&get);
     assert_eq!(get_parsed["nested"], 42);
+}
+
+#[test]
+fn settings_set_refuses_an_unknown_key() {
+    let (_tmp, data_dir) = temp_data_dir();
+    let output = run_agora(
+        &data_dir,
+        &["settings", "set", "a_key_agora_never_declared", "true"],
+    );
+    assert!(
+        !output.status.success(),
+        "an undeclared key must be refused, not stored"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No setting named"),
+        "stderr should name the unknown key:\n{stderr}"
+    );
+    // It must not have been created.
+    let get = run_agora(
+        &data_dir,
+        &["settings", "get", "a_key_agora_never_declared"],
+    );
+    assert!(!get.status.success(), "the refused key must not exist");
+}
+
+#[test]
+fn settings_set_refuses_a_wrong_type() {
+    let (_tmp, data_dir) = temp_data_dir();
+    let output = run_agora(
+        &data_dir,
+        &[
+            "settings",
+            "set",
+            "network_modrinth_enabled",
+            r#""perhaps""#,
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "a non-boolean value must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("expects true or false"),
+        "stderr should say what the setting expects:\n{stderr}"
+    );
+    // The old value (true, the default) is untouched.
+    let get = run_agora_json(&data_dir, &["settings", "get", "network_modrinth_enabled"]);
+    assert_eq!(assert_json_stdout(&get), serde_json::Value::Bool(true));
+}
+
+#[test]
+fn settings_set_stores_a_legacy_zero_as_false() {
+    let (_tmp, data_dir) = temp_data_dir();
+    let set = run_agora_json(
+        &data_dir,
+        &["settings", "set", "network_modrinth_enabled", "0"],
+    );
+    assert!(set.status.success(), "a legacy 0 is a valid off value");
+    assert_eq!(
+        assert_json_stdout(&set)["value"],
+        serde_json::Value::Bool(false)
+    );
+    let get = run_agora_json(&data_dir, &["settings", "get", "network_modrinth_enabled"]);
+    assert_eq!(assert_json_stdout(&get), serde_json::Value::Bool(false));
 }
 
 #[test]
@@ -809,13 +878,19 @@ fn settings_list_persists_value() {
     let (_tmp, data_dir) = temp_data_dir();
 
     // Set a value, then list
-    run_agora(&data_dir, &["settings", "set", "my_key", r#""my_val""#]);
+    run_agora(
+        &data_dir,
+        &["settings", "set", "plugin_theme", r#""my_val""#],
+    );
     let list = run_agora_json(&data_dir, &["settings", "list"]);
     let parsed = assert_json_stdout(&list);
     let obj = parsed
         .as_object()
         .expect("settings list JSON should be an object");
-    assert_eq!(obj.get("my_key").and_then(|v| v.as_str()), Some("my_val"));
+    assert_eq!(
+        obj.get("plugin_theme").and_then(|v| v.as_str()),
+        Some("my_val")
+    );
 }
 
 // ---------------------------------------------------------------------------

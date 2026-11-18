@@ -100,6 +100,7 @@ pub mod registry_sync;
 pub mod save_backup;
 pub mod session_ledger;
 pub mod settings;
+pub mod settings_registry;
 pub mod shared_folder;
 pub mod shared_settings;
 pub mod snapshot;

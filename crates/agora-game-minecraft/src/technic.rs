@@ -99,16 +99,12 @@ pub struct TechnicPackDetail {
 /// Read a boolean setting, defaulting to `default` when absent or unreadable.
 /// Accepts JSON booleans and legacy JSON strings (`"true"` / `"1"`).
 fn setting_bool(conn: &Connection, key: &str, default: bool) -> bool {
-    db::get_setting(conn, key)
-        .ok()
-        .flatten()
-        .map(|value| match value {
-            serde_json::Value::Bool(b) => b,
-            serde_json::Value::String(s) => s == "true" || s == "1",
-            serde_json::Value::Number(n) => n.as_i64() == Some(1),
-            _ => default,
-        })
-        .unwrap_or(default)
+    match agora_core::settings_registry::read_bool(conn, key) {
+        Ok(Some(value)) => value,
+        Ok(None) => default,
+        // Consent is not something a damaged store can grant.
+        Err(_) => false,
+    }
 }
 
 fn consent_backend_available(conn: &Connection) -> bool {

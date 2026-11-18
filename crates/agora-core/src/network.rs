@@ -110,15 +110,15 @@ impl NetworkPolicy {
     pub fn from_db(conn: &rusqlite::Connection) -> Self {
         let mut policy = Self::all_enabled();
 
-        // All launch-network settings default to enabled.
-        // Only explicit "false"/false in the DB disables the category.
-        if !is_network_enabled_default_true(conn, "network_mojang_metadata_enabled") {
+        // All launch-network settings default to enabled. The typed registry
+        // reads them, so an unreadable value reads as off, not as on.
+        if !db::is_network_enabled(conn, "network_mojang_metadata_enabled") {
             policy.set_category(NetworkCategory::MojangMetadata, false);
         }
-        if !is_network_enabled_default_true(conn, "network_mojang_content_enabled") {
+        if !db::is_network_enabled(conn, "network_mojang_content_enabled") {
             policy.set_category(NetworkCategory::MojangContent, false);
         }
-        if !is_network_enabled_default_true(conn, "network_loader_enabled") {
+        if !db::is_network_enabled(conn, "network_loader_enabled") {
             policy.set_category(NetworkCategory::LoaderMetadataAndContent, false);
         }
         if !db::is_network_enabled(conn, "network_msa_enabled") {
@@ -129,26 +129,6 @@ impl NetworkPolicy {
         }
         policy
     }
-}
-
-/// Like `db::is_network_enabled` but returns `true` (default-enabled) when the
-/// setting key is absent from the database. Matches the first-party-network-defaults
-/// behaviour where missing keys are treated as enabled.
-fn is_network_enabled_default_true(conn: &rusqlite::Connection, key: &str) -> bool {
-    // Lockdown Mode is a global network block: when enabled the launch planner
-    // refuses every category even though these keys default to enabled.
-    if db::is_lockdown_enabled(conn) {
-        return false;
-    }
-    db::get_setting(conn, key)
-        .ok()
-        .flatten()
-        .map(|v| match v {
-            serde_json::Value::Bool(b) => b,
-            serde_json::Value::String(s) => s == "true",
-            _ => false,
-        })
-        .unwrap_or(true)
 }
 
 fn category_bit(category: NetworkCategory) -> u8 {
