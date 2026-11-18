@@ -67,6 +67,9 @@ rand = { workspace = true }
 semver = { workspace = true }
 thiserror = { workspace = true }
 flate2 = "1"
+# Catalog deltas (MASTER_SPEC §33): a nightly update is a zstd patch against the
+# catalog the client already verified, a few KB instead of the whole database.
+zstd = "0.13"
 roxmltree = "0.20"
 
 # LOOT's plugin header reader (GPL-3.0, the licence Agora itself uses). Header only: the

@@ -242,9 +242,22 @@ pub async fn check_and_download_update(
         "https://api.github.com/repos/{}/releases/assets/{}",
         registry_repo, bundle_id
     );
-    let bundle_bytes = download_file(&bundle_url, github_token.as_deref()).await?;
-
     let trust = effective_trust(app_data_dir, &RegistryTrust::production());
+    // A nightly change is usually a few KB against the catalog already here.
+    // Anything that does not line up falls back to the whole bundle.
+    let bundle_bytes = match bundle_from_delta(
+        app_data_dir,
+        &latest,
+        registry_repo,
+        github_token.as_deref(),
+        &trust,
+    )
+    .await
+    {
+        Some(bytes) => bytes,
+        None => download_file(&bundle_url, github_token.as_deref()).await?,
+    };
+
     let verified = registry_bundle::verify_bundle(&bundle_bytes, &trust).map_err(bundle_error)?;
 
     // Anti-rollback, checked only after the signature so the compared stamp is
@@ -308,6 +321,43 @@ pub async fn check_and_download_update(
         expires_at: Some(verified.header.expires_at.clone()),
         message: format!("Catalog updated to {}.", latest.tag_name),
     })
+}
+
+/// Rebuild the latest bundle from the cached catalog and a published delta
+/// (MASTER_SPEC §33), or `None` when that is not possible.
+///
+/// The reference is the cached bundle's payload, verified before use, and the
+/// rebuilt bundle must pass the same [`registry_bundle::verify_bundle`] check
+/// as a full download, so a delta can save bytes but never change what is
+/// trusted. Every failure returns `None` and the caller downloads the bundle.
+async fn bundle_from_delta(
+    app_data_dir: &Path,
+    latest: &GitHubRelease,
+    registry_repo: &str,
+    token: Option<&str>,
+    trust: &RegistryTrust,
+) -> Option<Vec<u8>> {
+    let bundle_path = paths::registry_bundle_path(app_data_dir).ok()?;
+    if !bundle_path.exists() {
+        return None;
+    }
+    let current = load_payload(&bundle_path, trust).ok()?;
+    let delta_name = registry_bundle::delta_asset_name(&current.header.db_sha256)?;
+    let header_id = latest.find_asset(registry_bundle::HEADER_ASSET)?;
+    let delta_id = latest.find_asset(&delta_name)?;
+    let asset_url =
+        |id: u64| format!("https://api.github.com/repos/{registry_repo}/releases/assets/{id}");
+
+    let mut bundle = download_file(&asset_url(header_id), token).await.ok()?;
+    let db_len = registry_bundle::signed_prefix_db_len(&bundle).ok()?;
+    if db_len > registry_bundle::MAX_DELTA_PAYLOAD {
+        return None;
+    }
+    let delta = download_file(&asset_url(delta_id), token).await.ok()?;
+    let payload = registry_bundle::apply_payload_delta(&current.payload, &delta, db_len).ok()?;
+    bundle.extend_from_slice(&payload);
+    registry_bundle::verify_bundle(&bundle, trust).ok()?;
+    Some(bundle)
 }
 
 /// Outcome of the startup integrity check on the cached registry.

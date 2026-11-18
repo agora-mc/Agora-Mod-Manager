@@ -5598,3 +5598,50 @@ crash journal on disk.
   written by the previous code.
 - **Crash tests:** staged apply (each step) and the content-store migration (halfway).
 - `docs/architecture/layer-ownership.md` and `docs/DEVELOPMENT.md` name the one way for each job.
+
+## 33. CATALOG DELTAS
+
+Status: built 2026-11-18. Owner request: a catalog update should download what changed, not the
+whole catalog again.
+
+### 33.1 Why
+The signed bundle (§32, Wave 1) carries the whole SQLite catalog: 4.4 MB on 2026-11-18, downloaded
+in full whenever a nightly build changes anything. Measured between the 2026-11-17 and 2026-11-18
+catalogs: zstd of the whole database is 379 KB, and a zstd delta against the previous database is
+**7 KB**.
+
+### 33.2 What a release carries
+Beside `registry.bundle` (unchanged, still the fallback and the bootstrap):
+- `registry.header`: the bundle's signed prefix (magic, header length, header, signature), with no
+  database.
+- `registry.delta-<sha16>.zst`: one per distinct database among the releases kept (7), a zstd frame
+  that rebuilds this release's database with that earlier database as a raw-content dictionary
+  (what `zstd --patch-from` writes). `<sha16>` is the first 16 hex digits of the earlier
+  database's SHA-256.
+
+`scripts/deploy_release_assets.py` builds them (`scripts/catalog_delta.py`) from the bundles of the
+releases it keeps, applies each delta once to check it rebuilds the new database, and uploads them.
+A failure there is logged and skips the deltas; the full bundle is always published.
+
+### 33.3 What the client does
+`registry_sync::bundle_from_delta`, before the full download:
+1. Load the cached bundle and verify it; its payload is the reference.
+2. Look for `registry.header` and the delta named after the reference's signed `db_sha256`.
+3. Download both, rebuild the database (at most the header's `db_len`, and never more than
+   512 MiB), append it to the signed prefix.
+4. Verify the result with the same `verify_bundle` as a full download, then continue exactly as a
+   full download does (anti-rollback, expiry, schema, install).
+
+Any step that fails returns to the full download. A delta can save bytes; it cannot change what is
+trusted, because the rebuilt bundle is checked against the signature like any other.
+
+### 33.4 Decisions
+- **Binary delta of the database, not table shards.** The review proposed per-table shards with an
+  index and a client-side merge. A delta needs no new catalog format, no merge code and no partial
+  state, and is smaller for the changes that happen (a few rows). Shards would only win if clients
+  wanted part of the catalog, which none do.
+- **No separate revocation channel.** Withdrawing a bad mod means editing the catalog anyway; the
+  owner runs the compile workflow by hand, and with deltas the hourly sync then fetches the change
+  in a few KB.
+- **zstd** (the `zstd` crate in core, `zstandard` in the compiler requirements) is the one new
+  dependency; `flate2` cannot do this (its dictionary window is 32 KB).

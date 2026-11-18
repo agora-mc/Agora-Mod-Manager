@@ -29,6 +29,7 @@ import gen_addrlib_names as gan
 import crash_benchmark as cb
 import fetch_loader_manifests
 import deploy_release_assets
+import catalog_delta
 import finalize_release_assets as fra
 import refresh_loader_manifests
 import validate_loader_catalog_delta
@@ -4394,6 +4395,59 @@ class TestCatalogBundle(unittest.TestCase):
                     registry_compiler.build_catalog_bundle(
                         db_path, b"", skip_sign=False
                     )
+
+
+try:
+    import zstandard as _zstandard  # noqa: F401
+    _HAVE_ZSTD = True
+except ImportError:
+    _HAVE_ZSTD = False
+
+
+def _fake_bundle(db: bytes) -> bytes:
+    header = b'{"db_len":%d}' % len(db)
+    return catalog_delta.MAGIC + len(header).to_bytes(4, "little") + header + b"S" * 64 + db
+
+
+@unittest.skipUnless(_HAVE_ZSTD, "zstandard is not installed (pip install -r compiler/requirements.txt)")
+class CatalogDeltaTests(unittest.TestCase):
+    def setUp(self):
+        self.out = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.out, ignore_errors=True)
+
+    def test_split_bundle_separates_signed_prefix(self):
+        bundle = _fake_bundle(b"database")
+        prefix, db = catalog_delta.split_bundle(bundle)
+        self.assertEqual(db, b"database")
+        self.assertEqual(prefix + db, bundle)
+        with self.assertRaises(ValueError):
+            catalog_delta.split_bundle(b"nope")
+
+    def test_deltas_rebuild_the_new_database_from_each_earlier_one(self):
+        old_a = bytes(range(256)) * 400
+        old_b = old_a[:-500] + b"x" * 500
+        new = old_a[:5000] + b"changed row" + old_a[5000:]
+        written = catalog_delta.write_delta_assets(
+            _fake_bundle(new), [_fake_bundle(old_a), _fake_bundle(old_b), _fake_bundle(old_a), b"junk"], self.out
+        )
+        names = sorted(p.name for p in written)
+        self.assertIn("registry.header", names)
+        self.assertEqual(len(names), 3)
+        self.assertEqual((self.out / "registry.header").read_bytes(), catalog_delta.split_bundle(_fake_bundle(new))[0])
+        for old in (old_a, old_b):
+            delta = (self.out / catalog_delta.delta_asset_name(old)).read_bytes()
+            self.assertLess(len(delta), len(new) // 10)
+            self.assertEqual(catalog_delta.apply_delta(old, delta), new)
+
+    def test_no_delta_from_an_identical_database(self):
+        db = b"same" * 1000
+        written = catalog_delta.write_delta_assets(_fake_bundle(db), [_fake_bundle(db)], self.out)
+        self.assertEqual([p.name for p in written], ["registry.header"])
+
+    def test_delta_asset_names_are_recognised_for_replacement(self):
+        self.assertTrue(catalog_delta.is_delta_asset("registry.header"))
+        self.assertTrue(catalog_delta.is_delta_asset("registry.delta-0123456789abcdef.zst"))
+        self.assertFalse(catalog_delta.is_delta_asset("registry.bundle"))
 
 
 if __name__ == "__main__":

@@ -761,6 +761,72 @@ fn decode_signature(raw: &str) -> Option<Signature> {
     Some(Signature::from_bytes(&array))
 }
 
+/// Release asset holding only a bundle's signed prefix: magic, header length,
+/// header and signature, without the database. A client that can rebuild the
+/// database from a delta downloads this instead of the whole bundle.
+pub const HEADER_ASSET: &str = "registry.header";
+
+/// The largest database a delta may rebuild. A delta only ever produces bytes
+/// that are then checked against the signed header, so this bound exists only
+/// to stop a hostile or broken delta from exhausting memory first.
+pub const MAX_DELTA_PAYLOAD: u64 = 512 * 1024 * 1024;
+
+/// Name of the release asset that turns the database whose SHA-256 is
+/// `reference_db_sha256` into the release's database: `registry.delta-<first
+/// 16 hex digits>.zst`. `None` for a value that is not a SHA-256.
+pub fn delta_asset_name(reference_db_sha256: &str) -> Option<String> {
+    let sha = reference_db_sha256.trim().to_ascii_lowercase();
+    if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!("registry.delta-{}.zst", &sha[..16]))
+}
+
+/// Check that `prefix` is exactly a bundle's signed prefix and return the
+/// database length its header names. The header is not trusted here: the
+/// rebuilt bundle goes through [`verify_bundle`] like any download.
+pub fn signed_prefix_db_len(prefix: &[u8]) -> Result<u64, BundleError> {
+    if prefix.len() < MIN_BUNDLE_LEN {
+        return Err(BundleError::Truncated("header"));
+    }
+    if &prefix[..MAGIC_LEN] != MAGIC {
+        return Err(BundleError::BadMagic);
+    }
+    let header_len = u32::from_le_bytes(
+        prefix[MAGIC_LEN..MAGIC_LEN + 4]
+            .try_into()
+            .map_err(|_| BundleError::Truncated("header length"))?,
+    ) as usize;
+    if header_len == 0 || header_len > 1024 * 1024 {
+        return Err(BundleError::HeaderTooLarge);
+    }
+    let header_start = MAGIC_LEN + 4;
+    if prefix.len() != header_start + header_len + SIGNATURE_LENGTH {
+        return Err(BundleError::Truncated("signed prefix"));
+    }
+    let header: CatalogHeader =
+        serde_json::from_slice(&prefix[header_start..header_start + header_len])
+            .map_err(|error| BundleError::HeaderNotJson(error.to_string()))?;
+    Ok(header.db_len)
+}
+
+/// Rebuild a database from the previous one and a zstd delta made with the
+/// previous database as its dictionary (`zstd --patch-from`). Reads at most
+/// `limit` bytes; more is an error. The result is unverified.
+pub fn apply_payload_delta(reference: &[u8], delta: &[u8], limit: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut decoder = zstd::stream::read::Decoder::with_dictionary(delta, reference)?;
+    let mut out = Vec::new();
+    (&mut decoder).take(limit + 1).read_to_end(&mut out)?;
+    if out.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "catalog delta rebuilds more bytes than its header names",
+        ));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1138,5 +1204,115 @@ mod tests {
             verify_bundle(&bundle, &trust),
             Err(BundleError::UnknownKey(_))
         ));
+    }
+
+    fn delta_between(old: &[u8], new: &[u8]) -> Vec<u8> {
+        let mut encoder =
+            zstd::stream::write::Encoder::with_dictionary(Vec::new(), 19, old).unwrap();
+        encoder.include_contentsize(true).unwrap();
+        encoder
+            .set_pledged_src_size(Some(new.len() as u64))
+            .unwrap();
+        std::io::Write::write_all(&mut encoder, new).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn a_delta_and_signed_prefix_rebuild_a_verifiable_bundle() {
+        let signing = key(7);
+        let old: Vec<u8> = (0..20_000u32).flat_map(|n| n.to_le_bytes()).collect();
+        let mut new = old.clone();
+        new[1234] ^= 0xff;
+        new.extend_from_slice(b"one more row");
+        let bundle = sign(&signing, &header_for(&signing, &new), &new);
+        let prefix = &bundle[..bundle.len() - new.len()];
+
+        assert_eq!(signed_prefix_db_len(prefix).unwrap(), new.len() as u64);
+        let delta = delta_between(&old, &new);
+        assert!(delta.len() < 200, "delta was {} bytes", delta.len());
+        let rebuilt = apply_payload_delta(&old, &delta, new.len() as u64).unwrap();
+        let mut rebuilt_bundle = prefix.to_vec();
+        rebuilt_bundle.extend_from_slice(&rebuilt);
+        assert_eq!(rebuilt_bundle, bundle);
+        verify_bundle(&rebuilt_bundle, &RegistryTrust::with_key(public(&signing))).unwrap();
+    }
+
+    #[test]
+    fn a_delta_against_the_wrong_reference_never_verifies() {
+        let signing = key(7);
+        // Incompressible bytes, so the delta can only rebuild them by copying
+        // from its dictionary: the wrong dictionary yields the wrong bytes.
+        let noise = |seed: u64| {
+            let mut state = seed;
+            (0..50_000)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (state >> 56) as u8
+                })
+                .collect::<Vec<u8>>()
+        };
+        let old = noise(1);
+        let other = noise(2);
+        let mut new = old.clone();
+        new[10] = 9;
+        let bundle = sign(&signing, &header_for(&signing, &new), &new);
+        let prefix = &bundle[..bundle.len() - new.len()];
+        let delta = delta_between(&old, &new);
+        let rebuilt = apply_payload_delta(&other, &delta, new.len() as u64);
+        if let Ok(rebuilt) = rebuilt {
+            let mut candidate = prefix.to_vec();
+            candidate.extend_from_slice(&rebuilt);
+            assert!(verify_bundle(&candidate, &RegistryTrust::with_key(public(&signing))).is_err());
+        }
+    }
+
+    #[test]
+    fn a_delta_may_not_rebuild_more_than_the_limit() {
+        let old = vec![0u8; 1000];
+        let new = vec![0u8; 10_000];
+        let delta = delta_between(&old, &new);
+        assert!(apply_payload_delta(&old, &delta, 5_000).is_err());
+    }
+
+    #[test]
+    fn a_prefix_with_trailing_bytes_or_bad_magic_is_refused() {
+        let signing = key(7);
+        let new = b"payload".to_vec();
+        let bundle = sign(&signing, &header_for(&signing, &new), &new);
+        assert!(signed_prefix_db_len(&bundle).is_err());
+        let mut prefix = bundle[..bundle.len() - new.len()].to_vec();
+        prefix[0] = b'X';
+        assert!(signed_prefix_db_len(&prefix).is_err());
+    }
+
+    #[test]
+    fn delta_asset_names_use_the_reference_hash() {
+        let sha = "AB".repeat(32);
+        assert_eq!(
+            delta_asset_name(&sha).as_deref(),
+            Some("registry.delta-abababababababab.zst")
+        );
+        assert_eq!(delta_asset_name("nothex"), None);
+    }
+
+    #[test]
+    fn a_delta_written_by_the_python_compiler_applies_here() {
+        // Made by scripts/catalog_delta.make_delta (python-zstandard, raw-content
+        // dictionary): old = b"agora catalog row " * 200, new = old with
+        // b"NEW MOD ROW " inserted at byte 900.
+        let old = b"agora catalog row ".repeat(200);
+        let mut new = old[..900].to_vec();
+        new.extend_from_slice(b"NEW MOD ROW ");
+        new.extend_from_slice(&old[900..]);
+        let delta = hex::decode(
+            "28b52ffd601c0ddd000060614e4557204d4f4420524f570300f3821f502e2d2a075cd56403",
+        )
+        .unwrap();
+        assert_eq!(
+            apply_payload_delta(&old, &delta, new.len() as u64).unwrap(),
+            new
+        );
     }
 }

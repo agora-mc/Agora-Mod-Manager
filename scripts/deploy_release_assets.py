@@ -16,6 +16,11 @@ Requires:
     registry.bundle   — The signed catalog bundle the launcher installs
     registry-web.json — The web registry export (in the working directory)
     registry-web.json.sig — The web export signature (in the working directory)
+
+Each release also carries ``registry.header`` and ``registry.delta-*.zst``
+(MASTER_SPEC §33), built here from the bundles of the releases it keeps, so a
+client holding any of them downloads a few KB instead of the whole bundle.
+Delta failures are logged and skipped: the full bundle is always published.
 """
 
 from __future__ import annotations
@@ -28,6 +33,8 @@ from pathlib import Path
 from urllib.parse import quote
 
 import requests
+
+import catalog_delta
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("deploy_release_assets")
@@ -82,6 +89,9 @@ def main() -> int:
     for asset_path in RELEASE_ASSETS:
         upload_asset(headers, release, asset_path)
 
+    for asset_path in build_delta_assets(headers, repo, tag):
+        upload_asset(headers, release, asset_path)
+
     logger.info("Upload complete.")
 
     # Prune old registry-* releases.
@@ -123,7 +133,7 @@ def create_release(headers: dict, repo: str, tag: str) -> dict:
 def delete_existing_assets(headers: dict, repo: str, release: dict) -> None:
     for asset in release.get("assets", []):
         name = asset.get("name", "")
-        if name in {path.name for path in RELEASE_ASSETS}:
+        if name in {path.name for path in RELEASE_ASSETS} or catalog_delta.is_delta_asset(name):
             url = f"{API_BASE}/repos/{repo}/releases/assets/{asset['id']}"
             resp = requests.delete(url, headers=headers)
             if resp.status_code == 204:
@@ -150,6 +160,42 @@ def upload_asset(headers: dict, release: dict, path: Path) -> None:
 
     size = path.stat().st_size
     logger.info("Uploaded %s (%d bytes)", filename, size)
+
+
+DELTA_DIR = Path("catalog-deltas")
+
+
+def build_delta_assets(headers: dict, repo: str, tag: str) -> list[Path]:
+    """Deltas from the bundles of the releases kept beside this one."""
+    try:
+        resp = requests.get(f"{API_BASE}/repos/{repo}/releases?per_page=100", headers=headers)
+        resp.raise_for_status()
+        releases = [
+            r for r in resp.json()
+            if r.get("tag_name", "").startswith("registry-") and r.get("tag_name") != tag
+        ]
+        releases.sort(key=lambda r: r.get("tag_name", ""), reverse=True)
+        previous: list[bytes] = []
+        for old in releases[:MAX_RELEASES_TO_KEEP]:
+            asset = next((a for a in old.get("assets", []) if a.get("name") == "registry.bundle"), None)
+            if asset is None:
+                continue
+            got = requests.get(
+                f"{API_BASE}/repos/{repo}/releases/assets/{asset['id']}",
+                headers={**headers, "Accept": "application/octet-stream"},
+            )
+            if got.status_code == 200:
+                previous.append(got.content)
+            else:
+                logger.warning("Could not fetch %s's bundle: HTTP %d", old["tag_name"], got.status_code)
+        written = catalog_delta.write_delta_assets(
+            Path("registry.bundle").read_bytes(), previous, DELTA_DIR
+        )
+        logger.info("Built %d catalog delta(s) from %d earlier bundle(s).", len(written) - 1, len(previous))
+        return written
+    except Exception as exc:  # noqa: BLE001 - deltas are an optimisation; the bundle still ships
+        logger.warning("Skipping catalog deltas: %s", exc)
+        return []
 
 
 def prune_old_releases(headers: dict, repo: str) -> None:
