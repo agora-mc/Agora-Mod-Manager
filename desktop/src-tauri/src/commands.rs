@@ -4947,16 +4947,47 @@ pub async fn export_backup(
     instance_id: String,
     snapshot_id: String,
     export_dir: String,
+    with_bytes: Option<bool>,
 ) -> LauncherResult<String> {
     let ctx = crate::core_context(&app)?;
-    agora_core::backup::export_instance_backup(
-        &ctx,
-        &instance_id,
-        &snapshot_id,
-        std::path::Path::new(&export_dir),
-        agora_game_minecraft::snapshot_scope::tracked_entries(),
-    )
-    .await
+    let is_game = agora_core::game_instance::get(&ctx, &instance_id)
+        .map_err(|error| LauncherError::Generic {
+            code: "ERR_LOCAL_STATE_FAILED".into(),
+            message: format!("cannot read instance '{instance_id}': {error}"),
+        })?
+        .is_some();
+    if is_game {
+        agora_core::backup::export_game_instance_backup(
+            &ctx,
+            &instance_id,
+            &snapshot_id,
+            std::path::Path::new(&export_dir),
+            with_bytes.unwrap_or(false),
+        )
+        .await
+    } else {
+        agora_core::backup::export_instance_backup(
+            &ctx,
+            &instance_id,
+            &snapshot_id,
+            std::path::Path::new(&export_dir),
+            agora_game_minecraft::snapshot_scope::tracked_entries(),
+        )
+        .await
+    }
+}
+
+/// The bytes a game backup's content objects would add, so the page can show
+/// the cost before the player asks to include them.
+#[tauri::command]
+pub async fn game_backup_bytes(
+    app: tauri::AppHandle,
+    _state: tauri::State<'_, LauncherState>,
+    instance_id: String,
+    snapshot_id: String,
+) -> LauncherResult<u64> {
+    let ctx = crate::core_context(&app)?;
+    agora_core::backup::game_instance_backup_content_bytes(&ctx, &instance_id, &snapshot_id)
 }
 
 /// Read a backup artifact back into an instance.
@@ -6142,6 +6173,38 @@ pub async fn detect_drift(
     snapshot_id: String,
 ) -> LauncherResult<serde_json::Value> {
     let sanitized = crate::paths::sanitize_id(&instance_id);
+    let ctx = crate::core_context(&app)?;
+    // A game instance has no Minecraft folder list: compare its declared state
+    // files and rules instead.
+    if let Some(record) = agora_core::game_instance::get(&ctx, &sanitized).map_err(|error| {
+        LauncherError::Generic {
+            code: "ERR_LOCAL_STATE_FAILED".into(),
+            message: format!("cannot read instance '{sanitized}': {error}"),
+        }
+    })? {
+        let definition = ctx
+            .games
+            .game(&record.game)
+            .ok_or_else(|| LauncherError::Generic {
+                code: "ERR_GAME_DEFINITION".into(),
+                message: format!(
+                    "the definition for game '{}' is not installed",
+                    record.game.as_str()
+                ),
+            })?;
+        let diff = agora_core::game_snapshot::diff_against_snapshot(
+            &ctx,
+            &sanitized,
+            definition,
+            &snapshot_id,
+        )
+        .map_err(|error| LauncherError::Generic {
+            code: "ERR_DRIFT".into(),
+            message: error,
+        })?;
+        return Ok(serde_json::to_value(&diff.files).unwrap_or_default());
+    }
+
     let instance_dir = crate::paths::instance_dir(&app, &sanitized)
         .map_err(|_| LauncherError::LocalStateFailed)?;
     let snapshot_id_for_task = snapshot_id.clone();

@@ -2249,6 +2249,11 @@ pub fn launch_with(
     let prepared =
         prepare_launch_with(ctx, id, definition, options.clone(), discover_fn, launcher)?;
 
+    // The recovery point the session may promote: taken after deployment has
+    // settled the instance's state, before anything runs.
+    let launch_point =
+        crate::game_snapshot::prepare_launch(ctx, id, definition).map_err(InstanceError::Other)?;
+
     // 2. Determine store and running_from
     let (store, running_from) = match &record.base {
         BaseReference::Pinned { id: base_id, .. } => {
@@ -2323,6 +2328,11 @@ pub fn launch_with(
     // 7. Open the session ledger row: what this launch ran with. Best effort by construction;
     //    a launch is never blocked or failed by its own bookkeeping.
     let session_id = crate::session_ledger::record_launch(ctx, id, definition, &store);
+    if let Err(error) =
+        crate::game_snapshot::record_launch_point(ctx, id, session_id.as_deref(), &launch_point)
+    {
+        eprintln!("[lkg] could not record the launch recovery point for '{id}': {error}");
+    }
 
     Ok(LaunchedInstance {
         launched,

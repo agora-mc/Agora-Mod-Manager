@@ -3188,6 +3188,22 @@ unreadable with the reason and retention leaves it alone. The Minecraft folder
 list has moved out of core into the Minecraft package, which declares it, so
 core holds no game's folders.
 
+**Game-instance last-known-good and backups.** A game-instance launch takes a
+pre-launch snapshot after deployment settles the state, and skips it when the
+content hash of the declared state is unchanged since the newest snapshot. When
+the session ends, the session ledger's verdict is mapped to §23.2's classes
+(clean exit after the minimum runtime with no crash evidence is a success; a
+crash, a freeze or a start failure is a crash; a player Stop is cancelled; an
+unwatched end is unknown; a clean exit that was too short is abandoned) and only
+a success promotes the pre-launch snapshot to LKG. Retention is the existing
+policy, with the current LKG evicted last. Changes since LKG are the state-file
+diff plus the content items and load-after lists that changed, and restore-to-LKG
+uses the guarded snapshot restore. A backup always holds the state and each
+content item's file hashes and recorded source; the mod bytes are included only
+when the player asks (the size is shown first). Import verifies every hash
+before writing, and a backup without bytes either finds every object in the
+store or refuses the whole import naming the missing items.
+
 ### 23.4 Health, Crash Doctor, Memory, Authentication, and Launch Reliability (formerly §19.19)
 
 Health reports separate blockers, warnings, and non-interrupting recommendations. Recommendation-only reports remain green and never stop launch. Warning mutes use stable structured keys with legacy-setting migration; blockers cannot be muted. A health scan carries an identity derived from the instance manifest plus observed mod-file and registry-database content hashes. Core launch reuses that scan only while the identity remains unchanged, preventing duplicate healthy scans without trusting stale frontend approval.

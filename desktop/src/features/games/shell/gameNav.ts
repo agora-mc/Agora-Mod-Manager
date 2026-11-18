@@ -38,6 +38,7 @@ export const GAME_INSTANCE_PAGE_TABS: readonly GameInstancePageTab[] = [
   { id: 'ini-saves', label: 'INI & saves' },
   { id: 'loadouts', label: 'Loadouts' },
   { id: 'tools', label: 'Tools' },
+  { id: 'snapshots', label: 'Snapshots' },
 ];
 
 /**

@@ -531,8 +531,8 @@ Minecraft only loads data packs from inside a world, so Agora copies enabled dat
 | `agora import launchers [--root <DIR>]` | List Prism, CurseForge and Modrinth instances that can be imported |
 | `agora import plan <KEY>... [--root <DIR>] [--name <NAME>] [--no-settings]` | Show what importing launcher instances would copy; prints a plan fingerprint |
 | `agora import run <KEY>... [--root <DIR>] [--name <NAME>] [--no-settings] [--fingerprint <HASH>]` | Import launcher instances (items commit independently) |
-| `agora backup export <INSTANCE> --out <DIR> [--snapshot <ID>]` | Write a snapshot (a new one unless `--snapshot` is given) to a folder as one zip |
-| `agora backup import <FILE> [--instance <INSTANCE>]` | Read a backup zip into an instance as a restorable snapshot |
+| `agora backup export <INSTANCE> --out <DIR> [--snapshot <ID>] [--with-bytes]` | Write a snapshot (a new one unless `--snapshot` is given) to a folder as one zip. For a game instance the backup always holds the instance's state and each content item's hash and source; `--with-bytes` also includes the mod bytes, and prints their size first |
+| `agora backup import <FILE> [--instance <INSTANCE>]` | Read a backup zip into an instance as a restorable snapshot. Every hash is checked before anything is written; a game backup without its mod bytes is refused, naming every missing item, unless those objects already exist |
 | `agora backup prune <INSTANCE> [--keep <N>] [--yes]` | Delete snapshots beyond the newest N (default 10) |
 | `agora export <INSTANCE> <DEST> [--world <FOLDER>] [--allow-unverified-loader]` | Export a standalone, ready-to-run server folder |
 | `agora pack update-preview <INSTANCE> <MRPACK>` | Show what a newer .mrpack would change. Changes nothing |
@@ -559,13 +559,20 @@ agora snapshots list <INSTANCE>
 agora snapshots create <INSTANCE> --label "Before update"
 agora snapshots restore <INSTANCE> <SNAPSHOT_ID> [--force]
 agora snapshots delete <INSTANCE> <SNAPSHOT_ID>
+agora snapshots lkg <INSTANCE>
+agora snapshots lkg-diff <INSTANCE>
+agora snapshots restore-lkg <INSTANCE> [--force]
 ```
 
 A restore replaces tracked instance state. Preserve valuable worlds separately and verify the intended snapshot ID before restoring. Every restore takes a pre-restore snapshot first, so the restore itself can be undone by restoring that `pre-restore-…` entry.
 
 Agora's automatic pre-launch recovery snapshot is optimized for mod, configuration, and layout recovery and does not include `saves/`. Full manual and transactional snapshots use a broader scope, but no local snapshot system should be the only backup for an irreplaceable world.
 
+`snapshots lkg` prints the snapshot that last launched well and how the last launch ended. `snapshots lkg-diff` lists the files that changed since it (a reordered plugin list and a changed INI each appear as a modified state file) and, for a game instance, the content items and load-after lists that changed. `snapshots restore-lkg` restores that snapshot through the normal guarded restore, taking an undo snapshot first. A launch promotes its pre-launch snapshot only when the session ends successfully — a clean exit after the minimum runtime with no crash evidence. A crash, a cancelled run, an unknown ending, or a run too short to count never promotes.
+
 The same commands work for a game instance (§26). Its snapshot holds the instance's own state — the manifest (content layers, save choice), the plugin lists and INI copies the game definition declares, the `.agora_loadouts` store, and the load-after rules — while mod files stay once in the content store, so a snapshot is small. A restore writes those files atomically, restores every list's rules in one database transaction, and marks the deployed folder for a rebuild at the next launch. It refuses while the game is running or cannot be proven idle; `--force` restores anyway, after the warning that the running game may overwrite it. A content item the snapshot names but the store no longer holds refuses the restore, naming the item, before anything changes. Content-store removal refuses while a game-instance snapshot still names the item; the refusal names the snapshot (instance, label and time) and the exact `agora snapshots delete <instance> <id>` command. An unreadable snapshot refuses too, naming it and its command; `agora games content remove --ignore-unreadable-snapshots` is the explicit override, and it names each snapshot it ignored on stderr. `snapshots list` shows a damaged snapshot as unreadable with the reason instead of hiding it, and keeps it out of automatic retention so it can be inspected or deleted by hand.
+
+A game-instance launch takes its pre-launch snapshot after deployment has settled the state and skips it when the state's content hash is unchanged since the last snapshot. When the game closes, the session ledger's verdict is mapped to the LaunchOutcome classes in §23.2 and only a success promotes the snapshot to last-known-good. Retention is the existing policy, so the current last-known-good is evicted last.
 
 ### Loadouts
 

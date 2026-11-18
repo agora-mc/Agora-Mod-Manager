@@ -648,6 +648,78 @@ pub fn snapshot_file_index(
     Ok(result)
 }
 
+/// One file a snapshot records, including a declared file the instance did not
+/// have. Backup export needs the absent entries: restoring them is what removes
+/// a file the captured state did not contain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotFileView {
+    pub relative_path: String,
+    pub size: u64,
+    pub sha256: Option<String>,
+    pub absent: bool,
+}
+
+/// Every file entry a snapshot records, absent ones included, in path order.
+pub fn snapshot_file_entries(
+    instance_dir: &Path,
+    snapshot_id: &str,
+) -> Result<Vec<SnapshotFileView>, String> {
+    validate_snapshot_id(snapshot_id)?;
+    let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
+    if manifest_path.is_file() {
+        let manifest = read_manifest_file(&manifest_path, snapshot_id)?;
+        let mut result = Vec::with_capacity(manifest.files.len());
+        let mut seen = HashSet::new();
+        for indexed in &manifest.files {
+            validate_relative_path(&indexed.relative_path)?;
+            if !seen.insert(indexed.relative_path.clone()) {
+                return Err(format!(
+                    "snapshot manifest contains duplicate path {}",
+                    indexed.relative_path
+                ));
+            }
+            if !indexed.absent {
+                let hash = indexed
+                    .blob_sha256
+                    .as_deref()
+                    .or(indexed.sha256.as_deref())
+                    .ok_or_else(|| {
+                        format!(
+                            "snapshot manifest has no content hash for {}",
+                            indexed.relative_path
+                        )
+                    })?;
+                validate_blob_hash(hash)?;
+            }
+            result.push(SnapshotFileView {
+                relative_path: indexed.relative_path.clone(),
+                size: indexed.size,
+                sha256: indexed
+                    .sha256
+                    .clone()
+                    .or_else(|| indexed.blob_sha256.clone()),
+                absent: indexed.absent,
+            });
+        }
+        result.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        return Ok(result);
+    }
+
+    // Legacy ZIP snapshots cannot record an absent file: every entry in the
+    // archive is a file that existed.
+    snapshot_file_index(instance_dir, snapshot_id).map(|entries| {
+        entries
+            .into_iter()
+            .map(|entry| SnapshotFileView {
+                relative_path: entry.path,
+                size: entry.size,
+                sha256: Some(entry.sha256),
+                absent: false,
+            })
+            .collect()
+    })
+}
+
 /// The non-file state a snapshot recorded, and the content-store item ids its
 /// captured state names. A legacy ZIP or an older manifest records neither.
 pub fn snapshot_aux(instance_dir: &Path, snapshot_id: &str) -> Result<SnapshotAux, String> {

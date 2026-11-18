@@ -1107,6 +1107,7 @@ fn spawn_exit_watch(
         game_id,
         session_id,
     } = watch;
+    let watched_instance = instance_id.clone();
     std::thread::spawn(move || {
         // Waits for the game's own process (not the loader that started it) and records how it
         // ended in the session ledger.
@@ -1114,6 +1115,7 @@ fn spawn_exit_watch(
             Some(definition) => {
                 let _ = game_instance::watch_session(
                     &ctx,
+                    &watched_instance,
                     definition,
                     session_id.as_deref(),
                     &running_from,

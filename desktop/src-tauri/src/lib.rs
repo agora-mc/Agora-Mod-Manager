@@ -306,6 +306,7 @@ pub fn run() {
             commands::step_back_bisect,
             commands::cancel_bisect,
             commands::export_backup,
+            commands::game_backup_bytes,
             commands::import_backup,
             commands::apply_backup_retention,
             commands::get_mod_groups,

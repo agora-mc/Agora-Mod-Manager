@@ -19,10 +19,13 @@ use std::path::{Path, PathBuf};
 use agora_game_api::{GameDefinition, LayerSource, LoadOrderDestination};
 use serde::{Deserialize, Serialize};
 
+use agora_game_api::crash::SessionVerdict;
+
 use crate::ctx::Ctx;
 use crate::game_instance;
 use crate::game_load_order::{self, LoadAfterRule};
 use crate::game_loadout::GameLoadoutRules;
+use crate::lkg::{self, Diff, FileEntry, LaunchOutcome, LkgState};
 use crate::lock_manager::LockResource;
 use crate::snapshot::{
     self, RestoreCoverageKind, RestoreOutcome, Snapshot, SnapshotAux, SnapshotInputFile,
@@ -236,16 +239,26 @@ pub fn capture_data(
     instance_id: &str,
     definition: &GameDefinition,
 ) -> Result<GameSnapshotData, String> {
-    let manifest = game_instance::get_manifest(ctx, instance_id).map_err(|e| e.to_string())?;
     let dir = ctx
         .paths
         .instance_dir(instance_id)
         .map_err(|e| e.to_string())?;
+    // A backup imported into a fresh data folder has no live manifest yet. Its
+    // snapshot still restores one, and the undo point records that there was
+    // none rather than refusing the restore. A manifest that exists but cannot
+    // be read is still an error.
+    let manifest = if dir.join(INSTANCE_MANIFEST_ROOT).exists() {
+        Some(game_instance::get_manifest(ctx, instance_id).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
 
     let mut refs = BTreeSet::new();
-    for layer in manifest.layers.layers() {
-        if let LayerSource::Content { content } = &layer.source {
-            refs.insert(content.clone());
+    if let Some(manifest) = &manifest {
+        for layer in manifest.layers.layers() {
+            if let LayerSource::Content { content } = &layer.source {
+                refs.insert(content.clone());
+            }
         }
     }
     for profile in crate::loadout::list_profiles(&dir)? {
@@ -379,6 +392,381 @@ pub fn snapshot_before_change_locked(
     )
     .map(|_| ())
     .map_err(|error| format!("could not take a recovery point before '{label}': {error}"))
+}
+
+// ---------------------------------------------------------------------------
+// Last-known-good
+// ---------------------------------------------------------------------------
+
+/// Set while a launch is in flight: the session and the snapshot that must be
+/// promoted if the session ends well.
+const LKG_PENDING: &str = ".agora_instance_lkg_pending";
+
+/// The recovery point a launch may promote when the session ends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrelaunchPoint {
+    pub snapshot_id: String,
+    /// False when the state had not changed since the last snapshot, so no new
+    /// snapshot was written.
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingLaunch {
+    session_id: String,
+    snapshot_id: String,
+}
+
+/// The changes between an instance's current state and its last-known-good
+/// snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LkgDiff {
+    pub snapshot_id: String,
+    pub files: Diff,
+    /// Content-store items the current state names that the LKG did not.
+    pub added_content: Vec<String>,
+    /// Content-store items the LKG named that the current state no longer does.
+    pub removed_content: Vec<String>,
+    /// Load-order lists whose load-after rules changed, by list id.
+    pub rules_changed: Vec<String>,
+}
+
+fn fingerprint_entries(entries: &[(String, Option<String>)], data: &GameSnapshotData) -> String {
+    let mut hasher = sha2::Sha256::new();
+    use sha2::Digest;
+    hasher.update(b"agora-game-lkg-state-v1");
+    for (path, hash) in entries {
+        hasher.update((path.len() as u64).to_le_bytes());
+        hasher.update(path.as_bytes());
+        match hash {
+            Some(hash) => {
+                hasher.update([1u8]);
+                hasher.update(hash.as_bytes());
+            }
+            None => hasher.update([0u8]),
+        }
+    }
+    hasher.update(serde_json::to_vec(data).unwrap_or_default());
+    format!("{:x}", hasher.finalize())
+}
+
+fn live_fingerprint(files: &[SnapshotInputFile], data: &GameSnapshotData) -> String {
+    let entries: Vec<(String, Option<String>)> = files
+        .iter()
+        .map(|file| {
+            (
+                file.relative_path.clone(),
+                file.contents
+                    .as_ref()
+                    .map(|bytes| snapshot::sha256_hex(bytes)),
+            )
+        })
+        .collect();
+    fingerprint_entries(&entries, data)
+}
+
+fn snapshot_fingerprint(
+    instance_dir: &Path,
+    snapshot_id: &str,
+    data: &GameSnapshotData,
+) -> Result<String, String> {
+    let entries = snapshot::snapshot_file_entries(instance_dir, snapshot_id)?;
+    let entries: Vec<(String, Option<String>)> = entries
+        .into_iter()
+        .map(|entry| {
+            (
+                entry.relative_path,
+                if entry.absent { None } else { entry.sha256 },
+            )
+        })
+        .collect();
+    Ok(fingerprint_entries(&entries, data))
+}
+
+/// The newest snapshot, when it is a readable game-instance snapshot whose
+/// state can be compared. A damaged or foreign newest snapshot cannot prove
+/// the state unchanged, so the caller takes a new one.
+fn newest_comparable_snapshot(
+    instance_dir: &Path,
+) -> Result<Option<(Snapshot, GameSnapshotData)>, String> {
+    let Some(newest) = snapshot::list_snapshots(instance_dir)?.into_iter().next() else {
+        return Ok(None);
+    };
+    if newest.unreadable.is_some() {
+        return Ok(None);
+    }
+    let Some(data) = snapshot_data(instance_dir, &newest.id)? else {
+        return Ok(None);
+    };
+    Ok(Some((newest, data)))
+}
+
+/// Take the recovery point a launch may promote. The state is captured before
+/// the game starts; an unchanged state reuses the newest snapshot rather than
+/// writing another copy of the same state.
+pub fn prepare_launch(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+) -> Result<PrelaunchPoint, String> {
+    let dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| e.to_string())?;
+    let _lock = ctx
+        .lock_manager
+        .acquire(
+            LockResource::Instance(instance_id.to_string()),
+            "launch-snapshot",
+        )
+        .map_err(|e| e.to_string())?;
+    refuse_if_pending(&dir, None)?;
+
+    let current_files = capture_files(ctx, instance_id, definition)?;
+    let current_data = capture_data(ctx, instance_id, definition)?;
+    let current = live_fingerprint(&current_files, &current_data);
+
+    if let Some((snapshot, data)) = newest_comparable_snapshot(&dir)? {
+        if snapshot_fingerprint(&dir, &snapshot.id, &data)? == current {
+            return Ok(PrelaunchPoint {
+                snapshot_id: snapshot.id,
+                created: false,
+            });
+        }
+    }
+
+    let aux = aux_for(&current_data)?;
+    let snapshot = snapshot::create_snapshot_from_data(
+        &dir,
+        Some("pre-launch"),
+        &current_files,
+        SnapshotOrigin::Automatic,
+        &aux,
+    )?;
+    if let Err(error) = lkg::run_retention(&dir) {
+        eprintln!("[snapshot] retention after pre-launch capture failed: {error}");
+    }
+    Ok(PrelaunchPoint {
+        snapshot_id: snapshot.id,
+        created: true,
+    })
+}
+
+/// Tie a launch's recovery point to the session that will judge it. Without a
+/// session there will be no verdict, so a launch that could not open one is not
+/// recorded here and nothing is promoted later.
+pub fn record_launch_point(
+    ctx: &Ctx,
+    instance_id: &str,
+    session_id: Option<&str>,
+    point: &PrelaunchPoint,
+) -> Result<(), String> {
+    let Some(session_id) = session_id else {
+        return Ok(());
+    };
+    let dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| e.to_string())?;
+    let pending = PendingLaunch {
+        session_id: session_id.to_string(),
+        snapshot_id: point.snapshot_id.clone(),
+    };
+    let bytes = serde_json::to_vec(&pending)
+        .map_err(|e| format!("could not serialize the launch recovery point: {e}"))?;
+    snapshot::atomic_write_pub(&dir.join(LKG_PENDING), &bytes)
+}
+
+fn read_pending_launch(dir: &Path) -> Option<PendingLaunch> {
+    let bytes = std::fs::read(dir.join(LKG_PENDING)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Map the session ledger's verdict to §23.2's launch classes.
+///
+/// `Normal` after the minimum runtime is the only success. A clean exit that
+/// was too short is `Abandoned`; a crash, a freeze and a start failure are
+/// `Crash`; a player Stop is `Cancelled`; an end nobody watched is `Unknown`.
+/// None of those promotes.
+pub fn outcome_from_verdict(verdict: SessionVerdict, runtime_ms: u64) -> LaunchOutcome {
+    match verdict {
+        SessionVerdict::Normal => {
+            if runtime_ms >= lkg::DEFAULT_ABANDON_THRESHOLD_MS {
+                LaunchOutcome::Success
+            } else {
+                LaunchOutcome::Abandoned
+            }
+        }
+        SessionVerdict::Crashed { .. } | SessionVerdict::Froze | SessionVerdict::FailedToStart => {
+            LaunchOutcome::Crash
+        }
+        SessionVerdict::Stopped => LaunchOutcome::Cancelled,
+        SessionVerdict::ClosedUnknown => LaunchOutcome::Unknown,
+    }
+}
+
+/// Record how a launch ended and promote its recovery point only for a
+/// success. Called by the session watcher, which is the one place both front
+/// ends report the game's end.
+pub fn finish_launch_session(
+    ctx: &Ctx,
+    instance_id: &str,
+    session_id: &str,
+    verdict: Option<SessionVerdict>,
+    runtime_ms: u64,
+) -> Option<LaunchOutcome> {
+    let dir = ctx.paths.instance_dir(instance_id).ok()?;
+    let pending = read_pending_launch(&dir)?;
+    if pending.session_id != session_id {
+        return None;
+    }
+    // Remove it first: two watchers must not both promote the same launch.
+    let _ = std::fs::remove_file(dir.join(LKG_PENDING));
+    let outcome = match verdict {
+        Some(verdict) => outcome_from_verdict(verdict, runtime_ms),
+        // The ledger could not judge the session. "Could not tell" never promotes.
+        None => LaunchOutcome::Unknown,
+    };
+    if let Err(error) = lkg::record_launch_outcome(
+        &dir,
+        Some(&pending.snapshot_id),
+        session_id,
+        outcome.clone(),
+    ) {
+        eprintln!("[lkg] could not record the launch outcome for '{instance_id}': {error}");
+    }
+    if let Err(error) = lkg::run_retention(&dir) {
+        eprintln!("[snapshot] retention after a launch ended failed: {error}");
+    }
+    Some(outcome)
+}
+
+fn capture_files_as_entries(files: &[SnapshotInputFile]) -> Vec<FileEntry> {
+    files
+        .iter()
+        .filter_map(|file| {
+            file.contents.as_ref().map(|bytes| FileEntry {
+                path: file.relative_path.clone(),
+                sha256: snapshot::sha256_hex(bytes),
+                size: bytes.len() as u64,
+            })
+        })
+        .collect()
+}
+
+fn rules_by_list(data: &GameSnapshotData) -> std::collections::BTreeMap<&str, &[LoadAfterRule]> {
+    data.rules
+        .iter()
+        .map(|list| (list.list.as_str(), list.rules.as_slice()))
+        .collect()
+}
+
+/// What changed since the current last-known-good snapshot. A reordered plugin
+/// list and a changed INI show up as modified state files; content items and
+/// load-after rules are named separately because they are not files.
+pub fn diff_since_lkg(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+) -> Result<LkgDiff, String> {
+    let dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| e.to_string())?;
+    let state = lkg::read_lkg_state(&dir)?;
+    let snapshot_id = state.current_lkg_snapshot_id.clone().ok_or_else(|| {
+        format!(
+            "'{instance_id}' has no last-known-good setup yet: launch it once, then make a change"
+        )
+    })?;
+    diff_against_snapshot(ctx, instance_id, definition, &snapshot_id)
+}
+
+/// What changed between the current state and one snapshot. Used for "changes
+/// since LKG" and for the snapshot diff a front end shows.
+pub fn diff_against_snapshot(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    snapshot_id: &str,
+) -> Result<LkgDiff, String> {
+    let dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| e.to_string())?;
+
+    let reference = snapshot::snapshot_file_index(&dir, snapshot_id)?;
+    let current_files = capture_files(ctx, instance_id, definition)?;
+    let current_data = capture_data(ctx, instance_id, definition)?;
+    let current = capture_files_as_entries(&current_files);
+    let files = lkg::compute_diff(&reference, &current, Some(snapshot_id.to_string()), None);
+
+    let reference_data = snapshot_data(&dir, snapshot_id)?.unwrap_or_default();
+    let reference_content: std::collections::BTreeSet<String> =
+        reference_data.content_refs.iter().cloned().collect();
+    let current_content: std::collections::BTreeSet<String> =
+        current_data.content_refs.iter().cloned().collect();
+    let added_content = current_content
+        .difference(&reference_content)
+        .cloned()
+        .collect();
+    let removed_content = reference_content
+        .difference(&current_content)
+        .cloned()
+        .collect();
+
+    let list_ids: std::collections::BTreeSet<String> = reference_data
+        .rules
+        .iter()
+        .chain(current_data.rules.iter())
+        .map(|list| list.list.clone())
+        .collect();
+    let reference_rules = rules_by_list(&reference_data);
+    let current_rules = rules_by_list(&current_data);
+    let mut rules_changed: Vec<String> = list_ids
+        .into_iter()
+        .filter(|list| reference_rules.get(list.as_str()) != current_rules.get(list.as_str()))
+        .collect();
+    rules_changed.sort();
+    rules_changed.dedup();
+
+    Ok(LkgDiff {
+        snapshot_id: snapshot_id.to_string(),
+        files,
+        added_content,
+        removed_content,
+        rules_changed,
+    })
+}
+
+/// Restore an instance to the setup that last launched well, through the same
+/// guarded restore a snapshot uses.
+pub fn restore_to_lkg(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    force_while_running: bool,
+) -> Result<GameRestoreOutcome, GameRestoreError> {
+    let dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| e.to_string())?;
+    let state: LkgState = lkg::read_lkg_state(&dir).map_err(GameRestoreError::Other)?;
+    let snapshot_id = state.current_lkg_snapshot_id.ok_or_else(|| {
+        GameRestoreError::Other(format!(
+            "'{instance_id}' has no last-known-good setup yet: launch it once to record one"
+        ))
+    })?;
+    restore(
+        ctx,
+        instance_id,
+        definition,
+        &snapshot_id,
+        force_while_running,
+    )
 }
 
 /// The content-store items a snapshot named that can no longer be restored,

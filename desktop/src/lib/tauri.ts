@@ -2692,8 +2692,16 @@ export interface CapturableFile {
  * Point it at a folder Dropbox or OneDrive already syncs and backups go offsite
  * with no service behind them.
  */
-export const exportBackup = (instanceId: string, snapshotId: string, exportDir: string) =>
-  invoke<string>('export_backup', { instanceId, snapshotId, exportDir });
+export const exportBackup = (
+  instanceId: string,
+  snapshotId: string,
+  exportDir: string,
+  withBytes = false,
+) => invoke<string>('export_backup', { instanceId, snapshotId, exportDir, withBytes });
+
+/** The bytes a game backup's mod objects would add, so the cost is shown first. */
+export const gameBackupBytes = (instanceId: string, snapshotId: string) =>
+  invoke<number>('game_backup_bytes', { instanceId, snapshotId });
 
 /** Read a backup artifact back into an instance. Fully validated before it
  *  touches the instance directory — the file is untrusted input. */

@@ -87,15 +87,35 @@ use sha2::Digest;
 // Constants and types
 // ---------------------------------------------------------------------------
 
-pub const BACKUP_SCHEMA_VERSION: u32 = 1;
+pub const BACKUP_SCHEMA_VERSION: u32 = 2;
 const BACKUP_MANIFEST_NAME: &str = "manifest.json";
+/// Content object bytes in a game-instance backup live under this zip prefix,
+/// named by their SHA-256 so an importer can verify and file them directly.
+const CONTENT_OBJECTS_PREFIX: &str = "content-objects";
 const MAX_BACKUP_MANIFEST_BYTES: u64 = 5 * 1024 * 1024; // 5 MiB
 const MAX_BACKUP_ENTRIES: usize = 10_000;
 const MAX_BACKUP_SINGLE_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GiB
-const MAX_BACKUP_TOTAL_SIZE: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
+                                                             // A game setup can be tens of GB of mods when the player chooses to include
+                                                             // their bytes. The cap is a sanity limit, not a storage policy.
+const MAX_BACKUP_TOTAL_SIZE: u64 = 64 * 1024 * 1024 * 1024; // 64 GiB
+
+/// What kind of instance a backup came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupKind {
+    #[default]
+    Minecraft,
+    /// A generic game instance (§26). Its state is declared files plus database
+    /// rows; mod bytes stay in the content store unless the player includes them.
+    GameInstance,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupManifest {
+    /// Absent in artifacts written before game-instance backups existed, which
+    /// are Minecraft backups.
+    #[serde(default)]
+    pub kind: BackupKind,
     pub schema_version: u32,
     pub instance_id: String,
     pub snapshot: crate::snapshot::Snapshot,
@@ -106,13 +126,33 @@ pub struct BackupManifest {
     /// safety alone.
     #[serde(default)]
     pub scope_entries: Vec<String>,
+    /// A game instance's non-file state (load-after rules), written into the
+    /// snapshot manifest on import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<serde_json::Value>,
+    /// Content-store item ids the captured state names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content_refs: Vec<String>,
+    /// The content items the state names, with their files and provenance, so
+    /// an import can restore the manifests and check every hash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content_items: Vec<crate::content_store::ContentItem>,
+    /// Whether the artifact carries the content objects' bytes. Without them,
+    /// import needs the objects to exist already.
+    #[serde(default)]
+    pub includes_content_bytes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupFileEntry {
     pub relative_path: String,
     pub size: u64,
+    /// Absent for a file the snapshot recorded as not existing; restoring it
+    /// removes that file.
+    #[serde(default)]
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub absent: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -169,6 +209,46 @@ fn backup_file_name(instance_dir: &Path, snapshot_id: &str) -> String {
     format!("agora-backup-{safe_instance}-{snapshot_id}.zip")
 }
 
+/// The app data root an instance folder sits under. `import_backup` can be
+/// handed a path that does not exist yet, so this is derived from the folder,
+/// the same way `snapshot::snapshot_objects_dir` derives it.
+fn data_root_for(instance_dir: &Path) -> PathBuf {
+    let instances_root = instance_dir.parent().unwrap_or(instance_dir);
+    if instances_root
+        .file_name()
+        .is_some_and(|name| name == "instances")
+    {
+        instances_root
+            .parent()
+            .unwrap_or(instances_root)
+            .to_path_buf()
+    } else {
+        instances_root.to_path_buf()
+    }
+}
+
+fn content_root_for(instance_dir: &Path) -> PathBuf {
+    data_root_for(instance_dir).join("content")
+}
+
+fn content_item_path_for(instance_dir: &Path, item_id: &str) -> PathBuf {
+    content_root_for(instance_dir)
+        .join("items")
+        .join(format!("{item_id}.json"))
+}
+
+fn content_object_path_for(instance_dir: &Path, sha256: &str) -> PathBuf {
+    let prefix = if sha256.len() >= 2 {
+        &sha256[..2]
+    } else {
+        "xx"
+    };
+    content_root_for(instance_dir)
+        .join("objects")
+        .join(prefix)
+        .join(sha256)
+}
+
 // ---------------------------------------------------------------------------
 // Validation helpers (reuse snapshot's path rules)
 // ---------------------------------------------------------------------------
@@ -198,6 +278,7 @@ fn validate_backup_manifest(manifest: &BackupManifest) -> Result<(), String> {
     }
     let mut seen = HashSet::new();
     let mut total: u64 = 0;
+    let mut present_count = 0usize;
     for entry in &manifest.files {
         crate::snapshot::validate_relative_path(&entry.relative_path)?;
         // A backup that names its scope must keep every file inside it. An
@@ -218,27 +299,76 @@ fn validate_backup_manifest(manifest: &BackupManifest) -> Result<(), String> {
                 entry.relative_path
             ));
         }
-        crate::snapshot::validate_blob_hash(&entry.sha256)?;
-        if entry.size > MAX_BACKUP_SINGLE_FILE_SIZE {
-            return Err(format!(
-                "backup file {} size {} exceeds per-file limit",
-                entry.relative_path, entry.size
-            ));
-        }
-        total = total.saturating_add(entry.size);
-        if total > MAX_BACKUP_TOTAL_SIZE {
-            return Err(format!(
-                "backup total size {} exceeds limit of {}",
-                total, MAX_BACKUP_TOTAL_SIZE
-            ));
+        if !entry.absent {
+            present_count += 1;
+            crate::snapshot::validate_blob_hash(&entry.sha256)?;
+            if entry.size > MAX_BACKUP_SINGLE_FILE_SIZE {
+                return Err(format!(
+                    "backup file {} size {} exceeds per-file limit",
+                    entry.relative_path, entry.size
+                ));
+            }
+            total = total.saturating_add(entry.size);
+            if total > MAX_BACKUP_TOTAL_SIZE {
+                return Err(format!(
+                    "backup total size {} exceeds limit of {}",
+                    total, MAX_BACKUP_TOTAL_SIZE
+                ));
+            }
         }
     }
-    // Cross-check snapshot's declared counts against manifest.
-    if manifest.files.len() != manifest.snapshot.file_count {
+    if manifest.kind == BackupKind::GameInstance {
+        if manifest.state.is_none() {
+            return Err("a game-instance backup must carry the instance's state".into());
+        }
+        let mut seen_items = HashSet::new();
+        for item in &manifest.content_items {
+            if item.item_id.is_empty()
+                || item.item_id.contains('/')
+                || item.item_id.contains('\\')
+                || !seen_items.insert(item.item_id.clone())
+            {
+                return Err(format!(
+                    "backup contains an invalid or duplicate content item id {:?}",
+                    item.item_id
+                ));
+            }
+            let mut seen_files = HashSet::new();
+            for file in &item.files {
+                crate::snapshot::validate_blob_hash(&file.sha256)?;
+                if !seen_files.insert((file.path.as_str().to_string(), file.sha256.clone())) {
+                    return Err(format!(
+                        "content item {} contains duplicate file {}",
+                        item.item_id,
+                        file.path.as_str()
+                    ));
+                }
+                if file.size > MAX_BACKUP_SINGLE_FILE_SIZE {
+                    return Err(format!(
+                        "content file {} in item {} exceeds per-file limit",
+                        file.path.as_str(),
+                        item.item_id
+                    ));
+                }
+            }
+        }
+        for item_id in &manifest.content_refs {
+            if !manifest
+                .content_items
+                .iter()
+                .any(|item| &item.item_id == item_id)
+            {
+                return Err(format!(
+                    "backup state names content item {item_id} but does not describe it"
+                ));
+            }
+        }
+    }
+    // Cross-check snapshot's declared counts against the files that exist.
+    if present_count != manifest.snapshot.file_count {
         return Err(format!(
-            "backup manifest file_count {} does not match files length {}",
-            manifest.snapshot.file_count,
-            manifest.files.len()
+            "backup manifest file_count {} does not match the {} present files",
+            manifest.snapshot.file_count, present_count
         ));
     }
     Ok(())
@@ -514,6 +644,7 @@ pub fn export_snapshot(
     // It is self-describing so an import onto a fresh machine can validate
     // before writing any file.
     let backup_manifest = BackupManifest {
+        kind: BackupKind::Minecraft,
         schema_version: BACKUP_SCHEMA_VERSION,
         instance_id: sanitized_instance_id(instance_dir),
         snapshot: snapshot.clone(),
@@ -523,6 +654,7 @@ pub fn export_snapshot(
                 relative_path: entry.path.clone(),
                 size: entry.size,
                 sha256: entry.sha256.to_ascii_lowercase(),
+                absent: false,
             })
             .collect(),
         exported_at: chrono::Utc::now().to_rfc3339(),
@@ -530,6 +662,10 @@ pub fn export_snapshot(
             .iter()
             .map(|entry| (*entry).to_string())
             .collect(),
+        state: None,
+        content_refs: Vec::new(),
+        content_items: Vec::new(),
+        includes_content_bytes: false,
     };
     validate_backup_manifest(&backup_manifest)?;
 
@@ -789,11 +925,19 @@ fn validate_zip_file_set<R: Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     manifest: &BackupManifest,
 ) -> Result<(), String> {
-    let expected: HashSet<String> = manifest
+    let mut expected: HashSet<String> = manifest
         .files
         .iter()
+        .filter(|entry| !entry.absent)
         .map(|entry| entry.relative_path.clone())
         .collect();
+    if manifest.includes_content_bytes {
+        for item in &manifest.content_items {
+            for file in &item.files {
+                expected.insert(content_object_zip_path(&file.sha256));
+            }
+        }
+    }
 
     let mut seen = HashSet::new();
     for index in 0..archive.len() {
@@ -850,6 +994,7 @@ fn verify_zip_entries_hash<R: Read + std::io::Seek>(
     let expected: BTreeMap<&str, &BackupFileEntry> = manifest
         .files
         .iter()
+        .filter(|entry| !entry.absent)
         .map(|entry| (entry.relative_path.as_str(), entry))
         .collect();
 
@@ -857,6 +1002,11 @@ fn verify_zip_entries_hash<R: Read + std::io::Seek>(
         let mut entry = archive
             .by_name(name)
             .map_err(|error| format!("backup entry {name} is missing from zip: {error}"))?;
+        if expected_entry.absent {
+            return Err(format!(
+                "backup file {name} is recorded as absent but present in the zip"
+            ));
+        }
         if entry.size() != expected_entry.size {
             return Err(format!(
                 "backup size mismatch for {name}: manifest {}, zip {}",
@@ -902,7 +1052,58 @@ fn verify_zip_entries_hash<R: Read + std::io::Seek>(
             ));
         }
     }
+
+    if manifest.includes_content_bytes {
+        let mut verified = HashSet::new();
+        for item in &manifest.content_items {
+            for file in &item.files {
+                if !verified.insert(file.sha256.clone()) {
+                    continue;
+                }
+                let name = content_object_zip_path(&file.sha256);
+                let mut entry = archive.by_name(&name).map_err(|error| {
+                    format!("backup content object {name} is missing from zip: {error}")
+                })?;
+                if entry.size() > MAX_BACKUP_SINGLE_FILE_SIZE {
+                    return Err(format!(
+                        "backup content object {name} size {} exceeds per-file limit",
+                        entry.size()
+                    ));
+                }
+                let mut hasher = sha2::Sha256::new();
+                let mut buffer = vec![0u8; 1024 * 1024];
+                let mut total: u64 = 0;
+                loop {
+                    let read = entry.read(&mut buffer).map_err(|error| {
+                        format!("failed to read backup content object {name}: {error}")
+                    })?;
+                    if read == 0 {
+                        break;
+                    }
+                    total += read as u64;
+                    hasher.update(&buffer[..read]);
+                }
+                if total != file.size {
+                    return Err(format!(
+                        "backup content object {name} size mismatch: expected {}, got {total}",
+                        file.size
+                    ));
+                }
+                let actual = format!("{:x}", hasher.finalize());
+                if !actual.eq_ignore_ascii_case(&file.sha256) {
+                    return Err(format!(
+                        "backup content object {name} hash mismatch: expected {}, got {actual}",
+                        file.sha256
+                    ));
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+fn content_object_zip_path(sha256: &str) -> String {
+    format!("{CONTENT_OBJECTS_PREFIX}/{sha256}")
 }
 
 /// Import a backup artifact into an instance directory.
@@ -946,6 +1147,10 @@ pub fn import_backup(
     let manifest = read_and_validate_manifest(&mut archive)?;
     validate_zip_file_set(&mut archive, &manifest)?;
     verify_zip_entries_hash(&mut archive, &manifest)?;
+
+    if manifest.kind == BackupKind::GameInstance {
+        return import_game_backup(instance_dir, artifact_path, &manifest);
+    }
 
     // Phase 2: stage the validated content to a sibling directory on the same
     // volume as `instance_dir` so promotions are same-volume renames.
@@ -1131,10 +1336,9 @@ pub fn import_backup(
             }
         }
 
-        // Write the SnapshotManifest (schema v3) that `list_snapshots` and
-        // `snapshot_file_index` expect.
-        let snapshot_manifest_json =
-            build_snapshot_manifest_json(&manifest.snapshot, &manifest.files)?;
+        // Write the SnapshotManifest `list_snapshots` and `snapshot_file_index`
+        // expect. A game-instance backup also restores the state it carries.
+        let snapshot_manifest_json = build_snapshot_manifest_json(&manifest)?;
         crate::snapshot::atomic_write_pub(&dest_manifest_path, snapshot_manifest_json.as_bytes())?;
     }
 
@@ -1157,38 +1361,75 @@ pub fn import_backup(
     Ok(manifest.snapshot)
 }
 
-fn build_snapshot_manifest_json(
-    snapshot: &crate::snapshot::Snapshot,
-    files: &[BackupFileEntry],
-) -> Result<String, String> {
-    // Reuse the on-disk schema from `snapshot.rs:256` SnapshotManifest.
+fn build_snapshot_manifest_json(backup: &BackupManifest) -> Result<String, String> {
+    // Reuse the on-disk schema from `snapshot.rs` SnapshotManifest.
     #[derive(Serialize)]
     struct SnapshotManifest<'a> {
         schema_version: u32,
         snapshot: &'a crate::snapshot::Snapshot,
         files: Vec<SnapshotFileEntry<'a>>,
+        scope: Vec<crate::snapshot::SnapshotRoot>,
+        content_refs: &'a [String],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        state: Option<&'a serde_json::Value>,
     }
     #[derive(Serialize)]
     struct SnapshotFileEntry<'a> {
         relative_path: &'a str,
         size: u64,
-        sha256: &'a str,
-        blob_sha256: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sha256: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        blob_sha256: Option<&'a str>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        absent: bool,
     }
-    let mut sorted_files: Vec<&BackupFileEntry> = files.iter().collect();
+    let mut sorted_files: Vec<&BackupFileEntry> = backup.files.iter().collect();
     sorted_files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    // The roots the restore is allowed to touch, derived exactly as
+    // `create_snapshot_from_data` derives them.
+    let mut roots: std::collections::BTreeMap<String, crate::snapshot::RootState> =
+        std::collections::BTreeMap::new();
+    for entry in &sorted_files {
+        let root = entry
+            .relative_path
+            .split('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let has_child = entry.relative_path.contains('/');
+        roots
+            .entry(root)
+            .and_modify(|state| {
+                if has_child {
+                    *state = crate::snapshot::RootState::Directory;
+                }
+            })
+            .or_insert(if has_child {
+                crate::snapshot::RootState::Directory
+            } else {
+                crate::snapshot::RootState::File
+            });
+    }
     let manifest = SnapshotManifest {
-        schema_version: 3,
-        snapshot,
+        schema_version: 4,
+        snapshot: &backup.snapshot,
         files: sorted_files
             .into_iter()
             .map(|entry| SnapshotFileEntry {
                 relative_path: &entry.relative_path,
                 size: entry.size,
-                sha256: &entry.sha256,
-                blob_sha256: &entry.sha256,
+                sha256: (!entry.absent).then_some(entry.sha256.as_str()),
+                blob_sha256: (!entry.absent).then_some(entry.sha256.as_str()),
+                absent: entry.absent,
             })
             .collect(),
+        scope: roots
+            .into_iter()
+            .map(|(name, state)| crate::snapshot::SnapshotRoot { name, state })
+            .collect(),
+        content_refs: &backup.content_refs,
+        state: backup.state.as_ref(),
     };
     serde_json::to_string_pretty(&manifest)
         .map_err(|error| format!("failed to serialize snapshot manifest: {error}"))
@@ -1216,6 +1457,601 @@ fn validate_zip_entry_name(name: &str) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Game-instance backups (§23.2, §26)
+// ---------------------------------------------------------------------------
+
+/// Every distinct content object a set of items names, in a stable order.
+fn content_objects(items: &[crate::content_store::ContentItem]) -> BTreeMap<String, u64> {
+    let mut objects = BTreeMap::new();
+    for item in items {
+        for file in &item.files {
+            objects.entry(file.sha256.clone()).or_insert(file.size);
+        }
+    }
+    objects
+}
+
+/// Export a game instance's state as one backup file.
+///
+/// The state is always included. Content objects are included only when
+/// `include_content_bytes` is set; either way each item's manifest and the
+/// sources that can fetch it again are recorded. Without the bytes the export
+/// does not need the objects to exist locally.
+pub fn export_game_snapshot(
+    instance_dir: &Path,
+    snapshot_id: &str,
+    export_dir: &Path,
+    content_root: &Path,
+    include_content_bytes: bool,
+) -> Result<PathBuf, String> {
+    crate::snapshot::validate_snapshot_id(snapshot_id)?;
+    if !instance_dir.is_dir() {
+        return Err(format!(
+            "instance directory does not exist: {}",
+            instance_dir.display()
+        ));
+    }
+    if instance_dir.join(crate::snapshot::RESTORE_MARKER).exists() {
+        return Err(
+            "cannot export while a restore is in progress; retry after the restore completes"
+                .into(),
+        );
+    }
+    fs::create_dir_all(export_dir)
+        .map_err(|error| format!("failed to create export directory: {error}"))?;
+
+    let snapshots = crate::snapshot::list_snapshots(instance_dir)
+        .map_err(|error| format!("failed to list snapshots: {error}"))?;
+    let snapshot = snapshots
+        .iter()
+        .find(|snapshot| snapshot.id == snapshot_id)
+        .cloned()
+        .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
+    if snapshot.unreadable.is_some() {
+        return Err(format!(
+            "snapshot {snapshot_id} cannot be read: {}",
+            snapshot.unreadable.unwrap_or_default()
+        ));
+    }
+
+    let entries = crate::snapshot::snapshot_file_entries(instance_dir, snapshot_id)?;
+    let aux = crate::snapshot::snapshot_aux(instance_dir, snapshot_id)?;
+    let state = aux
+        .state
+        .ok_or_else(|| format!("snapshot {snapshot_id} is not a game-instance snapshot"))?;
+
+    let mut items = Vec::with_capacity(aux.content_refs.len());
+    for item_id in &aux.content_refs {
+        let path = content_root.join("items").join(format!("{item_id}.json"));
+        let text = fs::read_to_string(&path).map_err(|error| {
+            format!("content item {item_id} named by the snapshot cannot be read: {error}")
+        })?;
+        let item: crate::content_store::ContentItem =
+            serde_json::from_str(&text).map_err(|error| {
+                format!("content item {item_id} is not a valid item record: {error}")
+            })?;
+        if &item.item_id != item_id {
+            return Err(format!(
+                "content item {item_id} records a different id ({})",
+                item.item_id
+            ));
+        }
+        items.push(item);
+    }
+
+    let objects = content_objects(&items);
+    let mut total_size: u64 = entries
+        .iter()
+        .filter(|entry| !entry.absent)
+        .map(|entry| entry.size)
+        .sum();
+    if include_content_bytes {
+        total_size = total_size.saturating_add(objects.values().sum::<u64>());
+    }
+    if total_size > MAX_BACKUP_TOTAL_SIZE {
+        return Err(format!(
+            "backup total size {total_size} exceeds limit of {MAX_BACKUP_TOTAL_SIZE}"
+        ));
+    }
+    let entry_count = entries.iter().filter(|entry| !entry.absent).count()
+        + if include_content_bytes {
+            objects.len()
+        } else {
+            0
+        };
+    if entry_count > MAX_BACKUP_ENTRIES {
+        return Err(format!(
+            "backup file count {entry_count} exceeds limit of {MAX_BACKUP_ENTRIES}"
+        ));
+    }
+
+    let mut roots: std::collections::BTreeSet<String> = entries
+        .iter()
+        .filter_map(|entry| entry.relative_path.split('/').next().map(str::to_string))
+        .collect();
+    roots.retain(|root| !root.is_empty());
+
+    let backup_manifest = BackupManifest {
+        kind: BackupKind::GameInstance,
+        schema_version: BACKUP_SCHEMA_VERSION,
+        instance_id: sanitized_instance_id(instance_dir),
+        snapshot: snapshot.clone(),
+        files: entries
+            .iter()
+            .map(|entry| BackupFileEntry {
+                relative_path: entry.relative_path.clone(),
+                size: entry.size,
+                sha256: entry.sha256.clone().unwrap_or_default(),
+                absent: entry.absent,
+            })
+            .collect(),
+        exported_at: chrono::Utc::now().to_rfc3339(),
+        scope_entries: roots.into_iter().collect(),
+        state: Some(state),
+        content_refs: aux.content_refs,
+        content_items: items,
+        includes_content_bytes: include_content_bytes,
+    };
+    validate_backup_manifest(&backup_manifest)?;
+
+    let file_name = backup_file_name(instance_dir, snapshot_id);
+    let final_path = export_dir.join(&file_name);
+    let temp_path = export_dir.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+
+    let create_result: Result<(), String> = (|| {
+        let file = fs::File::create(&temp_path)
+            .map_err(|error| format!("failed to create backup artifact: {error}"))?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        let manifest_bytes = serde_json::to_vec_pretty(&backup_manifest)
+            .map_err(|error| format!("failed to serialize backup manifest: {error}"))?;
+        if manifest_bytes.len() as u64 > MAX_BACKUP_MANIFEST_BYTES {
+            return Err("backup manifest exceeds size limit".into());
+        }
+        zip.start_file(BACKUP_MANIFEST_NAME, options)
+            .map_err(|error| format!("failed to start backup manifest entry: {error}"))?;
+        zip.write_all(&manifest_bytes)
+            .map_err(|error| format!("failed to write backup manifest: {error}"))?;
+
+        let mut buffer = vec![0u8; 1024 * 1024];
+        for entry in &backup_manifest.files {
+            if entry.absent {
+                continue;
+            }
+            let blob_path = crate::snapshot::snapshot_blob_path(instance_dir, &entry.sha256);
+            if !blob_path.is_file()
+                || !crate::snapshot::blob_file_matches(&blob_path, &entry.sha256, entry.size)
+            {
+                return Err(format!(
+                    "snapshot blob is missing or corrupted for {}",
+                    entry.relative_path
+                ));
+            }
+            zip.start_file(&entry.relative_path, options)
+                .map_err(|error| {
+                    format!(
+                        "failed to start backup entry for {}: {error}",
+                        entry.relative_path
+                    )
+                })?;
+            let mut reader = fs::File::open(&blob_path).map_err(|error| {
+                format!("failed to open blob for {}: {error}", entry.relative_path)
+            })?;
+            let mut hasher = sha2::Sha256::new();
+            let mut remaining = entry.size;
+            loop {
+                let to_read = std::cmp::min(buffer.len() as u64, remaining) as usize;
+                if to_read == 0 {
+                    break;
+                }
+                let read = reader.read(&mut buffer[..to_read]).map_err(|error| {
+                    format!("failed to read blob for {}: {error}", entry.relative_path)
+                })?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+                zip.write_all(&buffer[..read]).map_err(|error| {
+                    format!(
+                        "failed to write backup entry for {}: {error}",
+                        entry.relative_path
+                    )
+                })?;
+                remaining -= read as u64;
+            }
+            if remaining != 0 {
+                return Err(format!(
+                    "snapshot blob truncated for {}: expected {} bytes",
+                    entry.relative_path, entry.size
+                ));
+            }
+            let actual = format!("{:x}", hasher.finalize());
+            if !actual.eq_ignore_ascii_case(&entry.sha256) {
+                return Err(format!(
+                    "snapshot blob hash mismatch for {} during export",
+                    entry.relative_path
+                ));
+            }
+        }
+
+        if include_content_bytes {
+            for (hash, size) in &objects {
+                let object_path = content_root.join("objects").join(&hash[..2]).join(hash);
+                if !object_path.is_file()
+                    || !crate::snapshot::blob_file_matches(&object_path, hash, *size)
+                {
+                    return Err(format!(
+                        "content object {hash} is missing or corrupted; export without bytes instead"
+                    ));
+                }
+                let name = content_object_zip_path(hash);
+                zip.start_file(&name, options)
+                    .map_err(|error| format!("failed to start content object {name}: {error}"))?;
+                let mut reader = fs::File::open(&object_path)
+                    .map_err(|error| format!("failed to open content object {hash}: {error}"))?;
+                let mut hasher = sha2::Sha256::new();
+                let mut remaining = *size;
+                loop {
+                    let to_read = std::cmp::min(buffer.len() as u64, remaining) as usize;
+                    if to_read == 0 {
+                        break;
+                    }
+                    let read = reader.read(&mut buffer[..to_read]).map_err(|error| {
+                        format!("failed to read content object {hash}: {error}")
+                    })?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                    zip.write_all(&buffer[..read]).map_err(|error| {
+                        format!("failed to write content object {name}: {error}")
+                    })?;
+                    remaining -= read as u64;
+                }
+                if remaining != 0 {
+                    return Err(format!(
+                        "content object {hash} is truncated: expected {size} bytes"
+                    ));
+                }
+                let actual = format!("{:x}", hasher.finalize());
+                if !actual.eq_ignore_ascii_case(hash) {
+                    return Err(format!("content object {hash} changed during export"));
+                }
+            }
+        }
+
+        let file = zip
+            .finish()
+            .map_err(|error| format!("failed to finalize backup zip: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("failed to sync backup artifact: {error}"))?;
+        Ok(())
+    })();
+
+    if let Err(error) = create_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    let _ = fs::remove_file(&final_path);
+    fs::rename(&temp_path, &final_path)
+        .map_err(|error| format!("failed to commit backup artifact: {error}"))?;
+    Ok(final_path)
+}
+
+/// The bytes a game backup would hold for its content objects, so a front end
+/// can show the cost before the player asks for them.
+pub fn game_backup_content_bytes(
+    instance_dir: &Path,
+    snapshot_id: &str,
+    content_root: &Path,
+) -> Result<u64, String> {
+    let aux = crate::snapshot::snapshot_aux(instance_dir, snapshot_id)?;
+    let mut items = Vec::new();
+    for item_id in &aux.content_refs {
+        let path = content_root.join("items").join(format!("{item_id}.json"));
+        let text = fs::read_to_string(&path)
+            .map_err(|error| format!("content item {item_id} cannot be read: {error}"))?;
+        items.push(
+            serde_json::from_str::<crate::content_store::ContentItem>(&text)
+                .map_err(|error| format!("content item {item_id} is not valid: {error}"))?,
+        );
+    }
+    Ok(content_objects(&items).values().sum())
+}
+
+/// Bring a validated game-instance backup's snapshot and content records into
+/// an instance. Nothing live is changed; a missing content object refuses the
+/// whole import and names what is missing.
+fn import_game_backup(
+    instance_dir: &Path,
+    artifact_path: &Path,
+    manifest: &BackupManifest,
+) -> Result<crate::snapshot::Snapshot, String> {
+    if instance_dir.join(crate::snapshot::RESTORE_MARKER).exists() {
+        return Err(
+            "cannot import while a restore is in progress; retry after the restore completes"
+                .into(),
+        );
+    }
+
+    // Everything is checked before the first write.
+    let mut missing = Vec::new();
+    for item in &manifest.content_items {
+        let dest = content_item_path_for(instance_dir, &item.item_id);
+        if dest.is_file() {
+            let existing = fs::read_to_string(&dest).ok().and_then(|text| {
+                serde_json::from_str::<crate::content_store::ContentItem>(&text).ok()
+            });
+            if existing.as_ref() != Some(item) {
+                return Err(format!(
+                    "content item {} already exists with different contents; nothing was imported",
+                    item.item_id
+                ));
+            }
+        }
+        for file in &item.files {
+            let path = content_object_path_for(instance_dir, &file.sha256);
+            let present = if manifest.includes_content_bytes {
+                true
+            } else {
+                path.is_file() && crate::snapshot::blob_file_matches(&path, &file.sha256, file.size)
+            };
+            if !present {
+                let name = if item.name.trim().is_empty() {
+                    item.item_id.as_str()
+                } else {
+                    item.name.as_str()
+                };
+                missing.push(format!("{name} ({})", file.path.as_str()));
+            }
+        }
+    }
+    if !missing.is_empty() {
+        missing.sort();
+        missing.dedup();
+        return Err(format!(
+            "the backup needs content the store does not hold: {}; nothing was imported",
+            missing.join(", ")
+        ));
+    }
+
+    let dest_manifest_path =
+        crate::snapshot::snapshot_manifest_path(instance_dir, &manifest.snapshot.id);
+    if dest_manifest_path.exists() {
+        let same_files =
+            crate::snapshot::snapshot_file_entries(instance_dir, &manifest.snapshot.id)
+                .map(|existing| {
+                    let mut expected: Vec<_> = manifest
+                        .files
+                        .iter()
+                        .map(|entry| crate::snapshot::SnapshotFileView {
+                            relative_path: entry.relative_path.clone(),
+                            size: entry.size,
+                            sha256: (!entry.absent).then(|| entry.sha256.clone()),
+                            absent: entry.absent,
+                        })
+                        .collect();
+                    expected.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+                    existing == expected
+                })
+                .unwrap_or(false);
+        let same_state = crate::snapshot::snapshot_aux(instance_dir, &manifest.snapshot.id)
+            .map(|aux| aux.state == manifest.state && aux.content_refs == manifest.content_refs)
+            .unwrap_or(false);
+        if same_files && same_state {
+            return Ok(manifest.snapshot.clone());
+        }
+        return Err(format!(
+            "snapshot {} already exists with different content",
+            manifest.snapshot.id
+        ));
+    }
+
+    let instances_root = instance_dir.parent().unwrap_or(instance_dir);
+    let staging_dir = instances_root.join(format!(
+        ".agora-import-{}-{}",
+        sanitized_instance_id(instance_dir),
+        uuid::Uuid::new_v4()
+    ));
+    if staging_dir.exists() {
+        fs::remove_dir_all(&staging_dir)
+            .map_err(|error| format!("failed to clear stale import staging: {error}"))?;
+    }
+    fs::create_dir_all(&staging_dir)
+        .map_err(|error| format!("failed to create import staging: {error}"))?;
+
+    let stage_result: Result<(), String> = (|| {
+        let file = fs::File::open(artifact_path)
+            .map_err(|error| format!("failed to reopen backup artifact: {error}"))?;
+        let mut archive = zip::ZipArchive::new(file)
+            .map_err(|error| format!("failed to read backup zip: {error}"))?;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        for entry in &manifest.files {
+            if entry.absent {
+                continue;
+            }
+            let mut zip_entry = archive.by_name(&entry.relative_path).map_err(|error| {
+                format!(
+                    "backup entry {} missing during stage: {error}",
+                    entry.relative_path
+                )
+            })?;
+            let dest = staging_dir.join(Path::new(&entry.relative_path));
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("failed to create staging parent: {error}"))?;
+            }
+            let mut dest_file = fs::File::create(&dest)
+                .map_err(|error| format!("failed to stage {}: {error}", entry.relative_path))?;
+            let mut total: u64 = 0;
+            loop {
+                let read = zip_entry.read(&mut buffer).map_err(|error| {
+                    format!(
+                        "failed to read backup entry {}: {error}",
+                        entry.relative_path
+                    )
+                })?;
+                if read == 0 {
+                    break;
+                }
+                total += read as u64;
+                dest_file
+                    .write_all(&buffer[..read])
+                    .map_err(|error| format!("failed to stage {}: {error}", entry.relative_path))?;
+            }
+            if total != entry.size {
+                return Err(format!(
+                    "staging size mismatch for {}: expected {}, got {total}",
+                    entry.relative_path, entry.size
+                ));
+            }
+            dest_file.sync_all().map_err(|error| {
+                format!("failed to sync staged {}: {error}", entry.relative_path)
+            })?;
+        }
+
+        if manifest.includes_content_bytes {
+            for (hash, size) in content_objects(&manifest.content_items) {
+                let name = content_object_zip_path(&hash);
+                let mut zip_entry = archive.by_name(&name).map_err(|error| {
+                    format!("backup content object {name} missing during stage: {error}")
+                })?;
+                let dest = staging_dir.join(CONTENT_OBJECTS_PREFIX).join(&hash);
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|error| format!("failed to create staging parent: {error}"))?;
+                }
+                let mut dest_file = fs::File::create(&dest)
+                    .map_err(|error| format!("failed to stage content object {hash}: {error}"))?;
+                let mut total: u64 = 0;
+                loop {
+                    let read = zip_entry.read(&mut buffer).map_err(|error| {
+                        format!("failed to read content object {hash}: {error}")
+                    })?;
+                    if read == 0 {
+                        break;
+                    }
+                    total += read as u64;
+                    dest_file.write_all(&buffer[..read]).map_err(|error| {
+                        format!("failed to stage content object {hash}: {error}")
+                    })?;
+                }
+                if total != size {
+                    return Err(format!(
+                        "staging size mismatch for content object {hash}: expected {size}, got {total}"
+                    ));
+                }
+                dest_file
+                    .sync_all()
+                    .map_err(|error| format!("failed to sync content object {hash}: {error}"))?;
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = stage_result {
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Err(error);
+    }
+
+    let write_result: Result<(), String> = (|| {
+        fs::create_dir_all(instance_dir)
+            .map_err(|error| format!("failed to create instance directory: {error}"))?;
+        fs::create_dir_all(crate::snapshot::snapshots_dir(instance_dir))
+            .map_err(|error| format!("failed to create snapshots dir: {error}"))?;
+        fs::create_dir_all(crate::snapshot::snapshot_objects_dir(instance_dir))
+            .map_err(|error| format!("failed to create snapshot object store: {error}"))?;
+
+        for entry in &manifest.files {
+            if entry.absent {
+                continue;
+            }
+            let staged = staging_dir.join(Path::new(&entry.relative_path));
+            let bytes = fs::read(&staged).map_err(|error| {
+                format!("failed to read staged {}: {error}", entry.relative_path)
+            })?;
+            if bytes.len() as u64 != entry.size
+                || !crate::snapshot::sha256_hex(&bytes).eq_ignore_ascii_case(&entry.sha256)
+            {
+                return Err(format!("staged hash mismatch for {}", entry.relative_path));
+            }
+            let blob_path = crate::snapshot::snapshot_blob_path(instance_dir, &entry.sha256);
+            if let Some(parent) = blob_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("failed to create blob prefix: {error}"))?;
+            }
+            fs::write(&blob_path, &bytes).map_err(|error| {
+                format!("failed to write blob for {}: {error}", entry.relative_path)
+            })?;
+            let _ = crate::artifact_receipt::record_verified(
+                &blob_path,
+                "sha256",
+                &entry.sha256,
+                i64::try_from(entry.size).ok(),
+            );
+        }
+
+        if manifest.includes_content_bytes {
+            for (hash, size) in content_objects(&manifest.content_items) {
+                let staged = staging_dir.join(CONTENT_OBJECTS_PREFIX).join(&hash);
+                let bytes = fs::read(&staged).map_err(|error| {
+                    format!("failed to read staged content object {hash}: {error}")
+                })?;
+                if bytes.len() as u64 != size
+                    || !crate::snapshot::sha256_hex(&bytes).eq_ignore_ascii_case(&hash)
+                {
+                    return Err(format!(
+                        "staged content object {hash} does not match its hash"
+                    ));
+                }
+                let dest = content_object_path_for(instance_dir, &hash);
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent).map_err(|error| {
+                        format!("failed to create content object prefix: {error}")
+                    })?;
+                }
+                fs::write(&dest, &bytes)
+                    .map_err(|error| format!("failed to write content object {hash}: {error}"))?;
+                let _ = crate::artifact_receipt::record_verified(
+                    &dest,
+                    "sha256",
+                    &hash,
+                    i64::try_from(size).ok(),
+                );
+            }
+        }
+
+        for item in &manifest.content_items {
+            let dest = content_item_path_for(instance_dir, &item.item_id);
+            if dest.is_file() {
+                continue;
+            }
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("failed to create content items dir: {error}"))?;
+            }
+            let bytes = serde_json::to_vec_pretty(item).map_err(|error| {
+                format!("failed to serialize content item {}: {error}", item.item_id)
+            })?;
+            crate::snapshot::atomic_write_pub(&dest, &bytes)?;
+        }
+
+        let snapshot_manifest_json = build_snapshot_manifest_json(manifest)?;
+        crate::snapshot::atomic_write_pub(&dest_manifest_path, snapshot_manifest_json.as_bytes())?;
+        Ok(())
+    })();
+
+    let _ = fs::remove_dir_all(&staging_dir);
+    if let Err(error) = write_result {
+        return Err(error);
+    }
+    let _ = crate::snapshot::mark_instance_mutated(instance_dir);
+    Ok(manifest.snapshot.clone())
+}
 
 // ---------------------------------------------------------------------------
 // Instance-level entry points shared by every front end
@@ -1255,6 +2091,52 @@ pub async fn export_instance_backup(
         )
         .await
         .map_err(|e| backup_error(format!("Backup export task failed: {e}")))?
+        .map_err(backup_error)
+}
+
+/// Write a game instance's snapshot out to `export_dir`, including the content
+/// objects' bytes only when `include_content_bytes` is set.
+pub async fn export_game_instance_backup(
+    ctx: &crate::ctx::Ctx,
+    instance_id: &str,
+    snapshot_id: &str,
+    export_dir: &Path,
+    include_content_bytes: bool,
+) -> crate::error::LauncherResult<String> {
+    let sanitized = crate::paths::sanitize_id(instance_id);
+    let instance_dir = ctx.paths.instance_dir(&sanitized)?;
+    let content_root = ctx.paths.content_root();
+    let snapshot_id = snapshot_id.to_string();
+    let export_dir = export_dir.to_path_buf();
+    ctx.task_scheduler
+        .run_blocking(
+            crate::task_scheduler::BlockingPriority::UserInitiated,
+            move || {
+                export_game_snapshot(
+                    &instance_dir,
+                    &snapshot_id,
+                    &export_dir,
+                    &content_root,
+                    include_content_bytes,
+                )
+                .map(|path| path.to_string_lossy().into_owned())
+            },
+        )
+        .await
+        .map_err(|e| backup_error(format!("Backup export task failed: {e}")))?
+        .map_err(backup_error)
+}
+
+/// The bytes a game backup's content objects would add, so a front end can show
+/// the cost before including them.
+pub fn game_instance_backup_content_bytes(
+    ctx: &crate::ctx::Ctx,
+    instance_id: &str,
+    snapshot_id: &str,
+) -> crate::error::LauncherResult<u64> {
+    let sanitized = crate::paths::sanitize_id(instance_id);
+    let instance_dir = ctx.paths.instance_dir(&sanitized)?;
+    game_backup_content_bytes(&instance_dir, snapshot_id, &ctx.paths.content_root())
         .map_err(backup_error)
 }
 
@@ -1687,6 +2569,7 @@ mod tests {
                 relative_path: "../evil.txt".into(),
                 size: 4,
                 sha256: crate::snapshot::sha256_hex(b"evil"),
+                absent: false,
             });
             manifest.snapshot.file_count += 1;
             // Rebuild a new zip with the tampered manifest and an evil entry.

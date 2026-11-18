@@ -462,6 +462,7 @@ fn a_watched_normal_quit_is_recorded_as_normal() {
     let mut launched = launch(&f, &exit_now());
     let report = game_instance::watch_session(
         &f.ctx,
+        &f.record.instance_id,
         &f.def,
         launched.session_id.as_deref(),
         &launched.running_from,
@@ -492,11 +493,13 @@ fn a_stop_during_the_run_is_recorded_as_stopped() {
     let running_from = launched.running_from.clone();
     let ctx = f.ctx.clone();
     let def = f.def.clone();
+    let instance_id = f.record.instance_id.clone();
     let watcher = std::thread::spawn({
         let session = session.clone();
         move || {
             game_instance::watch_session(
                 &ctx,
+                &instance_id,
                 &def,
                 Some(&session),
                 &running_from,

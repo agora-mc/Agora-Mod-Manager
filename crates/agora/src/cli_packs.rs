@@ -613,6 +613,11 @@ pub enum BackupCmd {
         out: PathBuf,
         #[arg(long, help = "Snapshot to export (default: take a new one now)")]
         snapshot: Option<String>,
+        #[arg(
+            long,
+            help = "Include the mod bytes. Without this the backup holds the instance's state and each item's hash and source, so a setup of tens of GB stays small"
+        )]
+        with_bytes: bool,
     },
     /// Read a backup zip into an instance as a restorable snapshot. The live
     /// instance is not changed; restore it with `agora snapshots restore`.
@@ -646,37 +651,79 @@ pub async fn run_backup(
             instance,
             out,
             snapshot,
+            with_bytes,
         } => {
             let instance_dir = require_instance(data_dir, &instance)?;
-            let snapshot_id = match snapshot {
-                Some(id) => id,
-                None => {
-                    agora_core::snapshot::create_snapshot_with_origin(
-                        &instance_dir,
-                        Some("backup export"),
-                        agora_game_minecraft::snapshot_scope::tracked_entries(),
-                        agora_core::snapshot::SnapshotOrigin::User,
-                    )
-                    .map_err(|e| anyhow::anyhow!("{e}"))?
-                    .id
+            let game = agora_core::game_instance::get(ctx, &instance)?;
+            if let Some(_record) = game {
+                let snapshot_id = match snapshot {
+                    Some(id) => id,
+                    None => {
+                        agora_core::snapshot_service::SnapshotService::new(ctx.clone())
+                            .create(&instance, Some("backup export"))
+                            .map_err(|e| anyhow::anyhow!("{e}"))?
+                            .id
+                    }
+                };
+                if with_bytes {
+                    let bytes = agora_core::backup::game_instance_backup_content_bytes(
+                        ctx,
+                        &instance,
+                        &snapshot_id,
+                    )?;
+                    eprintln!(
+                        "Including the mod bytes: {bytes} bytes ({:.1} MB). Without --with-bytes the backup would hold only the state and each item's hash and source.",
+                        bytes as f64 / 1_000_000.0
+                    );
                 }
-            };
-            std::fs::create_dir_all(&out)?;
-            let path = agora_core::backup::export_instance_backup(
-                ctx,
-                &instance,
-                &snapshot_id,
-                &out,
-                agora_game_minecraft::snapshot_scope::tracked_entries(),
-            )
-            .await?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({"status": "exported", "instanceId": instance, "snapshotId": snapshot_id, "path": path})
-                );
+                std::fs::create_dir_all(&out)?;
+                let path = agora_core::backup::export_game_instance_backup(
+                    ctx,
+                    &instance,
+                    &snapshot_id,
+                    &out,
+                    with_bytes,
+                )
+                .await?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"status": "exported", "instanceId": instance, "snapshotId": snapshot_id, "path": path, "withBytes": with_bytes})
+                    );
+                } else {
+                    println!("Backed up '{instance}' (snapshot {snapshot_id}) to {path}");
+                }
             } else {
-                println!("Backed up '{instance}' (snapshot {snapshot_id}) to {path}");
+                let snapshot_id = match snapshot {
+                    Some(id) => id,
+                    None => {
+                        agora_core::snapshot::create_snapshot_with_origin(
+                            &instance_dir,
+                            Some("backup export"),
+                            agora_game_minecraft::snapshot_scope::tracked_entries(),
+                            agora_core::snapshot::SnapshotOrigin::User,
+                        )
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                        .id
+                    }
+                };
+                std::fs::create_dir_all(&out)?;
+                let path = agora_core::backup::export_instance_backup(
+                    ctx,
+                    &instance,
+                    &snapshot_id,
+                    &out,
+                    agora_game_minecraft::snapshot_scope::tracked_entries(),
+                )
+                .await?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"status": "exported", "instanceId": instance, "snapshotId": snapshot_id, "path": path})
+                    );
+                } else {
+                    println!("Backed up '{instance}' (snapshot {snapshot_id}) to {path}");
+                }
             }
         }
         BackupCmd::Import { file, instance } => {

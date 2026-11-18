@@ -6,12 +6,15 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use agora_core::backup;
 use agora_core::content_store;
 use agora_core::ctx::CoreContext;
 use agora_core::game_instance::{GameInstanceManifest, SavesChoice};
 use agora_core::game_registry::{GameRegistry, PackageSource};
 use agora_core::game_snapshot;
+use agora_core::lkg::{self, LaunchOutcome};
 use agora_core::snapshot::{self, SnapshotOrigin};
+use agora_game_api::crash::SessionVerdict;
 use agora_game_api::{
     BaseReference, ContentLayout, GameDefinition, GameId, GamePackage, InstallId, Layer, LayerId,
     LayerSource, LayerStack, LoadOrderDefinition, LoadOrderFormat, LoadOrderItems, LoadOrderRules,
@@ -479,4 +482,331 @@ fn a_minecraft_shaped_snapshot_still_restores() {
         b"original"
     );
     assert!(outcome.restored_roots.iter().any(|root| root == "mods"));
+}
+
+// -- last-known-good ---------------------------------------------------------------------------
+
+#[test]
+fn a_successful_session_promotes_and_a_crash_or_short_run_does_not() {
+    let h = Harness::new();
+    h.write_user_file("Plugins.txt", b"*A.esp\n");
+
+    let point = game_snapshot::prepare_launch(&h.ctx, &h.id, &h.def).unwrap();
+    assert!(point.created, "the first launch writes a recovery point");
+    game_snapshot::record_launch_point(&h.ctx, &h.id, Some("s-1"), &point).unwrap();
+    let outcome = game_snapshot::finish_launch_session(
+        &h.ctx,
+        &h.id,
+        "s-1",
+        Some(SessionVerdict::Normal),
+        120_000,
+    )
+    .unwrap();
+    assert_eq!(outcome, LaunchOutcome::Success);
+    let state = lkg::read_lkg_state(&h.dir()).unwrap();
+    assert_eq!(
+        state.current_lkg_snapshot_id.as_deref(),
+        Some(point.snapshot_id.as_str())
+    );
+
+    // A crash never replaces the setup that worked.
+    h.write_user_file("Plugins.txt", b"*B.esp\n");
+    let crash_point = game_snapshot::prepare_launch(&h.ctx, &h.id, &h.def).unwrap();
+    game_snapshot::record_launch_point(&h.ctx, &h.id, Some("s-2"), &crash_point).unwrap();
+    let outcome = game_snapshot::finish_launch_session(
+        &h.ctx,
+        &h.id,
+        "s-2",
+        Some(SessionVerdict::Crashed {
+            how: agora_game_api::crash::MatchedBy::ExitStatus,
+        }),
+        120_000,
+    )
+    .unwrap();
+    assert_eq!(outcome, LaunchOutcome::Crash);
+    assert_eq!(
+        lkg::read_lkg_state(&h.dir())
+            .unwrap()
+            .current_lkg_snapshot_id,
+        Some(point.snapshot_id.clone())
+    );
+
+    // A clean exit before the minimum runtime is abandoned, not a success.
+    let short_point = game_snapshot::prepare_launch(&h.ctx, &h.id, &h.def).unwrap();
+    game_snapshot::record_launch_point(&h.ctx, &h.id, Some("s-3"), &short_point).unwrap();
+    let outcome = game_snapshot::finish_launch_session(
+        &h.ctx,
+        &h.id,
+        "s-3",
+        Some(SessionVerdict::Normal),
+        2_000,
+    )
+    .unwrap();
+    assert_eq!(outcome, LaunchOutcome::Abandoned);
+    assert_eq!(
+        lkg::read_lkg_state(&h.dir())
+            .unwrap()
+            .current_lkg_snapshot_id,
+        Some(point.snapshot_id)
+    );
+}
+
+#[test]
+fn an_unchanged_state_skips_the_prelaunch_snapshot() {
+    let h = Harness::new();
+    h.write_user_file("Plugins.txt", b"*A.esp\n");
+
+    let first = game_snapshot::prepare_launch(&h.ctx, &h.id, &h.def).unwrap();
+    assert!(first.created);
+    let count = snapshot::list_snapshots(&h.dir()).unwrap().len();
+
+    let again = game_snapshot::prepare_launch(&h.ctx, &h.id, &h.def).unwrap();
+    assert!(
+        !again.created,
+        "an unchanged state reuses the last snapshot"
+    );
+    assert_eq!(again.snapshot_id, first.snapshot_id);
+    assert_eq!(snapshot::list_snapshots(&h.dir()).unwrap().len(), count);
+
+    h.write_user_file("Skyrim.ini", b"[General]\nValue=1\n");
+    let changed = game_snapshot::prepare_launch(&h.ctx, &h.id, &h.def).unwrap();
+    assert!(changed.created, "a changed INI writes a new recovery point");
+    assert_ne!(changed.snapshot_id, first.snapshot_id);
+}
+
+#[test]
+fn changes_since_lkg_lists_a_reordered_plugin_and_a_changed_ini() {
+    let h = Harness::new();
+    h.write_user_file("Plugins.txt", b"*A.esp\n*B.esp\n");
+    h.write_user_file("Skyrim.ini", b"[General]\nValue=1\n");
+    let point = game_snapshot::prepare_launch(&h.ctx, &h.id, &h.def).unwrap();
+    game_snapshot::record_launch_point(&h.ctx, &h.id, Some("s-1"), &point).unwrap();
+    game_snapshot::finish_launch_session(
+        &h.ctx,
+        &h.id,
+        "s-1",
+        Some(SessionVerdict::Normal),
+        120_000,
+    )
+    .unwrap();
+
+    h.write_user_file("Plugins.txt", b"*B.esp\n*A.esp\n");
+    h.write_user_file("Skyrim.ini", b"[General]\nValue=2\n");
+
+    let diff = game_snapshot::diff_since_lkg(&h.ctx, &h.id, &h.def).unwrap();
+    let changed: Vec<&str> = diff
+        .files
+        .modified
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert!(
+        changed.contains(&"user/Plugins.txt"),
+        "the reordered plugin list is listed: {changed:?}"
+    );
+    assert!(
+        changed.contains(&"user/Skyrim.ini"),
+        "the changed INI is listed: {changed:?}"
+    );
+}
+
+#[test]
+fn restore_to_lkg_round_trips_files_and_rules() {
+    let h = Harness::new();
+    h.write_user_file("Plugins.txt", b"*A.esp\n*B.esp\n");
+    h.write_user_file("Skyrim.ini", b"[General]\nValue=1\n");
+    h.set_rules(&[agora_core::game_load_order::LoadAfterRule {
+        item: "B.esp".into(),
+        after: "A.esp".into(),
+    }]);
+    let point = game_snapshot::prepare_launch(&h.ctx, &h.id, &h.def).unwrap();
+    game_snapshot::record_launch_point(&h.ctx, &h.id, Some("s-1"), &point).unwrap();
+    game_snapshot::finish_launch_session(
+        &h.ctx,
+        &h.id,
+        "s-1",
+        Some(SessionVerdict::Normal),
+        120_000,
+    )
+    .unwrap();
+
+    h.write_user_file("Plugins.txt", b"*C.esp\n");
+    h.write_user_file("Skyrim.ini", b"[General]\nValue=2\n");
+    h.set_rules(&[]);
+
+    let outcome = game_snapshot::restore_to_lkg(&h.ctx, &h.id, &h.def, false).unwrap();
+    assert!(!outcome.undo_snapshot_id.is_empty());
+    assert_eq!(h.read_user_file("Plugins.txt"), b"*A.esp\n*B.esp\n");
+    assert_eq!(h.read_user_file("Skyrim.ini"), b"[General]\nValue=1\n");
+    let rules = agora_core::game_load_order::load_after_rules(&h.ctx, &h.id, "plugins").unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].item, "B.esp");
+}
+
+// -- backups ------------------------------------------------------------------------------------
+
+fn fresh_context(def: &GameDefinition, root: &std::path::Path) -> CoreContext {
+    let ctx = CoreContext::for_testing(root.join("app_data"))
+        .with_games(registry(def))
+        .with_minecraft_snapshot_entries(MINECRAFT);
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    ctx
+}
+
+fn snapshot_manifest_path(dir: &std::path::Path, id: &str) -> std::path::PathBuf {
+    dir.join(".agora_snapshots").join(format!("{id}.json"))
+}
+
+#[test]
+fn a_backup_without_bytes_imports_when_objects_exist_and_lists_missing_ones() {
+    let h = Harness::new();
+    let item = h.add_item();
+    h.add_layer(&item);
+    h.write_user_file("Plugins.txt", b"*A.esp\n");
+    let snap =
+        game_snapshot::create(&h.ctx, &h.id, &h.def, Some("base"), SnapshotOrigin::User).unwrap();
+
+    let export = TempDir::new().unwrap();
+    let artifact = backup::export_game_snapshot(
+        &h.dir(),
+        &snap.id,
+        export.path(),
+        &h.ctx.paths.content_root(),
+        false,
+    )
+    .unwrap();
+
+    // Same data root: the content objects the backup names are still there.
+    let fresh_dir = h.ctx.paths.instance_dir("fresh-copy").unwrap();
+    let imported = backup::import_backup(&fresh_dir, &artifact).unwrap();
+    assert_eq!(imported.id, snap.id);
+    assert!(snapshot::list_snapshots(&fresh_dir)
+        .unwrap()
+        .iter()
+        .any(|snapshot| snapshot.id == snap.id));
+    assert!(h.ctx.paths.content_item_path(&item).is_file());
+
+    // Remove the objects, then import into another instance: the whole import
+    // refuses and names the item, writing no snapshot.
+    let parsed: content_store::ContentItem = serde_json::from_str(
+        &std::fs::read_to_string(h.ctx.paths.content_item_path(&item)).unwrap(),
+    )
+    .unwrap();
+    for file in &parsed.files {
+        let _ = std::fs::remove_file(h.ctx.paths.content_object_path(&file.sha256));
+    }
+    let missing_dir = h.ctx.paths.instance_dir("fresh-missing").unwrap();
+    let error = backup::import_backup(&missing_dir, &artifact).unwrap_err();
+    assert!(error.contains("needs content"), "{error}");
+    assert!(
+        error.contains("Test item"),
+        "names the missing item: {error}"
+    );
+    assert!(
+        !snapshot_manifest_path(&missing_dir, &snap.id).exists(),
+        "a refused import writes no snapshot"
+    );
+}
+
+#[test]
+fn a_backup_with_bytes_round_trips_into_an_empty_data_folder() {
+    let h = Harness::new();
+    let item = h.add_item();
+    h.add_layer(&item);
+    h.write_user_file("Plugins.txt", b"*A.esp\n");
+    h.write_user_file("Skyrim.ini", b"[General]\nValue=1\n");
+    let snap =
+        game_snapshot::create(&h.ctx, &h.id, &h.def, Some("base"), SnapshotOrigin::User).unwrap();
+
+    let export = TempDir::new().unwrap();
+    let artifact = backup::export_game_snapshot(
+        &h.dir(),
+        &snap.id,
+        export.path(),
+        &h.ctx.paths.content_root(),
+        true,
+    )
+    .unwrap();
+
+    let empty = TempDir::new().unwrap();
+    let ctx = fresh_context(&h.def, empty.path());
+    let id = "restored";
+    let dir = ctx.paths.instance_dir(id).unwrap();
+    let imported = backup::import_backup(&dir, &artifact).unwrap();
+    assert_eq!(imported.id, snap.id);
+
+    // Every content object the state names was written from the backup.
+    let parsed: content_store::ContentItem =
+        serde_json::from_str(&std::fs::read_to_string(ctx.paths.content_item_path(&item)).unwrap())
+            .unwrap();
+    for file in &parsed.files {
+        assert!(
+            ctx.paths.content_object_path(&file.sha256).is_file(),
+            "content object {} was not restored",
+            file.sha256
+        );
+    }
+
+    // The state files themselves restore, including the manifest the empty
+    // instance did not have.
+    game_snapshot::restore(&ctx, id, &h.def, &imported.id, true).unwrap();
+    assert_eq!(
+        std::fs::read(dir.join("user").join("Plugins.txt")).unwrap(),
+        b"*A.esp\n"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("user").join("Skyrim.ini")).unwrap(),
+        b"[General]\nValue=1\n"
+    );
+    assert!(dir.join("instance_manifest.json").is_file());
+}
+
+#[test]
+fn a_tampered_game_backup_is_refused() {
+    let h = Harness::new();
+    h.write_user_file("Plugins.txt", b"*A.esp\n");
+    let snap =
+        game_snapshot::create(&h.ctx, &h.id, &h.def, Some("base"), SnapshotOrigin::User).unwrap();
+    let export = TempDir::new().unwrap();
+    let artifact = backup::export_game_snapshot(
+        &h.dir(),
+        &snap.id,
+        export.path(),
+        &h.ctx.paths.content_root(),
+        false,
+    )
+    .unwrap();
+
+    let tampered_path = export.path().join("tampered.zip");
+    {
+        use std::io::{Read, Write};
+        let file = std::fs::File::open(&artifact).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let out = std::fs::File::create(&tampered_path).unwrap();
+        let mut writer = zip::ZipWriter::new(out);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            let name = entry.name().unwrap().into_owned();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            if name == "user/Plugins.txt" && !bytes.is_empty() {
+                bytes[0] ^= 0xFF;
+            }
+            writer.start_file(&name, options).unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    let empty = TempDir::new().unwrap();
+    let ctx = fresh_context(&h.def, empty.path());
+    let dir = ctx.paths.instance_dir("victim").unwrap();
+    let error = backup::import_backup(&dir, &tampered_path).unwrap_err();
+    assert!(
+        error.contains("hash mismatch") || error.contains("size mismatch"),
+        "a tampered backup is refused: {error}"
+    );
+    assert!(!snapshot_manifest_path(&dir, &snap.id).exists());
 }
