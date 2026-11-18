@@ -1,6 +1,7 @@
 use crate::browse_cache::SharedBrowseCache;
 use crate::msa::{MsaDeviceCodeFlow, MsaLoginCancel};
 use agora_core::error::LauncherResult;
+use agora_core::http_client::apply_proxy;
 use agora_core::models::ModVersionCandidate;
 use agora_core::process_identity::{self, ProcessIdentity};
 use std::collections::{HashMap, HashSet};
@@ -93,7 +94,7 @@ impl AppState {
         // The timeout is short because the AppState client is for lightweight
         // health checks and status queries. Heavy downloads use HttpClients
         // from the managed CoreContext.
-        let client = agora_core::http_client::apply_proxy(
+        let client = apply_proxy(
             reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .redirect(reqwest::redirect::Policy::none())
@@ -102,11 +103,9 @@ impl AppState {
         .ok()
         .and_then(|builder| builder.build().ok())
         .or_else(|| {
-            agora_core::http_client::apply_proxy(
-                reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
-            )
-            .ok()
-            .and_then(|builder| builder.build().ok())
+            apply_proxy(reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()))
+                .ok()
+                .and_then(|builder| builder.build().ok())
         })
         .expect("reqwest::Client::builder().build() must succeed");
         Self {

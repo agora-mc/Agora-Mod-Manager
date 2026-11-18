@@ -1072,6 +1072,18 @@ pub fn is_network_enabled(conn: &Connection, key: &str) -> bool {
     }
 }
 
+/// Read a declared boolean setting, failing closed: an unreadable value or a
+/// store that cannot be read means `false`.
+///
+/// Game packages reach this through `db`, which they already import, instead of
+/// growing their `agora_core` reference budget with a second module path.
+pub fn declared_bool(conn: &Connection, key: &str) -> bool {
+    match crate::settings_registry::read_bool(conn, key) {
+        Ok(Some(value)) => value,
+        Ok(None) | Err(_) => false,
+    }
+}
+
 /// Whether Lockdown Mode (global network block) is enabled.
 ///
 /// Lockdown overrides every per-endpoint toggle. It defaults to off when the

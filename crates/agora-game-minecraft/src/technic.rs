@@ -23,7 +23,9 @@
 use agora_core::ctx::Ctx;
 use agora_core::db;
 use agora_core::error::{LauncherError, LauncherResult};
+use agora_core::event_sink;
 use agora_core::http_client::{self, ClientCategory, HostPolicy, HttpClients};
+use agora_core::network;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
@@ -98,13 +100,9 @@ pub struct TechnicPackDetail {
 
 /// Read a boolean setting, defaulting to `default` when absent or unreadable.
 /// Accepts JSON booleans and legacy JSON strings (`"true"` / `"1"`).
-fn setting_bool(conn: &Connection, key: &str, default: bool) -> bool {
-    match agora_core::settings_registry::read_bool(conn, key) {
-        Ok(Some(value)) => value,
-        Ok(None) => default,
-        // Consent is not something a damaged store can grant.
-        Err(_) => false,
-    }
+fn setting_bool(conn: &Connection, key: &str) -> bool {
+    // Consent is not something a damaged store can grant.
+    db::declared_bool(conn, key)
 }
 
 fn consent_backend_available(conn: &Connection) -> bool {
@@ -121,7 +119,7 @@ pub fn consent_for_tier(conn: &rusqlite::Connection, tier: TechnicTier) -> Launc
             message: "Technic content requires network access, which is disabled by Privacy Lockdown Mode.".into(),
         });
     }
-    let technic_enabled = setting_bool(conn, "technic_enabled", false);
+    let technic_enabled = setting_bool(conn, "technic_enabled");
     if !technic_enabled {
         return Err(LauncherError::Generic {
             code: "ERR_TECHNIC_DISABLED".into(),
@@ -129,7 +127,7 @@ pub fn consent_for_tier(conn: &rusqlite::Connection, tier: TechnicTier) -> Launc
         });
     }
     if tier == TechnicTier::Zip {
-        let allow_unverified = setting_bool(conn, "allow_unverified_packs", false);
+        let allow_unverified = setting_bool(conn, "allow_unverified_packs");
         if !allow_unverified {
             return Err(LauncherError::Generic {
                 code: "ERR_UNVERIFIED_PACKS_DISABLED".into(),
@@ -162,7 +160,7 @@ const TECHNIC_API_HOST: &str = "api.technicpack.net";
 async fn technic_api_get_bytes(clients: &HttpClients, url: &str) -> LauncherResult<Vec<u8>> {
     eprintln!(
         "[technic] api fetch url={}",
-        agora_core::network::sanitized_url_for_log(url)
+        network::sanitized_url_for_log(url)
     );
     http_client::checked_get_bytes_with_policy(
         clients,
@@ -185,7 +183,7 @@ async fn technic_get_bytes(clients: &HttpClients, url: &str) -> LauncherResult<V
             .ok()
             .and_then(|parsed| parsed.host_str().map(str::to_string))
             .unwrap_or_default(),
-        agora_core::network::sanitized_url_for_log(url)
+        network::sanitized_url_for_log(url)
     );
     http_client::checked_get_bytes_with_policy(
         clients,
@@ -701,7 +699,7 @@ pub async fn install_solder_pack(
         },
         name_override,
         ctx.progress_sink.clone(),
-        agora_core::event_sink::CancellationToken::new(),
+        event_sink::CancellationToken::new(),
     )
     .await
 }
@@ -730,7 +728,7 @@ pub async fn install_zip_pack(
         },
         name_override,
         ctx.progress_sink.clone(),
-        agora_core::event_sink::CancellationToken::new(),
+        event_sink::CancellationToken::new(),
     )
     .await
 }

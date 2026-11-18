@@ -5,7 +5,7 @@ use crate::pack_install::PackInstallResult;
 use agora_core::ctx::Ctx;
 use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::event_sink::{
-    CancellationToken, CoreEvent, OperationId, ProgressEvent, ProgressPhase, ProgressSink,
+    self, CancellationToken, CoreEvent, OperationId, ProgressEvent, ProgressPhase, ProgressSink,
 };
 use agora_core::models::InstanceRow;
 use agora_core::network::NetworkPolicy;
@@ -240,7 +240,7 @@ impl ImportService {
     pub async fn run_import_with_sink(
         &self,
         request: ImportRequest,
-        sink: Arc<dyn agora_core::event_sink::ProgressSink>,
+        sink: Arc<dyn event_sink::ProgressSink>,
         cancel: CancellationToken,
     ) -> LauncherResult<ImportResult> {
         self.run_import_named(request, None, sink, cancel).await
@@ -454,7 +454,7 @@ impl ImportService {
         &self,
         request: ImportRequest,
         name_override: Option<String>,
-        sink: Arc<dyn agora_core::event_sink::ProgressSink>,
+        sink: Arc<dyn event_sink::ProgressSink>,
         cancel: CancellationToken,
     ) -> LauncherResult<ImportResult> {
         let op = self.ctx.operation_manager.register("Import instance");
@@ -1841,7 +1841,7 @@ mod tests {
         phase: ProgressPhase,
     }
 
-    impl agora_core::event_sink::ProgressSink for CancelOnPhaseSink {
+    impl event_sink::ProgressSink for CancelOnPhaseSink {
         fn report(&self, event: ProgressEvent) {
             if event.phase == self.phase {
                 self.cancel.cancel();
