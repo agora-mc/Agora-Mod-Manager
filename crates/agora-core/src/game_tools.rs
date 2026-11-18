@@ -2482,7 +2482,13 @@ fn guard_for(
             operation,
         )?)
     } else {
-        Ok(InstanceGuard::for_mutation(ctx, instance_id, operation)?)
+        InstanceGuard::for_mutation(ctx, instance_id, operation).map_err(|error| {
+            if error.code() == "ERR_INSTANCE_RUNNING" {
+                ToolError::SessionRunning(instance_id.to_string())
+            } else {
+                ToolError::Lock(error)
+            }
+        })
     }
 }
 
