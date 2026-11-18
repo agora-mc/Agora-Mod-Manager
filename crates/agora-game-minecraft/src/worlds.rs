@@ -9,11 +9,12 @@
 //! Minecraft rewrites both files on exit and would silently undo the edit.
 
 use crate::instance_service::TrashFn;
-use agora_core::app_paths::is_safe_file_name;
+use agora_core as core_api;
 use agora_core::ctx::Ctx;
 use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::lock_manager::{LockGuard, LockResource};
 use base64::Engine;
+use core_api::app_paths::is_safe_file_name;
 use fastnbt::Value;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -140,8 +141,8 @@ impl WorldService {
     }
 
     fn instance_dir(&self, instance_id: &str) -> LauncherResult<(String, PathBuf)> {
-        let id = agora_core::paths::sanitize_id(instance_id);
-        agora_core::app_paths::validate_path_component(&id)?;
+        let id = core_api::paths::sanitize_id(instance_id);
+        core_api::app_paths::validate_path_component(&id)?;
         let dir = self.ctx.paths.instance_dir(&id)?;
         if !dir.is_dir() {
             return Err(error(
@@ -159,7 +160,7 @@ impl WorldService {
             .ctx
             .lock_manager
             .acquire(LockResource::Instance(id.clone()), operation)?;
-        agora_core::instance_runtime::check_idle(&self.ctx.paths, &id)?;
+        core_api::instance_runtime::check_idle(&self.ctx.paths, &id)?;
         Ok((guard, dir))
     }
 
@@ -626,7 +627,7 @@ fn read_world(dir: &Path, folder: String) -> WorldInfo {
 }
 
 /// Name and last-played time of a world, without measuring it.
-fn world_summary(dir: &Path, folder: &str) -> Option<(String, i64)> {
+pub(crate) fn world_summary(dir: &Path, folder: &str) -> Option<(String, i64)> {
     let root = read_level_dat(&dir.join("level.dat")).ok()?;
     let Value::Compound(mut root) = root else {
         return None;
