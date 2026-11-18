@@ -116,6 +116,12 @@ impl agora_game_minecraft::launch_service::LaunchProgress for ConsoleLaunchProgr
         }
     }
 
+    fn offline(&self, note: &str) {
+        if !self.json {
+            eprintln!("[!!] {note}");
+        }
+    }
+
     fn started(&self, started: &agora_game_minecraft::launch_service::LaunchStarted) {
         // Record what this launch ran with, so a crash at its end can be diagnosed against it.
         if let Some(session) =

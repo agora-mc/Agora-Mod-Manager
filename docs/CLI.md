@@ -810,7 +810,9 @@ The CLI writes the total session duration to standard error. `--timings` adds in
 
 `--yes` bypasses the interactive health confirmation. It does not make an unhealthy instance safe and should not be used as a generic automation default.
 
-The CLI launches directly through Agora core. Microsoft authentication is therefore required for normal online identity.
+The CLI launches directly through Agora core. Microsoft authentication is used for the normal online identity.
+
+If Microsoft cannot be reached (no connection, a timeout, a 5xx from its servers), Lockdown Mode is on, or the Microsoft sign-in switch is off, the launch continues with the stored profile (name and UUID) and a placeholder offline token. It prints `Playing offline: online servers and Realms will not accept this session.` followed by the reason. Single-player still works; online servers and Realms will refuse the session. This fallback is never used when Microsoft says the session is invalid (`invalid_grant`, or another 4xx refusal): sign in again with `agora auth login`.
 
 ### Microsoft authentication
 

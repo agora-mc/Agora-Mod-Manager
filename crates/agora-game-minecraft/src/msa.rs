@@ -618,18 +618,7 @@ async fn refresh_oauth_token(
         .unwrap_or_default();
 
     if !status.is_success() {
-        if is_msa_permanent_refresh_error(&body) {
-            return Err(LauncherError::MsaAuthRequired);
-        }
-        if let Some(code) = oauth_error_code(&body) {
-            if is_app_access_error(&code) {
-                return Err(app_access_denied());
-            }
-        }
-        return Err(err(
-            "ERR_MSA_OAUTH_REFRESH_HTTP",
-            format!("Microsoft could not renew the session (HTTP {status})."),
-        ));
+        return Err(refresh_http_failure(status, &body));
     }
 
     serde_json::from_str::<OAuthToken>(&body).map_err(|_| {
@@ -644,8 +633,40 @@ async fn refresh_oauth_token(
 /// (`invalid_grant` or `expired_token`) that should clear stored credentials.
 fn is_msa_permanent_refresh_error(body: &str) -> bool {
     matches!(
-        oauth_error_code(body).as_deref(),
+        oauth_error_code(&body).as_deref(),
         Some("invalid_grant") | Some("expired_token")
+    )
+}
+
+/// A 5xx from any step of the sign-in chain is the server being unavailable,
+/// which is the same situation as having no connection for the purpose of
+/// offline play.
+const ERR_MSA_SERVER_UNAVAILABLE: &str = "ERR_MSA_SERVER_UNAVAILABLE";
+
+fn server_unavailable(step: &str, status: reqwest::StatusCode) -> LauncherError {
+    err(
+        ERR_MSA_SERVER_UNAVAILABLE,
+        format!("{step} failed because Microsoft's servers are unavailable (HTTP {status})."),
+    )
+}
+
+/// Classify a failed `/token` response. Kept separate from the request so the
+/// permanent/transient split is testable without a server.
+fn refresh_http_failure(status: reqwest::StatusCode, body: &str) -> LauncherError {
+    if is_msa_permanent_refresh_error(body) {
+        return LauncherError::MsaAuthRequired;
+    }
+    if let Some(code) = oauth_error_code(body) {
+        if is_app_access_error(&code) {
+            return app_access_denied();
+        }
+    }
+    if status.is_server_error() {
+        return server_unavailable("Renewing the Microsoft session", status);
+    }
+    err(
+        "ERR_MSA_OAUTH_REFRESH_HTTP",
+        format!("Microsoft could not renew the session (HTTP {status})."),
     )
 }
 
@@ -755,6 +776,9 @@ async fn xbl_authenticate(
         .unwrap_or_default();
 
     if !status.is_success() {
+        if status.is_server_error() {
+            return Err(server_unavailable("Signing in to Xbox Live", status));
+        }
         return Err(err(
             "ERR_MSA_XBOX_AUTH_HTTP",
             format!("Xbox Live rejected the sign-in (HTTP {status})."),
@@ -846,6 +870,12 @@ async fn xsts_authorize(
         if let Some(specific) = parse_xerr(&raw).and_then(xsts_error_for) {
             return Err(specific);
         }
+        if status.is_server_error() {
+            return Err(server_unavailable(
+                "Authorizing the Xbox Live session",
+                status,
+            ));
+        }
         return Err(err(
             "ERR_MSA_XSTS_HTTP",
             format!("Xbox Live authorization failed (HTTP {status})."),
@@ -905,6 +935,9 @@ async fn minecraft_login(
         return Err(app_access_denied());
     }
     if !status.is_success() {
+        if status.is_server_error() {
+            return Err(server_unavailable("Signing in to Minecraft", status));
+        }
         return Err(err(
             "ERR_MSA_MC_TOKEN_HTTP",
             format!("Minecraft sign-in failed (HTTP {status})."),
@@ -955,6 +988,9 @@ async fn check_entitlements(clients: &HttpClients, mc_access_token: &str) -> Lau
         .unwrap_or_default();
 
     if !status.is_success() {
+        if status.is_server_error() {
+            return Err(server_unavailable("Checking Minecraft ownership", status));
+        }
         return Err(err(
             "ERR_MSA_ENTITLEMENTS_HTTP",
             format!("Could not check Minecraft ownership (HTTP {status})."),
@@ -1001,6 +1037,9 @@ async fn minecraft_profile(
         ));
     }
     if !status.is_success() {
+        if status.is_server_error() {
+            return Err(server_unavailable("Reading the Minecraft profile", status));
+        }
         return Err(err(
             "ERR_MSA_PROFILE_HTTP",
             format!("Could not read the Minecraft profile (HTTP {status})."),
@@ -1385,6 +1424,67 @@ pub enum MsaCredentialOutcome {
     SignInRequired,
     /// Temporary failure; stored credentials preserved.
     RefreshFailed(LauncherError),
+}
+
+/// The access-token value handed to the game for a local, offline session.
+///
+/// Minecraft's own launch arguments (`--accessToken ${auth_access_token}` in the
+/// version JSON, substituted in `launch_planner::substitute`) only pass this on
+/// to the session service. Single-player never validates it; the conventional
+/// placeholder is `0`, and `user_type` stays `legacy` exactly as the delegated
+/// launch path already uses for an account Agora does not own. No real token is
+/// involved, and online servers reject it, which the note says.
+pub const OFFLINE_ACCESS_TOKEN: &str = "0";
+
+/// The sentence a launch result and the UI must show for an offline session.
+pub const OFFLINE_PLAY_NOTE: &str =
+    "Playing offline: online servers and Realms will not accept this session.";
+
+/// Whether a failed refresh means "no network" rather than "the account is no
+/// longer valid". Only failures in this list fall back to the stored profile.
+///
+/// A 4xx (including `invalid_grant` and every other refusal) is a decision by
+/// Microsoft about the session, so it must never launch offline. Lockdown Mode,
+/// a disabled Microsoft switch and an unreadable privacy store all mean no
+/// network request was made, which is the same condition for this purpose.
+pub fn is_offline_refresh_failure(error: &LauncherError) -> bool {
+    match error {
+        LauncherError::NetworkOffline | LauncherError::NetworkUnavailable { .. } => true,
+        LauncherError::NetworkMsaDisabled => true,
+        LauncherError::Generic { code, .. } => matches!(
+            code.as_str(),
+            "ERR_NETWORK"
+                | "ERR_NETWORK_LOCKDOWN"
+                | "ERR_NETWORK_ENDPOINT_DISABLED"
+                | "ERR_NETWORK_SETTINGS_UNREADABLE"
+                | ERR_MSA_SERVER_UNAVAILABLE
+        ),
+        _ => false,
+    }
+}
+
+/// The offline note, naming the reason so a lockdown/settings launch is not
+/// mistaken for a normal outage.
+pub fn offline_play_note(error: &LauncherError) -> String {
+    let reason = match error {
+        LauncherError::NetworkOffline | LauncherError::NetworkUnavailable { .. } => {
+            "Agora could not reach Microsoft."
+        }
+        LauncherError::NetworkMsaDisabled => "Microsoft sign-in is turned off in Settings.",
+        LauncherError::Generic { code, .. } => match code.as_str() {
+            "ERR_NETWORK_LOCKDOWN" => "Lockdown Mode is on, so Agora is using no network.",
+            "ERR_NETWORK_ENDPOINT_DISABLED" => {
+                "Microsoft sign-in is turned off in Settings, so Agora is using no network."
+            }
+            "ERR_NETWORK_SETTINGS_UNREADABLE" => {
+                "Agora could not read the privacy settings, so it is using no network."
+            }
+            ERR_MSA_SERVER_UNAVAILABLE => "Microsoft's sign-in servers are unavailable.",
+            _ => "Agora could not renew the Microsoft sign-in.",
+        },
+        _ => "Agora could not renew the Microsoft sign-in.",
+    };
+    format!("{OFFLINE_PLAY_NOTE} {reason}")
 }
 
 static MSA_REFRESH_MUTEX: LazyLock<tokio::sync::Mutex<()>> =
@@ -2180,6 +2280,91 @@ mod tests {
         ));
         assert!(!is_msa_permanent_refresh_error("not-json"));
         assert!(!is_msa_permanent_refresh_error(""));
+    }
+
+    #[test]
+    fn only_no_network_refresh_failures_are_offline_playable() {
+        for error in [
+            LauncherError::NetworkOffline,
+            LauncherError::NetworkUnavailable {
+                action: "renew the Microsoft session".into(),
+            },
+            LauncherError::NetworkMsaDisabled,
+            LauncherError::Generic {
+                code: "ERR_NETWORK_LOCKDOWN".into(),
+                message: String::new(),
+            },
+            LauncherError::Generic {
+                code: "ERR_NETWORK_ENDPOINT_DISABLED".into(),
+                message: String::new(),
+            },
+            LauncherError::Generic {
+                code: "ERR_NETWORK_SETTINGS_UNREADABLE".into(),
+                message: String::new(),
+            },
+            LauncherError::Generic {
+                code: "ERR_MSA_SERVER_UNAVAILABLE".into(),
+                message: String::new(),
+            },
+        ] {
+            assert!(
+                is_offline_refresh_failure(&error),
+                "should allow offline play: {error:?}"
+            );
+        }
+
+        for error in [
+            LauncherError::MsaAuthRequired,
+            LauncherError::AuthExpired,
+            LauncherError::Generic {
+                code: "ERR_MSA_OAUTH_REFRESH_HTTP".into(),
+                message: String::new(),
+            },
+            LauncherError::Generic {
+                code: "ERR_MSA_NO_ENTITLEMENT".into(),
+                message: String::new(),
+            },
+            LauncherError::Generic {
+                code: "ERR_NETWORK_GATE_MISSING".into(),
+                message: String::new(),
+            },
+        ] {
+            assert!(
+                !is_offline_refresh_failure(&error),
+                "must not launch offline: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_server_error_is_offline_playable_but_invalid_grant_is_not() {
+        let server = refresh_http_failure(status(503), r#"{"error":"server_error"}"#);
+        assert_eq!(server.code(), ERR_MSA_SERVER_UNAVAILABLE);
+        assert!(is_offline_refresh_failure(&server));
+
+        let invalid = refresh_http_failure(status(400), r#"{"error":"invalid_grant"}"#);
+        assert!(matches!(invalid, LauncherError::MsaAuthRequired));
+        assert!(!is_offline_refresh_failure(&invalid));
+
+        let other_4xx = refresh_http_failure(status(429), r#"{"error":"temporarily_unavailable"}"#);
+        assert_eq!(other_4xx.code(), "ERR_MSA_OAUTH_REFRESH_HTTP");
+        assert!(!is_offline_refresh_failure(&other_4xx));
+    }
+
+    #[test]
+    fn the_offline_note_names_the_reason_and_what_will_not_work() {
+        let transport = offline_play_note(&LauncherError::NetworkOffline);
+        assert!(transport.contains("online servers and Realms will not accept this session"));
+        assert!(transport.contains("could not reach Microsoft"));
+
+        let lockdown = offline_play_note(&LauncherError::Generic {
+            code: "ERR_NETWORK_LOCKDOWN".into(),
+            message: String::new(),
+        });
+        assert!(lockdown.contains("Lockdown Mode"));
+
+        let disabled = offline_play_note(&LauncherError::NetworkMsaDisabled);
+        assert!(disabled.contains("Settings"));
     }
 
     /// Build a local state DB with one network setting written.

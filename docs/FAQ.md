@@ -127,7 +127,7 @@ Yes. Press a button on a connected controller and Agora adapts to it. Minecraft 
 
 ### Can I play offline?
 
-Yes, once an instance has everything it needs. Get ready while you are online, because each instance needs its own files. See [Privacy and offline use](https://agoramc.com/docs/guides/privacy-offline).
+Yes, once an instance has everything it needs and you have signed in to a Microsoft account at least once. Get ready while you are online, because each instance needs its own files. If Agora cannot reach Microsoft, it starts the game with your saved profile and says you are playing offline: single-player works, but online servers and Realms will not accept the session. See [Privacy and offline use](https://agoramc.com/docs/guides/privacy-offline).
 
 ### Can an AI assistant help me fix my game?
 

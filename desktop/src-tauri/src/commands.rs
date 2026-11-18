@@ -623,6 +623,18 @@ impl agora_game_minecraft::launch_service::LaunchProgress for DelegatedLaunchPro
         );
     }
 
+    fn offline(&self, note: &str) {
+        use tauri::Emitter;
+        let _ = self.app.emit(
+            "launch-progress",
+            serde_json::json!({
+                "instance_id": self.instance_id,
+                "phase": "offline",
+                "message": note,
+            }),
+        );
+    }
+
     fn started(&self, started: &agora_game_minecraft::launch_service::LaunchStarted) {
         use tauri::Emitter;
         let app = self.app.clone();
@@ -1033,6 +1045,18 @@ impl agora_game_minecraft::launch_service::LaunchProgress for TauriLaunchProgres
                 "phase": format!("{phase}-complete"),
                 "message": format!("Completed in {duration_ms} ms"),
                 "duration_ms": duration_ms,
+            }),
+        );
+    }
+
+    fn offline(&self, note: &str) {
+        use tauri::Emitter;
+        let _ = self.app.emit(
+            "launch-progress",
+            serde_json::json!({
+                "instance_id": self.instance_id,
+                "phase": "offline",
+                "message": note,
             }),
         );
     }

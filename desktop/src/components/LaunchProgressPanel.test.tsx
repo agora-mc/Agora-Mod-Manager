@@ -48,4 +48,11 @@ describe('LaunchProgressPanel', () => {
     expect(screen.queryByRole('progressbar')).toBeNull();
     expect(screen.queryByLabelText('Elapsed time')).toBeNull();
   });
+
+  it('keeps the offline-session warning visible during the launch', () => {
+    const notice =
+      'Playing offline: online servers and Realms will not accept this session. Agora could not reach Microsoft.';
+    render(<LaunchProgressPanel progress={{ ...base, stage: 'loading', label: 'Running — loading', notice }} />);
+    expect(screen.getByTestId('launch-offline-notice').textContent).toBe(notice);
+  });
 });

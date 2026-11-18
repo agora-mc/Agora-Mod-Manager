@@ -65,7 +65,7 @@ This applies if the official launcher starts your game, which is the default. Op
 
 ### Direct launch says it can't sign in
 
-Check your Microsoft account in Settings, under Accounts, and sign in again if needed. Direct launch needs this to play online. If the official launcher starts your game, you sign in there instead and don't need a Microsoft sign-in in Agora.
+Check your Microsoft account in Settings, under Accounts, and sign in again if needed. Direct launch needs it for online play. If Agora cannot reach Microsoft, direct launch still starts the game with your saved profile and says it is playing offline, which works for single-player; online servers and Realms will not accept that session. If Microsoft says the sign-in is no longer valid, sign in again. If the official launcher starts your game, you sign in there instead and don't need a Microsoft sign-in in Agora.
 
 ### I can't vote
 
@@ -80,7 +80,7 @@ Each instance needs its own files, so get ready while you are still online:
 3. Make sure its Java is installed.
 4. Turn on **Lockdown Mode** under Settings > Privacy and try launching, while you can still go back online to fix anything missing.
 
-You can't sign in or download anything missing while offline. See [Privacy and offline use](https://agoramc.com/docs/guides/privacy-offline).
+You can't sign in or download anything missing while offline. Direct launch uses the profile you last signed in with and tells you it is playing offline; online servers and Realms will not accept that session. See [Privacy and offline use](https://agoramc.com/docs/guides/privacy-offline).
 
 ## Browsing and installing
 

@@ -1467,7 +1467,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
           callout: {
             tone: 'warning',
             title: 'Some things need the internet',
-            text: 'While a connection is blocked or you are offline, Agora cannot sign you in or download missing game files, loaders, Java, or mods.',
+            text: 'While a connection is blocked or you are offline, Agora cannot sign you in or download missing game files, loaders, Java, or mods. Direct launch can still start with the account you already signed in; it says you are playing offline, and online servers and Realms will not accept that session.',
           },
         },
         {

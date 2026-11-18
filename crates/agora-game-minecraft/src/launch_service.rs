@@ -82,6 +82,11 @@ pub trait LaunchProgress: Send + Sync {
     fn phase_completed(&self, _name: &str, _duration_ms: u128) {}
     fn started(&self, _started: &LaunchStarted) {}
     fn log(&self, _stream: &str, _line: &str) {}
+
+    /// The launch is going ahead without Microsoft, using the stored profile.
+    /// Adapters must show `note` to the player; the default drops it only for
+    /// hosts that have no user-facing launch state.
+    fn offline(&self, _note: &str) {}
     /// Verified-file counts while the `materializing` phase runs.
     fn files(&self, _progress: &crate::launch_stage::FileProgress) {}
     /// Managed Java provisioning progress while `provisioning-java` runs:
@@ -188,6 +193,8 @@ struct LaunchInputs {
     registry_db: Option<PathBuf>,
     network_policy: NetworkPolicy,
     identity: LaunchIdentity,
+    /// Set when this launch is offline: the sentence the result and UI show.
+    offline_notice: Option<String>,
     java_override: Option<PathBuf>,
     allow_incompatible_java_override: bool,
     java_candidates: Vec<JavaInstallation>,
@@ -225,6 +232,8 @@ pub struct LaunchResult {
     pub snapshot_id: String,
     pub java_path: PathBuf,
     pub process_identity: ProcessIdentity,
+    /// The offline-session sentence, when this launch did not use Microsoft.
+    pub offline_notice: Option<String>,
 }
 
 /// Core-owned launch lifecycle service.
@@ -269,7 +278,7 @@ impl LaunchService {
     ) -> LauncherResult<LaunchResult> {
         progress.phase("loading-inputs", "Loading instance and account state");
         let started = Instant::now();
-        let inputs = self.load_inputs(request).await?;
+        let inputs = self.load_inputs(request, progress).await?;
         progress.phase_completed("loading-inputs", started.elapsed().as_millis());
         // Before the pre-launch snapshot, so the snapshot holds what launched.
         for problem in agora_core::shared_settings::apply_before_launch(
@@ -330,7 +339,11 @@ impl LaunchService {
         self.launch_locked(request, progress).await
     }
 
-    async fn load_inputs(&self, request: LaunchRequest) -> LauncherResult<LaunchInputs> {
+    async fn load_inputs(
+        &self,
+        request: LaunchRequest,
+        progress: &dyn LaunchProgress,
+    ) -> LauncherResult<LaunchInputs> {
         let conn = agora_core::db::local_state_connection(&self.ctx.paths.local_state_db())
             .map_err(|error| LauncherError::Generic {
                 code: "ERR_LOCAL_STATE_FAILED".into(),
@@ -348,33 +361,69 @@ impl LaunchService {
         let manifest_path = self.ctx.paths.instance_manifest(&request.instance_id)?;
         let manifest = agora_core::helpers::read_manifest(&manifest_path)?;
         let network_policy = NetworkPolicy::from_db(&conn);
-        let identity = if request.mode == LaunchMode::Direct {
-            network_policy.check(agora_core::network::NetworkCategory::MicrosoftAuthentication)?;
-            match crate::msa::get_valid_credentials(&self.ctx.http_clients).await {
-                crate::msa::MsaCredentialOutcome::Valid(credentials) => LaunchIdentity {
-                    username: credentials.username,
-                    access_token: credentials.access_token,
-                    uuid: credentials.uuid,
-                    user_type: "msa".into(),
+        let (identity, offline_notice) = if request.mode == LaunchMode::Direct {
+            let mut online = None;
+            let offline_error = match network_policy
+                .check(agora_core::network::NetworkCategory::MicrosoftAuthentication)
+            {
+                Ok(()) => match crate::msa::get_valid_credentials(&self.ctx.http_clients).await {
+                    crate::msa::MsaCredentialOutcome::Valid(credentials) => {
+                        online = Some(LaunchIdentity {
+                            username: credentials.username,
+                            access_token: credentials.access_token,
+                            uuid: credentials.uuid,
+                            user_type: "msa".into(),
+                            client_id: String::new(),
+                            xuid: String::new(),
+                            user_properties: "{}".into(),
+                        });
+                        None
+                    }
+                    crate::msa::MsaCredentialOutcome::SignInRequired => {
+                        return Err(LauncherError::MsaAuthRequired)
+                    }
+                    crate::msa::MsaCredentialOutcome::RefreshFailed(error) => Some(error),
+                },
+                Err(error) => Some(error),
+            };
+
+            if let Some(identity) = online {
+                (identity, None)
+            } else {
+                let error = offline_error.expect("a failed check or refresh produced an error");
+                if !crate::msa::is_offline_refresh_failure(&error) {
+                    return Err(error);
+                }
+                let credentials =
+                    crate::msa::load_credentials()?.ok_or(LauncherError::MsaAuthRequired)?;
+                let note = crate::msa::offline_play_note(&error);
+                progress.offline(&note);
+                (
+                    LaunchIdentity {
+                        username: credentials.username,
+                        access_token: crate::msa::OFFLINE_ACCESS_TOKEN.into(),
+                        uuid: credentials.uuid,
+                        user_type: "legacy".into(),
+                        client_id: String::new(),
+                        xuid: String::new(),
+                        user_properties: "{}".into(),
+                    },
+                    Some(note),
+                )
+            }
+        } else {
+            (
+                LaunchIdentity {
+                    username: "Player".into(),
+                    access_token: String::new(),
+                    uuid: "00000000000000000000000000000000".into(),
+                    user_type: "legacy".into(),
                     client_id: String::new(),
                     xuid: String::new(),
                     user_properties: "{}".into(),
                 },
-                crate::msa::MsaCredentialOutcome::SignInRequired => {
-                    return Err(LauncherError::MsaAuthRequired)
-                }
-                crate::msa::MsaCredentialOutcome::RefreshFailed(error) => return Err(error),
-            }
-        } else {
-            LaunchIdentity {
-                username: "Player".into(),
-                access_token: String::new(),
-                uuid: "00000000000000000000000000000000".into(),
-                user_type: "legacy".into(),
-                client_id: String::new(),
-                xuid: String::new(),
-                user_properties: "{}".into(),
-            }
+                None,
+            )
         };
         let java_runtime_mode = match agora_core::db::get_setting(&conn, "java_runtime_mode")
             .ok()
@@ -436,6 +485,7 @@ impl LaunchService {
                 .then(|| self.ctx.paths.registry_db()),
             network_policy,
             identity,
+            offline_notice,
             java_override,
             allow_incompatible_java_override: row.java_incompatible_override,
             java_candidates: Vec::new(),
@@ -627,6 +677,7 @@ impl LaunchService {
                 snapshot_id,
                 java_path: PathBuf::new(),
                 process_identity,
+                offline_notice: None,
             };
             progress.finished(&result);
             _op_handle.complete();
@@ -1013,6 +1064,7 @@ impl LaunchService {
             snapshot_id,
             java_path,
             process_identity,
+            offline_notice: request.offline_notice,
         };
         progress.finished(&result);
         Ok(result)
@@ -1704,13 +1756,16 @@ mod tests {
             drop(conn);
 
             let inputs = runtime
-                .block_on(service.load_inputs(LaunchRequest {
-                    instance_id: "gc-fixture".into(),
-                    mode: LaunchMode::Delegated,
-                    health_policy: HealthPolicy::WarnOnly,
-                    health_scan_token: None,
-                    quick_play: None,
-                }))
+                .block_on(service.load_inputs(
+                    LaunchRequest {
+                        instance_id: "gc-fixture".into(),
+                        mode: LaunchMode::Delegated,
+                        health_policy: HealthPolicy::WarnOnly,
+                        health_scan_token: None,
+                        quick_play: None,
+                    },
+                    &NoopLaunchProgress,
+                ))
                 .unwrap();
             assert_eq!(
                 inputs.jvm_gc_profile,
