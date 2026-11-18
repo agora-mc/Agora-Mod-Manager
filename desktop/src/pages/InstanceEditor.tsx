@@ -3225,9 +3225,11 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
               you must accept yourself. The server uses this instance's memory setting.
             </p>
             <p className="text-xs text-muted-foreground">
-              A loader launcher whose download has no published hash (Fabric and Quilt's generated
-              server launcher) is refused unless you allow it below; Forge and NeoForge installers are
-              checked against Agora's pinned catalog.
+              Fabric and Quilt installers come from the loader's official Maven repository and are
+              checked against the <span className="font-medium text-foreground">.sha512</span> published
+              beside them; Forge and NeoForge are checked against Agora's pinned catalog. The first
+              start runs the installer, so it downloads the loader and the Minecraft server jar then.
+              Only allow an unverified download if the repository publishes no hash file at all.
             </p>
             <div className="flex flex-wrap items-center gap-3">
               <label className="flex items-center gap-2 text-xs text-muted-foreground">

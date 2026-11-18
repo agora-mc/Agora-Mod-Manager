@@ -200,9 +200,9 @@ fn export_local(
 
 /// A full export: local files, then the pinned loader, scripts, EULA and README.
 ///
-/// `allow_unverified_loader` is the explicit override for a loader launcher the
-/// catalog cannot hash (the Fabric and Quilt server bootstrap). Without it the
-/// export refuses, naming why.
+/// `allow_unverified_loader` is the explicit override for an official installer
+/// whose repository publishes no hash beside it. Without it the export refuses,
+/// naming why.
 pub async fn export_ready_server(
     ctx: &Ctx,
     instance_id: &str,
@@ -231,10 +231,21 @@ pub async fn export_ready_server(
         &manifest.loader,
         &manifest.minecraft_version,
         &loader_version,
-        allow_unverified_loader,
     )?;
     let java_major =
         required_java_major(ctx, &manifest.minecraft_version, &policy, &mut notes).await;
+
+    // Fetch and verify the loader before writing anything, so a refused
+    // download never leaves a half-built server folder.
+    let loader = prepare_loader(
+        ctx,
+        &policy,
+        &manifest.loader,
+        &manifest.minecraft_version,
+        &loader_version,
+        allow_unverified_loader,
+    )
+    .await?;
 
     let local = export_local(
         &instance_dir,
@@ -248,16 +259,14 @@ pub async fn export_ready_server(
         },
     )?;
 
-    let loader = prepare_loader(
-        ctx,
-        &policy,
-        &manifest.loader,
-        &manifest.minecraft_version,
-        &loader_version,
-        dest_dir,
-        allow_unverified_loader,
-    )
-    .await?;
+    if let Some(bytes) = &loader.bytes {
+        std::fs::write(dest_dir.join(&loader.artifact_name), bytes).map_err(|e| {
+            LauncherError::Generic {
+                code: "ERR_EXPORT_WRITE".into(),
+                message: format!("Failed to write {}: {e}", loader.artifact_name),
+            }
+        })?;
+    }
 
     // A folder imported without a Minecraft version has no runnable server to
     // prepare; the mods/config/world export still succeeds and says what is
@@ -272,7 +281,13 @@ pub async fn export_ready_server(
             &manifest.loader,
         );
         write_start_scripts(dest_dir, &scripts)?;
-        if matches!(&loader.plan, LauncherPlan::InstallerThenRun { .. }) {
+        if matches!(
+            &loader.plan,
+            LauncherPlan::InstallerThenRun {
+                runner: InstallerRunner::RunScript,
+                ..
+            }
+        ) {
             let jvm_args = generate_args_for_java(gc_profile, heap_mb, "", java_major);
             write_jvm_args(dest_dir, &jvm_args)?;
         }
@@ -623,20 +638,41 @@ fn world_recency(world_dir: &Path) -> i64 {
 // Loader download and verification
 // ---------------------------------------------------------------------------
 
+/// The official installer repositories. The installer version comes from each
+/// repository's `maven-metadata.xml` `<release>` (then `<latest>`, then the last
+/// `<version>`); Agora's loader catalog pins loader versions, not installer
+/// versions.
+const FABRIC_INSTALLER_BASE: &str = "https://maven.fabricmc.net/net/fabricmc/fabric-installer";
+const QUILT_INSTALLER_BASE: &str =
+    "https://maven.quiltmc.org/repository/release/org/quiltmc/quilt-installer";
+
+/// How a verified installer builds the server on first start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstallerRunner {
+    /// Forge/NeoForge's generated run scripts, which read user_jvm_args.txt.
+    RunScript,
+    /// A launcher jar written by the installer (Fabric, Quilt).
+    LauncherJar { file: String },
+}
+
 /// How the start script reaches a running server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LauncherPlan {
-    /// A runnable server launcher jar (Fabric, Quilt).
+    /// A runnable server launcher jar (vanilla).
     LauncherJar { file: String },
-    /// A verified installer that builds the server on first start
-    /// (Forge, NeoForge).
-    InstallerThenRun { installer: String },
+    /// A verified installer that builds the server on first start.
+    InstallerThenRun {
+        installer: String,
+        args: Vec<String>,
+        runner: InstallerRunner,
+    },
 }
 
 struct PreparedLoader {
     loader_version: String,
     plan: LauncherPlan,
     artifact_name: String,
+    bytes: Option<Vec<u8>>,
     notes: Vec<String>,
 }
 
@@ -677,26 +713,10 @@ fn plan_loader(
     })
 }
 
-/// Refuse a loader export that cannot be verified before any local file is
-/// written, so a refusal never leaves a half-built server folder.
-fn preflight_loader(
-    loader: &str,
-    mc_version: &str,
-    loader_version: &str,
-    allow_unverified: bool,
-) -> LauncherResult<()> {
-    let (kind, entry) = plan_loader(loader, mc_version, loader_version)?;
-    if kind != LoaderKind::FabricLike || allow_unverified {
-        return Ok(());
-    }
-    let entry = entry.expect("a FabricLike loader has a pinned entry");
-    let server_url = server_launcher_url(&entry.source_url)?;
-    Err(LauncherError::Generic {
-        code: "ERR_EXPORT_UNVERIFIED_LOADER".into(),
-        message: format!(
-            "The pinned {loader} catalog has no published hash for its generated server launcher, so it cannot be verified. Pass --allow-unverified-loader to download it anyway; it comes from {server_url}."
-        ),
-    })
+/// Resolve the loader before any local file is written, so an unsupported
+/// loader or a missing pin is refused without leaving a half-built folder.
+fn preflight_loader(loader: &str, mc_version: &str, loader_version: &str) -> LauncherResult<()> {
+    plan_loader(loader, mc_version, loader_version).map(|_| ())
 }
 
 async fn prepare_loader(
@@ -705,7 +725,6 @@ async fn prepare_loader(
     loader: &str,
     mc_version: &str,
     loader_version: &str,
-    dest_dir: &Path,
     allow_unverified: bool,
 ) -> LauncherResult<PreparedLoader> {
     let clients = &ctx.http_clients;
@@ -719,15 +738,14 @@ async fn prepare_loader(
                     file: "server.jar".into(),
                 },
                 artifact_name: String::new(),
+                bytes: None,
                 notes: vec![
                     "The instance has no Minecraft version, so no server jar or start script was prepared."
                         .into(),
                 ],
             });
         }
-        (LoaderKind::Vanilla, _) => {
-            return download_vanilla_server(ctx, policy, mc_version, dest_dir).await;
-        }
+        (LoaderKind::Vanilla, _) => return download_vanilla_server(ctx, policy, mc_version).await,
         (_, Some(entry)) => entry,
         (_, None) => unreachable!("a modded loader has a pinned entry"),
     };
@@ -746,34 +764,35 @@ async fn prepare_loader(
         let profile = fetch_loader_bytes(clients, &entry.source_url, &entry.file_name).await?;
         verify_loader_artifact(&loader_key, &entry, &profile)?;
 
-        let server_url = server_launcher_url(&entry.source_url)?;
-        if !allow_unverified {
-            return Err(LauncherError::Generic {
-                code: "ERR_EXPORT_UNVERIFIED_LOADER".into(),
-                message: format!(
-                    "The pinned {loader} catalog has no published hash for its generated server launcher, so it cannot be verified. Pass --allow-unverified-loader to download it anyway; it comes from {server_url}."
-                ),
-            });
+        let (artifact_name, bytes, installer_version, hash_verified) =
+            prepare_official_installer(clients, &loader_key, allow_unverified).await?;
+        if !hash_verified {
+            notes.push(format!(
+                "No published .sha512 was found beside the {loader} installer {installer_version}; it was downloaded because unverified loader downloads were allowed."
+            ));
         }
-        let server =
-            fetch_loader_bytes(clients, &server_url, &format!("{loader}-server-launch.jar"))
-                .await?;
-        let artifact_name = format!("{loader_key}-server-launch.jar");
-        std::fs::write(dest_dir.join(&artifact_name), &server).map_err(|e| {
-            LauncherError::Generic {
-                code: "ERR_EXPORT_WRITE".into(),
-                message: format!("Failed to write {artifact_name}: {e}"),
-            }
-        })?;
+        let (args, runner_file) = match loader_key.as_str() {
+            "quilt" => (
+                quilt_installer_server_args(mc_version, &entry.loader_version),
+                "quilt-server-launch.jar".to_string(),
+            ),
+            _ => (
+                fabric_installer_server_args(mc_version, &entry.loader_version),
+                "fabric-server-launch.jar".to_string(),
+            ),
+        };
         notes.push(format!(
-            "The {loader} server launcher has no published hash; it was downloaded from {server_url} because unverified loader downloads were allowed."
+            "The first start runs the verified {loader} installer {installer_version} in server mode and writes {runner_file}; it downloads the loader's libraries and the Minecraft server jar."
         ));
         return Ok(PreparedLoader {
             loader_version: entry.loader_version,
-            plan: LauncherPlan::LauncherJar {
-                file: artifact_name.clone(),
+            plan: LauncherPlan::InstallerThenRun {
+                installer: artifact_name.clone(),
+                args,
+                runner: InstallerRunner::LauncherJar { file: runner_file },
             },
             artifact_name,
+            bytes: Some(bytes),
             notes,
         });
     }
@@ -781,10 +800,6 @@ async fn prepare_loader(
     let bytes = fetch_loader_bytes(clients, &entry.source_url, &entry.file_name).await?;
     verify_loader_artifact(&loader_key, &entry, &bytes)?;
     let artifact_name = format!("{loader_key}-installer.jar");
-    std::fs::write(dest_dir.join(&artifact_name), &bytes).map_err(|e| LauncherError::Generic {
-        code: "ERR_EXPORT_WRITE".into(),
-        message: format!("Failed to write {artifact_name}: {e}"),
-    })?;
     notes.push(format!(
         "The first start runs the verified {loader} installer to build the server; it needs Java and downloads the loader's libraries."
     ));
@@ -792,10 +807,176 @@ async fn prepare_loader(
         loader_version: entry.loader_version,
         plan: LauncherPlan::InstallerThenRun {
             installer: artifact_name.clone(),
+            args: vec!["--installServer".into()],
+            runner: InstallerRunner::RunScript,
         },
         artifact_name,
+        bytes: Some(bytes),
         notes,
     })
+}
+
+/// Fabric's installer server mode. Source: `ServerHandler.java` lines 69-94
+/// (`installCli` and `cliHelp`) and `Main.java` lines 86-89 (the handler name
+/// is matched case-insensitively) in
+/// https://github.com/FabricMC/fabric-installer. It writes
+/// `fabric-server-launch.jar` (`ServerInstaller.java` line 61).
+fn fabric_installer_server_args(mc_version: &str, loader_version: &str) -> Vec<String> {
+    vec![
+        "server".into(),
+        "-dir".into(),
+        ".".into(),
+        "-mcversion".into(),
+        mc_version.into(),
+        "-loader".into(),
+        loader_version.into(),
+        "-downloadMinecraft".into(),
+    ]
+}
+
+/// Quilt's installer server mode. Source: `CliInstaller.java` lines 193-275
+/// (`install server <minecraftVersion> [<loaderVersion>] [--install-dir=]
+/// [--download-server]`) and `InstallServer.java` lines 67-70, 109 and 126-129
+/// in https://github.com/QuiltMC/quilt-installer. It writes
+/// `quilt-server-launch.jar`.
+fn quilt_installer_server_args(mc_version: &str, loader_version: &str) -> Vec<String> {
+    vec![
+        "install".into(),
+        "server".into(),
+        mc_version.into(),
+        loader_version.into(),
+        "--install-dir=.".into(),
+        "--download-server".into(),
+    ]
+}
+
+/// Download a Fabric/Quilt installer from its official Maven repository and
+/// check it against the strongest hash the repository publishes beside it
+/// (`.sha512`; both repositories publish it). A missing hash file is the only
+/// case `allow_unverified` may override.
+async fn prepare_official_installer(
+    clients: &HttpClients,
+    loader: &str,
+    allow_unverified: bool,
+) -> LauncherResult<(String, Vec<u8>, String, bool)> {
+    let base = match loader {
+        "fabric" => FABRIC_INSTALLER_BASE,
+        "quilt" => QUILT_INSTALLER_BASE,
+        _ => {
+            return Err(LauncherError::Generic {
+                code: "ERR_EXPORT_UNSUPPORTED_LOADER".into(),
+                message: format!("No official installer repository is known for {loader}."),
+            })
+        }
+    };
+    let metadata_url = format!("{base}/maven-metadata.xml");
+    let metadata = fetch_loader_bytes(clients, &metadata_url, "maven-metadata.xml").await?;
+    let installer_version = parse_maven_metadata_latest(&String::from_utf8_lossy(&metadata))?;
+    let jar_name = format!("{loader}-installer-{installer_version}.jar");
+    let jar_url = format!("{base}/{installer_version}/{jar_name}");
+    let bytes = fetch_loader_bytes(clients, &jar_url, &jar_name).await?;
+    let hash_url = format!("{jar_url}.sha512");
+    let published =
+        match fetch_loader_bytes(clients, &hash_url, &format!("{jar_name}.sha512")).await {
+            Ok(text) => Some(String::from_utf8_lossy(&text).into_owned()),
+            Err(error) if is_http_not_found(&error) => None,
+            Err(error) => return Err(error),
+        };
+    let verified =
+        verify_published_hash(&bytes, published.as_deref(), &jar_name, allow_unverified)?;
+    Ok((
+        format!("{loader}-installer.jar"),
+        bytes,
+        installer_version,
+        verified,
+    ))
+}
+
+fn is_http_not_found(error: &LauncherError) -> bool {
+    error.to_string().contains("HTTP 404")
+}
+
+/// `<release>` first, then `<latest>`, then the last `<version>` in a Maven
+/// `maven-metadata.xml`.
+fn parse_maven_metadata_latest(xml: &str) -> LauncherResult<String> {
+    for tag in ["release", "latest"] {
+        if let Some(value) = xml_tag(xml, tag) {
+            if !value.is_empty() {
+                return Ok(value.to_string());
+            }
+        }
+    }
+    let mut last = None;
+    let mut rest = xml;
+    while let Some(start) = rest.find("<version>") {
+        let after = &rest[start + "<version>".len()..];
+        let Some(end) = after.find("</version>") else {
+            break;
+        };
+        last = Some(after[..end].trim().to_string());
+        rest = &after[end + "</version>".len()..];
+    }
+    last.filter(|value| !value.is_empty())
+        .ok_or_else(|| LauncherError::Generic {
+            code: "ERR_EXPORT_INSTALLER_METADATA".into(),
+            message: "The installer repository's maven-metadata.xml names no version.".into(),
+        })
+}
+
+fn xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].trim())
+}
+
+/// The hash in a Maven `.sha512` file: a bare digest, or `sha512:`/`sha512-`
+/// prefixed, optionally followed by the file name.
+fn parse_published_hash(text: &str) -> LauncherResult<String> {
+    let raw = text
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let raw = raw.strip_prefix("sha512:").unwrap_or(&raw);
+    let raw = raw.strip_prefix("sha512-").unwrap_or(raw);
+    let raw = raw.strip_prefix("sha512=").unwrap_or(raw);
+    if raw.len() != 128 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(LauncherError::Generic {
+            code: "ERR_EXPORT_INSTALLER_HASH".into(),
+            message: "The installer's published hash is not a SHA-512 digest.".into(),
+        });
+    }
+    Ok(raw.to_string())
+}
+
+/// Check installer bytes against the published hash. A missing hash file is
+/// only allowed with the explicit override, and is reported as unverified.
+fn verify_published_hash(
+    bytes: &[u8],
+    published: Option<&str>,
+    file: &str,
+    allow_unverified: bool,
+) -> LauncherResult<bool> {
+    match published {
+        Some(text) => {
+            let expected = parse_published_hash(text)?;
+            let actual = core_api::download::sha512_hex(bytes);
+            if actual.eq_ignore_ascii_case(&expected) {
+                Ok(true)
+            } else {
+                Err(LauncherError::HashMismatch)
+            }
+        }
+        None if allow_unverified => Ok(false),
+        None => Err(LauncherError::Generic {
+            code: "ERR_EXPORT_UNVERIFIED_LOADER".into(),
+            message: format!(
+                "No .sha512 hash is published beside {file}, so it cannot be verified. Pass --allow-unverified-loader to download it anyway."
+            ),
+        }),
+    }
 }
 
 /// Vanilla has no loader catalog entry: the server jar is Mojang's own, with
@@ -804,7 +985,6 @@ async fn download_vanilla_server(
     ctx: &Ctx,
     policy: &NetworkPolicy,
     mc_version: &str,
-    dest_dir: &Path,
 ) -> LauncherResult<PreparedLoader> {
     let info = crate::minecraft_metadata::ensure_base_version_metadata(
         &ctx.paths.minecraft_runtime_root(),
@@ -842,16 +1022,13 @@ async fn download_vanilla_server(
             ),
         });
     }
-    std::fs::write(dest_dir.join("server.jar"), &bytes).map_err(|e| LauncherError::Generic {
-        code: "ERR_EXPORT_WRITE".into(),
-        message: format!("Failed to write server.jar: {e}"),
-    })?;
     Ok(PreparedLoader {
         loader_version: "vanilla".into(),
         plan: LauncherPlan::LauncherJar {
             file: "server.jar".into(),
         },
         artifact_name: "server.jar".into(),
+        bytes: Some(bytes),
         notes: Vec::new(),
     })
 }
@@ -917,21 +1094,6 @@ fn verify_loader_artifact(loader: &str, entry: &LoaderEntry, bytes: &[u8]) -> La
     }
 }
 
-/// The server launcher URL for a pinned loader profile. Fabric and Quilt
-/// publish it beside the profile; it is derived from the catalog's URL so no
-/// endpoint is hard-coded here.
-fn server_launcher_url(profile_url: &str) -> LauncherResult<String> {
-    let base = profile_url
-        .strip_suffix("/profile/json")
-        .ok_or_else(|| LauncherError::Generic {
-            code: "ERR_EXPORT_LOADER_URL".into(),
-            message: format!(
-                "Cannot derive a server launcher URL from the pinned profile URL {profile_url}."
-            ),
-        })?;
-    Ok(format!("{base}/server/jar"))
-}
-
 // ---------------------------------------------------------------------------
 // Start scripts, EULA and README
 // ---------------------------------------------------------------------------
@@ -946,34 +1108,58 @@ fn start_scripts(
     let gc_args = generate_args_for_java(gc_profile, heap_mb, "", java_major);
     let sh = format!(
         "#!/usr/bin/env sh\n# Agora server export for {loader}. Java {java_major} or newer is required.\n# Accept the Minecraft EULA in eula.txt before the first start.\ncd \"$(dirname \"$0\")\"\nJAVA_BIN=\"${{JAVA:-java}}\"\n{}\n",
-        shell_body(plan, &gc_args, java_major)
+        shell_body(plan, &gc_args)
     );
     let bat = format!(
         "@echo off\r\nrem Agora server export for {loader}. Java {java_major} or newer is required.\r\nrem Accept the Minecraft EULA in eula.txt before the first start.\r\ncd /d \"%~dp0\"\r\nif \"%JAVA%\"==\"\" set \"JAVA=java\"\r\n{}\r\n",
-        batch_body(plan, &gc_args, java_major)
+        batch_body(plan, &gc_args)
     );
     (sh, bat)
 }
 
-fn shell_body(plan: &LauncherPlan, gc_args: &str, _java_major: u32) -> String {
+fn shell_body(plan: &LauncherPlan, gc_args: &str) -> String {
     match plan {
         LauncherPlan::LauncherJar { file } => {
             format!("exec \"$JAVA_BIN\" {gc_args} -jar {file} nogui")
         }
-        LauncherPlan::InstallerThenRun { installer } => format!(
-            "if [ ! -f run.sh ]; then\n  \"$JAVA_BIN\" -jar {installer} --installServer || exit 1\nfi\nexec bash ./run.sh nogui"
-        ),
+        LauncherPlan::InstallerThenRun {
+            installer,
+            args,
+            runner,
+        } => {
+            let install = format!("\"$JAVA_BIN\" -jar {installer} {}", args.join(" "));
+            match runner {
+                InstallerRunner::RunScript => format!(
+                    "if [ ! -f run.sh ]; then\n  {install} || exit 1\nfi\nexec bash ./run.sh nogui"
+                ),
+                InstallerRunner::LauncherJar { file } => format!(
+                    "if [ ! -f {file} ]; then\n  {install} || exit 1\nfi\nexec \"$JAVA_BIN\" {gc_args} -jar {file} nogui"
+                ),
+            }
+        }
     }
 }
 
-fn batch_body(plan: &LauncherPlan, gc_args: &str, _java_major: u32) -> String {
+fn batch_body(plan: &LauncherPlan, gc_args: &str) -> String {
     match plan {
         LauncherPlan::LauncherJar { file } => {
             format!("\"%JAVA%\" {gc_args} -jar {file} nogui")
         }
-        LauncherPlan::InstallerThenRun { installer } => format!(
-            "if not exist run.bat (\r\n  \"%JAVA%\" -jar {installer} --installServer\r\n  if errorlevel 1 exit /b 1\r\n)\r\ncall run.bat nogui"
-        ),
+        LauncherPlan::InstallerThenRun {
+            installer,
+            args,
+            runner,
+        } => {
+            let install = format!("\"%JAVA%\" -jar {installer} {}", args.join(" "));
+            match runner {
+                InstallerRunner::RunScript => format!(
+                    "if not exist run.bat (\r\n  {install}\r\n  if errorlevel 1 exit /b 1\r\n)\r\ncall run.bat nogui"
+                ),
+                InstallerRunner::LauncherJar { file } => format!(
+                    "if not exist {file} (\r\n  {install}\r\n  if errorlevel 1 exit /b 1\r\n)\r\n\"%JAVA%\" {gc_args} -jar {file} nogui"
+                ),
+            }
+        }
     }
 }
 
@@ -1052,10 +1238,18 @@ fn write_readme(dest_dir: &Path, info: &ReadmeInfo<'_>) -> LauncherResult<()> {
         text.push_str(
             "\nThis folder has no server launcher and no start script. The instance has no Minecraft version, so there was nothing to download; set the instance's game version and export again.\n",
         );
-    } else if let LauncherPlan::InstallerThenRun { installer } = info.plan {
-        text.push_str(&format!(
-            "\nThe first start runs the verified installer {installer} (--installServer). It needs Java and downloads the loader's libraries; later starts reuse them. Memory and GC flags are in user_jvm_args.txt.\n"
-        ));
+    } else if let LauncherPlan::InstallerThenRun {
+        installer, runner, ..
+    } = info.plan
+    {
+        match runner {
+            InstallerRunner::RunScript => text.push_str(&format!(
+                "\nThe first start runs the verified installer {installer} (--installServer). It needs Java and downloads the loader's libraries; later starts reuse them. Memory and GC flags are in user_jvm_args.txt.\n"
+            )),
+            InstallerRunner::LauncherJar { file } => text.push_str(&format!(
+                "\nThe first start runs the verified installer {installer} in server mode and writes {file}; it downloads the loader's libraries and the Minecraft server jar. Later starts reuse them. Memory and GC flags are in the start script.\n"
+            )),
+        }
     }
     if !info.notes.is_empty() {
         text.push_str("\nNotes\n-----\n");
@@ -1408,6 +1602,8 @@ side = "CLIENT"
         let (sh, bat) = start_scripts(
             &LauncherPlan::InstallerThenRun {
                 installer: "forge-installer.jar".into(),
+                args: vec!["--installServer".into()],
+                runner: InstallerRunner::RunScript,
             },
             2048,
             GcProfile::HighEfficiency,
@@ -1444,15 +1640,114 @@ side = "CLIENT"
     }
 
     #[test]
-    fn the_server_launcher_url_is_derived_not_hard_coded() {
+    fn the_official_installer_commands_match_the_documented_flags() {
         assert_eq!(
-            server_launcher_url(
-                "https://meta.example.test/v2/versions/loader/1.21/0.16.0/profile/json"
-            )
-            .unwrap(),
-            "https://meta.example.test/v2/versions/loader/1.21/0.16.0/server/jar"
+            fabric_installer_server_args("1.21", "0.16.0"),
+            vec![
+                "server",
+                "-dir",
+                ".",
+                "-mcversion",
+                "1.21",
+                "-loader",
+                "0.16.0",
+                "-downloadMinecraft",
+            ]
         );
-        assert!(server_launcher_url("https://meta.example.test/unexpected").is_err());
+        assert_eq!(
+            quilt_installer_server_args("1.21", "0.27.0"),
+            vec![
+                "install",
+                "server",
+                "1.21",
+                "0.27.0",
+                "--install-dir=.",
+                "--download-server",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fabric_installer_script_installs_once_then_runs_the_launcher_jar() {
+        let (sh, bat) = start_scripts(
+            &LauncherPlan::InstallerThenRun {
+                installer: "fabric-installer.jar".into(),
+                args: fabric_installer_server_args("1.21", "0.16.0"),
+                runner: InstallerRunner::LauncherJar {
+                    file: "fabric-server-launch.jar".into(),
+                },
+            },
+            4096,
+            GcProfile::HighEfficiency,
+            21,
+            "fabric",
+        );
+        assert!(
+            sh.contains("server -dir . -mcversion 1.21 -loader 0.16.0 -downloadMinecraft"),
+            "{sh}"
+        );
+        assert!(sh.contains("fabric-server-launch.jar"), "{sh}");
+        assert!(sh.contains("-Xmx4096M"), "{sh}");
+        assert!(sh.contains("if [ ! -f fabric-server-launch.jar ]"), "{sh}");
+        assert!(bat.contains("-mcversion 1.21"), "{bat}");
+        assert!(bat.contains("fabric-server-launch.jar"), "{bat}");
+        assert!(!sh.contains("user_jvm_args.txt"), "{sh}");
+    }
+
+    #[test]
+    fn maven_metadata_names_the_release_then_latest_then_last_version() {
+        let xml = "<metadata><versioning><latest>9.9</latest><release>1.1.2</release>\
+                   <versions><version>1.0.0</version><version>1.1.2</version></versions>\
+                   </versioning></metadata>";
+        assert_eq!(parse_maven_metadata_latest(xml).unwrap(), "1.1.2");
+
+        let xml = "<metadata><versioning><latest>0.15.1</latest>\
+                   <versions><version>0.14.1</version><version>0.15.1</version></versions>\
+                   </versioning></metadata>";
+        assert_eq!(parse_maven_metadata_latest(xml).unwrap(), "0.15.1");
+
+        let xml = "<metadata><versioning><versions><version>0.14.1</version>\
+                   <version>0.15.1</version></versions></versioning></metadata>";
+        assert_eq!(parse_maven_metadata_latest(xml).unwrap(), "0.15.1");
+
+        assert!(parse_maven_metadata_latest("<metadata/>").is_err());
+    }
+
+    #[test]
+    fn the_published_sha512_is_parsed_and_checked() {
+        let digest = core_api::download::sha512_hex(b"installer bytes");
+        assert_eq!(
+            parse_published_hash(&format!("{digest}  fabric-installer.jar\n")).unwrap(),
+            digest
+        );
+        assert_eq!(
+            parse_published_hash(&format!("sha512:{digest}")).unwrap(),
+            digest
+        );
+
+        let verified = verify_published_hash(
+            b"installer bytes",
+            Some(&digest),
+            "fabric-installer.jar",
+            false,
+        )
+        .unwrap();
+        assert!(verified);
+
+        assert!(matches!(
+            verify_published_hash(b"other bytes", Some(&digest), "fabric-installer.jar", false),
+            Err(LauncherError::HashMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_missing_hash_file_refuses_unless_unverified_downloads_are_allowed() {
+        let error = verify_published_hash(b"installer bytes", None, "fabric-installer.jar", false)
+            .unwrap_err();
+        assert!(error.to_string().contains("No .sha512"), "{error}");
+        assert!(
+            !verify_published_hash(b"installer bytes", None, "fabric-installer.jar", true).unwrap()
+        );
     }
 
     fn loader_entry(file_type: &str, source_url: &str, sha256: &str) -> LoaderEntry {
@@ -1472,21 +1767,11 @@ side = "CLIENT"
     }
 
     #[test]
-    fn an_unverified_fabric_launcher_is_refused_before_any_file_is_written() {
-        let tmp = TempDir::new().unwrap();
-        let dest = tmp.path().join("server");
-        let error = preflight_loader("fabric", "1.21", "", false).unwrap_err();
-        assert!(error.to_string().contains("cannot be verified"), "{error}");
-        assert!(!dest.exists());
-        preflight_loader("fabric", "1.21", "", true).unwrap();
-    }
-
-    #[test]
     fn an_unknown_loader_is_refused_and_a_missing_pin_is_named() {
-        let error = preflight_loader("sand", "1.21", "", false).unwrap_err();
+        let error = preflight_loader("sand", "1.21", "").unwrap_err();
         assert!(error.to_string().contains("no server export"), "{error}");
 
-        let error = preflight_loader("forge", "1.21", "0.0.0", false).unwrap_err();
+        let error = preflight_loader("forge", "1.21", "0.0.0").unwrap_err();
         assert!(
             error
                 .to_string()
