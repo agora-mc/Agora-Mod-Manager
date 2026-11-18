@@ -130,8 +130,15 @@ The Rust desktop build embeds selected public configuration at compile time. A `
 | --- | --- | --- |
 | `AGORA_OAUTH_CLIENT_ID` | Public GitHub application client ID used by the governance device flow | No |
 | `AGORA_REGISTRY_PUBKEY` | Public Ed25519 key used to verify downloaded catalog signatures | No |
+| `AGORA_REGISTRY_PUBKEYS` | Comma-separated trusted catalog keys (first primary, rest recovery); takes precedence over `AGORA_REGISTRY_PUBKEY` | No |
 | `AGORA_REGISTRY_REPO` | Catalog repository in `owner/repo` form | No |
 | `VITE_AGORA_REPOSITORY` | Repository used by desktop frontend links | No |
+
+The compiler also reads `AGORA_REGISTRY_VALIDITY_DAYS` (catalog expiry, default 90),
+`AGORA_REGISTRY_TAG`, `AGORA_REGISTRY_KEY_CERTIFICATES` (a recovery-signed
+rotation certificate file), and `AGORA_REGISTRY_REVOCATIONS` (a recovery-signed
+revocation statement file). See
+[RELEASING.md](RELEASING.md#catalog-signing-rotation-and-expiry).
 
 The matching `ED25519_PRIVATE_KEY`, GitHub tokens, updater signing key, and webhook URLs are secrets. They belong only in the intended protected environment and must never be copied into documentation or screenshots. GitHub device flow does not require embedding a client secret in the native app.
 

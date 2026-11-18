@@ -79,33 +79,16 @@ fn io_error(message: impl Into<String>) -> LauncherError {
 // Trust anchor
 // ---------------------------------------------------------------------------
 
-/// Which key the registry must be signed with.
+/// Which keys the registry may be signed with.
 ///
-/// Production code uses [`RegistryTrust::production`], the key compiled into
-/// the app. [`RegistryTrust::with_key`] exists so tests can sign a registry of
-/// their own; no setting or environment variable reaches it.
-#[derive(Debug, Clone, Default)]
-pub struct RegistryTrust {
-    key_hex: Option<String>,
-}
+/// Production code uses [`RegistryTrust::production`], the key list compiled
+/// into the app. [`RegistryTrust::with_key`] exists so tests can sign a catalog
+/// of their own; no setting or environment variable reaches it.
+pub use crate::registry_bundle::RegistryTrust;
 
 impl RegistryTrust {
-    pub fn production() -> Self {
-        Self { key_hex: None }
-    }
-
-    /// Test support: trust this Ed25519 public key (hex) instead.
-    pub fn with_key(key_hex: impl Into<String>) -> Self {
-        Self {
-            key_hex: Some(key_hex.into()),
-        }
-    }
-
     fn open(&self, app_data_dir: &Path) -> LauncherResult<crate::registry_sync::VerifiedRegistry> {
-        match &self.key_hex {
-            None => crate::registry_sync::open_verified_registry(app_data_dir),
-            Some(key) => crate::registry_sync::open_verified_registry_with_key(app_data_dir, key),
-        }
+        crate::registry_sync::open_verified_registry_with_trust(app_data_dir, self)
     }
 }
 
@@ -1217,16 +1200,30 @@ impl PluginService {
     }
 
     /// The signed catalog, or the reason there is not one. Never an empty fallback.
+    ///
+    /// Installs, updates and rollbacks take URLs and hashes from this catalog,
+    /// so they require a catalog that is not past its signed expiry.
     fn signed_catalog(&self) -> LauncherResult<OfficialCatalog> {
-        load_signed_catalog(&self.inner.registry_trust, self.inner.ctx.paths.root()).map_err(|e| {
+        let registry = self
+            .inner
+            .registry_trust
+            .open(self.inner.ctx.paths.root())
+            .map_err(|e| {
+                refused(
+                    "ERR_OFFICIAL_PLUGIN_CATALOG",
+                    format!(
+                        "Official plugins are unavailable: {}",
+                        unavailable_reason(&e)
+                    ),
+                )
+            })?;
+        registry.require_fresh().map_err(|e| {
             refused(
                 "ERR_OFFICIAL_PLUGIN_CATALOG",
-                format!(
-                    "Official plugins are unavailable: {}",
-                    unavailable_reason(&e)
-                ),
+                format!("Official plugins are unavailable: {e}"),
             )
-        })
+        })?;
+        OfficialCatalog::read(registry.connection())
     }
 
     /// Version of the live (non-tombstone) install under this id, if any.

@@ -231,7 +231,21 @@ impl RegistryService {
     }
 
     /// Open a read-only connection to the resolved registry database.
+    ///
+    /// The catalog is verified in this call. A debug-only `AGORA_DEV_REGISTRY_DB`
+    /// override is an explicit developer choice and is opened unsigned, as before.
     pub fn connection(&self) -> LauncherResult<rusqlite::Connection> {
+        #[cfg(debug_assertions)]
+        if self.development_registry_active() {
+            return self.connection_unverified();
+        }
+        self.ctx.registry_connection()
+    }
+
+    /// An unsigned connection to the resolved path. Only the debug-only dev
+    /// override reaches this.
+    #[cfg(debug_assertions)]
+    fn connection_unverified(&self) -> LauncherResult<rusqlite::Connection> {
         let path = self.resolve_db_path()?;
         if !path.exists() {
             return Err(LauncherError::RegistryMissing);
@@ -265,7 +279,11 @@ impl RegistryService {
         if self.development_registry_active() {
             return get_game_item(&self.connection()?, item_id);
         }
-        let registry = crate::registry_sync::open_verified_registry(self.ctx.paths.root())?;
+        let registry = crate::registry_sync::open_verified_registry_with_trust(
+            self.ctx.paths.root(),
+            &self.ctx.registry_trust,
+        )?;
+        registry.require_fresh()?;
         get_game_item(registry.connection(), item_id)
     }
 
@@ -279,10 +297,11 @@ impl RegistryService {
         item_id: &str,
         pubkey_hex: &str,
     ) -> LauncherResult<Option<GameCatalogItem>> {
-        let registry = crate::registry_sync::open_verified_registry_with_key(
+        let registry = crate::registry_sync::open_verified_registry_with_trust(
             self.ctx.paths.root(),
-            pubkey_hex,
+            &crate::registry_bundle::RegistryTrust::with_key(pubkey_hex),
         )?;
+        registry.require_fresh()?;
         get_game_item(registry.connection(), item_id)
     }
 
@@ -4534,6 +4553,7 @@ mod game_catalog_tests {
     #[test]
     fn a_catalog_install_refuses_a_registry_tampered_after_verification() {
         use ed25519_dalek::{Signer, SigningKey};
+        use sha2::Digest;
 
         let dir = tempfile::tempdir().unwrap();
         let ctx = Ctx::for_testing(dir.path().to_owned());
@@ -4556,8 +4576,27 @@ mod game_catalog_tests {
         }
         let key = SigningKey::from_bytes(&[9u8; 32]);
         let public = hex::encode(key.verifying_key().to_bytes());
-        let signature = key.sign(&std::fs::read(&db_path).unwrap()).to_bytes();
-        std::fs::write(ctx.paths.registry_signature(), signature).unwrap();
+        let payload = std::fs::read(&db_path).unwrap();
+        let header = crate::registry_bundle::CatalogHeader {
+            format: crate::registry_bundle::BUNDLE_FORMAT,
+            key_id: crate::registry_bundle::key_id_for_public_key(&public),
+            schema_version: 10,
+            tag: "registry-test".into(),
+            built_at: "2026-11-16T12:00:00+00:00".into(),
+            issued_at: "2026-11-16T12:00:00+00:00".into(),
+            expires_at: "2099-01-01T00:00:00+00:00".into(),
+            db_len: payload.len() as u64,
+            db_sha256: hex::encode(sha2::Sha256::digest(&payload)),
+            certificates: Vec::new(),
+            revocations: Vec::new(),
+        };
+        let header_bytes = crate::registry_bundle::header_bytes(&header);
+        let signature = key
+            .sign(&crate::registry_bundle::header_signing_bytes(&header_bytes))
+            .to_bytes();
+        let bundle = crate::registry_bundle::encode_bundle(&header_bytes, &signature, &payload);
+        let bundle_path = ctx.paths.registry_bundle();
+        std::fs::write(&bundle_path, &bundle).unwrap();
 
         let svc = RegistryService::new(ctx.clone());
         let item = svc
@@ -4566,7 +4605,9 @@ mod game_catalog_tests {
             .expect("the signed registry has the entry");
         assert_eq!(item.source_identifier, "owner/repo");
 
-        // The startup check saw the good bytes. Now swap the entry a later reader would see.
+        // The readable database is changed after verification. The install must
+        // either refuse or re-extract the signed bytes; it must not read the
+        // attacker's entry.
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
             "UPDATE game_catalog_items
@@ -4577,10 +4618,24 @@ mod game_catalog_tests {
         .unwrap();
         drop(conn);
 
+        match svc.get_game_item_for_install_with_key("crash-logger", &public) {
+            Ok(Some(item)) => assert_eq!(
+                item.source_identifier, "owner/repo",
+                "the readable database was replaced, but the signed payload must win"
+            ),
+            Err(_) => {}
+            Ok(None) => panic!("the signed payload still has the entry"),
+        }
+
+        // A changed bundle cannot verify at all.
+        let mut tampered = bundle;
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+        std::fs::write(&bundle_path, tampered).unwrap();
         assert!(
             svc.get_game_item_for_install_with_key("crash-logger", &public)
                 .is_err(),
-            "an install must not read a registry whose signature no longer matches"
+            "an install must not read a bundle whose signature no longer matches"
         );
     }
 }

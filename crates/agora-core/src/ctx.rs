@@ -110,6 +110,9 @@ pub struct CoreContext {
     pub process_session_manager: ProcessSessionManager,
     /// Registry of supported games and their packages.
     pub games: Arc<crate::game_registry::GameRegistry>,
+    /// The keys this context trusts for the signed catalog, and (in tests) the
+    /// debug-only permission to open an unsigned cache.
+    pub registry_trust: crate::registry_bundle::RegistryTrust,
 }
 
 /// The main context type alias — use `Ctx` throughout the codebase.
@@ -448,9 +451,17 @@ impl CoreContext {
         //    download URL and expected hash the launcher trusts. A failing db is
         //    quarantined here, which also leaves no `registry.db` behind so the
         //    next sync re-downloads a good copy.
-        let registry_trusted = match crate::registry_sync::verify_cached_registry(paths.root()) {
+        let registry_trusted = match crate::registry_sync::verify_cached_registry_with_trust(
+            paths.root(),
+            &registry_trust,
+        ) {
             crate::registry_sync::CachedRegistryIntegrity::Verified => true,
             crate::registry_sync::CachedRegistryIntegrity::Absent => false,
+            crate::registry_sync::CachedRegistryIntegrity::Stale(reason)
+            | crate::registry_sync::CachedRegistryIntegrity::Recovered(reason) => {
+                warnings.push(reason);
+                true
+            }
             crate::registry_sync::CachedRegistryIntegrity::Quarantined(reason)
             | crate::registry_sync::CachedRegistryIntegrity::Error(reason) => {
                 warnings.push(reason);
@@ -461,11 +472,14 @@ impl CoreContext {
         //    Then validate the cached registry schema version (warning only —
         //    the cached db may be absent or stale, which is recoverable). A db
         //    that failed verification is not opened at all.
-        let reg_path = paths.registry_db();
         let mut registry_conn = None;
-        if registry_trusted && reg_path.exists() {
-            match crate::db::registry_connection(&reg_path) {
-                Ok(conn) => {
+        if registry_trusted {
+            match crate::registry_sync::open_verified_registry_with_trust(
+                paths.root(),
+                &registry_trust,
+            ) {
+                Ok(registry) => {
+                    let conn = registry.into_connection();
                     let version: Result<i64, _> = conn.query_row(
                         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
                         [],
@@ -564,6 +578,7 @@ impl CoreContext {
             task_scheduler: TaskScheduler::default(),
             process_session_manager: ProcessSessionManager::new(),
             games,
+            registry_trust: registry_trust.clone(),
         };
         ctx.extensions.insert(behaviour_runtime);
 
@@ -612,6 +627,7 @@ impl CoreContext {
             task_scheduler: TaskScheduler::default(),
             process_session_manager: ProcessSessionManager::new(),
             games: Arc::new(crate::game_registry::GameRegistry::empty()),
+            registry_trust: crate::registry_bundle::RegistryTrust::unverified_debug(),
         }
     }
 
@@ -659,14 +675,13 @@ impl CoreContext {
     /// reported as warnings too, leaving the active catalogs in place. An error
     /// means a package's catalogs parsed but could not be activated.
     pub fn reload_game_catalogs(&self) -> LauncherResult<Vec<String>> {
-        let reg_path = self.paths.registry_db();
-        if !reg_path.exists() {
-            return Ok(vec![
-                "No registry database found; runtime catalog unchanged".into(),
-            ]);
-        }
-        let conn = match crate::db::registry_connection(&reg_path) {
+        let conn = match self.registry_connection() {
             Ok(conn) => conn,
+            Err(LauncherError::RegistryMissing) => {
+                return Ok(vec![
+                    "No registry database found; runtime catalog unchanged".into(),
+                ]);
+            }
             Err(e) => {
                 return Ok(vec![format!(
                     "Cannot open registry database; runtime catalog unchanged: {e}"
@@ -685,6 +700,36 @@ impl CoreContext {
     }
 
     /// The path model reference.
+    /// Open the cached catalog only after its signed bundle verified.
+    ///
+    /// This is the one opener every core and game-package reader should use;
+    /// `db::registry_connection` takes a bare path and cannot tell whether the
+    /// bytes beside it were verified.
+    pub fn registry_connection(&self) -> LauncherResult<rusqlite::Connection> {
+        crate::registry_sync::open_verified_registry_with_trust(
+            self.paths.root(),
+            &self.registry_trust,
+        )
+        .map(crate::registry_sync::VerifiedRegistry::into_connection)
+    }
+
+    /// Like [`Self::registry_connection`], but refuses a catalog past its signed
+    /// expiry. Use this for anything that downloads or replaces software from
+    /// catalog-provided URLs and hashes.
+    pub fn registry_connection_fresh(&self) -> LauncherResult<rusqlite::Connection> {
+        let registry = crate::registry_sync::open_verified_registry_with_trust(
+            self.paths.root(),
+            &self.registry_trust,
+        )?;
+        registry.require_fresh()?;
+        Ok(registry.into_connection())
+    }
+
+    /// The verified catalog's digest, or `None` when there is no catalog.
+    pub fn registry_digest(&self) -> LauncherResult<Option<String>> {
+        crate::registry_sync::verified_registry_digest(self.paths.root(), &self.registry_trust)
+    }
+
     pub fn paths(&self) -> &AppPaths {
         &self.paths
     }

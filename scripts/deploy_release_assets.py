@@ -13,6 +13,7 @@ Requires:
     GITHUB_REPOSITORY — Repo slug in owner/repo format (set automatically in Actions)
     registry.db       — The compiled database file (in the working directory)
     registry.db.sig   — The Ed25519 signature file (in the working directory)
+    registry.bundle   — The signed catalog bundle the launcher installs
     registry-web.json — The web registry export (in the working directory)
     registry-web.json.sig — The web export signature (in the working directory)
 """
@@ -34,6 +35,7 @@ logger = logging.getLogger("deploy_release_assets")
 API_BASE = "https://api.github.com"
 MAX_RELEASES_TO_KEEP = 7
 RELEASE_ASSETS = (
+    Path("registry.bundle"),
     Path("registry.db"),
     Path("registry.db.sig"),
     Path("registry-web.json"),

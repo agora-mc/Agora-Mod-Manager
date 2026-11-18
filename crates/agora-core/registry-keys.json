@@ -1,0 +1,10 @@
+[
+  {
+    "role": "primary",
+    "public_key_hex": "47adee76cf587ee618f79eb2fa5bde003824d3bfc2dbb5080d33073c5a8f8c18"
+  },
+  {
+    "role": "recovery",
+    "public_key_hex": "REPLACE_WITH_OFFLINE_RECOVERY_PUBLIC_KEY"
+  }
+]

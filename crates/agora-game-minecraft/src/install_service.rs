@@ -904,18 +904,10 @@ impl InstallService {
     }
 
     fn compute_registry_revision(&self) -> LauncherResult<String> {
-        let path = self.ctx.paths.registry_db();
-        if !path.is_file() {
-            return Ok("registry-unavailable".into());
-        }
-        let bytes = std::fs::read(&path).map_err(|e| LauncherError::Generic {
-            code: "ERR_REGISTRY_READ".into(),
-            message: format!("Could not read registry: {e}"),
-        })?;
-        use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(bytes);
-        Ok(format!("{:x}", hasher.finalize()))
+        Ok(self
+            .ctx
+            .registry_digest()?
+            .unwrap_or_else(|| "registry-unavailable".into()))
     }
 }
 

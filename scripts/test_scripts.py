@@ -9,16 +9,19 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
 import urllib.error
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "compiler"))
 
 import build_loot_wasm
 import build_official_plugin as bop
@@ -31,9 +34,20 @@ import refresh_loader_manifests
 import validate_loader_catalog_delta
 import build_docs_web as bdw
 import check_package_docs as cpd
+import check_registry_keys as crk
+import generate_registry_key as grk
+import make_registry_key_certificate as mk
+import make_registry_revocation as mr
 import pin_hashes
 import stage_cli_sidecar
 import stage_vfs_files
+import compile as registry_compiler
+
+try:
+    import nacl.encoding
+    import nacl.signing
+except ImportError:  # pragma: no cover - the compiler gate installs requirements.txt
+    nacl = None  # type: ignore
 
 
 def _response(read_side_effect=None, read_value=b"data"):
@@ -4224,6 +4238,162 @@ class TestGenAddrlibNames(unittest.TestCase):
             root.mkdir()
             with self.assertRaises(gan.GenerationError):
                 gan.generate(root, Path(temporary) / "names.js")
+
+
+@unittest.skipUnless(nacl is not None, "PyNaCl is required to sign a test statement")
+class TestRecoverySignedStatements(unittest.TestCase):
+    def test_a_certificate_carries_and_signs_its_role(self):
+        recovery = nacl.signing.SigningKey(bytes([7]) * 32)
+        new = nacl.signing.SigningKey(bytes([8]) * 32)
+        new_public = new.verify_key.encode(encoder=nacl.encoding.RawEncoder)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "cert.json"
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "make_registry_key_certificate.py",
+                    "--new-public-key",
+                    new_public.hex(),
+                    "--role",
+                    "recovery",
+                    "--signing-key",
+                    bytes(recovery).hex(),
+                    "--out",
+                    str(out),
+                ],
+            ):
+                self.assertEqual(mk.main(), 0)
+            certificate = json.loads(out.read_text(encoding="utf-8"))[0]
+            self.assertEqual(certificate["role"], "recovery")
+            message = (
+                mk.CERT_DOMAIN
+                + certificate["key_id"].encode()
+                + b"\n"
+                + certificate["public_key"].encode()
+                + b"\n"
+                + b"recovery"
+                + b"\n"
+                + certificate["signed_by"].encode()
+            )
+            recovery.verify_key.verify(
+                message, bytes.fromhex(certificate["signature"])
+            )
+
+    def test_a_revocation_is_signed_by_the_recovery_key(self):
+        recovery = nacl.signing.SigningKey(bytes([9]) * 32)
+        revoked = nacl.signing.SigningKey(bytes([10]) * 32)
+        revoked_public = revoked.verify_key.encode(encoder=nacl.encoding.RawEncoder)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "revoke.json"
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "make_registry_revocation.py",
+                    "--revoked-public-key",
+                    revoked_public.hex(),
+                    "--signing-key",
+                    bytes(recovery).hex(),
+                    "--out",
+                    str(out),
+                ],
+            ):
+                self.assertEqual(mr.main(), 0)
+            statement = json.loads(out.read_text(encoding="utf-8"))[0]
+            recovery.verify_key.verify(
+                mr.REVOKE_DOMAIN
+                + statement["revoked_key_id"].encode()
+                + b"\n"
+                + statement["signed_by"].encode(),
+                bytes.fromhex(statement["signature"]),
+            )
+
+    def test_a_recovery_key_may_not_revoke_itself(self):
+        recovery = nacl.signing.SigningKey(bytes([11]) * 32)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "revoke.json"
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "make_registry_revocation.py",
+                    "--revoked-public-key",
+                    recovery.verify_key.encode(encoder=nacl.encoding.RawEncoder).hex(),
+                    "--signing-key",
+                    bytes(recovery).hex(),
+                    "--out",
+                    str(out),
+                ],
+            ):
+                self.assertEqual(mr.main(), 1)
+            self.assertFalse(out.exists())
+
+
+@unittest.skipUnless(nacl is not None, "PyNaCl is required to sign a test bundle")
+class TestCatalogBundle(unittest.TestCase):
+    def test_a_signed_bundle_carries_the_key_id_and_payload_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "registry.db"
+            conn = sqlite3.connect(str(db_path))
+            conn.execute(
+                "CREATE TABLE system_config (key TEXT PRIMARY KEY, value_json TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO system_config (key, value_json) VALUES ('built_at', ?)",
+                ['"2026-11-16T12:00:00+00:00"'],
+            )
+            conn.commit()
+            conn.close()
+            db_bytes = db_path.read_bytes()
+            seed = b"" * 32
+            signing = nacl.signing.SigningKey(seed)
+            public = signing.verify_key.encode(encoder=nacl.encoding.RawEncoder)
+            expected_id = hashlib.sha256(public).hexdigest()[:16]
+
+            with mock.patch.dict(
+                os.environ,
+                {"ED25519_PRIVATE_KEY": seed.hex(), "AGORA_REGISTRY_VALIDITY_DAYS": "30"},
+                clear=False,
+            ):
+                bundle = registry_compiler.build_catalog_bundle(
+                    db_path, db_bytes, skip_sign=False
+                )
+
+            magic = b"AGORA-CATALOG-V1"
+            self.assertTrue(bundle.startswith(magic))
+            header_len = int.from_bytes(bundle[len(magic):len(magic) + 4], "little")
+            header_start = len(magic) + 4
+            header = json.loads(
+                bundle[header_start:header_start + header_len].decode("utf-8")
+            )
+            signature = bundle[header_start + header_len:header_start + header_len + 64]
+            payload = bundle[header_start + header_len + 64:]
+
+            self.assertEqual(header["key_id"], expected_id)
+            self.assertEqual(header["built_at"], "2026-11-16T12:00:00+00:00")
+            self.assertEqual(header["db_len"], len(db_bytes))
+            self.assertEqual(header["db_sha256"], hashlib.sha256(db_bytes).hexdigest())
+            self.assertEqual(payload, db_bytes)
+            signing.verify_key.verify(
+                b"AGORA-CATALOG-HEADER-V1\n"
+                + bundle[header_start:header_start + header_len],
+                signature,
+            )
+            issued = datetime.fromisoformat(header["issued_at"])
+            expires = datetime.fromisoformat(header["expires_at"])
+            self.assertEqual((expires - issued).days, 30)
+
+    def test_an_empty_input_is_not_a_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "empty.db"
+            with mock.patch.dict(
+                os.environ, {"ED25519_PRIVATE_KEY": ""}, clear=False
+            ):
+                with self.assertRaises(RuntimeError):
+                    registry_compiler.build_catalog_bundle(
+                        db_path, b"", skip_sign=False
+                    )
 
 
 if __name__ == "__main__":

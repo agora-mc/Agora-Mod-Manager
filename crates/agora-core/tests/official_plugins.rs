@@ -18,6 +18,7 @@ use agora_core::plugins::{
     Consent, NoopUiSink, OfficialCatalog, OfficialInstallState, OfficialStatus, PackageFetcher,
     PluginService, PluginStatus, RegistryTrust, UpdateOutcome, PLUGINS_EMERGENCY_STOP_SETTING,
 };
+use agora_core::registry_bundle::{self, CatalogHeader};
 use agora_game_api::{
     DeploymentStrategy, GameDefinition, GameId, PackageDefinition, StoreId, StoreIdentifier,
 };
@@ -303,12 +304,42 @@ fn write_registry(root: &Path, releases: &[Release], key: &SigningKey, sign: boo
 }
 
 fn sign_registry(root: &Path, key: &SigningKey, sign: bool) {
-    let sig = root.join("registry.db.sig");
-    let _ = std::fs::remove_file(&sig);
-    if sign {
-        let bytes = std::fs::read(root.join("registry.db")).unwrap();
-        std::fs::write(&sig, key.sign(&bytes).to_bytes()).unwrap();
-    }
+    let db = root.join("registry.db");
+    let payload = std::fs::read(&db).unwrap();
+    let public = hex::encode(key.verifying_key().to_bytes());
+    let header = CatalogHeader {
+        format: registry_bundle::BUNDLE_FORMAT,
+        key_id: registry_bundle::key_id_for_public_key(&public),
+        schema_version: 9,
+        tag: "registry-test".into(),
+        built_at: "2026-11-16T12:00:00+00:00".into(),
+        issued_at: "2026-11-16T12:00:00+00:00".into(),
+        expires_at: "2099-01-01T00:00:00+00:00".into(),
+        db_len: payload.len() as u64,
+        db_sha256: hex::encode(Sha256::digest(&payload)),
+        certificates: Vec::new(),
+        revocations: Vec::new(),
+    };
+    let header_bytes = registry_bundle::header_bytes(&header);
+    let signature = if sign {
+        key.sign(&registry_bundle::header_signing_bytes(&header_bytes))
+            .to_bytes()
+    } else {
+        [0u8; 64]
+    };
+    let bundle = registry_bundle::encode_bundle(&header_bytes, &signature, &payload);
+    std::fs::write(root.join("registry.bundle"), bundle).unwrap();
+    let _ = std::fs::remove_file(root.join("registry.db.sig"));
+}
+
+/// Break the signature area of the signed bundle without changing its length.
+fn corrupt_registry_bundle(root: &Path) {
+    let path = root.join("registry.bundle");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let header_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+    let signature_last = 20 + header_len + 63;
+    bytes[signature_last] ^= 0xff;
+    std::fs::write(&path, bytes).unwrap();
 }
 
 #[derive(Default)]
@@ -428,22 +459,8 @@ impl World {
     /// registry fails and gets quarantined for. The files are put back afterwards so a test can
     /// keep using them; the official check at startup has already run against the test key.
     fn start(&self) -> (CoreContext, Vec<String>) {
-        let db = self.paths().registry_db();
-        let sig = self.paths().registry_signature();
-        let saved = (std::fs::read(&db).ok(), std::fs::read(&sig).ok());
-        let started = CoreContext::initialize_with_registry_trust(
-            self.paths(),
-            GameRegistry::builder(),
-            trust(),
-        )
-        .unwrap();
-        for (path, bytes) in [(db, saved.0), (sig, saved.1)] {
-            let _ = std::fs::remove_file(&path);
-            if let Some(bytes) = bytes {
-                std::fs::write(&path, bytes).unwrap();
-            }
-        }
-        started
+        CoreContext::initialize_with_registry_trust(self.paths(), GameRegistry::builder(), trust())
+            .unwrap()
     }
 }
 
@@ -897,17 +914,11 @@ async fn an_unsigned_or_tampered_registry_offers_no_official_plugins() {
         .unavailable_reason
         .is_some());
 
-    // Tampered after signing: the package URL is swapped for another.
+    // Tampered after signing: the signed bundle no longer verifies.
     let world = World::new();
     world.fetcher.serve(&release()[0].url, zip.clone());
     write_registry(world.root(), &release(), &signing_key(), true);
-    let conn = rusqlite::Connection::open(world.root().join("registry.db")).unwrap();
-    conn.execute(
-        "UPDATE official_plugins SET package_url = 'https://evil.example/x.zip'",
-        [],
-    )
-    .unwrap();
-    drop(conn);
+    corrupt_registry_bundle(world.root());
     let list = world.service.official_plugins().unwrap();
     assert!(list.plugins.is_empty());
     assert!(list.unavailable_reason.is_some());
@@ -943,7 +954,7 @@ async fn an_installed_official_plugin_keeps_loading_when_the_registry_stops_veri
     );
 
     // Corrupt the signature.
-    std::fs::write(world.root().join("registry.db.sig"), [0u8; 64]).unwrap();
+    corrupt_registry_bundle(world.root());
 
     let OfficialStatus::CatalogUnavailable { reason } = world.status() else {
         panic!("without a verifiable registry it is not official");
@@ -2874,7 +2885,7 @@ async fn an_unverifiable_catalog_keeps_a_data_only_official_plugin_loading() {
             .unwrap(),
     );
 
-    std::fs::write(world.root().join("registry.db.sig"), [0u8; 64]).unwrap();
+    corrupt_registry_bundle(world.root());
     assert!(matches!(
         world.status(),
         OfficialStatus::CatalogUnavailable { .. }
@@ -2971,7 +2982,6 @@ async fn an_unverified_official_plugin_with_scripts_does_not_run_them() {
     .unwrap();
     drop(conn);
 
-    std::fs::write(world.root().join("registry.db.sig"), [0u8; 64]).unwrap();
     world.service.reload().unwrap();
     assert!(matches!(
         world.status(),
