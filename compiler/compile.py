@@ -31,6 +31,7 @@ import requests
 
 from governance import (
     COMMUNITY_REVIEW_LABEL,
+    GovernanceError,
     GovernanceMode,
     GovernancePolicy,
     REGISTRY_VOTE_LABEL,
@@ -3694,6 +3695,7 @@ def compile_registry(
     state_in_path: Path | None = None,
     state_out_path: Path | None = None,
     official_fetcher: Callable[[str], bytes] | None = _fetch_official_package,
+    allow_partial_governance: bool = False,
 ) -> None:
     """Build the SQLite registry database at *output_path*.
 
@@ -3704,6 +3706,16 @@ def compile_registry(
     global REGISTRY_DIR
     if registry_root:
         REGISTRY_DIR = Path(registry_root).resolve()
+    if not allow_partial_governance:
+        allow_partial_governance = os.environ.get(
+            "AGORA_GOVERNANCE_ALLOW_PARTIAL", ""
+        ).strip().lower() in {"1", "true", "yes"}
+    if allow_partial_governance:
+        logger.warning(
+            "Partial governance is allowed (--allow-partial-governance or "
+            "AGORA_GOVERNANCE_ALLOW_PARTIAL); a failed read will be logged "
+            "and skipped instead of stopping the compile."
+        )
     logger.info("Starting nightly compile")
 
     conn = sqlite3.connect(":memory:")
@@ -3855,6 +3867,7 @@ def compile_registry(
             governance_state_out_path=_gov_state_out,
             quarantine_decisions_path=_quarantine_path,
             discord_webhook_url=_discord_url,
+            allow_partial=allow_partial_governance,
         )
         logger.info(
             "Governance pipeline complete: mode=%s, policy=%s, results=%d items",
@@ -3863,7 +3876,10 @@ def compile_registry(
             len([k for k in _governance_results if not k.startswith("_")]),
         )
     else:
-        logger.info("GITHUB_TOKEN not set; governance pipeline skipped.")
+        raise GovernanceError(
+            "governance mode requires GITHUB_TOKEN; use --governance-mode off "
+            "for a catalog without governance data"
+        )
 
     # Enrich items with governance scores before insertion.
     for _path, data in all_items:
@@ -4350,6 +4366,13 @@ def main() -> None:
              "monitor (reads + state + Discord, no GitHub mutations). Default: off.",
     )
     parser.add_argument(
+        "--allow-partial-governance",
+        action="store_true",
+        help="Maintainer override: log and skip unreadable governance inputs or "
+             "failed GitHub reads instead of stopping the compile. Also enabled "
+             "by AGORA_GOVERNANCE_ALLOW_PARTIAL=1. Never use for a release build.",
+    )
+    parser.add_argument(
         "--governance-state-in",
         type=str,
         default=None,
@@ -4384,6 +4407,7 @@ def main() -> None:
         state_in_path=Path(args.governance_state_in) if args.governance_state_in else None,
         state_out_path=Path(args.governance_state_out) if args.governance_state_out else None,
         official_fetcher=None if args.skip_official_asset_check else _fetch_official_package,
+        allow_partial_governance=args.allow_partial_governance,
     )
 
 
