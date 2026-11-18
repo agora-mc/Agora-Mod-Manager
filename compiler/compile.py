@@ -4374,7 +4374,8 @@ def main() -> None:
         "--governance-state-in",
         type=str,
         default=None,
-        help="Path to input governance-state.json (optional; missing = fresh state)",
+        help="Path to input governance-state.json (omit for fresh state; a named "
+             "file that cannot be read stops the run)",
     )
     parser.add_argument(
         "--governance-state-out",
