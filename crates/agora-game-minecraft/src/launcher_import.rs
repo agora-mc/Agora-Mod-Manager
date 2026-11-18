@@ -880,16 +880,7 @@ fn parse_prism_settings(cfg: &HashMap<String, HashMap<String, String>>) -> Launc
         .get("jvmargs")
         .map(|args| {
             args.split_whitespace()
-                .filter(|arg| {
-                    !arg.starts_with("-Xmx")
-                        && !arg.starts_with("-Xms")
-                        && !arg.starts_with("-Xss")
-                        && !arg.starts_with("-cp")
-                        && !arg.starts_with("-classpath")
-                        && !arg.starts_with("-agentpath")
-                        && !arg.starts_with("-javaagent:")
-                        && !arg.starts_with("-Djava.library.path")
-                })
+                .filter(|arg| safe_jvm_argument(arg))
                 .map(|s| s.to_string())
                 .collect()
         })
@@ -1831,7 +1822,19 @@ fn read_modrinth_global_launch_settings(conn: &rusqlite::Connection) -> LaunchSe
     }
 }
 
-fn safe_jvm_argument(argument: &str) -> bool {
+/// Whether a JVM argument from another launcher may be carried over.
+///
+/// Refused are the options that run a program or load code the player did not
+/// choose, from the Oracle/Sun launcher's documented option set: `-agentlib`,
+/// `-agentpath`, `-javaagent`, `-Xrun` (the deprecated agent form),
+/// `-Xbootclasspath` (every `:`/`a:`/`p:` form), `-XX:OnError` and
+/// `-XX:OnOutOfMemoryError` (commands the VM runs), `-Djava.system.class.loader`
+/// (a class that becomes the system class loader), `-Djava.library.path`, and
+/// `@argfile` (an argument file read by the launcher itself). Memory and
+/// classpath options are Agora's to set, and token-like values are not carried
+/// from another launcher. Everything else is the player's and is kept.
+pub(crate) fn safe_jvm_argument(argument: &str) -> bool {
+    let lower = argument.to_ascii_lowercase();
     !argument.starts_with("-Xmx")
         && !argument.starts_with("-Xms")
         && !argument.starts_with("-cp")
@@ -1839,7 +1842,16 @@ fn safe_jvm_argument(argument: &str) -> bool {
         && !argument.starts_with("-agentpath")
         && !argument.starts_with("-agentlib")
         && !argument.starts_with("-javaagent")
+        && !argument.starts_with("-Xrun")
+        && !argument.starts_with("-Xbootclasspath")
+        && !argument.starts_with("-XX:OnError=")
+        && !argument.starts_with("-XX:OnOutOfMemoryError=")
         && !argument.starts_with("-Djava.library.path")
+        && !argument.starts_with("-Djava.system.class.loader")
+        && !argument.starts_with('@')
+        && !lower.contains("token")
+        && !lower.contains("password")
+        && !lower.contains("credential")
 }
 
 #[derive(Deserialize)]
@@ -2550,6 +2562,33 @@ mod tests {
             .iter()
             .any(|a| a.starts_with("-javaagent:")));
         assert!(settings.jvm_args.iter().any(|a| a == "-XX:+UseG1GC"));
+    }
+
+    #[test]
+    fn test_safe_jvm_argument_refuses_commands_and_code_loaders() {
+        for argument in [
+            "-XX:OnError=touch /tmp/pwned",
+            "-XX:OnOutOfMemoryError=touch /tmp/pwned",
+            "@args.txt",
+            "-Xbootclasspath:/tmp/evil.jar",
+            "-Xbootclasspath/a:/tmp/evil.jar",
+            "-Xbootclasspath/p:/tmp/evil.jar",
+            "-Djava.system.class.loader=evil.Loader",
+            "-javaagent:/tmp/evil.jar",
+            "-agentlib:jdwp=transport=dt_socket,server=y",
+            "-agentpath:/tmp/evil.so",
+            "-Xrunjdwp:transport=dt_socket",
+            "-cp",
+            "-classpath",
+            "-Xmx2G",
+            "-Xms1G",
+        ] {
+            assert!(!safe_jvm_argument(argument), "{argument} must be dropped");
+        }
+        for argument in ["-XX:+UseG1GC", "-Dfoo=bar"] {
+            assert!(safe_jvm_argument(argument), "{argument} must be kept");
+        }
+        assert!(!safe_jvm_argument("-Djava.library.path=/x"));
     }
 
     // --------------------------------------------------------------

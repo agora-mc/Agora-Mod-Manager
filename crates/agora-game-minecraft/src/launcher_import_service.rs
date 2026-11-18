@@ -952,25 +952,10 @@ fn sanitize_settings(candidate: &ImportCandidate, preserve: bool) -> LaunchSetti
             .settings_preview
             .jvm_args
             .iter()
-            .filter(|argument| safe_import_jvm_argument(argument))
+            .filter(|argument| crate::launcher_import::safe_jvm_argument(argument))
             .cloned()
             .collect(),
     }
-}
-
-fn safe_import_jvm_argument(argument: &str) -> bool {
-    let lower = argument.to_ascii_lowercase();
-    !argument.starts_with("-Xmx")
-        && !argument.starts_with("-Xms")
-        && !argument.starts_with("-cp")
-        && !argument.starts_with("-classpath")
-        && !argument.starts_with("-agentpath")
-        && !argument.starts_with("-agentlib")
-        && !argument.starts_with("-javaagent")
-        && !argument.starts_with("-Djava.library.path")
-        && !lower.contains("token")
-        && !lower.contains("password")
-        && !lower.contains("credential")
 }
 
 fn rediscover_selection(selection: &ImportSelection) -> Option<ImportCandidate> {
@@ -2962,6 +2947,32 @@ mod tests {
         let s = sanitize_settings(&c, true);
         assert!(s.jvm_args.contains(&"-XX:+UseG1GC".to_string()));
         assert!(s.jvm_args.contains(&"-Dfoo=bar".to_string()));
+    }
+
+    #[test]
+    fn test_sanitize_settings_drops_jvm_args_that_run_commands_or_load_code() {
+        let refused = [
+            "-XX:OnError=touch /tmp/pwned",
+            "-XX:OnOutOfMemoryError=touch /tmp/pwned",
+            "@args.txt",
+            "-Xbootclasspath:/tmp/evil.jar",
+            "-Xbootclasspath/a:/tmp/evil.jar",
+            "-Xbootclasspath/p:/tmp/evil.jar",
+            "-Djava.system.class.loader=evil.Loader",
+            "-javaagent:/tmp/evil.jar",
+            "-agentlib:jdwp=transport=dt_socket,server=y",
+            "-agentpath:/tmp/evil.so",
+            "-Xrunjdwp:transport=dt_socket",
+        ];
+        let mut args = vec!["-XX:+UseG1GC"];
+        args.extend(refused);
+        let c = make_candidate_with_settings(None, None, args);
+        let s = sanitize_settings(&c, true);
+        assert!(
+            s.jvm_args == vec!["-XX:+UseG1GC".to_string()],
+            "only the safe argument may remain: {:?}",
+            s.jvm_args
+        );
     }
 
     // --------------------------------------------------------------
