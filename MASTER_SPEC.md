@@ -85,7 +85,7 @@ If CurseForge were a beer, this would be Agora.
 | Data Compiler | Python (GitHub Actions, free runners) |
 | Game Execution | Official Mojang Launcher (wrapper/delegation) |
 | AI Integration | Local MCP Server (user-provided API keys or local Ollama) |
-| Data Hosting | GitHub Release Assets (for `registry.db` + `registry.db.sig`) |
+| Data Hosting | GitHub Release Assets (for `registry.bundle`; `registry.db` and `registry.db.sig` remain for the web export) |
 
 ---
 
@@ -371,9 +371,9 @@ Community-submitted regex patterns create a ReDoS (Regular Expression Denial of 
 
 11. **Image URL Hydration:** For mods with `download_strategy = "github_release"`, curators provide `icon_url` and `gallery_urls` directly in the manifest (e.g., pointing to `raw.githubusercontent.com` asset paths). For `modrinth_id` mods, the compiler queries the Modrinth API via the batch endpoint `GET /v2/projects?ids=[...]` (up to 500 IDs per request) to extract icon/gallery URLs. For non-Modrinth, non-GitHub items, curators provide image URLs manually. If custom promotional banners are needed, upload those assets to the dedicated `launcher-media` repository served via GitHub Pages. **The database never holds binary image data — only URL strings pointing to CDN-hosted images.**
 
-12. **Database Signing:** Sign the compiled `registry.db` with the project's offline Ed25519 private key. Write the signature to `registry.db.sig`. This allows the Tauri client to verify database authenticity and detect a compromised GitHub account distributing a malicious build.
+12. **Catalog Signing:** Sign the compiled `registry.db` and its header with the project's offline Ed25519 private key, producing `registry.bundle`. This is the launcher's only catalog artifact. `registry.db.sig` is still written for the web export; the launcher no longer accepts a database and signature as two files.
 
-13. **Deployment as GitHub Release Asset:** Upload `registry.db` and `registry.db.sig` as assets on a tagged GitHub Release (e.g., `registry-2026-06-15`). **Do not commit `registry.db` to the source repository.** A binary file committed daily would bloat the repository's Git history irreversibly, making clones prohibitively slow. GitHub Release Assets support files up to 2GB (vs. 100MB for regular commits), and the database (storing text: names, descriptions, numbers) will remain well under 30MB for the foreseeable future. The Tauri client fetches the latest release asset URL from the GitHub Releases API on startup.
+13. **Deployment as GitHub Release Asset:** Upload `registry.bundle` as the catalog asset on a tagged GitHub Release (e.g., `registry-2026-06-15`); the web export keeps its own files. **Do not commit `registry.db` to the source repository.** A binary file committed daily would bloat the repository's Git history irreversibly, making clones prohibitively slow. GitHub Release Assets support files up to 2GB (vs. 100MB for regular commits), and the database (storing text: names, descriptions, numbers) will remain well under 30MB for the foreseeable future. The Tauri client fetches the latest release asset URL from the GitHub Releases API on startup.
 
 ### 3.2 GitHub Interaction Limits ("Raid Shield")
 
@@ -403,7 +403,8 @@ The launcher maintains **two separate SQLite databases**:
 | Database | Location | Purpose | Mutability |
 |---|---|---|---|
 | `registry.db` | App data directory, downloaded from GitHub Release Assets | Curated catalog, crash signatures, social metrics | Read-only at runtime |
-| `registry.db.sig` | Same directory as `registry.db` | Ed25519 signature for `registry.db` | Read-only at runtime |
+| `registry.bundle` | Same directory as `registry.db` | Signed catalog header plus the SQLite payload; the launcher installs this one file | Read-only at runtime |
+| `registry.trust` | Same directory as `registry.bundle` | Keys and revocations learned from verified catalogs; only ever grows | Read-only at runtime |
 | `local_state.db` | App data directory | User settings, instances, telemetry, approvals | Read-write |
 
 ### Table: `registry_items`
@@ -497,9 +498,9 @@ The Tauri app tracks the currently cached `registry.db` release tag (e.g., `regi
 6. Refuse a bundle built before the installed one, and refuse an update when the installed bundle's signed build stamp cannot be read.
 7. Show a notification: *"Registry updated to <tag>. <N> new mods, <M> updated entries."*
 
-The bundle header also carries `issued_at` and `expires_at`. An expired catalog is still readable for browsing and diagnosis, but the app marks it stale and refuses to install or update curated content or official plugins from it. `registry.db` and `registry.db.sig` remain published for the web export and older clients, but the launcher installs the bundle as one unit: there is no state in which the database and the signature it was verified against come from different builds. The previous bundle is promoted when the current one is incomplete or damaged.
+The bundle header also carries `issued_at` and `expires_at`. An expired catalog is still readable for browsing and diagnosis, but the app marks it stale and refuses to install or update curated content or official plugins from it. `registry.db` and `registry.db.sig` remain published for the web export, but the launcher installs the bundle as one unit and refuses the two-file form: there is no state in which the database and the signature it was verified against come from different builds. The previous bundle is promoted when the current one is incomplete or damaged.
 
-Clients trust a compiled-in list of public keys, each named by an id derived from the key. A new key is introduced by a certificate inside a bundle, signed by a key the client already trusts; a compromised key is retired by shipping a client build that no longer trusts it and by listing it in the bundle's `revoked_key_ids`. Rotation and retirement are operators' procedures, documented in [`docs/RELEASING.md`](docs/RELEASING.md#catalog-signing-rotation-and-expiry).
+Clients trust a compiled-in list of public keys, each named by an id derived from the key and carrying a role: a primary key signs catalogs, and an offline recovery key may sign a certificate or a revocation but never a catalog. A new key is introduced by a certificate inside a bundle, signed by a key the client already trusts; a compromised key is retired by listing it in the bundle's `revoked_key_ids` and by shipping a client build that no longer trusts it. The client persists introduced keys and revocations in `registry.trust` next to the cached bundle, and never removes a revocation, so a later bundle signed by a retired key is refused even when it omits the revocation list. Rotation and retirement are operators' procedures, documented in [`docs/RELEASING.md`](docs/RELEASING.md#catalog-signing-rotation-and-expiry).
 
 If offline, the app skips the update check and uses the last cached DB. A "Limited Offline Mode" banner appears if the DB is older than 7 days.
 
@@ -994,7 +995,7 @@ On the app's first launch (or if `registry.db` has never been downloaded):
    - In Browse-Only Mode: the user can browse the curated catalog and assemble modpacks, but cannot vote, submit reviews, report crashes to GitHub, or use the Triage Center.
    - A profile icon in the top-right corner shows a "Sign in with GitHub" badge. Clicking it resumes the Device Flow.
 
-4. **Database Download:** If online, the app queries the GitHub Releases API for the latest `registry-*` tag, downloads the attached `registry.db` and `registry.db.sig`, verifies the Ed25519 signature, and loads it into `tauri-plugin-sql`. If offline, the app uses the last cached DB or shows "Limited Offline Mode."
+4. **Catalog Download:** If online, the app queries the GitHub Releases API for the latest `registry-*` tag, downloads the attached `registry.bundle`, verifies its header, signature and payload, and extracts `registry.db` into `tauri-plugin-sql`. If offline, the app uses the last cached bundle or shows "Limited Offline Mode."
 
 5. **Optional Tutorial:** A brief interactive overlay highlights the sidebar tabs (Home, Browse, My Instances, Community Governance, Settings).
 

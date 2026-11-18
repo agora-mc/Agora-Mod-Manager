@@ -189,6 +189,13 @@ jobs:
       # always one version (MASTER_SPEC §28.4). Built, and on Windows signed,
       # before Tauri bundles it beside the desktop executable through
       # tauri.bundle-cli.conf.json.
+      - name: Check compiled catalog keys
+        shell: bash
+        env:
+          AGORA_REGISTRY_PUBKEY: ${{ vars.AGORA_REGISTRY_PUBKEY || secrets.AGORA_REGISTRY_PUBKEY }}
+          AGORA_REGISTRY_PUBKEYS: ${{ vars.AGORA_REGISTRY_PUBKEYS || secrets.AGORA_REGISTRY_PUBKEYS }}
+        run: python scripts/check_registry_keys.py
+
       - name: Build bundled CLI
         shell: bash
         run: cargo build --release --locked -p agora-cli ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
@@ -426,6 +433,13 @@ jobs:
           PY="$(command -v python3 || command -v python)"
           "$PY" scripts/set_release_version.py "$TAG"
           "$PY" scripts/set_release_version.py --check
+
+      - name: Check compiled catalog keys
+        shell: bash
+        env:
+          AGORA_REGISTRY_PUBKEY: ${{ vars.AGORA_REGISTRY_PUBKEY || secrets.AGORA_REGISTRY_PUBKEY }}
+          AGORA_REGISTRY_PUBKEYS: ${{ vars.AGORA_REGISTRY_PUBKEYS || secrets.AGORA_REGISTRY_PUBKEYS }}
+        run: python scripts/check_registry_keys.py
 
       - name: Build CLI
         run: cargo build --release --locked -p agora-cli --target ${{ matrix.target }}

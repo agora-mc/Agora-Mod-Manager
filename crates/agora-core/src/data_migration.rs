@@ -284,9 +284,9 @@ impl DataMigrationService {
 
     /// Create a timestamped backup of existing destination state.
     ///
-    /// Copies `local_state.db`, `registry.db`, `registry.db.sig`, and the
-    /// `instances/` directory to a `migration-backups/<timestamp>/` dir
-    /// under the staging root.
+    /// Copies `local_state.db`, the signed catalog bundle, the readable
+    /// `registry.db`, and the `instances/` directory to a
+    /// `migration-backups/<timestamp>/` dir under the staging root.
     fn create_backup(&self) -> LauncherResult<PathBuf> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -307,7 +307,6 @@ impl DataMigrationService {
         let files_to_backup = [
             self.dest.local_state_db(),
             self.dest.registry_db(),
-            self.dest.registry_signature(),
             self.dest.registry_bundle(),
             self.dest.registry_bundle_previous(),
         ];
@@ -447,7 +446,6 @@ impl DataMigrationService {
         let files_to_restore = [
             "local_state.db",
             "registry.db",
-            "registry.db.sig",
             "registry.bundle",
             "registry.bundle.prev",
         ];

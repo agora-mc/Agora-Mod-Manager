@@ -312,22 +312,56 @@ the SQLite database as one unit, so a crash cannot leave a database and a
 signature that describe different builds. The header names the signing key id,
 the schema version, the build time, the issue and expiry times, and the
 database length and SHA-256. `registry.db` and `registry.db.sig` are still
-published for the web export and older clients, but the launcher never installs
-them as a pair.
+published for the web export, but the launcher does not accept that two-file
+form: no signed expiry and no rotation live there. A pre-bundle cache is treated
+as no catalog and the next sync downloads a bundle.
 
 ### Trusted keys
 
 The client trusts a compiled-in list of Ed25519 public keys, each named by the
-first 16 hex characters of its SHA-256. A release build can override the list at
-compile time:
+first 16 hex characters of its SHA-256 and each carrying a role:
+
+- **primary** signs catalogs in CI;
+- **recovery** is kept offline and may only sign a certificate or a revocation,
+  never a catalog.
+
+A release build must carry at least one of each, or
+`python scripts/check_registry_keys.py` fails the release. The defaults live in
+`crates/agora-core/registry-keys.json`. The recovery slot is a placeholder until
+the owner generates the offline key:
+
+```bash
+python scripts/generate_registry_key.py --private-key-out D:/keys/agora-recovery.key
+```
+
+That prints only the public key and writes the private key to the named path,
+which must be outside this repository. Put the printed public key in the recovery
+slot (or pass both keys in `AGORA_REGISTRY_PUBKEYS` on the release build). Never
+run that command into the repo or save the private half in CI.
+
+A release build can override the compiled list at compile time:
 
 | Variable | Meaning |
 | --- | --- |
-| `AGORA_REGISTRY_PUBKEY` | One public key, hex (the older single-key variable) |
-| `AGORA_REGISTRY_PUBKEYS` | Comma-separated public keys, hex (takes precedence) |
+| `AGORA_REGISTRY_PUBKEY` | One primary public key, hex (the older single-key variable) |
+| `AGORA_REGISTRY_PUBKEYS` | Comma-separated public keys, hex; the first is primary, the rest recovery (takes precedence) |
 
 The compiler derives the key id from `ED25519_PRIVATE_KEY`; operators never keep
 a separate id in sync.
+
+### What the client remembers
+
+Next to the cached bundle the client keeps `registry.trust`, a line log of the
+keys a verified catalog introduced (each line is its certificate) and the key ids
+it revoked. A new entry is written before a verified bundle is installed, and
+the log only grows: a revocation is never removed. Every later verification
+starts from the compiled keys plus remembered keys minus remembered revocations.
+A compiled-in key that was revoked stays revoked.
+
+A missing or unreadable state file falls back to the compiled keys and whatever
+complete lines can still be read (a truncated final line loses only that line).
+No key introduced by certificate is trusted without a valid certificate chain
+from a compiled key, so a garbage or forged state file cannot widen trust.
 
 ### Rotating a key
 
@@ -344,9 +378,12 @@ Rotation is a trust statement, not a client update:
 4. When every supported client knows the new key, remove the old key from the
    compiled-in list and from `AGORA_REGISTRY_PUBKEYS`.
 
-A **compromised** key is retired by shipping a client build without it, and by
-compiling catalogs with `AGORA_REGISTRY_REVOKED_KEY_IDS=<old-id>` so clients that
-trust the new key refuse certificates signed by the old one. Until every client
+A **compromised** key is retired by compiling a catalog with
+`AGORA_REGISTRY_REVOKED_KEY_IDS=<old-id>` (signed by the primary, or introduced
+by a certificate signed by the recovery key) and by shipping a client build
+without it. The client remembers the revocation in
+`registry.trust` next to the cached bundle, so a later bundle signed by the old
+key is refused even if it leaves the revocation list out. Until every client
 has that build, an attacker holding the old private key can still sign a bundle
 those clients accept; a short expiry limits how long such a bundle remains
 current. Never weaken or skip signature verification during a rotation.
@@ -376,8 +413,9 @@ open.
 - [ ] Governance inputs validate.
 - [ ] Loader/runtime catalog inputs are current and pinned.
 - [ ] Compiler tests pass.
-- [ ] The catalog is signed with the production key.
-- [ ] The public key expected by released clients matches the signing key.
+- [ ] The catalog is signed with the production primary key.
+- [ ] The public keys expected by released clients match the signing key, and
+      `python scripts/check_registry_keys.py` passes (primary and recovery).
 - [ ] `registry.bundle` is present and its header names the expected key id.
 - [ ] Catalog database, bundle and web export signatures verify.
 - [ ] The signed expiry is in the future and long enough for the release cadence.

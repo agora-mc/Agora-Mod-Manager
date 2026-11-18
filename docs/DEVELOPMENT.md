@@ -130,7 +130,7 @@ The Rust desktop build embeds selected public configuration at compile time. A `
 | --- | --- | --- |
 | `AGORA_OAUTH_CLIENT_ID` | Public GitHub application client ID used by the governance device flow | No |
 | `AGORA_REGISTRY_PUBKEY` | Public Ed25519 key used to verify downloaded catalog signatures | No |
-| `AGORA_REGISTRY_PUBKEYS` | Comma-separated trusted catalog keys; takes precedence over `AGORA_REGISTRY_PUBKEY` | No |
+| `AGORA_REGISTRY_PUBKEYS` | Comma-separated trusted catalog keys (first primary, rest recovery); takes precedence over `AGORA_REGISTRY_PUBKEY` | No |
 | `AGORA_REGISTRY_REPO` | Catalog repository in `owner/repo` form | No |
 | `VITE_AGORA_REPOSITORY` | Repository used by desktop frontend links | No |
 

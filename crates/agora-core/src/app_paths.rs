@@ -196,6 +196,12 @@ impl AppPaths {
         self.root.join("registry.bundle.prev")
     }
 
+    /// The trust this client has learned from verified catalogs: introduced
+    /// keys and revocations. It only ever grows.
+    pub fn registry_trust_state(&self) -> PathBuf {
+        self.root.join("registry.trust")
+    }
+
     /// Root directory for all instances (`instances/`).
     pub fn instances_root(&self) -> PathBuf {
         self.root.join("instances")

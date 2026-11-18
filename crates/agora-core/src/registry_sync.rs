@@ -1,5 +1,5 @@
-//! Registry database sync â€” download, verify, and atomically replace the
-//! signed `registry.db` from GitHub Releases.
+//! Registry catalog sync: download, verify, install and read the one signed
+//! `registry.bundle` from GitHub Releases.
 //!
 //! This module is pure (no Tauri types) so it can be consumed by the Tauri
 //! GUI, the standalone `agora` CLI, and the in-process MCP listener.
@@ -9,12 +9,15 @@ use crate::error::{LauncherError, LauncherResult};
 use crate::lock_manager::LockManager;
 use crate::operation_manager::OperationManager;
 use crate::paths;
-use crate::registry_bundle::{self, BundleError, CatalogHeader, RegistryTrust, VerifiedBundle};
+use crate::registry_bundle::{
+    self, BundleError, CatalogHeader, KeyCertificate, RegistryKey, RegistryKeyRole, RegistryTrust,
+    VerifiedBundle,
+};
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, VerifyingKey, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
+use ed25519_dalek::{Signature, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -69,16 +72,17 @@ pub struct RegistryStatus {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Check GitHub Releases for a newer registry.db and download + verify it.
+/// Check GitHub Releases for a newer catalog and download + verify it.
 ///
 /// Steps (per section 4.1a):
 /// 1. Query GitHub Releases API for the latest tagged release.
 /// 2. Compare the tag with the locally cached tag.
-/// 3. If newer: download registry.db and registry.db.sig from release assets.
-/// 4. Verify the Ed25519 signature.
-/// 5. Check schema_version for forward/backward compatibility.
-/// 6. Atomically replace the cached DB (write .tmp, rename).
-/// 7. Update the cached tag in local_state.db.
+/// 3. If newer: download the single signed `registry.bundle` asset.
+/// 4. Verify the header key id, Ed25519 signature, expiry and schema version.
+/// 5. Refuse a bundle built before the installed one.
+/// 6. Install the bundle with one rename, keep the previous one, and extract
+///    `registry.db` from the signed payload.
+/// 7. Remember the keys/revocations it taught us and update the cached tag.
 ///
 /// When `operation_manager` is provided, a "Update registry" operation is
 /// registered for the duration of the download and verification.
@@ -213,7 +217,7 @@ pub async fn check_and_download_update(
     );
     let bundle_bytes = download_file(&bundle_url, github_token.as_deref()).await?;
 
-    let trust = RegistryTrust::production();
+    let trust = effective_trust(app_data_dir, &RegistryTrust::production());
     let verified = registry_bundle::verify_bundle(&bundle_bytes, &trust).map_err(bundle_error)?;
 
     // Anti-rollback, checked only after the signature so the compared stamp is
@@ -336,6 +340,207 @@ fn quarantine_aside(path: &Path, kind: &str) -> std::io::Result<()> {
 // Bundle loading, with a per-process header cache
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// What this client remembers about catalog keys
+// ---------------------------------------------------------------------------
+
+/// Keys and revocations learned from bundles that verified here before. The
+/// file is a line log, so a truncated final line only loses that line.
+///
+/// ```text
+/// v1 key <key_id> <public_key> <signed_by> <signature>
+/// v1 revoke <key_id>
+/// ```
+///
+/// A key line is a certificate, not a bare key: a garbage or forged line is
+/// ignored unless it is signed by a key this client already trusts. A
+/// revocation line can only shrink trust, so reading a forged one is safe.
+#[derive(Debug, Default)]
+struct RememberedTrust {
+    keys: Vec<RegistryKey>,
+    revoked: Vec<String>,
+}
+
+fn load_remembered_trust(app_data_dir: &Path, base: &RegistryTrust) -> RememberedTrust {
+    let path = match paths::registry_trust_state_path(app_data_dir) {
+        Ok(path) => path,
+        Err(_) => return RememberedTrust::default(),
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        // Missing or unreadable: the compiled keys are the whole trust set.
+        // No key introduced by certificate is trusted in this state.
+        return RememberedTrust::default();
+    };
+
+    let mut certificates: Vec<KeyCertificate> = Vec::new();
+    let mut revoked: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        match fields.as_slice() {
+            ["v1", "key", id, public_key, signed_by, signature] => {
+                certificates.push(KeyCertificate {
+                    key_id: (*id).to_string(),
+                    public_key: (*public_key).to_string(),
+                    signed_by: (*signed_by).to_string(),
+                    signature: (*signature).to_string(),
+                });
+            }
+            ["v1", "revoke", id] => revoked.push((*id).to_string()),
+            // A truncated line, an older version, or junk: ignore it.
+            _ => {}
+        }
+    }
+
+    // Revocations win, so apply them before certificates are allowed to
+    // introduce anything. A certificate signed by a revoked key is ignored.
+    let mut trusted: BTreeMap<String, ed25519_dalek::VerifyingKey> = BTreeMap::new();
+    for key in base.keys() {
+        if revoked.iter().any(|id| id == &key.id) {
+            continue;
+        }
+        if let Some(verifying) = verifying_key_hex(&key.public_key_hex) {
+            trusted.insert(key.id.clone(), verifying);
+        }
+    }
+    let mut remembered: Vec<RegistryKey> = Vec::new();
+    for _ in 0..=certificates.len() {
+        let mut added = false;
+        for certificate in &certificates {
+            if trusted.contains_key(&certificate.key_id) {
+                continue;
+            }
+            let Some(signer) = trusted.get(&certificate.signed_by).copied() else {
+                continue;
+            };
+            if revoked.iter().any(|id| id == &certificate.signed_by) {
+                continue;
+            }
+            if registry_bundle::key_id_for_public_key(&certificate.public_key) != certificate.key_id
+            {
+                continue;
+            }
+            let Some(signature) = decode_hex_signature(&certificate.signature) else {
+                continue;
+            };
+            use ed25519_dalek::Verifier;
+            let message = KeyCertificate::signed_bytes(
+                &certificate.key_id,
+                &certificate.public_key,
+                &certificate.signed_by,
+            );
+            if signer.verify(&message, &signature).is_err() {
+                continue;
+            }
+            let Some(verifying) = verifying_key_hex(&certificate.public_key) else {
+                continue;
+            };
+            trusted.insert(certificate.key_id.clone(), verifying);
+            remembered.push(
+                RegistryKey::from_hex(certificate.public_key.clone())
+                    .with_role(RegistryKeyRole::Primary),
+            );
+            added = true;
+        }
+        if !added {
+            break;
+        }
+    }
+
+    RememberedTrust {
+        keys: remembered,
+        revoked,
+    }
+}
+
+/// Compiled keys plus what this client remembered, minus what it remembered as
+/// revoked.
+fn effective_trust(app_data_dir: &Path, base: &RegistryTrust) -> RegistryTrust {
+    let remembered = load_remembered_trust(app_data_dir, base);
+    let mut trust = base.clone();
+    trust.merge_remembered(remembered.keys, remembered.revoked);
+    trust
+}
+
+/// Persist the keys a verified bundle introduced and the revocations it made.
+///
+/// Only complete lines are appended, and the file is never rewritten, so a
+/// crash cannot lose an earlier revocation. Duplicate lines are harmless.
+fn remember_bundle_trust(app_data_dir: &Path, verified: &VerifiedBundle) -> LauncherResult<()> {
+    if verified.header.is_expired_at(Utc::now()) {
+        return Ok(());
+    }
+    let path =
+        paths::registry_trust_state_path(app_data_dir).map_err(|_| LauncherError::Generic {
+            code: "ERR_REGISTRY_TRUST_STATE".into(),
+            message: "Could not resolve the catalog trust state path.".into(),
+        })?;
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut lines = String::new();
+    for certificate in &verified.newly_trusted {
+        if verified
+            .header
+            .revoked_key_ids
+            .iter()
+            .any(|id| id == &certificate.key_id)
+        {
+            continue;
+        }
+        let marker = format!("v1 key {} ", certificate.key_id);
+        if existing.lines().any(|line| line.starts_with(&marker)) {
+            continue;
+        }
+        lines.push_str(&format!(
+            "v1 key {} {} {} {}\n",
+            certificate.key_id,
+            certificate.public_key,
+            certificate.signed_by,
+            certificate.signature
+        ));
+    }
+    for id in &verified.header.revoked_key_ids {
+        let marker = format!("v1 revoke {id}");
+        if existing.lines().any(|line| line == marker) {
+            continue;
+        }
+        lines.push_str(&format!("v1 revoke {id}\n"));
+    }
+    if lines.is_empty() {
+        return Ok(());
+    }
+    if existing.is_empty() {
+        std::fs::create_dir_all(path.parent().unwrap_or(Path::new("."))).ok();
+    } else if !existing.ends_with('\n') {
+        lines.insert(0, '\n');
+    }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| LauncherError::Generic {
+            code: "ERR_REGISTRY_TRUST_STATE".into(),
+            message: format!("Could not write the catalog trust state: {error}."),
+        })?;
+    file.write_all(lines.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|error| LauncherError::Generic {
+            code: "ERR_REGISTRY_TRUST_STATE".into(),
+            message: format!("Could not save the catalog trust state: {error}."),
+        })
+}
+
+fn verifying_key_hex(public_key_hex: &str) -> Option<ed25519_dalek::VerifyingKey> {
+    let bytes = hex::decode(public_key_hex.trim()).ok()?;
+    let array: [u8; PUBLIC_KEY_LENGTH] = bytes.try_into().ok()?;
+    ed25519_dalek::VerifyingKey::from_bytes(&array).ok()
+}
+
+fn decode_hex_signature(raw: &str) -> Option<Signature> {
+    let bytes = hex::decode(raw.trim()).ok()?;
+    let array: [u8; SIGNATURE_LENGTH] = bytes.try_into().ok()?;
+    Some(Signature::from_bytes(&array))
+}
+
 /// One bundle header that verified in this process, with the file identity it
 /// was read from. Re-reading and re-verifying a multi-megabyte bundle for every
 /// catalog read would be wasteful; the database itself is still hashed on every
@@ -354,12 +559,7 @@ fn header_cache() -> &'static Mutex<HashMap<PathBuf, CachedHeader>> {
 }
 
 fn trust_fingerprint(trust: &RegistryTrust) -> String {
-    trust
-        .keys()
-        .iter()
-        .map(|key| key.id.as_str())
-        .collect::<Vec<_>>()
-        .join(",")
+    trust.fingerprint()
 }
 
 #[derive(Debug)]
@@ -378,8 +578,10 @@ impl std::fmt::Display for BundleLoadError {
 }
 
 fn load_header(path: &Path, trust: &RegistryTrust) -> Result<CatalogHeader, BundleLoadError> {
+    let app_data_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let trust = effective_trust(app_data_dir, trust);
     let metadata = std::fs::metadata(path).map_err(BundleLoadError::Io)?;
-    let fingerprint = trust_fingerprint(trust);
+    let fingerprint = trust_fingerprint(&trust);
     if let Ok(cache) = header_cache().lock() {
         if let Some(entry) = cache.get(path) {
             if entry.len == metadata.len()
@@ -392,7 +594,7 @@ fn load_header(path: &Path, trust: &RegistryTrust) -> Result<CatalogHeader, Bund
     }
     let bytes = std::fs::read(path).map_err(BundleLoadError::Io)?;
     let verified =
-        registry_bundle::verify_bundle(&bytes, trust).map_err(BundleLoadError::Bundle)?;
+        registry_bundle::verify_bundle(&bytes, &trust).map_err(BundleLoadError::Bundle)?;
     if let Ok(mut cache) = header_cache().lock() {
         cache.insert(
             path.to_path_buf(),
@@ -408,8 +610,10 @@ fn load_header(path: &Path, trust: &RegistryTrust) -> Result<CatalogHeader, Bund
 }
 
 fn load_payload(path: &Path, trust: &RegistryTrust) -> Result<VerifiedBundle, BundleLoadError> {
+    let app_data_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let trust = effective_trust(app_data_dir, trust);
     let bytes = std::fs::read(path).map_err(BundleLoadError::Io)?;
-    registry_bundle::verify_bundle(&bytes, trust).map_err(BundleLoadError::Bundle)
+    registry_bundle::verify_bundle(&bytes, &trust).map_err(BundleLoadError::Bundle)
 }
 
 fn bundle_error(error: BundleError) -> LauncherError {
@@ -427,7 +631,8 @@ fn bundle_error(error: BundleError) -> LauncherError {
         BundleError::SignatureInvalid
         | BundleError::UnknownKey(_)
         | BundleError::RevokedKey(_)
-        | BundleError::CertificateInvalid(_) => "ERR_REGISTRY_SIGNATURE_INVALID",
+        | BundleError::CertificateInvalid(_)
+        | BundleError::KeyNotForCatalog(_) => "ERR_REGISTRY_SIGNATURE_INVALID",
         BundleError::PayloadHash => "ERR_REGISTRY_BUNDLE_HASH",
     };
     LauncherError::Generic {
@@ -470,6 +675,52 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// A hash of the readable database, keyed by the file identity it was computed
+/// from. The registry connection is opened `SQLITE_OPEN_READ_ONLY`, so the only
+/// writer is `ensure_database` itself (install/recovery) and the debug seed.
+/// Re-hashing a multi-megabyte catalog on every open is what this avoids.
+#[derive(Debug, Clone)]
+struct DatabaseHashMemo {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    sha256: String,
+}
+
+fn database_hash_memo() -> &'static Mutex<HashMap<PathBuf, DatabaseHashMemo>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, DatabaseHashMemo>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_database_hash(path: &Path, sha256: &str) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if let Ok(mut memo) = database_hash_memo().lock() {
+        memo.insert(
+            path.to_path_buf(),
+            DatabaseHashMemo {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+                sha256: sha256.to_ascii_lowercase(),
+            },
+        );
+    }
+}
+
+fn database_hash_memoized(path: &Path) -> std::io::Result<String> {
+    let metadata = std::fs::metadata(path)?;
+    if let Ok(memo) = database_hash_memo().lock() {
+        if let Some(entry) = memo.get(path) {
+            if entry.len == metadata.len() && entry.modified == metadata.modified().ok() {
+                return Ok(entry.sha256.clone());
+            }
+        }
+    }
+    let hash = sha256_file(path)?;
+    remember_database_hash(path, &hash);
+    Ok(hash)
+}
+
 fn sha256_file(path: &Path) -> std::io::Result<String> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
@@ -497,7 +748,7 @@ fn ensure_database(
     let db_path =
         paths::registry_db_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
     if db_path.exists() {
-        if let Ok(hash) = sha256_file(&db_path) {
+        if let Ok(hash) = database_hash_memoized(&db_path) {
             if hash == header.db_sha256.to_ascii_lowercase() {
                 return Ok(());
             }
@@ -525,7 +776,9 @@ fn ensure_database(
     write_atomic(&db_path, payload).map_err(|error| LauncherError::Generic {
         code: "ERR_REGISTRY_WRITE".into(),
         message: format!("Could not write the readable catalog: {error}."),
-    })
+    })?;
+    remember_database_hash(&db_path, &header.db_sha256);
+    Ok(())
 }
 
 /// Install the exact signed bytes of a bundle that has already been verified.
@@ -543,6 +796,12 @@ fn install_bundle_bytes(
         paths::registry_bundle_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
     let previous_path = paths::registry_bundle_previous_path(app_data_dir)
         .map_err(|_| LauncherError::RegistryMissing)?;
+    let trust = effective_trust(app_data_dir, trust);
+    let payload = registry_bundle::verify_bundle(bundle_bytes, &trust).map_err(bundle_error)?;
+    // Remember what this verified bundle teaches before it is installed. A
+    // failure to persist a revocation must not leave a catalog whose future
+    // keys the client has not learned about.
+    remember_bundle_trust(app_data_dir, &payload)?;
 
     // Keep the previous copy only when the current file looks like a bundle.
     // A corrupt current must not overwrite a good previous one.
@@ -568,13 +827,12 @@ fn install_bundle_bytes(
         let _ = std::fs::remove_file(sig_path);
     }
 
-    let payload = registry_bundle::verify_bundle(bundle_bytes, trust).map_err(bundle_error)?;
     ensure_database(
         app_data_dir,
         &bundle_path,
         header,
         Some(&payload.payload),
-        trust,
+        &trust,
     )
 }
 
@@ -605,37 +863,10 @@ pub fn verify_cached_registry_with_trust(
         return verify_bundle_file(app_data_dir, &bundle_path, trust);
     }
 
-    // Cache written before signed bundles. It is still authentic if its
-    // sidecar verifies; it simply has no expiry or key id.
-    let db_path = match paths::registry_db_path(app_data_dir) {
-        Ok(path) => path,
-        Err(_) => return CachedRegistryIntegrity::Absent,
-    };
-    if !db_path.exists() {
-        return CachedRegistryIntegrity::Absent;
-    }
-    let sig_path = match paths::registry_sig_path(app_data_dir) {
-        Ok(path) => path,
-        Err(_) => return CachedRegistryIntegrity::Absent,
-    };
-
-    let db_bytes = match std::fs::read(&db_path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return CachedRegistryIntegrity::Error(format!(
-                "Cached registry could not be read ({error}); it will not be used."
-            ))
-        }
-    };
-    let sig_bytes = std::fs::read(&sig_path).ok();
-    if verify_legacy_pair(trust, &db_bytes, sig_bytes.as_deref()).is_ok() {
-        return CachedRegistryIntegrity::Verified;
-    }
-    quarantine_legacy(
-        &db_path,
-        &sig_path,
-        "Cached registry failed signature verification",
-    )
+    // A pre-bundle cache is not a catalog. It has no signed expiry, no key id
+    // and no rotation, so this client ignores it and the next sync downloads a
+    // bundle. The next successful install replaces `registry.db`.
+    CachedRegistryIntegrity::Absent
 }
 
 fn verify_bundle_file(
@@ -649,6 +880,7 @@ fn verify_bundle_file(
                 if header.is_expired_at(Utc::now()) {
                     CachedRegistryIntegrity::Stale(stale_message(&header))
                 } else {
+                    remember_cached_bundle(app_data_dir, bundle_path, trust);
                     CachedRegistryIntegrity::Verified
                 }
             }
@@ -679,6 +911,7 @@ fn recover_previous(
     if previous_path.exists() {
         if let Ok(header) = load_header(&previous_path, trust) {
             if ensure_database(app_data_dir, &previous_path, &header, None, trust).is_ok() {
+                remember_cached_bundle(app_data_dir, &previous_path, trust);
                 let recovered = format!("{reason} The previous verified catalog was restored.");
                 if let Ok(previous_bytes) = std::fs::read(&previous_path) {
                     if quarantine_aside(bundle_path, "bundle.untrusted").is_ok()
@@ -702,19 +935,13 @@ fn quarantine_bundle(bundle_path: &Path, reason: String) -> CachedRegistryIntegr
     CachedRegistryIntegrity::Quarantined(reason)
 }
 
-fn quarantine_legacy(db_path: &Path, sig_path: &Path, reason: &str) -> CachedRegistryIntegrity {
-    let reason = format!("{reason}; it was quarantined and will be re-downloaded.");
-    if let Err(error) = quarantine_aside(db_path, "db.untrusted") {
-        return CachedRegistryIntegrity::Error(format!(
-            "{reason} It could not be moved aside ({error}), so it will not be used this run."
-        ));
+/// Re-read a bundle that already verified and remember what it teaches. This
+/// is what lets a client upgraded from a pre-trust-state build learn the keys
+/// and revocations of the catalog it already has.
+fn remember_cached_bundle(app_data_dir: &Path, bundle_path: &Path, trust: &RegistryTrust) {
+    if let Ok(verified) = load_payload(bundle_path, trust) {
+        let _ = remember_bundle_trust(app_data_dir, &verified);
     }
-    if let Err(error) = quarantine_aside(sig_path, "sig.untrusted") {
-        return CachedRegistryIntegrity::Error(format!(
-            "{reason} The database was moved aside, but its signature could not be ({error})."
-        ));
-    }
-    CachedRegistryIntegrity::Quarantined(reason)
 }
 
 fn stale_message(header: &CatalogHeader) -> String {
@@ -722,33 +949,6 @@ fn stale_message(header: &CatalogHeader) -> String {
         "The catalog expired on {}. It can still be browsed, but installs and updates wait for a fresh catalog.",
         header.expires_at
     )
-}
-
-/// Verify a pre-bundle database against any key in the trust set. A missing
-/// sidecar is unsigned, which is not trusted (except for the debug-only test
-/// convenience).
-fn verify_legacy_pair(
-    trust: &RegistryTrust,
-    db_bytes: &[u8],
-    sig_bytes: Option<&[u8]>,
-) -> LauncherResult<()> {
-    if trust.keys().is_empty() {
-        if trust.permits_unsigned_debug() {
-            return Ok(());
-        }
-        return Err(LauncherError::RegistrySignatureInvalid);
-    }
-    let Some(sig_bytes) = sig_bytes else {
-        return Err(LauncherError::RegistrySignatureInvalid);
-    };
-    let mut last_error = LauncherError::RegistrySignatureInvalid;
-    for key in trust.keys() {
-        match verify_signature_with_key(&key.public_key_hex, db_bytes, sig_bytes) {
-            Ok(()) => return Ok(()),
-            Err(error) => last_error = error,
-        }
-    }
-    Err(last_error)
 }
 
 /// The signed build stamp of the cached catalog, for the rollback check.
@@ -774,28 +974,8 @@ fn read_cached_built_at_checked(
         };
     }
 
-    let db_path =
-        paths::registry_db_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
-    if !db_path.exists() {
-        return Ok(None);
-    }
-    let db_bytes = std::fs::read(&db_path).map_err(|error| LauncherError::Generic {
-        code: "ERR_REGISTRY_CACHED_STAMP_UNREADABLE".into(),
-        message: format!(
-            "The installed catalog cannot be read ({error}), so an update cannot be proved newer."
-        ),
-    })?;
-    let sig_bytes = paths::registry_sig_path(app_data_dir)
-        .ok()
-        .and_then(|path| std::fs::read(path).ok());
-    verify_legacy_pair(trust, &db_bytes, sig_bytes.as_deref()).map_err(|_| {
-        LauncherError::Generic {
-            code: "ERR_REGISTRY_CACHED_STAMP_UNREADABLE".into(),
-            message: "The installed catalog's signature does not verify, so its build stamp cannot be trusted and an update cannot be proved newer."
-                .into(),
-        }
-    })?;
-    Ok(read_built_at_from_bytes(app_data_dir, &db_bytes))
+    // No bundle is no catalog: there is no signed stamp to roll back from.
+    Ok(None)
 }
 
 fn cached_catalog_summary(app_data_dir: &Path) -> Option<CachedCatalogSummary> {
@@ -808,15 +988,7 @@ fn cached_catalog_summary(app_data_dir: &Path) -> Option<CachedCatalogSummary> {
             expires_at: Some(header.expires_at),
         });
     }
-    let db_path = paths::registry_db_path(app_data_dir).ok()?;
-    if !db_path.exists() {
-        return None;
-    }
-    Some(CachedCatalogSummary {
-        schema_version: read_cached_schema_version(Some(&db_path)).ok(),
-        stale: false,
-        expires_at: None,
-    })
+    None
 }
 
 /// The digest of the verified catalog, for cache keys and lockfile revisions.
@@ -839,17 +1011,8 @@ pub fn verified_registry_digest(
         return Ok(Some(header.db_sha256.to_ascii_lowercase()));
     }
 
-    let db_path =
-        paths::registry_db_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
-    if !db_path.exists() {
-        return Ok(None);
-    }
-    let db_bytes = std::fs::read(&db_path).map_err(|_| LauncherError::RegistryMissing)?;
-    let sig_bytes = paths::registry_sig_path(app_data_dir)
-        .ok()
-        .and_then(|path| std::fs::read(path).ok());
-    verify_legacy_pair(trust, &db_bytes, sig_bytes.as_deref())?;
-    Ok(Some(hex::encode(Sha256::digest(&db_bytes))))
+    // No bundle is no catalog.
+    Ok(None)
 }
 
 /// Return the current registry status without performing a network check.
@@ -886,8 +1049,6 @@ pub fn get_status(app_data_dir: &Path, local_state_path: &Path) -> RegistryStatu
 /// if it exists. Development convenience for local testing.
 #[cfg(debug_assertions)]
 pub fn seed_from_local_build(app_data_dir: &Path) -> LauncherResult<bool> {
-    let dest = paths::registry_db_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
-
     // Prefer the signed bundle a local compiler build now emits. Seeding is a
     // debug convenience, so structure is checked but the signature is not (a
     // --skip-sign build has a placeholder one).
@@ -931,81 +1092,6 @@ pub fn seed_from_local_build(app_data_dir: &Path) -> LauncherResult<bool> {
             break;
         }
         search_dir = dir.parent().map(std::path::Path::to_path_buf);
-    }
-
-    if dest.exists() {
-        let cached_version = read_cached_schema_version(Some(&dest)).unwrap_or(0);
-        let cached_mtime = dest.metadata().and_then(|m| m.modified()).ok();
-        let mut search_dir = std::env::current_dir().ok();
-        for _ in 0..5 {
-            if let Some(dir) = search_dir {
-                let candidate = dir.join("registry.db");
-                if candidate.exists() {
-                    if let Some(local_version) = read_schema_version_at(&candidate) {
-                        // Re-seed when the local build's schema version is
-                        // newer, OR when the local registry.db file was
-                        // modified more recently than the cached copy. The
-                        // version check alone misses content-only recompiles
-                        // (added/edited mods at an unchanged schema version),
-                        // leaving the dev cache stale.
-                        let local_mtime = candidate.metadata().and_then(|m| m.modified()).ok();
-                        let newer_mtime = match (cached_mtime, local_mtime) {
-                            (Some(c), Some(l)) => l > c,
-                            _ => false,
-                        };
-                        if local_version > cached_version || newer_mtime {
-                            let dest_sig = paths::registry_sig_path(app_data_dir)
-                                .map_err(|_| LauncherError::RegistryMissing)?;
-                            let local_sig = candidate.with_extension("db.sig");
-                            std::fs::copy(&candidate, &dest)
-                                .map_err(|_| LauncherError::RegistryDownloadFailed)?;
-                            if local_sig.exists() {
-                                std::fs::copy(&local_sig, &dest_sig)
-                                    .map_err(|_| LauncherError::RegistryDownloadFailed)?;
-                            }
-                            eprintln!(
-                                "Re-seeded registry.db (schema {} -> {}) from local build at {}",
-                                cached_version,
-                                local_version,
-                                candidate.display()
-                            );
-                            return Ok(true);
-                        }
-                    }
-                    break;
-                }
-                search_dir = dir.parent().map(std::path::Path::to_path_buf);
-            } else {
-                break;
-            }
-        }
-        return Ok(false);
-    }
-
-    let mut search_dir = std::env::current_dir().ok();
-    for _ in 0..5 {
-        if let Some(dir) = search_dir {
-            let candidate = dir.join("registry.db");
-            if candidate.exists() {
-                std::fs::copy(&candidate, &dest)
-                    .map_err(|_| LauncherError::RegistryDownloadFailed)?;
-                let local_sig = candidate.with_extension("db.sig");
-                if local_sig.exists() {
-                    let dest_sig = paths::registry_sig_path(app_data_dir)
-                        .map_err(|_| LauncherError::RegistryMissing)?;
-                    std::fs::copy(&local_sig, &dest_sig)
-                        .map_err(|_| LauncherError::RegistryDownloadFailed)?;
-                }
-                eprintln!(
-                    "Seeded registry.db from local build at {}",
-                    candidate.display()
-                );
-                return Ok(true);
-            }
-            search_dir = dir.parent().map(std::path::Path::to_path_buf);
-        } else {
-            break;
-        }
     }
 
     Ok(false)
@@ -1231,25 +1317,25 @@ pub fn open_verified_registry_with_trust(
         }
     }
 
-    // A cache written before signed bundles.
-    let db_path =
-        paths::registry_db_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
-    if !db_path.exists() {
-        return Err(LauncherError::RegistryMissing);
+    // A debug-only test fixture: `Ctx::for_testing` may open a hand-built
+    // unsigned database. This is never reachable from a release build because
+    // `permits_unsigned_debug` is false there. A pre-bundle `registry.db` +
+    // `.sig` is not accepted; it has no signed expiry, no key id and no
+    // rotation, so the next sync downloads a bundle.
+    #[cfg(debug_assertions)]
+    if trust.permits_unsigned_debug() {
+        let db_path =
+            paths::registry_db_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
+        if db_path.exists() {
+            let conn =
+                db::registry_connection(&db_path).map_err(|_| LauncherError::RegistryMissing)?;
+            return Ok(VerifiedRegistry {
+                conn: Some(conn),
+                freshness: RegistryFreshness::default(),
+            });
+        }
     }
-    let db_bytes = std::fs::read(&db_path).map_err(|_| LauncherError::RegistryMissing)?;
-    let sig_bytes = paths::registry_sig_path(app_data_dir)
-        .ok()
-        .and_then(|path| std::fs::read(path).ok());
-    verify_legacy_pair(trust, &db_bytes, sig_bytes.as_deref())?;
-    let conn = db::registry_connection(&db_path).map_err(|error| LauncherError::Generic {
-        code: "ERR_REGISTRY_UNREADABLE".into(),
-        message: format!("The verified catalog could not be opened: {error}"),
-    })?;
-    Ok(VerifiedRegistry {
-        conn: Some(conn),
-        freshness: RegistryFreshness::default(),
-    })
+    Err(LauncherError::RegistryMissing)
 }
 
 fn open_bundle_once(
@@ -1287,88 +1373,6 @@ pub fn open_verified_registry_with_key(
         return Err(LauncherError::RegistrySignatureInvalid);
     }
     open_verified_registry_with_trust(app_data_dir, &RegistryTrust::with_key(pubkey_hex))
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers â€” Ed25519 signature verification
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-fn verify_signature(db_bytes: &[u8], sig_bytes: &[u8]) -> LauncherResult<()> {
-    verify_legacy_pair(&RegistryTrust::production(), db_bytes, Some(sig_bytes))
-}
-
-/// [`verify_signature`] against an explicit key, so a caller that is handed a
-/// different trust anchor (a test, never a user setting) shares the one check.
-fn verify_signature_with_key(
-    pubkey_hex: &str,
-    db_bytes: &[u8],
-    sig_bytes: &[u8],
-) -> LauncherResult<()> {
-    // In debug builds only, allow skipping verification when no pubkey is set.
-    // Release builds must have AGORA_REGISTRY_PUBKEY compiled in.
-    #[cfg(not(debug_assertions))]
-    {
-        if pubkey_hex.is_empty() {
-            return Err(LauncherError::Generic {
-                code: "ERR_REGISTRY_PUBKEY_NOT_CONFIGURED".to_string(),
-                message: "Catalog public key not compiled in; refusing to verify. \
-                          Set AGORA_REGISTRY_PUBKEY (Ed25519 public key, hex) as an \
-                          environment variable before building the desktop app: \
-                          `$env:AGORA_REGISTRY_PUBKEY='...'; npm run tauri:dev`. \
-                          See README.md > \"Environment variables for the Tauri build\"."
-                    .to_string(),
-            });
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    {
-        if pubkey_hex.is_empty() {
-            eprintln!(
-                "WARNING: AGORA_REGISTRY_PUBKEY not set; skipping signature verification (debug build only).\n\
-                 Set `$env:AGORA_REGISTRY_PUBKEY` (Ed25519 public key, hex) before `npm run tauri:dev` to enable verification.\n\
-                 See README.md > \"Environment variables for the Tauri build\"."
-            );
-            if sig_bytes.is_empty() {
-                return Err(LauncherError::RegistrySignatureInvalid);
-            }
-            return Ok(());
-        }
-    }
-
-    let pubkey_bytes = hex::decode(pubkey_hex).map_err(|_| LauncherError::Generic {
-        code: "ERR_REGISTRY_PUBKEY".to_string(),
-        message: "Invalid compiled-in registry public key.".to_string(),
-    })?;
-
-    if pubkey_bytes.len() != PUBLIC_KEY_LENGTH {
-        return Err(LauncherError::Generic {
-            code: "ERR_REGISTRY_PUBKEY".to_string(),
-            message: "Compiled-in registry public key is wrong length.".to_string(),
-        });
-    }
-
-    if sig_bytes.len() != SIGNATURE_LENGTH {
-        return Err(LauncherError::RegistrySignatureInvalid);
-    }
-
-    let pubkey_array: [u8; PUBLIC_KEY_LENGTH] = pubkey_bytes
-        .try_into()
-        .map_err(|_| LauncherError::RegistrySignatureInvalid)?;
-
-    let sig_array: [u8; SIGNATURE_LENGTH] = sig_bytes
-        .try_into()
-        .map_err(|_| LauncherError::RegistrySignatureInvalid)?;
-
-    let verifying_key = VerifyingKey::from_bytes(&pubkey_array)
-        .map_err(|_| LauncherError::RegistrySignatureInvalid)?;
-    let signature = Signature::from_bytes(&sig_array);
-
-    use ed25519_dalek::Verifier;
-    verifying_key
-        .verify(db_bytes, &signature)
-        .map_err(|_| LauncherError::RegistrySignatureInvalid)
 }
 
 // ---------------------------------------------------------------------------
@@ -1419,6 +1423,7 @@ fn read_schema_version_from_bytes(
 ///
 /// Returns `None` when the key is absent, which is the normal case for any
 /// database compiled before the stamp was introduced.
+#[cfg(test)]
 fn read_built_at(conn: &rusqlite::Connection) -> Option<String> {
     let raw: String = conn
         .query_row(
@@ -1429,27 +1434,6 @@ fn read_built_at(conn: &rusqlite::Connection) -> Option<String> {
         .ok()?;
     // Stored JSON-encoded, matching `runtime_catalog_source`.
     serde_json::from_str::<String>(&raw).ok()
-}
-
-/// Read `built_at` from raw database bytes, using the same private-directory
-/// staging as [`read_schema_version_from_bytes`].
-fn read_built_at_from_bytes(app_data_dir: &std::path::Path, db_bytes: &[u8]) -> Option<String> {
-    let temp_db = next_temp_path(app_data_dir, "registry-rollback");
-    std::fs::write(&temp_db, db_bytes).ok()?;
-
-    let built_at = (|| {
-        let conn = rusqlite::Connection::open_with_flags(
-            &temp_db,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .ok()?;
-        let value = read_built_at(&conn);
-        drop(conn);
-        value
-    })();
-
-    let _ = std::fs::remove_file(&temp_db);
-    built_at
 }
 
 /// Whether `latest` names a strictly newer registry release than `cached`.
@@ -1545,6 +1529,7 @@ fn is_rollback(cached_built_at: Option<&str>, candidate_built_at: Option<&str>) 
 }
 
 /// Read the schema version from the cached registry database at `path`.
+#[cfg(test)]
 fn read_cached_schema_version(path: Option<&std::path::Path>) -> LauncherResult<i64> {
     let path = path.ok_or(LauncherError::RegistryMissing)?;
     let conn = rusqlite::Connection::open_with_flags(
@@ -1559,23 +1544,6 @@ fn read_cached_schema_version(path: Option<&std::path::Path>) -> LauncherResult<
         |row| row.get(0),
     )
     .map_err(|_| LauncherError::RegistryMissing)
-}
-
-/// Open a read-only connection at an arbitrary path and read the schema version.
-#[cfg(debug_assertions)]
-fn read_schema_version_at(path: &std::path::Path) -> Option<i64> {
-    let conn = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
-    let _ = conn.pragma_update(None, "query_only", "ON");
-    conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-        [],
-        |row| row.get(0),
-    )
-    .ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1868,23 +1836,6 @@ mod tests {
         assert!(!status.stale);
 
         let _ = fs::remove_dir_all(&tmp_dir);
-    }
-
-    #[test]
-    fn test_verify_signature_debug_skips_when_no_key() {
-        let db_bytes = b"test data";
-        let sig_bytes = b"00000000000000000000000000000000\
-                         00000000000000000000000000000000"; // 64 zero bytes
-        let result = verify_signature(db_bytes, sig_bytes);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_verify_signature_wrong_length() {
-        let db_bytes = b"test data";
-        let short_sig = b"deadbeef"; // 8 bytes, not 64
-        let result = verify_signature(db_bytes, short_sig);
-        assert!(result.is_err());
     }
 
     #[test]
@@ -2233,6 +2184,149 @@ mod tests {
         assert!(open_verified_registry_with_trust(dir.path(), &trust_old).is_err());
     }
 
+    fn certificate(old: &ed25519_dalek::SigningKey, new_public: &str) -> KeyCertificate {
+        use ed25519_dalek::Signer;
+        let old_id = registry_bundle::key_id_for_public_key(&test_public(old));
+        let new_id = registry_bundle::key_id_for_public_key(new_public);
+        let message = KeyCertificate::signed_bytes(&new_id, new_public, &old_id);
+        KeyCertificate {
+            key_id: new_id,
+            public_key: new_public.to_string(),
+            signed_by: old_id,
+            signature: hex::encode(old.sign(&message).to_bytes()),
+        }
+    }
+
+    /// A revocation learned from one verified bundle is remembered, so a later
+    /// bundle signed by the stolen key cannot simply leave it out.
+    #[test]
+    fn a_revocation_survives_into_a_later_bundle() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stolen = test_key(20);
+        let primary = test_key(21);
+        let trust = RegistryTrust::with_keys([test_public(&stolen), test_public(&primary)]);
+        let payload = sample_db();
+
+        let mut revoking = fresh_header(&primary, &payload);
+        revoking
+            .revoked_key_ids
+            .push(registry_bundle::key_id_for_public_key(&test_public(
+                &stolen,
+            )));
+        let revoking_bundle = signed_bundle(&primary, &revoking, &payload);
+        install_bundle_bytes(dir.path(), &revoking, &revoking_bundle, &trust).unwrap();
+
+        let stale = fresh_header(&stolen, &payload);
+        let stale_bundle = signed_bundle(&stolen, &stale, &payload);
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            stale_bundle,
+        )
+        .unwrap();
+
+        assert!(
+            open_verified_registry_with_trust(dir.path(), &trust).is_err(),
+            "a bundle signed by the revoked key must be refused even without its own revocation list"
+        );
+    }
+
+    /// A key introduced by a certificate is remembered, so a later bundle signed
+    /// by it needs no certificate of its own.
+    #[test]
+    fn an_introduced_key_is_remembered_without_its_certificate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let old = test_key(22);
+        let new = test_key(23);
+        let payload = sample_db();
+        let old_trust = RegistryTrust::with_key(test_public(&old));
+
+        let mut introduced = fresh_header(&new, &payload);
+        introduced
+            .certificates
+            .push(certificate(&old, &test_public(&new)));
+        let first = signed_bundle(&new, &introduced, &payload);
+        install_bundle_bytes(dir.path(), &introduced, &first, &old_trust).unwrap();
+
+        let later = fresh_header(&new, &payload);
+        let later_bundle = signed_bundle(&new, &later, &payload);
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            later_bundle,
+        )
+        .unwrap();
+
+        assert!(
+            open_verified_registry_with_trust(dir.path(), &old_trust).is_ok(),
+            "the introduced key should stay trusted without carrying its certificate again"
+        );
+    }
+
+    /// A garbage state file is not a new trust root: a key may only be remembered
+    /// through a certificate signed by a key the client already trusts.
+    #[test]
+    fn a_garbage_state_file_never_widens_trust() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let old = test_key(24);
+        let attacker = test_key(25);
+        let payload = sample_db();
+        let trust = RegistryTrust::with_key(test_public(&old));
+        let mut forged = fresh_header(&attacker, &payload);
+        forged
+            .certificates
+            .push(certificate(&attacker, &test_public(&attacker)));
+        let forged_bundle = signed_bundle(&attacker, &forged, &payload);
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            forged_bundle,
+        )
+        .unwrap();
+
+        fs::write(
+            paths::registry_trust_state_path(dir.path()).unwrap(),
+            "this is not a trust state
+v1 key deadbeef deadbeef deadbeef deadbeef
+",
+        )
+        .unwrap();
+
+        assert!(
+            open_verified_registry_with_trust(dir.path(), &trust).is_err(),
+            "a forged certificate signed by an unknown key must not introduce the attacker's key"
+        );
+    }
+
+    /// A truncated final line loses only that line; complete lines before it
+    /// still count.
+    #[test]
+    fn a_truncated_state_file_keeps_the_complete_revocations_it_can_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = test_key(26);
+        let stolen = test_key(27);
+        let trust = RegistryTrust::with_keys([test_public(&primary), test_public(&stolen)]);
+        let stolen_id = registry_bundle::key_id_for_public_key(&test_public(&stolen));
+        fs::write(
+            paths::registry_trust_state_path(dir.path()).unwrap(),
+            format!(
+                "v1 revoke {stolen_id}
+v1 revoke truncated-without-a-newline"
+            ),
+        )
+        .unwrap();
+
+        let payload = sample_db();
+        let stale = fresh_header(&stolen, &payload);
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            signed_bundle(&stolen, &stale, &payload),
+        )
+        .unwrap();
+
+        assert!(
+            open_verified_registry_with_trust(dir.path(), &trust).is_err(),
+            "the complete revocation line before the truncation still applies"
+        );
+    }
+
     /// The app and the CLI share one data folder. Their staging files must never
     /// be the same name.
     #[test]
@@ -2255,10 +2349,10 @@ mod tests {
         assert!(leftovers.is_empty(), "temporary files were left behind");
     }
 
-    /// A cache written before signed bundles is still accepted when its sidecar
-    /// verifies, so an upgrade does not orphan an installed catalog.
+    /// A pre-bundle cache is not a catalog: no signed expiry, no key id, no
+    /// rotation. The client ignores it and the next sync downloads a bundle.
     #[test]
-    fn a_legacy_signed_pair_is_still_accepted() {
+    fn a_legacy_pair_is_no_catalog() {
         use ed25519_dalek::Signer;
         let dir = tempfile::TempDir::new().unwrap();
         let key = test_key(10);
@@ -2271,52 +2365,9 @@ mod tests {
         let trust = RegistryTrust::with_key(test_public(&key));
         assert_eq!(
             verify_cached_registry_with_trust(dir.path(), &trust),
-            CachedRegistryIntegrity::Verified
+            CachedRegistryIntegrity::Absent
         );
-        assert!(open_verified_registry_with_trust(dir.path(), &trust).is_ok());
-    }
-
-    /// A cached db whose signature does not verify must be quarantined, and the
-    /// quarantine must leave no `registry.db` behind — that absence is what
-    /// makes the next sync re-download a good copy instead of reporting
-    /// "up to date".
-    #[test]
-    fn verify_cached_registry_quarantines_a_tampered_db() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let db_path = paths::registry_db_path(dir.path()).unwrap();
-        let sig_path = paths::registry_sig_path(dir.path()).unwrap();
-        std::fs::write(&db_path, b"tampered registry contents").unwrap();
-        std::fs::write(&sig_path, [0u8; SIGNATURE_LENGTH]).unwrap();
-
-        let result = verify_cached_registry(dir.path());
-        assert!(
-            matches!(result, CachedRegistryIntegrity::Quarantined(_)),
-            "a db that fails signature verification must be quarantined, got {result:?}"
-        );
-        assert!(
-            !db_path.exists(),
-            "the untrusted db must not remain in place"
-        );
-        assert!(
-            db_path.with_extension("db.untrusted").exists(),
-            "the untrusted db should be preserved for inspection"
-        );
-    }
-
-    /// A missing sidecar is treated the same as a bad signature: an unsigned db
-    /// is not a trusted one.
-    #[test]
-    fn verify_cached_registry_quarantines_a_db_with_no_signature() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let db_path = paths::registry_db_path(dir.path()).unwrap();
-        std::fs::write(&db_path, b"unsigned registry contents").unwrap();
-
-        let result = verify_cached_registry(dir.path());
-        assert!(
-            matches!(result, CachedRegistryIntegrity::Quarantined(_)),
-            "a db with no signature sidecar must be quarantined, got {result:?}"
-        );
-        assert!(!db_path.exists());
+        assert!(open_verified_registry_with_trust(dir.path(), &trust).is_err());
     }
 
     #[test]
@@ -2342,27 +2393,6 @@ mod tests {
     #[test]
     fn test_app_schema_version_constant() {
         const { assert!(APP_REGISTRY_SCHEMA_VERSION >= 1) };
-    }
-
-    /// A quarantine whose documented target is occupied must still move the tampered
-    /// `registry.db` away: leaving it at `registry.db` lets later readers open it.
-    #[test]
-    fn a_failed_quarantine_does_not_leave_the_unsigned_db_in_place() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let db_path = paths::registry_db_path(dir.path()).unwrap();
-        let sig_path = paths::registry_sig_path(dir.path()).unwrap();
-        std::fs::write(&db_path, b"tampered registry contents").unwrap();
-        std::fs::write(&sig_path, [0u8; SIGNATURE_LENGTH]).unwrap();
-        let blocker = db_path.with_extension("db.untrusted");
-        std::fs::create_dir(&blocker).unwrap();
-        std::fs::write(blocker.join("keep"), b"x").unwrap();
-
-        let result = verify_cached_registry(dir.path());
-        assert!(matches!(result, CachedRegistryIntegrity::Quarantined(_)));
-        assert!(
-            !db_path.exists(),
-            "reported as quarantined, but the tampered db is still at registry.db"
-        );
     }
 
     /// Cache keys use the signed payload hash, so they cannot be made to

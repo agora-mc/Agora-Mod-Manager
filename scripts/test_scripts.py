@@ -34,6 +34,8 @@ import refresh_loader_manifests
 import validate_loader_catalog_delta
 import build_docs_web as bdw
 import check_package_docs as cpd
+import check_registry_keys as crk
+import generate_registry_key as grk
 import pin_hashes
 import stage_cli_sidecar
 import stage_vfs_files
@@ -4234,6 +4236,84 @@ class TestGenAddrlibNames(unittest.TestCase):
             root.mkdir()
             with self.assertRaises(gan.GenerationError):
                 gan.generate(root, Path(temporary) / "names.js")
+
+
+class TestRegistryKeyReleaseCheck(unittest.TestCase):
+    def test_two_valid_keys_with_both_roles_pass(self):
+        keys = [
+            {"role": "primary", "public_key_hex": "1" * 64},
+            {"role": "recovery", "public_key_hex": "2" * 64},
+        ]
+        self.assertEqual(crk.check(keys), [])
+
+    def test_a_placeholder_recovery_slot_fails_the_release(self):
+        keys = [
+            {"role": "primary", "public_key_hex": "1" * 64},
+            {"role": "recovery", "public_key_hex": crk.PLACEHOLDER},
+        ]
+        problems = crk.check(keys)
+        self.assertTrue(any("placeholder" in problem for problem in problems), problems)
+
+    def test_one_key_is_not_enough(self):
+        problems = crk.check([{"role": "primary", "public_key_hex": "1" * 64}])
+        self.assertTrue(any("fewer than two" in problem for problem in problems), problems)
+        self.assertTrue(any("recovery" in problem for problem in problems), problems)
+
+    def test_an_invalid_key_is_refused(self):
+        keys = [
+            {"role": "primary", "public_key_hex": "not-hex"},
+            {"role": "recovery", "public_key_hex": "2" * 64},
+        ]
+        problems = crk.check(keys)
+        self.assertTrue(any("32-byte" in problem for problem in problems), problems)
+
+    def test_the_source_file_is_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "keys.json"
+            path.write_text(
+                json.dumps(
+                    [
+                        {"role": "primary", "public_key_hex": "1" * 64},
+                        {"role": "recovery", "public_key_hex": "2" * 64},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            keys = crk._from_source(path)
+            self.assertEqual(len(keys), 2)
+            self.assertEqual(crk.check(keys), [])
+
+
+@unittest.skipUnless(nacl is not None, "PyNaCl is required to generate a test key")
+class TestGenerateRegistryKey(unittest.TestCase):
+    def test_it_prints_only_the_public_half_and_writes_the_private_half(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "recovery.key"
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["generate_registry_key.py", "--private-key-out", str(destination)],
+                ),
+                contextlib.redirect_stdout(stdout),
+            ):
+                self.assertEqual(grk.main(), 0)
+            printed = stdout.getvalue().strip().splitlines()[0]
+            self.assertRegex(printed, r"^[0-9a-f]{64}$")
+            private = destination.read_text(encoding="ascii").strip()
+            self.assertRegex(private, r"^[0-9a-f]{64}$")
+            self.assertNotEqual(printed, private)
+
+    def test_it_refuses_to_write_inside_the_repository(self):
+        destination = Path(grk.REPO_ROOT) / "should-not-exist-recovery.key"
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["generate_registry_key.py", "--private-key-out", str(destination)],
+        ):
+            self.assertEqual(grk.main(), 1)
+        self.assertFalse(destination.exists())
 
 
 @unittest.skipUnless(nacl is not None, "PyNaCl is required to sign a test bundle")

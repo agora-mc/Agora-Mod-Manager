@@ -38,13 +38,23 @@ pub const CERT_DOMAIN: &[u8] = b"AGORA-CATALOG-KEY-CERT-V1\n";
 /// The only bundle format this build understands.
 pub const BUNDLE_FORMAT: u32 = 1;
 
-/// The public keys compiled into the client when no build-time override is set.
+/// The keys compiled into the client when no build-time override is set.
 ///
-/// A release build may set `AGORA_REGISTRY_PUBKEYS` (comma-separated hex) or
-/// the older single-key `AGORA_REGISTRY_PUBKEY`. Keep an old key here for the
-/// length of a rotation, then remove it in the next client release.
-const DEFAULT_REGISTRY_PUBKEYS: &[&str] =
-    &["47adee76cf587ee618f79eb2fa5bde003824d3bfc2dbb5080d33073c5a8f8c18"];
+/// Kept in `registry-keys.json` so `scripts/check_registry_keys.py` can read the
+/// same list a release build compiles in. The recovery slot is deliberately a
+/// placeholder until the owner generates the offline recovery key; the release
+/// check refuses a build with fewer than two valid keys.
+const DEFAULT_REGISTRY_KEYS_JSON: &str = include_str!("../registry-keys.json");
+
+/// What a compiled-in key is allowed to sign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryKeyRole {
+    /// Signs catalogs in CI.
+    Primary,
+    /// Kept offline; signs a certificate, never a catalog. The certificate can
+    /// authorize a replacement primary, whose catalog carries a revocation.
+    Recovery,
+}
 
 /// One trusted public key: the id is derived from the key, so operators never
 /// have to keep two names in step.
@@ -52,13 +62,23 @@ const DEFAULT_REGISTRY_PUBKEYS: &[&str] =
 pub struct RegistryKey {
     pub id: String,
     pub public_key_hex: String,
+    pub role: RegistryKeyRole,
 }
 
 impl RegistryKey {
     pub fn from_hex(public_key_hex: impl Into<String>) -> Self {
         let public_key_hex = public_key_hex.into();
         let id = key_id_for_public_key(&public_key_hex);
-        Self { id, public_key_hex }
+        Self {
+            id,
+            public_key_hex,
+            role: RegistryKeyRole::Primary,
+        }
+    }
+
+    pub fn with_role(mut self, role: RegistryKeyRole) -> Self {
+        self.role = role;
+        self
     }
 }
 
@@ -67,6 +87,8 @@ impl RegistryKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryTrust {
     keys: Vec<RegistryKey>,
+    /// Keys a verified catalog has retired. This list only grows.
+    revoked: Vec<String>,
     permit_unsigned_debug: bool,
 }
 
@@ -81,10 +103,11 @@ impl RegistryTrust {
     pub fn production() -> Self {
         let keys = compiled_public_keys()
             .into_iter()
-            .map(RegistryKey::from_hex)
+            .map(|(role, key)| RegistryKey::from_hex(key).with_role(role))
             .collect();
         Self {
             keys,
+            revoked: Vec::new(),
             permit_unsigned_debug: false,
         }
     }
@@ -93,11 +116,12 @@ impl RegistryTrust {
     pub fn with_key(public_key_hex: impl Into<String>) -> Self {
         Self {
             keys: vec![RegistryKey::from_hex(public_key_hex)],
+            revoked: Vec::new(),
             permit_unsigned_debug: false,
         }
     }
 
-    /// Test support: trust exactly these keys.
+    /// Test support: trust exactly these keys, all as primaries.
     pub fn with_keys<I, S>(keys: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -108,6 +132,23 @@ impl RegistryTrust {
                 .into_iter()
                 .map(|key| RegistryKey::from_hex(key.into()))
                 .collect(),
+            revoked: Vec::new(),
+            permit_unsigned_debug: false,
+        }
+    }
+
+    /// Test support: trust these keys with explicit roles.
+    pub fn with_roles<I, S>(keys: I) -> Self
+    where
+        I: IntoIterator<Item = (RegistryKeyRole, S)>,
+        S: Into<String>,
+    {
+        Self {
+            keys: keys
+                .into_iter()
+                .map(|(role, key)| RegistryKey::from_hex(key.into()).with_role(role))
+                .collect(),
+            revoked: Vec::new(),
             permit_unsigned_debug: false,
         }
     }
@@ -119,7 +160,27 @@ impl RegistryTrust {
     pub fn unverified_debug() -> Self {
         Self {
             keys: Vec::new(),
+            revoked: Vec::new(),
             permit_unsigned_debug: cfg!(debug_assertions),
+        }
+    }
+
+    /// Add keys a verified catalog remembered, and the revocations it taught
+    /// us. Revocations always win over keys.
+    pub fn merge_remembered(
+        &mut self,
+        keys: impl IntoIterator<Item = RegistryKey>,
+        revoked: impl IntoIterator<Item = String>,
+    ) {
+        for key in keys {
+            if !self.keys.iter().any(|known| known.id == key.id) {
+                self.keys.push(key);
+            }
+        }
+        for id in revoked {
+            if !self.revoked.contains(&id) {
+                self.revoked.push(id);
+            }
         }
     }
 
@@ -127,8 +188,21 @@ impl RegistryTrust {
         &self.keys
     }
 
+    pub fn revoked(&self) -> &[String] {
+        &self.revoked
+    }
+
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
+    }
+
+    /// A stable name for this key set, used to key the verified-header cache.
+    pub fn fingerprint(&self) -> String {
+        let mut ids: Vec<&str> = self.keys.iter().map(|key| key.id.as_str()).collect();
+        ids.sort_unstable();
+        let mut revoked: Vec<&str> = self.revoked.iter().map(String::as_str).collect();
+        revoked.sort_unstable();
+        format!("{}|{}", ids.join(","), revoked.join(","))
     }
 
     /// Whether an unsigned legacy catalog may be opened. Only ever true in a
@@ -138,12 +212,20 @@ impl RegistryTrust {
     }
 }
 
-fn compiled_public_keys() -> Vec<String> {
-    let split = |raw: &str| -> Vec<String> {
+fn compiled_public_keys() -> Vec<(RegistryKeyRole, String)> {
+    let split = |raw: &str| -> Vec<(RegistryKeyRole, String)> {
         raw.split(',')
             .map(str::trim)
             .filter(|key| !key.is_empty())
-            .map(str::to_string)
+            .enumerate()
+            .map(|(index, key)| {
+                let role = if index == 0 {
+                    RegistryKeyRole::Primary
+                } else {
+                    RegistryKeyRole::Recovery
+                };
+                (role, key.to_string())
+            })
             .collect()
     };
     if let Some(raw) = option_env!("AGORA_REGISTRY_PUBKEYS") {
@@ -156,9 +238,26 @@ fn compiled_public_keys() -> Vec<String> {
             return split(raw);
         }
     }
-    DEFAULT_REGISTRY_PUBKEYS
-        .iter()
-        .map(|key| (*key).to_string())
+    default_public_keys()
+}
+
+fn default_public_keys() -> Vec<(RegistryKeyRole, String)> {
+    #[derive(serde::Deserialize)]
+    struct CompiledKey {
+        role: String,
+        public_key_hex: String,
+    }
+    let keys: Vec<CompiledKey> =
+        serde_json::from_str(DEFAULT_REGISTRY_KEYS_JSON).unwrap_or_default();
+    keys.into_iter()
+        .filter_map(|key| {
+            let role = match key.role.as_str() {
+                "primary" => RegistryKeyRole::Primary,
+                "recovery" => RegistryKeyRole::Recovery,
+                _ => return None,
+            };
+            Some((role, key.public_key_hex))
+        })
         .collect()
 }
 
@@ -282,6 +381,10 @@ pub enum BundleError {
     RevokedKey(String),
     #[error("a catalog key certificate is invalid: {0}")]
     CertificateInvalid(String),
+    #[error(
+        "the catalog was signed by recovery key {0}, which may only sign a certificate or revocation"
+    )]
+    KeyNotForCatalog(String),
     #[error("the catalog payload length does not match the signed header")]
     PayloadLength,
     #[error("the catalog payload does not match the signed SHA-256")]
@@ -406,6 +509,10 @@ pub fn encode_bundle(
 pub struct VerifiedBundle {
     pub header: CatalogHeader,
     pub payload: Vec<u8>,
+    /// Certificates this verification actually accepted, so the client can
+    /// remember the keys they introduced. A certificate signed by an unknown
+    /// or revoked key is not in this list.
+    pub newly_trusted: Vec<KeyCertificate>,
 }
 
 /// Verify a bundle against the client's trust set.
@@ -413,6 +520,7 @@ pub fn verify_bundle(bytes: &[u8], trust: &RegistryTrust) -> Result<VerifiedBund
     let parsed = parse_bundle(bytes)?;
     let trusted = trusted_keys(&parsed.header, trust)?;
     let signing_key = trusted
+        .keys
         .get(&parsed.header.key_id)
         .ok_or_else(|| BundleError::UnknownKey(parsed.header.key_id.clone()))?;
 
@@ -421,6 +529,10 @@ pub fn verify_bundle(bytes: &[u8], trust: &RegistryTrust) -> Result<VerifiedBund
     signing_key
         .verify(&header_signing_bytes(parsed.header_bytes), &signature)
         .map_err(|_| BundleError::SignatureInvalid)?;
+
+    if trusted.roles.get(&parsed.header.key_id) == Some(&RegistryKeyRole::Recovery) {
+        return Err(BundleError::KeyNotForCatalog(parsed.header.key_id));
+    }
 
     let digest = Sha256::digest(parsed.payload);
     let expected = parsed.header.db_sha256.to_ascii_lowercase();
@@ -431,34 +543,44 @@ pub fn verify_bundle(bytes: &[u8], trust: &RegistryTrust) -> Result<VerifiedBund
     Ok(VerifiedBundle {
         header: parsed.header,
         payload: parsed.payload.to_vec(),
+        newly_trusted: trusted.newly_trusted,
     })
+}
+
+struct TrustedKeys {
+    keys: BTreeMap<String, VerifyingKey>,
+    roles: BTreeMap<String, RegistryKeyRole>,
+    newly_trusted: Vec<KeyCertificate>,
 }
 
 /// Build the trusted key set for a header: compiled-in keys, then certificates
 /// signed by an already-trusted key, then the header's revocations.
-fn trusted_keys(
-    header: &CatalogHeader,
-    trust: &RegistryTrust,
-) -> Result<BTreeMap<String, VerifyingKey>, BundleError> {
+fn trusted_keys(header: &CatalogHeader, trust: &RegistryTrust) -> Result<TrustedKeys, BundleError> {
     let mut trusted: BTreeMap<String, VerifyingKey> = BTreeMap::new();
+    let mut roles: BTreeMap<String, RegistryKeyRole> = BTreeMap::new();
     for key in trust.keys() {
         if let Some(verifying) = verifying_key(&key.public_key_hex) {
             trusted.insert(key.id.clone(), verifying);
+            roles.insert(key.id.clone(), key.role);
         }
     }
 
     // Retire keys before they can vouch for anything else. A bundle signed by a
     // trusted key is allowed to say an old key is compromised; certificates
-    // that key signed must stop counting from that point.
-    for revoked in &header.revoked_key_ids {
-        trusted.remove(revoked);
+    // that key signed must stop counting from that point. The client's
+    // remembered revocations from earlier verified bundles count too.
+    let mut revoked: Vec<&str> = trust.revoked.iter().map(String::as_str).collect();
+    revoked.extend(header.revoked_key_ids.iter().map(String::as_str));
+    for id in &revoked {
+        trusted.remove(*id);
     }
-    if header.revoked_key_ids.iter().any(|id| id == &header.key_id) {
+    if revoked.iter().any(|id| *id == header.key_id) {
         return Err(BundleError::RevokedKey(header.key_id.clone()));
     }
 
     // Certificates can chain, so repeat until nothing new is trusted. The
     // certificate count bounds the loop, so a cycle cannot spin.
+    let mut newly_trusted = Vec::new();
     for _ in 0..=header.certificates.len() {
         let mut added = false;
         for certificate in &header.certificates {
@@ -470,11 +592,7 @@ fn trusted_keys(
             };
             // Re-checked here because a certificate earlier in this list can
             // name a revoked signer and the set was filtered before the loop.
-            if header
-                .revoked_key_ids
-                .iter()
-                .any(|revoked| revoked == &certificate.signed_by)
-            {
+            if revoked.iter().any(|id| *id == certificate.signed_by) {
                 continue;
             }
             let expected_id = key_id_for_public_key(&certificate.public_key);
@@ -509,6 +627,7 @@ fn trusted_keys(
                 ))
             })?;
             trusted.insert(certificate.key_id.clone(), verifying);
+            newly_trusted.push(certificate.clone());
             added = true;
         }
         if !added {
@@ -516,7 +635,11 @@ fn trusted_keys(
         }
     }
 
-    Ok(trusted)
+    Ok(TrustedKeys {
+        keys: trusted,
+        roles,
+        newly_trusted,
+    })
 }
 
 fn verifying_key(public_key_hex: &str) -> Option<VerifyingKey> {
@@ -726,6 +849,51 @@ mod tests {
             verify_bundle(&bundle, &RegistryTrust::with_key(public(&old))),
             Err(BundleError::UnknownKey(_))
         ));
+    }
+
+    #[test]
+    fn a_recovery_key_cannot_sign_a_catalog() {
+        let payload = b"the signed catalog";
+        let recovery = key(17);
+        let header = header_for(&recovery, payload);
+        let bundle = sign(&recovery, &header, payload);
+        let trust = RegistryTrust::with_roles([(RegistryKeyRole::Recovery, public(&recovery))]);
+        assert!(matches!(
+            verify_bundle(&bundle, &trust),
+            Err(BundleError::KeyNotForCatalog(_))
+        ));
+    }
+
+    #[test]
+    fn a_recovery_key_can_sign_a_certificate_for_a_new_catalog_key() {
+        let payload = b"the signed catalog";
+        let recovery = key(18);
+        let primary = key(19);
+        let new = key(20);
+        let mut header = header_for(&primary, payload);
+        let cert_message = KeyCertificate::signed_bytes(
+            &key_id_for_public_key(&public(&new)),
+            &public(&new),
+            &key_id_for_public_key(&public(&recovery)),
+        );
+        header.certificates.push(KeyCertificate {
+            key_id: key_id_for_public_key(&public(&new)),
+            public_key: public(&new),
+            signed_by: key_id_for_public_key(&public(&recovery)),
+            signature: hex::encode(recovery.sign(&cert_message).to_bytes()),
+        });
+        let bundle = sign(&primary, &header, payload);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, public(&recovery)),
+            (RegistryKeyRole::Primary, public(&primary)),
+        ]);
+        let verified = verify_bundle(&bundle, &trust)
+            .expect("the recovery key may introduce a key, the primary signs the catalog");
+        assert_eq!(verified.newly_trusted.len(), 1);
+        assert_eq!(
+            verified.newly_trusted[0].key_id,
+            key_id_for_public_key(&public(&new))
+        );
     }
 
     #[test]
