@@ -608,6 +608,7 @@ fn list_kept_aside(db_path: &Path) -> anyhow::Result<Vec<PathBuf>> {
 fn restore_newest_backup(db_path: &Path) -> anyhow::Result<Option<PathBuf>> {
     let mut backups = list_backup_files(&backups_dir(db_path))?;
     backups.reverse();
+    let mut unreadable: Option<anyhow::Error> = None;
     for backup in backups {
         let candidate = db_path.with_file_name(format!(
             "{}.restore-{}",
@@ -617,24 +618,39 @@ fn restore_newest_backup(db_path: &Path) -> anyhow::Result<Option<PathBuf>> {
                 .unwrap_or("local_state.db"),
             unique_stamp()
         ));
-        if std::fs::copy(&backup, &candidate).is_err() {
+        if let Err(error) = std::fs::copy(&backup, &candidate) {
+            // "Could not read" is not "this backup is bad": remember it, and
+            // do not silently start fresh while an unreadable copy might hold
+            // the player's data.
+            unreadable = Some(error.into());
             continue;
         }
-        let usable = matches!(check_integrity(&candidate), Ok(Integrity::Ok));
-        if usable {
-            let _ = std::fs::remove_file(sidecar_path(db_path, "-wal"));
-            let _ = std::fs::remove_file(sidecar_path(db_path, "-shm"));
-            match std::fs::rename(&candidate, db_path) {
-                Ok(()) => return Ok(Some(backup)),
-                Err(_) => {
-                    let _ = std::fs::remove_file(&candidate);
-                    continue;
+        match check_integrity(&candidate) {
+            Ok(Integrity::Ok) => {
+                let _ = std::fs::remove_file(sidecar_path(db_path, "-wal"));
+                let _ = std::fs::remove_file(sidecar_path(db_path, "-shm"));
+                match std::fs::rename(&candidate, db_path) {
+                    Ok(()) => return Ok(Some(backup)),
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&candidate);
+                        unreadable = Some(error.into());
+                    }
                 }
             }
+            Ok(Integrity::Corrupt(_)) => {
+                // This backup is genuinely unusable; try the next one.
+                let _ = std::fs::remove_file(&candidate);
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&candidate);
+                unreadable = Some(error);
+            }
         }
-        let _ = std::fs::remove_file(&candidate);
     }
-    Ok(None)
+    match unreadable {
+        Some(error) => Err(error.context("no backup could be read after the database was damaged")),
+        None => Ok(None),
+    }
 }
 
 /// The global AlwaysPreTouch switch from Settings, if the user set one.
