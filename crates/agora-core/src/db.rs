@@ -2849,6 +2849,8 @@ mod tests {
         // Each database gets its own folder, so a replay's `backups/` folder is
         // not shared with another test running at the same time.
         let dir = std::env::temp_dir().join(format!("agora-test-{}-{}", std::process::id(), n));
+        // A recycled process id must not inherit a previous run's rows.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create test db folder");
         let path = dir.join("local_state.db");
         init_local_state_db(&path).expect("failed to init test db");
