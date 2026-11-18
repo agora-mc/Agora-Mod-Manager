@@ -313,7 +313,11 @@ def _load_poll_blacklist(*, allow_partial: bool = False) -> set[str]:
 # Schema setup
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 10
+# The catalog schema version lives in one file that both this compiler and the
+# app (`agora_core::registry_sync::APP_REGISTRY_SCHEMA_VERSION`) read, so the two
+# can never disagree. Bump it there, never here.
+SCHEMA_VERSION_FILE = Path(__file__).resolve().parent / "registry_schema_version"
+SCHEMA_VERSION = int(SCHEMA_VERSION_FILE.read_text(encoding="utf-8").strip())
 
 
 CREATE_INDEXES = [

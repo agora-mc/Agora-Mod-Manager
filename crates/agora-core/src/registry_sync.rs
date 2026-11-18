@@ -41,10 +41,35 @@ pub fn resolve_registry_repo(cli_override: Option<&str>) -> String {
 /// `crash_signatures` table now stores `games_json`, `level`, `cause`, `text`
 /// and the action columns, and the app turns those rows into rules in the
 /// community crash pack. An older catalog is still readable, but it has no v2
-/// community signatures until it is refreshed. Compiler and app ship in
-/// lockstep from a single commit, so clients always receive a matching signed
-/// db via the update flow.
-pub const APP_REGISTRY_SCHEMA_VERSION: i64 = 10;
+/// community signatures until it is refreshed.
+///
+/// The number lives in `compiler/registry_schema_version`, which the compiler
+/// reads too, so the app and the compiler can never name different versions.
+/// Bump it there.
+pub const APP_REGISTRY_SCHEMA_VERSION: i64 =
+    parse_schema_version(include_str!("../../../compiler/registry_schema_version"));
+
+/// Parse the shared schema version file (decimal digits, optional trailing
+/// whitespace) at compile time; anything else fails the build.
+const fn parse_schema_version(text: &str) -> i64 {
+    let bytes = text.as_bytes();
+    let mut value: i64 = 0;
+    let mut i = 0;
+    let mut digits = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_digit() {
+            assert!(digits < 9, "compiler/registry_schema_version is too large");
+            value = value * 10 + (b - b'0') as i64;
+            digits += 1;
+        } else if !b.is_ascii_whitespace() {
+            panic!("compiler/registry_schema_version must hold only a number");
+        }
+        i += 1;
+    }
+    assert!(digits > 0, "compiler/registry_schema_version is empty");
+    value
+}
 
 /// Minimum interval between automatic update checks (1 hour).
 const UPDATE_CHECK_INTERVAL_SECS: i64 = 3600;

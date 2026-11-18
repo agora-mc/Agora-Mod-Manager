@@ -203,15 +203,13 @@ class TestSchemaVersion(_CompileFixtures):
         fails on every legitimate schema bump and says nothing about whether
         the db actually matches the compiler that wrote it.
         """
-        # Read the constant from source rather than importing compile.py:
+        # Read the shared version file rather than importing compile.py:
         # importing it is import-path dependent (works under `discover -s
         # compiler`, not under a dotted module path) and pulls in the whole
         # compiler for one integer.
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        source = pathlib.Path(repo_root, "compiler", "compile.py").read_text(encoding="utf-8")
-        match = re.search(r"^SCHEMA_VERSION\s*=\s*(\d+)", source, re.MULTILINE)
-        self.assertIsNotNone(match, "SCHEMA_VERSION not found in compile.py")
-        expected = int(match.group(1))
+        text = pathlib.Path(repo_root, "compiler", "registry_schema_version").read_text(encoding="utf-8")
+        expected = int(text.strip())
 
         conn = self._open_db()
         try:
