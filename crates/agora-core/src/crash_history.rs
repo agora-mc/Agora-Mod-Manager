@@ -239,14 +239,23 @@ pub fn stored_log_count(conn: &Connection, instance_id: &str) -> anyhow::Result<
 }
 
 /// The whole-file hashes of artifacts that a live diagnosis already read, from its stored answer.
-/// A stored answer this build cannot decode simply contributes none. A caller diagnosing one
-/// session passes its id as `exclude_session` so the session's own earlier answer does not hide
-/// the evidence it is about to read again; every other session's evidence is not reused.
+/// Kept for storage/history dedup; live evidence exclusion uses [`answered_artifact_identities`].
 pub(crate) fn answered_artifact_hashes(
     conn: &Connection,
     instance_id: &str,
     exclude_session: Option<&str>,
 ) -> Result<BTreeSet<String>, String> {
+    Ok(answered_artifact_identities(conn, instance_id, exclude_session)?.hashes)
+}
+
+/// Evidence identities from stored answers. Occurrences identify which event was read; content
+/// hashes remain for storage dedup. Answers written before occurrence tracking contribute only
+/// legacy hashes, used as a compatibility fallback for a lingering file.
+pub(crate) fn answered_artifact_identities(
+    conn: &Connection,
+    instance_id: &str,
+    exclude_session: Option<&str>,
+) -> Result<crate::crash_live::AnsweredEvidence, String> {
     let mut stmt = conn
         .prepare("SELECT session_id, answer_json FROM session_answers WHERE instance_id = ?1")
         .map_err(|error| error.to_string())?;
@@ -255,7 +264,7 @@ pub(crate) fn answered_artifact_hashes(
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(|error| error.to_string())?;
-    let mut hashes = BTreeSet::new();
+    let mut answered = crate::crash_live::AnsweredEvidence::default();
     for row in rows {
         let Ok((session_id, json)) = row else {
             continue;
@@ -264,13 +273,20 @@ pub(crate) fn answered_artifact_hashes(
             continue;
         }
         if let Ok(StoredAnswer::Analyzed {
-            artifact_hashes, ..
+            artifact_hashes,
+            artifact_occurrences,
+            ..
         }) = serde_json::from_str::<StoredAnswer>(&json)
         {
-            hashes.extend(artifact_hashes);
+            answered.hashes.extend(artifact_hashes.iter().cloned());
+            if artifact_occurrences.is_empty() {
+                answered.legacy_hashes.extend(artifact_hashes);
+            } else {
+                answered.occurrences.extend(artifact_occurrences);
+            }
         }
     }
-    Ok(hashes)
+    Ok(answered)
 }
 
 /// List every file the applicable packs' `sources` point at, analyse the newest ones once, and

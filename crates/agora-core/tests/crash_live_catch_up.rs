@@ -159,6 +159,7 @@ fn stored_answer(session: &str, hashes: Vec<String>) -> SessionAnswer {
             changes: Vec::new(),
             record: None,
             artifact_hashes: hashes,
+            artifact_occurrences: Vec::new(),
         },
     }
 }
@@ -278,4 +279,160 @@ fn without_a_later_session_the_window_ends_now_and_still_sees_the_crash() {
         answer.is_some(),
         "with no later session the window ends at now, so the crash is still its evidence"
     );
+}
+
+
+/// Two separate crashes can produce byte-identical logs. Each session must still read its own
+/// evidence; a content hash alone does not make them the same event.
+#[test]
+fn identical_logs_in_separate_session_windows_are_both_evidence() {
+    let fixture = Fixture::new();
+    let conn = fixture.conn();
+    let now = SystemTime::now();
+    let pack = time_pack();
+
+    // Session 1 crashes and writes its own log.
+    let s1_start = now - Duration::from_secs(4 * 3600);
+    let s1_end = s1_start + Duration::from_secs(30);
+    fixture.write_log("crash-first.log", s1_start + Duration::from_secs(5));
+    let s1 = begin(&conn, s1_start, Owner::current());
+    session_ledger::finish(
+        &conn,
+        &s1,
+        &SessionFinish {
+            ended_at: chrono::DateTime::<chrono::Utc>::from(s1_end).to_rfc3339(),
+            duration_ms: 30_000,
+            exit: ExitObservation::Code {
+                pid: 1111,
+                image: "Game.exe".to_string(),
+                code: 0xC000_0005,
+            },
+            game_runtime_ms: Some(30_000),
+            normal_exit_codes: vec![0],
+            artifact: None,
+            froze: false,
+        },
+    )
+    .unwrap();
+
+    // A separate crash later writes a different log file with identical bytes.
+    let s2_start = now - Duration::from_secs(2 * 3600);
+    let s2_end = s2_start + Duration::from_secs(30);
+    fixture.write_log("crash-second.log", s2_start + Duration::from_secs(5));
+    let s2 = begin(&conn, s2_start, Owner::current());
+    session_ledger::finish(
+        &conn,
+        &s2,
+        &SessionFinish {
+            ended_at: chrono::DateTime::<chrono::Utc>::from(s2_end).to_rfc3339(),
+            duration_ms: 30_000,
+            exit: ExitObservation::Code {
+                pid: 2222,
+                image: "Game.exe".to_string(),
+                code: 0xC000_0005,
+            },
+            game_runtime_ms: Some(30_000),
+            normal_exit_codes: vec![0],
+            artifact: None,
+            froze: false,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let packs = [pack];
+    let a1 = agora_core::crash_live::diagnose_session(&fixture.ctx, &s1, fixture.live(&packs))
+        .expect("session 1 is diagnosable");
+    let a2 = agora_core::crash_live::diagnose_session(&fixture.ctx, &s2, fixture.live(&packs))
+        .expect("session 2 is diagnosable");
+
+    assert!(
+        matches!(a1.answer, StoredAnswer::Analyzed { .. }),
+        "session 1 should read its own crash log: {:?}",
+        a1.answer
+    );
+    assert!(
+        matches!(a2.answer, StoredAnswer::Analyzed { .. }),
+        "session 2's identical log is a separate crash and must not be dropped: {:?}",
+        a2.answer
+    );
+}
+
+/// The same log file occurrence that another session already read must not be consumed again.
+#[test]
+fn a_lingering_log_occurrence_across_session_windows_is_used_once() {
+    let fixture = Fixture::new();
+    let conn = fixture.conn();
+    let now = SystemTime::now();
+    let pack = time_pack();
+
+    let log_modified = now - Duration::from_secs(90 * 60);
+    fixture.write_log("crash-shared.log", log_modified);
+
+    // Session 1 answers this log.
+    let s1_start = now - Duration::from_secs(2 * 3600);
+    let s1 = begin(&conn, s1_start, Owner::current());
+    let ended = now - Duration::from_secs(80 * 60);
+    session_ledger::finish(
+        &conn,
+        &s1,
+        &SessionFinish {
+            ended_at: chrono::DateTime::<chrono::Utc>::from(ended).to_rfc3339(),
+            duration_ms: 2_400_000,
+            exit: ExitObservation::Code {
+                pid: 4242,
+                image: "Game.exe".to_string(),
+                code: 0xC000_0005,
+            },
+            game_runtime_ms: Some(2_400_000),
+            normal_exit_codes: vec![0],
+            artifact: None,
+            froze: false,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let packs = [pack];
+    let a1 = agora_core::crash_live::diagnose_session(&fixture.ctx, &s1, fixture.live(&packs))
+        .expect("session 1 is diagnosable");
+    assert!(
+        matches!(a1.answer, StoredAnswer::Analyzed { .. }),
+        "session 1 should read the crash log: {:?}",
+        a1.answer
+    );
+
+    // Another session window still covers the same lingering log file occurrence.
+    let conn = fixture.conn();
+    let s2_start = now - Duration::from_secs(100 * 60);
+    let s2 = begin(&conn, s2_start, Owner::current());
+    let ended = now - Duration::from_secs(70 * 60);
+    session_ledger::finish(
+        &conn,
+        &s2,
+        &SessionFinish {
+            ended_at: chrono::DateTime::<chrono::Utc>::from(ended).to_rfc3339(),
+            duration_ms: 1_800_000,
+            exit: ExitObservation::Code {
+                pid: 4343,
+                image: "Game.exe".to_string(),
+                code: 0xC000_0005,
+            },
+            game_runtime_ms: Some(1_800_000),
+            normal_exit_codes: vec![0],
+            artifact: None,
+            froze: false,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let a2 = agora_core::crash_live::diagnose_session(&fixture.ctx, &s2, fixture.live(&packs))
+        .expect("session 2 is diagnosable");
+    match a2.answer {
+        StoredAnswer::NothingToRead { .. } => {}
+        other => panic!(
+            "the same lingering log occurrence belongs to session 1, so session 2 has nothing to read: {other:?}"
+        ),
+    }
 }

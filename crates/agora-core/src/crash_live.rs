@@ -62,16 +62,45 @@ pub enum StoredAnswer {
         /// this field existed have none, and are still read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         record: Option<RecordedCrash>,
-        /// Whole-file content hashes of the artifacts this session read. The sweep uses them to
-        /// recognise this crash's own logs and not count it again, including a log too large to
-        /// copy whole. Older answers have none.
+        /// Whole-file content hashes of the artifacts this session read. Kept for storage dedup and
+        /// history sweep identity; live evidence exclusion uses occurrences. Older answers have none.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         artifact_hashes: Vec<String>,
+        /// Artifact occurrences this session read. Two separate crashes with byte-identical logs are
+        /// different occurrences and both remain evidence. Older answers have none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        artifact_occurrences: Vec<ArtifactOccurrence>,
     },
     /// Nothing was readable for this session. That is not a clean bill of health.
     NothingToRead { why: String },
     /// The analysis itself failed or panicked. The launch path was not touched.
     CouldNotAnalyze { why: String },
+}
+
+/// One artifact occurrence a session read as evidence: file origin plus when it was last written,
+/// bound to the session that consumed it. The same bytes elsewhere or at another time are not the
+/// same event.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ArtifactOccurrence {
+    /// The artifact's path when it was read.
+    pub path: String,
+    /// When the file was last written, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<String>,
+    /// File size when read, to tell a rewritten-in-place file apart when times are coarse.
+    #[serde(default)]
+    pub size: u64,
+}
+
+/// Evidence identities another session's stored answer already consumed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnsweredEvidence {
+    /// Occurrences read by answers that recorded them.
+    pub occurrences: BTreeSet<ArtifactOccurrence>,
+    /// Content hashes from every answered artifact, for storage/history dedup.
+    pub hashes: BTreeSet<String>,
+    /// Hashes from answers that predate occurrence tracking; used only as a compatibility fallback.
+    pub legacy_hashes: BTreeSet<String>,
 }
 
 /// One session's stored answer, with the ids needed to show it.
@@ -1275,6 +1304,7 @@ fn clean_exit_answer(answer: StoredAnswer) -> StoredAnswer {
             changes,
             record,
             artifact_hashes,
+            artifact_occurrences,
         } => {
             let mut answer = *answer;
             answer.verdict = SessionVerdict::Normal;
@@ -1285,6 +1315,7 @@ fn clean_exit_answer(answer: StoredAnswer) -> StoredAnswer {
                 changes,
                 record,
                 artifact_hashes,
+                artifact_occurrences,
             }
         }
         other => other,
@@ -1508,21 +1539,34 @@ fn exclude_answered_evidence(
     record: &SessionRecord,
     collection: &mut SourceCollection,
 ) -> Result<(), String> {
-    let answered = crate::crash_history::answered_artifact_hashes(
+    let answered = crate::crash_history::answered_artifact_identities(
         conn,
         &record.instance_id,
         Some(&record.session_id),
     )
     .map_err(|error| format!("the stored crash answers could not be read: {error}"))?;
-    if answered.is_empty() {
+    if answered.occurrences.is_empty() && answered.legacy_hashes.is_empty() {
         return Ok(());
     }
     let mut kept = Vec::with_capacity(collection.bound.len());
     for found in collection.bound.drain(..) {
-        let already = found.unit == agora_game_api::crash::ArtifactUnit::File
-            && crate::crash_history::content_hash_file(&found.path)
-                .ok()
-                .is_some_and(|hash| answered.contains(&hash));
+        let already = if found.unit == agora_game_api::crash::ArtifactUnit::File {
+            if let Some(occurrence) = artifact_occurrence(&found) {
+                if answered.occurrences.contains(&occurrence) {
+                    true
+                } else if !answered.legacy_hashes.is_empty() {
+                    crate::crash_history::content_hash_file(&found.path)
+                        .ok()
+                        .is_some_and(|hash| answered.legacy_hashes.contains(&hash))
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         if already {
             collection
                 .seen
@@ -1543,6 +1587,14 @@ fn exclude_answered_evidence(
         .seen
         .sort_by(|left, right| (&left.source_id, &left.name).cmp(&(&right.source_id, &right.name)));
     Ok(())
+}
+
+fn artifact_occurrence(found: &FoundArtifact) -> Option<ArtifactOccurrence> {
+    (found.unit == agora_game_api::crash::ArtifactUnit::File).then(|| ArtifactOccurrence {
+        path: found.path.to_string_lossy().into_owned(),
+        modified_at: found.modified.map(crate::crash_engine::evidence::rfc3339),
+        size: found.size,
+    })
 }
 
 fn diagnose_record(
@@ -1674,11 +1726,18 @@ fn diagnose_record(
     // comparison by their content hash. Hash the whole source file, never the stored copy: a log
     // over the copy limit is kept as head and tail, and its copy's hash would not match the whole
     // file the sweep reads, so the crash would count itself as history.
-    let exclude_hashes: Vec<String> = collection
+    let bound_files: Vec<&FoundArtifact> = collection
         .bound
         .iter()
         .filter(|found| found.unit == agora_game_api::crash::ArtifactUnit::File)
+        .collect();
+    let exclude_hashes: Vec<String> = bound_files
+        .iter()
         .filter_map(|found| crate::crash_history::content_hash_file(&found.path).ok())
+        .collect();
+    let artifact_occurrences: Vec<ArtifactOccurrence> = bound_files
+        .iter()
+        .filter_map(|found| artifact_occurrence(found))
         .collect();
     let setup_hash = record.manifest.as_ref().map(|manifest| manifest.hash());
     let limits = crate::crash_history::LogSweepLimits::default();
@@ -1761,6 +1820,7 @@ fn diagnose_record(
             changes,
             record: Some(recorded),
             artifact_hashes: exclude_hashes,
+            artifact_occurrences,
         },
         crash_artifact,
         normal_stop,

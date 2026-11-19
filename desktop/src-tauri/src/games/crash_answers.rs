@@ -558,6 +558,7 @@ mod tests {
                 }],
                 record: None,
                 artifact_hashes: Vec::new(),
+                artifact_occurrences: Vec::new(),
             },
         }
     }
