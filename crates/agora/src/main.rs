@@ -393,6 +393,10 @@ enum Commands {
     },
     /// Discover installed games across supported stores.
     Games {
+        /// Change an instance even while its game is running. Only commands that edit an
+        /// instance use it; the instance lock is still taken.
+        #[arg(long, global = true)]
+        while_running: bool,
         #[command(subcommand)]
         action: GamesCmd,
     },
@@ -1497,6 +1501,11 @@ enum InstanceCmd {
             help = "Run the planned batch without asking"
         )]
         yes: bool,
+        #[arg(
+            long,
+            help = "Change the instance even while its game is running (the running game keeps the files it opened)"
+        )]
+        while_running: bool,
     },
 }
 
@@ -1801,6 +1810,11 @@ enum ModsCmd {
         abort_conflicts: bool,
         #[arg(long, help = "Resolve plan and print it without executing")]
         dry_run: bool,
+        #[arg(
+            long,
+            help = "Change the instance even while its game is running (the running game keeps the files it opened)"
+        )]
+        while_running: bool,
     },
     Remove {
         project: String,
@@ -1821,6 +1835,11 @@ enum ModsCmd {
         remove_anyway: bool,
         #[arg(long, help = "Resolve plan and print it without executing")]
         dry_run: bool,
+        #[arg(
+            long,
+            help = "Change the instance even while its game is running (the running game keeps the files it opened)"
+        )]
+        while_running: bool,
     },
     /// Search the curated registry for items matching a query.
     Search {
@@ -1868,6 +1887,11 @@ enum ModsCmd {
         abort_conflicts: bool,
         #[arg(long, help = "Resolve plan and print it without executing")]
         dry_run: bool,
+        #[arg(
+            long,
+            help = "Change the instance even while its game is running (the running game keeps the files it opened)"
+        )]
+        while_running: bool,
     },
     /// Update all installed items with a registry identity to their latest versions.
     UpdateAll {
@@ -1890,6 +1914,11 @@ enum ModsCmd {
         abort_conflicts: bool,
         #[arg(long, help = "Resolve plan and print it without executing")]
         dry_run: bool,
+        #[arg(
+            long,
+            help = "Change the instance even while its game is running (the running game keeps the files it opened)"
+        )]
+        while_running: bool,
     },
     /// Enable a previously disabled mod by renaming <file>.disabled back to <file>.
     Enable {
@@ -2166,6 +2195,11 @@ enum PackCmd {
         /// The newer .mrpack file.
         mrpack: PathBuf,
         #[arg(
+            long,
+            help = "Change the instance even while its game is running (the file the game already has open will not change on disk until it exits)"
+        )]
+        while_running: bool,
+        #[arg(
             long = "keep-ours",
             value_name = "KEY",
             help = "Keep the instance's file for this conflict (repeatable)"
@@ -2198,6 +2232,11 @@ enum LoadoutCmd {
         /// when there are any; `keep` leaves them on, `off` switches them off.
         #[arg(long = "others", value_enum)]
         others: Option<UnlistedModsArg>,
+        #[arg(
+            long,
+            help = "Apply the profile even while the game is running (the running game may overwrite its settings when it exits)"
+        )]
+        while_running: bool,
     },
     /// Save a loadout profile again so it records the instance's current setup.
     /// Shows what would change and asks first; `--yes` skips the question.
@@ -3845,6 +3884,15 @@ async fn run_plugin_command(
     Ok(())
 }
 
+fn install_service(ctx: &agora_core::ctx::Ctx, while_running: bool) -> InstallService {
+    let service = InstallService::new(ctx.clone());
+    if while_running {
+        service.while_running()
+    } else {
+        service
+    }
+}
+
 async fn run_mods_command(
     action: ModsCmd,
     data_dir: &Path,
@@ -3891,8 +3939,9 @@ async fn run_mods_command(
             replace_conflicts,
             abort_conflicts,
             dry_run,
+            while_running,
         } => {
-            let svc = InstallService::new(ctx.clone());
+            let svc = install_service(ctx, while_running);
             let requested_version = version.clone().unwrap_or_else(|| "selected".into());
             let optional_deps = resolve_optional_deps(include_optional, exclude_optional);
             let intent = agora_game_minecraft::install_pipeline::InstallIntent {
@@ -4065,8 +4114,9 @@ async fn run_mods_command(
             abort_conflicts,
             remove_anyway,
             dry_run,
+            while_running,
         } => {
-            let svc = InstallService::new(ctx.clone());
+            let svc = install_service(ctx, while_running);
             let load = svc.load_instance(&instance)?;
 
             let prepared = InstallService::prepare_removal(
@@ -4242,8 +4292,9 @@ async fn run_mods_command(
             replace_conflicts,
             abort_conflicts,
             dry_run,
+            while_running,
         } => {
-            let svc = InstallService::new(ctx.clone());
+            let svc = install_service(ctx, while_running);
             let target_version = version.clone().unwrap_or_else(|| "latest".into());
             let optional_deps = resolve_optional_deps(include_optional, exclude_optional);
             let intent = agora_game_minecraft::install_pipeline::InstallIntent {
@@ -4456,8 +4507,9 @@ async fn run_mods_command(
             replace_conflicts,
             abort_conflicts,
             dry_run,
+            while_running,
         } => {
-            let svc = InstallService::new(ctx.clone());
+            let svc = install_service(ctx, while_running);
             let load = svc.load_instance(&instance)?;
 
             let items: Vec<agora_game_minecraft::install_pipeline::BatchUpdateItem> = load
@@ -4877,7 +4929,8 @@ async fn run_instance_command(
             instance,
             apply,
             yes,
-        } => cli_updates::instance_updates(ctx, &instance, apply, yes, json).await?,
+            while_running,
+        } => cli_updates::instance_updates(ctx, &instance, apply, yes, while_running, json).await?,
     }
     Ok(())
 }
@@ -5088,9 +5141,19 @@ async fn run_pack_command(
             keep_ours,
             take_theirs,
             yes,
+            while_running,
         } => {
-            cli_updates::pack_update(ctx, &instance, &mrpack, &keep_ours, &take_theirs, yes, json)
-                .await?
+            cli_updates::pack_update(
+                ctx,
+                &instance,
+                &mrpack,
+                &keep_ours,
+                &take_theirs,
+                yes,
+                while_running,
+                json,
+            )
+            .await?
         }
     }
     Ok(())
@@ -6099,6 +6162,7 @@ async fn run_loadout_command(
             instance,
             name,
             others,
+            while_running,
         } => {
             let instance_dir = agora_core::paths::instance_dir(data_dir, &instance)?;
             if !instance_dir.exists() {
@@ -6112,14 +6176,21 @@ async fn run_loadout_command(
                     anyhow::anyhow!("The definition for game '{}' is missing", record.game)
                 })?;
                 agora_core::game_loadout::apply_game_profile_with_undo(
-                    ctx, &instance, definition, &name,
+                    ctx,
+                    &instance,
+                    definition,
+                    &name,
+                    while_running,
                 )
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             } else {
                 // Same core service the desktop uses: the lock, the running-game
                 // check and the undo point are not things a second front end skips.
-                let service =
+                let mut service =
                     agora_game_minecraft::loadout_service::LoadoutService::new(ctx.clone());
+                if while_running {
+                    service = service.while_running();
+                }
                 let unlisted = service.unlisted_mods(&instance, &name)?;
                 let choice = match (others, unlisted.is_empty()) {
                     (Some(choice), _) => choice.into(),
@@ -7064,7 +7135,10 @@ async fn run_command(
                 }
             }
         },
-        Commands::Games { action } => match action {
+        Commands::Games {
+            action,
+            while_running,
+        } => match action {
             GamesCmd::Discover => {
                 let report = agora_core::game_discovery::discover_with_folders(&ctx.paths);
                 if json {
@@ -8106,7 +8180,12 @@ async fn run_command(
                             std::process::exit(1);
                         }
                     };
-                    match agora_core::game_deploy::set_deployment(ctx, &instance_id, chosen) {
+                    match agora_core::game_deploy::set_deployment_while_running(
+                        ctx,
+                        &instance_id,
+                        chosen,
+                        while_running,
+                    ) {
                         Ok(()) => {
                             let shown = chosen.map(|m| m.as_str()).unwrap_or("auto");
                             if json {
@@ -8976,21 +9055,23 @@ async fn run_command(
                         // Where the item went: the caller's own `--into`/`--from`, or what the
                         // game's content rules say (the same call the desktop makes).
                         let (added_item, layer) = if into.is_some() || from.is_some() {
-                            match agora_core::game_deploy::add_content(
+                            match agora_core::game_deploy::add_content_while_running(
                                 ctx,
                                 &instance_id,
                                 &item_id,
                                 into.as_deref(),
                                 from.as_deref(),
+                                while_running,
                             ) {
                                 Ok(layer) => (item_id.clone(), Box::new(layer)),
                                 Err(e) => exit_with_error(json, &e.to_string()),
                             }
                         } else {
-                            match agora_core::game_deploy::add_to_instance(
+                            match agora_core::game_deploy::add_to_instance_while_running(
                                 ctx,
                                 &instance_id,
                                 &item_id,
+                                while_running,
                             ) {
                                 Ok(AddToInstance::Added {
                                     item_id: added_item,
@@ -9231,7 +9312,12 @@ async fn run_command(
                         instance_id,
                         item_id,
                     } => {
-                        match agora_core::game_deploy::remove_content(ctx, &instance_id, &item_id) {
+                        match agora_core::game_deploy::remove_content_while_running(
+                            ctx,
+                            &instance_id,
+                            &item_id,
+                            while_running,
+                        ) {
                             Ok(()) => {
                                 if json {
                                     let out = serde_json::json!({
@@ -9265,11 +9351,12 @@ async fn run_command(
                         instance_id,
                         item_id,
                     } => {
-                        match agora_core::game_deploy::set_content_enabled(
+                        match agora_core::game_deploy::set_content_enabled_while_running(
                             ctx,
                             &instance_id,
                             &item_id,
                             true,
+                            while_running,
                         ) {
                             Ok(()) => {
                                 if json {
@@ -9305,11 +9392,12 @@ async fn run_command(
                         instance_id,
                         item_id,
                     } => {
-                        match agora_core::game_deploy::set_content_enabled(
+                        match agora_core::game_deploy::set_content_enabled_while_running(
                             ctx,
                             &instance_id,
                             &item_id,
                             false,
+                            while_running,
                         ) {
                             Ok(()) => {
                                 if json {
@@ -9360,11 +9448,12 @@ async fn run_command(
                             std::process::exit(1);
                         }
                         let new_index = position - 1;
-                        match agora_core::game_deploy::move_content(
+                        match agora_core::game_deploy::move_content_while_running(
                             ctx,
                             &instance_id,
                             &item_id,
                             new_index,
+                            while_running,
                         ) {
                             Ok(()) => {
                                 if json {
@@ -9420,11 +9509,12 @@ async fn run_command(
                                 std::process::exit(1);
                             }
                         };
-                        match agora_core::game_deploy::set_content_own_copy(
+                        match agora_core::game_deploy::set_content_own_copy_while_running(
                             ctx,
                             &instance_id,
                             &item_id,
                             own_copy,
+                            while_running,
                         ) {
                             Ok(()) => {
                                 if json {
@@ -9537,7 +9627,13 @@ async fn run_command(
                     if !json {
                         println!("Deploying as '{mode}'.");
                     }
-                    match agora_core::game_deploy::deploy(ctx, &instance_id, game_def, mode) {
+                    match agora_core::game_deploy::deploy_while_running(
+                        ctx,
+                        &instance_id,
+                        game_def,
+                        mode,
+                        while_running,
+                    ) {
                         Ok(agora_core::game_deploy::DeployOutcome::UpToDate { plugins }) => {
                             if json {
                                 let out = serde_json::json!({
@@ -9625,7 +9721,11 @@ async fn run_command(
                     }
                 }
                 GameInstanceCmd::Undeploy { instance_id } => {
-                    match agora_core::game_deploy::undeploy(ctx, &instance_id) {
+                    match agora_core::game_deploy::undeploy_while_running(
+                        ctx,
+                        &instance_id,
+                        while_running,
+                    ) {
                         Ok(harvest) => {
                             if json {
                                 let out = serde_json::json!({
@@ -9821,10 +9921,11 @@ async fn run_command(
                             value,
                             unset,
                         },
+                        while_running,
                     )?;
                 }
                 GameInstanceCmd::Tools { action } => {
-                    instance_tools_command(ctx, json, action)?;
+                    instance_tools_command(ctx, json, action, while_running)?;
                 }
                 GameInstanceCmd::Rename { instance_id, name } => {
                     cli_games_parity::rename(ctx, json, &instance_id, &name)?
@@ -9874,7 +9975,7 @@ async fn run_command(
                     instance_id: None,
                     action: Some(order),
                 } if order.is_load_order_command() => {
-                    plugins_load_order_command(ctx, json, order)?;
+                    plugins_load_order_command(ctx, json, order, while_running)?;
                 }
                 GameInstanceCmd::Plugins {
                     instance_id,
@@ -9944,13 +10045,14 @@ async fn run_command(
                             }
                         }
                         Some((name, active)) => {
-                            match agora_core::game_plugins::set_active_in(
+                            match agora_core::game_plugins::set_active_in_while_running(
                                 ctx,
                                 &instance_id,
                                 game_def,
                                 list_id.as_deref(),
                                 &name,
                                 active,
+                                while_running,
                             ) {
                                 Ok(changed) => {
                                     let state = if active { "active" } else { "inactive" };
@@ -11833,6 +11935,7 @@ fn instance_tools_command(
     ctx: &agora_core::ctx::Ctx,
     json: bool,
     action: InstanceToolsCmd,
+    while_running: bool,
 ) -> anyhow::Result<()> {
     use agora_core::game_tools;
     use agora_game_api::ToolId;
@@ -11893,7 +11996,7 @@ fn instance_tools_command(
             let launcher = &agora_core::game_launch::SystemLauncher;
             // `confirmed` is passed true only on the paths below that showed the swap's costs and got a yes.
             let run_as = |capture: game_tools::CaptureMode, confirmed: bool| {
-                game_tools::run(
+                game_tools::run_while_running(
                     ctx,
                     &instance_id,
                     game_def,
@@ -11902,6 +12005,7 @@ fn instance_tools_command(
                     confirmed,
                     launcher,
                     &cancel,
+                    while_running,
                 )
             };
             let mut outcome = if capture == game_tools::CaptureMode::Swap {
@@ -12005,8 +12109,14 @@ fn instance_tools_command(
         }
         InstanceToolsCmd::Rollback { tool, .. } => {
             let tool = tool_id(&tool);
-            let state = game_tools::rollback(ctx, &instance_id, game_def, &tool)
-                .unwrap_or_else(|e| fail(e.to_string()));
+            let state = game_tools::rollback_while_running(
+                ctx,
+                &instance_id,
+                game_def,
+                &tool,
+                while_running,
+            )
+            .unwrap_or_else(|e| fail(e.to_string()));
             if json {
                 println!("{}", serde_json::to_string_pretty(&state)?);
             } else {
@@ -12020,8 +12130,9 @@ fn instance_tools_command(
         }
         InstanceToolsCmd::Remove { tool, .. } => {
             let tool = tool_id(&tool);
-            let removed = game_tools::remove(ctx, &instance_id, game_def, &tool)
-                .unwrap_or_else(|e| fail(e.to_string()));
+            let removed =
+                game_tools::remove_while_running(ctx, &instance_id, game_def, &tool, while_running)
+                    .unwrap_or_else(|e| fail(e.to_string()));
             if json {
                 let out = serde_json::json!({
                     "instance_id": instance_id,
@@ -12616,6 +12727,7 @@ fn ini_command(
     instance_id: &str,
     game_def: &agora_game_api::GameDefinition,
     request: IniRequest,
+    while_running: bool,
 ) -> anyhow::Result<()> {
     use agora_core::game_ini;
 
@@ -12692,8 +12804,15 @@ fn ini_command(
         if value.is_some() {
             fail("--unset takes no value".to_string());
         }
-        let changed = match game_ini::unset_value(ctx, instance_id, game_def, &file, &section, &key)
-        {
+        let changed = match game_ini::unset_value_while_running(
+            ctx,
+            instance_id,
+            game_def,
+            &file,
+            &section,
+            &key,
+            while_running,
+        ) {
             Ok(changed) => changed,
             Err(e) => fail(e.to_string()),
         };
@@ -12738,11 +12857,19 @@ fn ini_command(
         return Ok(());
     };
 
-    let changed =
-        match game_ini::set_value(ctx, instance_id, game_def, &file, &section, &key, &value) {
-            Ok(changed) => changed,
-            Err(e) => fail(e.to_string()),
-        };
+    let changed = match game_ini::set_value_while_running(
+        ctx,
+        instance_id,
+        game_def,
+        &file,
+        &section,
+        &key,
+        &value,
+        while_running,
+    ) {
+        Ok(changed) => changed,
+        Err(e) => fail(e.to_string()),
+    };
     if json {
         let out = serde_json::json!({
             "status": "ok",
@@ -13090,6 +13217,7 @@ fn plugins_load_order_command(
     ctx: &agora_core::ctx::Ctx,
     json: bool,
     cmd: InstancePluginsCmd,
+    while_running: bool,
 ) -> anyhow::Result<()> {
     use agora_core::game_load_order::{self as load_order, MoveTarget};
 
@@ -13143,12 +13271,13 @@ fn plugins_load_order_command(
     let locking = matches!(cmd, InstancePluginsCmd::Lock { .. });
     match cmd {
         InstancePluginsCmd::Sort { dry_run, .. } => {
-            match load_order::sort_and_order_in(
+            match load_order::sort_and_order_in_while_running(
                 ctx,
                 &instance_id,
                 game_def,
                 list_id.as_deref(),
                 dry_run,
+                while_running,
             ) {
                 Ok((report, order)) => {
                     if json {
@@ -13224,22 +13353,24 @@ fn plugins_load_order_command(
                 _ => fail("name one target: --to N, --before PLUGIN or --after PLUGIN".to_string()),
             };
             let result = if break_rule {
-                load_order::move_plugin_in_breaking_rules(
+                load_order::move_plugin_in_breaking_rules_while_running(
                     ctx,
                     &instance_id,
                     game_def,
                     list_id.as_deref(),
                     &plugin,
                     &target,
+                    while_running,
                 )
             } else {
-                load_order::move_plugin_in(
+                load_order::move_plugin_in_while_running(
                     ctx,
                     &instance_id,
                     game_def,
                     list_id.as_deref(),
                     &plugin,
                     &target,
+                    while_running,
                 )
             };
             match result {
@@ -13270,13 +13401,14 @@ fn plugins_load_order_command(
             }
         }
         InstancePluginsCmd::Lock { plugin, .. } | InstancePluginsCmd::Unlock { plugin, .. } => {
-            match agora_core::game_plugins::set_locked_in(
+            match agora_core::game_plugins::set_locked_in_while_running(
                 ctx,
                 &instance_id,
                 game_def,
                 list_id.as_deref(),
                 &plugin,
                 locking,
+                while_running,
             ) {
                 Ok(changed) => {
                     if json {
@@ -16324,6 +16456,7 @@ mod tests {
         fs::create_dir_all(&tmp).expect("create tmp");
 
         let ctx = CoreContext::for_testing(tmp.clone());
+        agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).expect("init db");
         let instance_dir = ctx.paths.instance_dir("test-instance").unwrap();
         fs::create_dir_all(instance_dir.join("mods")).expect("create mods dir");
         let mod_path = instance_dir.join("mods").join("test-mod.jar");
@@ -17315,6 +17448,7 @@ mod tests {
             )
             .expect("should parse");
             let Commands::Games {
+                while_running: _,
                 action:
                     crate::GamesCmd::Catalog {
                         action:
@@ -17364,6 +17498,7 @@ mod tests {
         .expect("should parse");
         match cli.command {
             Commands::Games {
+                while_running: _,
                 action:
                     GamesCmd::Instance {
                         action:
@@ -17396,6 +17531,7 @@ mod tests {
         .expect("should parse");
         match cli.command {
             Commands::Games {
+                while_running: _,
                 action:
                     GamesCmd::Instance {
                         action:

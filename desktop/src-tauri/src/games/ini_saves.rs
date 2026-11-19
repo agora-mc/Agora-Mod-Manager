@@ -145,14 +145,31 @@ pub async fn games_ini_set(
     section: String,
     key: String,
     value: Option<String>,
+    while_running: Option<bool>,
 ) -> Result<IniChange, GamesError> {
+    let while_running = while_running.unwrap_or(false);
     run_blocking(app, "Changing the INI file", move |ctx| {
         game_definition!(&ctx, &instance_id, definition);
         let changed = match &value {
-            Some(value) => {
-                game_ini::set_value(&ctx, &instance_id, definition, &file, &section, &key, value)
-            }
-            None => game_ini::unset_value(&ctx, &instance_id, definition, &file, &section, &key),
+            Some(value) => game_ini::set_value_while_running(
+                &ctx,
+                &instance_id,
+                definition,
+                &file,
+                &section,
+                &key,
+                value,
+                while_running,
+            ),
+            None => game_ini::unset_value_while_running(
+                &ctx,
+                &instance_id,
+                definition,
+                &file,
+                &section,
+                &key,
+                while_running,
+            ),
         }
         .map_err(core_failed)?;
         let files = game_ini::list_files(&ctx, &instance_id, definition).map_err(core_failed)?;
@@ -270,13 +287,28 @@ pub async fn games_mod_ini_set(
     section: String,
     key: String,
     value: Option<String>,
+    while_running: Option<bool>,
 ) -> Result<IniContents, GamesError> {
+    let while_running = while_running.unwrap_or(false);
     run_blocking(app, "Saving the mod INI file", move |ctx| {
         match &value {
-            Some(value) => {
-                game_mod_ini::set_mod_ini_value(&ctx, &instance_id, &path, &section, &key, value)
-            }
-            None => game_mod_ini::unset_mod_ini_value(&ctx, &instance_id, &path, &section, &key),
+            Some(value) => game_mod_ini::set_mod_ini_value_while_running(
+                &ctx,
+                &instance_id,
+                &path,
+                &section,
+                &key,
+                value,
+                while_running,
+            ),
+            None => game_mod_ini::unset_mod_ini_value_while_running(
+                &ctx,
+                &instance_id,
+                &path,
+                &section,
+                &key,
+                while_running,
+            ),
         }
         .map_err(core_failed)?;
         let read = game_mod_ini::read_mod_ini(&ctx, &instance_id, &path).map_err(core_failed)?;
@@ -291,9 +323,12 @@ pub async fn games_mod_ini_reset(
     app: tauri::AppHandle,
     instance_id: String,
     path: String,
+    while_running: Option<bool>,
 ) -> Result<Vec<ModIniRow>, GamesError> {
+    let while_running = while_running.unwrap_or(false);
     run_blocking(app, "Resetting the mod INI file", move |ctx| {
-        game_mod_ini::reset_mod_ini(&ctx, &instance_id, &path).map_err(core_failed)?;
+        game_mod_ini::reset_mod_ini_while_running(&ctx, &instance_id, &path, while_running)
+            .map_err(core_failed)?;
         let rows = game_mod_ini::list_mod_inis(&ctx, &instance_id).map_err(core_failed)?;
         Ok(mod_ini_rows(rows))
     })
@@ -306,9 +341,12 @@ pub async fn games_mod_ini_keep_game_version(
     app: tauri::AppHandle,
     instance_id: String,
     path: String,
+    while_running: Option<bool>,
 ) -> Result<Vec<ModIniRow>, GamesError> {
+    let while_running = while_running.unwrap_or(false);
     run_blocking(app, "Keeping the game's mod INI version", move |ctx| {
-        game_mod_ini::keep_game_version(&ctx, &instance_id, &path).map_err(core_failed)?;
+        game_mod_ini::keep_game_version_while_running(&ctx, &instance_id, &path, while_running)
+            .map_err(core_failed)?;
         let rows = game_mod_ini::list_mod_inis(&ctx, &instance_id).map_err(core_failed)?;
         Ok(mod_ini_rows(rows))
     })
@@ -321,9 +359,12 @@ pub async fn games_mod_ini_restore_mine(
     app: tauri::AppHandle,
     instance_id: String,
     path: String,
+    while_running: Option<bool>,
 ) -> Result<Vec<ModIniRow>, GamesError> {
+    let while_running = while_running.unwrap_or(false);
     run_blocking(app, "Restoring your mod INI version", move |ctx| {
-        game_mod_ini::restore_mine(&ctx, &instance_id, &path).map_err(core_failed)?;
+        game_mod_ini::restore_mine_while_running(&ctx, &instance_id, &path, while_running)
+            .map_err(core_failed)?;
         let rows = game_mod_ini::list_mod_inis(&ctx, &instance_id).map_err(core_failed)?;
         Ok(mod_ini_rows(rows))
     })

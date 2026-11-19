@@ -9,7 +9,7 @@ use crate::install_pipeline::{
     ProgressReporter, ResolvedInstallPlan, ResolvedOperation, ReverseDepInfo,
 };
 use crate::resolver::Resolver;
-use agora_core::{
+use ac::{
     artifact_hash::{is_sha256_hex, verify_download, ConfirmableHash, HashOrigin},
     ctx::Ctx,
     dependency_ops::AliasMap,
@@ -17,6 +17,8 @@ use agora_core::{
     models::{InstalledMod, InstanceManifest},
 };
 use std::path::PathBuf;
+
+use agora_core as ac;
 
 // ---------------------------------------------------------------------------
 // InstanceLoadResult
@@ -39,7 +41,10 @@ pub struct InstanceLoadResult {
 #[derive(Clone)]
 pub struct InstallService {
     ctx: Ctx,
-    providers: Option<agora_core::providers::ProviderRegistry>,
+    providers: Option<ac::providers::ProviderRegistry>,
+    /// The user's explicit answer to a running game: change the instance
+    /// anyway. The instance lock is still taken; see [`InstanceGuard`].
+    allow_while_running: bool,
 }
 
 impl InstallService {
@@ -47,25 +52,70 @@ impl InstallService {
         Self {
             ctx,
             providers: None,
+            allow_while_running: false,
+        }
+    }
+
+    /// Allow changes while the instance's game is running. Only for a caller
+    /// that has explicitly confirmed it (the CLI's `--while-running` flag or a
+    /// desktop confirmation); the instance lock is still taken.
+    pub fn while_running(mut self) -> Self {
+        self.allow_while_running = true;
+        self
+    }
+
+    fn mutation_guard(
+        &self,
+        instance_id: &str,
+        operation: &str,
+    ) -> LauncherResult<ac::instance_runtime::InstanceGuard> {
+        if self.allow_while_running {
+            ac::instance_runtime::InstanceGuard::for_mutation_while_running(
+                &self.ctx,
+                instance_id,
+                operation,
+            )
+        } else {
+            ac::instance_runtime::InstanceGuard::for_mutation(&self.ctx, instance_id, operation)
+        }
+    }
+
+    async fn mutation_guard_async(
+        &self,
+        instance_id: &str,
+        operation: &str,
+    ) -> LauncherResult<ac::instance_runtime::InstanceGuard> {
+        if self.allow_while_running {
+            ac::instance_runtime::InstanceGuard::for_mutation_while_running_async(
+                &self.ctx,
+                instance_id,
+                operation,
+            )
+            .await
+        } else {
+            ac::instance_runtime::InstanceGuard::for_mutation_async(
+                &self.ctx,
+                instance_id,
+                operation,
+            )
+            .await
         }
     }
 
     /// Resolve `SourceType::Provider` items against these providers. Without
     /// a registry, a provider item fails to resolve with a clear error rather
     /// than falling through to another source.
-    pub fn with_providers(mut self, providers: agora_core::providers::ProviderRegistry) -> Self {
+    pub fn with_providers(mut self, providers: ac::providers::ProviderRegistry) -> Self {
         self.providers = Some(providers);
         self
     }
 
     /// Validate instance ID and load its manifest + registry revision.
     pub fn load_instance(&self, instance_id: &str) -> LauncherResult<InstanceLoadResult> {
-        let sanitized = agora_core::paths::sanitize_id(instance_id);
-        agora_core::app_paths::validate_path_component(&sanitized).map_err(|_| {
-            LauncherError::Generic {
-                code: "ERR_INVALID_INSTANCE".into(),
-                message: "Invalid instance ID.".into(),
-            }
+        let sanitized = ac::paths::sanitize_id(instance_id);
+        ac::app_paths::validate_path_component(&sanitized).map_err(|_| LauncherError::Generic {
+            code: "ERR_INVALID_INSTANCE".into(),
+            message: "Invalid instance ID.".into(),
         })?;
         let instance_dir = self.ctx.paths.instance_dir(&sanitized)?;
         let manifest_path = self.ctx.paths.instance_manifest(&sanitized)?;
@@ -75,7 +125,7 @@ impl InstallService {
                 message: format!("Instance '{instance_id}' not found."),
             });
         }
-        let manifest = agora_core::helpers::read_manifest(&manifest_path)?;
+        let manifest = ac::helpers::read_manifest(&manifest_path)?;
         let registry_revision = self.compute_registry_revision()?;
         Ok(InstanceLoadResult {
             instance_dir,
@@ -113,7 +163,7 @@ impl InstallService {
             Some(target) => {
                 let aliases = AliasMap::from_pairs(&[]);
                 let installed: Vec<InstalledMod> = all_installed(manifest).cloned().collect();
-                let removal = agora_core::dependency_ops::build_removal_plan_with_aliases(
+                let removal = ac::dependency_ops::build_removal_plan_with_aliases(
                     &installed, target, &aliases,
                 );
                 (
@@ -165,7 +215,7 @@ impl InstallService {
             .filter(|value| !value.is_empty())
         {
             resolver = resolver.with_github_token(token);
-        } else if let Some(token) = agora_core::auth::get_token() {
+        } else if let Some(token) = ac::auth::get_token() {
             resolver = resolver.with_stored_github_token(token);
         }
         let prepared = resolver.resolve(&intent, &load.manifest).await?;
@@ -211,8 +261,23 @@ impl InstallService {
         let loader_service = crate::loader_service::LoaderService::new(self.ctx.clone());
         let download_cache =
             crate::download_cache::DownloadCache::new(self.ctx.paths.download_cache_dir());
+        let guard = match self
+            .mutation_guard_async(&plan.intent.target_instance, "install")
+            .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                return InstallOutcome::Failed {
+                    error: error.to_string(),
+                    rollback_performed: false,
+                    snapshot_id: None,
+                    hash_confirmation: None,
+                };
+            }
+        };
         InstallPipeline
             .execute_plan_with_scheduler(
+                &guard,
                 plan,
                 &load.instance_dir,
                 &load.registry_revision,
@@ -265,11 +330,11 @@ impl InstallService {
         plan: &mut ResolvedInstallPlan,
         manifest: &InstanceManifest,
     ) {
-        let conflicts =
-            match agora_core::registry::RegistryService::new(self.ctx.clone()).known_conflicts() {
-                Ok(conflicts) if !conflicts.is_empty() => conflicts,
-                _ => return,
-            };
+        let conflicts = match ac::registry::RegistryService::new(self.ctx.clone()).known_conflicts()
+        {
+            Ok(conflicts) if !conflicts.is_empty() => conflicts,
+            _ => return,
+        };
         plan.warnings
             .extend(curated_conflict_warnings(plan, manifest, &conflicts));
     }
@@ -280,7 +345,7 @@ impl InstallService {
     /// becomes a plan warning, so the review never says "nothing to check" when
     /// the check did not run. It never blocks the install.
     fn append_curator_warnings(&self, plan: &mut ResolvedInstallPlan) {
-        match agora_core::registry::RegistryService::new(self.ctx.clone()).curator_warnings() {
+        match ac::registry::RegistryService::new(self.ctx.clone()).curator_warnings() {
             Ok(warnings) => {
                 plan.warnings
                     .extend(curator_warning_plan_warnings(plan, &warnings));
@@ -311,13 +376,10 @@ impl InstallService {
         filename: &str,
         pinned: bool,
     ) -> LauncherResult<bool> {
-        let sanitized = agora_core::paths::sanitize_id(instance_id);
-        let _guard = self.ctx.lock_manager.acquire(
-            agora_core::lock_manager::LockResource::Instance(sanitized.clone()),
-            "set_update_pinned",
-        )?;
+        let sanitized = ac::paths::sanitize_id(instance_id);
+        let _guard = self.mutation_guard(&sanitized, "set_update_pinned")?;
         let manifest_path = self.ctx.paths.instance_manifest(&sanitized)?;
-        let mut manifest = agora_core::helpers::read_manifest(&manifest_path)?;
+        let mut manifest = ac::helpers::read_manifest(&manifest_path)?;
 
         let mut changed = false;
         for entry in manifest
@@ -334,7 +396,7 @@ impl InstallService {
             }
         }
         if changed {
-            agora_core::helpers::atomic_write_manifest(&manifest_path, &manifest)?;
+            ac::helpers::atomic_write_manifest(&manifest_path, &manifest)?;
             // The cached result was computed before this entry was pinned, so
             // it still counts toward the instance card's update badge. Drop it
             // and let the next check rebuild without the pinned entry. Failing
@@ -349,7 +411,7 @@ impl InstallService {
         if !manifest_path.exists() {
             return Ok(());
         }
-        let manifest = agora_core::helpers::read_manifest(&manifest_path)?;
+        let manifest = ac::helpers::read_manifest(&manifest_path)?;
         if manifest.is_locked {
             return Err(LauncherError::InstanceLocked);
         }
@@ -380,12 +442,13 @@ impl InstallService {
         self.check_not_locked(instance_id)?;
 
         let dir = self.ctx.paths.instance_dir(instance_id)?;
-        agora_core::helpers::check_disk_space(&dir)?;
+        ac::helpers::check_disk_space(&dir)?;
 
-        let bytes =
-            agora_core::download::download_mod_bytes(&self.ctx.http_clients, download_url).await?;
+        let bytes = ac::download::download_mod_bytes(&self.ctx.http_clients, download_url).await?;
+        let guard = self.mutation_guard(instance_id, "install_artifact")?;
 
         self.commit_verified_artifact(
+            &guard,
             instance_id,
             filename,
             content_type,
@@ -437,12 +500,13 @@ impl InstallService {
         self.check_not_locked(instance_id)?;
 
         let dir = self.ctx.paths.instance_dir(instance_id)?;
-        agora_core::helpers::check_disk_space(&dir)?;
+        ac::helpers::check_disk_space(&dir)?;
 
-        let bytes =
-            agora_core::download::download_mod_bytes(&self.ctx.http_clients, download_url).await?;
+        let bytes = ac::download::download_mod_bytes(&self.ctx.http_clients, download_url).await?;
+        let guard = self.mutation_guard(instance_id, "install_artifact")?;
 
         self.commit_verified_artifact(
+            &guard,
             instance_id,
             filename,
             content_type,
@@ -466,6 +530,7 @@ impl InstallService {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_verified_artifact(
         &self,
+        guard: &agora_core::instance_runtime::InstanceGuard,
         instance_id: &str,
         filename: &str,
         content_type: &str,
@@ -482,6 +547,14 @@ impl InstallService {
         accept_hash_confirmation: bool,
         bytes: Vec<u8>,
     ) -> LauncherResult<InstalledMod> {
+        if guard.instance_id() != instance_id {
+            return Err(LauncherError::Generic {
+                code: "ERR_INSTANCE_GUARD".into(),
+                message:
+                    "The instance guard authorises a different instance; nothing was installed."
+                        .into(),
+            });
+        }
         // The name becomes a path under the instance: it must be one portable
         // file name, whatever the source or the pack claims.
         if !agora_core::app_paths::is_safe_file_name(filename) {
@@ -681,6 +754,7 @@ impl InstallService {
     /// updates the manifest atomically.
     pub fn remove_artifact(&self, instance_id: &str, filename: &str) -> LauncherResult<bool> {
         self.check_not_locked(instance_id)?;
+        let _guard = self.mutation_guard(instance_id, "remove_artifact")?;
 
         if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
             return Err(LauncherError::Generic {
@@ -737,6 +811,7 @@ impl InstallService {
         source_path: &str,
     ) -> LauncherResult<InstalledMod> {
         self.check_not_locked(instance_id)?;
+        let _guard = self.mutation_guard(instance_id, "add_manual_artifact")?;
 
         let src = std::path::Path::new(source_path);
         let ext = src
@@ -887,7 +962,8 @@ impl InstallService {
         item_id: &str,
     ) -> LauncherResult<InstalledMod> {
         self.check_not_locked(instance_id)?;
-        crate::content_bridge::add_item_to_instance(&self.ctx, instance_id, item_id)
+        let guard = self.mutation_guard(instance_id, "install_stored_item")?;
+        crate::content_bridge::add_item_to_instance(&self.ctx, &guard, instance_id, item_id)
     }
 
     /// Convenience: resolve and immediately execute (one-shot).

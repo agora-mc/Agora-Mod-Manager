@@ -68,10 +68,17 @@ pub async fn instance_updates(
     instance: &str,
     apply: bool,
     yes: bool,
+    while_running: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let providers = provider_registry(ctx)?;
-    let service = InstallService::new(ctx.clone()).with_providers(providers.clone());
+    let service = if while_running {
+        InstallService::new(ctx.clone())
+            .with_providers(providers.clone())
+            .while_running()
+    } else {
+        InstallService::new(ctx.clone()).with_providers(providers.clone())
+    };
     // Refuse an unknown instance here, before any network work.
     service.load_instance(instance)?;
 
@@ -538,6 +545,7 @@ fn pack_resolutions(
 
 /// Apply a newer .mrpack. Refuses unless every conflict is answered and `yes`
 /// is given.
+#[allow(clippy::too_many_arguments)]
 pub async fn pack_update(
     ctx: &Ctx,
     instance: &str,
@@ -545,6 +553,7 @@ pub async fn pack_update(
     keep_ours: &[String],
     take_theirs: &[String],
     yes: bool,
+    while_running: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let (instance_dir, preview) = load_pack_preview(ctx, instance, mrpack)?;
@@ -573,6 +582,7 @@ pub async fn pack_update(
             &instance_dir,
             &mrpack,
             &resolutions,
+            while_running,
         )
     })
     .await

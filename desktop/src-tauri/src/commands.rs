@@ -1510,10 +1510,29 @@ async fn with_worlds<T: Send + 'static>(
     app: &tauri::AppHandle,
     op: impl FnOnce(agora_game_minecraft::worlds::WorldService) -> LauncherResult<T> + Send + 'static,
 ) -> LauncherResult<T> {
+    with_worlds_while_running(app, false, op).await
+}
+
+/// As [`with_worlds`], with the user's confirmed answer to a running game.
+/// Core still takes the instance lock; only the "game is running" check is
+/// overridden.
+async fn with_worlds_while_running<T: Send + 'static>(
+    app: &tauri::AppHandle,
+    while_running: bool,
+    op: impl FnOnce(agora_game_minecraft::worlds::WorldService) -> LauncherResult<T> + Send + 'static,
+) -> LauncherResult<T> {
     let ctx = crate::core_context(app)?;
-    tokio::task::spawn_blocking(move || op(agora_game_minecraft::worlds::WorldService::new(ctx)))
-        .await
-        .map_err(|_| LauncherError::LocalStateFailed)?
+    tokio::task::spawn_blocking(move || {
+        let service = agora_game_minecraft::worlds::WorldService::new(ctx);
+        let service = if while_running {
+            service.while_running()
+        } else {
+            service
+        };
+        op(service)
+    })
+    .await
+    .map_err(|_| LauncherError::LocalStateFailed)?
 }
 
 /// Worlds in an instance with name, mode, size and icon, most recent first.
@@ -1532,8 +1551,9 @@ pub async fn rename_world(
     instance_id: String,
     folder: String,
     name: String,
+    while_running: Option<bool>,
 ) -> LauncherResult<()> {
-    with_worlds(&app, move |worlds| {
+    with_worlds_while_running(&app, while_running.unwrap_or(false), move |worlds| {
         worlds.rename(&instance_id, &folder, &name)
     })
     .await
@@ -1545,8 +1565,12 @@ pub async fn copy_world(
     app: tauri::AppHandle,
     instance_id: String,
     folder: String,
+    while_running: Option<bool>,
 ) -> LauncherResult<String> {
-    with_worlds(&app, move |worlds| worlds.copy(&instance_id, &folder)).await
+    with_worlds_while_running(&app, while_running.unwrap_or(false), move |worlds| {
+        worlds.copy(&instance_id, &folder)
+    })
+    .await
 }
 
 /// Move a world to the system recycle bin.
@@ -1555,9 +1579,10 @@ pub async fn delete_world(
     app: tauri::AppHandle,
     instance_id: String,
     folder: String,
+    while_running: Option<bool>,
 ) -> LauncherResult<()> {
     let trash = crate::instances::trash_adapter();
-    with_worlds(&app, move |worlds| {
+    with_worlds_while_running(&app, while_running.unwrap_or(false), move |worlds| {
         worlds.delete(&instance_id, &folder, &trash)
     })
     .await
@@ -1570,6 +1595,7 @@ pub async fn export_world(
     app: tauri::AppHandle,
     instance_id: String,
     folder: String,
+    while_running: Option<bool>,
 ) -> LauncherResult<Option<String>> {
     let picked = rfd::AsyncFileDialog::new()
         .set_title("Export world")
@@ -1583,7 +1609,7 @@ pub async fn export_world(
     };
     let destination = handle.path().to_path_buf();
     let shown = destination.to_string_lossy().to_string();
-    with_worlds(&app, move |worlds| {
+    with_worlds_while_running(&app, while_running.unwrap_or(false), move |worlds| {
         worlds.export(&instance_id, &folder, &destination)
     })
     .await?;
@@ -1595,6 +1621,7 @@ pub async fn export_world(
 pub async fn import_world(
     app: tauri::AppHandle,
     instance_id: String,
+    while_running: Option<bool>,
 ) -> LauncherResult<Option<String>> {
     let picked = rfd::AsyncFileDialog::new()
         .set_title("Import world")
@@ -1605,9 +1632,11 @@ pub async fn import_world(
         return Ok(None);
     };
     let archive = handle.path().to_path_buf();
-    with_worlds(&app, move |worlds| worlds.import(&instance_id, &archive))
-        .await
-        .map(Some)
+    with_worlds_while_running(&app, while_running.unwrap_or(false), move |worlds| {
+        worlds.import(&instance_id, &archive)
+    })
+    .await
+    .map(Some)
 }
 
 /// Worlds and servers played most recently, for Home.
@@ -1684,8 +1713,9 @@ pub async fn add_server(
     instance_id: String,
     name: String,
     address: String,
+    while_running: Option<bool>,
 ) -> LauncherResult<()> {
-    with_worlds(&app, move |worlds| {
+    with_worlds_while_running(&app, while_running.unwrap_or(false), move |worlds| {
         worlds.add_server(&instance_id, &name, &address)
     })
     .await
@@ -1698,8 +1728,9 @@ pub async fn update_server(
     index: usize,
     name: String,
     address: String,
+    while_running: Option<bool>,
 ) -> LauncherResult<()> {
-    with_worlds(&app, move |worlds| {
+    with_worlds_while_running(&app, while_running.unwrap_or(false), move |worlds| {
         worlds.update_server(&instance_id, index, &name, &address)
     })
     .await
@@ -1710,8 +1741,9 @@ pub async fn remove_server(
     app: tauri::AppHandle,
     instance_id: String,
     index: usize,
+    while_running: Option<bool>,
 ) -> LauncherResult<()> {
-    with_worlds(&app, move |worlds| {
+    with_worlds_while_running(&app, while_running.unwrap_or(false), move |worlds| {
         worlds.remove_server(&instance_id, index)
     })
     .await
@@ -1903,8 +1935,9 @@ pub async fn move_server(
     instance_id: String,
     index: usize,
     offset: i32,
+    while_running: Option<bool>,
 ) -> LauncherResult<()> {
-    with_worlds(&app, move |worlds| {
+    with_worlds_while_running(&app, while_running.unwrap_or(false), move |worlds| {
         worlds.move_server(&instance_id, index, offset)
     })
     .await
@@ -4709,6 +4742,7 @@ pub async fn apply_pack_update(
         String,
         agora_game_minecraft::pack_update::ConflictResolution,
     >,
+    while_running: Option<bool>,
 ) -> LauncherResult<agora_game_minecraft::pack_update::PackUpdateOutcome> {
     let sanitized = paths::sanitize_id(&instance_id);
     let instance_dir =
@@ -4728,6 +4762,7 @@ pub async fn apply_pack_update(
                     &instance_dir,
                     std::path::Path::new(&mrpack_path),
                     &resolutions,
+                    while_running.unwrap_or(false),
                 )
             },
         )
@@ -5489,6 +5524,7 @@ pub async fn apply_loadout_profile(
             &sanitized,
             &definition,
             &profile_name,
+            false,
         )
         .map_err(|e| loadout_error(e.to_string())),
         None => agora_game_minecraft::loadout_service::LoadoutService::new(ctx).apply(
@@ -5955,47 +5991,18 @@ pub async fn resolve_install_plan(
     Ok(plan)
 }
 
-/// Atomic launch/process exclusion for install apply (SOL-2 §18.6 /
+/// One-active-install exclusion for install apply (SOL-2 §18.6 /
 /// MASTER_SPEC §23.3 / SAFETY_BOUNDARIES §6).
 ///
-/// MUST be called while holding the application state lock so a launch cannot
-/// race between this check and install registration. Rejects an install while
-/// the TARGET instance is running or a launch is being prepared, and enforces
-/// the one-active-install invariant.
+/// MUST be called while holding the application state lock so two applies
+/// cannot both register. "Is the instance busy with a game?" is *not* answered
+/// here: the core `InstanceGuard` every mutating service takes answers it once,
+/// for both adapters, and refuses a running game with a named error before the
+/// lock wait.
 fn ensure_install_apply_allowed(
     shared: &crate::state::AppState,
     instance_id: &str,
 ) -> LauncherResult<()> {
-    if shared
-        .running_processes
-        .values()
-        .any(|running| running.instance_id == instance_id)
-    {
-        return Err(LauncherError::Generic {
-            code: "ERR_INSTALL_PROCESS_ACTIVE".into(),
-            message: "This instance is running — stop it before installing.".into(),
-        });
-    }
-    {
-        if shared.launch_reservations.contains(instance_id) {
-            return Err(LauncherError::Generic {
-                code: "ERR_INSTALL_LAUNCH_RESERVED".into(),
-                message:
-                    "This instance is starting — wait for the launch to finish before installing."
-                        .into(),
-            });
-        }
-    }
-    // Delegated launches have no reservation; the target-aware marker covers
-    // the whole delegated session (SOL-2 §19.3).
-    if shared.active_launches.contains(instance_id) {
-        return Err(LauncherError::Generic {
-            code: "ERR_INSTALL_LAUNCH_ACTIVE".into(),
-            message:
-                "This instance is starting a launch — wait for it to finish before installing."
-                    .into(),
-        });
-    }
     if shared.active_install_instances.contains(instance_id) {
         return Err(LauncherError::Generic {
             code: "ERR_INSTALL_ACTIVE".into(),
@@ -8071,8 +8078,11 @@ mod command_helper_tests {
     };
     use crate::state::LauncherState;
 
+    /// The desktop no longer answers "is this instance busy?" itself: a running
+    /// process or launch marker is the core guard's business, and the adapter's
+    /// remaining check is the one-active-install invariant.
     #[test]
-    fn install_apply_rejects_running_target_instance() {
+    fn install_apply_leaves_running_and_launch_busy_to_the_core_guard() {
         let state = LauncherState::default();
         {
             let mut shared = state.blocking_lock();
@@ -8084,25 +8094,11 @@ mod command_helper_tests {
                     session_id: 1,
                 },
             );
-        }
-        let shared = state.blocking_lock();
-        let err = ensure_install_apply_allowed(&shared, "inst-a").unwrap_err();
-        assert_eq!(err.code(), "ERR_INSTALL_PROCESS_ACTIVE");
-        // A different instance is not blocked by the target check.
-        assert!(ensure_install_apply_allowed(&shared, "inst-b").is_ok());
-    }
-
-    #[test]
-    fn install_apply_rejects_launch_reservation_for_target() {
-        let state = LauncherState::default();
-        {
-            let mut shared = state.blocking_lock();
             shared.launch_reservations.insert("inst-a".into());
+            shared.active_launches.insert("inst-a".into());
         }
         let shared = state.blocking_lock();
-        let err = ensure_install_apply_allowed(&shared, "inst-a").unwrap_err();
-        assert_eq!(err.code(), "ERR_INSTALL_LAUNCH_RESERVED");
-        assert!(ensure_install_apply_allowed(&shared, "inst-b").is_ok());
+        assert!(ensure_install_apply_allowed(&shared, "inst-a").is_ok());
     }
 
     #[test]
@@ -8128,40 +8124,6 @@ mod command_helper_tests {
         let shared = state.blocking_lock();
         assert!(ensure_install_apply_allowed(&shared, "inst-a").is_ok());
         assert!(!shared.active_install_instances.contains("inst-a"));
-    }
-
-    #[test]
-    fn install_apply_rejects_after_running_process_clears_then_allows() {
-        let state = LauncherState::default();
-        {
-            let mut shared = state.blocking_lock();
-            shared.running_processes.insert(
-                2,
-                crate::state::RunningProcess {
-                    instance_id: "inst-a".into(),
-                    pid: 7,
-                    session_id: 2,
-                },
-            );
-        }
-        {
-            let shared = state.blocking_lock();
-            assert_eq!(
-                ensure_install_apply_allowed(&shared, "inst-a")
-                    .unwrap_err()
-                    .code(),
-                "ERR_INSTALL_PROCESS_ACTIVE"
-            );
-        }
-        // Process exits; apply is allowed and registers the marker.
-        {
-            let mut shared = state.blocking_lock();
-            shared.running_processes.clear();
-            ensure_install_apply_allowed(&shared, "inst-a").unwrap();
-            shared.active_install_instances.insert("inst-a".into());
-        }
-        let shared = state.blocking_lock();
-        assert!(shared.active_install_instances.contains("inst-a"));
     }
 
     // SOL-2 §19.3: launch admission is the inverse of install admission. A
@@ -8203,28 +8165,6 @@ mod command_helper_tests {
     }
 
     #[test]
-    fn install_apply_rejects_active_launch_marker_and_recovers_after_cleanup() {
-        let state = LauncherState::default();
-        {
-            let mut shared = state.blocking_lock();
-            shared.active_launches.insert("inst-a".into());
-        }
-        {
-            let shared = state.blocking_lock();
-            let err = ensure_install_apply_allowed(&shared, "inst-a").unwrap_err();
-            assert_eq!(err.code(), "ERR_INSTALL_LAUNCH_ACTIVE");
-        }
-        // Cancellation/completion removes the delegated launch marker; install
-        // apply is permitted again.
-        {
-            let mut shared = state.blocking_lock();
-            shared.active_launches.remove("inst-a");
-        }
-        let shared = state.blocking_lock();
-        assert!(ensure_install_apply_allowed(&shared, "inst-a").is_ok());
-    }
-
-    #[test]
     fn mutual_exclusion_both_directions_with_cleanup_then_retry() {
         // Install registers first: launch is rejected, then install cleanup
         // permits a launch.
@@ -8249,13 +8189,9 @@ mod command_helper_tests {
         }
         {
             let shared = state.blocking_lock();
-            // Install while the (delegated) launch marker is set is rejected.
-            assert_eq!(
-                ensure_install_apply_allowed(&shared, "inst-a")
-                    .unwrap_err()
-                    .code(),
-                "ERR_INSTALL_LAUNCH_ACTIVE"
-            );
+            // The launch marker no longer answers "busy" for install apply; the
+            // core guard answers it for the whole delegated session.
+            assert!(ensure_install_apply_allowed(&shared, "inst-a").is_ok());
             // Launch is permitted once the install is gone.
             assert!(ensure_launch_admitted(&shared, "inst-a").is_ok());
         }

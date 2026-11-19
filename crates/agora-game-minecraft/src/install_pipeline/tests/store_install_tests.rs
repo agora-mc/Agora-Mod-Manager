@@ -47,19 +47,29 @@ fn read_instance_manifest(dir: &Path) -> InstanceManifest {
 }
 
 fn run_store_plan(plan: &ResolvedInstallPlan, dir: &Path, ctx: &Ctx) -> InstallOutcome {
-    tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(InstallPipeline.execute_plan_with_scheduler(
-            plan,
-            dir,
-            "registry-rev",
-            &NoopReporter,
-            &CancellationToken::new(),
-            InstallExecutionResources {
-                content_store: Some(ctx),
-                ..Default::default()
-            },
-        ))
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let guard = agora_core::instance_runtime::InstanceGuard::for_mutation_async(
+            ctx,
+            &plan.intent.target_instance,
+            "test-install",
+        )
+        .await
+        .unwrap();
+        InstallPipeline
+            .execute_plan_with_scheduler(
+                &guard,
+                plan,
+                dir,
+                "registry-rev",
+                &NoopReporter,
+                &CancellationToken::new(),
+                InstallExecutionResources {
+                    content_store: Some(ctx),
+                    ..Default::default()
+                },
+            )
+            .await
+    })
 }
 
 fn write_mod_jar(dir: &Path, id: &str, version: &str) -> std::path::PathBuf {
@@ -404,6 +414,42 @@ fn a_mod_deleted_by_hand_can_be_installed_again() {
 }
 
 #[test]
+fn two_concurrent_direct_installs_keep_both_manifest_entries() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, dir) = ctx_instance(&tmp, "test");
+    let alpha = write_mod_jar(tmp.path(), "alpha", "1.0.0");
+    let beta = write_mod_jar(tmp.path(), "beta", "1.0.0");
+
+    let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let handles: Vec<_> = [(alpha, "alpha"), (beta, "beta")]
+        .into_iter()
+        .map(|(source, name)| {
+            let ctx = ctx.clone();
+            let start = std::sync::Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                crate::install_service::InstallService::new(ctx)
+                    .add_manual_artifact("test", source.to_str().unwrap())
+                    .unwrap_or_else(|error| panic!("{name} install failed: {error}"));
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let names: std::collections::HashSet<String> = read_instance_manifest(&dir)
+        .mods
+        .into_iter()
+        .map(|entry| entry.filename)
+        .collect();
+    assert!(
+        names.contains("alpha-1.0.0.jar") && names.contains("beta-1.0.0.jar"),
+        "an install was lost: {names:?}"
+    );
+}
+
+#[test]
 fn a_direct_artifact_install_links_from_the_store() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (ctx, dir) = ctx_instance(&tmp, "test");
@@ -411,9 +457,13 @@ fn a_direct_artifact_install_links_from_the_store() {
     let bytes = std::fs::read(&source).unwrap();
     let sha = super::sha256_hex(&bytes);
     let service = crate::install_service::InstallService::new(ctx.clone());
+    let guard =
+        agora_core::instance_runtime::InstanceGuard::for_mutation(&ctx, "test", "test-commit")
+            .unwrap();
 
     let installed = service
         .commit_verified_artifact(
+            &guard,
             "test",
             "manual.jar",
             "mod",
@@ -513,12 +563,16 @@ fn catalog_and_modrinth_provenance_survive_an_offline_add() {
     )
     .unwrap();
     let service = crate::install_service::InstallService::new(ctx.clone());
+    let guard =
+        agora_core::instance_runtime::InstanceGuard::for_mutation(&ctx, "first", "test-commit")
+            .unwrap();
 
     let catalog_jar = write_mod_jar(tmp.path(), "catalog-mod", "1.0.0");
     let catalog_bytes = std::fs::read(&catalog_jar).unwrap();
     let catalog_sha = super::sha256_hex(&catalog_bytes);
     let catalog = service
         .commit_verified_artifact(
+            &guard,
             "first",
             "catalog.jar",
             "mod",
@@ -542,6 +596,7 @@ fn catalog_and_modrinth_provenance_survive_an_offline_add() {
     let raw_sha = super::sha256_hex(&raw_bytes);
     let raw = service
         .commit_verified_artifact(
+            &guard,
             "first",
             "raw.jar",
             "mod",
@@ -853,8 +908,12 @@ fn review_remove_never_deletes_a_same_named_file_in_another_folder() {
     let bytes = std::fs::read(&source).unwrap();
     let sha = super::sha256_hex(&bytes);
     let service = crate::install_service::InstallService::new(ctx.clone());
+    let guard =
+        agora_core::instance_runtime::InstanceGuard::for_mutation(&ctx, "test", "test-commit")
+            .unwrap();
     service
         .commit_verified_artifact(
+            &guard,
             "test",
             "Pack.zip",
             "shader",

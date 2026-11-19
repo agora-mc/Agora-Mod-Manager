@@ -21,7 +21,7 @@ use crate::content_store::protect;
 use crate::ctx::Ctx;
 use crate::game_base::{get_modified_unix_ms, BaseManifest};
 use crate::game_discovery::volume::VolumeDetector;
-use crate::lock_manager::LockResource;
+use crate::instance_runtime::InstanceGuard;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1472,14 +1472,48 @@ pub fn deployment_dir(ctx: &Ctx, instance_id: &str) -> Result<Option<PathBuf>, D
     }
 }
 
+fn guard_for(
+    ctx: &Ctx,
+    instance_id: &str,
+    operation: &str,
+    allow_while_running: bool,
+) -> Result<InstanceGuard, DeployError> {
+    if allow_while_running {
+        Ok(InstanceGuard::for_mutation_while_running(
+            ctx,
+            instance_id,
+            operation,
+        )?)
+    } else {
+        Ok(InstanceGuard::for_mutation(ctx, instance_id, operation)?)
+    }
+}
+
 pub fn deploy(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
     mode: DeployMode,
 ) -> Result<DeployOutcome, DeployError> {
-    let (outcome, _plan) =
-        deploy_checked::<DeployError>(ctx, instance_id, definition, mode, |_| Ok(()))??;
+    deploy_while_running(ctx, instance_id, definition, mode, false)
+}
+
+/// [`deploy`], with the user's explicit answer to a running game.
+pub fn deploy_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    mode: DeployMode,
+    allow_while_running: bool,
+) -> Result<DeployOutcome, DeployError> {
+    let (outcome, _plan) = deploy_checked_while_running::<DeployError>(
+        ctx,
+        instance_id,
+        definition,
+        mode,
+        allow_while_running,
+        |_| Ok(()),
+    )??;
     Ok(outcome)
 }
 
@@ -1494,13 +1528,32 @@ pub(crate) fn deploy_checked<E>(
     mode: DeployMode,
     before_build: impl FnOnce(&DeploymentPlan) -> Result<(), E>,
 ) -> Result<Result<(DeployOutcome, DeploymentPlan), DeployError>, E> {
-    let _lock = match ctx
-        .lock_manager
-        .acquire(LockResource::Instance(instance_id.to_string()), "deploy")
-    {
-        Ok(lock) => lock,
-        Err(e) => return Ok(Err(e.into())),
+    deploy_checked_while_running(ctx, instance_id, definition, mode, false, before_build)
+}
+
+pub(crate) fn deploy_checked_while_running<E>(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    mode: DeployMode,
+    allow_while_running: bool,
+    before_build: impl FnOnce(&DeploymentPlan) -> Result<(), E>,
+) -> Result<Result<(DeployOutcome, DeploymentPlan), DeployError>, E> {
+    let guard = match guard_for(ctx, instance_id, "deploy", allow_while_running) {
+        Ok(guard) => guard,
+        Err(error) => return Ok(Err(error)),
     };
+    deploy_checked_locked(ctx, &guard, definition, mode, before_build)
+}
+
+pub(crate) fn deploy_checked_locked<E>(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    mode: DeployMode,
+    before_build: impl FnOnce(&DeploymentPlan) -> Result<(), E>,
+) -> Result<Result<(DeployOutcome, DeploymentPlan), DeployError>, E> {
+    let instance_id = guard.instance_id();
     // An interrupted tool swap is put back before anything is deployed (MASTER_SPEC §26.9).
     if let Err(e) = crate::game_tool_swap::recover_game(ctx, definition) {
         return Ok(Err(DeployError::Other(e.to_string())));
@@ -1512,11 +1565,11 @@ pub(crate) fn deploy_checked<E>(
 /// whole run, and the lock is not re-entrant.
 pub(crate) fn deploy_locked(
     ctx: &Ctx,
-    instance_id: &str,
+    guard: &InstanceGuard,
     definition: &GameDefinition,
     mode: DeployMode,
 ) -> Result<DeployOutcome, DeployError> {
-    deploy_locked_with_copy(ctx, instance_id, definition, mode, None)
+    deploy_locked_with_copy(ctx, guard.instance_id(), definition, mode, None)
 }
 
 /// What [`place_files`] did: the counts, and the record of each file as the folder now holds it.
@@ -2232,6 +2285,27 @@ pub(crate) fn sync_view_orders(
     instance_id: &str,
     definition: &GameDefinition,
 ) -> Result<(), DeployError> {
+    sync_view_orders_while_running(ctx, instance_id, definition, false)
+}
+
+/// [`sync_view_orders`], with the user's explicit answer to a running game.
+pub(crate) fn sync_view_orders_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    allow_while_running: bool,
+) -> Result<(), DeployError> {
+    let guard = guard_for(ctx, instance_id, "view-load-order", allow_while_running)?;
+    sync_view_orders_with_guard(ctx, &guard, definition)
+}
+
+/// [`sync_view_orders`] for a caller that already holds the instance guard.
+pub(crate) fn sync_view_orders_with_guard(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+) -> Result<(), DeployError> {
+    let instance_id = guard.instance_id();
     if !definition
         .load_orders
         .iter()
@@ -2239,10 +2313,6 @@ pub(crate) fn sync_view_orders(
     {
         return Ok(());
     }
-    let _lock = ctx.lock_manager.acquire(
-        LockResource::Instance(instance_id.to_string()),
-        "view-load-order",
-    )?;
     let target = deploy_target(ctx, instance_id)?;
     sync_view_orders_locked(ctx, instance_id, definition, &target)
 }
@@ -2301,14 +2371,25 @@ fn activate_plugins(
 }
 
 pub fn undeploy(ctx: &Ctx, instance_id: &str) -> Result<HarvestReport, DeployError> {
-    let _lock = ctx
-        .lock_manager
-        .acquire(LockResource::Instance(instance_id.to_string()), "undeploy")?;
-    undeploy_locked(ctx, instance_id)
+    undeploy_while_running(ctx, instance_id, false)
 }
 
-/// [`undeploy`] with the instance's lock already held.
-pub(crate) fn undeploy_locked(ctx: &Ctx, instance_id: &str) -> Result<HarvestReport, DeployError> {
+/// [`undeploy`], with the user's explicit answer to a running game.
+pub fn undeploy_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    allow_while_running: bool,
+) -> Result<HarvestReport, DeployError> {
+    let guard = guard_for(ctx, instance_id, "undeploy", allow_while_running)?;
+    undeploy_locked(ctx, &guard)
+}
+
+/// [`undeploy`] with the instance's guard already held.
+pub(crate) fn undeploy_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+) -> Result<HarvestReport, DeployError> {
+    let instance_id = guard.instance_id();
     let manifest = crate::game_instance::get_manifest(ctx, instance_id).map_err(|e| match e {
         crate::game_instance::InstanceError::NotFound(id) => DeployError::InstanceNotFound(id),
         other => DeployError::Other(other.to_string()),
@@ -3174,11 +3255,38 @@ pub fn add_content(
     mount_path: Option<&str>,
     source_path: Option<&str>,
 ) -> Result<Layer, DeployError> {
-    let _lock = ctx.lock_manager.acquire(
-        LockResource::Instance(instance_id.to_string()),
-        "content-add",
-    )?;
+    add_content_while_running(
+        ctx,
+        instance_id,
+        item_id_or_prefix,
+        mount_path,
+        source_path,
+        false,
+    )
+}
 
+/// [`add_content`], with the user's explicit answer to a running game.
+pub fn add_content_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    item_id_or_prefix: &str,
+    mount_path: Option<&str>,
+    source_path: Option<&str>,
+    allow_while_running: bool,
+) -> Result<Layer, DeployError> {
+    let guard = guard_for(ctx, instance_id, "content-add", allow_while_running)?;
+    add_content_locked(ctx, &guard, item_id_or_prefix, mount_path, source_path)
+}
+
+/// [`add_content`] for a caller that already holds the instance guard.
+pub fn add_content_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    item_id_or_prefix: &str,
+    mount_path: Option<&str>,
+    source_path: Option<&str>,
+) -> Result<Layer, DeployError> {
+    let instance_id = guard.instance_id();
     let item_id = crate::content_store::resolve_item_id(ctx, item_id_or_prefix)?;
     let _item = crate::content_store::get_item(ctx, &item_id)?;
 
@@ -3436,6 +3544,28 @@ pub fn add_to_instance(
     instance_id: &str,
     item_id: &str,
 ) -> Result<AddToInstance, AddToInstanceError> {
+    add_to_instance_while_running(ctx, instance_id, item_id, false)
+}
+
+/// [`add_to_instance`], with the user's explicit answer to a running game.
+pub fn add_to_instance_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    item_id: &str,
+    allow_while_running: bool,
+) -> Result<AddToInstance, AddToInstanceError> {
+    let guard = guard_for(ctx, instance_id, "content-add", allow_while_running)
+        .map_err(AddToInstanceError::Deploy)?;
+    add_to_instance_locked(ctx, &guard, item_id)
+}
+
+/// [`add_to_instance`] for a caller that already holds the instance guard.
+pub fn add_to_instance_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    item_id: &str,
+) -> Result<AddToInstance, AddToInstanceError> {
+    let instance_id = guard.instance_id();
     let manifest = crate::game_instance::get_manifest(ctx, instance_id)?;
     let game = ctx
         .games
@@ -3455,7 +3585,7 @@ pub fn add_to_instance(
     if layout.thunderstore_bepinex {
         if let Some(package) = crate::content_thunderstore::parse_manifest(ctx, item_id)? {
             let outcome =
-                crate::content_thunderstore::install_thunderstore(ctx, instance_id, item_id)?;
+                crate::content_thunderstore::install_thunderstore_locked(ctx, guard, item_id)?;
             return Ok(AddToInstance::Added {
                 item_id: outcome.derived_item.item_id.clone(),
                 layer: Box::new(outcome.layer),
@@ -3500,7 +3630,7 @@ pub fn add_to_instance(
         } => {
             let mount = (!mount_path.is_empty()).then_some(mount_path.as_str());
             let source = (!source_path.is_empty()).then_some(source_path.as_str());
-            let layer = add_content(ctx, instance_id, item_id, mount, source)?;
+            let layer = add_content_locked(ctx, guard, item_id, mount, source)?;
             Ok(AddToInstance::Added {
                 item_id: item_id.to_string(),
                 layer: Box::new(layer),
@@ -3529,11 +3659,27 @@ pub fn set_deployment(
     instance_id: &str,
     mode: Option<DeployMode>,
 ) -> Result<(), DeployError> {
-    let _lock = ctx.lock_manager.acquire(
-        LockResource::Instance(instance_id.to_string()),
-        "set-deployment",
-    )?;
+    set_deployment_while_running(ctx, instance_id, mode, false)
+}
 
+/// [`set_deployment`], with the user's explicit answer to a running game.
+pub fn set_deployment_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    mode: Option<DeployMode>,
+    allow_while_running: bool,
+) -> Result<(), DeployError> {
+    let guard = guard_for(ctx, instance_id, "set-deployment", allow_while_running)?;
+    set_deployment_locked(ctx, &guard, mode)
+}
+
+/// [`set_deployment`] for a caller that already holds the instance guard.
+pub fn set_deployment_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    mode: Option<DeployMode>,
+) -> Result<(), DeployError> {
+    let instance_id = guard.instance_id();
     let mut manifest =
         crate::game_instance::get_manifest(ctx, instance_id).map_err(|e| match e {
             crate::game_instance::InstanceError::NotFound(id) => DeployError::InstanceNotFound(id),
@@ -3581,11 +3727,27 @@ pub fn remove_content(
     instance_id: &str,
     item_id_or_prefix: &str,
 ) -> Result<(), DeployError> {
-    let _lock = ctx.lock_manager.acquire(
-        LockResource::Instance(instance_id.to_string()),
-        "content-remove",
-    )?;
+    remove_content_while_running(ctx, instance_id, item_id_or_prefix, false)
+}
 
+/// [`remove_content`], with the user's explicit answer to a running game.
+pub fn remove_content_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    item_id_or_prefix: &str,
+    allow_while_running: bool,
+) -> Result<(), DeployError> {
+    let guard = guard_for(ctx, instance_id, "content-remove", allow_while_running)?;
+    remove_content_locked(ctx, &guard, item_id_or_prefix)
+}
+
+/// [`remove_content`] for a caller that already holds the instance guard.
+pub fn remove_content_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    item_id_or_prefix: &str,
+) -> Result<(), DeployError> {
+    let instance_id = guard.instance_id();
     let mut manifest =
         crate::game_instance::get_manifest(ctx, instance_id).map_err(|e| match e {
             crate::game_instance::InstanceError::NotFound(id) => DeployError::InstanceNotFound(id),
@@ -3608,11 +3770,29 @@ pub fn set_content_enabled(
     item_id_or_prefix: &str,
     enabled: bool,
 ) -> Result<(), DeployError> {
-    let _lock = ctx.lock_manager.acquire(
-        LockResource::Instance(instance_id.to_string()),
-        "content-enable",
-    )?;
+    set_content_enabled_while_running(ctx, instance_id, item_id_or_prefix, enabled, false)
+}
 
+/// [`set_content_enabled`], with the user's explicit answer to a running game.
+pub fn set_content_enabled_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    item_id_or_prefix: &str,
+    enabled: bool,
+    allow_while_running: bool,
+) -> Result<(), DeployError> {
+    let guard = guard_for(ctx, instance_id, "content-enable", allow_while_running)?;
+    set_content_enabled_locked(ctx, &guard, item_id_or_prefix, enabled)
+}
+
+/// [`set_content_enabled`] for a caller that already holds the instance guard.
+pub fn set_content_enabled_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    item_id_or_prefix: &str,
+    enabled: bool,
+) -> Result<(), DeployError> {
+    let instance_id = guard.instance_id();
     let mut manifest =
         crate::game_instance::get_manifest(ctx, instance_id).map_err(|e| match e {
             crate::game_instance::InstanceError::NotFound(id) => DeployError::InstanceNotFound(id),
@@ -3635,11 +3815,29 @@ pub fn set_content_own_copy(
     item_id_or_prefix: &str,
     own_copy: bool,
 ) -> Result<(), DeployError> {
-    let _lock = ctx.lock_manager.acquire(
-        LockResource::Instance(instance_id.to_string()),
-        "content-own-copy",
-    )?;
+    set_content_own_copy_while_running(ctx, instance_id, item_id_or_prefix, own_copy, false)
+}
 
+/// [`set_content_own_copy`], with the user's explicit answer to a running game.
+pub fn set_content_own_copy_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    item_id_or_prefix: &str,
+    own_copy: bool,
+    allow_while_running: bool,
+) -> Result<(), DeployError> {
+    let guard = guard_for(ctx, instance_id, "content-own-copy", allow_while_running)?;
+    set_content_own_copy_locked(ctx, &guard, item_id_or_prefix, own_copy)
+}
+
+/// [`set_content_own_copy`] for a caller that already holds the instance guard.
+pub fn set_content_own_copy_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    item_id_or_prefix: &str,
+    own_copy: bool,
+) -> Result<(), DeployError> {
+    let instance_id = guard.instance_id();
     let mut manifest =
         crate::game_instance::get_manifest(ctx, instance_id).map_err(|e| match e {
             crate::game_instance::InstanceError::NotFound(id) => DeployError::InstanceNotFound(id),
@@ -3662,11 +3860,29 @@ pub fn move_content(
     item_id_or_prefix: &str,
     new_index: usize,
 ) -> Result<(), DeployError> {
-    let _lock = ctx.lock_manager.acquire(
-        LockResource::Instance(instance_id.to_string()),
-        "content-move",
-    )?;
+    move_content_while_running(ctx, instance_id, item_id_or_prefix, new_index, false)
+}
 
+/// [`move_content`], with the user's explicit answer to a running game.
+pub fn move_content_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    item_id_or_prefix: &str,
+    new_index: usize,
+    allow_while_running: bool,
+) -> Result<(), DeployError> {
+    let guard = guard_for(ctx, instance_id, "content-move", allow_while_running)?;
+    move_content_locked(ctx, &guard, item_id_or_prefix, new_index)
+}
+
+/// [`move_content`] for a caller that already holds the instance guard.
+pub fn move_content_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    item_id_or_prefix: &str,
+    new_index: usize,
+) -> Result<(), DeployError> {
+    let instance_id = guard.instance_id();
     let mut manifest =
         crate::game_instance::get_manifest(ctx, instance_id).map_err(|e| match e {
             crate::game_instance::InstanceError::NotFound(id) => DeployError::InstanceNotFound(id),

@@ -256,7 +256,7 @@ fn a_loadout_ini_entry_cannot_reach_outside_the_instance() {
     };
     game_loadout::save_game_profile(&h.ctx, "reach", "reach", state).unwrap();
 
-    let applied = game_loadout::apply_game_profile_with_undo(&h.ctx, "reach", &def, "reach");
+    let applied = game_loadout::apply_game_profile_with_undo(&h.ctx, "reach", &def, "reach", false);
 
     assert!(
         !written.exists(),

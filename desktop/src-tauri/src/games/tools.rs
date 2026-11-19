@@ -617,13 +617,34 @@ pub async fn games_tools_save_inputs(
     instance_id: String,
     tool_id: String,
     values: std::collections::BTreeMap<String, String>,
+    while_running: Option<bool>,
 ) -> Result<(), GamesError> {
     let tool = tool_id_of(&tool_id)?;
+    let while_running = while_running.unwrap_or(false);
     with_ctx(app, move |ctx| {
         let game = definition_of(&ctx, &instance_id)?;
         for (input_id, value) in values {
-            game_tools::save_tool_input(&ctx, &instance_id, &game, &tool, &input_id, &value)
+            if value.trim().is_empty() {
+                game_tools::clear_tool_input_while_running(
+                    &ctx,
+                    &instance_id,
+                    &tool,
+                    &input_id,
+                    while_running,
+                )
                 .map_err(core_error)?;
+            } else {
+                game_tools::set_tool_input_while_running(
+                    &ctx,
+                    &instance_id,
+                    &game,
+                    &tool,
+                    &input_id,
+                    &value,
+                    while_running,
+                )
+                .map_err(core_error)?;
+            }
         }
         Ok(())
     })
@@ -633,6 +654,7 @@ pub async fn games_tools_save_inputs(
 /// Run a tool in the instance. `refusal` is the reason the virtual file system gave, when the user has
 /// chosen the tier that runs instead of it; `confirm_swap` says the swap's costs were shown and accepted.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn games_tools_run(
     app: tauri::AppHandle,
     instance_id: String,
@@ -641,15 +663,17 @@ pub async fn games_tools_run(
     refusal: Option<String>,
     confirm_swap: bool,
     item_id: Option<String>,
+    while_running: Option<bool>,
 ) -> Result<RunResult, GamesError> {
     let tool = tool_id_of(&tool_id)?;
     let capture = parse_capture(&capture)?;
     require_named_refusal(refusal.as_deref())?;
+    let while_running = while_running.unwrap_or(false);
     with_ctx(app, move |ctx| {
         let game = definition_of(&ctx, &instance_id)?;
         let cancel = CancellationToken::new();
         let result = match (item_id.as_deref(), refusal) {
-            (Some(item), _) => game_tools::run_for_item(
+            (Some(item), _) => game_tools::run_for_item_while_running(
                 &ctx,
                 &instance_id,
                 &game,
@@ -659,8 +683,9 @@ pub async fn games_tools_run(
                 confirm_swap,
                 &SystemLauncher,
                 &cancel,
+                while_running,
             ),
-            (None, Some(reason)) => game_tools::run_after_vfs_refusal(
+            (None, Some(reason)) => game_tools::run_after_vfs_refusal_while_running(
                 &ctx,
                 &instance_id,
                 &game,
@@ -670,8 +695,9 @@ pub async fn games_tools_run(
                 &reason,
                 &SystemLauncher,
                 &cancel,
+                while_running,
             ),
-            (None, None) => game_tools::run(
+            (None, None) => game_tools::run_while_running(
                 &ctx,
                 &instance_id,
                 &game,
@@ -680,6 +706,7 @@ pub async fn games_tools_run(
                 confirm_swap,
                 &SystemLauncher,
                 &cancel,
+                while_running,
             ),
         };
         run_reply(result)
@@ -693,11 +720,14 @@ pub async fn games_tools_rollback(
     app: tauri::AppHandle,
     instance_id: String,
     tool_id: String,
+    while_running: Option<bool>,
 ) -> Result<ToolsView, GamesError> {
     let tool = tool_id_of(&tool_id)?;
+    let while_running = while_running.unwrap_or(false);
     with_ctx(app, move |ctx| {
         let game = definition_of(&ctx, &instance_id)?;
-        game_tools::rollback(&ctx, &instance_id, &game, &tool).map_err(core_error)?;
+        game_tools::rollback_while_running(&ctx, &instance_id, &game, &tool, while_running)
+            .map_err(core_error)?;
         view_of(&ctx, &instance_id, &game)
     })
     .await
@@ -709,12 +739,15 @@ pub async fn games_tools_remove(
     app: tauri::AppHandle,
     instance_id: String,
     tool_id: String,
+    while_running: Option<bool>,
 ) -> Result<RemoveReply, GamesError> {
     let tool = tool_id_of(&tool_id)?;
+    let while_running = while_running.unwrap_or(false);
     with_ctx(app, move |ctx| {
         let game = definition_of(&ctx, &instance_id)?;
         let removed_generations =
-            game_tools::remove(&ctx, &instance_id, &game, &tool).map_err(core_error)?;
+            game_tools::remove_while_running(&ctx, &instance_id, &game, &tool, while_running)
+                .map_err(core_error)?;
         let view = view_of(&ctx, &instance_id, &game)?;
         Ok(RemoveReply {
             removed_generations,
@@ -814,9 +847,11 @@ pub async fn games_user_tools_add(
     output_is_mod: bool,
     output_folder: Option<String>,
     keeps_output: bool,
+    while_running: Option<bool>,
 ) -> Result<UserToolRow, GamesError> {
+    let while_running = while_running.unwrap_or(false);
     with_ctx(app, move |ctx| {
-        let tool = game_user_tools::add(
+        let tool = game_user_tools::add_while_running(
             &ctx,
             &instance_id,
             NewUserTool {
@@ -827,6 +862,7 @@ pub async fn games_user_tools_add(
                 output_folder,
                 keeps_output,
             },
+            while_running,
         )
         .map_err(core_error)?;
         // `add` accepts only an executable that is there, so a new tool is never missing.
@@ -841,9 +877,12 @@ pub async fn games_user_tools_remove(
     app: tauri::AppHandle,
     instance_id: String,
     id: String,
+    while_running: Option<bool>,
 ) -> Result<UserToolsView, GamesError> {
+    let while_running = while_running.unwrap_or(false);
     with_ctx(app, move |ctx| {
-        game_user_tools::remove(&ctx, &instance_id, &id).map_err(core_error)?;
+        game_user_tools::remove_while_running(&ctx, &instance_id, &id, while_running)
+            .map_err(core_error)?;
         user_tools_of(&ctx, &instance_id)
     })
     .await
@@ -907,12 +946,21 @@ pub async fn games_tools_use_output(
     instance_id: String,
     tool_id: String,
     item_id: String,
+    while_running: Option<bool>,
 ) -> Result<Vec<ToolOutputRow>, GamesError> {
     let tool = tool_id_of(&tool_id)?;
+    let while_running = while_running.unwrap_or(false);
     with_ctx(app, move |ctx| {
         let game = definition_of(&ctx, &instance_id)?;
-        let records = game_tools::use_tool_output(&ctx, &instance_id, &game, &tool, &item_id)
-            .map_err(core_error)?;
+        let records = game_tools::use_tool_output_while_running(
+            &ctx,
+            &instance_id,
+            &game,
+            &tool,
+            &item_id,
+            while_running,
+        )
+        .map_err(core_error)?;
         Ok(output_rows(records))
     })
     .await
@@ -920,6 +968,7 @@ pub async fn games_tools_use_output(
 
 /// Run one of the person's own tools through the same pipeline as a declared one.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn games_user_tools_run(
     app: tauri::AppHandle,
     instance_id: String,
@@ -928,14 +977,16 @@ pub async fn games_user_tools_run(
     refusal: Option<String>,
     confirm_swap: bool,
     move_aside: bool,
+    while_running: Option<bool>,
 ) -> Result<RunResult, GamesError> {
     let capture = parse_capture(&capture)?;
     require_named_refusal(refusal.as_deref())?;
+    let while_running = while_running.unwrap_or(false);
     with_ctx(app, move |ctx| {
         let game = definition_of(&ctx, &instance_id)?;
         let cancel = CancellationToken::new();
         let result = match refusal {
-            Some(reason) => game_tools::run_user_tool_after_vfs_refusal(
+            Some(reason) => game_tools::run_user_tool_after_vfs_refusal_while_running(
                 &ctx,
                 &instance_id,
                 &game,
@@ -946,8 +997,9 @@ pub async fn games_user_tools_run(
                 move_aside,
                 &SystemLauncher,
                 &cancel,
+                while_running,
             ),
-            None => game_tools::run_user_tool(
+            None => game_tools::run_user_tool_while_running(
                 &ctx,
                 &instance_id,
                 &game,
@@ -957,6 +1009,7 @@ pub async fn games_user_tools_run(
                 move_aside,
                 &SystemLauncher,
                 &cancel,
+                while_running,
             ),
         };
         run_reply(result)

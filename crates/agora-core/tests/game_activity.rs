@@ -177,7 +177,7 @@ fn a_loadout_apply_is_refused_by_an_open_session_with_no_journaled_files() {
     game_loadout::save_game_profile(&h.ctx, "live", "base", state).unwrap();
     h.open_view_session("live");
 
-    let error = game_loadout::apply_game_profile_with_undo(&h.ctx, "live", &def, "base")
+    let error = game_loadout::apply_game_profile_with_undo(&h.ctx, "live", &def, "base", false)
         .expect_err("an open session must refuse the apply");
     assert!(
         error.to_string().contains("running"),
@@ -273,4 +273,165 @@ fn the_activity_answer_is_idle_with_no_records_and_running_with_a_live_lease() {
         agora_core::instance_runtime::game_activity(&h.ctx, "demo"),
         agora_core::instance_runtime::GameActivity::Running
     );
+}
+
+/// Editing an INI under a live game is exactly what the one guard is for: the game rewrites the
+/// file when it saves. `--while-running` is the explicit override.
+#[test]
+fn an_ini_edit_is_refused_by_a_live_session_unless_overridden() {
+    let h = Harness::new();
+    let def = skyrim();
+    h.make_instance("live");
+    put(
+        &h.ctx
+            .paths
+            .instance_dir("live")
+            .unwrap()
+            .join("user/Skyrim.ini"),
+        b"[General]\nValue=1\n",
+    );
+    h.open_view_session("live");
+
+    let refused = agora_core::game_ini::set_value_while_running(
+        &h.ctx,
+        "live",
+        &def,
+        "user/Skyrim.ini",
+        "General",
+        "Value",
+        "2",
+        false,
+    )
+    .expect_err("a live session must refuse the edit");
+    assert!(refused.to_string().contains("running"), "{refused}");
+
+    agora_core::game_ini::set_value_while_running(
+        &h.ctx,
+        "live",
+        &def,
+        "user/Skyrim.ini",
+        "General",
+        "Value",
+        "2",
+        true,
+    )
+    .expect("the override must allow the edit");
+}
+
+/// Reordering the plugin list under a live game is refused, and allowed only with the override.
+#[test]
+fn a_plugin_list_edit_is_refused_by_a_live_session_unless_overridden() {
+    use agora_game_api::{
+        LoadOrderDefinition, LoadOrderFormat, LoadOrderItems, LoadOrderRules, RelPath,
+    };
+
+    let h = Harness::new();
+    let mut def = skyrim();
+    def.load_orders = vec![LoadOrderDefinition {
+        id: "plugins".into(),
+        name: "Plugins".into(),
+        file: RelPath::new("user/Plugins.txt").unwrap(),
+        destination: Default::default(),
+        items: LoadOrderItems {
+            folder: RelPath::new("Data").unwrap(),
+            patterns: vec!["*.esp".into()],
+            folders: false,
+        },
+        format: LoadOrderFormat::Lines {
+            active_prefix: "*".into(),
+            header: vec![],
+        },
+        rules: LoadOrderRules {
+            kind: "none".into(),
+            entry: None,
+            implicit: Vec::new(),
+            implicit_list_file: None,
+            sorter: None,
+            overlaps: None,
+        },
+        intro: None,
+        item_heading: None,
+    }];
+    h.make_instance("live");
+    h.open_view_session("live");
+    let lines = [("A.esp".to_string(), true), ("B.esp".to_string(), true)];
+
+    let refused = agora_core::game_plugins::import_list_in_while_running(
+        &h.ctx,
+        "live",
+        &def,
+        None,
+        &lines,
+        &[],
+        &[],
+        false,
+    )
+    .expect_err("a live session must refuse the reorder");
+    assert!(refused.to_string().contains("running"), "{refused}");
+
+    agora_core::game_plugins::import_list_in_while_running(
+        &h.ctx,
+        "live",
+        &def,
+        None,
+        &lines,
+        &[],
+        &[],
+        true,
+    )
+    .expect("the override must allow the reorder");
+}
+
+/// Undeploying under a live game is refused, and allowed only with the override. An unpinned
+/// instance has nothing to undeploy, so the override reaches that answer instead of the guard.
+#[test]
+fn an_undeploy_is_refused_by_a_live_session_unless_overridden() {
+    let h = Harness::new();
+    h.make_instance("live");
+    h.open_view_session("live");
+
+    let refused = agora_core::game_deploy::undeploy_while_running(&h.ctx, "live", false)
+        .expect_err("a live session must refuse the undeploy");
+    assert!(refused.to_string().contains("running"), "{refused}");
+
+    agora_core::game_deploy::undeploy_while_running(&h.ctx, "live", true)
+        .expect("the override must get past the guard");
+}
+
+/// A caller that already holds the instance guard (the launch path) uses the `*_locked` form,
+/// which must neither refuse nor re-take the non-re-entrant instance lock.
+#[test]
+fn the_launch_locked_path_does_not_retake_the_instance_lock() {
+    let h = Harness::new();
+    let def = skyrim();
+    h.make_instance("live");
+
+    let guard = agora_core::instance_runtime::InstanceGuard::for_mutation(&h.ctx, "live", "launch")
+        .unwrap();
+    agora_core::game_plugins::sync_without_content_locked(&h.ctx, &guard, &def, &StoreId::steam())
+        .unwrap();
+    agora_core::game_deploy::set_deployment_locked(&h.ctx, &guard, None).unwrap();
+}
+
+/// Switching the folder a running game saves into is what the guard is for. The choice is
+/// refused under a live session and allowed only with the explicit override.
+#[test]
+fn a_save_choice_is_refused_by_a_live_session_unless_overridden() {
+    let h = Harness::new();
+    let def = skyrim();
+    h.make_instance("live");
+    h.open_view_session("live");
+
+    let refused = agora_core::game_saves::set_choice_while_running(
+        &h.ctx,
+        "live",
+        &def,
+        SavesChoice::Own,
+        false,
+    )
+    .expect_err("a live session must refuse the save choice");
+    assert!(refused.to_string().contains("running"), "{refused}");
+
+    agora_core::game_saves::set_choice_while_running(&h.ctx, "live", &def, SavesChoice::Own, true)
+        .expect("the override must allow the save choice");
 }

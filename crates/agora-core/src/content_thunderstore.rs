@@ -16,6 +16,7 @@ use crate::content_store::{self, ContentError, ContentItem, ContentSource};
 use crate::ctx::Ctx;
 use crate::game_deploy::{self, DeployError};
 use crate::game_instance::{self, InstanceError};
+use crate::instance_runtime::InstanceGuard;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ThunderstoreInstallError {
@@ -114,6 +115,19 @@ pub fn install_thunderstore(
     instance_id: &str,
     item_id: &str,
 ) -> Result<ThunderstoreInstallOutcome, ThunderstoreInstallError> {
+    let guard = InstanceGuard::for_mutation(ctx, instance_id, "content-add").map_err(|error| {
+        ThunderstoreInstallError::Deploy(crate::game_deploy::DeployError::Other(error.to_string()))
+    })?;
+    install_thunderstore_locked(ctx, &guard, item_id)
+}
+
+/// [`install_thunderstore`] for a caller that already holds the instance guard.
+pub fn install_thunderstore_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    item_id: &str,
+) -> Result<ThunderstoreInstallOutcome, ThunderstoreInstallError> {
+    let instance_id = guard.instance_id();
     let item = content_store::get_item(ctx, item_id)?;
     let manifest =
         parse_manifest(ctx, item_id)?.ok_or(ThunderstoreInstallError::NotThunderstorePackage)?;
@@ -192,7 +206,7 @@ pub fn install_thunderstore(
     let derived = save_import_metadata(ctx, outcome.item(), &manifest)?;
 
     // Add derived item to instance with mount_path "" and source_path ""
-    let layer = game_deploy::add_content(ctx, instance_id, &derived.item_id, Some(""), Some(""))?;
+    let layer = game_deploy::add_content_locked(ctx, guard, &derived.item_id, Some(""), Some(""))?;
 
     // Check dependencies against all content layers now in instance
     let updated_manifest = game_instance::get_manifest(ctx, instance_id)?;

@@ -32,6 +32,7 @@
 use crate::app_paths::AppPaths;
 use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
+use crate::lock_manager::{LockGuard, LockResource};
 use crate::process_identity::{self, ProcessIdentity};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -342,6 +343,154 @@ pub fn ensure_game_not_running(ctx: &Ctx, instance_id: &str, action: &str) -> Re
     }
 }
 
+/// Permission to change an instance, from one place for every service.
+///
+/// Holding this proves two things at once: this process has the instance's
+/// exclusive writer lock, and (unless the user explicitly overrode it) the
+/// instance's game is not running. Services that change an instance take it
+/// instead of calling [`check_idle`] and `LockManager::acquire` themselves;
+/// functions they call while it is held take `&InstanceGuard` rather than
+/// taking the lock again (it is not re-entrant).
+///
+/// The game check comes *before* the wait for the lock. A running game holds no
+/// lock — the lock covers only the mutation or the launch through spawn — so
+/// asking first turns a 30-second timeout into an immediate, named refusal.
+/// The check is repeated after the lock is taken, because a launch that was
+/// already in flight can have published its lease while this guard waited.
+#[derive(Debug)]
+pub struct InstanceGuard {
+    instance_id: String,
+    lock: LockGuard,
+    allow_while_running: bool,
+}
+
+impl InstanceGuard {
+    /// Take the instance lock and make sure no game is using the instance.
+    ///
+    /// Blocks while another Agora operation holds the lock (the default
+    /// timeout). Use [`Self::for_mutation_async`] from async code.
+    pub fn for_mutation(ctx: &Ctx, instance_id: &str, operation: &str) -> LauncherResult<Self> {
+        Self::take(ctx, instance_id, operation, false, |resource, operation| {
+            ctx.lock_manager.acquire(resource, operation)
+        })
+    }
+
+    /// The explicit user override for the running-game check: take the lock and
+    /// allow the change while a game is running. The lock itself is never
+    /// skipped, so two Agora operations still never change one instance at once.
+    pub fn for_mutation_while_running(
+        ctx: &Ctx,
+        instance_id: &str,
+        operation: &str,
+    ) -> LauncherResult<Self> {
+        Self::take(ctx, instance_id, operation, true, |resource, operation| {
+            ctx.lock_manager.acquire(resource, operation)
+        })
+    }
+
+    /// Async counterpart of [`Self::for_mutation`]. The wait for a contested
+    /// lock yields to the runtime instead of blocking a worker thread.
+    pub async fn for_mutation_async(
+        ctx: &Ctx,
+        instance_id: &str,
+        operation: &str,
+    ) -> LauncherResult<Self> {
+        Self::take_async(ctx, instance_id, operation, false).await
+    }
+
+    /// Async counterpart of [`Self::for_mutation_while_running`].
+    pub async fn for_mutation_while_running_async(
+        ctx: &Ctx,
+        instance_id: &str,
+        operation: &str,
+    ) -> LauncherResult<Self> {
+        Self::take_async(ctx, instance_id, operation, true).await
+    }
+
+    fn take(
+        ctx: &Ctx,
+        instance_id: &str,
+        operation: &str,
+        allow_while_running: bool,
+        acquire: impl FnOnce(LockResource, &str) -> LauncherResult<LockGuard>,
+    ) -> LauncherResult<Self> {
+        if !allow_while_running {
+            ensure_mutation_allowed(ctx, instance_id)?;
+        }
+        let lock = acquire(LockResource::Instance(instance_id.to_string()), operation)?;
+        if !allow_while_running {
+            ensure_mutation_allowed(ctx, instance_id)?;
+        }
+        Ok(Self {
+            instance_id: instance_id.to_string(),
+            lock,
+            allow_while_running,
+        })
+    }
+
+    async fn take_async(
+        ctx: &Ctx,
+        instance_id: &str,
+        operation: &str,
+        allow_while_running: bool,
+    ) -> LauncherResult<Self> {
+        if !allow_while_running {
+            ensure_mutation_allowed(ctx, instance_id)?;
+        }
+        let lock = ctx
+            .lock_manager
+            .acquire_async(LockResource::Instance(instance_id.to_string()), operation)
+            .await?;
+        if !allow_while_running {
+            ensure_mutation_allowed(ctx, instance_id)?;
+        }
+        Ok(Self {
+            instance_id: instance_id.to_string(),
+            lock,
+            allow_while_running,
+        })
+    }
+
+    /// Whether the user explicitly allowed this change while the game runs. Services
+    /// that have their own running-session check use this to skip it as well.
+    pub fn allows_running(&self) -> bool {
+        self.allow_while_running
+    }
+
+    /// The instance this guard authorises changes to.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// The underlying lock path, for callers that pass it on.
+    pub fn lock(&self) -> &LockGuard {
+        &self.lock
+    }
+}
+
+fn ensure_mutation_allowed(ctx: &Ctx, instance_id: &str) -> LauncherResult<()> {
+    // The runtime lease first, because it is the record that keeps its own
+    // error codes: `ERR_INSTANCE_RUNNING` for a live game and
+    // `ERR_INSTANCE_LAUNCH_INDETERMINATE` for a launch with nothing to verify.
+    check_idle(&ctx.paths, instance_id)?;
+    match game_activity(ctx, instance_id) {
+        GameActivity::Idle => Ok(()),
+        GameActivity::Running => Err(LauncherError::Generic {
+            code: "ERR_INSTANCE_RUNNING".into(),
+            message: format!(
+                "The game is running in '{instance_id}'; close it before changing this instance."
+            ),
+        }),
+        GameActivity::CouldNotTell(reason) => Err(LauncherError::Generic {
+            code: "ERR_INSTANCE_LAUNCH_INDETERMINATE".into(),
+            message: format!(
+                "Could not tell whether the game is running in '{instance_id}' ({reason}); \
+                 refusing to change this instance."
+            ),
+        }),
+    }
+}
+
 fn instance_game_and_store(
     ctx: &Ctx,
     instance_id: &str,
@@ -354,7 +503,29 @@ fn instance_game_and_store(
                 .map(|store| (manifest.game.clone(), store)),
         ),
         Err(crate::game_instance::InstanceError::NotFound(_)) => Ok(None),
-        Err(error) => Err(error.to_string()),
+        Err(error) => {
+            // A Minecraft manifest is not a generic instance manifest: it has no generic `base`
+            // and therefore no user-files journal keyed by a store. That is "no journal", not an
+            // unreadable record. A generic manifest whose base is present but damaged still
+            // fails closed.
+            let manifest_path = ctx
+                .paths
+                .instance_manifest(instance_id)
+                .map_err(|e| e.to_string())?;
+            let Ok(bytes) = std::fs::read(&manifest_path) else {
+                return Err(error.to_string());
+            };
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            let game_is_minecraft = value
+                .get("game")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|game| game == "minecraft");
+            match value.get("base") {
+                None | Some(serde_json::Value::Null) if game_is_minecraft => Ok(None),
+                _ => Err(error.to_string()),
+            }
+        }
     }
 }
 
@@ -436,6 +607,10 @@ pub fn stop_game(ctx: &Ctx, instance_id: &str) -> LauncherResult<u32> {
 mod tests {
     use super::*;
 
+    fn init_test_state(ctx: &Ctx) {
+        crate::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    }
+
     fn paths() -> (AppPaths, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = AppPaths::from_root(tmp.path().to_path_buf());
@@ -495,6 +670,92 @@ mod tests {
         let path = lease_path(&paths, "demo").unwrap();
         fs::write(&path, b"{ this is not a lease").unwrap();
         assert!(check_idle(&paths, "demo").is_err());
+    }
+
+    #[test]
+    fn a_running_game_refuses_the_guard_at_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = Ctx::for_testing(tmp.path().to_path_buf());
+        init_test_state(&ctx);
+        let identity = process_identity::capture(std::process::id()).unwrap();
+        let generation = publish_starting(&ctx.paths, "demo").unwrap();
+        publish_running(&ctx.paths, "demo", &generation, identity).unwrap();
+
+        let error = InstanceGuard::for_mutation(&ctx, "demo", "test").unwrap_err();
+        assert_eq!(error.code(), "ERR_INSTANCE_RUNNING");
+    }
+
+    #[test]
+    fn the_running_game_override_still_takes_the_lock() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = Ctx::for_testing(tmp.path().to_path_buf());
+        init_test_state(&ctx);
+        let identity = process_identity::capture(std::process::id()).unwrap();
+        let generation = publish_starting(&ctx.paths, "demo").unwrap();
+        publish_running(&ctx.paths, "demo", &generation, identity).unwrap();
+
+        let guard = InstanceGuard::for_mutation_while_running(&ctx, "demo", "test").unwrap();
+        assert_eq!(guard.instance_id(), "demo");
+        // Another operation still cannot take the same lock, override or not.
+        let other = crate::lock_manager::LockManager::new(ctx.paths.locks_root().to_path_buf());
+        assert!(other
+            .acquire_with_timeout(
+                LockResource::Instance("demo".into()),
+                "other",
+                std::time::Duration::ZERO,
+                None,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn an_idle_instance_yields_the_guard_and_blocks_a_second_writer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = Ctx::for_testing(tmp.path().to_path_buf());
+        init_test_state(&ctx);
+        let guard = InstanceGuard::for_mutation(&ctx, "demo", "first").unwrap();
+        let other = crate::lock_manager::LockManager::new(ctx.paths.locks_root().to_path_buf());
+        assert!(other
+            .acquire_with_timeout(
+                LockResource::Instance("demo".into()),
+                "second",
+                std::time::Duration::ZERO,
+                None,
+            )
+            .is_err());
+        drop(guard);
+        InstanceGuard::for_mutation(&ctx, "demo", "third").unwrap();
+    }
+
+    /// The async form must wait with the runtime, not block its only thread.
+    #[test]
+    fn an_async_guard_does_not_block_a_current_thread_runtime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = Ctx::for_testing(tmp.path().to_path_buf());
+        init_test_state(&ctx);
+        let holder = crate::lock_manager::LockManager::new(ctx.paths.locks_root().to_path_buf());
+        let _held = holder
+            .acquire(LockResource::Instance("demo".into()), "holder")
+            .unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // If the guard blocked the thread instead of awaiting, the timer
+            // could not fire and this test would hang instead of failing.
+            let waited = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                InstanceGuard::for_mutation_async(&ctx, "demo", "waiter"),
+            )
+            .await;
+            assert!(waited.is_err(), "the async guard should have yielded");
+            drop(_held);
+            InstanceGuard::for_mutation_async(&ctx, "demo", "after")
+                .await
+                .unwrap();
+        });
     }
 
     #[test]

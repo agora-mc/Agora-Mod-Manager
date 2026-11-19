@@ -593,12 +593,21 @@ pub async fn games_instance_content_add(
     app: tauri::AppHandle,
     instance_id: String,
     item_id: String,
+    while_running: Option<bool>,
 ) -> Result<InstanceAddOutcome, GamesError> {
     let instance_id = checked_id(&instance_id)?;
     let item_id = checked_id(&item_id)?;
+    let while_running = while_running.unwrap_or(false);
     tokio::task::spawn_blocking(move || -> Result<InstanceAddOutcome, GamesError> {
         let ctx = crate::core_context(&app)?;
-        match game_deploy::add_to_instance(&ctx, &instance_id, &item_id).map_err(add_error)? {
+        match game_deploy::add_to_instance_while_running(
+            &ctx,
+            &instance_id,
+            &item_id,
+            while_running,
+        )
+        .map_err(add_error)?
+        {
             AddToInstance::Added {
                 item_id,
                 layer,
@@ -640,12 +649,15 @@ pub async fn games_instance_content_remove(
     app: tauri::AppHandle,
     instance_id: String,
     item_id: String,
+    while_running: Option<bool>,
 ) -> Result<(), GamesError> {
     let instance_id = checked_id(&instance_id)?;
     let item_id = checked_id(&item_id)?;
+    let while_running = while_running.unwrap_or(false);
     tokio::task::spawn_blocking(move || -> Result<(), GamesError> {
         let ctx = crate::core_context(&app)?;
-        game_deploy::remove_content(&ctx, &instance_id, &item_id).map_err(deploy_error)
+        game_deploy::remove_content_while_running(&ctx, &instance_id, &item_id, while_running)
+            .map_err(deploy_error)
     })
     .await
     .map_err(|_| {
@@ -663,13 +675,21 @@ pub async fn games_instance_content_set_enabled(
     instance_id: String,
     item_id: String,
     enabled: bool,
+    while_running: Option<bool>,
 ) -> Result<(), GamesError> {
     let instance_id = checked_id(&instance_id)?;
     let item_id = checked_id(&item_id)?;
+    let while_running = while_running.unwrap_or(false);
     tokio::task::spawn_blocking(move || -> Result<(), GamesError> {
         let ctx = crate::core_context(&app)?;
-        game_deploy::set_content_enabled(&ctx, &instance_id, &item_id, enabled)
-            .map_err(deploy_error)
+        game_deploy::set_content_enabled_while_running(
+            &ctx,
+            &instance_id,
+            &item_id,
+            enabled,
+            while_running,
+        )
+        .map_err(deploy_error)
     })
     .await
     .map_err(|_| GamesError::new(TASK_FAILED, "Changing the item did not finish."))?
@@ -682,13 +702,22 @@ pub async fn games_instance_content_move(
     instance_id: String,
     item_id: String,
     position: usize,
+    while_running: Option<bool>,
 ) -> Result<(), GamesError> {
     let instance_id = checked_id(&instance_id)?;
     let item_id = checked_id(&item_id)?;
     let new_index = move_index(position)?;
+    let while_running = while_running.unwrap_or(false);
     tokio::task::spawn_blocking(move || -> Result<(), GamesError> {
         let ctx = crate::core_context(&app)?;
-        game_deploy::move_content(&ctx, &instance_id, &item_id, new_index).map_err(deploy_error)
+        game_deploy::move_content_while_running(
+            &ctx,
+            &instance_id,
+            &item_id,
+            new_index,
+            while_running,
+        )
+        .map_err(deploy_error)
     })
     .await
     .map_err(|_| GamesError::new(TASK_FAILED, "Moving the item did not finish."))?

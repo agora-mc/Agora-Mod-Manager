@@ -13,6 +13,7 @@
 
 use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
+#[cfg(test)]
 use crate::lock_manager::LockResource;
 use crate::snapshot::{self, RestoreOutcome, Snapshot};
 
@@ -28,11 +29,11 @@ impl SnapshotService {
     /// Capture a full snapshot of an instance.
     pub fn create(&self, instance_id: &str, label: Option<&str>) -> LauncherResult<Snapshot> {
         let instance_dir = self.ctx.paths.instance_dir(instance_id)?;
-        let _guard = self
-            .ctx
-            .lock_manager
-            .acquire(LockResource::Instance(instance_id.to_string()), "snapshot")?;
-        crate::instance_runtime::check_idle(&self.ctx.paths, instance_id)?;
+        let _guard = crate::instance_runtime::InstanceGuard::for_mutation(
+            &self.ctx,
+            instance_id,
+            "snapshot",
+        )?;
 
         let snapshot = snapshot::create_snapshot_with_origin(
             &instance_dir,
@@ -55,11 +56,11 @@ impl SnapshotService {
     /// mutation.
     pub fn restore(&self, instance_id: &str, snapshot_id: &str) -> LauncherResult<RestoreOutcome> {
         let instance_dir = self.ctx.paths.instance_dir(instance_id)?;
-        let _guard = self.ctx.lock_manager.acquire(
-            LockResource::Instance(instance_id.to_string()),
+        let _guard = crate::instance_runtime::InstanceGuard::for_mutation(
+            &self.ctx,
+            instance_id,
             "restore_snapshot",
         )?;
-        crate::instance_runtime::check_idle(&self.ctx.paths, instance_id)?;
 
         // Validate the target before capturing anything: an invalid request
         // should not cost the user a snapshot.

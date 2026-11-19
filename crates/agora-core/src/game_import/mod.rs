@@ -36,7 +36,6 @@ use crate::game_registry::{GameInventory, IdentifiedInstall, RuntimeResolution};
 use crate::game_saves::{self, SavesError};
 use crate::game_tools::{self, ToolError};
 use crate::game_user_tools;
-use crate::lock_manager::LockResource;
 
 /// The `overwrite` files that no tool claims become one content layer with this name.
 pub const OVERWRITE_LAYER_NAME: &str = "MO2 overwrite";
@@ -1550,14 +1549,17 @@ pub fn run(
                 .filter(|l| l.managed)
                 .map(|l| l.name.clone())
                 .collect();
-            let _lock = ctx.lock_manager.acquire(
-                LockResource::Instance(instance_id.clone()),
-                "mo2-import-plugins",
-            )?;
-            game_plugins::import_list(
+            let guard = crate::instance_runtime::InstanceGuard::for_mutation(
                 ctx,
                 &instance_id,
+                "mo2-import-plugins",
+            )
+            .map_err(|error| ImportError::Other(error.to_string()))?;
+            game_plugins::import_list_in_locked(
+                ctx,
+                &guard,
                 &def,
+                None,
                 &lines,
                 &managed,
                 &plan.plugins.locked,
@@ -2090,6 +2092,7 @@ pub fn mo2_run_profiles(
                 &instance_id,
                 &definition,
                 &profiles[0],
+                false,
             )
             .map_err(|e| ImportError::Other(e.to_string()))?;
             Ok(Mo2MultiReport {

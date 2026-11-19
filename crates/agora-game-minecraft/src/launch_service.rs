@@ -10,7 +10,7 @@ use agora_core::ctx::Ctx;
 use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::instance_runtime;
 use agora_core::lkg::LaunchOutcome;
-use agora_core::lock_manager::LockResource;
+use agora_core::lock_manager::{LockGuard, LockResource};
 use agora_core::models::InstanceManifest;
 use agora_core::network::NetworkPolicy;
 use agora_core::process_identity::{self, ProcessIdentity};
@@ -281,7 +281,7 @@ impl LaunchService {
         progress: &dyn LaunchProgress,
     ) -> LauncherResult<LaunchResult> {
         validate_instance_id(&request.instance_id)?;
-        let _lock = self
+        let lock = self
             .ctx
             .lock_manager
             .acquire_async(
@@ -289,13 +289,14 @@ impl LaunchService {
                 "launch",
             )
             .await?;
-        self.launch_locked(request, progress).await
+        self.launch_locked(request, progress, lock).await
     }
 
     async fn launch_locked(
         &self,
         request: LaunchRequest,
         progress: &dyn LaunchProgress,
+        lock: LockGuard,
     ) -> LauncherResult<LaunchResult> {
         progress.phase("loading-inputs", "Loading instance and account state");
         let started = Instant::now();
@@ -313,7 +314,7 @@ impl LaunchService {
         // resolver/materializer futures. Keep it heap-backed so CLI hosts with
         // the default Windows main-thread stack do not have to inline that
         // state into their command-dispatch future.
-        Box::pin(self.launch_inputs(inputs, progress)).await
+        Box::pin(self.launch_inputs(inputs, progress, lock)).await
     }
 
     /// Execute a launch with an optional recovery step performed before
@@ -327,7 +328,7 @@ impl LaunchService {
         progress: &dyn LaunchProgress,
     ) -> LauncherResult<LaunchResult> {
         validate_instance_id(&request.instance_id)?;
-        let _lock = self
+        let lock = self
             .ctx
             .lock_manager
             .acquire_async(
@@ -357,7 +358,7 @@ impl LaunchService {
                     .await?;
             }
         }
-        self.launch_locked(request, progress).await
+        self.launch_locked(request, progress, lock).await
     }
 
     async fn load_inputs(
@@ -560,6 +561,7 @@ impl LaunchService {
         &self,
         request: LaunchInputs,
         progress: &dyn LaunchProgress,
+        lock: LockGuard,
     ) -> LauncherResult<LaunchResult> {
         let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let _op_handle = self.ctx.operation_manager.register_for_instance(
@@ -639,7 +641,36 @@ impl LaunchService {
             let operation_id = _op_handle.id().clone();
 
             progress.phase("handoff", "Handing off to external launcher");
-            progress.handoff(&request.identity)?;
+            // The delegated game outlives this call (and this process), so it
+            // gets the same durable runtime lease a direct launch publishes.
+            // Publish before the spawn, while the instance lock is held, so a
+            // mutation cannot slip in between the handoff and the record.
+            let lease_generation =
+                instance_runtime::publish_starting(&self.ctx.paths, &request.instance_id)?;
+            if let Err(error) = progress.handoff(&request.identity) {
+                let _ = instance_runtime::clear(
+                    &self.ctx.paths,
+                    &request.instance_id,
+                    Some(&lease_generation),
+                );
+                return Err(error);
+            }
+            match identify_delegated_process(&request.game_dir) {
+                Some(identity) => instance_runtime::publish_running(
+                    &self.ctx.paths,
+                    &request.instance_id,
+                    &lease_generation,
+                    identity,
+                )?,
+                None => instance_runtime::publish_running_unverified(
+                    &self.ctx.paths,
+                    &request.instance_id,
+                    &lease_generation,
+                )?,
+            }
+            // The lock covers only the mutation and the spawn. From here the
+            // runtime lease alone says "in use".
+            drop(lock);
             // Do not publish a session until the external launcher was
             // actually spawned. A snapshot or handoff failure must not make a
             // non-existent session supersede an already monitored launch.
@@ -927,6 +958,10 @@ impl LaunchService {
             &lease_generation,
             process_identity.clone(),
         )?;
+        // The lock covers the materialization, snapshot and spawn. The game is
+        // now identified and its lease is published, so the runtime lease alone
+        // says "in use" for the rest of the session.
+        drop(lock);
         record_launch_started(&self.ctx, &request.instance_id);
 
         // Register the session with the core-owned process session manager.
@@ -1168,11 +1203,23 @@ impl LaunchService {
                 }
             }
 
+            // Prefer the game process over the official launcher process the
+            // lease was first published with: the launcher may be closed while
+            // the game keeps running.
+            upgrade_delegated_lease(ctx, instance_id, game_dir);
+
             if started.elapsed() >= std::time::Duration::from_secs(12 * 60 * 60) {
                 break LaunchOutcome::Unknown;
             }
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         };
+
+        // The delegated session this monitor owned has ended (or hit its
+        // twelve-hour cap), so its runtime lease must end too. A superseded
+        // monitor leaves the lease to the newer session.
+        if !superseded {
+            let _ = instance_runtime::clear(&ctx.paths, instance_id, None);
+        }
 
         // A newer session for this instance already owns the LKG state.
         // Recording here would overwrite that session's outcome with this
@@ -1563,6 +1610,72 @@ pub(crate) fn wrapper_command(game_dir: &std::path::Path) -> Option<String> {
         .trim()
         .to_string();
     (!value.is_empty()).then_some(value)
+}
+
+/// The process that should own a delegated session's runtime lease.
+///
+/// The official launcher starts the game itself, so Agora does not get a child
+/// handle. It looks for the game's own process first (the launcher's Java
+/// command names the instance folder) and falls back to the launcher process it
+/// just started. Either way the lease records a real OS identity, so the stale
+/// check can end it when that process exits; an unverifiable lease is published
+/// only when neither can be read.
+fn identify_delegated_process(instance_dir: &Path) -> Option<ProcessIdentity> {
+    find_game_process(instance_dir).or_else(|| {
+        crate::official_launcher::running_pids(None)
+            .into_iter()
+            .find_map(|pid| process_identity::capture(pid).ok())
+    })
+}
+
+/// Find the running Java process whose command line names this instance folder.
+fn find_game_process(instance_dir: &Path) -> Option<ProcessIdentity> {
+    let wanted = normalise_process_text(&instance_dir.to_string_lossy());
+    let mut system = sysinfo::System::new();
+    system.refresh_processes();
+    for (pid, process) in system.processes() {
+        let name = process.name().to_ascii_lowercase();
+        if !name.contains("java") {
+            continue;
+        }
+        let command = normalise_process_text(&process.cmd().join(" "));
+        // A boundary after the folder keeps "inst" from matching "inst2".
+        let names_this_instance = ["", " ", "/", "\"", "'"]
+            .iter()
+            .any(|suffix| command.contains(&format!("{wanted}{suffix}")));
+        if names_this_instance {
+            if let Ok(identity) = process_identity::capture(pid.as_u32()) {
+                return Some(identity);
+            }
+        }
+    }
+    None
+}
+
+fn normalise_process_text(text: &str) -> String {
+    text.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// Replace the lease's owner with the game process once it is visible. The
+/// launcher process a delegated launch starts may exit before the game does,
+/// so the game itself is the better thing to verify.
+fn upgrade_delegated_lease(ctx: &Ctx, instance_id: &str, game_dir: &Path) {
+    let Ok(Some(lease)) = instance_runtime::read(&ctx.paths, instance_id) else {
+        return;
+    };
+    if lease.identity.as_ref().is_some_and(|identity| {
+        process_identity::verify(identity).is_ok()
+            && identity
+                .expected_exe
+                .as_deref()
+                .is_some_and(|exe| exe.to_ascii_lowercase().contains("java"))
+    }) {
+        return;
+    }
+    let Some(identity) = find_game_process(game_dir) else {
+        return;
+    };
+    let _ = instance_runtime::publish_running(&ctx.paths, instance_id, &lease.generation, identity);
 }
 
 /// Learn the spawned game's identity so the running lease can be verified.

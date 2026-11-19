@@ -808,10 +808,12 @@ pub fn delete_with_options(
             "a tool is running for instance '{id}'; wait for it to finish, then try again"
         )));
     }
-    let _lock = ctx
-        .lock_manager
-        .acquire(resource, "delete")
-        .map_err(|e| InstanceError::Other(e.to_string()))?;
+    let _guard = crate::instance_runtime::InstanceGuard::for_mutation(ctx, id, "delete").map_err(
+        |error| match error.code().as_str() {
+            "ERR_INSTANCE_RUNNING" => InstanceError::Running(id.to_string()),
+            _ => InstanceError::Other(error.to_string()),
+        },
+    )?;
 
     let db_path = ctx.paths.local_state_db();
     let conn = crate::db::local_state_connection(&db_path)
@@ -852,24 +854,6 @@ pub fn delete_with_options(
         return Err(InstanceError::InvalidInstanceDir(instance_dir));
     }
 
-    // A launch that is swapping or spawning has no game process yet, but it is running: the
-    // journal says so. An unreadable journal is not "not running"; it refuses.
-    if let Ok(manifest) = get_manifest(ctx, id) {
-        if let Some(store) = session_store(&base_ref, &manifest) {
-            match crate::game_user_files::status(ctx, &manifest.game, &store) {
-                Ok(Some(session)) if session.running && session.instance == id => {
-                    return Err(InstanceError::Running(id.to_string()));
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    return Err(InstanceError::Other(format!(
-                        "the user-files session for instance '{id}' cannot be read, so it may be running: {error}"
-                    )))
-                }
-            }
-        }
-    }
-
     // The instance's deployed folder is Agora's and is rebuilt on demand, but the game may have
     // written into it. Take it down as a launch end does: harvest those changes first, and refuse
     // (changing nothing) when that cannot run. A game still running from it is refused there.
@@ -894,7 +878,7 @@ pub fn delete_with_options(
         None
     };
     if instance_dir.join("instance_manifest.json").exists() && !base_unreadable {
-        crate::game_deploy::undeploy_locked(ctx, id)?;
+        crate::game_deploy::undeploy_locked(ctx, &_guard)?;
     }
     // What is left is the empty folder Agora made for the farm; the instance is going, so it does.
     if let Some(folder) = deployment_folder {
@@ -1050,15 +1034,15 @@ pub fn rename(ctx: &Ctx, id: &str, name: &str) -> Result<(), InstanceError> {
     if name.is_empty() {
         return Err(InstanceError::Other("Give the instance a name.".into()));
     }
-    // The manifest is rewritten whole, so this takes the lock every other writer of it takes: a
-    // deploy or a delete in flight is waited for rather than overwritten.
-    let _lock = ctx
-        .lock_manager
-        .acquire(
-            crate::lock_manager::LockResource::Instance(id.to_string()),
-            "rename",
-        )
-        .map_err(|e| InstanceError::Other(e.to_string()))?;
+    // The manifest is rewritten whole, so this takes the same guard every other writer of it
+    // takes: a deploy or a delete in flight is waited for rather than overwritten, and a game
+    // that is using the instance is refused.
+    let _guard = crate::instance_runtime::InstanceGuard::for_mutation(ctx, id, "rename").map_err(
+        |error| match error.code().as_str() {
+            "ERR_INSTANCE_RUNNING" => InstanceError::Running(id.to_string()),
+            _ => InstanceError::Other(error.to_string()),
+        },
+    )?;
     let db_path = ctx.paths.local_state_db();
     let conn = crate::db::local_state_connection(&db_path)
         .map_err(|e| InstanceError::Other(e.to_string()))?;

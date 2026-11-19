@@ -21,6 +21,7 @@ use crate::ctx::Ctx;
 use crate::error::LauncherError;
 use crate::game_plugins::PluginListError;
 use crate::game_user_files::{self, Journal};
+use crate::instance_runtime::InstanceGuard;
 use crate::lock_manager::{LockGuard, LockResource};
 
 const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
@@ -631,14 +632,61 @@ pub fn set_value(
     key: &str,
     value: &str,
 ) -> Result<bool, IniError> {
+    set_value_while_running(
+        ctx,
+        instance_id,
+        definition,
+        file,
+        section,
+        key,
+        value,
+        false,
+    )
+}
+
+/// [`set_value`], with the user's explicit answer to a running game.
+#[allow(clippy::too_many_arguments)]
+pub fn set_value_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    file: &str,
+    section: &str,
+    key: &str,
+    value: &str,
+    allow_while_running: bool,
+) -> Result<bool, IniError> {
+    let store = store_of(ctx, instance_id)?;
+    let guard = guard_for_ini(ctx, instance_id, definition, &store, allow_while_running)?;
+    set_value_locked(ctx, &guard, definition, file, section, key, value)
+}
+
+/// [`set_value`] for a caller that already holds the instance guard.
+pub fn set_value_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    file: &str,
+    section: &str,
+    key: &str,
+    value: &str,
+) -> Result<bool, IniError> {
     check_names(section, key)?;
     check_value(value)?;
-    let store = store_of(ctx, instance_id)?;
-    let _locks = lock_for_edit(ctx, instance_id, definition, &store)?;
-    edit_locked(ctx, instance_id, definition, &store, file, |doc| {
-        let changed = doc.set(section, key, value)?;
-        Ok((changed, changed))
-    })
+    let store = store_of(ctx, guard.instance_id())?;
+    let _user_files = user_files_lock_for_edit(ctx, definition, &store)?;
+    edit_locked_with_session_check(
+        ctx,
+        guard.instance_id(),
+        definition,
+        &store,
+        file,
+        !guard.allows_running(),
+        |doc| {
+            let changed = doc.set(section, key, value)?;
+            Ok((changed, changed))
+        },
+    )
 }
 
 /// Remove a key from one of the instance's files. Returns whether the file changed.
@@ -650,50 +698,144 @@ pub fn unset_value(
     section: &str,
     key: &str,
 ) -> Result<bool, IniError> {
-    check_names(section, key)?;
-    let store = store_of(ctx, instance_id)?;
-    let _locks = lock_for_edit(ctx, instance_id, definition, &store)?;
-    edit_locked(ctx, instance_id, definition, &store, file, |doc| {
-        let changed = doc.unset(section, key)?;
-        Ok((changed, changed))
-    })
+    unset_value_while_running(ctx, instance_id, definition, file, section, key, false)
 }
 
-/// The two locks an edit holds: the instance's, and the game's per-user files for the store, the
-/// lock a launch's swap takes. An edit takes the instance's first, as deployment does.
-pub(crate) fn lock_for_edit(
+/// [`unset_value`], with the user's explicit answer to a running game.
+pub fn unset_value_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    file: &str,
+    section: &str,
+    key: &str,
+    allow_while_running: bool,
+) -> Result<bool, IniError> {
+    let store = store_of(ctx, instance_id)?;
+    let guard = guard_for_ini(ctx, instance_id, definition, &store, allow_while_running)?;
+    unset_value_locked(ctx, &guard, definition, file, section, key)
+}
+
+/// [`unset_value`] for a caller that already holds the instance guard.
+pub fn unset_value_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    file: &str,
+    section: &str,
+    key: &str,
+) -> Result<bool, IniError> {
+    check_names(section, key)?;
+    let store = store_of(ctx, guard.instance_id())?;
+    let _user_files = user_files_lock_for_edit(ctx, definition, &store)?;
+    edit_locked_with_session_check(
+        ctx,
+        guard.instance_id(),
+        definition,
+        &store,
+        file,
+        !guard.allows_running(),
+        |doc| {
+            let changed = doc.unset(section, key)?;
+            Ok((changed, changed))
+        },
+    )
+}
+
+fn guard_for(
+    ctx: &Ctx,
+    instance_id: &str,
+    operation: &str,
+    allow_while_running: bool,
+) -> Result<InstanceGuard, IniError> {
+    if allow_while_running {
+        Ok(InstanceGuard::for_mutation_while_running(
+            ctx,
+            instance_id,
+            operation,
+        )?)
+    } else {
+        Ok(InstanceGuard::for_mutation(ctx, instance_id, operation)?)
+    }
+}
+
+/// A refused guard for an INI edit, translated back to the INI-specific answer when the
+/// user-files journal can say which it is: a live session, or one that must be restored.
+pub(crate) fn guard_for_ini(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
     store: &StoreId,
-) -> Result<(LockGuard, LockGuard), IniError> {
-    let instance = ctx
-        .lock_manager
-        .acquire(LockResource::Instance(instance_id.to_string()), "ini-edit")?;
-    let user_files = ctx.lock_manager.acquire(
+    allow_while_running: bool,
+) -> Result<InstanceGuard, IniError> {
+    match guard_for(ctx, instance_id, "ini-edit", allow_while_running) {
+        Ok(guard) => Ok(guard),
+        Err(IniError::Lock(error))
+            if !allow_while_running && error.code() == "ERR_INSTANCE_RUNNING" =>
+        {
+            match refuse_during_session(ctx, definition, store) {
+                Ok(()) => Err(IniError::Lock(error)),
+                Err(specific) => Err(specific),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn user_files_lock_for_edit(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    store: &StoreId,
+) -> Result<LockGuard, IniError> {
+    Ok(ctx.lock_manager.acquire(
         LockResource::GameUserFiles(definition.id.clone(), store.clone()),
         "ini-edit",
-    )?;
-    Ok((instance, user_files))
+    )?)
 }
 
 /// Edit the instance's copy of `file` with `f`, which returns its own result and whether it changed
 /// the document. The copy is written only when the document changed.
 ///
-/// The caller holds the locks from [`lock_for_edit`]. Refused while the game's session is running,
+/// The caller holds the instance guard and the user-files lock. Refused while the game's session is running,
 /// and while an earlier session's swap has not been put back: either way the game's file is not the
 /// instance's to read or write. A copy that does not exist yet is seeded from the game's file, and
 /// that file must exist or the copy starts empty.
-pub(crate) fn edit_locked<T>(
+/// [`edit_locked`] for a caller that holds the instance guard. The guard's explicit
+/// override also skips the running-session check.
+pub(crate) fn edit_with_guard<T>(
     ctx: &Ctx,
-    instance_id: &str,
+    guard: &InstanceGuard,
     definition: &GameDefinition,
     store: &StoreId,
     file: &str,
     f: impl FnOnce(&mut IniDocument) -> Result<(T, bool), IniError>,
 ) -> Result<T, IniError> {
+    edit_locked_with_session_check(
+        ctx,
+        guard.instance_id(),
+        definition,
+        store,
+        file,
+        !guard.allows_running(),
+        f,
+    )
+}
+
+/// [`edit_with_guard`] with the running-session check optional. The guard's explicit
+/// override skips that check, but the instance lock is still held.
+fn edit_locked_with_session_check<T>(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    store: &StoreId,
+    file: &str,
+    check_session: bool,
+    f: impl FnOnce(&mut IniDocument) -> Result<(T, bool), IniError>,
+) -> Result<T, IniError> {
     let (rel, mapping) = resolve_file(definition, store, file)?;
-    refuse_during_session(ctx, definition, store)?;
+    if check_session {
+        refuse_during_session(ctx, definition, store)?;
+    }
     let copy = join_rel(&instance_dir(ctx, instance_id)?, rel.as_str());
     let mut document = if copy.exists() {
         load(&copy)?

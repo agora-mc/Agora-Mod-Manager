@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::ctx::Ctx;
 use crate::game_deploy::{self, DeployMode, FileSource};
 use crate::game_instance::{self, GameInstanceManifest};
+use crate::instance_runtime::InstanceGuard;
 use crate::lock_manager::LockResource;
 
 const USER_TOOLS_FILE: &str = "user_tools.json";
@@ -156,15 +157,7 @@ pub fn list(ctx: &Ctx, instance_id: &str) -> Result<Vec<UserTool>, UserToolError
     read_file(&instance_dir.join(USER_TOOLS_FILE))
 }
 
-/// Add a tool to the instance's list.
-///
-/// `exe` must be a path `find_candidates` returns for this instance right now, a known tool's
-/// executable (relative, not traversing, no device name, not from a disabled mod), or an absolute
-/// path to an existing `.exe` the user chose outside the game folder (see [`is_absolute_exe`]).
-/// The same executable twice is refused.
-pub fn add(ctx: &Ctx, instance_id: &str, new: NewUserTool) -> Result<UserTool, UserToolError> {
-    // The list is an instance file, so it is edited under the instance lock like every other one.
-    // A tool run holds that lock for its whole run; fail fast rather than wait out the timeout.
+fn refuse_during_tool_run(ctx: &Ctx, instance_id: &str) -> Result<(), UserToolError> {
     let resource = LockResource::Instance(instance_id.to_string());
     if ctx
         .lock_manager
@@ -175,10 +168,53 @@ pub fn add(ctx: &Ctx, instance_id: &str, new: NewUserTool) -> Result<UserTool, U
             "a tool is running for instance '{instance_id}'; wait for it to finish, then try again"
         )));
     }
-    let _lock = ctx
-        .lock_manager
-        .acquire(resource, "user-tool-add")
-        .map_err(|e| UserToolError::Other(e.to_string()))?;
+    Ok(())
+}
+
+fn guard_for(
+    ctx: &Ctx,
+    instance_id: &str,
+    operation: &str,
+    allow_while_running: bool,
+) -> Result<InstanceGuard, UserToolError> {
+    if allow_while_running {
+        InstanceGuard::for_mutation_while_running(ctx, instance_id, operation)
+            .map_err(|error| UserToolError::Other(error.to_string()))
+    } else {
+        InstanceGuard::for_mutation(ctx, instance_id, operation)
+            .map_err(|error| UserToolError::Other(error.to_string()))
+    }
+}
+
+/// Add a tool to the instance's list.
+///
+/// `exe` must be a path `find_candidates` returns for this instance right now, a known tool's
+/// executable (relative, not traversing, no device name, not from a disabled mod), or an absolute
+/// path to an existing `.exe` the user chose outside the game folder (see [`is_absolute_exe`]).
+/// The same executable twice is refused.
+pub fn add(ctx: &Ctx, instance_id: &str, new: NewUserTool) -> Result<UserTool, UserToolError> {
+    add_while_running(ctx, instance_id, new, false)
+}
+
+/// [`add`], with the user's explicit answer to a running game.
+pub fn add_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    new: NewUserTool,
+    allow_while_running: bool,
+) -> Result<UserTool, UserToolError> {
+    refuse_during_tool_run(ctx, instance_id)?;
+    let guard = guard_for(ctx, instance_id, "user-tool-add", allow_while_running)?;
+    add_locked(ctx, &guard, new)
+}
+
+/// [`add`] for a caller that already holds the instance guard.
+pub fn add_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    new: NewUserTool,
+) -> Result<UserTool, UserToolError> {
+    let instance_id = guard.instance_id();
     let definition = definition_of(ctx, instance_id)?;
     let instance_dir = instance_dir(ctx, instance_id)?;
     let path = instance_dir.join(USER_TOOLS_FILE);
@@ -246,20 +282,28 @@ pub fn add(ctx: &Ctx, instance_id: &str, new: NewUserTool) -> Result<UserTool, U
 
 /// Remove a tool from the instance's list. Only the list is edited; no file is deleted.
 pub fn remove(ctx: &Ctx, instance_id: &str, id: &str) -> Result<Vec<UserTool>, UserToolError> {
-    let resource = LockResource::Instance(instance_id.to_string());
-    if ctx
-        .lock_manager
-        .current_operation(&resource)
-        .is_some_and(|operation| operation.starts_with("tool-"))
-    {
-        return Err(UserToolError::Other(format!(
-            "a tool is running for instance '{instance_id}'; wait for it to finish, then try again"
-        )));
-    }
-    let _lock = ctx
-        .lock_manager
-        .acquire(resource, "user-tool-remove")
-        .map_err(|e| UserToolError::Other(e.to_string()))?;
+    remove_while_running(ctx, instance_id, id, false)
+}
+
+/// [`remove`], with the user's explicit answer to a running game.
+pub fn remove_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    id: &str,
+    allow_while_running: bool,
+) -> Result<Vec<UserTool>, UserToolError> {
+    refuse_during_tool_run(ctx, instance_id)?;
+    let guard = guard_for(ctx, instance_id, "user-tool-remove", allow_while_running)?;
+    remove_locked(ctx, &guard, id)
+}
+
+/// [`remove`] for a caller that already holds the instance guard.
+pub fn remove_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    id: &str,
+) -> Result<Vec<UserTool>, UserToolError> {
+    let instance_id = guard.instance_id();
     let instance_dir = instance_dir(ctx, instance_id)?;
     let path = instance_dir.join(USER_TOOLS_FILE);
     let mut tools = read_file(&path)?;
@@ -573,16 +617,30 @@ pub fn import_tools(
     instance_id: &str,
     entries: Vec<NewUserTool>,
 ) -> Result<Vec<ImportedTool>, UserToolError> {
+    import_tools_while_running(ctx, instance_id, entries, false)
+}
+
+/// [`import_tools`], with the user's explicit answer to a running game.
+pub fn import_tools_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    entries: Vec<NewUserTool>,
+    allow_while_running: bool,
+) -> Result<Vec<ImportedTool>, UserToolError> {
     if entries.is_empty() {
         return Ok(Vec::new());
     }
-    let _lock = ctx
-        .lock_manager
-        .acquire(
-            LockResource::Instance(instance_id.to_string()),
-            "user-tool-import",
-        )
-        .map_err(|e| UserToolError::Other(e.to_string()))?;
+    let guard = guard_for(ctx, instance_id, "user-tool-import", allow_while_running)?;
+    import_tools_locked(ctx, &guard, entries)
+}
+
+/// [`import_tools`] for a caller that already holds the instance guard.
+pub fn import_tools_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    entries: Vec<NewUserTool>,
+) -> Result<Vec<ImportedTool>, UserToolError> {
+    let instance_id = guard.instance_id();
     let definition = definition_of(ctx, instance_id)?;
     let path = instance_dir(ctx, instance_id)?.join(USER_TOOLS_FILE);
     let mut tools = read_file(&path)?;

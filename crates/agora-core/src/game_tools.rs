@@ -44,7 +44,7 @@ use crate::game_tool_swap::{self, SwapError, SwapJournal};
 use crate::game_user_files::{self, UserFilesError};
 use crate::game_user_tools::UserTool;
 use crate::install_watch::{InstallChanges, InstallWatch};
-use crate::lock_manager::LockResource;
+use crate::instance_runtime::InstanceGuard;
 
 /// Failed runs kept in `failed-<run>` folders, the newest first (MASTER_SPEC §26.9).
 pub const FAILED_RUNS_KEPT: usize = 3;
@@ -1133,16 +1133,37 @@ pub fn import_output(
     tool_id: &ToolId,
     files: &[(String, PathBuf)],
 ) -> Result<usize, ToolError> {
+    import_output_while_running(ctx, instance_id, definition, tool_id, files, false)
+}
+
+/// [`import_output`], with the user's explicit answer to a running game.
+pub fn import_output_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    files: &[(String, PathBuf)],
+    allow_while_running: bool,
+) -> Result<usize, ToolError> {
+    let guard = guard_for(ctx, instance_id, "tool-import", allow_while_running)?;
+    import_output_locked(ctx, &guard, definition, tool_id, files)
+}
+
+/// [`import_output`] for a caller that already holds the instance guard.
+pub fn import_output_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    files: &[(String, PathBuf)],
+) -> Result<usize, ToolError> {
+    let instance_id = guard.instance_id();
     declared_tool(ctx, definition, tool_id)?;
     if files.is_empty() {
         return Err(ToolError::Invalid(format!(
             "no files to import as the output of '{tool_id}'"
         )));
     }
-    let _lock = ctx.lock_manager.acquire(
-        LockResource::Instance(instance_id.to_string()),
-        "tool-import",
-    )?;
     let mut manifest = load_manifest(ctx, instance_id)?;
     if generated_position(manifest.layers.layers(), tool_id.as_str()).is_some() {
         return Err(ToolError::Invalid(format!(
@@ -1242,6 +1263,41 @@ pub fn set_tool_input(
     input_id: &str,
     value: &str,
 ) -> Result<(), ToolError> {
+    set_tool_input_while_running(
+        ctx,
+        instance_id,
+        definition,
+        tool_id,
+        input_id,
+        value,
+        false,
+    )
+}
+
+/// [`set_tool_input`], with the user's explicit answer to a running game.
+pub fn set_tool_input_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    input_id: &str,
+    value: &str,
+    allow_while_running: bool,
+) -> Result<(), ToolError> {
+    let guard = guard_for(ctx, instance_id, "tool-input", allow_while_running)?;
+    set_tool_input_locked(ctx, &guard, definition, tool_id, input_id, value)
+}
+
+/// [`set_tool_input`] for a caller that already holds the instance guard.
+pub fn set_tool_input_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    input_id: &str,
+    value: &str,
+) -> Result<(), ToolError> {
+    let instance_id = guard.instance_id();
     let tool = declared_tool(ctx, definition, tool_id)?;
     let input = tool
         .inputs
@@ -1285,6 +1341,29 @@ pub fn clear_tool_input(
     tool_id: &ToolId,
     input_id: &str,
 ) -> Result<(), ToolError> {
+    clear_tool_input_while_running(ctx, instance_id, tool_id, input_id, false)
+}
+
+/// [`clear_tool_input`], with the user's explicit answer to a running game.
+pub fn clear_tool_input_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    tool_id: &ToolId,
+    input_id: &str,
+    allow_while_running: bool,
+) -> Result<(), ToolError> {
+    let guard = guard_for(ctx, instance_id, "tool-input", allow_while_running)?;
+    clear_tool_input_locked(ctx, &guard, tool_id, input_id)
+}
+
+/// [`clear_tool_input`] for a caller that already holds the instance guard.
+pub fn clear_tool_input_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    tool_id: &ToolId,
+    input_id: &str,
+) -> Result<(), ToolError> {
+    let instance_id = guard.instance_id();
     let mut inputs = read_tool_inputs(ctx, instance_id)?;
     if let Some(tool) = inputs.get_mut(tool_id.as_str()) {
         tool.remove(input_id);
@@ -2407,6 +2486,29 @@ fn refused_vfs(
 /// [`ToolError::SwapNotConfirmed`] unless `swap_costs_acknowledged` is true. The caller passes true
 /// only after it showed the user those costs and the user accepted them; the flag is not read for
 /// any other capture.
+fn guard_for(
+    ctx: &Ctx,
+    instance_id: &str,
+    operation: &str,
+    allow_while_running: bool,
+) -> Result<InstanceGuard, ToolError> {
+    if allow_while_running {
+        Ok(InstanceGuard::for_mutation_while_running(
+            ctx,
+            instance_id,
+            operation,
+        )?)
+    } else {
+        InstanceGuard::for_mutation(ctx, instance_id, operation).map_err(|error| {
+            if error.code() == "ERR_INSTANCE_RUNNING" {
+                ToolError::SessionRunning(instance_id.to_string())
+            } else {
+                ToolError::Lock(error)
+            }
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     ctx: &Ctx,
@@ -2418,6 +2520,58 @@ pub fn run(
     launcher: &dyn Launcher,
     cancel: &CancellationToken,
 ) -> Result<RunOutcome, ToolError> {
+    run_while_running(
+        ctx,
+        instance_id,
+        definition,
+        tool_id,
+        capture,
+        swap_costs_acknowledged,
+        launcher,
+        cancel,
+        false,
+    )
+}
+
+/// [`run`], with the user's explicit answer to a running game.
+#[allow(clippy::too_many_arguments)]
+pub fn run_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    capture: CaptureMode,
+    swap_costs_acknowledged: bool,
+    launcher: &dyn Launcher,
+    cancel: &CancellationToken,
+    allow_while_running: bool,
+) -> Result<RunOutcome, ToolError> {
+    let guard = guard_for(ctx, instance_id, "tool-run", allow_while_running)?;
+    run_locked(
+        ctx,
+        &guard,
+        definition,
+        tool_id,
+        capture,
+        swap_costs_acknowledged,
+        launcher,
+        cancel,
+    )
+}
+
+/// [`run`] for a caller that already holds the instance guard.
+#[allow(clippy::too_many_arguments)]
+pub fn run_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    capture: CaptureMode,
+    swap_costs_acknowledged: bool,
+    launcher: &dyn Launcher,
+    cancel: &CancellationToken,
+) -> Result<RunOutcome, ToolError> {
+    let instance_id = guard.instance_id();
     let tool = as_installed(
         ctx,
         instance_id,
@@ -2426,6 +2580,7 @@ pub fn run(
     );
     run_inner(
         ctx,
+        guard,
         instance_id,
         definition,
         &tool,
@@ -2457,6 +2612,62 @@ pub fn run_for_item(
     launcher: &dyn Launcher,
     cancel: &CancellationToken,
 ) -> Result<RunOutcome, ToolError> {
+    run_for_item_while_running(
+        ctx,
+        instance_id,
+        definition,
+        tool_id,
+        item_id,
+        capture,
+        swap_costs_acknowledged,
+        launcher,
+        cancel,
+        false,
+    )
+}
+
+/// [`run_for_item`], with the user's explicit answer to a running game.
+#[allow(clippy::too_many_arguments)]
+pub fn run_for_item_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    item_id: &str,
+    capture: CaptureMode,
+    swap_costs_acknowledged: bool,
+    launcher: &dyn Launcher,
+    cancel: &CancellationToken,
+    allow_while_running: bool,
+) -> Result<RunOutcome, ToolError> {
+    let guard = guard_for(ctx, instance_id, "tool-run", allow_while_running)?;
+    run_for_item_locked(
+        ctx,
+        &guard,
+        definition,
+        tool_id,
+        item_id,
+        capture,
+        swap_costs_acknowledged,
+        launcher,
+        cancel,
+    )
+}
+
+/// [`run_for_item`] for a caller that already holds the instance guard.
+#[allow(clippy::too_many_arguments)]
+pub fn run_for_item_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    item_id: &str,
+    capture: CaptureMode,
+    swap_costs_acknowledged: bool,
+    launcher: &dyn Launcher,
+    cancel: &CancellationToken,
+) -> Result<RunOutcome, ToolError> {
+    let instance_id = guard.instance_id();
     let tool = as_installed(
         ctx,
         instance_id,
@@ -2479,6 +2690,7 @@ pub fn run_for_item(
     }
     run_inner(
         ctx,
+        guard,
         instance_id,
         definition,
         &tool,
@@ -2554,6 +2766,62 @@ pub fn run_after_vfs_refusal(
     launcher: &dyn Launcher,
     cancel: &CancellationToken,
 ) -> Result<RunOutcome, ToolError> {
+    run_after_vfs_refusal_while_running(
+        ctx,
+        instance_id,
+        definition,
+        tool_id,
+        next,
+        swap_costs_acknowledged,
+        refusal,
+        launcher,
+        cancel,
+        false,
+    )
+}
+
+/// [`run_after_vfs_refusal`], with the user's explicit answer to a running game.
+#[allow(clippy::too_many_arguments)]
+pub fn run_after_vfs_refusal_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    next: CaptureMode,
+    swap_costs_acknowledged: bool,
+    refusal: &str,
+    launcher: &dyn Launcher,
+    cancel: &CancellationToken,
+    allow_while_running: bool,
+) -> Result<RunOutcome, ToolError> {
+    let guard = guard_for(ctx, instance_id, "tool-run", allow_while_running)?;
+    run_after_vfs_refusal_locked(
+        ctx,
+        &guard,
+        definition,
+        tool_id,
+        next,
+        swap_costs_acknowledged,
+        refusal,
+        launcher,
+        cancel,
+    )
+}
+
+/// [`run_after_vfs_refusal`] for a caller that already holds the instance guard.
+#[allow(clippy::too_many_arguments)]
+pub fn run_after_vfs_refusal_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    next: CaptureMode,
+    swap_costs_acknowledged: bool,
+    refusal: &str,
+    launcher: &dyn Launcher,
+    cancel: &CancellationToken,
+) -> Result<RunOutcome, ToolError> {
+    let instance_id = guard.instance_id();
     let tool = as_installed(
         ctx,
         instance_id,
@@ -2563,6 +2831,7 @@ pub fn run_after_vfs_refusal(
     match next {
         CaptureMode::Links | CaptureMode::Swap => run_inner(
             ctx,
+            guard,
             instance_id,
             definition,
             &tool,
@@ -2628,9 +2897,65 @@ pub fn run_user_tool(
     launcher: &dyn Launcher,
     cancel: &CancellationToken,
 ) -> Result<RunOutcome, ToolError> {
-    run_user_inner(
+    run_user_tool_while_running(
         ctx,
         instance_id,
+        definition,
+        user_tool_id,
+        capture,
+        swap_costs_acknowledged,
+        move_aside,
+        launcher,
+        cancel,
+        false,
+    )
+}
+
+/// [`run_user_tool`], with the user's explicit answer to a running game.
+#[allow(clippy::too_many_arguments)]
+pub fn run_user_tool_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    user_tool_id: &str,
+    capture: CaptureMode,
+    swap_costs_acknowledged: bool,
+    move_aside: bool,
+    launcher: &dyn Launcher,
+    cancel: &CancellationToken,
+    allow_while_running: bool,
+) -> Result<RunOutcome, ToolError> {
+    let guard = guard_for(ctx, instance_id, "tool-run", allow_while_running)?;
+    run_user_tool_locked(
+        ctx,
+        &guard,
+        definition,
+        user_tool_id,
+        capture,
+        swap_costs_acknowledged,
+        move_aside,
+        launcher,
+        cancel,
+    )
+}
+
+/// [`run_user_tool`] for a caller that already holds the instance guard.
+#[allow(clippy::too_many_arguments)]
+pub fn run_user_tool_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    user_tool_id: &str,
+    capture: CaptureMode,
+    swap_costs_acknowledged: bool,
+    move_aside: bool,
+    launcher: &dyn Launcher,
+    cancel: &CancellationToken,
+) -> Result<RunOutcome, ToolError> {
+    run_user_inner(
+        ctx,
+        guard,
+        guard.instance_id(),
         definition,
         user_tool_id,
         capture,
@@ -2656,10 +2981,70 @@ pub fn run_user_tool_after_vfs_refusal(
     launcher: &dyn Launcher,
     cancel: &CancellationToken,
 ) -> Result<RunOutcome, ToolError> {
+    run_user_tool_after_vfs_refusal_while_running(
+        ctx,
+        instance_id,
+        definition,
+        user_tool_id,
+        next,
+        swap_costs_acknowledged,
+        refusal,
+        move_aside,
+        launcher,
+        cancel,
+        false,
+    )
+}
+
+/// [`run_user_tool_after_vfs_refusal`], with the user's explicit answer to a running game.
+#[allow(clippy::too_many_arguments)]
+pub fn run_user_tool_after_vfs_refusal_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    user_tool_id: &str,
+    next: CaptureMode,
+    swap_costs_acknowledged: bool,
+    refusal: &str,
+    move_aside: bool,
+    launcher: &dyn Launcher,
+    cancel: &CancellationToken,
+    allow_while_running: bool,
+) -> Result<RunOutcome, ToolError> {
+    let guard = guard_for(ctx, instance_id, "tool-run", allow_while_running)?;
+    run_user_tool_after_vfs_refusal_locked(
+        ctx,
+        &guard,
+        definition,
+        user_tool_id,
+        next,
+        swap_costs_acknowledged,
+        refusal,
+        move_aside,
+        launcher,
+        cancel,
+    )
+}
+
+/// [`run_user_tool_after_vfs_refusal`] for a caller that already holds the instance guard.
+#[allow(clippy::too_many_arguments)]
+pub fn run_user_tool_after_vfs_refusal_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    user_tool_id: &str,
+    next: CaptureMode,
+    swap_costs_acknowledged: bool,
+    refusal: &str,
+    move_aside: bool,
+    launcher: &dyn Launcher,
+    cancel: &CancellationToken,
+) -> Result<RunOutcome, ToolError> {
     match next {
         CaptureMode::Links | CaptureMode::Swap => run_user_inner(
             ctx,
-            instance_id,
+            guard,
+            guard.instance_id(),
             definition,
             user_tool_id,
             next,
@@ -2679,6 +3064,7 @@ pub fn run_user_tool_after_vfs_refusal(
 #[allow(clippy::too_many_arguments)]
 fn run_user_inner(
     ctx: &Ctx,
+    guard: &InstanceGuard,
     instance_id: &str,
     definition: &GameDefinition,
     user_tool_id: &str,
@@ -2696,6 +3082,7 @@ fn run_user_inner(
                 let declared = as_installed(ctx, instance_id, definition, declared);
                 return run_inner(
                     ctx,
+                    guard,
                     instance_id,
                     definition,
                     &declared,
@@ -2721,6 +3108,7 @@ fn run_user_inner(
     };
     run_inner(
         ctx,
+        guard,
         instance_id,
         definition,
         &tool,
@@ -2748,6 +3136,7 @@ fn fell_back_reason(refusal: &str, tier: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 fn run_inner(
     ctx: &Ctx,
+    guard: &InstanceGuard,
     instance_id: &str,
     definition: &GameDefinition,
     tool: &ToolDefinition,
@@ -2914,10 +3303,7 @@ fn run_inner(
         },
     };
 
-    let _lock = ctx
-        .lock_manager
-        .acquire(LockResource::Instance(instance_id.to_string()), "tool-run")?;
-
+    let _ = guard;
     // An interrupted swap for this game is put back before anything else runs (MASTER_SPEC §26.9).
     game_tool_swap::recover_game(ctx, definition)?;
 
@@ -2953,6 +3339,7 @@ fn run_inner(
         Route::Vfs(dll) => {
             let (outcome, injected) = match run_under_vfs(
                 ctx,
+                guard,
                 instance_id,
                 definition,
                 tool,
@@ -3071,6 +3458,7 @@ fn vfs_unavailable_message(reason: &str, next: &Option<CaptureMode>) -> String {
 #[allow(clippy::too_many_arguments)]
 fn run_under_vfs(
     ctx: &Ctx,
+    guard: &InstanceGuard,
     instance_id: &str,
     definition: &GameDefinition,
     tool: &ToolDefinition,
@@ -3094,7 +3482,7 @@ fn run_under_vfs(
     let game_dir = deployment_folder(base, instance_id)?;
     let writable = instance_dir.join("writable");
 
-    deploy_locked(ctx, instance_id, definition, DeployMode::Virtual)?;
+    deploy_locked(ctx, guard, definition, DeployMode::Virtual)?;
     let fingerprint = input_fingerprint_scoped(ctx, instance_id, definition, tool, scope_item)?;
 
     let roots = LaunchRoots {
@@ -3984,10 +4372,31 @@ pub fn use_tool_output(
     tool_id: &ToolId,
     item_id: &str,
 ) -> Result<Vec<ToolOutputRecord>, ToolError> {
-    let _lock = ctx.lock_manager.acquire(
-        LockResource::Instance(instance_id.to_string()),
-        "tool-output-use",
-    )?;
+    use_tool_output_while_running(ctx, instance_id, definition, tool_id, item_id, false)
+}
+
+/// [`use_tool_output`], with the user's explicit answer to a running game.
+pub fn use_tool_output_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    item_id: &str,
+    allow_while_running: bool,
+) -> Result<Vec<ToolOutputRecord>, ToolError> {
+    let guard = guard_for(ctx, instance_id, "tool-output-use", allow_while_running)?;
+    use_tool_output_locked(ctx, &guard, definition, tool_id, item_id)
+}
+
+/// [`use_tool_output`] for a caller that already holds the instance guard.
+pub fn use_tool_output_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    item_id: &str,
+) -> Result<Vec<ToolOutputRecord>, ToolError> {
+    let instance_id = guard.instance_id();
     let instance_dir = ctx
         .paths
         .instance_dir(instance_id)
@@ -4466,10 +4875,29 @@ pub fn rollback(
     definition: &GameDefinition,
     tool_id: &ToolId,
 ) -> Result<ToolState, ToolError> {
-    let _lock = ctx.lock_manager.acquire(
-        LockResource::Instance(instance_id.to_string()),
-        "tool-rollback",
-    )?;
+    rollback_while_running(ctx, instance_id, definition, tool_id, false)
+}
+
+/// [`rollback`], with the user's explicit answer to a running game.
+pub fn rollback_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    allow_while_running: bool,
+) -> Result<ToolState, ToolError> {
+    let guard = guard_for(ctx, instance_id, "tool-rollback", allow_while_running)?;
+    rollback_locked(ctx, &guard, definition, tool_id)
+}
+
+/// [`rollback`] for a caller that already holds the instance guard.
+pub fn rollback_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+) -> Result<ToolState, ToolError> {
+    let instance_id = guard.instance_id();
     let mut manifest = load_manifest(ctx, instance_id)?;
     let mut layers = manifest.layers.layers().to_vec();
     let position = generated_position(&layers, tool_id.as_str())
@@ -4527,10 +4955,29 @@ pub fn remove(
     definition: &GameDefinition,
     tool_id: &ToolId,
 ) -> Result<Vec<String>, ToolError> {
-    let _lock = ctx.lock_manager.acquire(
-        LockResource::Instance(instance_id.to_string()),
-        "tool-remove",
-    )?;
+    remove_while_running(ctx, instance_id, definition, tool_id, false)
+}
+
+/// [`remove`], with the user's explicit answer to a running game.
+pub fn remove_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    allow_while_running: bool,
+) -> Result<Vec<String>, ToolError> {
+    let guard = guard_for(ctx, instance_id, "tool-remove", allow_while_running)?;
+    remove_locked(ctx, &guard, definition, tool_id)
+}
+
+/// [`remove`] for a caller that already holds the instance guard.
+pub fn remove_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+) -> Result<Vec<String>, ToolError> {
+    let instance_id = guard.instance_id();
     let mut manifest = load_manifest(ctx, instance_id)?;
     let mut layers = manifest.layers.layers().to_vec();
     let instance_dir = ctx

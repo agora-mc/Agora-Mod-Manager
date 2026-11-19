@@ -415,12 +415,17 @@ pub fn run_server_edit(
     server: &str,
     name: Option<String>,
     address: Option<String>,
+    while_running: bool,
     output_fmt: OutputFormat,
 ) -> anyhow::Result<()> {
     if name.is_none() && address.is_none() {
         anyhow::bail!("Nothing to change. Pass --name and/or --address.");
     }
-    let service = WorldService::new(ctx.clone());
+    let service = if while_running {
+        WorldService::new(ctx.clone()).while_running()
+    } else {
+        WorldService::new(ctx.clone())
+    };
     let index = resolve_server(&service, instance, server)?;
     let current = service
         .list_servers(instance)?
@@ -448,9 +453,14 @@ pub fn run_server_move(
     instance: &str,
     server: &str,
     direction: MoveDirection,
+    while_running: bool,
     output_fmt: OutputFormat,
 ) -> anyhow::Result<()> {
-    let service = WorldService::new(ctx.clone());
+    let service = if while_running {
+        WorldService::new(ctx.clone()).while_running()
+    } else {
+        WorldService::new(ctx.clone())
+    };
     let index = resolve_server(&service, instance, server)?;
     let offset = match direction {
         MoveDirection::Up => -1,

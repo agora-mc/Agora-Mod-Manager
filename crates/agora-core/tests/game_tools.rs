@@ -1160,6 +1160,20 @@ fn a_stale_output_and_an_unknown_one_warn_and_never_refuse() {
     let launched = launch(&f.ctx, f.id(), &f.def, &StagingLauncher::plain())
         .expect("a stale output does not refuse a launch");
     assert_eq!(launched.prepared.generated_findings.len(), 1);
+    if let Some(session_id) = launched.session_id.as_deref() {
+        if let Ok(conn) = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()) {
+            let done = agora_core::session_ledger::SessionFinish {
+                ended_at: chrono::Utc::now().to_rfc3339(),
+                duration_ms: 0,
+                exit: agora_core::session_ledger::ExitObservation::unavailable("test launch"),
+                game_runtime_ms: Some(0),
+                normal_exit_codes: vec![0],
+                artifact: None,
+                froze: false,
+            };
+            let _ = agora_core::session_ledger::finish(&conn, session_id, &done);
+        }
+    }
     let mut child = launched.launched;
     child.child.wait().unwrap();
 

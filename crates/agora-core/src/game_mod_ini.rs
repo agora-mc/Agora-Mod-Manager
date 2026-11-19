@@ -16,7 +16,7 @@ use crate::ctx::Ctx;
 use crate::error::LauncherError;
 use crate::game_ini::IniDocument;
 use crate::game_instance::{self, GameInstanceManifest};
-use crate::lock_manager::LockResource;
+use crate::instance_runtime::InstanceGuard;
 
 const OVERRIDES: &str = "overrides";
 const REPLACED: &str = "overrides-replaced";
@@ -606,7 +606,33 @@ pub fn set_mod_ini_value(
     key: &str,
     value: &str,
 ) -> Result<bool, ModIniError> {
-    edit_mod_ini(ctx, instance_id, path, |document| {
+    set_mod_ini_value_while_running(ctx, instance_id, path, section, key, value, false)
+}
+
+/// [`set_mod_ini_value`], with the user's explicit answer to a running game.
+pub fn set_mod_ini_value_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    path: &str,
+    section: &str,
+    key: &str,
+    value: &str,
+    allow_while_running: bool,
+) -> Result<bool, ModIniError> {
+    let guard = guard_for(ctx, instance_id, "mod-ini-edit", allow_while_running)?;
+    set_mod_ini_value_locked(ctx, &guard, path, section, key, value)
+}
+
+/// [`set_mod_ini_value`] for a caller that already holds the instance guard.
+pub fn set_mod_ini_value_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    path: &str,
+    section: &str,
+    key: &str,
+    value: &str,
+) -> Result<bool, ModIniError> {
+    edit_mod_ini_locked(ctx, guard, path, |document| {
         let changed = document.set(section, key, value)?;
         Ok((changed, changed))
     })
@@ -621,7 +647,31 @@ pub fn unset_mod_ini_value(
     section: &str,
     key: &str,
 ) -> Result<bool, ModIniError> {
-    edit_mod_ini(ctx, instance_id, path, |document| {
+    unset_mod_ini_value_while_running(ctx, instance_id, path, section, key, false)
+}
+
+/// [`unset_mod_ini_value`], with the user's explicit answer to a running game.
+pub fn unset_mod_ini_value_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    path: &str,
+    section: &str,
+    key: &str,
+    allow_while_running: bool,
+) -> Result<bool, ModIniError> {
+    let guard = guard_for(ctx, instance_id, "mod-ini-edit", allow_while_running)?;
+    unset_mod_ini_value_locked(ctx, &guard, path, section, key)
+}
+
+/// [`unset_mod_ini_value`] for a caller that already holds the instance guard.
+pub fn unset_mod_ini_value_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    path: &str,
+    section: &str,
+    key: &str,
+) -> Result<bool, ModIniError> {
+    edit_mod_ini_locked(ctx, guard, path, |document| {
         let changed = document.unset(section, key)?;
         Ok((changed, changed))
     })
@@ -630,12 +680,13 @@ pub fn unset_mod_ini_value(
 /// Edit the instance's copy with `f`, which returns its own result and whether it changed the
 /// document. The copy is written only when it changed, through a temporary file beside it. The
 /// store is read, never written.
-fn edit_mod_ini<T>(
+fn edit_mod_ini_locked<T>(
     ctx: &Ctx,
-    instance_id: &str,
+    guard: &InstanceGuard,
     path: &str,
     f: impl FnOnce(&mut IniDocument) -> Result<(T, bool), crate::game_ini::IniError>,
 ) -> Result<T, ModIniError> {
+    let instance_id = guard.instance_id();
     let row = listed_row(ctx, instance_id, path)?;
     if !row.mod_enabled {
         return Err(ModIniError::NotEditable {
@@ -648,10 +699,6 @@ fn edit_mod_ini<T>(
         });
     }
     let target = override_path(ctx, instance_id, &row)?;
-    let _lock = ctx.lock_manager.acquire(
-        LockResource::Instance(instance_id.to_string()),
-        "mod-ini-edit",
-    )?;
     let writable = writable_path(ctx, instance_id, &row)?;
     let mut document = if writable.is_file() {
         load_ini(&row.path, &writable)?
@@ -698,6 +745,27 @@ fn edit_mod_ini<T>(
 /// Adopt the game's version: copy the writable copy into the override, so both agree and the game
 /// keeps reading the same bytes. The writable copy stays.
 pub fn keep_game_version(ctx: &Ctx, instance_id: &str, path: &str) -> Result<(), ModIniError> {
+    keep_game_version_while_running(ctx, instance_id, path, false)
+}
+
+/// [`keep_game_version`], with the user's explicit answer to a running game.
+pub fn keep_game_version_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    path: &str,
+    allow_while_running: bool,
+) -> Result<(), ModIniError> {
+    let guard = guard_for(ctx, instance_id, "mod-ini-keep", allow_while_running)?;
+    keep_game_version_locked(ctx, &guard, path)
+}
+
+/// [`keep_game_version`] for a caller that already holds the instance guard.
+pub fn keep_game_version_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    path: &str,
+) -> Result<(), ModIniError> {
+    let instance_id = guard.instance_id();
     let row = listed_row(ctx, instance_id, path)?;
     if !row.mod_enabled {
         return Err(ModIniError::NotEditable {
@@ -710,10 +778,6 @@ pub fn keep_game_version(ctx: &Ctx, instance_id: &str, path: &str) -> Result<(),
         });
     }
     let writable = writable_path(ctx, instance_id, &row)?;
-    let _lock = ctx.lock_manager.acquire(
-        LockResource::Instance(instance_id.to_string()),
-        "mod-ini-keep",
-    )?;
     if !writable.is_file() {
         return Ok(());
     }
@@ -731,15 +795,49 @@ pub fn keep_game_version(ctx: &Ctx, instance_id: &str, path: &str) -> Result<(),
 
 /// Go back to the user's version: move the game's writable copy aside, so the override runs again.
 pub fn restore_mine(ctx: &Ctx, instance_id: &str, path: &str) -> Result<(), ModIniError> {
+    restore_mine_while_running(ctx, instance_id, path, false)
+}
+
+/// [`restore_mine`], with the user's explicit answer to a running game.
+pub fn restore_mine_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    path: &str,
+    allow_while_running: bool,
+) -> Result<(), ModIniError> {
+    let guard = guard_for(ctx, instance_id, "mod-ini-restore", allow_while_running)?;
+    restore_mine_locked(ctx, &guard, path)
+}
+
+/// [`restore_mine`] for a caller that already holds the instance guard.
+pub fn restore_mine_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    path: &str,
+) -> Result<(), ModIniError> {
+    let instance_id = guard.instance_id();
     let row = listed_row(ctx, instance_id, path)?;
-    let _lock = ctx.lock_manager.acquire(
-        LockResource::Instance(instance_id.to_string()),
-        "mod-ini-restore",
-    )?;
     if stage_writable_backup(ctx, instance_id, &row)?.is_some() {
         remove_writable(ctx, instance_id, &row)?;
     }
     Ok(())
+}
+
+fn guard_for(
+    ctx: &Ctx,
+    instance_id: &str,
+    operation: &str,
+    allow_while_running: bool,
+) -> Result<InstanceGuard, ModIniError> {
+    if allow_while_running {
+        Ok(InstanceGuard::for_mutation_while_running(
+            ctx,
+            instance_id,
+            operation,
+        )?)
+    } else {
+        Ok(InstanceGuard::for_mutation(ctx, instance_id, operation)?)
+    }
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ModIniError> {
@@ -770,12 +868,29 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ModIniError> {
 /// and the folders inside `overrides/` that it leaves empty are removed. A path with no copy is a
 /// no-op, not an error.
 pub fn reset_mod_ini(ctx: &Ctx, instance_id: &str, path: &str) -> Result<(), ModIniError> {
+    reset_mod_ini_while_running(ctx, instance_id, path, false)
+}
+
+/// [`reset_mod_ini`], with the user's explicit answer to a running game.
+pub fn reset_mod_ini_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    path: &str,
+    allow_while_running: bool,
+) -> Result<(), ModIniError> {
+    let guard = guard_for(ctx, instance_id, "mod-ini-reset", allow_while_running)?;
+    reset_mod_ini_locked(ctx, &guard, path)
+}
+
+/// [`reset_mod_ini`] for a caller that already holds the instance guard.
+pub fn reset_mod_ini_locked(
+    ctx: &Ctx,
+    guard: &InstanceGuard,
+    path: &str,
+) -> Result<(), ModIniError> {
+    let instance_id = guard.instance_id();
     let row = listed_row(ctx, instance_id, path)?;
     let target = override_path(ctx, instance_id, &row)?;
-    let _lock = ctx.lock_manager.acquire(
-        LockResource::Instance(instance_id.to_string()),
-        "mod-ini-reset",
-    )?;
     // The game's changed copy is kept aside too, so the mod's own file really runs.
     let backup = stage_writable_backup(ctx, instance_id, &row)?;
     match std::fs::remove_file(&target) {
