@@ -10600,7 +10600,11 @@ fn run_games_import(
                 if json {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 } else {
-                    print_multi_run(&report.instances, &report.loadouts);
+                    print_mo2_multi_run(&report);
+                }
+                if report.profiles.iter().any(|p| p.error.is_some()) {
+                    let failed = report.profiles.iter().filter(|p| p.error.is_some()).count();
+                    anyhow::bail!("{failed} profile(s) failed to import");
                 }
                 return Ok(());
             }
@@ -10992,6 +10996,25 @@ fn print_vortex_multi_run(
         }
         if let Some(note) = &save.note {
             println!("Saves for profile '{}': {note}", save.profile);
+        }
+    }
+}
+
+fn print_mo2_multi_run(report: &agora_core::game_import::Mo2MultiReport) {
+    print_multi_run(&report.instances, &report.loadouts);
+    for outcome in &report.profiles {
+        if let Some(error) = &outcome.error {
+            eprintln!("Profile '{}' failed: {error}", outcome.profile);
+        }
+        if !outcome.external_files_written.is_empty() {
+            println!(
+                "Files written outside the instance for profile '{}' ({}):",
+                outcome.profile,
+                outcome.external_files_written.len()
+            );
+            for path in &outcome.external_files_written {
+                println!("  {}", path.display());
+            }
         }
     }
 }

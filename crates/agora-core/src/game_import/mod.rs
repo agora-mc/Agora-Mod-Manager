@@ -1242,6 +1242,9 @@ pub struct Mo2RunReport {
     pub saves_copied: usize,
     pub saves_skipped_existing: usize,
     pub saves_folder: Option<PathBuf>,
+    /// Files this import wrote outside the instance folder (copied save files under Documents).
+    #[serde(default)]
+    pub external_files_written: Vec<PathBuf>,
     /// Programs from MO2's executables list added to the instance's own tools, by name. A tool the
     /// game declares is found in its mod by itself and is not repeated here.
     pub tools_added: Vec<String>,
@@ -1319,6 +1322,20 @@ struct RunDetail {
     overwrite_item: Option<String>,
 }
 
+struct RunInnerError {
+    error: ImportError,
+    external_files_written: Vec<PathBuf>,
+}
+
+impl<E: Into<ImportError>> From<E> for RunInnerError {
+    fn from(error: E) -> Self {
+        Self {
+            error: error.into(),
+            external_files_written: Vec::new(),
+        }
+    }
+}
+
 fn single_copy_bytes(plan: &Mo2Plan, copy_saves: bool) -> u64 {
     let saves = if copy_saves && plan.saves.local && plan.saves.from.is_some() {
         plan.saves.bytes
@@ -1384,7 +1401,9 @@ pub fn run(
     options: RunOptions,
     progress: &dyn Fn(ImportProgress),
 ) -> Result<Mo2RunReport, ImportError> {
-    run_inner(ctx, inventory, request, options, progress, false, true).map(|detail| detail.report)
+    run_inner(ctx, inventory, request, options, progress, false, true)
+        .map(|detail| detail.report)
+        .map_err(|err| err.error)
 }
 
 fn run_inner(
@@ -1395,13 +1414,13 @@ fn run_inner(
     progress: &dyn Fn(ImportProgress),
     only_enabled_mods: bool,
     check_space: bool,
-) -> Result<RunDetail, ImportError> {
+) -> Result<RunDetail, RunInnerError> {
     let plan = plan(ctx, inventory, request)?;
     if check_space {
         let needed = single_copy_bytes(&plan, request.copy_saves);
         if let Some(free) = crate::game_tool_swap::available_bytes(&ctx.paths.content_root()) {
             if needed > free {
-                return Err(ImportError::NotEnoughSpace { needed, free });
+                return Err(ImportError::NotEnoughSpace { needed, free }.into());
             }
         }
     }
@@ -1438,6 +1457,7 @@ fn run_inner(
         saves_copied: 0,
         saves_skipped_existing: 0,
         saves_folder: None,
+        external_files_written: Vec::new(),
         tools_added: Vec::new(),
         next_steps: Vec::new(),
     };
@@ -1563,6 +1583,7 @@ fn run_inner(
 
     // Everything from here sets the new instance up. If any of it fails, the half-made instance is
     // removed, so a second run starts clean rather than being refused as already imported.
+    let mut external_files_written: Vec<PathBuf> = Vec::new();
     let populated: Result<(), ImportError> = (|| {
         let mut manifest: GameInstanceManifest = game_instance::get_manifest(ctx, &instance_id)?;
         manifest.imported_from = Some(ImportRecord {
@@ -1711,6 +1732,7 @@ fn run_inner(
                                 continue;
                             }
                             std::fs::copy(entry.path(), &dest)?;
+                            external_files_written.push(dest);
                             report.saves_copied += 1;
                         }
                     }
@@ -1728,8 +1750,12 @@ fn run_inner(
         Ok(())
     })();
     if let Err(error) = populated {
-        return Err(abandon_half_made_instance(ctx, &instance_id, error));
+        return Err(RunInnerError {
+            error: abandon_half_made_instance(ctx, &instance_id, error),
+            external_files_written,
+        });
     }
+    report.external_files_written = external_files_written;
 
     // 8. MO2's executables become the instance's own tools. A tool that cannot be added is a note,
     // never a failed import: the instance is complete without it.
@@ -1974,11 +2000,30 @@ pub fn mo2_plan_profiles(
     })
 }
 
+/// Outcome of one profile in a multi-profile MO2 import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Mo2ProfileOutcome {
+    pub profile: String,
+    /// The created instance id (or the shared instance id in merged mode), or `None` if this
+    /// profile failed to import.
+    pub instance_id: Option<String>,
+    /// Error message when importing this profile failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Files the import wrote outside the instance folder (such as copied saves under Documents),
+    /// kept even when a later step failed so nothing is silently forgotten.
+    #[serde(default)]
+    pub external_files_written: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Mo2MultiReport {
     pub plan: Mo2MultiPlan,
     pub instances: Vec<String>,
     pub loadouts: Vec<String>,
+    /// Per-profile result (instance id or error) and any files written outside the instance.
+    #[serde(default)]
+    pub profiles: Vec<Mo2ProfileOutcome>,
 }
 
 fn add_mo2_mod_to_merged(
@@ -2221,6 +2266,7 @@ pub fn mo2_run_profiles(
     match grouping {
         profiles::Grouping::Separate => {
             let mut instances = Vec::new();
+            let mut outcomes = Vec::with_capacity(profiles.len());
             for profile in profiles {
                 let request = Mo2Request {
                     profile: profile.clone(),
@@ -2232,16 +2278,34 @@ pub fn mo2_run_profiles(
                     ),
                     ..base.clone()
                 };
-                let report = run_inner(ctx, inventory, &request, options, progress, false, false)?
-                    .report;
-                if let Some(instance) = report.instance_id {
-                    instances.push(instance);
+                match run_inner(ctx, inventory, &request, options, progress, false, false) {
+                    Ok(detail) => {
+                        let report = detail.report;
+                        if let Some(instance) = &report.instance_id {
+                            instances.push(instance.clone());
+                        }
+                        outcomes.push(Mo2ProfileOutcome {
+                            profile: profile.clone(),
+                            instance_id: report.instance_id,
+                            error: None,
+                            external_files_written: report.external_files_written,
+                        });
+                    }
+                    Err(err) => {
+                        outcomes.push(Mo2ProfileOutcome {
+                            profile: profile.clone(),
+                            instance_id: None,
+                            error: Some(err.error.to_string()),
+                            external_files_written: err.external_files_written,
+                        });
+                    }
                 }
             }
             Ok(Mo2MultiReport {
                 plan: multi,
                 instances,
                 loadouts: Vec::new(),
+                profiles: outcomes,
             })
         }
         profiles::Grouping::Merged => {
@@ -2251,7 +2315,8 @@ pub fn mo2_run_profiles(
                 copy_saves: false,
                 ..base.clone()
             };
-            let detail = run_inner(ctx, inventory, &request, options, progress, true, false)?;
+            let detail = run_inner(ctx, inventory, &request, options, progress, true, false)
+                .map_err(|err| err.error)?;
             let report = detail.report;
             let overwrite_item = detail.overwrite_item;
             let instance_id = report
@@ -2262,7 +2327,8 @@ pub fn mo2_run_profiles(
             // Everything after the first profile's instance exists is one recoverable unit:
             // any failure removes the half-made instance so a normal retry succeeds cleanly
             // instead of hitting AlreadyImported.
-            let merged = (|| -> Result<Vec<String>, ImportError> {
+            let mut copied_saves_all: Vec<PathBuf> = Vec::new();
+            let merged = (|| -> Result<(Vec<String>, Vec<Mo2ProfileOutcome>), ImportError> {
                 let definition = ctx
                     .games
                     .game(&multi.plans[0].game)
@@ -2351,6 +2417,7 @@ pub fn mo2_run_profiles(
                 )
                 .map_err(|e| ImportError::Other(e.to_string()))?;
 
+                let mut per_profile_external: HashMap<String, Vec<PathBuf>> = HashMap::new();
                 if base.copy_saves {
                     let store = game_ini::store_of(ctx, &instance_id)?;
                     if let Some(rule) = game_saves::rule_for(&definition, &store) {
@@ -2365,6 +2432,7 @@ pub fn mo2_run_profiles(
                                 game_saves::own_folder_scoped(rule, &instance_id, Some(profile))?;
                             let entries = saves_entries(from)?;
                             let mut created_dir = false;
+                            let written = per_profile_external.entry(profile.clone()).or_default();
                             for entry in entries {
                                 let path = entry.path();
                                 let meta = std::fs::symlink_metadata(&path)
@@ -2383,21 +2451,50 @@ pub fn mo2_run_profiles(
                                     continue;
                                 }
                                 std::fs::copy(&path, &dest)?;
+                                written.push(dest.clone());
+                                copied_saves_all.push(dest);
                             }
                         }
                     }
                 }
 
-                Ok(loadouts)
+                let outcomes = profiles
+                    .iter()
+                    .map(|profile| Mo2ProfileOutcome {
+                        profile: profile.clone(),
+                        instance_id: Some(instance_id.clone()),
+                        error: None,
+                        external_files_written: per_profile_external
+                            .remove(profile)
+                            .unwrap_or_default(),
+                    })
+                    .collect();
+
+                Ok((loadouts, outcomes))
             })();
 
             match merged {
-                Ok(loadouts) => Ok(Mo2MultiReport {
+                Ok((loadouts, outcomes)) => Ok(Mo2MultiReport {
                     plan: multi,
                     instances: vec![instance_id],
                     loadouts,
+                    profiles: outcomes,
                 }),
-                Err(error) => Err(abandon_half_made_instance(ctx, &instance_id, error)),
+                Err(error) => {
+                    let error = if copied_saves_all.is_empty() {
+                        error
+                    } else {
+                        let listed: Vec<String> = copied_saves_all
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect();
+                        ImportError::Other(format!(
+                            "{error} (files already copied outside the instance were left untouched: {})",
+                            listed.join(", ")
+                        ))
+                    };
+                    Err(abandon_half_made_instance(ctx, &instance_id, error))
+                }
             }
         }
     }

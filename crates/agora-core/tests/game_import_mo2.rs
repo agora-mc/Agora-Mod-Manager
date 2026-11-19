@@ -2203,3 +2203,108 @@ fn f1f_single_profile_run_checks_free_space_before_copying() {
             .expect("single-profile run succeeds when exact bytes fit");
     }
 }
+
+#[test]
+fn f1g_separate_mode_returns_per_profile_report_and_lists_copied_saves() {
+    use agora_core::game_import::{profiles::Grouping, ImportPhase};
+
+    let f = fixture();
+    // Second profile enables a mod we delete once profile 1 reaches Finishing, so planning
+    // succeeds for all three profiles, profile 1 creates its instance, profile 2 fails, and
+    // profile 3 still completes.
+    let doomed_mod = f.setup.join("mods/DoomedMod");
+    write(&doomed_mod.join("Doomed.esp"), b"DOOMED");
+    let fails_prof = f.setup.join("profiles/FailsMidRun");
+    write(
+        &fails_prof.join("modlist.txt"),
+        b"# Mod Organizer\r\n+DoomedMod\r\n",
+    );
+    write(
+        &fails_prof.join("plugins.txt"),
+        b"# Mod Organizer\r\n*Doomed.esp\r\n",
+    );
+
+    let third = f.setup.join("profiles/Third");
+    write(
+        &third.join("modlist.txt"),
+        b"# Mod Organizer\r\n+Alpha\r\n+Beta\r\n",
+    );
+    write(
+        &third.join("plugins.txt"),
+        b"# Mod Organizer\r\n*Alpha.esp\r\n*Beta.esp\r\n",
+    );
+    write(
+        &third.join("settings.ini"),
+        b"[General]\r\nLocalSaves=true\r\nLocalSettings=false\r\n",
+    );
+    write(&third.join("saves/ThirdSave.ess"), b"THIRD SAVE");
+
+    let profiles = vec![
+        "Test Profile".to_string(),
+        "FailsMidRun".to_string(),
+        "Third".to_string(),
+    ];
+    let removed = std::cell::Cell::new(false);
+    let report = game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("Sep Batch"), true),
+        &profiles,
+        Grouping::Separate,
+        Default::default(),
+        &|p| {
+            if p.phase == ImportPhase::Finishing && !removed.replace(true) {
+                std::fs::remove_file(fails_prof.join("modlist.txt")).unwrap();
+            }
+        },
+    )
+    .expect("separate mode must return a per-profile report instead of failing the whole call");
+
+    assert_eq!(
+        report.instances.len(),
+        2,
+        "profiles 1 and 3 created instances: {report:?}"
+    );
+    assert_eq!(report.profiles.len(), 3, "{:?}", report.profiles);
+
+    // Profile 1 succeeded and lists both copied save files written outside the instance.
+    let p0 = &report.profiles[0];
+    assert_eq!(p0.profile, "Test Profile");
+    assert!(p0.instance_id.is_some());
+    assert!(p0.error.is_none());
+    assert_eq!(p0.external_files_written.len(), 2, "{p0:?}");
+    assert!(
+        p0.external_files_written.iter().all(|p| p.is_file()),
+        "all reported copied save files must exist on disk: {:?}",
+        p0.external_files_written
+    );
+    assert!(p0
+        .external_files_written
+        .iter()
+        .any(|p| p.file_name().and_then(|n| n.to_str()) == Some("Save1.ess")));
+
+    // Profile 2 failed and reports its error without hiding profiles 1 and 3.
+    let p1 = &report.profiles[1];
+    assert_eq!(p1.profile, "FailsMidRun");
+    assert!(p1.instance_id.is_none());
+    assert!(
+        p1.error
+            .as_deref()
+            .is_some_and(|e| e.contains("modlist.txt")),
+        "profile 2 must carry its error: {p1:?}"
+    );
+
+    // Profile 3 succeeded and lists its copied save file.
+    let p2 = &report.profiles[2];
+    assert_eq!(p2.profile, "Third");
+    assert!(p2.instance_id.is_some());
+    assert!(p2.error.is_none());
+    assert_eq!(p2.external_files_written.len(), 1, "{p2:?}");
+    assert!(p2.external_files_written[0].is_file());
+    assert_eq!(
+        p2.external_files_written[0]
+            .file_name()
+            .and_then(|n| n.to_str()),
+        Some("ThirdSave.ess")
+    );
+}
