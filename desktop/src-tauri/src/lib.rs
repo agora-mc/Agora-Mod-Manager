@@ -16,6 +16,7 @@ pub mod mojang;
 pub mod providers;
 pub use agora_game_minecraft::override_sanitizer;
 pub mod mcp;
+pub mod parity;
 pub mod paths;
 pub mod plugins;
 pub mod registry;
@@ -485,6 +486,10 @@ pub fn run() {
             commands::list_mod_reviews,
             commands::get_governance_config,
             commands::get_governance_summary,
+            parity::local_state_report,
+            parity::registry_under_review,
+            parity::registry_audit_log,
+            parity::registry_resolutions,
             commands::get_item_vote,
             commands::set_item_vote,
             commands::list_governance_events,
@@ -677,6 +682,12 @@ pub fn run() {
             games::tools::games_tools_diff,
             games::tools::games_tools_swap_costs,
             games::tools::games_tools_swap_status,
+            games::parity::games_instance_is_default,
+            games::parity::games_instance_set_default,
+            games::parity::games_instance_deploy,
+            games::parity::games_instance_undeploy,
+            games::parity::games_instance_content_set_own_copy,
+            games::parity::games_tools_swap_remove_copy,
             games::tools::games_tools_swap_restore,
             games::tools::games_user_tools_list,
             games::tools::games_user_tools_add,

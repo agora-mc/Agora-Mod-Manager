@@ -6,6 +6,7 @@
  * when a swap was interrupted.
  */
 
+import { KeptCopySection } from './KeptCopySection';
 import { useCallback, useEffect, useState } from 'react';
 import { Plus, ScanSearch, Wrench } from 'lucide-react';
 import { EmptyState, PageHeroAction } from '@/components/instance-kit';
@@ -191,6 +192,7 @@ export function InstanceToolsTab({ instanceId }: { gameId: string; instanceId: s
         </section>
       )}
       {restoreMessage && <p role="status" className="text-sm text-muted-foreground">{restoreMessage}</p>}
+      <KeptCopySection instanceId={instanceId} disabled={busy || Boolean(interrupted)} />
 
       {adding && (
         <AddToolPanel

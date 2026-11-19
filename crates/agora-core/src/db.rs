@@ -540,6 +540,75 @@ pub struct LocalStateInspection {
 
 /// Inspect the local database for reporting. Read-only: nothing is migrated,
 /// copied, renamed or deleted.
+/// What `agora doctor` and the desktop's data health panel report about the local database:
+/// the inspection in a form both can print, and whether any of it is a problem.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalStateReport {
+    pub path: String,
+    /// ok, corrupt, missing or unreadable.
+    pub integrity: &'static str,
+    pub integrity_detail: String,
+    pub schema_version: Option<i64>,
+    pub supported_version: i64,
+    pub database_is_newer: bool,
+    /// Pre-migration backups, newest first.
+    pub backups: Vec<String>,
+    pub backups_error: Option<String>,
+    pub backups_kept: usize,
+    /// Files a recovery moved aside.
+    pub kept_aside: Vec<String>,
+    pub kept_aside_error: Option<String>,
+    /// Anything above that needs attention.
+    pub problems: bool,
+}
+
+/// Inspect the local database and say what is wrong with it, if anything.
+pub fn local_state_report(db_path: &Path) -> LocalStateReport {
+    let info = inspect_local_state(db_path);
+    let (integrity, detail) = match &info.integrity {
+        LocalStateIntegrity::Ok => ("ok", String::new()),
+        LocalStateIntegrity::Corrupt(reason) => ("corrupt", reason.clone()),
+        LocalStateIntegrity::Missing => ("missing", String::new()),
+        LocalStateIntegrity::Unreadable(reason) => ("unreadable", reason.clone()),
+    };
+    let newer = info
+        .schema_version
+        .is_some_and(|version| version > info.supported_version);
+    let unreadable_schema =
+        !matches!(info.integrity, LocalStateIntegrity::Missing) && info.schema_version.is_none();
+    let problems = matches!(
+        info.integrity,
+        LocalStateIntegrity::Corrupt(_) | LocalStateIntegrity::Unreadable(_)
+    ) || unreadable_schema
+        || newer
+        || info.backups_error.is_some()
+        || info.kept_aside_error.is_some();
+    LocalStateReport {
+        path: info.path.display().to_string(),
+        integrity,
+        integrity_detail: detail,
+        schema_version: info.schema_version,
+        supported_version: info.supported_version,
+        database_is_newer: newer,
+        backups: info
+            .backups
+            .iter()
+            .rev()
+            .map(|path| path.display().to_string())
+            .collect(),
+        backups_error: info.backups_error.clone(),
+        backups_kept: LOCAL_STATE_BACKUP_RETENTION,
+        kept_aside: info
+            .kept_aside
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        kept_aside_error: info.kept_aside_error.clone(),
+        problems,
+    }
+}
+
 pub fn inspect_local_state(db_path: &Path) -> LocalStateInspection {
     let mut inspection = LocalStateInspection {
         path: db_path.to_path_buf(),

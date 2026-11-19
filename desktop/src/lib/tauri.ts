@@ -3843,3 +3843,50 @@ export const setInstanceGroup = (instanceId: string, group: string | null) =>
 /** Set this instance's window size; null clears it so the global default applies. */
 export const setInstanceWindowSize = (instanceId: string, size: WindowSize | null) =>
   invoke<void>('set_instance_window_size', { instanceId, width: size?.width ?? null, height: size?.height ?? null });
+
+// ---------------------------------------------------------------------------
+// Views the CLI had first: `agora doctor`, `agora registry under-review|audit-log|resolutions`
+// ---------------------------------------------------------------------------
+
+/** The local database's health, as `agora doctor` reports it. */
+export interface LocalStateReport {
+  path: string;
+  integrity: 'ok' | 'corrupt' | 'missing' | 'unreadable';
+  integrityDetail: string;
+  schemaVersion: number | null;
+  supportedVersion: number;
+  databaseIsNewer: boolean;
+  /** Pre-migration backups, newest first. */
+  backups: string[];
+  backupsError: string | null;
+  backupsKept: number;
+  /** Files a recovery moved aside. */
+  keptAside: string[];
+  keptAsideError: string | null;
+  problems: boolean;
+}
+
+export const localStateReport = () => invoke<LocalStateReport>('local_state_report');
+
+/** A catalog item the community is reviewing. */
+export interface UnderReviewItem {
+  id: string;
+  name: string;
+  content_type: string;
+  icon_url: string | null;
+  net_score: number;
+}
+
+/** One catalog audit log entry: a compile run or a governance event. */
+export interface AuditLogEntry {
+  id: number;
+  timestamp: string;
+  action: string;
+  details: string | null;
+}
+
+export const registryUnderReview = () => invoke<UnderReviewItem[]>('registry_under_review');
+export const registryAuditLog = (limit?: number) =>
+  invoke<AuditLogEntry[]>('registry_audit_log', { limit: limit ?? null });
+export const registryResolutions = (limit?: number) =>
+  invoke<AuditLogEntry[]>('registry_resolutions', { limit: limit ?? null });

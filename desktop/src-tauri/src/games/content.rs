@@ -110,6 +110,8 @@ pub struct InstanceContentRow {
     pub mount_path: String,
     /// The folder inside the item the layer reads from (`""` is the item's root).
     pub source_path: String,
+    /// The instance deploys its own copies of this item's files instead of sharing them.
+    pub own_copy: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -337,6 +339,7 @@ pub fn instance_content_rows(
             enabled: layer.enabled,
             mount_path: layer.mount_path.as_str().to_string(),
             source_path: layer.source_path.as_str().to_string(),
+            own_copy: layer.own_copy,
         });
     }
     Ok(rows)

@@ -8,21 +8,41 @@
 import { useEffect, useState } from 'react';
 import { Check, Copy, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { gamesErrorMessage, getSteamLaunchInfo, type SteamLaunchInfo } from './api';
+import {
+  gamesErrorMessage,
+  getSteamLaunchInfo,
+  isDefaultGameInstance,
+  setDefaultGameInstance,
+  type SteamLaunchInfo,
+} from './api';
 
 export function SteamLaunchPanel({ instanceId }: { instanceId: string }) {
   const [info, setInfo] = useState<SteamLaunchInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  // Whether Steam starts this instance when it launches the game with nothing pending.
+  const [isDefault, setIsDefault] = useState<boolean | null>(null);
+  const [defaultError, setDefaultError] = useState<string | null>(null);
 
   useEffect(() => {
     let live = true;
     setInfo(null);
     setError(null);
     setCopied(false);
+    setIsDefault(null);
+    setDefaultError(null);
     getSteamLaunchInfo(instanceId)
       .then((value) => {
         if (live) setInfo(value);
+        if (live && value.supported) {
+          isDefaultGameInstance(instanceId)
+            .then((answer) => {
+              if (live) setIsDefault(answer);
+            })
+            .catch((failure: unknown) => {
+              if (live) setDefaultError(gamesErrorMessage(failure));
+            });
+        }
       })
       .catch((failure: unknown) => {
         if (live) setError(gamesErrorMessage(failure));
@@ -48,6 +68,16 @@ export function SteamLaunchPanel({ instanceId }: { instanceId: string }) {
     );
   }
   if (!info.supported) return null;
+
+  const makeDefault = async () => {
+    setDefaultError(null);
+    try {
+      await setDefaultGameInstance(instanceId);
+      setIsDefault(true);
+    } catch (failure) {
+      setDefaultError(gamesErrorMessage(failure));
+    }
+  };
 
   const copy = async () => {
     try {
@@ -94,6 +124,27 @@ export function SteamLaunchPanel({ instanceId }: { instanceId: string }) {
           Agora read the launch options from {info.files.join(', ')}.
         </p>
       )}
+      <div className="flex flex-wrap items-center gap-2" data-testid="steam-default">
+        {isDefault === true ? (
+          <p className="text-sm text-green-700 dark:text-green-400">
+            Steam starts this instance when you launch the game from Steam.
+          </p>
+        ) : (
+          <>
+            <p className="text-sm text-muted-foreground">
+              When you launch the game from Steam, it starts this game&apos;s default instance.
+            </p>
+            {isDefault === false && (
+              <Button type="button" variant="outline" size="sm" onClick={() => void makeDefault()}>
+                Make this the one Steam starts
+              </Button>
+            )}
+          </>
+        )}
+        {defaultError !== null && (
+          <p role="alert" className="text-xs text-destructive">{defaultError}</p>
+        )}
+      </div>
       {info.problems.length > 0 && (
         <ul role="alert" className="space-y-1 text-xs text-destructive">
           {info.problems.map((problem) => (

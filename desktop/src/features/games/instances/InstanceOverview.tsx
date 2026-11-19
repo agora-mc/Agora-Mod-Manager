@@ -19,6 +19,7 @@ import { useInstanceSession } from './instanceSession';
 import type { GameInstancePage } from '@/lib/useDestination';
 import { CrashAnswerOverview } from './CrashAnswerPanel';
 import { SteamLaunchPanel } from './SteamLaunchPanel';
+import { DeploymentActions } from './DeploymentActions';
 
 interface InstanceOverviewTabProps {
   gameId: string;
@@ -182,6 +183,7 @@ export function InstanceOverviewTab({ instanceId, onNavigatePage }: InstanceOver
           {detail.running && (
             <p className="text-xs text-muted-foreground">The way the instance runs can be changed once the game has closed.</p>
           )}
+          <DeploymentActions instanceId={instanceId} running={detail.running} />
         </section>
 
         <section aria-labelledby="about-heading" className="space-y-3 rounded-xl border border-border bg-card p-5 @2xl:col-span-2">

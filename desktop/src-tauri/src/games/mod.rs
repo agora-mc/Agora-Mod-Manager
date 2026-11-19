@@ -18,6 +18,7 @@ pub mod ini_saves;
 pub mod instance_icons;
 pub mod instances;
 pub mod library;
+pub mod parity;
 pub mod plugins;
 pub mod support;
 pub mod tools;

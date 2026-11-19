@@ -54,6 +54,8 @@ export interface InstanceContentRow {
   enabled: boolean;
   mountPath: string;
   sourcePath: string;
+  /** The instance deploys its own copies of this item's files instead of sharing them. */
+  ownCopy?: boolean;
 }
 
 export interface InstanceContentList {
@@ -126,6 +128,13 @@ export const setInstanceContentEnabled = (instanceId: string, itemId: string, en
   invoke<void>('games_instance_content_set_enabled', { instanceId, itemId, enabled });
 
 /** Move an item to a 1-based position (1 is the lowest priority). */
+/**
+ * Deploy this item from the instance's own copies of its files (a tool or the game may then
+ * change them without touching other instances), or go back to the shared files.
+ */
+export const setInstanceContentOwnCopy = (instanceId: string, itemId: string, ownCopy: boolean) =>
+  invoke<void>('games_instance_content_set_own_copy', { instanceId, itemId, ownCopy });
+
 export const moveInstanceContent = (instanceId: string, itemId: string, position: number) =>
   invoke<void>('games_instance_content_move', { instanceId, itemId, position });
 

@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { agoraRepositoryUrl, agoraDiscordUrl, agoraSponsorsUrl } from '../lib/brandConfig';
 import { PageHero } from '../components/PageHero';
+import { CatalogActivity } from '../components/governance/CatalogActivity';
 
 const RULES = [
   {
@@ -69,6 +70,8 @@ export function Governance() {
           </div>
         }
       />
+
+      <CatalogActivity />
 
       {/* Why vote */}
       <section className="rounded-xl border border-border bg-card p-6">

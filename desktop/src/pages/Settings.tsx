@@ -91,6 +91,7 @@ import {
 } from './settings/AppearanceSettings';
 import { TemplateSettings } from './settings/TemplateSettings';
 import { RuntimeReclaim } from './settings/RuntimeReclaim';
+import { DataHealthSettings } from './settings/DataHealthSettings';
 import { ContentSharingSettings } from './settings/ContentSharingSettings';
 import { DownloadWatchSettings } from './settings/DownloadWatchSettings';
 import { DegradedCredentialNotice } from './settings/DegradedCredentialNotice';
@@ -2463,13 +2464,14 @@ export function Settings({
         {
           id: 'storage',
           label: 'Storage',
-          cards: ['download-watch', 'runtime-reclaim', 'content-sharing', 'recently-deleted'],
+          cards: ['download-watch', 'runtime-reclaim', 'content-sharing', 'recently-deleted', 'data-health'],
           content: (
             <>
               {card('download-watch', <DownloadWatchSettings />)}
               {card('content-sharing', <ContentSharingSettings />)}
               {card('recently-deleted', <RecentlyDeletedSettings />)}
               {card('runtime-reclaim', <RuntimeReclaim />)}
+              {card('data-health', <DataHealthSettings />)}
             </>
           ),
         },

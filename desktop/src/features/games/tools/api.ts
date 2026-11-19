@@ -579,3 +579,14 @@ export async function findUserTools(instanceId: string): Promise<ToolCandidate[]
   }
   return reply;
 }
+
+/**
+ * Delete the instance's kept copy of the game's Data folder (the CLI's `games tools-swap
+ * remove-copy`). Resolves `true` when a copy was deleted, `false` when there was none. The next
+ * swap run copies Data again.
+ */
+export async function removeKeptSwapCopy(instanceId: string): Promise<boolean> {
+  const reply = await invoke<unknown>('games_tools_swap_remove_copy', { instanceId });
+  if (typeof reply !== 'boolean') throw new Error('games_tools_swap_remove_copy sent an unexpected reply.');
+  return reply;
+}

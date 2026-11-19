@@ -2498,49 +2498,22 @@ fn run_doctor(paths: &agora_core::app_paths::AppPaths, json: bool) -> anyhow::Re
     let account = agora_game_minecraft::msa::account_store_status();
     let mut backups = info.backups.clone();
     backups.reverse();
-    let (integrity, detail) = match &info.integrity {
-        LocalStateIntegrity::Ok => ("ok", String::new()),
-        LocalStateIntegrity::Corrupt(reason) => ("corrupt", reason.clone()),
-        LocalStateIntegrity::Missing => ("missing", String::new()),
-        LocalStateIntegrity::Unreadable(reason) => ("unreadable", reason.clone()),
-    };
     let newer = info
         .schema_version
         .is_some_and(|version| version > info.supported_version);
-    let unreadable_schema =
-        !matches!(info.integrity, LocalStateIntegrity::Missing) && info.schema_version.is_none();
-    let problems = matches!(
-        info.integrity,
-        LocalStateIntegrity::Corrupt(_) | LocalStateIntegrity::Unreadable(_)
-    ) || unreadable_schema
-        || newer
-        || info.backups_error.is_some()
-        || info.kept_aside_error.is_some()
-        || account.needs_repair;
+    // The database part of the report is core's, shared with the desktop's data health panel.
+    let report = agora_core::db::local_state_report(&paths.local_state_db());
+    let problems = report.problems || account.needs_repair;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "path": info.path.display().to_string(),
-                "integrity": integrity,
-                "integrityDetail": detail,
-                "schemaVersion": info.schema_version,
-                "supportedVersion": info.supported_version,
-                "databaseIsNewer": newer,
-                "problems": problems,
-                "backups": backups.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
-                "backupsError": info.backups_error,
-                "backupsKept": agora_core::db::LOCAL_STATE_BACKUP_RETENTION,
-                "keptAside": info.kept_aside.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
-                "keptAsideError": info.kept_aside_error,
-                "accountStore": {
-                    "needsRepair": account.needs_repair,
-                    "corruptFile": account.corrupt_file,
-                    "detectedAt": account.detected_at,
-                    "message": account.message,
-                },
-            }))?
-        );
+        let mut out = serde_json::to_value(&report)?;
+        out["problems"] = serde_json::json!(problems);
+        out["accountStore"] = serde_json::json!({
+            "needsRepair": account.needs_repair,
+            "corruptFile": account.corrupt_file,
+            "detectedAt": account.detected_at,
+            "message": account.message,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(!problems);
     }
     println!("Local database: {}", info.path.display());

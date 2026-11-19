@@ -36,6 +36,7 @@ import {
   moveInstanceContent,
   removeInstanceContent,
   setInstanceContentEnabled,
+  setInstanceContentOwnCopy,
   type InstanceContentList,
   type InstanceContentRow,
   type InstanceAddOutcome,
@@ -176,6 +177,20 @@ export function InstanceContentTab({ gameId, instanceId }: InstanceContentTabPro
       await refresh();
       throw new Error(`Could not turn ${original.name} ${original.enabled ? 'off' : 'on'}. ${errorMessage(error)}`);
     }
+  };
+
+  const toggleOwnCopy = async (original: InstanceContentRow) => {
+    setNotice(null);
+    setActionError(null);
+    try {
+      await setInstanceContentOwnCopy(instanceId, original.itemId, !original.ownCopy);
+      setNotice(original.ownCopy
+        ? `${original.name} uses the shared files again from the next launch.`
+        : `${original.name} uses this instance's own copies of its files from the next launch.`);
+    } catch (error) {
+      setActionError(`Could not change how ${original.name} is deployed. ${errorMessage(error)}`);
+    }
+    await refresh();
   };
 
   const bulkToggle = async (rows: InstalledContentRow[], enabled: boolean) => {
@@ -372,15 +387,20 @@ export function InstanceContentTab({ gameId, instanceId }: InstanceContentTabPro
           loadOrder={loadOrder}
           extraRowMenuItems={(row) => {
             const original = originalsByKey.get(row.key);
-            if (!original || itemTools.length === 0) return null;
-            return itemTools.map((tool) => (
-              <DropdownMenuItem key={tool.toolId} onSelect={() => {
-                setToolError(null);
-                setToolTarget({ tool, item: original });
-              }}>
-                Run {tool.name} on this
-              </DropdownMenuItem>
-            ));
+            if (!original) return null;
+            return [
+              ...itemTools.map((tool) => (
+                <DropdownMenuItem key={tool.toolId} onSelect={() => {
+                  setToolError(null);
+                  setToolTarget({ tool, item: original });
+                }}>
+                  Run {tool.name} on this
+                </DropdownMenuItem>
+              )),
+              <DropdownMenuItem key="own-copy" onSelect={() => void toggleOwnCopy(original)}>
+                {original.ownCopy ? 'Use the shared files' : "Use this instance's own copies"}
+              </DropdownMenuItem>,
+            ];
           }}
         />
       )}

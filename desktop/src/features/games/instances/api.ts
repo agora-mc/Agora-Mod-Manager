@@ -619,3 +619,51 @@ export async function setGameInstanceIcon(instanceId: string, sourcePath: string
 export async function openGameInstanceFolder(instanceId: string): Promise<void> {
   await invoke<unknown>('open_instance_folder', { instanceId });
 }
+
+// ---------------------------------------------------------------------------
+// Steam default, manual deploy (the CLI's `games instance default|deploy|undeploy`)
+// ---------------------------------------------------------------------------
+
+/** Whether this instance is the one Steam starts for its game when nothing else is pending. */
+export async function isDefaultGameInstance(instanceId: string): Promise<boolean> {
+  const reply: unknown = await invoke<unknown>('games_instance_is_default', { instanceId });
+  if (typeof reply !== 'boolean') throw shapeError('games_instance_is_default');
+  return reply;
+}
+
+/** Make this instance the one Steam starts for its game. */
+export async function setDefaultGameInstance(instanceId: string): Promise<void> {
+  await invoke<unknown>('games_instance_set_default', { instanceId });
+}
+
+/** What a manual deploy did. `outcome.status` is `up_to_date` or `built`. */
+export interface DeployedInstance {
+  mode: string;
+  outcome: { status: 'up_to_date' | 'built'; linked?: number; copied?: number };
+}
+
+/** Deploy the game folder now, without launching. `mode` defaults to what a launch would use. */
+export async function deployGameInstance(instanceId: string, mode?: DeploymentChoice): Promise<DeployedInstance> {
+  const reply: unknown = await invoke<unknown>('games_instance_deploy', { instanceId, mode: mode ?? null });
+  if (!isRecord(reply) || typeof reply.mode !== 'string' || !isRecord(reply.outcome)) {
+    throw shapeError('games_instance_deploy');
+  }
+  return reply as unknown as DeployedInstance;
+}
+
+/** What taking a deployment down kept from the game's writes. */
+export interface UndeployedInstance {
+  copied_to_writable: string[];
+  base_files_changed: unknown[];
+  whiteouts_added: string[];
+  writable_files_removed: string[];
+}
+
+/** Take the deployed game folder down, keeping what the game wrote. */
+export async function undeployGameInstance(instanceId: string): Promise<UndeployedInstance> {
+  const reply: unknown = await invoke<unknown>('games_instance_undeploy', { instanceId });
+  if (!isRecord(reply) || !Array.isArray(reply.copied_to_writable)) {
+    throw shapeError('games_instance_undeploy');
+  }
+  return reply as unknown as UndeployedInstance;
+}

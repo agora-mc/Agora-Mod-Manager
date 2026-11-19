@@ -22,6 +22,7 @@ export const SETTINGS_CARD_AUDIENCE = {
   'game-support': 'all-games',
   'template-settings': 'minecraft',
   'runtime-reclaim': 'all-games',
+  'data-health': 'all-games',
   'download-watch': 'all-games',
   'content-sharing': 'minecraft',
   'recently-deleted': 'all-games',
