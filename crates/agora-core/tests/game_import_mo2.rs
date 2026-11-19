@@ -1660,3 +1660,118 @@ fn f1h_merged_profiles_preserve_opposite_mod_priorities() {
         "switching back restores Alpha winning over Gamma"
     );
 }
+
+#[test]
+fn f1a_merged_profile_without_own_settings_uses_shared_not_profile_1() {
+    use agora_core::game_import::profiles::Grouping;
+
+    let f = fixture();
+    // "Shared" has no LocalSettings and no plugins.txt of its own.
+    let shared_prof = f.setup.join("profiles/Shared");
+    write(
+        &shared_prof.join("modlist.txt"),
+        b"# Mod Organizer\r\n+Alpha\r\n+Beta\r\n-Gamma\r\n",
+    );
+    write(
+        &shared_prof.join("settings.ini"),
+        b"[General]\r\nLocalSaves=false\r\nLocalSettings=false\r\n",
+    );
+
+    // "OwnPlugins" has shared INIs (LocalSettings=false) but its own plugins.txt (*Beta.esp only).
+    let own_plugins = f.setup.join("profiles/OwnPlugins");
+    write(
+        &own_plugins.join("modlist.txt"),
+        b"# Mod Organizer\r\n+Beta\r\n",
+    );
+    write(
+        &own_plugins.join("settings.ini"),
+        b"[General]\r\nLocalSaves=false\r\nLocalSettings=false\r\n",
+    );
+    write(
+        &own_plugins.join("plugins.txt"),
+        b"# Mod Organizer\r\n*Beta.esp\r\n",
+    );
+    write(
+        &own_plugins.join("loadorder.txt"),
+        b"# Mod Organizer\r\nSkyrim.esm\r\nUpdate.esm\r\nBeta.esp\r\n",
+    );
+
+    let profiles = vec![
+        "Test Profile".to_string(),
+        "Shared".to_string(),
+        "OwnPlugins".to_string(),
+    ];
+    let report = agora_core::game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("Shared Settings Merge"), false),
+        &profiles,
+        Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("merged import runs");
+    let instance = &report.instances[0];
+    let dir = f.ctx.paths.instance_dir(instance).unwrap();
+
+    let loadouts = agora_core::loadout::list_profiles(&dir).unwrap();
+    let get_loadout = |name: &str| {
+        loadouts
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("missing loadout '{name}'"))
+            .game
+            .clone()
+            .expect("game loadout")
+    };
+
+    // Shared profile: every INI and plugin list must be explicitly absent (None).
+    let shared_state = get_loadout("Shared");
+    assert!(
+        !shared_state.inis.is_empty() && shared_state.inis.iter().all(|i| i.contents.is_none()),
+        "Shared must not inherit Profile 1 INIs: {:?}",
+        shared_state.inis
+    );
+    assert!(
+        !shared_state.plugin_lists.is_empty()
+            && shared_state
+                .plugin_lists
+                .iter()
+                .all(|l| l.contents.is_none()),
+        "Shared has no plugins.txt of its own, so its plugin list must be None: {:?}",
+        shared_state.plugin_lists
+    );
+
+    // Switching to Shared removes Profile 1's private INI copies and plugin list.
+    agora_core::game_loadout::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "Shared")
+        .expect("apply Shared");
+    assert!(
+        !dir.join("user/Skyrim.ini").exists(),
+        "Profile 1 Skyrim.ini must not remain under Shared"
+    );
+    assert!(
+        !dir.join("user/SkyrimCustom.ini").exists(),
+        "Profile 1 SkyrimCustom.ini must not remain under Shared"
+    );
+    assert!(
+        !dir.join("user/Plugins.txt").exists(),
+        "Profile 1 Plugins.txt must not remain under Shared"
+    );
+
+    // Switching to OwnPlugins keeps INIs shared, while writing OwnPlugins' own Plugins.txt.
+    agora_core::game_loadout::apply_game_profile_with_undo(
+        &f.ctx,
+        instance,
+        &f.def,
+        "OwnPlugins",
+    )
+    .expect("apply OwnPlugins");
+    assert!(!dir.join("user/Skyrim.ini").exists());
+    assert!(!dir.join("user/SkyrimCustom.ini").exists());
+    let plugins_text = std::fs::read_to_string(dir.join("user/Plugins.txt"))
+        .expect("OwnPlugins writes its own Plugins.txt");
+    assert!(
+        plugins_text.contains("*Beta.esp") && !plugins_text.contains("*Alpha.esp"),
+        "OwnPlugins Plugins.txt should have only *Beta.esp, got:\n{plugins_text}"
+    );
+}

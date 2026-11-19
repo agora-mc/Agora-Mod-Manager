@@ -1940,23 +1940,38 @@ fn mo2_state_for_merge(
     instance_id: &str,
     definition: &GameDefinition,
     plan: &Mo2Plan,
+    profile_dir: &Path,
     layer_mod: &HashMap<String, Option<String>>,
     folder_to_layer: &HashMap<String, String>,
 ) -> Result<crate::game_loadout::GameLoadout, ImportError> {
-    let mut state =
-        crate::game_loadout::capture(ctx, instance_id, definition).map_err(ImportError::Other)?;
+    let manifest = game_instance::get_manifest(ctx, instance_id)?;
+    let store = game_ini::store_of(ctx, instance_id)?;
+
     let enabled: std::collections::BTreeSet<&str> = plan
         .mods
         .iter()
         .filter(|m| m.enabled)
         .map(|m| m.folder.as_str())
         .collect();
-    for item in &mut state.content {
-        item.enabled = layer_mod
-            .get(item.item.as_str())
-            .and_then(|folder| folder.as_deref())
-            .is_some_and(|folder| enabled.contains(folder));
+    let mut content = Vec::new();
+    for layer in manifest.layers.layers() {
+        if matches!(
+            layer.source,
+            agora_game_api::LayerSource::Content { .. }
+                | agora_game_api::LayerSource::InstanceContent { .. }
+        ) {
+            let id = layer.id.as_str().to_string();
+            let is_enabled = layer_mod
+                .get(id.as_str())
+                .and_then(|folder| folder.as_deref())
+                .is_some_and(|folder| enabled.contains(folder));
+            content.push(crate::game_loadout::GameLoadoutContent {
+                item: id,
+                enabled: is_enabled,
+            });
+        }
     }
+
     // Order content layers lowest-priority first (matching LayerStack): `plan.mods` is highest
     // priority first. Enabled entries take precedence over disabled aliases of the same layer.
     let mut layer_rank: HashMap<String, usize> = HashMap::new();
@@ -1982,28 +1997,53 @@ fn mo2_state_for_merge(
     ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let mut layer_order: Vec<String> = ranked.into_iter().map(|(_, id)| id).collect();
     let placed: HashSet<&str> = layer_order.iter().map(String::as_str).collect();
-    let mut rest: Vec<String> = state
-        .content
+    let mut rest: Vec<String> = content
         .iter()
         .filter(|item| !placed.contains(item.item.as_str()))
         .map(|item| item.item.clone())
         .collect();
     layer_order.append(&mut rest);
-    state.layer_order = layer_order;
-    if plan.plugins.kept {
-        if let Some(rule) = definition.load_orders.first() {
+
+    // Start from the shared base (every list and INI absent = None) rather than capturing
+    // profile 1's state, so later profiles never inherit profile 1's private settings.
+    let own_plugins = profile_dir.join("plugins.txt").is_file();
+    let first_rule = definition.load_orders.first();
+    let plugin_contents = if own_plugins && plan.plugins.kept {
+        first_rule.map(|rule| {
             let lines: Vec<(String, bool)> = plan
                 .plugins
                 .lines
                 .iter()
                 .map(|line| (line.name.clone(), line.active))
                 .collect();
-            let bytes = crate::game_plugins::list_bytes(rule, &lines);
-            if let Some(list) = state.plugin_lists.iter_mut().find(|l| l.list == rule.id) {
-                list.contents = Some(bytes);
-            }
+            crate::game_plugins::list_bytes(rule, &lines)
+        })
+    } else {
+        None
+    };
+    let mut plugin_lists: Vec<crate::game_loadout::GameLoadoutPluginList> = definition
+        .load_orders
+        .iter()
+        .map(|rule| crate::game_loadout::GameLoadoutPluginList {
+            list: rule.id.clone(),
+            contents: None,
+        })
+        .collect();
+    if let Some(rule) = first_rule {
+        if let Some(list) = plugin_lists.iter_mut().find(|l| l.list == rule.id) {
+            list.contents = plugin_contents.clone();
         }
     }
+
+    let mut inis: Vec<crate::game_loadout::GameLoadoutIni> = definition
+        .user_files
+        .iter()
+        .filter(|m| m.applies_to_store(&store))
+        .map(|mapping| crate::game_loadout::GameLoadoutIni {
+            file: mapping.instance_path.as_str().to_string(),
+            contents: None,
+        })
+        .collect();
     for ini in &plan.inis {
         let contents = match std::fs::read(&ini.from) {
             Ok(bytes) => Some(bytes),
@@ -2014,21 +2054,45 @@ fn mo2_state_for_merge(
                 )))
             }
         };
-        if let Some(existing) = state.inis.iter_mut().find(|i| i.file == ini.instance_path) {
+        if let Some(existing) = inis.iter_mut().find(|i| i.file == ini.instance_path) {
             existing.contents = contents;
         } else {
-            state.inis.push(crate::game_loadout::GameLoadoutIni {
+            inis.push(crate::game_loadout::GameLoadoutIni {
                 file: ini.instance_path.clone(),
                 contents,
             });
         }
     }
-    state.saves = if plan.saves.local {
-        crate::game_instance::SavesChoice::Own
-    } else {
-        crate::game_instance::SavesChoice::Shared
-    };
-    Ok(state)
+    // The game's plugin list is also a user file, so keep its INI-shaped entry in step with
+    // `plugin_lists` rather than deleting it after writing the plugin list.
+    if let Some(rule) = first_rule {
+        if let Some(ini) = inis.iter_mut().find(|ini| ini.file == rule.file.as_str()) {
+            ini.contents = plugin_contents;
+        }
+    }
+
+    let rules = definition
+        .load_orders
+        .iter()
+        .map(|rule| crate::game_loadout::GameLoadoutRules {
+            list: rule.id.clone(),
+            rules: Vec::new(),
+        })
+        .collect();
+
+    Ok(crate::game_loadout::GameLoadout {
+        content,
+        layer_order,
+        plugin_lists,
+        inis,
+        rules,
+        saves: if plan.saves.local {
+            SavesChoice::Own
+        } else {
+            SavesChoice::Shared
+        },
+        save_folder: None,
+    })
 }
 
 pub fn mo2_run_profiles(
@@ -2121,13 +2185,23 @@ pub fn mo2_run_profiles(
                 })
                 .collect();
 
+            let ini_text = read_text_optional(&base.ini_path)?.unwrap_or_default();
+            let ini_dir = base
+                .ini_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            let mo2_ini = mo2::parse_ini(&ini_text, ini_dir);
+
             let mut loadouts = Vec::new();
             for (profile, profile_plan) in profiles.iter().zip(multi.plans.iter()) {
+                let profile_dir = mo2_ini.profiles.join(profile);
                 let state = mo2_state_for_merge(
                     ctx,
                     &instance_id,
                     &definition,
                     profile_plan,
+                    &profile_dir,
                     &layer_mod,
                     &folder_to_layer,
                 )?;
