@@ -38,7 +38,14 @@ pub fn parse_ini(text: &str, ini_dir: PathBuf) -> Mo2Ini {
     };
 
     let base = match get(SETTINGS, "base_directory").filter(|s| !s.trim().is_empty()) {
-        Some(value) => PathBuf::from(value.trim()),
+        Some(value) => {
+            let path = PathBuf::from(value.trim());
+            if path.is_relative() {
+                ini_dir.join(path)
+            } else {
+                path
+            }
+        }
         None => ini_dir,
     };
     let base_text = base.to_string_lossy().to_string();
@@ -52,7 +59,12 @@ pub fn parse_ini(text: &str, ini_dir: PathBuf) -> Mo2Ini {
                 "setting '{key}' uses a variable Agora does not know: {value}"
             ));
         }
-        PathBuf::from(value)
+        let path = PathBuf::from(value);
+        if path.is_relative() {
+            base.join(path)
+        } else {
+            path
+        }
     };
     let mods = resolve("mod_directory", "mods", &mut warnings);
     let profiles = resolve("profiles_directory", "profiles", &mut warnings);
@@ -88,7 +100,7 @@ fn ini_value(text: &str, section: &str, key: &str) -> Option<String> {
             continue;
         }
         if let Some((k, v)) = line.split_once('=') {
-            if k.trim() == key {
+            if k.trim().eq_ignore_ascii_case(key) {
                 return Some(v.trim().to_string());
             }
         }
@@ -96,8 +108,10 @@ fn ini_value(text: &str, section: &str, key: &str) -> Option<String> {
     None
 }
 
-/// The value MO2 means by a settings string: `@ByteArray(...)` wraps the text, and backslashes
-/// are doubled in the file (`D:\\Games` is `D:\Games`).
+/// The value MO2 means by a settings string: `@ByteArray(...)` wraps the text. MO2 stores these
+/// through Qt's QSettings INI format, which escapes `\\`, `"`, `\n`, `\r`, `\t`, and non-printable
+/// bytes as `\xHH` inside the byte array
+/// (<https://doc.qt.io/qt-6/qsettings.html>, "@ByteArray()" / INI escaping).
 pub fn decode_value(raw: &str) -> String {
     let inner = match raw
         .strip_prefix("@ByteArray(")
@@ -110,23 +124,50 @@ pub fn decode_value(raw: &str) -> String {
 }
 
 fn unescape(text: &str) -> String {
+    // Qt QSettings INI/byte-array escaping: \\, \", \n, \r, \t, and \xHH.
     let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
+    let mut chars = text.chars();
     while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.peek() {
-                Some('\\') => {
-                    out.push('\\');
-                    chars.next();
-                }
-                Some('"') => {
-                    out.push('"');
-                    chars.next();
-                }
-                _ => out.push('\\'),
-            }
-        } else {
+        if c != '\\' {
             out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('x') => {
+                let hi = chars.next();
+                let lo = chars.next();
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    if let (Some(hi), Some(lo)) = (hi.to_digit(16), lo.to_digit(16)) {
+                        if let Some(ch) = char::from_u32(hi * 16 + lo) {
+                            out.push(ch);
+                            continue;
+                        }
+                    }
+                    out.push('\\');
+                    out.push('x');
+                    out.push(hi);
+                    out.push(lo);
+                } else {
+                    out.push('\\');
+                    out.push('x');
+                    if let Some(hi) = hi {
+                        out.push(hi);
+                    }
+                    if let Some(lo) = lo {
+                        out.push(lo);
+                    }
+                }
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
         }
     }
     out
@@ -525,6 +566,44 @@ gamePath=@ByteArray(D:\\\\SteamLibrary\\\\steamapps\\\\common\\\\Skyrim Special 
     }
 
     #[test]
+    fn relative_base_directory_resolves_against_the_ini_folder() {
+        let text = "[Settings]\nbase_directory=portable\\base\n";
+        let ini = parse_ini(text, PathBuf::from(r"D:\Setup"));
+        assert_eq!(ini.base, PathBuf::from(r"D:\Setup").join(r"portable\base"));
+        assert_eq!(ini.mods, ini.base.join("mods"));
+    }
+
+    #[test]
+    fn relative_setting_paths_resolve_against_the_base() {
+        let text = "[Settings]\nbase_directory=E:\\\\Base\nmod_directory=mods_alt\nprofiles_directory=sub\\profiles\n";
+        let ini = parse_ini(text, PathBuf::from(r"D:\Setup"));
+        assert_eq!(ini.mods, PathBuf::from(r"E:\Base").join("mods_alt"));
+        assert_eq!(
+            ini.profiles,
+            PathBuf::from(r"E:\Base").join(r"sub\profiles")
+        );
+    }
+
+    #[test]
+    fn ini_keys_are_matched_case_insensitively() {
+        let text = "[Settings]\nMOD_DIRECTORY=E:\\\\AltMods\n[General]\nSELECTED_PROFILE=Chosen\n";
+        let ini = parse_ini(text, PathBuf::from(r"D:\Setup"));
+        assert_eq!(ini.mods, PathBuf::from(r"E:\AltMods"));
+        assert_eq!(ini.selected_profile.as_deref(), Some("Chosen"));
+        let s = parse_profile_settings("[General]\r\nlocalsaves=true\r\nLOCALSETTINGS=true\r\n");
+        assert!(s.local_saves && s.local_settings);
+    }
+
+    #[test]
+    fn byte_array_values_decode_qt_escapes() {
+        // Qt QSettings INI / @ByteArray escapes: \\, \", \n, \r, \t, \xHH
+        // (see <https://doc.qt.io/qt-6/qsettings.html>).
+        assert_eq!(decode_value("@ByteArray(Line\\tOne)"), "Line\tOne");
+        assert_eq!(decode_value("@ByteArray(A\\x42C)"), "ABC");
+        assert_eq!(decode_value("@ByteArray(D:\\\\Games)"), "D:\\Games");
+    }
+
+    #[test]
     fn an_unknown_variable_is_a_warning() {
         let text = "[Settings]\nmod_directory=%SOMEWHERE%/mods\n";
         let ini = parse_ini(text, PathBuf::from(r"D:\Setup"));
@@ -547,6 +626,22 @@ gamePath=@ByteArray(D:\\\\SteamLibrary\\\\steamapps\\\\common\\\\Skyrim Special 
             ]
         );
         assert_eq!(lines[0].line, 2, "line numbers count comments");
+    }
+
+    #[test]
+    fn modlist_separator_entries_are_headings_not_mods() {
+        // MO2 list separators are headings, not mods, and end with `_separator`; the importer
+        // skips them instead of treating them as mod folders (Mod Organizer 2 mod list separators:
+        // <https://github.com/ModOrganizer2/modorganizer/wiki/Managing-your-mods#separators>).
+        let text = "+--- Textures_separator\r\n-Disabled_separator\r\n+Real Mod\r\n";
+        let lines = parse_modlist(text);
+        assert!(
+            lines
+                .iter()
+                .any(|l| agora_game_api::fold_path_case(&l.name).ends_with("_separator")),
+            "separator headings are present in modlist.txt and identifiable by _separator"
+        );
+        assert!(lines.iter().any(|l| l.name == "Real Mod"));
     }
 
     #[test]
