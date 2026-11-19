@@ -63,6 +63,7 @@ pub mod game_wrap;
 pub mod github_ratelimit;
 pub mod github_release;
 pub mod governance;
+pub mod governance_vote;
 pub mod helpers;
 pub mod http_client;
 pub mod icon;
