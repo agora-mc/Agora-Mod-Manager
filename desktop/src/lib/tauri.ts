@@ -2028,8 +2028,11 @@ export const installTechnicZipPack = (
   loader: string,
   loaderVersion: string,
   instanceName?: string,
+  /** The user confirmed this unverified zip (see `withUnverifiedConsent`). */
+  allowUnverified = false,
 ) =>
   invoke<ImportResult>('install_technic_zip_pack', {
+    allowUnverified,
     name,
     downloadUrl,
     sha256,
@@ -3470,7 +3473,7 @@ export interface ProviderPlanPreview {
   fileCount: number;
   /** Reduced assurance (undeclared host, plain HTTP, MD5/SHA-1): warn, may continue. */
   warnings: ProviderSecurityNote[];
-  /** No integrity information at all: installs only with low security downloads on. */
+  /** No integrity information at all: installs after the user confirms, or always with low security downloads on. */
   lowSecurity: ProviderSecurityNote[];
   lowSecurityAllowed: boolean;
   /** Pack files outside the usual content folders: install only with reduced security mode on. */
@@ -3538,16 +3541,36 @@ export const providerInstallPreview = (
     loader: loader ?? null,
   });
 
-export const providerInstallPack = (itemId: string, versionId?: string, instanceName?: string) =>
-  invoke<ImportResult>('provider_install_pack', { itemId, versionId: versionId ?? null, instanceName: instanceName ?? null });
+export const providerInstallPack = (
+  itemId: string,
+  versionId?: string,
+  instanceName?: string,
+  allowUnverified = false,
+) =>
+  invoke<ImportResult>('provider_install_pack', {
+    itemId,
+    versionId: versionId ?? null,
+    instanceName: instanceName ?? null,
+    allowUnverified,
+  });
 
 /**
  * Install a catalog entry that pins one version of a provider's pack.
  * Fails with `ERR_PROVIDER_PACK_CHANGED` when the source now serves something
  * other than what was reviewed; `acceptChanged` is the user's answer to that.
  */
-export const installCatalogProviderPack = (itemId: string, acceptChanged: boolean, instanceName?: string) =>
-  invoke<ImportResult>('install_catalog_provider_pack', { itemId, acceptChanged, instanceName: instanceName ?? null });
+export const installCatalogProviderPack = (
+  itemId: string,
+  acceptChanged: boolean,
+  instanceName?: string,
+  allowUnverified = false,
+) =>
+  invoke<ImportResult>('install_catalog_provider_pack', {
+    itemId,
+    acceptChanged,
+    instanceName: instanceName ?? null,
+    allowUnverified,
+  });
 
 // --- Repair loader ---
 

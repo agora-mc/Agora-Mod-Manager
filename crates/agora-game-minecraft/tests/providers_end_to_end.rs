@@ -291,6 +291,7 @@ async fn a_file_install_resolves_through_the_provider_with_its_dependencies() {
         &fabric_instance(),
         "provider:agora.example-provider/shelf:lantern",
         None,
+        false,
     )
     .await
     .expect("resolves");
@@ -374,6 +375,7 @@ async fn a_curated_provider_pack_installs_only_the_plan_the_curators_pinned() {
         &"0".repeat(64),
         false,
         None,
+        false,
     )
     .await
     .unwrap_err();
@@ -417,6 +419,7 @@ async fn a_dependency_reached_first_as_optional_is_still_required_when_something
         &fabric_instance(),
         "provider:acme.misbehaving/bad:root",
         None,
+        false,
     )
     .await
     .unwrap();
@@ -471,6 +474,7 @@ async fn reduced_assurance_warns_and_no_integrity_needs_low_security_downloads()
         &fabric_instance(),
         "provider:acme.misbehaving/bad:x",
         None,
+        false,
     )
     .await
     .expect("an undeclared host warns rather than blocks");
@@ -495,15 +499,28 @@ async fn reduced_assurance_warns_and_no_integrity_needs_low_security_downloads()
     assert_eq!(preview.warnings.len(), 1);
     assert!(preview.low_security.is_empty());
 
-    // No integrity information at all needs the explicit opt-in...
+    // No integrity information at all asks the user first...
     let bare = "provider:acme.misbehaving/bad:bare";
-    let refused = install::resolve_item(&world.ctx, &registry, &fabric_instance(), bare, None)
-        .await
-        .err()
-        .expect("a file with no digest needs low security downloads");
-    assert!(refused.to_string().contains("low security"), "{refused}");
+    let refused =
+        install::resolve_item(&world.ctx, &registry, &fabric_instance(), bare, None, false)
+            .await
+            .err()
+            .expect("a file with no digest needs the user's confirmation");
+    assert_eq!(
+        refused.code(),
+        agora_core::providers::LOW_SECURITY_CONFIRMATION_CODE
+    );
+    assert!(
+        refused.to_string().contains("no integrity information"),
+        "{refused}"
+    );
 
-    // ...and does not even appear in Browse without it.
+    // ...which this install can give...
+    install::resolve_item(&world.ctx, &registry, &fabric_instance(), bare, None, true)
+        .await
+        .expect("allowed for an install the user confirmed");
+
+    // ...and it is listed in Browse either way: its page and the prompt say what it is.
     let cache = agora_game_minecraft::browse_cache::new_cache();
     let request = || browse::BrowseRequest {
         query_key: "q".into(),
@@ -512,16 +529,14 @@ async fn reduced_assurance_warns_and_no_integrity_needs_low_security_downloads()
     let shown = browse::search(&world.ctx, &registry, &cache, request())
         .await
         .unwrap();
-    assert!(shown.page.items.iter().all(|i| i.name != "Bare"));
-
-    set(&world.ctx, "allow_unverified_packs", true);
-    let shown = browse::search(&world.ctx, &registry, &cache, request())
-        .await
-        .unwrap();
     assert!(shown.page.items.iter().any(|i| i.name == "Bare"));
-    let accepted = install::resolve_item(&world.ctx, &registry, &fabric_instance(), bare, None)
-        .await
-        .expect("allowed once the user opts into low security downloads");
+
+    // Allow low security downloads answers the prompt for every install.
+    set(&world.ctx, "allow_unverified_packs", true);
+    let accepted =
+        install::resolve_item(&world.ctx, &registry, &fabric_instance(), bare, None, false)
+            .await
+            .expect("allowed once the user opts into low security downloads");
     let agora_game_minecraft::install_pipeline::ResolvedArtifact::Download(download) =
         accepted.artifact
     else {

@@ -114,13 +114,16 @@ pub async fn provider_install_preview(
 }
 
 /// Install a catalog entry that pins one version of a provider's pack.
-/// `accept_changed` is the user's answer to `ERR_PROVIDER_PACK_CHANGED`.
+/// `accept_changed` is the user's answer to `ERR_PROVIDER_PACK_CHANGED`;
+/// `allow_unverified` is the answer to `ERR_LOW_SECURITY_DISABLED` for this
+/// install.
 #[tauri::command]
 pub async fn install_catalog_provider_pack(
     app: AppHandle,
     item_id: String,
     accept_changed: bool,
     instance_name: Option<String>,
+    allow_unverified: Option<bool>,
 ) -> LauncherResult<agora_game_minecraft::import::ImportResult> {
     let ctx = crate::core_context(&app)?;
     install::install_catalog_pack(
@@ -129,6 +132,7 @@ pub async fn install_catalog_provider_pack(
         &item_id,
         accept_changed,
         instance_name.as_deref(),
+        allow_unverified.unwrap_or(false),
     )
     .await
 }
@@ -140,6 +144,7 @@ pub async fn provider_install_pack(
     item_id: String,
     version_id: Option<String>,
     instance_name: Option<String>,
+    allow_unverified: Option<bool>,
 ) -> LauncherResult<agora_game_minecraft::import::ImportResult> {
     let ctx = crate::core_context(&app)?;
     install::install_pack(
@@ -148,6 +153,7 @@ pub async fn provider_install_pack(
         &item_id,
         version_id.as_deref(),
         instance_name.as_deref(),
+        allow_unverified.unwrap_or(false),
     )
     .await
 }

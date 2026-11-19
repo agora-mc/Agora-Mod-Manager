@@ -704,13 +704,15 @@ pub async fn install_solder_pack(
     .await
 }
 
-/// Install a consented Technic zip archive. Tier Z requires BOTH
-/// `technic_enabled` and `allow_unverified_packs`; this is the only entry
-/// point that may start a zip import.
+/// Install a consented Technic zip archive. Tier Z requires `technic_enabled`
+/// and either the user's confirmation for this install (`allow_unverified`)
+/// or `allow_unverified_packs`, which confirms every install; this is the only
+/// entry point that may start a zip import.
 pub async fn install_zip_pack(
     ctx: &Ctx,
     pack: crate::import::TechnicZipPack,
     name_override: Option<String>,
+    allow_unverified: bool,
 ) -> LauncherResult<crate::import::ImportResult> {
     let conn = db::local_state_connection(&ctx.paths.local_state_db()).map_err(|error| {
         LauncherError::Generic {
@@ -718,7 +720,18 @@ pub async fn install_zip_pack(
             message: error.to_string(),
         }
     })?;
-    consent_for_tier(&conn, TechnicTier::Zip)?;
+    // The Solder tier's consent is the network and Technic switches; a zip
+    // additionally needs the user's word on files Agora cannot check.
+    consent_for_tier(&conn, TechnicTier::Solder)?;
+    if !allow_unverified && consent_for_tier(&conn, TechnicTier::Zip).is_err() {
+        return Err(LauncherError::Generic {
+            code: agora_core::providers::LOW_SECURITY_CONFIRMATION_CODE.into(),
+            message: format!(
+                "{} is a zip pack with no integrity information, so Agora cannot tell whether                  it was changed on the way. Install anyway only if you trust the source.",
+                pack.display_name
+            ),
+        });
+    }
     drop(conn);
     let svc = crate::import_service::ImportService::new(ctx.clone());
     svc.run_import_named(

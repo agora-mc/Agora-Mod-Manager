@@ -304,6 +304,7 @@ impl Resolver {
         version: Option<&str>,
         registry_revision: String,
         update: bool,
+        allow_unverified: bool,
     ) -> LauncherResult<PreparedPlan> {
         let resolution = crate::providers::install::resolve_item(
             &self.ctx,
@@ -311,6 +312,7 @@ impl Resolver {
             manifest,
             item_id,
             version,
+            allow_unverified,
         )
         .await?;
         let operation = if update {
@@ -411,6 +413,7 @@ impl Resolver {
                         candidate_version.as_deref(),
                         revision,
                         false,
+                        intent.overrides.allow_unverified,
                     )
                     .await
                 }
@@ -434,6 +437,7 @@ impl Resolver {
                         normalize_requested_version(Some(target_version)),
                         revision,
                         true,
+                        intent.overrides.allow_unverified,
                     )
                     .await
                 } else if installed.source == "modrinth_raw" {
@@ -495,6 +499,7 @@ impl Resolver {
                     revision,
                     intent.overrides.allow_closest_version,
                     &intent.overrides.skip_items,
+                    intent.overrides.allow_unverified,
                 )
                 .await
             }
@@ -2237,6 +2242,7 @@ pinned_version: None,
         registry_revision: String,
         allow_closest_version: bool,
         skip_items: &[String],
+        allow_unverified: bool,
     ) -> LauncherResult<PreparedPlan> {
         // Phase 1: resolve every root artifact before any dependency work so
         // the batch can treat its own items as satisfied dependencies.
@@ -2310,6 +2316,7 @@ pinned_version: None,
                             manifest,
                             &item.item_id,
                             item.candidate_version.as_deref(),
+                            allow_unverified,
                         )
                         .await?;
                         provider_extras.insert(

@@ -177,7 +177,6 @@ async fn fetch_round(
     registry: &ProviderRegistry,
     filters: &BrowseFilters,
     asks: Vec<(String, u32)>,
-    show_low_security: bool,
 ) -> (
     Vec<BrowseItem>,
     BTreeMap<String, ProviderCursor>,
@@ -219,9 +218,9 @@ async fn fetch_round(
                 items.extend(
                     page.hits
                         .into_iter()
-                        // Content with no integrity information appears only
-                        // for users who allowed low security downloads.
-                        .filter(|hit| show_low_security || !hit.summary.low_security)
+                        // Content with no integrity information is listed for
+                        // everyone: its page says so, and installing it asks
+                        // first unless low security downloads is on.
                         .map(|hit| browse_cache::item_from_hit(&descriptor, hit)),
                 );
             }
@@ -318,7 +317,6 @@ pub async fn search(
         registry,
         &filters,
         providers.iter().map(|id| (id.clone(), 0)).collect(),
-        agora_core::providers::low_security_allowed(ctx),
     )
     .await;
 
@@ -387,7 +385,6 @@ async fn count_hidden_by_filters(
         registry,
         unfiltered,
         providers.iter().map(|id| (id.clone(), 0)).collect(),
-        agora_core::providers::low_security_allowed(ctx),
     )
     .await;
     let count = browse_cache::merge_items(curated, provider_items, mean_approval).len() as u64;
@@ -434,13 +431,7 @@ pub async fn load_more(
             break;
         }
         let asked: Vec<String> = asks.iter().map(|(id, _)| id.clone()).collect();
-        let (items, mut cursors, failures) = fetch_round(
-            registry,
-            &filters,
-            asks,
-            agora_core::providers::low_security_allowed(ctx),
-        )
-        .await;
+        let (items, mut cursors, failures) = fetch_round(registry, &filters, asks).await;
         // A provider that vanished since the query started (disabled, plugin
         // removed) is simply finished; it must not keep the loop alive.
         for id in asked {

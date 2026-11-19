@@ -591,6 +591,12 @@ pub struct PlanOverrides {
     /// using the nearest available candidate after explicit user approval.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_closest_version: bool,
+    /// The user confirmed installing content provider files that publish no
+    /// integrity information, for this install only (the answer to
+    /// ERR_LOW_SECURITY_DISABLED). The *Allow low security downloads* setting
+    /// gives the same answer for every install.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_unverified: bool,
     /// What kind of content a raw Modrinth install is (`resourcepack`,
     /// `shader`, `datapack`, ...). Absent means a mod. Decides which Modrinth
     /// version `loaders` tags are acceptable and where the file is installed.

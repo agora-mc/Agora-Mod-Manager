@@ -754,15 +754,19 @@ agora provider plan-digest <PROVIDER_ID>:<PROJECT_ID>@<VERSION_ID>
 ```text
 agora pack install --provider <PROVIDER_ID> --project <PROJECT_ID>
 agora pack install --provider <PROVIDER_ID> --project <PROJECT_ID> --version <VERSION_ID> --name <NAME>
+agora pack install --provider <PROVIDER_ID> --project <PROJECT_ID> --allow-unverified
 agora technic search <QUERY> --limit 20
 agora technic install <SLUG>
 agora technic install <SLUG> --build <BUILD> --name <NAME>
 agora technic install <SLUG> --minecraft <VERSION> --loader <LOADER> --loader-version <VERSION> --sha256 <HEX>
+agora technic install <SLUG> --minecraft <VERSION> --loader <LOADER> --loader-version <VERSION> --allow-unverified
 ```
 
 `pack install --provider` installs a provider's modpack as a **new** instance, through the same registry the desktop uses. It cannot be combined with a manifest path and instance. `--version` is optional; without it the provider chooses.
 
-Technic consent is off by default. It is stored as the `technic_enabled` setting, and zip packs also need `allow_unverified_packs`; `agora settings set technic_enabled true` changes it. `technic search` and `technic install` are refused while the setting is off. Solder packs install at their recommended build unless `--build` names one. Zip packs carry no metadata, so you must give their Minecraft version, loader, and loader version. Pass `--sha256 <HEX>` (64 hex digits) to check the zip download against a published SHA-256; the download fails if it does not match. Without `--sha256` the CLI warns that the zip is installed unverified, and it does so before the install starts. `--sha256` is refused for Solder packs. Core checks both settings on every call, whatever flags you pass.
+**Files with no integrity information.** A provider file that publishes no digest at all, or a Technic zip pack without `--sha256`, is refused with `ERR_LOW_SECURITY_DISABLED`, naming each file's host. That is the same question the desktop app asks before such an install. Pass `--allow-unverified` to `pack install --provider`, `technic install` or `mod update` to answer yes for that command. Turning on `allow_unverified_packs` (*Allow low security downloads* in the desktop app) answers yes for every install. Agora cannot tell whether such a file was changed on the way, so only do this for a source you trust.
+
+Technic consent is off by default. It is stored as the `technic_enabled` setting, and a zip pack without `--sha256` also needs `--allow-unverified` or the `allow_unverified_packs` setting; `agora settings set technic_enabled true` changes it. `technic search` and `technic install` are refused while the setting is off. Solder packs install at their recommended build unless `--build` names one. Zip packs carry no metadata, so you must give their Minecraft version, loader, and loader version. Pass `--sha256 <HEX>` (64 hex digits) to check the zip download against a published SHA-256; the download fails if it does not match. Without `--sha256` the CLI warns that the zip is installed unverified, and it does so before the install starts. `--sha256` is refused for Solder packs. Core checks the settings and the confirmation on every call.
 
 ### Updates
 

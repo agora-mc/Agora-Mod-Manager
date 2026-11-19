@@ -2753,12 +2753,17 @@ always warned and whose bare zips always needed an opt-in):
 |---|---|
 | HTTPS from a declared host, SHA-256/512 | installs |
 | undeclared host, plain HTTP, or only MD5/SHA-1 | warning; the user may continue |
-| no digest at all | hidden and not installable unless **Allow low security downloads** is on |
+| no digest at all | listed; installing asks first, naming each file (*Allow low security downloads* answers for every install) |
 
 Agora warns and asks rather than blocks (see `AGENTS.md`, *Modding is user customization*). The
 setting keeps its old key (`allow_unverified_packs`) so existing choices carry over, and it is no
 longer switched off as a side effect of turning Technic off. A provider marks search results
-`lowSecurity` so Browse can hide them for users who have not opted in. Downloads use
+`lowSecurity`. **Changed 2026-11-18 (owner decision):** such content is no longer hidden. Installing it
+asks once per install, listing every file with no digest. Core refuses with
+`ERR_LOW_SECURITY_DISABLED` until the request carries `allowUnverified` (the desktop's *Install
+anyway*, the CLI's `--allow-unverified`). The prompt's *Don't ask again* turns the setting on, and
+the setting means "don't ask", not "allowed at all". Technic zip packs follow the same rule.
+Downloads use
 `ClientCategory::ConsentedContent` — `HostPolicy::ProviderDeclared` for declared hosts, the
 consented policy otherwise — so Lockdown, the private-address floor and per-hop redirect checks
 all still apply, and every published digest (including MD5) is checked.

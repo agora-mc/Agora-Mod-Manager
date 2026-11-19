@@ -801,7 +801,7 @@ export function Settings({
     // another, which parsing a joined blob apart at the call
     // site could.
     body: [
-      'This lets you install content with NO integrity information at all — no hash of any kind — from any content source: Technic zip packs, or a plugin source that publishes no digest.',
+      'Agora asks before each install of content with NO integrity information at all — no hash of any kind — such as a Technic zip pack or a plugin source that publishes no digest. This turns that question off and installs it without asking.',
       'Agora cannot detect if the file was modified in transit, swapped by the host, or replaced after the listing was created. You are trusting the uploader and their host completely.',
       'Only enable this if you already trust the specific pack you are installing.',
     ].join('\n\n'),
@@ -2029,7 +2029,7 @@ export function Settings({
           <div>
             <span className="text-sm">Allow low security downloads</span>
             <p className="text-xs text-muted-foreground mt-0.5">
-              Shows and installs content that has no integrity information at all — no hash of any kind — from any source, such as Technic zip packs. Agora cannot detect a modified or swapped file; you are taking it on the uploader's word.
+              Installs content that has no integrity information at all — no hash of any kind — such as Technic zip packs, without asking first each time. Left off, Agora asks before each such install. Agora cannot detect a modified or swapped file; you are taking it on the uploader's word.
               Content with weaker checks (an MD5, or a host the source did not declare) does not need this: it installs after a warning.
             </p>
           </div>

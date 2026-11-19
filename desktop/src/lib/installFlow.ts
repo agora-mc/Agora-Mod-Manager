@@ -37,6 +37,11 @@ export interface PlanOverrides {
   skipHealthScan: boolean;
   allowClosestVersion?: boolean;
   /**
+   * The user confirmed installing content provider files that publish no
+   * integrity information, for this install (`ERR_LOW_SECURITY_DISABLED`).
+   */
+  allowUnverified?: boolean;
+  /**
    * The user confirmed a download that differs from a curator pin or from the
    * hash recorded on an earlier install (`hashConfirmation` on a failed
    * outcome). Never overrides a mismatch with the hash the source published.

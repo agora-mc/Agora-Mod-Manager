@@ -406,28 +406,27 @@ pub fn url_in_scope(url: &str, hosts: &[String]) -> bool {
 /// Validate a plan and decide whether the user's settings permit it.
 ///
 /// Refuses a malformed plan. Refuses a plan containing files with no
-/// integrity information unless the user has allowed low security downloads.
-/// Everything else is permitted, with any warnings returned for the review
-/// screen: reduced assurance is the user's call, not Agora's.
+/// integrity information unless the user confirmed this install
+/// (`allow_unverified`, from the per-install prompt or the CLI's
+/// `--allow-unverified`) or turned on low security downloads, which answers
+/// that prompt for every install. Everything else is permitted, with any
+/// warnings returned for the review screen: reduced assurance is the user's
+/// call, not Agora's.
 pub fn authorize_plan(
     ctx: &Ctx,
     plan: &InstallPlan,
     declared_hosts: &[String],
+    allow_unverified: bool,
 ) -> LauncherResult<PlanAuthorization> {
     plan.validate().map_err(|e| LauncherError::Generic {
         code: "ERR_PROVIDER_PLAN_INVALID".into(),
         message: e.message,
     })?;
     let authorization = judge_plan(plan, declared_hosts);
-    if authorization.is_low_security() && !low_security_allowed(ctx) {
-        let first = &authorization.low_security[0];
+    if authorization.is_low_security() && !allow_unverified && !low_security_allowed(ctx) {
         return Err(LauncherError::Generic {
-            code: "ERR_LOW_SECURITY_DISABLED".into(),
-            message: format!(
-                "This install includes a file with no integrity information ({}: {}). Turn on \
-                 Allow low security downloads in Settings to install it anyway.",
-                first.url_host, first.reason
-            ),
+            code: LOW_SECURITY_CONFIRMATION_CODE.into(),
+            message: low_security_message(&authorization.low_security),
         });
     }
     if let Some(first) = authorization.outside_content_folders.first() {
@@ -486,6 +485,36 @@ pub fn judge_plan(plan: &InstallPlan, declared_hosts: &[String]) -> PlanAuthoriz
         }
     }
     verdict
+}
+
+/// The error an install returns when it holds files with no integrity
+/// information and the user has not confirmed them. The desktop answers it
+/// with a prompt and retries with `allowUnverified`; the CLI names its flag.
+pub const LOW_SECURITY_CONFIRMATION_CODE: &str = "ERR_LOW_SECURITY_DISABLED";
+
+/// What the confirmation prompt says: how many files, and each one's host and
+/// reason, so the user knows what they are accepting.
+pub fn low_security_message(notes: &[SecurityNote]) -> String {
+    const SHOWN: usize = 5;
+    let mut hosts: Vec<String> = notes
+        .iter()
+        .take(SHOWN)
+        .map(|note| format!("{} ({})", note.url_host, note.reason))
+        .collect();
+    if notes.len() > SHOWN {
+        hosts.push(format!("and {} more", notes.len() - SHOWN));
+    }
+    let count = if notes.len() == 1 {
+        "a file".to_string()
+    } else {
+        format!("{} files", notes.len())
+    };
+    format!(
+        "This install includes {count} with no integrity information, so Agora cannot tell \
+         whether they were changed on the way: {}. Install anyway only if you trust the \
+         source.",
+        hosts.join(", ")
+    )
 }
 
 /// Whether the user allows content with no integrity information.

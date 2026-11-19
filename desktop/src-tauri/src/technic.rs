@@ -63,6 +63,7 @@ pub async fn install_technic_zip_pack(
     loader: String,
     loader_version: String,
     instance_name: Option<String>,
+    allow_unverified: Option<bool>,
 ) -> LauncherResult<agora_game_minecraft::import::ImportResult> {
     let ctx = crate::core_context(&app)?;
     let pack = agora_game_minecraft::import::TechnicZipPack {
@@ -73,5 +74,5 @@ pub async fn install_technic_zip_pack(
         loader,
         loader_version,
     };
-    technic::install_zip_pack(&ctx, pack, instance_name).await
+    technic::install_zip_pack(&ctx, pack, instance_name, allow_unverified.unwrap_or(false)).await
 }

@@ -39,6 +39,8 @@ import { LoaderChooser } from './LoaderChooser';
 import { DatapackWorldsNote } from './DatapackWorldsNote';
 import { useControllerLayer } from '@/features/controller/useControllerLayer';
 import { cn, formatDateTime } from '@/lib/utils';
+import { useConfirm } from '@/components/ui/confirm';
+import { askUnverifiedInstall, LOW_SECURITY_CODE } from '@/lib/unverifiedConsent';
 
 // ---------------------------------------------------------------------------
 // User choices model
@@ -284,6 +286,7 @@ export function InstallFlow({
   const [state, dispatch] = useReducer(flowReducer, { phase: 'closed' } as FlowState);
   const panelRef = useRef<HTMLElement>(null);
   const [resolutionIntent, setResolutionIntent] = useState(intent);
+  const { confirm } = useConfirm();
   const [settingAutoConfirmClean, setSettingAutoConfirmClean] = useState(false);
   const [settingAlwaysAutoConfirm, setSettingAlwaysAutoConfirm] = useState(false);
   const initialPlanRef = useRef<ResolvedInstallPlan | null>(initialPlan ?? null);
@@ -665,6 +668,15 @@ export function InstallFlow({
           retryable={state.retryable}
           onRetry={() => dispatch({ type: 'retry' })}
           canTryClosest={state.code === 'ERR_VERSION_NOT_FOUND'}
+          canInstallUnverified={state.code === LOW_SECURITY_CODE}
+          onInstallUnverified={async () => {
+            if (!await askUnverifiedInstall(confirm, state.message)) return;
+            setResolutionIntent((current) => ({
+              ...current,
+              overrides: { ...current.overrides, allowUnverified: true },
+            }));
+            dispatch({ type: 'retry' });
+          }}
           canSkip={Boolean(skippedItemId)}
           onSkip={() => {
             if (!skippedItemId) return;
@@ -1716,7 +1728,7 @@ function ResultView({ outcome, instanceId, onOpenInstance, onInstallAnyway, onCl
   );
 }
 
-function ErrorView({ message, retryable, onRetry, canTryClosest, onTryClosest, canSkip, onSkip, onClose }: {
+function ErrorView({ message, retryable, onRetry, canTryClosest, onTryClosest, canSkip, onSkip, canInstallUnverified, onInstallUnverified, onClose }: {
   message: string;
   retryable: boolean;
   onRetry: () => void;
@@ -1724,6 +1736,9 @@ function ErrorView({ message, retryable, onRetry, canTryClosest, onTryClosest, c
   onTryClosest: () => void;
   canSkip: boolean;
   onSkip: () => void;
+  /** Core asked whether to install files with no integrity information. */
+  canInstallUnverified: boolean;
+  onInstallUnverified: () => void;
   onClose: () => void;
 }) {
   return (
@@ -1739,6 +1754,11 @@ function ErrorView({ message, retryable, onRetry, canTryClosest, onTryClosest, c
         {canSkip && (
           <button onClick={onSkip} className="rounded-lg border border-input px-4 py-2 text-sm font-medium hover:bg-accent">
             Skip This Mod
+          </button>
+        )}
+        {canInstallUnverified && (
+          <button onClick={onInstallUnverified} className="rounded-lg border border-destructive px-4 py-2 text-sm font-medium text-destructive hover:bg-destructive/10">
+            Install Anyway
           </button>
         )}
         {retryable && <button onClick={onRetry} className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Retry</button>}

@@ -121,6 +121,7 @@ async fn resolve_file(
     provider_id: &str,
     project_id: &str,
     version_id: Option<&str>,
+    allow_unverified: bool,
 ) -> LauncherResult<(ResolvedArtifact, FilePlan)> {
     let provider = registry.usable(provider_id)?;
     let descriptor = provider.descriptor();
@@ -132,7 +133,7 @@ async fn resolve_file(
             loader: manifest.loader.clone(),
         })
         .await?;
-    let authorization = authorize_plan(ctx, &plan, &descriptor.download_hosts)?;
+    let authorization = authorize_plan(ctx, &plan, &descriptor.download_hosts, allow_unverified)?;
     let InstallPlan::File(file) = plan else {
         return Err(LauncherError::Generic {
             code: "ERR_USE_PACK_INSTALL".into(),
@@ -172,11 +173,20 @@ pub async fn resolve_item(
     manifest: &InstanceManifest,
     item_id: &str,
     version_id: Option<&str>,
+    allow_unverified: bool,
 ) -> LauncherResult<ProviderResolution> {
     let (provider_id, project_id) =
         parse_item_id(item_id).ok_or_else(|| not_a_provider_item(item_id))?;
-    let (artifact, root) =
-        resolve_file(ctx, registry, manifest, provider_id, project_id, version_id).await?;
+    let (artifact, root) = resolve_file(
+        ctx,
+        registry,
+        manifest,
+        provider_id,
+        project_id,
+        version_id,
+        allow_unverified,
+    )
+    .await?;
 
     let mut dependencies: Vec<ResolvedDep> = Vec::new();
     let mut conflicts = Vec::new();
@@ -287,6 +297,7 @@ pub async fn resolve_item(
                 provider_id,
                 &dep_project,
                 dep_version.as_deref(),
+                allow_unverified,
             )
             .await
             {
@@ -331,11 +342,21 @@ pub async fn install_pack(
     item_id: &str,
     version_id: Option<&str>,
     name_override: Option<&str>,
+    allow_unverified: bool,
 ) -> LauncherResult<crate::import::ImportResult> {
     let (provider_id, project_id) =
         parse_item_id(item_id).ok_or_else(|| not_a_provider_item(item_id))?;
     let plan = resolve_pack_plan(registry, provider_id, project_id, version_id).await?;
-    install_resolved_pack(ctx, registry, provider_id, project_id, plan, name_override).await
+    install_resolved_pack(
+        ctx,
+        registry,
+        provider_id,
+        project_id,
+        plan,
+        name_override,
+        allow_unverified,
+    )
+    .await
 }
 
 async fn resolve_pack_plan(
@@ -362,9 +383,10 @@ async fn install_resolved_pack(
     project_id: &str,
     plan: InstallPlan,
     name_override: Option<&str>,
+    allow_unverified: bool,
 ) -> LauncherResult<crate::import::ImportResult> {
     let descriptor = registry.usable(provider_id)?.descriptor();
-    let authorization = authorize_plan(ctx, &plan, &descriptor.download_hosts)?;
+    let authorization = authorize_plan(ctx, &plan, &descriptor.download_hosts, allow_unverified)?;
     let InstallPlan::Pack(pack) = plan else {
         return Err(LauncherError::Generic {
             code: "ERR_NOT_A_PACK".into(),
@@ -469,6 +491,7 @@ pub async fn install_catalog_pack(
     item_id: &str,
     accept_changed: bool,
     name_override: Option<&str>,
+    allow_unverified: bool,
 ) -> LauncherResult<crate::import::ImportResult> {
     let item = agora_core::registry::RegistryService::new(ctx.clone())
         .get_item_by_id(item_id)?
@@ -503,6 +526,7 @@ pub async fn install_catalog_pack(
             })?,
         accept_changed,
         name_override,
+        allow_unverified,
     )
     .await
 }
@@ -521,6 +545,7 @@ pub async fn install_curated_pack(
     pinned_digest: &str,
     accept_changed: bool,
     name_override: Option<&str>,
+    allow_unverified: bool,
 ) -> LauncherResult<crate::import::ImportResult> {
     let pin = parse_curated(identifier)?;
     let plan = resolve_pack_plan(
@@ -555,6 +580,7 @@ pub async fn install_curated_pack(
         &pin.project_id,
         plan,
         name_override,
+        allow_unverified,
     )
     .await
 }
@@ -573,7 +599,8 @@ pub struct PlanPreview {
     pub file_count: usize,
     /// Reduced assurance: shown as a warning the user can continue past.
     pub warnings: Vec<agora_core::providers::SecurityNote>,
-    /// No integrity information at all: needs low security downloads on.
+    /// No integrity information at all: installs once the user confirms them
+    /// for this install, or always when low security downloads is on.
     pub low_security: Vec<agora_core::providers::SecurityNote>,
     /// Whether the user currently allows low security downloads.
     pub low_security_allowed: bool,

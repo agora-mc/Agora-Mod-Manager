@@ -1707,6 +1707,11 @@ enum ModsCmd {
         install_anyway: bool,
         #[arg(
             long,
+            help = "Install provider files that publish no integrity information, for this command only. Agora cannot tell whether they were changed on the way; the Allow low security downloads setting answers this for every install"
+        )]
+        allow_unverified: bool,
+        #[arg(
+            long,
             conflicts_with = "exclude_optional",
             help = "Include specific optional dependencies (comma-separated)"
         )]
@@ -1959,6 +1964,9 @@ enum PackCmd {
         /// Name for the new instance (with --provider).
         #[arg(long, requires = "provider")]
         name: Option<String>,
+        /// Install provider files that publish no integrity information, for this command only. Agora cannot tell whether they were changed on the way; the Allow low security downloads setting answers this for every install.
+        #[arg(long, requires = "provider")]
+        allow_unverified: bool,
     },
     /// List a curated registry pack's locked releases, newest first.
     Versions {
@@ -4060,6 +4068,7 @@ async fn run_mods_command(
             item,
             version,
             install_anyway,
+            allow_unverified,
             include_optional,
             exclude_optional,
             replace_conflicts,
@@ -4081,6 +4090,7 @@ async fn run_mods_command(
                     allow_replace: true,
                     skip_health_scan: false,
                     accept_hash_confirmation: install_anyway,
+                    allow_unverified,
                     ..Default::default()
                 },
             };
@@ -4088,7 +4098,10 @@ async fn run_mods_command(
             let reporter = SilentReporter;
             let cancel = agora_game_minecraft::install_pipeline::CancellationToken::new();
 
-            let mut plan = svc.resolve(intent, &reporter).await?;
+            let mut plan = svc
+                .resolve(intent, &reporter)
+                .await
+                .map_err(cli_govniche::low_security_hint)?;
 
             // Apply --replace-conflicts / --abort-conflicts override
             apply_conflict_overrides(&mut plan, replace_conflicts, abort_conflicts)?;
@@ -4713,6 +4726,7 @@ async fn run_pack_command(
             project: Some(project),
             version,
             name,
+            allow_unverified,
             ..
         } => {
             cli_govniche::install_provider_pack(
@@ -4721,6 +4735,7 @@ async fn run_pack_command(
                 &project,
                 version.as_deref(),
                 name.as_deref(),
+                allow_unverified,
                 json,
             )
             .await?;
