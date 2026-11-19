@@ -490,7 +490,7 @@ The Tauri app tracks the currently cached `registry.db` release tag (e.g., `regi
 - No more than once per hour to avoid GitHub API quota waste.
 
 **Update Check Flow:**
-1. Query GitHub Releases API: `GET /repos/{owner}/{repo}/releases/latest`.
+1. Query GitHub Releases API (`GET /repos/{owner}/{repo}/releases?per_page=100&page=N`, capped at 10 pages) and select the newest non-draft, non-prerelease release whose tag matches `registry-YYYY-MM-DD` and carries `registry.bundle` (ignoring desktop `v*` and official plugin `official-*` releases; never `/releases/latest`). If none qualifies, report `"No catalog release found."` rather than `"up to date"`.
 2. Compare the returned tag name with the locally cached tag.
 3. If newer: download the single signed `registry.bundle` release asset.
 4. Verify its header: the signing key id is in the client's trusted key list (or is introduced by a certificate signed by one), the Ed25519 signature covers the header bytes, the payload hashes to the signed SHA-256, and the schema version is supported.

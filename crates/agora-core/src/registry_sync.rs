@@ -100,7 +100,7 @@ pub struct RegistryStatus {
 /// Check GitHub Releases for a newer catalog and download + verify it.
 ///
 /// Steps (per section 4.1a):
-/// 1. Query GitHub Releases API for the latest tagged release.
+/// 1. Query GitHub Releases API for the latest catalog release.
 /// 2. Compare the tag with the locally cached tag.
 /// 3. If newer: download the single signed `registry.bundle` asset.
 /// 4. Verify the header key id, Ed25519 signature, expiry and schema version.
@@ -120,6 +120,36 @@ pub async fn check_and_download_update(
     registry_repo: &str,
     lock_manager: &LockManager,
 ) -> LauncherResult<RegistryStatus> {
+    let transport = GitHubTransport;
+    let trust = effective_trust(app_data_dir, &RegistryTrust::production());
+    check_and_download_update_inner(
+        app_data_dir,
+        local_state_path,
+        force,
+        github_token,
+        operation_manager,
+        registry_repo,
+        lock_manager,
+        &transport,
+        &trust,
+        chrono::Utc::now().timestamp(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn check_and_download_update_inner(
+    app_data_dir: &Path,
+    local_state_path: &Path,
+    force: bool,
+    github_token: Option<String>,
+    operation_manager: Option<&OperationManager>,
+    registry_repo: &str,
+    lock_manager: &LockManager,
+    transport: &dyn RegistryTransport,
+    trust: &RegistryTrust,
+    now: i64,
+) -> LauncherResult<RegistryStatus> {
     let conn =
         db::local_state_connection(local_state_path).map_err(|e| LauncherError::Generic {
             code: "ERR_DB".into(),
@@ -133,13 +163,12 @@ pub async fn check_and_download_update(
     }
     drop(conn);
     let cached_tag = get_cached_tag(local_state_path)?;
-    let cached = cached_catalog_summary(app_data_dir);
+    let cached = cached_catalog_summary_with_trust(app_data_dir, trust);
     let has_cached_db = cached.is_some();
     let cached_schema_version = cached.as_ref().and_then(|summary| summary.schema_version);
 
     if !force {
         if let Some(last_check) = get_last_check_time(local_state_path)? {
-            let now = chrono::Utc::now().timestamp();
             if now - last_check < UPDATE_CHECK_INTERVAL_SECS && cached_tag.is_some() {
                 return Ok(RegistryStatus {
                     has_cached_db,
@@ -165,33 +194,35 @@ pub async fn check_and_download_update(
         )
         .await?;
 
-    let latest = match query_latest_release(registry_repo, github_token.as_deref()).await {
-        Ok(release) => release,
-        // With no cached catalog there is nothing to fall back to. Say what
-        // failed rather than returning an empty status the UI reads as "no
-        // catalog found".
-        Err(e) if !has_cached_db => {
-            return Err(e.while_attempting("download the catalog"));
-        }
-        Err(e) => {
-            return Ok(RegistryStatus {
-                has_cached_db,
-                cached_tag,
-                cached_schema_version,
-                latest_tag: None,
-                update_available: false,
-                checked: false,
-                stale: cached.as_ref().is_some_and(|summary| summary.stale),
-                expires_at: cached.and_then(|summary| summary.expires_at),
-                message: format!(
-                    "{} Using the cached catalog.",
-                    e.while_attempting("check for updates")
-                ),
-            });
-        }
-    };
+    let latest =
+        match query_latest_catalog_release(transport, registry_repo, github_token.as_deref()).await
+        {
+            Ok(release) => release,
+            // With no cached catalog there is nothing to fall back to. Say what
+            // failed rather than returning an empty status the UI reads as "no
+            // catalog found".
+            Err(e) if !has_cached_db => {
+                return Err(e.while_attempting("download the catalog"));
+            }
+            Err(e) => {
+                return Ok(RegistryStatus {
+                    has_cached_db,
+                    cached_tag,
+                    cached_schema_version,
+                    latest_tag: None,
+                    update_available: false,
+                    checked: false,
+                    stale: cached.as_ref().is_some_and(|summary| summary.stale),
+                    expires_at: cached.and_then(|summary| summary.expires_at),
+                    message: format!(
+                        "{} Using the cached catalog.",
+                        e.while_attempting("check for updates")
+                    ),
+                });
+            }
+        };
 
-    set_last_check_time(local_state_path, chrono::Utc::now().timestamp())?;
+    set_last_check_time(local_state_path, now)?;
 
     // A merely *different* tag is not grounds to update: a signature stays
     // valid forever, so an older release republished as "latest" (or promoted
@@ -208,7 +239,7 @@ pub async fn check_and_download_update(
     );
 
     if !update_available && has_cached_db {
-        let cached = cached_catalog_summary(app_data_dir);
+        let cached = cached_catalog_summary_with_trust(app_data_dir, trust);
         return Ok(RegistryStatus {
             has_cached_db,
             cached_tag,
@@ -242,7 +273,6 @@ pub async fn check_and_download_update(
         "https://api.github.com/repos/{}/releases/assets/{}",
         registry_repo, bundle_id
     );
-    let trust = effective_trust(app_data_dir, &RegistryTrust::production());
     // A nightly change is usually a few KB against the catalog already here.
     // Anything that does not line up falls back to the whole bundle.
     let bundle_bytes = match bundle_from_delta(
@@ -250,21 +280,26 @@ pub async fn check_and_download_update(
         &latest,
         registry_repo,
         github_token.as_deref(),
-        &trust,
+        trust,
+        transport,
     )
     .await
     {
         Some(bytes) => bytes,
-        None => download_file(&bundle_url, github_token.as_deref()).await?,
+        None => {
+            transport
+                .download_asset(&bundle_url, github_token.as_deref())
+                .await?
+        }
     };
 
-    let verified = registry_bundle::verify_bundle(&bundle_bytes, &trust).map_err(bundle_error)?;
+    let verified = registry_bundle::verify_bundle(&bundle_bytes, trust).map_err(bundle_error)?;
 
     // Anti-rollback, checked only after the signature so the compared stamp is
     // one the signing key vouched for. The tag pre-check above works on
     // unsigned API metadata and can be forged; this cannot.
     let candidate_built_at = Some(verified.header.built_at.clone());
-    let cached_built_at = read_cached_built_at_checked(app_data_dir, &trust)?;
+    let cached_built_at = read_cached_built_at_checked(app_data_dir, trust)?;
     if is_rollback(cached_built_at.as_deref(), candidate_built_at.as_deref()) {
         return Err(LauncherError::Generic {
             code: "ERR_REGISTRY_ROLLBACK".into(),
@@ -302,7 +337,7 @@ pub async fn check_and_download_update(
         });
     }
 
-    install_bundle_bytes(app_data_dir, &verified.header, &bundle_bytes, &trust)?;
+    install_bundle_bytes(app_data_dir, &verified.header, &bundle_bytes, trust)?;
     set_cached_tag(local_state_path, &latest.tag_name)?;
     set_cached_asset_id(local_state_path, Some(bundle_id))?;
 
@@ -336,6 +371,7 @@ async fn bundle_from_delta(
     registry_repo: &str,
     token: Option<&str>,
     trust: &RegistryTrust,
+    transport: &dyn RegistryTransport,
 ) -> Option<Vec<u8>> {
     let bundle_path = paths::registry_bundle_path(app_data_dir).ok()?;
     if !bundle_path.exists() {
@@ -348,12 +384,18 @@ async fn bundle_from_delta(
     let asset_url =
         |id: u64| format!("https://api.github.com/repos/{registry_repo}/releases/assets/{id}");
 
-    let mut bundle = download_file(&asset_url(header_id), token).await.ok()?;
+    let mut bundle = transport
+        .download_asset(&asset_url(header_id), token)
+        .await
+        .ok()?;
     let db_len = registry_bundle::signed_prefix_db_len(&bundle).ok()?;
     if db_len > registry_bundle::MAX_DELTA_PAYLOAD {
         return None;
     }
-    let delta = download_file(&asset_url(delta_id), token).await.ok()?;
+    let delta = transport
+        .download_asset(&asset_url(delta_id), token)
+        .await
+        .ok()?;
     let payload = registry_bundle::apply_payload_delta(&current.payload, &delta, db_len).ok()?;
     bundle.extend_from_slice(&payload);
     registry_bundle::verify_bundle(&bundle, trust).ok()?;
@@ -1098,9 +1140,16 @@ fn read_cached_built_at_checked(
 }
 
 fn cached_catalog_summary(app_data_dir: &Path) -> Option<CachedCatalogSummary> {
+    cached_catalog_summary_with_trust(app_data_dir, &RegistryTrust::production())
+}
+
+fn cached_catalog_summary_with_trust(
+    app_data_dir: &Path,
+    trust: &RegistryTrust,
+) -> Option<CachedCatalogSummary> {
     let bundle_path = paths::registry_bundle_path(app_data_dir).ok()?;
     if bundle_path.exists() {
-        let header = load_header(&bundle_path, &RegistryTrust::production()).ok()?;
+        let header = load_header(&bundle_path, trust).ok()?;
         return Some(CachedCatalogSummary {
             schema_version: Some(header.schema_version),
             stale: header.is_expired_at(Utc::now()),
@@ -1220,13 +1269,18 @@ pub fn seed_from_local_build(app_data_dir: &Path) -> LauncherResult<bool> {
 // Internal helpers â€” GitHub API
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
     assets: Vec<GitHubAsset>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GitHubAsset {
     id: u64,
     name: String,
@@ -1245,42 +1299,113 @@ impl GitHubRelease {
     }
 }
 
-async fn query_latest_release(repo: &str, token: Option<&str>) -> LauncherResult<GitHubRelease> {
-    let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
-    let _permit = crate::github_ratelimit::acquire_github_permit().await;
-    let clients = crate::http_client::HttpClients::new()?;
-    let headers = token
-        .map(|t| vec![("Authorization".into(), format!("Bearer {t}"))])
-        .unwrap_or_default();
-    let resp = crate::http_client::checked_request_with_headers(
-        &clients,
-        crate::http_client::ClientCategory::GitHub,
-        &url,
-        headers,
-    )
-    .await?;
-    if crate::github_ratelimit::is_rate_limit_response(&resp) {
-        let retry = crate::github_ratelimit::parse_retry_after(&resp);
-        crate::github_ratelimit::report_rate_limit(retry).await;
-        return Err(LauncherError::Generic {
-            code: "ERR_REGISTRY_RATE_LIMITED".into(),
-            message: format!("GitHub rate limited (HTTP {}).", resp.status()),
-        });
-    }
-    if !resp.status().is_success() {
-        return Err(LauncherError::Generic {
+#[async_trait::async_trait]
+trait RegistryTransport: Send + Sync {
+    async fn releases_page(
+        &self,
+        repo: &str,
+        page: u32,
+        token: Option<&str>,
+    ) -> LauncherResult<Vec<GitHubRelease>>;
+
+    async fn download_asset(&self, url: &str, token: Option<&str>) -> LauncherResult<Vec<u8>>;
+}
+
+struct GitHubTransport;
+
+const RELEASES_PER_PAGE: usize = 100;
+const MAX_RELEASE_PAGES: u32 = 10;
+
+#[async_trait::async_trait]
+impl RegistryTransport for GitHubTransport {
+    async fn releases_page(
+        &self,
+        repo: &str,
+        page: u32,
+        token: Option<&str>,
+    ) -> LauncherResult<Vec<GitHubRelease>> {
+        let url = format!(
+            "https://api.github.com/repos/{}/releases?per_page={}&page={}",
+            repo, RELEASES_PER_PAGE, page
+        );
+        let _permit = crate::github_ratelimit::acquire_github_permit().await;
+        let clients = crate::http_client::HttpClients::new()?;
+        let headers = token
+            .map(|t| vec![("Authorization".into(), format!("Bearer {t}"))])
+            .unwrap_or_default();
+        let resp = crate::http_client::checked_request_with_headers(
+            &clients,
+            crate::http_client::ClientCategory::GitHub,
+            &url,
+            headers,
+        )
+        .await?;
+        if crate::github_ratelimit::is_rate_limit_response(&resp) {
+            let retry = crate::github_ratelimit::parse_retry_after(&resp);
+            crate::github_ratelimit::report_rate_limit(retry).await;
+            return Err(LauncherError::Generic {
+                code: "ERR_REGISTRY_RATE_LIMITED".into(),
+                message: format!("GitHub rate limited (HTTP {}).", resp.status()),
+            });
+        }
+        if !resp.status().is_success() {
+            return Err(LauncherError::Generic {
+                code: "ERR_REGISTRY_CHECK".into(),
+                message: format!("GitHub answered HTTP {}.", resp.status()),
+            });
+        }
+        let body = crate::http_client::checked_response_bytes(
+            resp,
+            crate::http_client::ClientCategory::GitHub,
+        )
+        .await?;
+        serde_json::from_slice::<Vec<GitHubRelease>>(&body).map_err(|e| LauncherError::Generic {
             code: "ERR_REGISTRY_CHECK".into(),
-            message: format!("GitHub answered HTTP {}.", resp.status()),
-        });
+            message: format!("Catalog release metadata was not readable: {e}."),
+        })
     }
-    let body = crate::http_client::checked_response_bytes(
-        resp,
-        crate::http_client::ClientCategory::GitHub,
-    )
-    .await?;
-    serde_json::from_slice::<GitHubRelease>(&body).map_err(|e| LauncherError::Generic {
-        code: "ERR_REGISTRY_CHECK".into(),
-        message: format!("Catalog release metadata was not readable: {e}."),
+
+    async fn download_asset(&self, url: &str, token: Option<&str>) -> LauncherResult<Vec<u8>> {
+        download_file(url, token).await
+    }
+}
+
+fn select_latest_catalog_release(releases: &[GitHubRelease]) -> Option<&GitHubRelease> {
+    let mut best: Option<((u16, u8, u8), &GitHubRelease)> = None;
+    for release in releases {
+        if release.draft || release.prerelease {
+            continue;
+        }
+        let Some(date) = parse_registry_tag(&release.tag_name) else {
+            continue;
+        };
+        if release.find_asset("registry.bundle").is_none() {
+            continue;
+        }
+        if best.is_none_or(|(best_date, _)| date > best_date) {
+            best = Some((date, release));
+        }
+    }
+    best.map(|(_, release)| release)
+}
+
+async fn query_latest_catalog_release(
+    transport: &dyn RegistryTransport,
+    repo: &str,
+    token: Option<&str>,
+) -> LauncherResult<GitHubRelease> {
+    for page in 1..=MAX_RELEASE_PAGES {
+        let releases = transport.releases_page(repo, page, token).await?;
+        if let Some(found) = select_latest_catalog_release(&releases) {
+            return Ok(found.clone());
+        }
+        if releases.len() < RELEASES_PER_PAGE {
+            break;
+        }
+    }
+    Err(LauncherError::Generic {
+        code: "ERR_REGISTRY_NOT_FOUND".into(),
+        message: "No catalog release found.".into(),
     })
 }
 
@@ -2582,6 +2707,8 @@ v1 key deadbeef deadbeef deadbeef deadbeef
     fn test_github_release_find_asset() {
         let release = GitHubRelease {
             tag_name: "v1.0.0".to_string(),
+            draft: false,
+            prerelease: false,
             assets: vec![
                 GitHubAsset {
                     id: 1,
@@ -2669,5 +2796,359 @@ v1 key deadbeef deadbeef deadbeef deadbeef
             )
             .unwrap();
         assert_eq!(built_at, "\"2026-11-16T12:00:00+00:00\"");
+    }
+
+    struct FakeRegistryTransport {
+        pages: HashMap<u32, Vec<GitHubRelease>>,
+        assets: Mutex<HashMap<u64, std::collections::VecDeque<LauncherResult<Vec<u8>>>>>,
+        pages_requested: Mutex<Vec<u32>>,
+    }
+
+    impl FakeRegistryTransport {
+        fn from_pages(pages: Vec<(u32, Vec<GitHubRelease>)>) -> Self {
+            Self {
+                pages: pages.into_iter().collect(),
+                assets: Mutex::new(HashMap::new()),
+                pages_requested: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn push_asset_ok(&self, asset_id: u64, bytes: Vec<u8>) {
+            self.assets
+                .lock()
+                .unwrap()
+                .entry(asset_id)
+                .or_default()
+                .push_back(Ok(bytes));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RegistryTransport for FakeRegistryTransport {
+        async fn releases_page(
+            &self,
+            _repo: &str,
+            page: u32,
+            _token: Option<&str>,
+        ) -> LauncherResult<Vec<GitHubRelease>> {
+            self.pages_requested.lock().unwrap().push(page);
+            Ok(self.pages.get(&page).cloned().unwrap_or_default())
+        }
+
+        async fn download_asset(&self, url: &str, _token: Option<&str>) -> LauncherResult<Vec<u8>> {
+            let asset_id: u64 = url
+                .rsplit('/')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .expect("asset url must end with numeric id");
+            let mut assets = self.assets.lock().unwrap();
+            let queue = assets
+                .get_mut(&asset_id)
+                .expect("unexpected asset download");
+            queue.pop_front().expect("no queued response for asset")
+        }
+    }
+
+    fn setup_sync_env() -> (tempfile::TempDir, PathBuf, LockManager) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = dir.path().join("local_state.db");
+        db::init_local_state_db(&ls_path).unwrap();
+        let locks = LockManager::new(dir.path().join("locks"));
+        (dir, ls_path, locks)
+    }
+
+    fn release_json_to_list(raw: &str) -> Vec<GitHubRelease> {
+        serde_json::from_str(raw).unwrap()
+    }
+
+    #[tokio::test]
+    async fn catalog_sync_selects_catalog_release_past_desktop_and_plugin_releases() {
+        let (dir, ls_path, locks) = setup_sync_env();
+        let key = test_key(40);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db_with_built_at("2026-11-18T02:00:00+00:00");
+        let header = header_for(
+            &key,
+            &payload,
+            "2026-11-18T02:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let bundle = signed_bundle(&key, &header, &payload);
+
+        // Recorded GitHub /releases payload: newest is desktop v0.9.5, then official plugin, then catalog.
+        let recorded = r#"[
+            {
+                "tag_name": "v0.9.5",
+                "draft": false,
+                "prerelease": false,
+                "assets": [
+                    {"id": 1001, "name": "agora-desktop-v0.9.5-windows-x64-setup.exe"},
+                    {"id": 1002, "name": "latest.json"}
+                ]
+            },
+            {
+                "tag_name": "official-skyrim-se-v0.1.0",
+                "draft": false,
+                "prerelease": false,
+                "assets": [
+                    {"id": 2001, "name": "agora.skyrim-se-0.1.0.zip"}
+                ]
+            },
+            {
+                "tag_name": "registry-2026-11-18",
+                "draft": false,
+                "prerelease": false,
+                "assets": [
+                    {"id": 3001, "name": "registry.bundle"},
+                    {"id": 3002, "name": "registry.db"}
+                ]
+            }
+        ]"#;
+        let transport =
+            FakeRegistryTransport::from_pages(vec![(1, release_json_to_list(recorded))]);
+        transport.push_asset_ok(3001, bundle);
+
+        let status = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            false,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_000,
+        )
+        .await
+        .expect("catalog sync should skip desktop and plugin releases and install catalog");
+
+        assert!(status.has_cached_db);
+        assert_eq!(status.cached_tag.as_deref(), Some("registry-2026-11-18"));
+        assert_eq!(status.latest_tag.as_deref(), Some("registry-2026-11-18"));
+    }
+
+    #[tokio::test]
+    async fn catalog_sync_with_cached_db_does_not_say_up_to_date_when_only_desktop_and_plugin_exist(
+    ) {
+        let (dir, ls_path, locks) = setup_sync_env();
+        let key = test_key(41);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let old_payload = sample_db_with_built_at("2026-11-17T02:00:00+00:00");
+        let old_header = header_for(
+            &key,
+            &old_payload,
+            "2026-11-17T02:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let old_bundle = signed_bundle(&key, &old_header, &old_payload);
+        install_bundle_bytes(dir.path(), &old_header, &old_bundle, &trust).unwrap();
+        set_cached_tag(&ls_path, "registry-2026-11-17").unwrap();
+        set_cached_asset_id(&ls_path, Some(2999)).unwrap();
+
+        let recorded = r#"[
+            {"tag_name": "v0.9.5", "draft": false, "prerelease": false, "assets": [{"id": 1001, "name": "latest.json"}]},
+            {"tag_name": "official-skyrim-se-v0.1.0", "draft": false, "prerelease": false, "assets": [{"id": 2001, "name": "agora.skyrim-se-0.1.0.zip"}]}
+        ]"#;
+        let transport =
+            FakeRegistryTransport::from_pages(vec![(1, release_json_to_list(recorded))]);
+
+        let status = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            true,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_000,
+        )
+        .await
+        .expect("cached catalog stays readable when no remote catalog release qualifies");
+
+        assert!(!status.checked);
+        assert!(
+            status
+                .message
+                .to_ascii_lowercase()
+                .contains("no catalog release found"),
+            "expected 'no catalog release found' message, got: {}",
+            status.message
+        );
+        assert!(
+            !status.message.to_ascii_lowercase().contains("up to date"),
+            "must never say 'up to date' when no catalog release qualifies: {}",
+            status.message
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_sync_pages_past_first_page_of_non_catalog_releases() {
+        let (dir, ls_path, locks) = setup_sync_env();
+        let key = test_key(42);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db_with_built_at("2026-11-18T02:00:00+00:00");
+        let header = header_for(
+            &key,
+            &payload,
+            "2026-11-18T02:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let bundle = signed_bundle(&key, &header, &payload);
+
+        let page1: Vec<GitHubRelease> = (0..RELEASES_PER_PAGE)
+            .map(|i| GitHubRelease {
+                tag_name: format!("official-plugin-v0.1.{i}"),
+                draft: false,
+                prerelease: false,
+                assets: vec![GitHubAsset {
+                    id: 10_000 + i as u64,
+                    name: "plugin.zip".into(),
+                }],
+            })
+            .collect();
+        let page2 = vec![GitHubRelease {
+            tag_name: "registry-2026-11-18".into(),
+            draft: false,
+            prerelease: false,
+            assets: vec![GitHubAsset {
+                id: 4001,
+                name: "registry.bundle".into(),
+            }],
+        }];
+        let transport = FakeRegistryTransport::from_pages(vec![(1, page1), (2, page2)]);
+        transport.push_asset_ok(4001, bundle);
+
+        let status = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            true,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_000,
+        )
+        .await
+        .expect("should page past page 1 to find catalog release on page 2");
+
+        assert_eq!(status.cached_tag.as_deref(), Some("registry-2026-11-18"));
+        assert_eq!(*transport.pages_requested.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn catalog_sync_ignores_drafts_prereleases_and_bundleless_catalog_releases() {
+        let releases = vec![
+            GitHubRelease {
+                tag_name: "registry-2026-11-20".into(),
+                draft: true,
+                prerelease: false,
+                assets: vec![GitHubAsset {
+                    id: 1,
+                    name: "registry.bundle".into(),
+                }],
+            },
+            GitHubRelease {
+                tag_name: "registry-2026-11-19".into(),
+                draft: false,
+                prerelease: true,
+                assets: vec![GitHubAsset {
+                    id: 2,
+                    name: "registry.bundle".into(),
+                }],
+            },
+            GitHubRelease {
+                tag_name: "registry-2026-11-18".into(),
+                draft: false,
+                prerelease: false,
+                assets: vec![GitHubAsset {
+                    id: 3,
+                    name: "registry.db".into(),
+                }],
+            },
+            GitHubRelease {
+                tag_name: "registry-2026-11-16".into(),
+                draft: false,
+                prerelease: false,
+                assets: vec![GitHubAsset {
+                    id: 4,
+                    name: "registry.bundle".into(),
+                }],
+            },
+            GitHubRelease {
+                tag_name: "registry-2026-11-17".into(),
+                draft: false,
+                prerelease: false,
+                assets: vec![GitHubAsset {
+                    id: 5,
+                    name: "registry.bundle".into(),
+                }],
+            },
+        ];
+        let picked = select_latest_catalog_release(&releases).expect("should pick 2026-11-17");
+        assert_eq!(picked.tag_name, "registry-2026-11-17");
+    }
+
+    #[tokio::test]
+    async fn catalog_sync_caps_paging_and_reports_no_catalog_release_found() {
+        let (dir, ls_path, locks) = setup_sync_env();
+        let trust = RegistryTrust::with_key(test_public(&test_key(44)));
+        let non_catalog_page: Vec<GitHubRelease> = (0..RELEASES_PER_PAGE)
+            .map(|i| GitHubRelease {
+                tag_name: format!("official-plugin-v0.1.{i}"),
+                draft: false,
+                prerelease: false,
+                assets: vec![GitHubAsset {
+                    id: i as u64,
+                    name: "plugin.zip".into(),
+                }],
+            })
+            .collect();
+        // 11 pages of non-catalog releases, catalog only on page 11 (beyond MAX_RELEASE_PAGES=10).
+        let mut pages: Vec<(u32, Vec<GitHubRelease>)> =
+            (1..=10).map(|p| (p, non_catalog_page.clone())).collect();
+        pages.push((
+            11,
+            vec![GitHubRelease {
+                tag_name: "registry-2026-11-18".into(),
+                draft: false,
+                prerelease: false,
+                assets: vec![GitHubAsset {
+                    id: 9999,
+                    name: "registry.bundle".into(),
+                }],
+            }],
+        ));
+        let transport = FakeRegistryTransport::from_pages(pages);
+
+        let err = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            true,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_000,
+        )
+        .await
+        .expect_err("should stop at page cap and report no catalog release found");
+
+        assert!(
+            err.to_string()
+                .to_ascii_lowercase()
+                .contains("no catalog release found"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            *transport.pages_requested.lock().unwrap(),
+            (1..=MAX_RELEASE_PAGES).collect::<Vec<u32>>()
+        );
     }
 }
