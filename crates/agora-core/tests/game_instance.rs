@@ -769,8 +769,14 @@ fn a_bad_chosen_id_is_refused_before_any_base_is_built() {
         BaseReference::Pinned { id, .. } => id,
         _ => unreachable!(),
     };
-    // With the only instance gone and its base removed, nothing exists to reuse.
+    // With the only instance gone and its base removed, nothing exists to reuse. A deleted
+    // instance still pins its base while it sits in Recently deleted, so empty that first.
     delete(&ctx, "taken").unwrap();
+    let os_trash: agora_core::game_instance::TrashFn =
+        std::sync::Arc::new(|path: &std::path::Path| {
+            std::fs::remove_dir_all(path).map_err(|error| error.to_string())
+        });
+    agora_core::game_instance::trash::purge_all(&ctx, &def.id, &os_trash);
     remove_base(&ctx.paths, &base_id).unwrap();
     let conn = rusqlite::Connection::open(ctx.paths.local_state_db()).unwrap();
     conn.execute(
