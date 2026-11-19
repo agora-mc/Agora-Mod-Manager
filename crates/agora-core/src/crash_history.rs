@@ -42,8 +42,6 @@ pub const LOG_RESULTS_TABLE: &str = "crash_log_results";
 pub struct LogSweepLimits {
     /// Logs analysed or re-used in one sweep, newest first. Older ones are reported as skipped.
     pub max_logs: usize,
-    /// A larger file is not read: a crash log bigger than this is not worth an unbounded read.
-    pub max_file_bytes: u64,
     /// Distinct log records kept per instance. The oldest are dropped first, like the evidence
     /// store's own retention.
     pub max_stored: usize,
@@ -53,7 +51,6 @@ impl Default for LogSweepLimits {
     fn default() -> Self {
         Self {
             max_logs: 50,
-            max_file_bytes: 16 * 1024 * 1024,
             max_stored: 200,
         }
     }
@@ -432,7 +429,6 @@ pub fn sweep_instance_logs(
                 name,
                 path,
                 modified: metadata.modified().ok(),
-                size: metadata.len(),
             });
         }
     }
@@ -461,21 +457,12 @@ pub fn sweep_instance_logs(
     // never allowed to stop the sweep.
     let answered_hashes = answered_artifact_hashes(conn, setup.instance_id, None)
         .map_err(|error| format!("the stored crash answers could not be read: {error}"))?;
+    let identity_limits = crate::crash_engine::evidence::CopyLimits::default();
     for candidate in &candidates {
-        if candidate.size > limits.max_file_bytes {
-            report.skipped.push(SkippedLog {
-                source_id: candidate.source_id.clone(),
-                name: candidate.name.clone(),
-                reason: format!(
-                    "it is {} bytes, over the {} byte limit for one log",
-                    candidate.size, limits.max_file_bytes
-                ),
-                intentional: false,
-            });
-            continue;
-        }
-        let bytes = match std::fs::read(&candidate.path) {
-            Ok(bytes) => bytes,
+        // A log over the copy budget is identified and analysed by its head and tail, exactly as
+        // the live path does, so a huge log is recorded rather than skipped and never read whole.
+        let (identity, bytes) = match bounded_content(&candidate.path, &identity_limits) {
+            Ok(found) => found,
             Err(error) => {
                 report.skipped.push(SkippedLog {
                     source_id: candidate.source_id.clone(),
@@ -486,9 +473,9 @@ pub fn sweep_instance_logs(
                 continue;
             }
         };
-        let hash = content_hash(&bytes);
+        let hash = identity.hash;
         // A log this analysis already holds is this crash's own evidence, never an earlier crash.
-        // Excluding it by whole-file hash also covers a log over the copy limit, whose stored copy
+        // Excluding it by content identity also covers a log over the copy limit, whose stored copy
         // is only head and tail.
         if setup
             .exclude_hashes
@@ -579,7 +566,6 @@ struct Candidate {
     name: String,
     path: PathBuf,
     modified: Option<SystemTime>,
-    size: u64,
 }
 
 fn source_folder(
@@ -619,31 +605,35 @@ pub fn bounded_content_identity(
     path: &std::path::Path,
     limits: &crate::crash_engine::evidence::CopyLimits,
 ) -> std::io::Result<ContentIdentity> {
+    bounded_content(path, limits).map(|(identity, _)| identity)
+}
+
+/// The bytes a bounded copy would keep and the identity of exactly those bytes: the whole file when
+/// it fits the budget, otherwise its head and tail with a partial identity. Nothing past the budget
+/// is read, so a huge log never has to be loaded whole.
+pub fn bounded_content(
+    path: &std::path::Path,
+    limits: &crate::crash_engine::evidence::CopyLimits,
+) -> std::io::Result<(ContentIdentity, Vec<u8>)> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut file = std::fs::File::open(path)?;
     let size = file.metadata()?.len();
     if size <= limits.max_file_bytes {
-        let mut hasher = Sha256::new();
-        let mut buffer = [0u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        return Ok(ContentIdentity {
-            hash: hex_digest(&hasher.finalize()),
-            partial: false,
-        });
+        let mut bytes = Vec::with_capacity(size as usize);
+        file.read_to_end(&mut bytes)?;
+        return Ok((
+            ContentIdentity {
+                hash: content_hash(&bytes),
+                partial: false,
+            },
+            bytes,
+        ));
     }
 
-    let mut hasher = Sha256::new();
-    let mut head = vec![0u8; limits.head_bytes.min(size) as usize];
-    let read = file.read(&mut head)?;
-    head.truncate(read);
-    hasher.update(&head);
+    let mut bytes = vec![0u8; limits.head_bytes.min(size) as usize];
+    let read = file.read(&mut bytes)?;
+    bytes.truncate(read);
 
     let tail_len = limits.tail_bytes.min(size.saturating_sub(read as u64)) as usize;
     if tail_len > 0 {
@@ -651,12 +641,15 @@ pub fn bounded_content_identity(
         let mut tail = vec![0u8; tail_len];
         let read_tail = file.read(&mut tail)?;
         tail.truncate(read_tail);
-        hasher.update(&tail);
+        bytes.extend_from_slice(&tail);
     }
-    Ok(ContentIdentity {
-        hash: hex_digest(&hasher.finalize()),
-        partial: true,
-    })
+    Ok((
+        ContentIdentity {
+            hash: content_hash(&bytes),
+            partial: true,
+        },
+        bytes,
+    ))
 }
 
 fn hex_digest(digest: &[u8]) -> String {

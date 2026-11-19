@@ -339,6 +339,61 @@ fn older_logs_over_the_sweep_bound_are_reported_as_skipped() {
 }
 
 #[test]
+fn an_oversized_log_is_recorded_with_a_bounded_partial_identity() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let fixture = Fixture::new();
+    let path = fixture.instance_dir.join("logs/huge.txt");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+    let limits = agora_core::crash_engine::evidence::CopyLimits::default();
+    let mut head = log_bytes("1234");
+    head.resize(limits.head_bytes as usize, b'H');
+    let tail = vec![b'T'; limits.tail_bytes as usize];
+    let total_len = 17 * 1024 * 1024u64;
+
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(&head).unwrap();
+    file.set_len(total_len).unwrap();
+    file.seek(SeekFrom::End(-(tail.len() as i64))).unwrap();
+    file.write_all(&tail).unwrap();
+    drop(file);
+
+    let report = fixture.sweep();
+    assert_eq!(report.analyzed, 1, "{report:#?}");
+    assert!(
+        report
+            .skipped
+            .iter()
+            .all(|skipped| skipped.name != "huge.txt"),
+        "an oversized log must be recorded, not skipped: {:#?}",
+        report.skipped
+    );
+
+    let stored_hash: String = fixture
+        .conn
+        .query_row(
+            "SELECT content_hash FROM crash_log_results WHERE instance_id = 'inst'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut bounded = head.clone();
+    bounded.extend_from_slice(&tail);
+    assert_eq!(
+        stored_hash,
+        agora_core::crash_history::content_hash(&bounded),
+        "the recorded identity must be the bounded head and tail"
+    );
+    let whole = std::fs::read(&path).unwrap();
+    assert_ne!(
+        stored_hash,
+        agora_core::crash_history::content_hash(&whole),
+        "the middle of an oversized log must not be read into its identity"
+    );
+}
+
+#[test]
 fn a_log_that_is_this_crash_is_skipped_on_purpose_not_as_a_limitation() {
     let fixture = Fixture::new();
     write_log(&fixture.instance_dir, "logs/current.txt", "2000");
