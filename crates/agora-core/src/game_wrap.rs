@@ -127,11 +127,48 @@ pub fn launch_status(ctx: &Ctx, instance_id: &str) -> Result<steam::SteamLaunchS
     Ok(steam::launch_status(&roots, &app_id))
 }
 
+/// Which platform route an instance launch takes. `Native` follows the build target; tests pass
+/// `Linux` to exercise the Steam hand-off on any host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchPlatform {
+    Linux,
+    Native,
+}
+
+/// The one decision a launch has to make before it starts anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlatformLaunch {
+    /// Run the ordinary launch. The caller owns the session and the exit watch.
+    Ordinary,
+    /// Steam was asked to run the game through `agora games wrap`. The wrapper owns the session
+    /// and the exit watch; the caller only reports the hand-off.
+    Steam(steam::SteamLaunchStatus),
+}
+
+/// Ask Steam to open a launch URL. The store's command implements this; tests inject a fake that
+/// records the URL instead of starting a process.
+pub trait SteamLauncher: Send + Sync {
+    fn start(&self, url: &str) -> std::io::Result<()>;
+    /// The command used, shown in the launch status.
+    fn describe(&self) -> String;
+}
+
 /// Ask Steam to start an instance: record the pending launch, then open `steam://rungameid/<app>`.
 /// The wrapper Steam starts finds the record and runs the instance.
 pub fn start_via_steam(
     ctx: &Ctx,
     instance_id: &str,
+) -> Result<steam::SteamLaunchStatus, WrapError> {
+    let launcher = native_steam_launcher().ok_or(WrapError::SteamMissing)?;
+    start_via_steam_with(ctx, instance_id, &launcher)
+}
+
+/// [`start_via_steam`] with an injected launcher, so a launch hand-off can be tested without a
+/// Steam install or a real process.
+pub fn start_via_steam_with(
+    ctx: &Ctx,
+    instance_id: &str,
+    launcher: &dyn SteamLauncher,
 ) -> Result<steam::SteamLaunchStatus, WrapError> {
     let (_, app_id) = instance_install(ctx, instance_id)?;
     let record = game_instance::get(ctx, instance_id)?
@@ -144,19 +181,7 @@ pub fn start_via_steam(
             created_unix_ms: now_ms(ctx),
         },
     )?;
-    let roots = crate::game_discovery::platform::find_steam_roots();
-    let flatpak_root = roots.iter().any(|root| is_flatpak_root(root));
-    let launcher = match std::env::var_os(STEAM_COMMAND_ENV) {
-        Some(program) => Some(SteamLauncher::Native(PathBuf::from(program))),
-        None => launcher_in(std::env::var_os("PATH").as_deref(), flatpak_root),
-    };
-    let Some(launcher) = launcher else {
-        clear_pending(ctx);
-        return Err(WrapError::SteamMissing);
-    };
-    let started = launcher
-        .command(&format!("steam://rungameid/{app_id}"))
-        .spawn();
+    let started = launcher.start(&format!("steam://rungameid/{app_id}"));
     if let Err(error) = started {
         // Nothing will pick the record up, so it must not claim a later launch.
         clear_pending(ctx);
@@ -165,29 +190,75 @@ pub fn start_via_steam(
         }
         return Err(WrapError::SteamStart(error.to_string()));
     }
+    let roots = crate::game_discovery::platform::find_steam_roots();
     let mut status = steam::launch_status(&roots, &app_id);
-    status.launcher = launcher.describe().to_string();
+    status.launcher = launcher.describe();
     Ok(status)
+}
+
+/// The shared platform dispatch: the CLI and the desktop both call it so a Linux Steam install
+/// always goes through the wrapper, whichever surface started the launch.
+pub fn dispatch_launch(
+    ctx: &Ctx,
+    instance_id: &str,
+    platform: LaunchPlatform,
+) -> Result<PlatformLaunch, WrapError> {
+    if platform == LaunchPlatform::Native && !cfg!(target_os = "linux") {
+        return Ok(PlatformLaunch::Ordinary);
+    }
+    let launcher = native_steam_launcher().ok_or(WrapError::SteamMissing)?;
+    dispatch_launch_with(ctx, instance_id, platform, &launcher)
+}
+
+/// [`dispatch_launch`] with an injected Steam launcher, for testing the hand-off both surfaces
+/// use. A non-Steam instance still takes the ordinary route, as the CLI has always done.
+pub fn dispatch_launch_with(
+    ctx: &Ctx,
+    instance_id: &str,
+    platform: LaunchPlatform,
+    launcher: &dyn SteamLauncher,
+) -> Result<PlatformLaunch, WrapError> {
+    let linux = match platform {
+        LaunchPlatform::Linux => true,
+        LaunchPlatform::Native => cfg!(target_os = "linux"),
+    };
+    if !linux {
+        return Ok(PlatformLaunch::Ordinary);
+    }
+    match start_via_steam_with(ctx, instance_id, launcher) {
+        Ok(status) => Ok(PlatformLaunch::Steam(status)),
+        Err(WrapError::NotSteam(_)) => Ok(PlatformLaunch::Ordinary),
+        Err(error) => Err(error),
+    }
+}
+
+fn native_steam_launcher() -> Option<StoreSteamLauncher> {
+    if let Some(program) = std::env::var_os(STEAM_COMMAND_ENV) {
+        return Some(StoreSteamLauncher::Native(PathBuf::from(program)));
+    }
+    let roots = crate::game_discovery::platform::find_steam_roots();
+    let flatpak_root = roots.iter().any(|root| is_flatpak_root(root));
+    launcher_in(std::env::var_os("PATH").as_deref(), flatpak_root)
 }
 
 /// How Steam can be asked to start a game on this machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SteamLauncher {
+enum StoreSteamLauncher {
     /// The store's own `steam` command.
     Native(PathBuf),
     /// A Flatpak install has no `steam` on `PATH`; its command names the sandbox.
     Flatpak(PathBuf),
 }
 
-impl SteamLauncher {
+impl StoreSteamLauncher {
     fn command(&self, url: &str) -> Command {
         match self {
-            SteamLauncher::Native(program) => {
+            StoreSteamLauncher::Native(program) => {
                 let mut command = Command::new(program);
                 command.arg(url);
                 command
             }
-            SteamLauncher::Flatpak(program) => {
+            StoreSteamLauncher::Flatpak(program) => {
                 let mut command = Command::new(program);
                 command.args(["run", "com.valvesoftware.Steam", url]);
                 command
@@ -195,11 +266,21 @@ impl SteamLauncher {
         }
     }
 
-    fn describe(&self) -> &'static str {
+    fn label(&self) -> &'static str {
         match self {
-            SteamLauncher::Native(_) => "steam",
-            SteamLauncher::Flatpak(_) => "flatpak run com.valvesoftware.Steam",
+            StoreSteamLauncher::Native(_) => "steam",
+            StoreSteamLauncher::Flatpak(_) => "flatpak run com.valvesoftware.Steam",
         }
+    }
+}
+
+impl SteamLauncher for StoreSteamLauncher {
+    fn start(&self, url: &str) -> std::io::Result<()> {
+        self.command(url).spawn().map(|_| ())
+    }
+
+    fn describe(&self) -> String {
+        self.label().to_string()
     }
 }
 
@@ -210,13 +291,13 @@ fn is_flatpak_root(root: &Path) -> bool {
 
 /// `steam` when it is on `PATH`; `flatpak` when only a Flatpak Steam root exists. A machine with
 /// neither cannot be asked to start a game, which is an error, never a silent no-op.
-fn launcher_in(path: Option<&OsStr>, flatpak_root: bool) -> Option<SteamLauncher> {
+fn launcher_in(path: Option<&OsStr>, flatpak_root: bool) -> Option<StoreSteamLauncher> {
     if let Some(steam) = find_executable(path, "steam") {
-        return Some(SteamLauncher::Native(steam));
+        return Some(StoreSteamLauncher::Native(steam));
     }
     if flatpak_root {
         if let Some(flatpak) = find_executable(path, "flatpak") {
-            return Some(SteamLauncher::Flatpak(flatpak));
+            return Some(StoreSteamLauncher::Flatpak(flatpak));
         }
     }
     None

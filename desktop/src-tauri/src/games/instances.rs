@@ -3,9 +3,11 @@
 //!
 //! Each command is a thin adapter over the `agora_core::game_instance` services. The CLI's
 //! `agora games instance ...` handlers call the same services, so the two cannot disagree about
-//! what an instance is. Launch runs the whole sequence in `launch_with` (deploy, check, swap-in,
-//! spawn, record). This file only turns the core's questions into replies the page can show, and
-//! watches the game so the user's files are put back when it closes.
+//! what an instance is. Launch first asks core's platform dispatch how the game is reached: on
+//! Linux a Steam install goes through `agora games wrap` and the wrapper owns the session; every
+//! other case runs the whole sequence in `launch_with` (deploy, check, swap-in, spawn, record).
+//! This file only turns the core's questions into replies the page can show, and watches the game
+//! so the user's files are put back when it closes.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,6 +21,7 @@ use agora_core::game_instance::{
 };
 use agora_core::game_launch::{LaunchError, LaunchedGame};
 use agora_core::game_user_files::{self, SessionStatus};
+use agora_core::game_wrap::{self, LaunchPlatform, PlatformLaunch};
 use agora_game_api::GameDefinition;
 use agora_game_api::{
     BaseMode, BaseReference, GameId, RuntimeFileFinding, RuntimeFileProblem, RuntimeIdentity,
@@ -962,6 +965,37 @@ fn set_deployment(
     })
 }
 
+/// A Steam hand-off is reported as a launch with a notice. The wrapper opened the session and
+/// will diagnose it and put the player's files back when the game closes, so this side starts no
+/// process and spawns no exit watch.
+fn steam_launch_reply(
+    status: &agora_core::game_discovery::steam::SteamLaunchStatus,
+) -> LaunchReply {
+    let mut notice = format!(
+        "Steam was asked to start this game through the Agora wrapper (app {}).",
+        status.app_id
+    );
+    if !status.wrapper_present {
+        notice.push_str(&format!(
+            " Set Steam's launch options to '{}' before the game starts.",
+            status.expected
+        ));
+    }
+    notice.push(' ');
+    notice.push_str(agora_core::game_wrap::PROTON_UNTESTED);
+    LaunchReply {
+        status: "launched",
+        pid: None,
+        deployment: None,
+        notice: Some(notice),
+        findings: Vec::new(),
+        reason: None,
+        next: None,
+        before_launch: Vec::new(),
+        before_launch_failure: None,
+    }
+}
+
 fn launch_instance(
     app: &tauri::AppHandle,
     instance_id: &str,
@@ -979,6 +1013,14 @@ fn launch_instance(
         .games
         .game(&record.game)
         .ok_or_else(|| game_missing(record.game.as_str()))?;
+
+    // The CLI asks the same core function. On Linux a Steam install is handed to Steam so the
+    // wrapper can mount the view; only the direct route starts a process here and needs a watcher.
+    match game_wrap::dispatch_launch(&ctx, instance_id, LaunchPlatform::Native) {
+        Ok(PlatformLaunch::Steam(status)) => return Ok(steam_launch_reply(&status)),
+        Ok(PlatformLaunch::Ordinary) => {}
+        Err(error) => return Err(core_failed(error.to_string())),
+    }
 
     let options = LaunchOptions {
         launch_anyway,
@@ -1708,6 +1750,27 @@ fn game_missing(game_id: &str) -> GamesError {
 mod tests {
     use super::*;
     use agora_core::game_load_order::Finding;
+
+    #[test]
+    fn a_steam_hand_off_is_reported_as_a_launch_with_a_notice() {
+        let status = agora_core::game_discovery::steam::SteamLaunchStatus {
+            app_id: "4242".into(),
+            expected: "agora games wrap %command%".into(),
+            configured: None,
+            wrapper_present: false,
+            files: Vec::new(),
+            problems: Vec::new(),
+            launcher: "fake steam".into(),
+        };
+        let reply = steam_launch_reply(&status);
+        assert_eq!(reply.status, "launched");
+        assert_eq!(reply.pid, None);
+        assert!(reply.findings.is_empty());
+        let notice = reply.notice.as_deref().expect("a notice for the hand-off");
+        assert!(notice.contains("Steam was asked"));
+        assert!(notice.contains("agora games wrap %command%"));
+        assert!(notice.contains(agora_core::game_wrap::PROTON_UNTESTED));
+    }
 
     #[test]
     fn an_unmet_mod_framework_is_reported_and_does_not_stop_a_launch() {

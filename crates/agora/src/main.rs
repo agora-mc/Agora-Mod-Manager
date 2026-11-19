@@ -11867,29 +11867,21 @@ fn print_vortex_run(report: &agora_core::game_import::vortex::VortexRunReport) {
     );
 }
 
-/// Whether a failed Steam hand-off may fall back to the ordinary launch.
-///
-/// Only a non-Steam install may: its launch has nothing to do with Steam. A Steam install with no
-/// `steam` command cannot work through any other path — a Windows game needs Proton through
-/// Steam, and a native Steam game needs the Steam client — so its error is reported instead.
-#[cfg(target_os = "linux")]
-fn steam_failure_falls_back(error: &agora_core::game_wrap::WrapError) -> bool {
-    matches!(error, agora_core::game_wrap::WrapError::NotSteam(_))
-}
-
 /// `games instance launch` on Linux: Steam starts the game, so Agora records what it asked for
 /// and hands the request to Steam. The `games wrap` it starts does the rest. A non-Steam instance
 /// returns `None` and the ordinary launch path runs it. A Steam instance that cannot be handed to
-/// Steam is an error, because the ordinary path cannot start it either.
+/// Steam is an error, because the ordinary path cannot start it either. The decision is the same
+/// one the desktop uses (`game_wrap::dispatch_launch`).
 #[cfg(target_os = "linux")]
 fn cli_linux_launch(
     ctx: &agora_core::ctx::Ctx,
     instance_id: &str,
     json: bool,
 ) -> anyhow::Result<Option<i32>> {
-    let status = match agora_core::game_wrap::start_via_steam(ctx, instance_id) {
-        Ok(status) => status,
-        Err(error) if steam_failure_falls_back(&error) => return Ok(None),
+    use agora_core::game_wrap::{dispatch_launch, LaunchPlatform, PlatformLaunch};
+    let status = match dispatch_launch(ctx, instance_id, LaunchPlatform::Native) {
+        Ok(PlatformLaunch::Steam(status)) => status,
+        Ok(PlatformLaunch::Ordinary) => return Ok(None),
         Err(error) => {
             if json {
                 let out = serde_json::json!({
