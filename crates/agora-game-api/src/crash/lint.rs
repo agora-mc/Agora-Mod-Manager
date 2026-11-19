@@ -1105,7 +1105,9 @@ fn check_regex(regex: &str, at: &str, out: &mut Vec<LintProblem>) -> Option<Rege
     match super::compile_rule_regex(regex) {
         Ok(compiled) => Some(compiled),
         Err(error) => {
-            let msg = if error.starts_with("a regex is at most") || error.starts_with("this regex is empty") {
+            let msg = if error.starts_with("a regex is at most")
+                || error.starts_with("this regex is empty")
+            {
                 error
             } else {
                 format!("this regex is refused: {error}")

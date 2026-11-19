@@ -71,7 +71,10 @@ fn hosted_primary_names_a_crash(pack: &LoadedCrashPack, file_name: &str, text: &
         .iter()
         .filter(|parser| {
             parser.reads == Reads::Primary
-                && matches!(parser.entry, CodeEntry::Script { .. } | CodeEntry::Wasm { .. })
+                && matches!(
+                    parser.entry,
+                    CodeEntry::Script { .. } | CodeEntry::Wasm { .. }
+                )
         })
         .cloned()
         .collect();
@@ -228,7 +231,13 @@ mod tests {
 
         let crash_text = "CRASH TIME: 2026-03-01 12:00:00\nSkyrim SSE v1.6.1170\nCrashLoggerSSE v1-20-1-0 Mar  1 2026 00:00:00\n\nUnhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x7FF700001000 ExampleGame.exe+001000\n";
         assert!(
-            names_a_crash(crash_text, "crash-2026-03-01.log", &[crash_logger.clone()], &[], None),
+            names_a_crash(
+                crash_text,
+                "crash-2026-03-01.log",
+                &[crash_logger.clone()],
+                &[],
+                None
+            ),
             "a hosted primary parser's declared detect must let the gate name a crash"
         );
 

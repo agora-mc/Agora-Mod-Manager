@@ -3263,7 +3263,10 @@ fn runtime_regex_exceeding_size_limit_is_refused_at_eval_time() {
         inspector: &inspector,
     });
     assert!(
-        evaluated.could_not_check.iter().any(|cnc| cnc.reason == agora_game_api::crash::CouldNotCheckReason::CodeFailed),
+        evaluated
+            .could_not_check
+            .iter()
+            .any(|cnc| cnc.reason == agora_game_api::crash::CouldNotCheckReason::CodeFailed),
         "a pattern exceeding MAX_RULE_REGEX_LEN must fail evaluation with CodeFailed"
     );
 }

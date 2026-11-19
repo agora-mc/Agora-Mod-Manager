@@ -940,13 +940,11 @@ fn could_not_check_key(check: &CouldNotCheck) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agora_game_api::crash::{
-        AttrValue, CrashPack, Fact, Family, Owner, Ref, Scalar,
-    };
     use crate::crash_engine::gate::NoHost;
     use crate::crash_engine::RefResolver;
     use crate::crash_packs::LoadedCrashPack;
     use crate::session_ledger::{ChangeKind, ManifestChange};
+    use agora_game_api::crash::{AttrValue, CrashPack, Fact, Family, Owner, Ref, Scalar};
 
     struct TestResolver;
     impl RefResolver for TestResolver {
@@ -1046,7 +1044,11 @@ mod tests {
         let output = analyze_with(pack, SessionVerdict::ClosedUnknown);
         assert_eq!(output.answer.verdict, SessionVerdict::ClosedUnknown);
         let en = output.answer.headline.get("en").expect("en headline");
-        let de = output.answer.headline.get("de").expect("de headline must survive");
+        let de = output
+            .answer
+            .headline
+            .get("de")
+            .expect("de headline must survive");
         assert!(en.contains("cannot tell whether"), "{en}");
         assert!(en.contains("A module was on the stack."), "{en}");
         assert!(de.contains("cannot tell whether"), "{de}");
@@ -1077,7 +1079,12 @@ mod tests {
             !output.answer.findings.is_empty(),
             "a refused plugin is still a warning after a clean exit"
         );
-        let headline = output.answer.headline.get("en").cloned().unwrap_or_default();
+        let headline = output
+            .answer
+            .headline
+            .get("en")
+            .cloned()
+            .unwrap_or_default();
         assert!(headline.contains("refused to load"), "{headline}");
     }
 
@@ -1189,9 +1196,24 @@ mod tests {
         )
         .expect("analyze succeeds");
 
-        assert_eq!(output.files[0].read_by.is_some(), true, "file should be read: {:?}", output.files[0]);
-        assert_eq!(output.answer.findings.len(), 1, "findings: {:?}", output.answer.findings);
-        assert_eq!(output.answer.candidates.len(), 1, "candidates: {:?}", output.answer.candidates);
+        assert_eq!(
+            output.files[0].read_by.is_some(),
+            true,
+            "file should be read: {:?}",
+            output.files[0]
+        );
+        assert_eq!(
+            output.answer.findings.len(),
+            1,
+            "findings: {:?}",
+            output.answer.findings
+        );
+        assert_eq!(
+            output.answer.candidates.len(),
+            1,
+            "candidates: {:?}",
+            output.answer.candidates
+        );
         let cand = &output.answer.candidates[0];
         assert!(
             !cand.families.contains(&Family::ChangeCorrelation),
