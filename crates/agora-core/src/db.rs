@@ -147,12 +147,23 @@ pub fn init_local_state_db_with(
     let mut report = LocalStateStartupReport::default();
 
     // 1. Integrity check, and recovery before anything writes to the file.
-    if db_path.exists() {
+    //    The recovery marker is written before the live file is moved, so a
+    //    launch that fails to restore a backup leaves evidence that recovery
+    //    is unfinished. Without it, the absent database would look like a first
+    //    run on the next start and recovery would be skipped.
+    let recovery_marker = recovery_marker_path(db_path);
+    if recovery_marker.is_file() {
+        if let Some(recovery) = recover_pending_database(db_path, &recovery_marker)? {
+            report.recovered_corrupt = Some(recovery);
+        }
+    } else if db_path.exists() {
         match check_integrity(db_path)? {
             Integrity::Ok => {}
             Integrity::Corrupt(reason) => {
+                write_recovery_marker(&recovery_marker)?;
                 let kept_at = quarantine_database(db_path, "corrupt")?;
                 let restored_from = restore_newest_backup(db_path)?;
+                clear_recovery_marker(&recovery_marker);
                 report.recovered_corrupt = Some(CorruptRecovery {
                     kept_at,
                     restored_from,
@@ -406,6 +417,86 @@ fn quarantine_database(db_path: &Path, label: &str) -> anyhow::Result<PathBuf> {
         )?;
     }
     Ok(kept_at)
+}
+
+/// Marker beside the database that says a corrupt file was moved aside and the
+/// backup restore did not finish. It is written before the move and removed
+/// once recovery has either restored a backup or deliberately started fresh.
+fn recovery_marker_path(db_path: &Path) -> PathBuf {
+    sidecar_path(db_path, ".recovery")
+}
+
+fn write_recovery_marker(marker: &Path) -> anyhow::Result<()> {
+    std::fs::write(marker, b"")?;
+    Ok(())
+}
+
+/// Remove the marker. A failure here is not fatal: the next launch sees the
+/// marker, finds a healthy database, and clears it then.
+fn clear_recovery_marker(marker: &Path) {
+    let _ = std::fs::remove_file(marker);
+}
+
+/// Retry recovery an earlier launch could not finish.
+///
+/// The earlier launch wrote the marker and moved the corrupt file aside, then
+/// failed to read or restore a backup. The absent database must not be taken
+/// for a first run: the backups are tried again, and a fresh start happens
+/// only when there is genuinely no readable backup.
+fn recover_pending_database(
+    db_path: &Path,
+    marker: &Path,
+) -> anyhow::Result<Option<CorruptRecovery>> {
+    if db_path.exists() {
+        match check_integrity(db_path)? {
+            Integrity::Ok => {
+                // The restore already happened; the marker outlived it.
+                clear_recovery_marker(marker);
+                return Ok(None);
+            }
+            Integrity::Corrupt(_) => {
+                // The marker was written but the move never happened.
+                let kept_at = quarantine_database(db_path, "corrupt")?;
+                let restored_from = restore_newest_backup(db_path)?;
+                clear_recovery_marker(marker);
+                return Ok(Some(CorruptRecovery {
+                    kept_at,
+                    restored_from,
+                }));
+            }
+        }
+    }
+    let kept_at = newest_kept_corrupt(db_path).unwrap_or_else(|| marker.to_path_buf());
+    let restored_from = restore_newest_backup(db_path)?;
+    clear_recovery_marker(marker);
+    Ok(Some(CorruptRecovery {
+        kept_at,
+        restored_from,
+    }))
+}
+
+/// The newest corrupt database a previous launch moved aside, if it is still
+/// there. The names start with a sortable timestamp, so the last one is the
+/// most recent.
+fn newest_kept_corrupt(db_path: &Path) -> Option<PathBuf> {
+    let name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("local_state.db");
+    let prefix = format!("{name}.corrupt-");
+    let dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix))
+        })
+        .collect();
+    files.sort();
+    files.pop()
 }
 
 /// Whether the database holds no SQLite objects at all (a brand-new file).

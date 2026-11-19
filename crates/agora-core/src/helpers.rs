@@ -422,21 +422,34 @@ pub fn available_disk_space_bytes(path: &Path) -> Option<u64> {
 
 #[cfg(not(target_os = "windows"))]
 pub fn available_disk_space_bytes(path: &Path) -> Option<u64> {
-    // `Disk::available_space` is the space a non-privileged process may use, the same number
-    // Windows reports through `GetDiskFreeSpaceExW`.
-    let disks = sysinfo::Disks::new_with_refreshed_list();
-    let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut best: Option<(usize, u64)> = None;
-    for disk in disks.list() {
-        let mount = disk.mount_point();
-        if absolute.starts_with(mount) {
-            let mount_len = mount.as_os_str().len();
-            if best.is_none_or(|(best_len, _)| mount_len > best_len) {
-                best = Some((mount_len, disk.available_space()));
-            }
-        }
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // statvfs needs a path it can resolve. The destination may not exist yet
+    // (content admission runs before the copy), so walk up to the nearest
+    // existing ancestor. Symlinks are followed, which is what we want: the
+    // answer must describe the filesystem that will actually hold the file,
+    // not the directory that merely contains a link to it.
+    let existing = path.ancestors().find(|ancestor| ancestor.exists())?;
+    let c_path = CString::new(existing.as_os_str().as_bytes()).ok()?;
+
+    // SAFETY: `c_path` is a valid NUL-terminated string and `info` is a valid
+    // `statvfs` buffer for the duration of the call.
+    let mut info: libc::statvfs = unsafe { std::mem::zeroed() };
+    let result = unsafe { libc::statvfs(c_path.as_ptr(), &mut info) };
+    if result != 0 {
+        return None;
     }
-    best.map(|(_, available)| available)
+    // `f_frsize` is the fundamental block size POSIX says to use; `f_bsize` is
+    // the preferred one and is the fallback where `f_frsize` is zero.
+    let block_size = if info.f_frsize != 0 {
+        info.f_frsize
+    } else {
+        info.f_bsize
+    };
+    u64::try_from(info.f_bavail)
+        .ok()?
+        .checked_mul(u64::try_from(block_size).ok()?)
 }
 
 pub fn check_disk_space_for(path: &Path, required_bytes: u64) -> LauncherResult<()> {
@@ -568,6 +581,23 @@ mod tests {
         assert_eq!(content_subdir("shader"), "shaderpacks");
         assert_eq!(content_subdir("datapack"), "datapacks");
         assert_eq!(content_subdir("world"), "saves");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn free_space_is_known_for_a_temp_directory_and_a_missing_descendant() {
+        let tmp = tempfile::tempdir().unwrap();
+        for path in [
+            tmp.path().to_path_buf(),
+            tmp.path().join("not-created").join("deeper"),
+        ] {
+            let free = available_disk_space_bytes(&path);
+            assert!(
+                free.is_some_and(|bytes| bytes > 0),
+                "free space for {} was {free:?}",
+                path.display()
+            );
+        }
     }
 
     #[test]
