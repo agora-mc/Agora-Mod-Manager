@@ -1327,12 +1327,12 @@ struct RunInnerError {
     external_files_written: Vec<PathBuf>,
 }
 
-impl<E: Into<ImportError>> From<E> for RunInnerError {
+impl<E: Into<ImportError>> From<E> for Box<RunInnerError> {
     fn from(error: E) -> Self {
-        Self {
+        Box::new(RunInnerError {
             error: error.into(),
             external_files_written: Vec::new(),
-        }
+        })
     }
 }
 
@@ -1360,10 +1360,7 @@ fn multi_copy_bytes(plans: &[Mo2Plan], grouping: profiles::Grouping, copy_saves:
     }
     let mods_bytes = union.values().copied().fold(0u64, u64::saturating_add);
     let overwrite_bytes = match grouping {
-        profiles::Grouping::Merged => plans
-            .first()
-            .map(|plan| plan.overwrite.bytes)
-            .unwrap_or(0),
+        profiles::Grouping::Merged => plans.first().map(|plan| plan.overwrite.bytes).unwrap_or(0),
         profiles::Grouping::Separate => {
             // Unclaimed overwrite rest goes into the deduplicated content store once;
             // tool-claimed generated files are copied into each separate instance.
@@ -1373,7 +1370,11 @@ fn multi_copy_bytes(plans: &[Mo2Plan], grouping: profiles::Grouping, copy_saves:
                 .unwrap_or(0);
             let generated_per_instance = plans
                 .iter()
-                .map(|plan| plan.overwrite.bytes.saturating_sub(plan.overwrite.rest_bytes))
+                .map(|plan| {
+                    plan.overwrite
+                        .bytes
+                        .saturating_sub(plan.overwrite.rest_bytes)
+                })
                 .fold(0u64, u64::saturating_add);
             rest_once.saturating_add(generated_per_instance)
         }
@@ -1414,7 +1415,7 @@ fn run_inner(
     progress: &dyn Fn(ImportProgress),
     only_enabled_mods: bool,
     check_space: bool,
-) -> Result<RunDetail, RunInnerError> {
+) -> Result<RunDetail, Box<RunInnerError>> {
     let plan = plan(ctx, inventory, request)?;
     if check_space {
         let needed = single_copy_bytes(&plan, request.copy_saves);
@@ -1750,10 +1751,10 @@ fn run_inner(
         Ok(())
     })();
     if let Err(error) = populated {
-        return Err(RunInnerError {
+        return Err(Box::new(RunInnerError {
             error: abandon_half_made_instance(ctx, &instance_id, error),
             external_files_written,
-        });
+        }));
     }
     report.external_files_written = external_files_written;
 
@@ -2071,18 +2072,23 @@ fn add_mo2_mod_to_merged(
     Ok(item_id)
 }
 
+struct MergedLayers {
+    layer_mods: HashMap<String, Vec<String>>,
+    folder_to_layer: HashMap<String, String>,
+    overwrite_layer_id: Option<String>,
+}
+
 fn mo2_state_for_merge(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
     plan: &Mo2Plan,
     profile_dir: &Path,
-    layer_mods: &HashMap<String, Vec<String>>,
-    folder_to_layer: &HashMap<String, String>,
-    overwrite_layer_id: Option<&str>,
+    merged: &MergedLayers,
 ) -> Result<crate::game_loadout::GameLoadout, ImportError> {
     let manifest = game_instance::get_manifest(ctx, instance_id)?;
     let store = game_ini::store_of(ctx, instance_id)?;
+    let overwrite_layer_id = merged.overwrite_layer_id.as_deref();
 
     let enabled: HashSet<String> = plan
         .mods
@@ -2100,7 +2106,8 @@ fn mo2_state_for_merge(
             let id = layer.id.as_str().to_string();
             let is_overwrite = overwrite_layer_id == Some(id.as_str());
             let is_enabled = is_overwrite
-                || layer_mods
+                || merged
+                    .layer_mods
                     .get(id.as_str())
                     .is_some_and(|folders| folders.iter().any(|folder| enabled.contains(folder)));
             content.push(crate::game_loadout::GameLoadoutContent {
@@ -2116,7 +2123,7 @@ fn mo2_state_for_merge(
     let mut layer_rank: HashMap<String, usize> = HashMap::new();
     for (idx, m) in plan.mods.iter().enumerate() {
         if m.enabled {
-            if let Some(layer_id) = folder_to_layer.get(&fold_path_case(&m.folder)) {
+            if let Some(layer_id) = merged.folder_to_layer.get(&fold_path_case(&m.folder)) {
                 if overwrite_layer_id != Some(layer_id.as_str()) {
                     layer_rank.entry(layer_id.clone()).or_insert(idx);
                 }
@@ -2125,7 +2132,7 @@ fn mo2_state_for_merge(
     }
     for (idx, m) in plan.mods.iter().enumerate() {
         if !m.enabled {
-            if let Some(layer_id) = folder_to_layer.get(&fold_path_case(&m.folder)) {
+            if let Some(layer_id) = merged.folder_to_layer.get(&fold_path_case(&m.folder)) {
                 if overwrite_layer_id != Some(layer_id.as_str()) {
                     layer_rank.entry(layer_id.clone()).or_insert(idx);
                 }
@@ -2143,8 +2150,7 @@ fn mo2_state_for_merge(
     let mut rest: Vec<String> = content
         .iter()
         .filter(|item| {
-            !placed.contains(item.item.as_str())
-                && overwrite_layer_id != Some(item.item.as_str())
+            !placed.contains(item.item.as_str()) && overwrite_layer_id != Some(item.item.as_str())
         })
         .map(|item| item.item.clone())
         .collect();
@@ -2384,6 +2390,12 @@ pub fn mo2_run_profiles(
                     .as_ref()
                     .and_then(|item_id| item_to_layer.get(item_id).cloned());
 
+                let merged_layers = MergedLayers {
+                    layer_mods,
+                    folder_to_layer,
+                    overwrite_layer_id,
+                };
+
                 let ini_text = read_text_optional(&base.ini_path)?.unwrap_or_default();
                 let ini_dir = base
                     .ini_path
@@ -2401,9 +2413,7 @@ pub fn mo2_run_profiles(
                         &definition,
                         profile_plan,
                         &profile_dir,
-                        &layer_mods,
-                        &folder_to_layer,
-                        overwrite_layer_id.as_deref(),
+                        &merged_layers,
                     )?;
                     crate::game_loadout::save_game_profile(ctx, &instance_id, profile, state)
                         .map_err(ImportError::Other)?;

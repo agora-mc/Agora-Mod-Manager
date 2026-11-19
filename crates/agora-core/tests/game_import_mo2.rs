@@ -1759,13 +1759,8 @@ fn f1a_merged_profile_without_own_settings_uses_shared_not_profile_1() {
     );
 
     // Switching to OwnPlugins keeps INIs shared, while writing OwnPlugins' own Plugins.txt.
-    agora_core::game_loadout::apply_game_profile_with_undo(
-        &f.ctx,
-        instance,
-        &f.def,
-        "OwnPlugins",
-    )
-    .expect("apply OwnPlugins");
+    agora_core::game_loadout::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "OwnPlugins")
+        .expect("apply OwnPlugins");
     assert!(!dir.join("user/Skyrim.ini").exists());
     assert!(!dir.join("user/SkyrimCustom.ini").exists());
     let plugins_text = std::fs::read_to_string(dir.join("user/Plugins.txt"))
@@ -1853,9 +1848,15 @@ fn f1c_overwrite_layer_stays_enabled_and_wins_in_every_merged_loadout() {
 
     let f = fixture();
     add_second_mo2_profile(&f);
-    write(&f.setup.join("mods/Alpha/override_check.txt"), b"from alpha");
+    write(
+        &f.setup.join("mods/Alpha/override_check.txt"),
+        b"from alpha",
+    );
     write(&f.setup.join("mods/Beta/override_check.txt"), b"from beta");
-    write(&f.setup.join("overwrite/override_check.txt"), b"from overwrite");
+    write(
+        &f.setup.join("overwrite/override_check.txt"),
+        b"from overwrite",
+    );
 
     let profiles = vec!["Test Profile".to_string(), "Alt".to_string()];
     let report = agora_core::game_import::mo2_run_profiles(
@@ -2042,7 +2043,10 @@ fn f1f_space_preflight_matches_exact_copies_in_merged_and_separate_modes() {
 
     let f = fixture();
     // Add a large mod that is disabled in BOTH profiles.
-    write(&f.setup.join("mods/HugeDisabled/big.bin"), &vec![b'X'; 8192]);
+    write(
+        &f.setup.join("mods/HugeDisabled/big.bin"),
+        &vec![b'X'; 8192],
+    );
     write(
         &f.setup.join("profiles/Test Profile/modlist.txt"),
         b"# Mod Organizer\r\n+Alpha\r\n-Beta\r\n+Gamma\r\n-HugeDisabled\r\n",
@@ -2075,14 +2079,7 @@ fn f1f_space_preflight_matches_exact_copies_in_merged_and_separate_modes() {
     )
     .unwrap();
 
-    let mod_bytes = |name: &str| {
-        p_main
-            .mods
-            .iter()
-            .find(|m| m.folder == name)
-            .unwrap()
-            .bytes
-    };
+    let mod_bytes = |name: &str| p_main.mods.iter().find(|m| m.folder == name).unwrap().bytes;
     let enabled_union = mod_bytes("Alpha") + mod_bytes("Beta") + mod_bytes("Gamma");
     let all_union = enabled_union + mod_bytes("HugeDisabled");
     let ow_total = p_main.overwrite.bytes;

@@ -1079,7 +1079,12 @@ mod tests {
 
         apply_game_profile_with_undo(&s.ctx, "test-instance", &s.def, "legacy").unwrap();
         let after = game_instance::get_manifest(&s.ctx, "test-instance").unwrap();
-        let ids: Vec<&str> = after.layers.layers().iter().map(|l| l.id.as_str()).collect();
+        let ids: Vec<&str> = after
+            .layers
+            .layers()
+            .iter()
+            .map(|l| l.id.as_str())
+            .collect();
         assert_eq!(
             ids,
             vec!["content:b", "content:a"],
