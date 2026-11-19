@@ -133,15 +133,18 @@ fn a_child_with_an_empty_environment_still_uses_the_view() {
     )
     .unwrap();
     let config = dir.path().join("config.json");
+    let log = dir.path().join("vfs.log");
+    let dll_x86 = cfg!(target_arch = "x86").then_some(&dll);
     std::fs::write(
         &config,
         serde_json::to_vec(&serde_json::json!({
-            "version": 1,
+            "version": if dll_x86.is_some() { 2 } else { 1 },
             "mount": mount,
             "upper": upper,
             "lowers": [mount, lower],
             "dll": dll,
-            "log": dir.path().join("vfs.log"),
+            "dll_x86": dll_x86,
+            "log": log,
         }))
         .unwrap(),
     )
@@ -153,7 +156,12 @@ fn a_child_with_an_empty_environment_still_uses_the_view() {
         .arg("spawn-empty-environment");
 
     let code = run_fixture(command, &dll);
-    assert_eq!(code, Some(0), "the child could not read the merged view");
+    assert_eq!(
+        code,
+        Some(0),
+        "the child could not read the merged view: {}",
+        std::fs::read_to_string(log).unwrap_or_default()
+    );
     assert_eq!(std::fs::read(marker).unwrap(), b"original lower contents");
     assert_eq!(
         std::fs::read(upper.join("early_Child.txt")).unwrap(),
