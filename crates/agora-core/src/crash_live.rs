@@ -1658,6 +1658,8 @@ fn diagnose_record(
     let normal_stop = log_shows_normal_stop(&collection, &game_packs, Some(&copied));
 
     let mut files = readable_files(&copied);
+    // Facts-only artifacts are parsed in place within the copy budget and never stored raw.
+    files.extend(facts_only_files(&collection));
     files.sort_by(|left, right| left.name.cmp(&right.name));
     files.dedup_by(|left, right| left.name == right.name && left.source == right.source);
     if files.is_empty() {
