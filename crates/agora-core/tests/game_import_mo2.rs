@@ -2017,3 +2017,189 @@ fn f1e_late_merge_failure_cleans_up_and_retry_succeeds() {
     assert_eq!(retry.instances.len(), 1);
     assert_eq!(retry.loadouts, profiles);
 }
+
+struct VolumeSeamGuard;
+
+impl VolumeSeamGuard {
+    fn set(free_bytes: u64) -> Self {
+        agora_core::game_tool_swap::set_volume_seam(Some(agora_core::game_tool_swap::VolumeSeam {
+            same_volume: None,
+            free_bytes: Some(free_bytes),
+        }));
+        Self
+    }
+}
+
+impl Drop for VolumeSeamGuard {
+    fn drop(&mut self) {
+        agora_core::game_tool_swap::set_volume_seam(None);
+    }
+}
+
+#[test]
+fn f1f_space_preflight_matches_exact_copies_in_merged_and_separate_modes() {
+    use agora_core::game_import::profiles::Grouping;
+
+    let f = fixture();
+    // Add a large mod that is disabled in BOTH profiles.
+    write(&f.setup.join("mods/HugeDisabled/big.bin"), &vec![b'X'; 8192]);
+    write(
+        &f.setup.join("profiles/Test Profile/modlist.txt"),
+        b"# Mod Organizer\r\n+Alpha\r\n-Beta\r\n+Gamma\r\n-HugeDisabled\r\n",
+    );
+    let alt = f.setup.join("profiles/Alt");
+    write(
+        &alt.join("modlist.txt"),
+        b"# Mod Organizer\r\n+Alpha\r\n+Beta\r\n-Gamma\r\n-HugeDisabled\r\n",
+    );
+    write(
+        &alt.join("plugins.txt"),
+        b"# Mod Organizer\r\n*Alpha.esp\r\n*Beta.esp\r\n",
+    );
+    write(
+        &alt.join("settings.ini"),
+        b"[General]\r\nLocalSaves=true\r\nLocalSettings=false\r\n",
+    );
+    write(&alt.join("saves/AltSave.ess"), &vec![b'S'; 512]);
+
+    let profiles = vec!["Test Profile".to_string(), "Alt".to_string()];
+
+    let p_main = game_import::plan(&f.ctx, &f.inventory, &request(&f, None, false)).unwrap();
+    let p_alt = game_import::plan(
+        &f.ctx,
+        &f.inventory,
+        &Mo2Request {
+            profile: "Alt".into(),
+            ..request(&f, None, false)
+        },
+    )
+    .unwrap();
+
+    let mod_bytes = |name: &str| {
+        p_main
+            .mods
+            .iter()
+            .find(|m| m.folder == name)
+            .unwrap()
+            .bytes
+    };
+    let enabled_union = mod_bytes("Alpha") + mod_bytes("Beta") + mod_bytes("Gamma");
+    let all_union = enabled_union + mod_bytes("HugeDisabled");
+    let ow_total = p_main.overwrite.bytes;
+    let ow_rest = p_main.overwrite.rest_bytes;
+    let ow_gen = ow_total - ow_rest;
+    let total_saves = p_main.saves.bytes + p_alt.saves.bytes;
+    assert!(ow_rest > 0 && ow_gen > 0 && total_saves > 0);
+
+    // 1. Merged without copy_saves: enabled union + overwrite once (no HugeDisabled, no saves).
+    let merged_no_saves = game_import::mo2_plan_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("M1"), false),
+        &profiles,
+        Grouping::Merged,
+    )
+    .unwrap();
+    assert_eq!(
+        merged_no_saves.bytes,
+        enabled_union + ow_total,
+        "merged (no saves) must count enabled union + overwrite once, not HugeDisabled"
+    );
+
+    // 2. Merged with copy_saves: adds both profiles' local saves.
+    let merged_with_saves = game_import::mo2_plan_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("M2"), true),
+        &profiles,
+        Grouping::Merged,
+    )
+    .unwrap();
+    assert_eq!(
+        merged_with_saves.bytes,
+        enabled_union + ow_total + total_saves,
+        "merged (copy_saves) must include both profiles' local saves"
+    );
+
+    // 3. Separate without copy_saves: union of all listed mods (incl. HugeDisabled, no double
+    //    count of Alpha/Beta/Gamma) + overwrite rest once + generated per instance.
+    let sep_no_saves = game_import::mo2_plan_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("S1"), false),
+        &profiles,
+        Grouping::Separate,
+    )
+    .unwrap();
+    assert_eq!(
+        sep_no_saves.bytes,
+        all_union + ow_rest + ow_gen * 2,
+        "separate (no saves) must count all listed mods once + overwrite rest once + generated per instance"
+    );
+
+    // 4. Separate with copy_saves: adds both profiles' local saves.
+    let sep_with_saves = game_import::mo2_plan_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("S2"), true),
+        &profiles,
+        Grouping::Separate,
+    )
+    .unwrap();
+    assert_eq!(
+        sep_with_saves.bytes,
+        all_union + ow_rest + ow_gen * 2 + total_saves,
+        "separate (copy_saves) must include both profiles' local saves"
+    );
+
+    // Executing Merged must NOT copy HugeDisabled into the content store.
+    game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("M-Run"), false),
+        &profiles,
+        Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("merged import runs");
+    let stored_names: Vec<String> = stored_items(&f.ctx).into_iter().map(|i| i.name).collect();
+    assert!(
+        !stored_names.iter().any(|n| n == "HugeDisabled"),
+        "merged execution must not store mods disabled in every chosen profile: {stored_names:?}"
+    );
+}
+
+#[test]
+fn f1f_single_profile_run_checks_free_space_before_copying() {
+    let f = fixture();
+    let req = request(&f, Some("Tight Disk"), true);
+    let planned = game_import::plan(&f.ctx, &f.inventory, &req).unwrap();
+    let needed = planned.bytes + planned.saves.bytes;
+    assert!(needed > 1);
+
+    {
+        let _guard = VolumeSeamGuard::set(needed - 1);
+        let err = game_import::run(&f.ctx, &f.inventory, &req, RunOptions::default(), &|_| {})
+            .expect_err("single-profile run must refuse when disk space is short by 1 byte");
+        assert!(
+            matches!(err, ImportError::NotEnoughSpace { needed: n, free } if n == needed && free == needed - 1),
+            "expected NotEnoughSpace {{ needed: {needed}, free: {} }}, got {err:?}",
+            needed - 1
+        );
+    }
+    assert!(
+        stored_items(&f.ctx).is_empty(),
+        "nothing may be stored when preflight refuses"
+    );
+    assert!(
+        game_instance::list(&f.ctx).unwrap().is_empty(),
+        "no instance may be created when preflight refuses"
+    );
+
+    {
+        let _guard = VolumeSeamGuard::set(needed);
+        game_import::run(&f.ctx, &f.inventory, &req, RunOptions::default(), &|_| {})
+            .expect("single-profile run succeeds when exact bytes fit");
+    }
+}

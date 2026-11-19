@@ -1319,6 +1319,62 @@ struct RunDetail {
     overwrite_item: Option<String>,
 }
 
+fn single_copy_bytes(plan: &Mo2Plan, copy_saves: bool) -> u64 {
+    let saves = if copy_saves && plan.saves.local && plan.saves.from.is_some() {
+        plan.saves.bytes
+    } else {
+        0
+    };
+    plan.bytes.saturating_add(saves)
+}
+
+fn multi_copy_bytes(plans: &[Mo2Plan], grouping: profiles::Grouping, copy_saves: bool) -> u64 {
+    // Separate mode invokes single-profile import per profile, storing every listed mod (enabled
+    // or disabled) into the deduplicated content store. Merged mode stores only the union of
+    // enabled mods across the chosen profiles (MASTER_SPEC §26.10).
+    let include_disabled = grouping == profiles::Grouping::Separate;
+    let mut union: BTreeMap<String, u64> = BTreeMap::new();
+    for plan in plans {
+        for item in &plan.mods {
+            if include_disabled || item.enabled {
+                union.insert(fold_path_case(&item.folder), item.bytes);
+            }
+        }
+    }
+    let mods_bytes = union.values().copied().fold(0u64, u64::saturating_add);
+    let overwrite_bytes = match grouping {
+        profiles::Grouping::Merged => plans
+            .first()
+            .map(|plan| plan.overwrite.bytes)
+            .unwrap_or(0),
+        profiles::Grouping::Separate => {
+            // Unclaimed overwrite rest goes into the deduplicated content store once;
+            // tool-claimed generated files are copied into each separate instance.
+            let rest_once = plans
+                .first()
+                .map(|plan| plan.overwrite.rest_bytes)
+                .unwrap_or(0);
+            let generated_per_instance = plans
+                .iter()
+                .map(|plan| plan.overwrite.bytes.saturating_sub(plan.overwrite.rest_bytes))
+                .fold(0u64, u64::saturating_add);
+            rest_once.saturating_add(generated_per_instance)
+        }
+    };
+    let saves_bytes = if copy_saves {
+        plans
+            .iter()
+            .filter(|plan| plan.saves.local && plan.saves.from.is_some())
+            .map(|plan| plan.saves.bytes)
+            .fold(0u64, u64::saturating_add)
+    } else {
+        0
+    };
+    mods_bytes
+        .saturating_add(overwrite_bytes)
+        .saturating_add(saves_bytes)
+}
+
 /// Run an import: store the bytes, make the instance, and set it up from the profile. The plan is
 /// made first, so a refusal happens before anything is written.
 pub fn run(
@@ -1328,7 +1384,7 @@ pub fn run(
     options: RunOptions,
     progress: &dyn Fn(ImportProgress),
 ) -> Result<Mo2RunReport, ImportError> {
-    run_inner(ctx, inventory, request, options, progress).map(|detail| detail.report)
+    run_inner(ctx, inventory, request, options, progress, false, true).map(|detail| detail.report)
 }
 
 fn run_inner(
@@ -1337,8 +1393,18 @@ fn run_inner(
     request: &Mo2Request,
     options: RunOptions,
     progress: &dyn Fn(ImportProgress),
+    only_enabled_mods: bool,
+    check_space: bool,
 ) -> Result<RunDetail, ImportError> {
     let plan = plan(ctx, inventory, request)?;
+    if check_space {
+        let needed = single_copy_bytes(&plan, request.copy_saves);
+        if let Some(free) = crate::game_tool_swap::available_bytes(&ctx.paths.content_root()) {
+            if needed > free {
+                return Err(ImportError::NotEnoughSpace { needed, free });
+            }
+        }
+    }
     let install = inventory
         .installs
         .iter()
@@ -1376,18 +1442,24 @@ fn run_inner(
         next_steps: Vec::new(),
     };
 
-    // 1. Bytes first: every listed mod, as it is on disk. The bar measures the mods alone: the
-    // overwrite folder is copied later and cannot be measured, so adding its bytes here would stop
-    // the bar short of its end.
-    let mods_total = plan.mods.len();
-    let mods_bytes: u64 = plan.mods.iter().map(|m| m.bytes).sum();
+    // 1. Bytes first: every listed mod (or enabled mods only for a merged base), as it is on disk.
+    // The bar measures the mods alone: the overwrite folder is copied later and cannot be measured,
+    // so adding its bytes here would stop the bar short of its end.
+    let mods_to_store: Vec<(usize, &PlannedMod)> = plan
+        .mods
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| !only_enabled_mods || m.enabled)
+        .collect();
+    let mods_total = mods_to_store.len();
+    let mods_bytes: u64 = mods_to_store.iter().map(|(_, m)| m.bytes).sum();
     let mut stored: Vec<(usize, String)> = Vec::new();
     let mut bytes_done = 0u64;
-    for (index, planned) in plan.mods.iter().enumerate() {
+    for (step, (plan_index, planned)) in mods_to_store.into_iter().enumerate() {
         progress(ImportProgress {
             phase: ImportPhase::Storing,
             current_mod: Some(planned.folder.clone()),
-            mods_done: index,
+            mods_done: step,
             mods_total,
             bytes_done,
             bytes_total: mods_bytes,
@@ -1405,13 +1477,13 @@ fn run_inner(
         let (files, _) = collect_mod_files(&planned.path).map_err(store_error)?;
         let outcome = content_store::add_collected(ctx, &planned.folder, files, source)
             .map_err(store_error)?;
-        stored.push((index, outcome.item().item_id.clone()));
+        stored.push((plan_index, outcome.item().item_id.clone()));
         bytes_done += planned.bytes;
         report.stored_mods += 1;
         progress(ImportProgress {
             phase: ImportPhase::Storing,
             current_mod: None,
-            mods_done: index + 1,
+            mods_done: step + 1,
             mods_total,
             bytes_done,
             bytes_total: mods_bytes,
@@ -1419,7 +1491,7 @@ fn run_inner(
         if options
             .stop_after_mods
             .is_some_and(|n| report.stored_mods >= n)
-            && index + 1 < mods_total
+            && step + 1 < mods_total
         {
             report.interrupted = true;
             return Ok(RunDetail {
@@ -1875,18 +1947,7 @@ pub fn mo2_plan_profiles(
         };
         plans.push(plan(ctx, inventory, &request)?);
     }
-    let mut union: BTreeMap<String, u64> = BTreeMap::new();
-    let mut separate_bytes = 0u64;
-    for plan in &plans {
-        for item in plan.mods.iter().filter(|m| m.enabled) {
-            union.insert(item.folder.clone(), item.bytes);
-            separate_bytes = separate_bytes.saturating_add(item.bytes);
-        }
-    }
-    let bytes = match grouping {
-        profiles::Grouping::Merged => union.values().sum(),
-        profiles::Grouping::Separate => separate_bytes,
-    };
+    let bytes = multi_copy_bytes(&plans, grouping, base.copy_saves);
     let free_bytes = crate::game_tool_swap::available_bytes(&ctx.paths.content_root());
     let fits = free_bytes.is_none_or(|free| bytes <= free);
     let suggestion = profiles::suggest_grouping(&sets);
@@ -2171,7 +2232,8 @@ pub fn mo2_run_profiles(
                     ),
                     ..base.clone()
                 };
-                let report = run(ctx, inventory, &request, options, progress)?;
+                let report = run_inner(ctx, inventory, &request, options, progress, false, false)?
+                    .report;
                 if let Some(instance) = report.instance_id {
                     instances.push(instance);
                 }
@@ -2189,7 +2251,7 @@ pub fn mo2_run_profiles(
                 copy_saves: false,
                 ..base.clone()
             };
-            let detail = run_inner(ctx, inventory, &request, options, progress)?;
+            let detail = run_inner(ctx, inventory, &request, options, progress, true, false)?;
             let report = detail.report;
             let overwrite_item = detail.overwrite_item;
             let instance_id = report
