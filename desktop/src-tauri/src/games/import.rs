@@ -3,6 +3,7 @@
 //! `agora games import mo2` does the same work through the same functions.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agora_core::content_store::Mo2Provenance;
 
@@ -23,6 +24,33 @@ pub const IMPORT_PROGRESS_EVENT: &str = "games-import-progress";
 const INI_NAME: &str = "ModOrganizer.ini";
 /// The request named a path that cannot be a setup (empty, missing, or not the setup's ini).
 const BAD_PATH: &str = "bad_path";
+/// Another import is already running.
+const IMPORT_BUSY: &str = "import_busy";
+
+static IMPORT_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug)]
+struct ImportGuard;
+
+impl ImportGuard {
+    fn acquire() -> Result<Self, GamesError> {
+        IMPORT_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self)
+            .map_err(|_| {
+                GamesError::new(
+                    IMPORT_BUSY,
+                    "Another import is already running. Wait for it to finish before starting another.",
+                )
+            })
+    }
+}
+
+impl Drop for ImportGuard {
+    fn drop(&mut self) {
+        IMPORT_IN_PROGRESS.store(false, Ordering::Release);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Finding setups
@@ -279,6 +307,7 @@ pub async fn games_import_mo2(
                 Err(error) => choose_install_or_fail(error, &inventory),
             };
         }
+        let _import_guard = ImportGuard::acquire()?;
         let emitter = app.clone();
         let report = game_import::run(
             &ctx,
@@ -659,6 +688,36 @@ mod tests {
         assert_eq!(provenance_text(&claimed), "Nexus mod 42 (not checked)");
         assert_eq!(provenance_text(&Mo2Provenance::Absent), "No meta.ini");
     }
+
+    #[test]
+    fn import_guard_refuses_a_second_import_and_releases() {
+        // Drop any leftover state from other tests in this process.
+        IMPORT_IN_PROGRESS.store(false, Ordering::SeqCst);
+        let first = ImportGuard::acquire().expect("first import acquires the guard");
+        let refused = ImportGuard::acquire().expect_err("a second import is refused");
+        assert_eq!(refused.code, IMPORT_BUSY);
+        assert!(
+            refused
+                .message
+                .contains("Another import is already running"),
+            "{}",
+            refused.message
+        );
+        drop(first);
+        let again = ImportGuard::acquire().expect("guard released on drop");
+        drop(again);
+    }
+
+    #[test]
+    fn import_guard_releases_on_panic() {
+        IMPORT_IN_PROGRESS.store(false, Ordering::SeqCst);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ImportGuard::acquire().expect("acquire before panic");
+            panic!("boom");
+        }));
+        let again = ImportGuard::acquire().expect("guard released on panic");
+        drop(again);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -823,6 +882,7 @@ pub async fn games_import_vortex_multi(
                 warnings: plan.warnings.clone(),
             })));
         }
+        let _import_guard = ImportGuard::acquire()?;
         let report = vortex::run_profiles(
             &ctx,
             &inventory,
@@ -941,6 +1001,7 @@ pub async fn games_import_mo2_multi(
                 warnings: plan.warnings.clone(),
             })));
         }
+        let _import_guard = ImportGuard::acquire()?;
         let report = game_import::mo2_run_profiles(
             &ctx,
             &inventory,
@@ -1050,6 +1111,7 @@ pub async fn games_import_vortex(
                 &plan,
             ))));
         }
+        let _import_guard = ImportGuard::acquire()?;
         let report = vortex::run(
             &ctx,
             &inventory,
