@@ -382,7 +382,7 @@ pub struct SaveFolderRow {
     pub path: String,
     /// False when the folder has not been made yet. That is not an error: the game makes it.
     pub exists: bool,
-    pub saves: usize,
+    pub saves: Option<usize>,
     /// The newest save's modification time, RFC 3339 in UTC.
     pub newest: Option<String>,
 }
@@ -397,7 +397,7 @@ pub struct SavesView {
     /// The folder the game reads and writes for this instance.
     pub in_use: SaveFolderRow,
     /// The other folder. Its saves stay where they are when the choice changes.
-    pub other: SaveFolderRow,
+    pub other: Option<SaveFolderRow>,
     /// The per-user file that holds the game's save setting, and `section/key` of the setting.
     pub setting_file: String,
     pub setting: String,
@@ -440,7 +440,7 @@ fn saves_view(status: &SavesStatus) -> SavesView {
         instance_id: status.instance_id.clone(),
         choice: status.choice.as_str().to_string(),
         in_use: save_folder_row(&status.in_use),
-        other: save_folder_row(&status.other),
+        other: status.other.as_ref().map(save_folder_row),
         setting_file: status.setting_file.clone(),
         setting: status.setting.clone(),
         setting_value: status.setting_value.clone(),
@@ -450,6 +450,7 @@ fn saves_view(status: &SavesStatus) -> SavesView {
 
 fn setting_change_row(change: &SettingChange) -> SettingChangeRow {
     let (action, value) = match change {
+        SettingChange::NoSetting => ("no_setting", None),
         SettingChange::Set { value } => ("set", Some(value.clone())),
         SettingChange::Unchanged => ("unchanged", None),
         SettingChange::Restored { value } => ("restored", Some(value.clone())),
@@ -641,7 +642,7 @@ mod tests {
                 "C:/Users/player/Documents/My Games/Skyrim Special Edition/Saves",
             ),
             exists,
-            saves,
+            saves: Some(saves),
             newest: None,
         }
     }
@@ -677,6 +678,7 @@ mod tests {
     #[test]
     fn every_core_setting_action_has_a_named_row() {
         let cases = [
+            (SettingChange::NoSetting, "no_setting", None),
             (SettingChange::Set { value: "a".into() }, "set", Some("a")),
             (SettingChange::Unchanged, "unchanged", None),
             (
@@ -706,7 +708,7 @@ mod tests {
     fn a_missing_save_folder_reads_as_not_made_yet_not_as_an_error() {
         let row = save_folder_row(&folder(false, 0));
         assert!(!row.exists);
-        assert_eq!(row.saves, 0);
+        assert_eq!(row.saves, Some(0));
         assert!(row.path.ends_with("Saves"));
     }
 
@@ -748,7 +750,7 @@ mod tests {
             instance_id: "abc".to_string(),
             choice: "own".to_string(),
             in_use: save_folder_row(&folder(true, 2)),
-            other: save_folder_row(&folder(false, 0)),
+            other: Some(save_folder_row(&folder(false, 0))),
             setting_file: "Skyrim.ini".to_string(),
             setting: "General/sSaveFolder".to_string(),
             setting_value: None,

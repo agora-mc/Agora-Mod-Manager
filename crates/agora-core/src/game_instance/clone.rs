@@ -5,15 +5,18 @@
 //! removes the staging folder and leaves nothing behind. Saves live outside the instance folder
 //! (in the game's own user-data folders), so the default clone cannot copy them by accident.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use agora_game_api::{GameDefinition, StoreId};
 
+use crate::content_store::is_reparse_point_or_symlink;
 use crate::ctx::Ctx;
 use crate::game_instance::{
     self, check_id_exists, generate_instance_id_from_name, GameInstanceManifest, InstanceError,
 };
-use crate::game_saves::{self, SavesError};
+use crate::game_saves::{self, SavesError, SavesState, STATE_FILE};
+use crate::instance_runtime::InstanceGuard;
+use crate::save_backup::{copy_save_files, BACKUP_DIR};
 
 /// What a clone is asked to take from its source.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -30,9 +33,18 @@ pub struct ClonedInstance {
     pub name: String,
 }
 
-/// Top-level entries a clone never copies. The manifest is rewritten, and logs and the VFS's own
-/// config are per-launch state rather than the instance's content.
-const SKIP_TOP_LEVEL: &[&str] = &["instance_manifest.json", "logs", "vfs"];
+/// The manifest gets a new identity. Launch logs, the VFS config and overlay work directory
+/// belong to the source's launches. Undo and backup history belong to the source's operations.
+/// Carry forward only the validated pre-isolation save setting, when one is needed.
+const SKIP_PATHS: &[&str] = &[
+    "instance_manifest.json",
+    "logs",
+    "vfs",
+    "view-work",
+    ".agora_loadouts/undo",
+    BACKUP_DIR,
+    STATE_FILE,
+];
 
 fn store_of(ctx: &Ctx, instance_id: &str) -> Result<StoreId, InstanceError> {
     let record = game_instance::get(ctx, instance_id)?
@@ -47,29 +59,28 @@ fn store_of(ctx: &Ctx, instance_id: &str) -> Result<StoreId, InstanceError> {
 
 /// Copy a folder tree, never following a link out of it. A link fails the clone rather than being
 /// silently dropped, because the result would not be the instance the player asked for.
-fn copy_tree(
-    source: &Path,
-    destination: &Path,
-    skip_top_level: &[&str],
-) -> Result<(), InstanceError> {
+fn copy_tree(source: &Path, destination: &Path, relative: &Path) -> Result<(), InstanceError> {
     std::fs::create_dir_all(destination)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
         let name = entry.file_name();
-        if skip_top_level.iter().any(|skip| name == *skip) {
+        let relative = relative.join(&name);
+        if SKIP_PATHS.iter().any(|skip| {
+            crate::game_user_files::paths_eq_case_insensitive(&relative, Path::new(skip))
+        }) {
             continue;
         }
         let from = entry.path();
         let to = destination.join(&name);
         let metadata = std::fs::symlink_metadata(&from)?;
-        if metadata.file_type().is_symlink() {
+        if is_reparse_point_or_symlink(&metadata) {
             return Err(InstanceError::Other(format!(
                 "'{}' is a link; Agora will not clone an instance whose files point outside it.",
                 from.display()
             )));
         }
         if metadata.is_dir() {
-            copy_tree(&from, &to, &[])?;
+            copy_tree(&from, &to, &relative)?;
         } else if metadata.is_file() {
             std::fs::copy(&from, &to)?;
         }
@@ -85,12 +96,14 @@ fn build_staging(
     new_name: &str,
     staging: &Path,
     source_manifest: &GameInstanceManifest,
+    save_state: Option<&SavesState>,
 ) -> Result<(), InstanceError> {
     let source_dir = ctx
         .paths
         .instance_dir(source_id)
         .map_err(|e| InstanceError::InvalidId(source_id.to_string(), e.to_string()))?;
-    copy_tree(&source_dir, staging, SKIP_TOP_LEVEL)?;
+    game_saves::checked_metadata(&source_dir)?;
+    copy_tree(&source_dir, staging, Path::new(""))?;
 
     let mut manifest = source_manifest.clone();
     manifest.instance_id = new_id.to_string();
@@ -100,47 +113,10 @@ fn build_staging(
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     std::fs::write(staging.join("instance_manifest.json"), manifest_bytes)?;
 
-    // The source's save setting names the source's folder. The clone's choice is recorded fresh
-    // (when it has its own saves) after the move, so a stale record must not be carried over.
-    let spent_state = staging.join("saves_state.json");
-    if spent_state.exists() {
-        std::fs::remove_file(&spent_state)?;
+    if let Some(state) = save_state {
+        std::fs::write(staging.join(STATE_FILE), serde_json::to_vec_pretty(state)?)?;
     }
     Ok(())
-}
-
-/// Point a clone at its own save folder: rewrite the copied setting through the same service the
-/// Saves page uses, create the folder, and copy the source's saves into it when `source` is named.
-/// Returns the folder Agora created or filled.
-fn reuse_own_saves(
-    ctx: &Ctx,
-    new_id: &str,
-    definition: &GameDefinition,
-    store: &StoreId,
-    source: Option<&Path>,
-) -> Result<PathBuf, InstanceError> {
-    let rule = game_saves::rule_for(definition, store).ok_or_else(|| {
-        InstanceError::Saves(SavesError::NoSaveLocation {
-            game: definition.id.as_str().to_string(),
-            store: store.as_str().to_string(),
-        })
-    })?;
-    let folder = game_saves::own_folder(rule, new_id)?;
-    game_saves::set_choice_inner(
-        ctx,
-        new_id,
-        definition,
-        game_instance::SavesChoice::Own,
-        false,
-        None,
-    )?;
-    std::fs::create_dir_all(&folder)?;
-    if let Some(source) = source {
-        if source.is_dir() {
-            copy_tree(source, &folder, &[])?;
-        }
-    }
-    Ok(folder)
 }
 
 /// Clone an instance. Refuses while the source is running, and refuses a source whose folder or
@@ -159,17 +135,25 @@ pub fn clone_instance(
     if !game_instance::get(ctx, source_id)?.is_some_and(|record| record.game == definition.id) {
         return Err(InstanceError::NotFound(source_id.to_string()));
     }
-    let source_manifest = game_instance::get_manifest(ctx, source_id)?;
-    let store = store_of(ctx, source_id)?;
-
+    let source_dir = ctx
+        .paths
+        .instance_dir(source_id)
+        .map_err(|error| InstanceError::InvalidId(source_id.to_string(), error.to_string()))?;
+    let source_manifest_path = source_dir.join("instance_manifest.json");
+    game_saves::checked_metadata(&source_manifest_path)?;
     // A running game is writing the files a clone would copy. The shared guard
     // takes the instance lock and checks the one "is this game running" answer;
     // it fails at once rather than waiting out the lock.
-    let _guard = crate::instance_runtime::InstanceGuard::for_mutation(ctx, source_id, "clone")
-        .map_err(|error| match error.code().as_str() {
-            "ERR_INSTANCE_RUNNING" => InstanceError::Running(source_id.to_string()),
-            _ => InstanceError::Other(error.to_string()),
+    let _guard =
+        InstanceGuard::for_mutation(ctx, source_id, "clone").map_err(|error| {
+            match error.code().as_str() {
+                "ERR_INSTANCE_RUNNING" => InstanceError::Running(source_id.to_string()),
+                _ => InstanceError::Other(error.to_string()),
+            }
         })?;
+    game_saves::checked_metadata(&source_manifest_path)?;
+    let source_manifest = game_instance::get_manifest(ctx, source_id)?;
+    let store = store_of(ctx, source_id)?;
 
     // The id is settled before any file is copied, so a taken name costs nothing.
     let conn = crate::db::local_state_connection(&ctx.paths.local_state_db())
@@ -190,43 +174,60 @@ pub fn clone_instance(
     // leaving a half-built clone behind.
     let needs_own_saves =
         options.copy_saves || source_manifest.saves == game_instance::SavesChoice::Own;
-    let rule = game_saves::rule_for(definition, &store).cloned();
-    let source_saves = if options.copy_saves {
-        let rule = rule.as_ref().ok_or_else(|| {
-            InstanceError::Saves(SavesError::NoSaveLocation {
-                game: definition.id.as_str().to_string(),
-                store: store.as_str().to_string(),
-            })
-        })?;
-        Some(match source_manifest.saves {
-            game_instance::SavesChoice::Own => game_saves::own_folder_scoped(
-                rule,
-                source_id,
-                source_manifest.save_scope.as_deref(),
-            )?,
-            game_instance::SavesChoice::Shared => game_saves::shared_folder(rule)?,
-        })
+    let mut source_saves = None;
+    let mut save_state = None;
+    let clone_save_folder = if needs_own_saves {
+        let scope = source_manifest.save_scope.as_deref();
+        let folders = game_saves::save_folders(definition, &store, source_id, scope)?;
+        let clone_folders = game_saves::save_folders(definition, &store, &new_id, None)?;
+        let destination = &clone_folders.in_use(game_instance::SavesChoice::Own)?.path;
+        if game_saves::checked_metadata(destination)?.is_some() {
+            return Err(InstanceError::Other(format!(
+                "the clone's save directory already exists at {}",
+                destination.display()
+            )));
+        }
+        if options.copy_saves {
+            let area = folders.in_use(source_manifest.saves)?;
+            let files = area.files()?;
+            if files.is_empty() {
+                return Err(InstanceError::Other(
+                    "the source has no eligible save files to copy".into(),
+                ));
+            }
+            source_saves = Some((area.path.clone(), files));
+        }
+        if let Some(rule) = folders
+            .ini
+            .filter(|_| source_manifest.saves == game_instance::SavesChoice::Own)
+        {
+            let state = game_saves::read_state(&source_dir.join(STATE_FILE))?.ok_or_else(|| {
+                SavesError::Other(
+                    "could not tell what the source's save setting was before isolation".into(),
+                )
+            })?;
+            if state.ini != rule.ini.as_str()
+                || state.section != rule.section
+                || state.key != rule.key
+                || state.set_to != game_saves::own_value_scoped(rule, source_id, scope)
+            {
+                return Err(SavesError::Other(
+                    "the source's recorded save setting differs from its save rule".into(),
+                )
+                .into());
+            }
+            game_saves::validate_previous_value(rule, &folders.shared, state.previous.as_deref())?;
+            save_state = Some(state);
+        }
+        Some(destination.clone())
     } else {
         None
-    };
-    if needs_own_saves && rule.is_none() {
-        return Err(InstanceError::Saves(SavesError::NoSaveLocation {
-            game: definition.id.as_str().to_string(),
-            store: store.as_str().to_string(),
-        }));
-    }
-    let clone_save_folder = match (&rule, needs_own_saves) {
-        (Some(rule), true) => Some(game_saves::own_folder_scoped(rule, &new_id, None)?),
-        _ => None,
     };
 
     let staging = ctx
         .paths
         .staging_dir(&format!("clone-{}", uuid::Uuid::new_v4()))
         .map_err(|error| InstanceError::Other(error.to_string()))?;
-    if staging.exists() {
-        std::fs::remove_dir_all(&staging)?;
-    }
     if let Err(error) = build_staging(
         ctx,
         source_id,
@@ -234,6 +235,7 @@ pub fn clone_instance(
         new_name,
         &staging,
         &source_manifest,
+        save_state.as_ref(),
     ) {
         let _ = std::fs::remove_dir_all(&staging);
         return Err(error);
@@ -255,20 +257,39 @@ pub fn clone_instance(
         return Err(error.into());
     }
 
-    let rollback = |destination: &Path, save_folder: &Option<PathBuf>| {
-        let _ = std::fs::remove_dir_all(destination);
+    let rollback = |save_folder: Option<&Path>| {
+        let _ = std::fs::remove_dir_all(&destination);
         if let Some(folder) = save_folder {
-            // A folder for a brand-new id is Agora's, so it may go when the clone fails.
-            let _ = std::fs::remove_dir_all(folder);
+            if game_saves::checked_metadata(folder).is_ok_and(|metadata| metadata.is_some()) {
+                let _ = std::fs::remove_dir_all(folder);
+            }
         }
     };
 
-    if needs_own_saves {
-        if let Err(error) =
-            reuse_own_saves(ctx, &new_id, definition, &store, source_saves.as_deref())
-        {
-            rollback(&destination, &clone_save_folder);
+    if let Some(folder) = clone_save_folder.as_deref() {
+        let result = (|| -> Result<(), InstanceError> {
+            game_saves::set_choice_inner(
+                ctx,
+                &new_id,
+                definition,
+                game_instance::SavesChoice::Own,
+                false,
+                None,
+            )?;
+            game_saves::checked_metadata(folder)?;
+            std::fs::create_dir_all(folder.parent().expect("the save folder has a parent"))?;
+            std::fs::create_dir(folder)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            rollback(None);
             return Err(error);
+        }
+        if let Some((source, files)) = source_saves {
+            if let Err(error) = copy_save_files(&files, &source, folder) {
+                rollback(Some(folder));
+                return Err(InstanceError::Other(error.to_string()));
+            }
         }
     }
 
@@ -283,7 +304,7 @@ pub fn clone_instance(
         ],
     );
     if let Err(error) = inserted {
-        rollback(&destination, &clone_save_folder);
+        rollback(clone_save_folder.as_deref());
         return Err(error.into());
     }
 

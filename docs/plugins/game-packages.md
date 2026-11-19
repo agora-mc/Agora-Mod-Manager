@@ -405,7 +405,7 @@ Each value is a function name in your script. Every field is optional.
 | `tool_ids` | list of strings | optional | Tool ids the game may use; may be empty |
 | `launch` | launch recipe | optional | How to launch it; leave it out when `prepare_launch` supplies one |
 | `user_files` | list of user file mappings | optional | Per-user files kept in the instance; may be empty |
-| `save_paths` | list of game paths | optional | Where its saves are; may be empty |
+| `save_paths` | list of save folders | optional | Save folders for games without a matching INI rule. Agora can operate on a single declared folder |
 | `linked_archive_patterns` | list of globs | optional | Archives linked rather than copied; may be empty |
 | `declared_writes` | list of globs | optional | Paths the game may write outside its folder |
 | `copy_patterns` | list of globs | optional | Extra small text files copied in Links mode |
@@ -631,11 +631,14 @@ A runtime constraint is `{ "game": "...", "stores": [...], "versions": { ... }, 
 | `ini` | path | required | The per-user file holding the setting |
 | `section` | string | required | The section in that file |
 | `key` | string | required | The setting's key |
-| `own_value` | string | required | The value that gives an instance its own saves; `{instance}` is its folder name |
+| `own_value` | string | required | Relative path to private saves. One complete component must be `{instance}`. If private saves sit under the shared folder, give them a dedicated parent directory, such as `Agora/{instance}` |
 | `shared_dir` | game path | required | Where saves live when the setting is absent |
 | `relative_to` | game path | required | The folder `own_value` is relative to |
+| `recognition` | object | optional | `{ "kind": "files", "patterns": ["*.ess"] }` counts files by case-insensitive name patterns using `*`. `{ "kind": "folders" }` counts one save per immediate subfolder |
 | `processes` | list of strings | optional | Image names whose exit ends the session |
 | `normal_exit_codes` | list of numbers | optional | Exit codes that mean a normal quit; empty means `[0]` |
+
+A `save_paths` entry can be a bare `user_data` game path or an object with `path` and optional `recognition`. To let Agora manage an instance's own folder directly, add `own_value` and optionally `relative_to`, which defaults to `path`. For example, `Agora/{instance}/characters` keeps private folders within a dedicated directory under the shared folder. A game without an INI setting controls where it writes at launch. The declaration tells Agora where to survey, copy and restore files. With no `recognition`, the save count is unknown.
 
 ### Launch alternative and runtime files
 

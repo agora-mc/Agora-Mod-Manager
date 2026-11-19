@@ -213,6 +213,7 @@
           "section": "General",
           "key": "SLocalSavePath",
           "own_value": "Saves\\Agora\\{instance}\\",
+          "recognition": { "kind": "files", "patterns": ["*.ess"] },
           "shared_dir": {
             "root": "user_data",
             "location": "documents",
@@ -232,6 +233,7 @@
           "section": "General",
           "key": "SLocalSavePath",
           "own_value": "Saves\\Agora\\{instance}\\",
+          "recognition": { "kind": "files", "patterns": ["*.ess"] },
           "shared_dir": {
             "root": "user_data",
             "location": "documents",

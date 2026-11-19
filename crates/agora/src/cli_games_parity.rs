@@ -41,6 +41,9 @@ pub enum SaveBackupCmd {
         /// Also record the backup for this crash-test session, as the desktop does before a test.
         #[arg(long)]
         session: Option<String>,
+        /// Allow copying saves while the game is running. The game may change them during the copy.
+        #[arg(long)]
+        allow_while_running: bool,
     },
     /// List the instance's save backups, newest first. With --session, show only the backup
     /// recorded for that crash-test session.
@@ -560,10 +563,16 @@ pub fn save_backup_command(ctx: &Ctx, json: bool, action: SaveBackupCmd) -> anyh
         SaveBackupCmd::Create {
             instance_id,
             session,
+            allow_while_running,
         } => {
             let definition = instance_game(ctx, json, &instance_id);
-            let backup = save_backup::backup(ctx, &instance_id, definition)
-                .unwrap_or_else(|e| ini_fail(json, e.to_string()));
+            let backup = save_backup::backup_while_running(
+                ctx,
+                &instance_id,
+                definition,
+                allow_while_running,
+            )
+            .unwrap_or_else(|e| ini_fail(json, e.to_string()));
             if let Some(session) = session.as_deref() {
                 let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())
                     .unwrap_or_else(|e| ini_fail(json, e.to_string()));

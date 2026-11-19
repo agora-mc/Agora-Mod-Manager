@@ -152,7 +152,11 @@ fn the_first_own_loadout_adopts_the_instances_existing_save_folder() {
         status.in_use.path, existing,
         "the game reads the existing folder"
     );
-    assert_eq!(status.in_use.saves, 1, "the player's save is still listed");
+    assert_eq!(
+        status.in_use.saves,
+        Some(1),
+        "the player's save is still listed"
+    );
 
     // The second loadout gets a new folder; the first folder and its save stay untouched.
     let second = game_loadout::create_game_profile(&h.ctx, h.instance, &def, "Second Setup")
