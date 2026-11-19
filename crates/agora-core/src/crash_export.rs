@@ -177,6 +177,19 @@ pub fn build_crash_report(
     )
 }
 
+/// [`build_crash_report`] with the mod list of `context.instance_id`, read from its manifest under
+/// `paths`. An instance id that is not a valid path name adds no mod list, like a missing one.
+pub fn build_instance_crash_report(
+    paths: &crate::app_paths::AppPaths,
+    context: &CrashReportContext,
+) -> String {
+    let manifest_path = context
+        .instance_id
+        .as_ref()
+        .and_then(|id| paths.instance_manifest(id).ok());
+    build_crash_report(manifest_path, context)
+}
+
 /// The instance's installed mods, or `None` when the manifest is missing or
 /// unreadable — an absent mod list is a weaker report, never a failed one.
 fn build_mod_list_section(manifest_path: &std::path::Path) -> Option<String> {
@@ -313,6 +326,22 @@ mod tests {
         let report = build_crash_report(Some("does/not/exist.json".into()), &ctx);
         assert!(report.contains("## Crash Log"));
         assert!(!report.contains("mod(s) installed"));
+    }
+
+    #[test]
+    fn an_instance_report_with_no_manifest_or_a_bad_id_still_carries_the_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::app_paths::AppPaths::from_root(tmp.path().to_path_buf());
+        for id in ["inst-1", "../outside"] {
+            let ctx = CrashReportContext {
+                instance_id: Some(id.into()),
+                crash_log: Some("boom".into()),
+                ..context()
+            };
+            let report = build_instance_crash_report(&paths, &ctx);
+            assert!(report.contains("## Crash Log"));
+            assert!(!report.contains("mod(s) installed"));
+        }
     }
 
     /// The log is shown inside one fenced block. A log line can itself be a fence, and then the

@@ -297,6 +297,115 @@ pub fn suspects_for_test(
         .collect()
 }
 
+/// The newest stored answer for an instance when it is an engine diagnosis. "Nothing to read" and
+/// "could not analyze" carry no suspects, so they read as no answer here.
+pub fn latest_analyzed_answer(
+    ctx: &Ctx,
+    instance_id: &str,
+) -> crate::error::LauncherResult<Option<CrashAnswer>> {
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).map_err(|error| {
+        crate::error::LauncherError::Generic {
+            code: "ERR_LOCAL_STATE_FAILED".into(),
+            message: error.to_string(),
+        }
+    })?;
+    let stored = latest_answer(&conn, instance_id).map_err(|error| {
+        crate::error::LauncherError::Generic {
+            code: "ERR_CRASH_ANSWER".into(),
+            message: error.to_string(),
+        }
+    })?;
+    Ok(stored.and_then(|stored| match stored.answer {
+        StoredAnswer::Analyzed { answer, .. } => Some(*answer),
+        _ => None,
+    }))
+}
+
+/// The next experiment once the player says the game still crashes without
+/// `ruled_out_owner_key`. The answer already ranks what remains; the ruled-out candidate is
+/// filtered out so the next experiment is about a different item. No answer means no suspects.
+pub fn next_suspects(
+    answer: Option<&CrashAnswer>,
+    view: Option<&crate::crash_engine::attribution::InstanceView>,
+    ruled_out_owner_key: &str,
+) -> crate::crash_service::InvestigationResult {
+    use crate::crash_service::{InvestigationResult, SuggestedAction};
+    let mut suspects = answer
+        .map(|answer| suspects_for_test(answer, view))
+        .unwrap_or_default();
+    suspects.retain(|suspect| suspect.mod_id != ruled_out_owner_key);
+    let suggested_action = suspects
+        .first()
+        .map_or(SuggestedAction::NoSuspects, |next| {
+            SuggestedAction::GuidedDisable {
+                next_suspect: next.clone(),
+            }
+        });
+    InvestigationResult {
+        suspects,
+        suggested_action,
+        ruled_out: vec![ruled_out_owner_key.to_string()],
+    }
+}
+
+/// [`next_suspects`] for an instance: reads its newest stored answer and, when there is one, the
+/// instance view that answer's candidates are matched against. `instances` is the game package's
+/// own instance system, as for [`crate::crash_engine::instance_view::resolve_crash_instance`].
+pub fn report_still_crashing(
+    ctx: &Ctx,
+    instance_id: &str,
+    ruled_out_owner_key: &str,
+    instances: Option<&dyn crate::crash_engine::instance_view::ExtraInstanceProvider>,
+) -> crate::error::LauncherResult<crate::crash_service::InvestigationResult> {
+    let Some(answer) = latest_analyzed_answer(ctx, instance_id)? else {
+        return Ok(next_suspects(None, None, ruled_out_owner_key));
+    };
+    let resolved =
+        crate::crash_engine::instance_view::resolve_crash_instance(ctx, instance_id, instances)?;
+    Ok(next_suspects(
+        Some(&answer),
+        Some(&resolved.view),
+        ruled_out_owner_key,
+    ))
+}
+
+/// The file name an engine candidate provides in `view`, so the experiment flow can disable it.
+/// The owner key must name an installed item (`item:<content key>`); a key the view cannot list is
+/// an error, never a silent no-op.
+pub fn suspect_file(
+    view: &crate::crash_engine::attribution::InstanceView,
+    owner_key: &str,
+) -> crate::error::LauncherResult<String> {
+    let content_key =
+        owner_key
+            .strip_prefix("item:")
+            .ok_or_else(|| crate::error::LauncherError::Generic {
+                code: "ERR_CRASH_SUSPECT_NOT_ITEM".into(),
+                message: "That suspect is not an installed item, so it cannot be turned off."
+                    .to_string(),
+            })?;
+    view.item_files(content_key)
+        .and_then(|files| files.into_iter().next())
+        .and_then(|path| path.rsplit(['/', '\\']).next().map(str::to_string))
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| crate::error::LauncherError::Generic {
+            code: "ERR_CRASH_SUSPECT_NO_FILE".into(),
+            message: "Agora could not find the file for that suspect in this instance.".to_string(),
+        })
+}
+
+/// [`suspect_file`] for an instance, resolving its view the way every crash reader does.
+pub fn resolve_suspect_file(
+    ctx: &Ctx,
+    instance_id: &str,
+    owner_key: &str,
+    instances: Option<&dyn crate::crash_engine::instance_view::ExtraInstanceProvider>,
+) -> crate::error::LauncherResult<String> {
+    let resolved =
+        crate::crash_engine::instance_view::resolve_crash_instance(ctx, instance_id, instances)?;
+    suspect_file(&resolved.view, owner_key)
+}
+
 /// The packs and host a live analysis runs with. The caller loads the packs (the plugin service
 /// and the game package's built-ins); core decides what to do with them.
 pub struct LivePacks<'a> {
@@ -1929,5 +2038,124 @@ impl SourceRoots for InstanceRoots {
                 "a live session cannot resolve this source root: {other:?}"
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod experiment_tests {
+    use super::*;
+    use crate::crash_engine::attribution::{InstanceView, LayerOwner, LayerView};
+    use crate::crash_service::SuggestedAction;
+    use agora_game_api::crash::{
+        Candidate, Cause, Level, LocalText, NextStep, NextStepKind, Owner, CRASH_CONTRACT_VERSION,
+    };
+
+    fn item(key: &str, score: u32) -> Candidate {
+        Candidate {
+            owner: Owner::Item {
+                key: key.to_string(),
+                name: key.to_string(),
+            },
+            level: Level::Possible,
+            score,
+            cause: Cause::Mod,
+            role: None,
+            families: Vec::new(),
+            sources: Vec::new(),
+            also_provided_by: Vec::new(),
+            save_risk: None,
+        }
+    }
+
+    fn answer(candidates: Vec<Candidate>) -> CrashAnswer {
+        CrashAnswer {
+            contract: CRASH_CONTRACT_VERSION,
+            verdict: SessionVerdict::Crashed {
+                how: MatchedBy::Supplied,
+            },
+            headline: LocalText::new(),
+            level: Level::Likely,
+            cause: Some(Cause::Mod),
+            candidates,
+            findings: Vec::new(),
+            inspections: Vec::new(),
+            could_not_check: Vec::new(),
+            trust_notes: Vec::new(),
+            next: NextStep {
+                kind: NextStepKind::ConfirmExperiment,
+                keys: Vec::new(),
+            },
+            repairs: Vec::new(),
+            actions: Vec::new(),
+            artifacts: Vec::new(),
+        }
+    }
+
+    fn layer(key: &str, file: &str) -> LayerView {
+        LayerView::new(
+            format!("mod:{key}"),
+            true,
+            LayerOwner::Item {
+                key: key.to_string(),
+                name: key.to_string(),
+            },
+            vec![file.to_string()],
+        )
+    }
+
+    fn view() -> InstanceView {
+        InstanceView::new(vec![
+            layer("one", "mods/one.jar"),
+            layer("two", "mods/two.jar"),
+        ])
+    }
+
+    #[test]
+    fn the_ruled_out_suspect_is_dropped_and_the_next_one_is_offered() {
+        let answer = answer(vec![item("one", 90), item("two", 40)]);
+        let result = next_suspects(Some(&answer), Some(&view()), "item:one");
+        assert_eq!(result.ruled_out, vec!["item:one".to_string()]);
+        assert_eq!(result.suspects.len(), 1);
+        assert_eq!(result.suspects[0].filename, "two.jar");
+        match result.suggested_action {
+            SuggestedAction::GuidedDisable { next_suspect } => {
+                assert_eq!(next_suspect.mod_id, "item:two")
+            }
+            SuggestedAction::NoSuspects => panic!("expected a next suspect"),
+        }
+    }
+
+    #[test]
+    fn no_answer_means_no_suspects() {
+        let result = next_suspects(None, None, "item:one");
+        assert!(result.suspects.is_empty());
+        assert!(matches!(
+            result.suggested_action,
+            SuggestedAction::NoSuspects
+        ));
+        assert_eq!(result.ruled_out, vec!["item:one".to_string()]);
+    }
+
+    #[test]
+    fn a_suspect_file_is_the_file_name_its_item_provides() {
+        assert_eq!(suspect_file(&view(), "item:two").unwrap(), "two.jar");
+    }
+
+    #[test]
+    fn a_suspect_that_is_not_an_item_or_not_listed_is_an_error() {
+        let not_item = suspect_file(&view(), "framework:forge").unwrap_err();
+        assert_eq!(not_item.code(), "ERR_CRASH_SUSPECT_NOT_ITEM");
+        let missing = suspect_file(&view(), "item:three").unwrap_err();
+        assert_eq!(missing.code(), "ERR_CRASH_SUSPECT_NO_FILE");
+    }
+
+    #[test]
+    fn no_stored_answer_means_no_suspects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::ctx::CoreContext::for_testing(tmp.path().to_path_buf());
+        crate::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+        assert!(latest_analyzed_answer(&ctx, "nothing").unwrap().is_none());
+        let result = report_still_crashing(&ctx, "nothing", "item:one", None).unwrap();
+        assert!(result.suspects.is_empty());
     }
 }
