@@ -17,6 +17,7 @@ import {
   listSnapshots,
   pickDirectory,
   pickOpenFile,
+  previewBackupImport,
   restoreSnapshot,
   type Snapshot,
   type SnapshotDiff,
@@ -130,7 +131,28 @@ export function InstanceRecoveryTab({ instanceId }: InstanceRecoveryTabProps) {
   async function importOne() {
     const artifact = await pickOpenFile('Choose a backup file', ['zip']);
     if (!artifact) return;
-    const imported = await run('import', () => importBackup(instanceId, artifact));
+    const preview = await run('preview', () => previewBackupImport(instanceId, artifact));
+    if (!preview) return;
+    let fetchMissing = false;
+    if (preview.missingItems.length > 0) {
+      fetchMissing = await confirm({
+        title: 'This backup needs content that is not here',
+        body:
+          `It names ${preview.missingItems.length} item(s), ${preview.missingObjects} object(s), ` +
+          `${formatBytes(preview.missingBytes)} in total:\n\n${preview.missingItems.join(', ')}\n\n` +
+          'Fetch them through the catalog? Only files whose hash matches the backup are accepted. ' +
+          'Nothing is applied if any of them cannot be fetched.',
+        confirmLabel: 'Fetch and import',
+        cancelLabel: 'Do not import',
+      });
+      if (!fetchMissing) {
+        setStatus('Nothing imported. The backup needs content that is not in the store.');
+        return;
+      }
+    }
+    const imported = await run('import', () =>
+      importBackup(instanceId, artifact, fetchMissing),
+    );
     if (!imported) return;
     await reload();
     const yes = await confirm({

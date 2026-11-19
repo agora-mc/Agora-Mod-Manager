@@ -3202,7 +3202,12 @@ uses the guarded snapshot restore. A backup always holds the state and each
 content item's file hashes and recorded source; the mod bytes are included only
 when the player asks (the size is shown first). Import verifies every hash
 before writing, and a backup without bytes either finds every object in the
-store or refuses the whole import naming the missing items.
+store or refuses the whole import naming the missing items; with the explicit
+fetch option it first refetches each object from the source the backup recorded,
+through the same hash-checked catalog path an install uses, and still refuses
+the whole import if any object cannot be completed. Importing a game backup into
+an empty data folder registers the instance (row and manifest) through the same
+core path a normal create uses, so it is listed, opened and deploy-plannable.
 
 ### 23.4 Health, Crash Doctor, Memory, Authentication, and Launch Reliability (formerly §19.19)
 

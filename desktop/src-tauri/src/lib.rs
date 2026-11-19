@@ -308,6 +308,7 @@ pub fn run() {
             commands::export_backup,
             commands::game_backup_bytes,
             commands::import_backup,
+            commands::preview_backup_import,
             commands::apply_backup_retention,
             commands::get_mod_groups,
             commands::set_mod_group,

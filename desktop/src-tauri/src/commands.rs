@@ -5001,14 +5001,33 @@ pub async fn import_backup(
     _state: tauri::State<'_, LauncherState>,
     instance_id: String,
     artifact_path: String,
+    fetch_missing: Option<bool>,
 ) -> LauncherResult<agora_core::snapshot::Snapshot> {
     let ctx = crate::core_context(&app)?;
-    agora_core::backup::import_instance_backup(
+    agora_core::backup::import_instance_backup_fetching(
+        &ctx,
+        &instance_id,
+        std::path::Path::new(&artifact_path),
+        fetch_missing.unwrap_or(false),
+    )
+    .await
+}
+
+/// What a backup import would need before it can be applied, so the page can
+/// ask before downloading anything.
+#[tauri::command]
+pub async fn preview_backup_import(
+    app: tauri::AppHandle,
+    _state: tauri::State<'_, LauncherState>,
+    instance_id: String,
+    artifact_path: String,
+) -> LauncherResult<agora_core::backup::BackupImportPreview> {
+    let ctx = crate::core_context(&app)?;
+    agora_core::backup::preview_backup_import(
         &ctx,
         &instance_id,
         std::path::Path::new(&artifact_path),
     )
-    .await
 }
 
 /// Apply a retention policy, returning the snapshot ids that were removed.

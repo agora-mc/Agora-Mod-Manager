@@ -4,15 +4,21 @@
 //! store and load-after rules. Mod bytes stay in the content store, and a
 //! snapshot that names an item keeps it from being removed.
 
+use std::collections::HashMap;
+use std::io::{Cursor, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use agora_core::backup;
-use agora_core::content_store;
+use agora_core::catalog_install::CatalogTransport;
+use agora_core::content_store::{self, ContentSource};
 use agora_core::ctx::CoreContext;
+use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::game_instance::{GameInstanceManifest, SavesChoice};
 use agora_core::game_registry::{GameRegistry, PackageSource};
 use agora_core::game_snapshot;
+use agora_core::github_release::{GitHubRelease, GitHubReleaseAsset};
 use agora_core::lkg::{self, LaunchOutcome};
+use agora_core::registry::{DownloadSource, GameCatalogItem};
 use agora_core::snapshot::{self, SnapshotOrigin};
 use agora_game_api::crash::SessionVerdict;
 use agora_game_api::{
@@ -20,6 +26,7 @@ use agora_game_api::{
     LayerSource, LayerStack, LoadOrderDefinition, LoadOrderFormat, LoadOrderItems, LoadOrderRules,
     PackageDefinition, RelPath, RuntimeIdentity, StoreId,
 };
+use async_trait::async_trait;
 use tempfile::TempDir;
 
 mod common;
@@ -715,6 +722,16 @@ fn a_backup_with_bytes_round_trips_into_an_empty_data_folder() {
     h.add_layer(&item);
     h.write_user_file("Plugins.txt", b"*A.esp\n");
     h.write_user_file("Skyrim.ini", b"[General]\nValue=1\n");
+    // A pinned base so the fresh machine can be deploy-planned after import.
+    let base_id = "base-imported-test";
+    let runtime = h.manifest().runtime_identity.unwrap();
+    let mut manifest = h.manifest();
+    manifest.base = BaseReference::Pinned {
+        id: base_id.to_string(),
+        runtime: runtime.clone(),
+        mode: agora_game_api::BaseMode::Linked,
+    };
+    h.write_manifest(&manifest);
     let snap =
         game_snapshot::create(&h.ctx, &h.id, &h.def, Some("base"), SnapshotOrigin::User).unwrap();
 
@@ -732,8 +749,48 @@ fn a_backup_with_bytes_round_trips_into_an_empty_data_folder() {
     let ctx = fresh_context(&h.def, empty.path());
     let id = "restored";
     let dir = ctx.paths.instance_dir(id).unwrap();
-    let imported = backup::import_backup(&dir, &artifact).unwrap();
+
+    // The base itself is machine-local, like any game install; record an empty
+    // one so the deploy plan has somewhere to read it from.
+    let base_dir = ctx.paths.bases_dir().join(base_id);
+    std::fs::create_dir_all(&base_dir).unwrap();
+    let base_manifest = agora_core::game_base::BaseManifest {
+        manifest_version: 1,
+        base_id: base_id.to_string(),
+        runtime,
+        mode: agora_game_api::BaseMode::Linked,
+        source_install: InstallId::new("steam:489830").unwrap(),
+        source_product: None,
+        source_location: base_dir.clone(),
+        location: base_dir,
+        created_unix_ms: 0,
+        files: Vec::new(),
+        skipped: Vec::new(),
+        incomplete_frameworks: Vec::new(),
+    };
+    let base_path = ctx.paths.base_manifest_path(base_id);
+    std::fs::create_dir_all(base_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &base_path,
+        serde_json::to_vec_pretty(&base_manifest).unwrap(),
+    )
+    .unwrap();
+
+    let imported = backup::import_instance_backup_blocking(&ctx, id, &artifact).unwrap();
     assert_eq!(imported.id, snap.id);
+
+    // Import made a usable instance: it is listed, opens, and can be planned.
+    let listed = agora_core::game_instance::list(&ctx).unwrap();
+    assert!(listed.iter().any(|record| record.instance_id == id));
+    let opened = agora_core::game_instance::get_manifest(&ctx, id).unwrap();
+    assert_eq!(opened.instance_id, id);
+    let plan =
+        agora_core::game_deploy::plan(&ctx, id, &h.def, agora_core::game_deploy::DeployMode::Links)
+            .expect("an imported instance must be deploy-plannable");
+    assert!(plan
+        .files
+        .iter()
+        .any(|file| file.path.as_str() == "Data/Test.esp"));
 
     // Every content object the state names was written from the backup.
     let parsed: content_store::ContentItem =
@@ -809,4 +866,264 @@ fn a_tampered_game_backup_is_refused() {
         "a tampered backup is refused: {error}"
     );
     assert!(!snapshot_manifest_path(&dir, &snap.id).exists());
+}
+
+// -- fetching missing content ---------------------------------------------------------------
+
+struct FakeCatalogTransport {
+    files: HashMap<String, Vec<u8>>,
+    fetches: Mutex<usize>,
+}
+
+impl FakeCatalogTransport {
+    fn with_archive(bytes: Vec<u8>) -> Self {
+        let mut files = HashMap::new();
+        files.insert("https://example.invalid/fake-v1.zip".to_string(), bytes);
+        Self {
+            files,
+            fetches: Mutex::new(0),
+        }
+    }
+
+    fn fetches(&self) -> usize {
+        *self.fetches.lock().unwrap()
+    }
+}
+
+#[async_trait]
+impl CatalogTransport for FakeCatalogTransport {
+    async fn releases_page(
+        &self,
+        _repo: &str,
+        page: u32,
+    ) -> LauncherResult<(Vec<GitHubRelease>, u32)> {
+        if page > 1 {
+            return Ok((Vec::new(), 1));
+        }
+        Ok((
+            vec![GitHubRelease {
+                tag_name: "v1".into(),
+                published_at: Some("2026-11-01T00:00:00Z".into()),
+                draft: false,
+                prerelease: false,
+                assets: vec![GitHubReleaseAsset {
+                    name: "fake.zip".into(),
+                    browser_download_url: "https://example.invalid/fake-v1.zip".into(),
+                    size: None,
+                    digest: None,
+                }],
+            }],
+            1,
+        ))
+    }
+
+    async fn fetch(&self, url: &str, _pinned_host: Option<&str>) -> LauncherResult<Vec<u8>> {
+        *self.fetches.lock().unwrap() += 1;
+        self.files
+            .get(url)
+            .cloned()
+            .ok_or_else(|| LauncherError::Generic {
+                code: "TEST_NO_FILE".into(),
+                message: format!("no fake file for {url}"),
+            })
+    }
+}
+
+fn zip_archive_bytes() -> Vec<u8> {
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("Data/Test.esp", options).unwrap();
+        writer.write_all(b"plugin bytes").unwrap();
+        writer.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
+fn fake_catalog_item(archive_sha256: &str) -> GameCatalogItem {
+    GameCatalogItem {
+        id: "fake-mod".into(),
+        game: "skyrim-se".into(),
+        name: "Fake mod".into(),
+        author: None,
+        content_type: "mod".into(),
+        download_strategy: "github_release".into(),
+        source_identifier: "example-author/fake-mod".into(),
+        sha256: Some(archive_sha256.to_string()),
+        download_sources: vec![DownloadSource {
+            strategy: "github_release".into(),
+            identifier: "example-author/fake-mod".into(),
+            pins: Vec::new(),
+        }],
+        game_compatibility: Vec::new(),
+        provides_framework: None,
+        description: None,
+        license_id: None,
+        page_url: None,
+        icon_url: None,
+        status: "active".into(),
+        date_added: None,
+    }
+}
+
+fn catalog_backup(h: &Harness) -> (TempDir, String, String) {
+    let bytes = zip_archive_bytes();
+    let archive_sha = agora_core::download::sha256_hex(&bytes);
+    let archive_path = h.dir().join("fake-mod.zip");
+    std::fs::write(&archive_path, &bytes).unwrap();
+    let item = content_store::add_archive_with_source(
+        &h.ctx,
+        &archive_path,
+        Some("Fake mod"),
+        |sha256, _path| ContentSource::Catalog {
+            item_id: "fake-mod".into(),
+            game: "skyrim-se".into(),
+            release: Some("v1".into()),
+            asset: "fake.zip".into(),
+            sha256: sha256.to_string(),
+            verified: true,
+            added_at_unix_ms: 0,
+        },
+    )
+    .unwrap()
+    .item()
+    .item_id
+    .clone();
+    h.add_layer(&item);
+    let snap =
+        game_snapshot::create(&h.ctx, &h.id, &h.def, Some("base"), SnapshotOrigin::User).unwrap();
+    let export = TempDir::new().unwrap();
+    backup::export_game_snapshot(
+        &h.dir(),
+        &snap.id,
+        export.path(),
+        &h.ctx.paths.content_root(),
+        false,
+    )
+    .unwrap();
+    (export, archive_sha, item)
+}
+
+#[tokio::test]
+async fn a_backup_without_bytes_fetches_the_recorded_source_and_applies() {
+    let h = Harness::new();
+    let (export, archive_sha, content_item) = catalog_backup(&h);
+    let artifact = export.path().join(format!(
+        "agora-backup-{}-{}.zip",
+        h.id,
+        snapshot::list_snapshots(&h.dir()).unwrap()[0].id
+    ));
+    let empty = TempDir::new().unwrap();
+    let ctx = fresh_context(&h.def, empty.path());
+    let id = "fetched";
+    let item = fake_catalog_item(&archive_sha);
+    let transport = FakeCatalogTransport::with_archive(zip_archive_bytes());
+
+    let preview = backup::preview_backup_import(&ctx, id, &artifact).unwrap();
+    assert_eq!(preview.missing_items, vec!["Fake mod".to_string()]);
+    assert_eq!(preview.missing_objects, 1);
+    assert!(preview.missing_bytes > 0);
+
+    backup::import_instance_backup_with(&ctx, id, &artifact, true, &transport, |item_id| {
+        if item_id == "fake-mod" {
+            Ok(Some(item.clone()))
+        } else {
+            Ok(None)
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(transport.fetches(), 1);
+    assert!(agora_core::game_instance::get(&ctx, id).unwrap().is_some());
+    let parsed: content_store::ContentItem = serde_json::from_str(
+        &std::fs::read_to_string(ctx.paths.content_item_path(&content_item)).unwrap(),
+    )
+    .unwrap();
+    for file in &parsed.files {
+        assert!(ctx.paths.content_object_path(&file.sha256).is_file());
+    }
+    assert_eq!(
+        snapshot::list_snapshots(&ctx.paths.instance_dir(id).unwrap())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_backup_fetch_that_mismatches_applies_nothing_and_names_the_item() {
+    let h = Harness::new();
+    let (export, archive_sha, _content_item) = catalog_backup(&h);
+    let artifact = export.path().join(format!(
+        "agora-backup-{}-{}.zip",
+        h.id,
+        snapshot::list_snapshots(&h.dir()).unwrap()[0].id
+    ));
+    let empty = TempDir::new().unwrap();
+    let ctx = fresh_context(&h.def, empty.path());
+    let id = "mismatched";
+    let item = fake_catalog_item(&archive_sha);
+    let mut wrong = zip_archive_bytes();
+    wrong[0] ^= 0xFF;
+    let transport = FakeCatalogTransport::with_archive(wrong);
+
+    let error =
+        backup::import_instance_backup_with(&ctx, id, &artifact, true, &transport, |item_id| {
+            if item_id == "fake-mod" {
+                Ok(Some(item.clone()))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+        .unwrap_err();
+
+    assert!(format!("{error}").contains("Fake mod"), "{error}");
+    assert!(format!("{error}").contains("does not match"), "{error}");
+    assert!(agora_core::game_instance::get(&ctx, id).unwrap().is_none());
+    let dir = ctx.paths.instance_dir(id).unwrap();
+    assert!(!dir.join(".agora_snapshots").exists());
+}
+
+#[tokio::test]
+async fn a_backup_fetch_is_refused_when_the_network_is_off() {
+    let h = Harness::new();
+    let (export, archive_sha, _content_item) = catalog_backup(&h);
+    let artifact = export.path().join(format!(
+        "agora-backup-{}-{}.zip",
+        h.id,
+        snapshot::list_snapshots(&h.dir()).unwrap()[0].id
+    ));
+    let empty = TempDir::new().unwrap();
+    let ctx = fresh_context(&h.def, empty.path());
+    let id = "network-off";
+    let item = fake_catalog_item(&archive_sha);
+    let transport = FakeCatalogTransport::with_archive(zip_archive_bytes());
+
+    agora_core::network_gate::install(Arc::new(agora_core::network_gate::DenyAll));
+    let result =
+        backup::import_instance_backup_with(&ctx, id, &artifact, true, &transport, |item_id| {
+            if item_id == "fake-mod" {
+                Ok(Some(item.clone()))
+            } else {
+                Ok(None)
+            }
+        })
+        .await;
+    agora_core::network_gate::install(Arc::new(agora_core::network_gate::AllowAll));
+
+    let error = result.unwrap_err();
+    assert!(
+        format!("{error}").to_lowercase().contains("network"),
+        "{error}"
+    );
+    assert_eq!(
+        transport.fetches(),
+        0,
+        "no request is made when the gate refuses"
+    );
+    assert!(agora_core::game_instance::get(&ctx, id).unwrap().is_none());
 }

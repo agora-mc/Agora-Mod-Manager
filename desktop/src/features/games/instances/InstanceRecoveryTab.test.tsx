@@ -2,10 +2,18 @@
  * A game instance shows its last-known-good setup, the changes since it, and
  * restores through the same guarded snapshot command as Minecraft.
  */
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { ConfirmProvider } from '@/components/ui/confirm';
 import { InstanceRecoveryTab } from './InstanceRecoveryTab';
-import { detectDrift, listSnapshots, restoreSnapshot } from '@/lib/tauri';
+import {
+  detectDrift,
+  importBackup,
+  listSnapshots,
+  pickOpenFile,
+  previewBackupImport,
+  restoreSnapshot,
+} from '@/lib/tauri';
 
 const lkg = {
   id: 'snap-good',
@@ -29,6 +37,7 @@ vi.mock('@/lib/tauri', async (importOriginal) => {
     detectDrift: vi.fn(),
     exportBackup: vi.fn(),
     importBackup: vi.fn(),
+    previewBackupImport: vi.fn(),
     gameBackupBytes: vi.fn(async () => 2048),
     pickDirectory: vi.fn(async () => '/tmp/backups'),
     pickOpenFile: vi.fn(async () => null),
@@ -75,6 +84,30 @@ describe('InstanceRecoveryTab', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Restore to it' }));
 
     await waitFor(() => expect(restoreSnapshot).toHaveBeenCalledWith('inst', 'snap-good', false));
+  });
+
+  it('asks before fetching missing content and imports with the fetch flag', async () => {
+    vi.mocked(pickOpenFile).mockResolvedValueOnce('/tmp/backup.zip');
+    vi.mocked(previewBackupImport).mockResolvedValueOnce({
+      snapshotId: 'backup-snap',
+      missingItems: ['Fake mod'],
+      missingObjects: 1,
+      missingBytes: 4096,
+      totalItems: 1,
+    });
+    vi.mocked(importBackup).mockResolvedValueOnce({} as never);
+
+    const { container } = render(
+      <ConfirmProvider>
+        <InstanceRecoveryTab instanceId="inst" />
+      </ConfirmProvider>,
+    );
+    fireEvent.click(await within(container).findByRole('button', { name: /Import backup/ }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Fetch and import' }));
+
+    await waitFor(() =>
+      expect(importBackup).toHaveBeenCalledWith('inst', '/tmp/backup.zip', true),
+    );
   });
 
   it('shows the size before an export that would include the mod files', async () => {

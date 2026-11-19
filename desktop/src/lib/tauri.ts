@@ -2705,8 +2705,23 @@ export const gameBackupBytes = (instanceId: string, snapshotId: string) =>
 
 /** Read a backup artifact back into an instance. Fully validated before it
  *  touches the instance directory — the file is untrusted input. */
-export const importBackup = (instanceId: string, artifactPath: string) =>
-  invoke<Snapshot>('import_backup', { instanceId, artifactPath });
+export const importBackup = (
+  instanceId: string,
+  artifactPath: string,
+  fetchMissing = false,
+) => invoke<Snapshot>('import_backup', { instanceId, artifactPath, fetchMissing });
+
+export interface BackupImportPreview {
+  snapshotId: string;
+  missingItems: string[];
+  missingObjects: number;
+  missingBytes: number;
+  totalItems: number;
+}
+
+/** The content a backup needs before it can be applied, read without downloading. */
+export const previewBackupImport = (instanceId: string, artifactPath: string) =>
+  invoke<BackupImportPreview>('preview_backup_import', { instanceId, artifactPath });
 
 /** Apply a retention policy; resolves to the snapshot ids that were removed. */
 export const applyBackupRetention = (

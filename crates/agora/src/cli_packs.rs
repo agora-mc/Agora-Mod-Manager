@@ -628,6 +628,11 @@ pub enum BackupCmd {
             help = "Instance to add the snapshot to (default: the backup's own)"
         )]
         instance: Option<String>,
+        #[arg(
+            long,
+            help = "Fetch content objects the backup does not carry, through the hash-checked catalog download path. Off by default because it can download a lot"
+        )]
+        fetch_missing: bool,
     },
     /// Delete old snapshots beyond a retention limit.
     Prune {
@@ -726,13 +731,34 @@ pub async fn run_backup(
                 }
             }
         }
-        BackupCmd::Import { file, instance } => {
+        BackupCmd::Import {
+            file,
+            instance,
+            fetch_missing,
+        } => {
             let instance = match instance {
                 Some(id) => id,
                 None => agora_core::backup::backup_artifact_instance_id(&file)?,
             };
-            let snapshot =
-                agora_core::backup::import_instance_backup(ctx, &instance, &file).await?;
+            if fetch_missing {
+                let preview = agora_core::backup::preview_backup_import(ctx, &instance, &file)?;
+                if !preview.missing_items.is_empty() {
+                    eprintln!(
+                        "Fetching {} missing content item(s), {} object(s), {} bytes before importing: {}",
+                        preview.missing_items.len(),
+                        preview.missing_objects,
+                        preview.missing_bytes,
+                        preview.missing_items.join(", ")
+                    );
+                }
+            }
+            let snapshot = agora_core::backup::import_instance_backup_fetching(
+                ctx,
+                &instance,
+                &file,
+                fetch_missing,
+            )
+            .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&snapshot)?);
             } else {

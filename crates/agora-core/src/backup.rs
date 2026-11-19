@@ -1763,6 +1763,438 @@ pub fn game_backup_content_bytes(
     Ok(content_objects(&items).values().sum())
 }
 
+/// What a backup import would need to fetch before it can be applied.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupImportPreview {
+    pub snapshot_id: String,
+    /// Content items whose objects the store lacks, by display name.
+    pub missing_items: Vec<String>,
+    pub missing_objects: usize,
+    pub missing_bytes: u64,
+    pub total_items: usize,
+}
+
+#[derive(Debug, Clone)]
+struct MissingItem {
+    item: crate::content_store::ContentItem,
+    missing_files: Vec<crate::content_store::ContentFile>,
+}
+
+fn content_object_present(instance_dir: &Path, file: &crate::content_store::ContentFile) -> bool {
+    let path = content_object_path_for(instance_dir, &file.sha256);
+    path.is_file() && crate::snapshot::blob_file_matches(&path, &file.sha256, file.size)
+}
+
+fn missing_items(instance_dir: &Path, manifest: &BackupManifest) -> Vec<MissingItem> {
+    let mut missing = Vec::new();
+    for item in &manifest.content_items {
+        let missing_files: Vec<_> = item
+            .files
+            .iter()
+            .filter(|file| !content_object_present(instance_dir, file))
+            .cloned()
+            .collect();
+        if !missing_files.is_empty() {
+            missing.push(MissingItem {
+                item: item.clone(),
+                missing_files,
+            });
+        }
+    }
+    missing
+}
+
+fn preview_from_missing(
+    snapshot_id: &str,
+    total_items: usize,
+    missing: &[MissingItem],
+) -> BackupImportPreview {
+    let mut names = Vec::with_capacity(missing.len());
+    let mut objects = 0usize;
+    let mut bytes = 0u64;
+    for entry in missing {
+        names.push(if entry.item.name.trim().is_empty() {
+            entry.item.item_id.clone()
+        } else {
+            entry.item.name.clone()
+        });
+        objects += entry.missing_files.len();
+        bytes = bytes.saturating_add(
+            entry
+                .missing_files
+                .iter()
+                .map(|file| file.size)
+                .sum::<u64>(),
+        );
+    }
+    names.sort();
+    names.dedup();
+    BackupImportPreview {
+        snapshot_id: snapshot_id.to_string(),
+        missing_items: names,
+        missing_objects: objects,
+        missing_bytes: bytes,
+        total_items,
+    }
+}
+
+/// Read and validate a backup's manifest without touching the instance.
+pub fn read_backup_manifest(artifact_path: &Path) -> Result<BackupManifest, String> {
+    validate_artifact_path(artifact_path)?;
+    let file = fs::File::open(artifact_path)
+        .map_err(|error| format!("failed to open backup artifact: {error}"))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|error| format!("failed to read backup zip: {error}"))?;
+    read_and_validate_manifest(&mut archive)
+}
+
+/// What a backup import would need, before anything is downloaded or written.
+pub fn preview_backup_import(
+    ctx: &crate::ctx::Ctx,
+    instance_id: &str,
+    artifact_path: &Path,
+) -> crate::error::LauncherResult<BackupImportPreview> {
+    let sanitized = crate::paths::sanitize_id(instance_id);
+    let instance_dir = ctx.paths.instance_dir(&sanitized)?;
+    let manifest = read_backup_manifest(artifact_path).map_err(backup_error)?;
+    if manifest.kind != BackupKind::GameInstance {
+        return Ok(BackupImportPreview {
+            snapshot_id: manifest.snapshot.id,
+            missing_items: Vec::new(),
+            missing_objects: 0,
+            missing_bytes: 0,
+            total_items: 0,
+        });
+    }
+    let missing = missing_items(&instance_dir, &manifest);
+    Ok(preview_from_missing(
+        &manifest.snapshot.id,
+        manifest.content_items.len(),
+        &missing,
+    ))
+}
+
+fn temp_archive_path(
+    ctx: &crate::ctx::Ctx,
+    item: &crate::content_store::ContentItem,
+    source: &crate::content_store::ContentSource,
+) -> PathBuf {
+    let extension = match source {
+        crate::content_store::ContentSource::Catalog { asset, .. } => Path::new(asset)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("zip"),
+        crate::content_store::ContentSource::Archive { path, .. } => Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("zip"),
+        _ => "zip",
+    };
+    // Not the content store's staging folder: an import cleans that folder
+    // before reading the archive.
+    let dir = ctx.paths.root().join("backup-fetch");
+    let _ = fs::create_dir_all(&dir);
+    dir.join(format!(
+        "backup-fetch-{}-{}.{extension}",
+        sanitize_name_for_file(&item.item_id),
+        uuid::Uuid::new_v4().simple()
+    ))
+}
+
+fn sanitize_name_for_file(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+fn stored_item_matches(
+    ctx: &crate::ctx::Ctx,
+    instance_dir: &Path,
+    recorded: &crate::content_store::ContentItem,
+) -> Result<(), String> {
+    let path = content_item_path_for(instance_dir, &recorded.item_id);
+    if path.is_file() {
+        let text = fs::read_to_string(&path).map_err(|error| {
+            format!("content item {} cannot be read: {error}", recorded.item_id)
+        })?;
+        let existing: crate::content_store::ContentItem = serde_json::from_str(&text)
+            .map_err(|error| format!("content item {} is not valid: {error}", recorded.item_id))?;
+        if existing.files != recorded.files {
+            return Err(format!(
+                "content item {} already exists with different contents",
+                recorded.item_id
+            ));
+        }
+    }
+    let missing: Vec<String> = recorded
+        .files
+        .iter()
+        .filter(|file| !content_object_present(instance_dir, file))
+        .map(|file| file.path.as_str().to_string())
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!("still missing {}", missing.join(", ")));
+    }
+    let _ = ctx;
+    Ok(())
+}
+
+fn import_archive_for_item(
+    ctx: &crate::ctx::Ctx,
+    instance_dir: &Path,
+    item: &crate::content_store::ContentItem,
+    source: &crate::content_store::ContentSource,
+    archive_path: &Path,
+) -> Result<(), String> {
+    let outcome = crate::content_store::add_archive_with_source(
+        ctx,
+        archive_path,
+        Some(item.name.as_str()),
+        |_sha256, _path| source.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    if outcome.item().item_id != item.item_id {
+        return Err(format!(
+            "the fetched archive produced content item {} instead of {}",
+            outcome.item().item_id,
+            item.item_id
+        ));
+    }
+    stored_item_matches(ctx, instance_dir, item)
+}
+
+fn import_file_for_item(
+    ctx: &crate::ctx::Ctx,
+    instance_dir: &Path,
+    item: &crate::content_store::ContentItem,
+    file_path: &Path,
+) -> Result<(), String> {
+    let rel = item.files.first().map(|file| file.path.as_str());
+    let outcome = crate::content_store::add_file(ctx, file_path, Some(item.name.as_str()), rel)
+        .map_err(|error| error.to_string())?;
+    if outcome.item().item_id != item.item_id {
+        return Err(format!(
+            "the recorded file produced content item {} instead of {}",
+            outcome.item().item_id,
+            item.item_id
+        ));
+    }
+    stored_item_matches(ctx, instance_dir, item)
+}
+
+fn import_folder_for_item(
+    ctx: &crate::ctx::Ctx,
+    instance_dir: &Path,
+    item: &crate::content_store::ContentItem,
+    folder_path: &Path,
+    source: &crate::content_store::ContentSource,
+) -> Result<(), String> {
+    let outcome = crate::content_store::add_folder_as(
+        ctx,
+        folder_path,
+        Some(item.name.as_str()),
+        source.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    if outcome.item().item_id != item.item_id {
+        return Err(format!(
+            "the recorded folder produced content item {} instead of {}",
+            outcome.item().item_id,
+            item.item_id
+        ));
+    }
+    stored_item_matches(ctx, instance_dir, item)
+}
+
+async fn refetch_item<F>(
+    ctx: &crate::ctx::Ctx,
+    instance_dir: &Path,
+    missing: &MissingItem,
+    transport: &dyn crate::catalog_install::CatalogTransport,
+    lookup: &F,
+) -> Result<(), String>
+where
+    F: Fn(&str) -> crate::error::LauncherResult<Option<crate::registry::GameCatalogItem>>,
+{
+    let item = &missing.item;
+    let mut reasons = Vec::new();
+    // Newest source first: it is the one most likely to still resolve.
+    for source in item.sources.iter().rev() {
+        let attempt: Result<(), String> = match source {
+            crate::content_store::ContentSource::Archive { path, .. } => {
+                let path = Path::new(path);
+                if !path.is_file() {
+                    Err(format!("the recorded archive {path:?} is not here"))
+                } else {
+                    import_archive_for_item(ctx, instance_dir, item, source, path)
+                }
+            }
+            crate::content_store::ContentSource::File { path, .. } => {
+                let path = Path::new(path);
+                if !path.is_file() {
+                    Err(format!("the recorded file {path:?} is not here"))
+                } else {
+                    import_file_for_item(ctx, instance_dir, item, path)
+                }
+            }
+            crate::content_store::ContentSource::Folder { path, .. } => {
+                let path = Path::new(path);
+                if !path.is_dir() {
+                    Err(format!("the recorded folder {path:?} is not here"))
+                } else {
+                    import_folder_for_item(ctx, instance_dir, item, path, source)
+                }
+            }
+            crate::content_store::ContentSource::Catalog { item_id, .. } => {
+                match lookup(item_id).map_err(|error| error.to_string())? {
+                    None => Err(format!(
+                        "catalog entry {item_id} is not available in this registry"
+                    )),
+                    Some(catalog_item) => {
+                        match crate::catalog_install::fetch_recorded_archive(
+                            transport,
+                            &catalog_item,
+                            source,
+                        )
+                        .await
+                        {
+                            Ok(bytes) => {
+                                let path = temp_archive_path(ctx, item, source);
+                                let result = fs::write(&path, &bytes)
+                                    .map_err(|error| format!("cannot stage the download: {error}"))
+                                    .and_then(|_| {
+                                        import_archive_for_item(ctx, instance_dir, item, source, &path)
+                                    });
+                                let _ = fs::remove_file(&path);
+                                result
+                            }
+                            Err(error) => Err(error.to_string()),
+                        }
+                    }
+                }
+            }
+            crate::content_store::ContentSource::Thunderstore { .. }
+            | crate::content_store::ContentSource::FomodInstall { .. }
+            | crate::content_store::ContentSource::Mo2Import { .. }
+            | crate::content_store::ContentSource::VortexImport { .. } => Err(
+                "this kind of source has no automatic download; it needs the original folder or archive"
+                    .to_string(),
+            ),
+        };
+        match attempt {
+            Ok(()) if content_object_present_all(instance_dir, item) => return Ok(()),
+            Ok(()) => reasons.push("the source did not restore every object".to_string()),
+            Err(reason) => reasons.push(reason),
+        }
+    }
+    Err(reasons.join("; "))
+}
+
+fn content_object_present_all(
+    instance_dir: &Path,
+    item: &crate::content_store::ContentItem,
+) -> bool {
+    item.files
+        .iter()
+        .all(|file| content_object_present(instance_dir, file))
+}
+
+/// Try to fetch every missing object from the sources the backup recorded.
+/// Fetched objects stay in the content store even if another item fails, so a
+/// later retry does not fetch them again. Returns every item that could not be
+/// completed, with the reasons.
+pub async fn fetch_missing_backup_content<F>(
+    ctx: &crate::ctx::Ctx,
+    instance_dir: &Path,
+    manifest: &BackupManifest,
+    transport: &dyn crate::catalog_install::CatalogTransport,
+    lookup: F,
+) -> Result<(), String>
+where
+    F: Fn(&str) -> crate::error::LauncherResult<Option<crate::registry::GameCatalogItem>>,
+{
+    let missing = missing_items(instance_dir, manifest);
+    let mut failures = Vec::new();
+    for entry in &missing {
+        if let Err(reason) = refetch_item(ctx, instance_dir, entry, transport, &lookup).await {
+            let name = if entry.item.name.trim().is_empty() {
+                entry.item.item_id.clone()
+            } else {
+                entry.item.name.clone()
+            };
+            failures.push(format!("{name}: {reason}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the backup still needs content that could not be fetched: {}; nothing was imported",
+            failures.join("; ")
+        ))
+    }
+}
+
+/// Import a backup, optionally fetching missing content first. With fetching
+/// off (the default) a backup that needs objects the store lacks refuses and
+/// names them. With it on, every missing object is fetched through the normal
+/// hash-checked path; any failure stops the import before anything is applied.
+#[allow(clippy::too_many_arguments)]
+pub async fn import_instance_backup_with<F>(
+    ctx: &crate::ctx::Ctx,
+    instance_id: &str,
+    artifact_path: &Path,
+    fetch_missing: bool,
+    transport: &dyn crate::catalog_install::CatalogTransport,
+    lookup: F,
+) -> crate::error::LauncherResult<crate::snapshot::Snapshot>
+where
+    F: Fn(&str) -> crate::error::LauncherResult<Option<crate::registry::GameCatalogItem>>,
+{
+    if fetch_missing {
+        let sanitized = crate::paths::sanitize_id(instance_id);
+        let instance_dir = ctx.paths.instance_dir(&sanitized)?;
+        let manifest = read_backup_manifest(artifact_path).map_err(backup_error)?;
+        if manifest.kind == BackupKind::GameInstance
+            && !missing_items(&instance_dir, &manifest).is_empty()
+        {
+            fetch_missing_backup_content(&ctx.clone(), &instance_dir, &manifest, transport, lookup)
+                .await
+                .map_err(backup_error)?;
+        }
+    }
+    import_instance_backup(ctx, instance_id, artifact_path).await
+}
+
+/// Import a backup, fetching missing content through the signed catalog when
+/// the caller allowed it.
+pub async fn import_instance_backup_fetching(
+    ctx: &crate::ctx::Ctx,
+    instance_id: &str,
+    artifact_path: &Path,
+    fetch_missing: bool,
+) -> crate::error::LauncherResult<crate::snapshot::Snapshot> {
+    let transport = crate::catalog_install::HttpTransport {
+        clients: &ctx.http_clients,
+        auth: crate::github_release::GitHubAuth::default(),
+    };
+    import_instance_backup_with(
+        ctx,
+        instance_id,
+        artifact_path,
+        fetch_missing,
+        &transport,
+        |item_id| {
+            crate::registry::RegistryService::new(ctx.clone()).get_game_item_for_install(item_id)
+        },
+    )
+    .await
+}
+
 /// Bring a validated game-instance backup's snapshot and content records into
 /// an instance. Nothing live is changed; a missing content object refuses the
 /// whole import and names what is missing.
@@ -1786,7 +2218,13 @@ fn import_game_backup(
             let existing = fs::read_to_string(&dest).ok().and_then(|text| {
                 serde_json::from_str::<crate::content_store::ContentItem>(&text).ok()
             });
-            if existing.as_ref() != Some(item) {
+            // Sources may differ: a fetch re-records the same objects under
+            // the backup's source. The files are what the snapshot restores,
+            // so those must match exactly.
+            if existing
+                .as_ref()
+                .is_some_and(|existing| existing.files != item.files)
+            {
                 return Err(format!(
                     "content item {} already exists with different contents; nothing was imported",
                     item.item_id
@@ -2145,26 +2583,57 @@ pub async fn import_instance_backup(
     instance_id: &str,
     artifact_path: &Path,
 ) -> crate::error::LauncherResult<crate::snapshot::Snapshot> {
-    let sanitized = crate::paths::sanitize_id(instance_id);
-    let instance_dir = ctx.paths.instance_dir(&sanitized)?;
-    let lock_manager = ctx.lock_manager.clone();
+    let ctx = ctx.clone();
+    let scheduler = ctx.task_scheduler.clone();
+    let instance_id = instance_id.to_string();
     let artifact_path = artifact_path.to_path_buf();
-    ctx.task_scheduler
+    scheduler
         .run_blocking(
             crate::task_scheduler::BlockingPriority::UserInitiated,
-            move || {
-                let _lock = lock_manager
-                    .acquire(
-                        crate::lock_manager::LockResource::Instance(sanitized.clone()),
-                        "import-backup",
-                    )
-                    .map_err(|e| e.to_string())?;
-                import_backup(&instance_dir, &artifact_path)
-            },
+            move || import_instance_backup_blocking(&ctx, &instance_id, &artifact_path),
         )
         .await
         .map_err(|e| backup_error(format!("Backup import task failed: {e}")))?
-        .map_err(backup_error)
+}
+
+/// The synchronous import used by every front end. Acquires the instance lock,
+/// imports the snapshot, and, for a game instance that did not exist yet,
+/// registers it through the same core path a normal create uses. The snapshot
+/// stays restorable; the live instance gets only the manifest and row it needs
+/// to be listed, opened and planned against.
+pub fn import_instance_backup_blocking(
+    ctx: &crate::ctx::Ctx,
+    instance_id: &str,
+    artifact_path: &Path,
+) -> crate::error::LauncherResult<crate::snapshot::Snapshot> {
+    let sanitized = crate::paths::sanitize_id(instance_id);
+    let instance_dir = ctx.paths.instance_dir(&sanitized)?;
+    let _lock = ctx.lock_manager.acquire(
+        crate::lock_manager::LockResource::Instance(sanitized.clone()),
+        "import-backup",
+    )?;
+    let snapshot = import_backup(&instance_dir, artifact_path).map_err(backup_error)?;
+    let is_game = crate::snapshot::snapshot_aux(&instance_dir, &snapshot.id)
+        .map(|aux| aux.state.is_some())
+        .unwrap_or(false);
+    if is_game {
+        let registered = crate::game_instance::get(ctx, &sanitized).map_err(|error| {
+            backup_error(format!(
+                "the backup was imported, but Agora cannot tell whether '{sanitized}' is already registered: {error}"
+            ))
+        })?;
+        if registered.is_none() {
+            crate::game_instance::adopt_imported_snapshot(ctx, &sanitized, &snapshot.id).map_err(
+                |error| {
+                    backup_error(format!(
+                        "the backup was imported as snapshot {}, but the instance could not be registered: {error}",
+                        snapshot.id
+                    ))
+                },
+            )?;
+        }
+    }
+    Ok(snapshot)
 }
 
 /// Apply a retention policy to `instance_id`, returning the snapshot ids removed.
