@@ -110,6 +110,7 @@ dependencies = [
  "hex",
  "junction",
  "keyring",
+ "libc",
  "md-5",
  "nix 0.31.3",
  "pbkdf2 0.12.2",

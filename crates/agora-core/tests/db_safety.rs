@@ -77,6 +77,16 @@ fn error_code(error: &anyhow::Error) -> Option<String> {
         .map(|error| error.code())
 }
 
+/// Mirrors the marker `db.rs` writes before moving a corrupt database aside.
+fn recovery_marker(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        "{}.recovery",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("local_state.db")
+    ))
+}
+
 #[test]
 fn the_v4_and_v6_columns_are_really_added() {
     let dir = tempfile::tempdir().unwrap();
@@ -226,6 +236,105 @@ fn corrupt_with_no_backup_gives_a_fresh_start() {
     assert!(restored_from.is_none());
     assert_eq!(std::fs::read(&kept_at).unwrap(), garbage);
     assert_eq!(schema_version(&path), LOCAL_STATE_SCHEMA_VERSION);
+}
+
+#[test]
+fn a_failed_recovery_is_retried_on_the_next_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = database_at(dir.path(), "local_state.db", 27);
+    set_setting(&path, "safety_probe", "\"kept\"");
+
+    let backup_dir = dir.path().join("backups");
+    std::fs::create_dir_all(&backup_dir).unwrap();
+    let backup_path = backup_dir.join("local_state-20000101-000000-000-0000-v27.db");
+    std::fs::copy(&path, &backup_path).unwrap();
+
+    std::fs::write(&path, b"this is not a sqlite database").unwrap();
+
+    // Make the backup unreadable for the first launch: a file where the backups
+    // folder should be makes reading the folder fail.
+    let hidden = dir.path().join("backups-hidden");
+    std::fs::rename(&backup_dir, &hidden).unwrap();
+    std::fs::write(&backup_dir, b"not a folder").unwrap();
+
+    let error = init_local_state_db_with(&path, &LocalStateOpenOptions::default()).unwrap_err();
+    assert!(
+        !path.exists(),
+        "the failed launch left no database at the live path"
+    );
+    assert!(
+        recovery_marker(&path).exists(),
+        "the recovery marker survives the failed launch"
+    );
+    let _ = error;
+
+    // The next launch finds the backups folder readable again.
+    std::fs::remove_file(&backup_dir).unwrap();
+    std::fs::rename(&hidden, &backup_dir).unwrap();
+
+    let report = init_local_state_db_with(&path, &LocalStateOpenOptions::default()).unwrap();
+    let recovery = report
+        .recovered_corrupt
+        .as_ref()
+        .expect("the retried recovery is reported");
+    assert_eq!(
+        recovery.restored_from.as_deref(),
+        Some(backup_path.as_path()),
+        "the backup that became readable is the one restored"
+    );
+    assert_eq!(
+        get_setting(&path, "safety_probe").as_deref(),
+        Some("\"kept\""),
+        "the setting written before the corruption survives"
+    );
+    assert!(
+        !recovery_marker(&path).exists(),
+        "the marker is cleared once recovery succeeds"
+    );
+}
+
+#[test]
+fn a_recovery_marker_with_no_backup_starts_fresh_and_keeps_the_old_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("local_state.db");
+    let garbage = b"still not a database";
+    std::fs::write(&path, garbage).unwrap();
+
+    // Simulate the interrupted launch: the corrupt file was moved aside and the
+    // marker was written, but no backup was ever readable.
+    let kept_at = dir
+        .path()
+        .join("local_state.db.corrupt-20000101-000000-000-p1-0000");
+    std::fs::rename(&path, &kept_at).unwrap();
+    std::fs::write(recovery_marker(&path), b"").unwrap();
+
+    let report = init_local_state_db_with(&path, &LocalStateOpenOptions::default()).unwrap();
+    let CorruptRecovery {
+        kept_at: reported,
+        restored_from,
+    } = report
+        .recovered_corrupt
+        .expect("the marker is reported as a recovery");
+    assert!(
+        restored_from.is_none(),
+        "with no backup the report says a fresh start, not a restore"
+    );
+    assert_eq!(reported, kept_at);
+    assert_eq!(
+        std::fs::read(&kept_at).unwrap(),
+        garbage,
+        "the old file is kept"
+    );
+    assert!(
+        !recovery_marker(&path).exists(),
+        "the marker is cleared once recovery is decided"
+    );
+    assert_eq!(schema_version(&path), LOCAL_STATE_SCHEMA_VERSION);
+    assert_eq!(
+        get_setting(&path, "safety_probe"),
+        None,
+        "a fresh database has no pre-corruption setting"
+    );
 }
 
 #[test]
