@@ -3225,3 +3225,45 @@ fn a_whole_file_match_does_not_copy_an_unbounded_line_into_the_answer() {
         ParserLimits::DEFAULT.max_line_len
     );
 }
+
+#[test]
+fn runtime_regex_exceeding_size_limit_is_refused_at_eval_time() {
+    let long_pattern = "a".repeat(agora_game_api::crash::MAX_RULE_REGEX_LEN + 1);
+    let rule = json!({
+        "id": "too_long",
+        "version": 1,
+        "when": {
+            "fact": {
+                "kind": "core.frame",
+                "where": {
+                    "module": { "regex": long_pattern }
+                }
+            }
+        },
+        "effects": [{ "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 10 } }],
+        "text": { "headline": { "en": "Clue" } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    let resolver = FakeResolver::new();
+    let inspector = FixedInspector(Inspection::Missing);
+    let evaluated = evaluate(&EvaluateInput {
+        packs: &packs,
+        parsed: std::slice::from_ref(&parsed),
+        texts: &[],
+        engine_facts: &EngineFacts::new(),
+        runtime_version: None,
+        resolver: &resolver,
+        inspector: &inspector,
+    });
+    assert!(
+        evaluated.could_not_check.iter().any(|cnc| cnc.reason == agora_game_api::crash::CouldNotCheckReason::CodeFailed),
+        "a pattern exceeding MAX_RULE_REGEX_LEN must fail evaluation with CodeFailed"
+    );
+}

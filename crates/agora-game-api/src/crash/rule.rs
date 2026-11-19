@@ -36,6 +36,39 @@ pub const RULE_REGEX_SIZE_LIMIT: usize = 1 << 20;
 /// The heaviest a rule may weigh a suspect.
 pub const MAX_RULE_WEIGHT: u32 = 32;
 
+/// Compile a rule's regex pattern, enforcing the size limit and length ceiling.
+/// Cached in thread-local storage for reuse across validation and evaluation.
+pub fn compile_rule_regex(pattern: &str) -> Result<regex::Regex, String> {
+    if pattern.len() > MAX_RULE_REGEX_LEN {
+        return Err(format!(
+            "a regex is at most {MAX_RULE_REGEX_LEN} bytes, and this one is {}",
+            pattern.len()
+        ));
+    }
+    if pattern.is_empty() {
+        return Err("this regex is empty, so it matches anything".to_string());
+    }
+    thread_local! {
+        static CACHE: std::cell::RefCell<BTreeMap<String, Result<regex::Regex, String>>> =
+            const { std::cell::RefCell::new(BTreeMap::new()) };
+    }
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(entry) = cache.get(pattern) {
+            return entry.clone();
+        }
+        let compiled = regex::RegexBuilder::new(pattern)
+            .size_limit(RULE_REGEX_SIZE_LIMIT)
+            .build()
+            .map_err(|error| error.to_string());
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert(pattern.to_string(), compiled.clone());
+        compiled
+    })
+}
+
 /// Three-valued logic (Kleene), shared with the platform condition language. The evaluator must use
 /// these operations rather than booleans.
 pub use crate::condition::Truth;

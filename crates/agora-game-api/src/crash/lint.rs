@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::condition::{compare_dotted, dotted};
-use regex::{Regex, RegexBuilder};
+use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -1102,36 +1102,15 @@ fn regex_names_address(regex: &str) -> bool {
 }
 
 fn check_regex(regex: &str, at: &str, out: &mut Vec<LintProblem>) -> Option<Regex> {
-    if regex.len() > MAX_RULE_REGEX_LEN {
-        out.push(problem(
-            LintCode::BadRegex,
-            at,
-            format!(
-                "a regex is at most {MAX_RULE_REGEX_LEN} bytes, and this one is {}",
-                regex.len()
-            ),
-        ));
-        return None;
-    }
-    if regex.is_empty() {
-        out.push(problem(
-            LintCode::BadRegex,
-            at,
-            "this regex is empty, so it matches anything",
-        ));
-        return None;
-    }
-    match RegexBuilder::new(regex)
-        .size_limit(RULE_REGEX_SIZE_LIMIT)
-        .build()
-    {
+    match super::compile_rule_regex(regex) {
         Ok(compiled) => Some(compiled),
         Err(error) => {
-            out.push(problem(
-                LintCode::BadRegex,
-                at,
-                format!("this regex is refused: {error}"),
-            ));
+            let msg = if error.starts_with("a regex is at most") || error.starts_with("this regex is empty") {
+                error
+            } else {
+                format!("this regex is refused: {error}")
+            };
+            out.push(problem(LintCode::BadRegex, at, msg));
             None
         }
     }

@@ -627,9 +627,11 @@ pub fn analyze_with_history(
         inspector,
     });
     // A change since the last good launch only ever boosts a suspect another family named.
-    evaluated
-        .signals
-        .extend(super::change::change_signals(changes));
+    if !super::evaluate::bucket_predates_change(&engine_facts) {
+        evaluated
+            .signals
+            .extend(super::change::change_signals(changes));
+    }
     // A pasted snippet is not a whole log. Say so, and never let the answer read stronger than
     // "possible", whatever the rules found.
     if let Some(source) = snippet_source {
@@ -926,4 +928,151 @@ fn could_not_check_key(check: &CouldNotCheck) -> String {
         check.detail.as_deref().unwrap_or(""),
         source
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agora_game_api::crash::{
+        AttrValue, CrashPack, Fact, Family, Owner, Ref, Scalar,
+    };
+    use crate::crash_engine::gate::NoHost;
+    use crate::crash_engine::RefResolver;
+    use crate::crash_packs::LoadedCrashPack;
+    use crate::session_ledger::{ChangeKind, ManifestChange};
+
+    struct TestResolver;
+    impl RefResolver for TestResolver {
+        fn resolve(&self, reference: &Ref) -> crate::crash_engine::Resolved {
+            if reference.kind == "module" && reference.value == "modA.dll" {
+                crate::crash_engine::Resolved {
+                    owner: Owner::Item {
+                        key: "mod-a".to_string(),
+                        name: "Mod A".to_string(),
+                    },
+                    role: None,
+                }
+            } else {
+                crate::crash_engine::Resolved {
+                    owner: Owner::Unknown,
+                    role: None,
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_bucket_predates_last_change_gets_no_change_signal() {
+        let pack_json = r#"{
+            "contract": 1,
+            "games": ["test-game"],
+            "parsers": [{
+                "id": "test_parser",
+                "detect": { "all": ["(?m)^==="] },
+                "entry": { "generic": { "name": "text_sections", "config": {
+                    "sections": [{
+                        "id": "main",
+                        "header": "^===$",
+                        "kind": "core.frame",
+                        "lines": [{
+                            "pattern": "^(?P<index>\\d+) (?P<module>\\S+)$",
+                            "attrs": { "index": "index" },
+                            "refs": [{ "kind": "module", "value": "module", "strength": "exec" }]
+                        }]
+                    }]
+                } } }
+            }],
+            "rules": [{
+                "id": "r1",
+                "version": 1,
+                "when": {
+                    "fact": {
+                        "kind": "core.frame",
+                        "ref": { "kind": "module", "bind": "m" }
+                    }
+                },
+                "effects": [{
+                    "finding": {
+                        "cause": "mod",
+                        "scope": "root_cause",
+                        "level": "possible",
+                        "candidate": { "owner_of": "m" },
+                        "family": "execution",
+                        "weight": 10
+                    }
+                }],
+                "text": { "headline": { "en": "Execution trace." } }
+            }]
+        }"#;
+
+        let pack = LoadedCrashPack {
+            plugin_id: "test.plugin".to_string(),
+            plugin_name: "Test Plugin".to_string(),
+            plugin_version: "1.0".to_string(),
+            dependencies: Vec::new(),
+            official: false,
+            file: "test/crash.json".to_string(),
+            pack: serde_json::from_str::<CrashPack>(pack_json).unwrap(),
+        };
+
+        let file = CrashFile {
+            name: "crash.log".to_string(),
+            bytes: b"===\n0 modA.dll\n".to_vec(),
+            origin: CrashFileOrigin::Collected,
+            source: None,
+        };
+
+        let resolver = TestResolver;
+        let no_inspector = NoInspector;
+        let host = NoHost;
+
+        let extra_facts = vec![Fact {
+            kind: "core.history".to_string(),
+            attrs: [(
+                "predates_last_change".to_string(),
+                AttrValue::Scalar(Scalar::Bool(true)),
+            )]
+            .into_iter()
+            .collect(),
+            refs: Vec::new(),
+            span: None,
+        }];
+
+        let changes = vec![ManifestChange {
+            kind: ChangeKind::Updated,
+            key: Some("mod-a".to_string()),
+            from_version: Some("1.0".to_string()),
+            to_version: Some("1.1".to_string()),
+            setting: None,
+        }];
+
+        let output = analyze_with_history(
+            &AnalyzeInput {
+                packs: &[pack],
+                files: &[file],
+                runtime_version: None,
+                host: &host,
+                built_in: &[],
+                instance: Some(InstanceAnalysis {
+                    game_id: "test-game",
+                    resolver: &resolver,
+                    inspector: &no_inspector,
+                    could_not_check: &[],
+                }),
+            },
+            &extra_facts,
+            &changes,
+            None,
+        )
+        .expect("analyze succeeds");
+
+        assert_eq!(output.files[0].read_by.is_some(), true, "file should be read: {:?}", output.files[0]);
+        assert_eq!(output.answer.findings.len(), 1, "findings: {:?}", output.answer.findings);
+        assert_eq!(output.answer.candidates.len(), 1, "candidates: {:?}", output.answer.candidates);
+        let cand = &output.answer.candidates[0];
+        assert!(
+            !cand.families.contains(&Family::ChangeCorrelation),
+            "a bucket that predates the last change must get no change signal"
+        );
+    }
 }
