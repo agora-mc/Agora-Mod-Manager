@@ -273,6 +273,8 @@ jobs:
           python-version: "3.12"
       - name: Check Tauri command bindings are in sync (name-presence only; typed signatures waived)
         run: python scripts/check_tauri_bindings.py --check
+      - name: Check every desktop command has a CLI equivalent or a reason it has none
+        run: python scripts/check_cli_coverage.py
 
   docs:
     runs-on: ubuntu-latest

@@ -160,7 +160,7 @@ all of them before calling a substantial change done.
 Repository root, hermetic and fast:
 
 ```bash
-python scripts/check_architecture.py && python scripts/check_docs.py && python scripts/check_package_docs.py && python scripts/check_tauri_bindings.py --check
+python scripts/check_architecture.py && python scripts/check_docs.py && python scripts/check_package_docs.py && python scripts/check_tauri_bindings.py --check && python scripts/check_cli_coverage.py
 ```
 
 Rust:
@@ -198,7 +198,7 @@ tests the bundle the app ships. `E2E_PORT=<port>` runs either on another port th
 Compiler (from `compiler/`, in a venv with `requirements.txt`):
 `python compile.py --skip-sign --no-governance-write --governance-mode off --out ../registry.db && python ../scripts/verify_db.py`.
 
-A new or renamed Tauri command also needs `python scripts/check_tauri_bindings.py --generate`.
+A new or renamed Tauri command also needs `python scripts/check_tauri_bindings.py --generate`, and an entry in `scripts/cli_coverage.json` saying which CLI command does the same thing (or why it is desktop-only); `check_cli_coverage.py` fails until it has one. `cargo test -p agora-cli --test cli_smoke` checks that every CLI command named there exists.
 
 ### Gotchas
 

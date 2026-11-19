@@ -30,6 +30,7 @@ import crash_benchmark as cb
 import fetch_loader_manifests
 import deploy_release_assets
 import catalog_delta
+import check_cli_coverage
 import finalize_release_assets as fra
 import refresh_loader_manifests
 import validate_loader_catalog_delta
@@ -4448,6 +4449,37 @@ class CatalogDeltaTests(unittest.TestCase):
         self.assertTrue(catalog_delta.is_delta_asset("registry.header"))
         self.assertTrue(catalog_delta.is_delta_asset("registry.delta-0123456789abcdef.zst"))
         self.assertFalse(catalog_delta.is_delta_asset("registry.bundle"))
+
+
+class CliCoverageTests(unittest.TestCase):
+    def doc(self, commands, budget=0):
+        return {"gap_budget": budget, "commands": commands}
+
+    def test_every_desktop_command_needs_an_entry(self):
+        errors = check_cli_coverage.check(self.doc({"a": {"cli": "list-instances"}}), {"a", "b"})
+        self.assertEqual(len(errors), 1)
+        self.assertIn("'b' is not in", errors[0])
+
+    def test_stale_and_malformed_entries_are_refused(self):
+        errors = check_cli_coverage.check(
+            self.doc({"a": {"cli": "x", "gui": "y"}, "gone": {"gui": "z"}, "c": {"gui": " "}}),
+            {"a", "c"},
+        )
+        self.assertEqual(len(errors), 3)
+
+    def test_gap_budget_only_goes_down(self):
+        commands = {"a": {"gap": "missing"}, "b": {"gap": "missing"}}
+        self.assertEqual(check_cli_coverage.check(self.doc(commands, budget=2), {"a", "b"}), [])
+        self.assertIn("over the budget", check_cli_coverage.check(self.doc(commands, 1), {"a", "b"})[0])
+        self.assertIn("lower gap_budget to 2", check_cli_coverage.check(self.doc(commands, 3), {"a", "b"})[0])
+
+    def test_the_real_file_is_complete(self):
+        import json
+        coverage = json.loads(check_cli_coverage.COVERAGE.read_text(encoding="utf-8"))
+        bindings = check_cli_coverage.check_tauri_bindings
+        lib = bindings.LIB_RS.read_text(encoding="utf-8")
+        desktop = bindings.parse_rust_commands(lib)
+        self.assertEqual(check_cli_coverage.check(coverage, desktop), [])
 
 
 if __name__ == "__main__":

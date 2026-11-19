@@ -1,0 +1,1237 @@
+{
+  "schema_version": 1,
+  "_about": "Every desktop (Tauri) command, and how a CLI user does the same thing: `cli` names the command path, `gui` says why it only makes sense in the desktop, `gap` is a known missing CLI command. scripts/check_cli_coverage.py keeps it complete; gap_budget may only go down.",
+  "gap_budget": 75,
+  "commands": {
+    "add_plugin_development_folder": {
+      "cli": "plugin install development"
+    },
+    "add_server": {
+      "cli": "server add"
+    },
+    "add_skin_to_library": {
+      "gap": "skin library"
+    },
+    "analyze_crash_file": {
+      "cli": "crash analyze"
+    },
+    "analyze_crash_text": {
+      "cli": "crash analyze"
+    },
+    "apply_backup_retention": {
+      "cli": "backup prune"
+    },
+    "apply_bisect_trial": {
+      "cli": "bisect apply"
+    },
+    "apply_install_plan": {
+      "cli": "mod install"
+    },
+    "apply_instance_template": {
+      "cli": "template apply"
+    },
+    "apply_loadout_profile": {
+      "cli": "loadout apply"
+    },
+    "apply_pack_update": {
+      "cli": "pack update"
+    },
+    "apply_plugin_repair": {
+      "gap": "plugin repair"
+    },
+    "batch_check_compat": {
+      "gui": "compatibility badges on Browse cards"
+    },
+    "browse_items": {
+      "gui": "Browse page cache"
+    },
+    "browse_load_more": {
+      "gui": "Browse page paging"
+    },
+    "browse_page": {
+      "gui": "Browse page paging"
+    },
+    "browse_search": {
+      "cli": "mod search"
+    },
+    "bundled_cli_path": {
+      "gui": "tells the desktop where its bundled CLI is"
+    },
+    "cancel_bisect": {
+      "cli": "bisect cancel"
+    },
+    "cancel_install": {
+      "gui": "cancel button for a running desktop install (the CLI stops with Ctrl+C)"
+    },
+    "cancel_java_runtime": {
+      "gui": "cancel button for a Java download"
+    },
+    "cancel_operation": {
+      "gui": "cancel button for a desktop operation"
+    },
+    "change_loader_version": {
+      "cli": "instance loader-version"
+    },
+    "check_all_instance_health": {
+      "cli": "health"
+    },
+    "check_instance_health": {
+      "cli": "health"
+    },
+    "check_instance_updates": {
+      "cli": "instance updates"
+    },
+    "check_mod_compat": {
+      "gui": "compatibility badge on a mod page"
+    },
+    "check_registry_update": {
+      "cli": "registry status"
+    },
+    "clear_cached_instance_updates": {
+      "gui": "update badge cache"
+    },
+    "clone_instance_cmd": {
+      "cli": "instance clone"
+    },
+    "compute_gc_args": {
+      "gui": "preview of JVM flags on the settings screen"
+    },
+    "confirm_crash_fix": {
+      "gap": "telling the crash doctor a fix worked"
+    },
+    "copy_world": {
+      "cli": "world copy"
+    },
+    "create_desktop_shortcut": {
+      "gui": "operating-system shortcut"
+    },
+    "create_instance": {
+      "cli": "instance create"
+    },
+    "create_instance_template": {
+      "cli": "template create"
+    },
+    "create_loadout_profile": {
+      "cli": "loadout create"
+    },
+    "create_snapshot": {
+      "cli": "snapshots create"
+    },
+    "credential_storage_status": {
+      "cli": "auth status"
+    },
+    "decline_controlify_offer": {
+      "gui": "controller mod offer in the desktop"
+    },
+    "delete_instance": {
+      "cli": "instance delete"
+    },
+    "delete_instance_template": {
+      "cli": "template delete"
+    },
+    "delete_loadout_profile": {
+      "cli": "loadout delete"
+    },
+    "delete_mod_group": {
+      "gui": "library grouping in the desktop"
+    },
+    "delete_screenshot": {
+      "gui": "screenshot gallery"
+    },
+    "delete_snapshot": {
+      "cli": "snapshots delete"
+    },
+    "delete_world": {
+      "cli": "world delete"
+    },
+    "detect_drift": {
+      "gap": "instance drift check"
+    },
+    "detect_launchers": {
+      "cli": "import launchers"
+    },
+    "detect_mojang_launcher": {
+      "gui": "official-launcher detection for the settings screen"
+    },
+    "disable_all_plugins": {
+      "cli": "plugin disable-all"
+    },
+    "disable_instance_mod": {
+      "cli": "mod disable"
+    },
+    "disable_mod_for_test": {
+      "gap": "turning one mod off to test a crash"
+    },
+    "discard_pack_review": {
+      "gap": "discarding a staged pack review"
+    },
+    "discover_launcher_imports": {
+      "cli": "import launchers"
+    },
+    "downloads_add": {
+      "gap": "adding a downloaded file by hand"
+    },
+    "downloads_default_folder": {
+      "gui": "folder picker default"
+    },
+    "downloads_ignore": {
+      "gap": "ignoring a downloaded file"
+    },
+    "downloads_list": {
+      "gap": "listing noticed downloads"
+    },
+    "downloads_scan": {
+      "cli": "downloads scan"
+    },
+    "enable_instance_mod": {
+      "cli": "mod enable"
+    },
+    "enable_mod_for_test": {
+      "gap": "turning one mod back on after a test"
+    },
+    "enable_mod_with_auto_deps": {
+      "cli": "mod enable"
+    },
+    "enrich_instance_content": {
+      "gui": "background metadata for the content list"
+    },
+    "ensure_java_runtime": {
+      "cli": "runtime ensure"
+    },
+    "evaluate_controlify_offer": {
+      "gui": "controller mod offer in the desktop"
+    },
+    "execute_launcher_imports": {
+      "cli": "import run"
+    },
+    "explain_mod_presence": {
+      "cli": "mod why"
+    },
+    "export_backup": {
+      "cli": "backup export"
+    },
+    "export_crash_report": {
+      "gap": "crash report export"
+    },
+    "export_instance_pack": {
+      "cli": "pack export"
+    },
+    "export_lockfile": {
+      "cli": "lockfile export"
+    },
+    "export_server_environment": {
+      "cli": "export"
+    },
+    "export_sourceless_mods": {
+      "gap": "exporting mods with no source"
+    },
+    "export_world": {
+      "cli": "world export"
+    },
+    "extract_overrides": {
+      "gap": "pack overrides extraction"
+    },
+    "fetch_community_image": {
+      "gui": "image proxy for the desktop"
+    },
+    "fetch_modrinth_project": {
+      "gui": "Modrinth project page"
+    },
+    "focus_main_window": {
+      "gui": "window management"
+    },
+    "for_you_items": {
+      "gui": "For You recommendations on Home"
+    },
+    "games_add_folder": {
+      "cli": "games folder add"
+    },
+    "games_base_build": {
+      "cli": "games base build"
+    },
+    "games_base_list": {
+      "cli": "games base list"
+    },
+    "games_base_remove": {
+      "cli": "games base remove"
+    },
+    "games_base_repair_framework": {
+      "cli": "games base repair-framework"
+    },
+    "games_base_verify": {
+      "cli": "games base verify"
+    },
+    "games_catalog_install": {
+      "cli": "games catalog install"
+    },
+    "games_catalog_list": {
+      "cli": "games catalog list"
+    },
+    "games_content_add": {
+      "cli": "games content add"
+    },
+    "games_content_list": {
+      "cli": "games content list"
+    },
+    "games_content_remove": {
+      "cli": "games content remove"
+    },
+    "games_content_verify": {
+      "cli": "games content verify"
+    },
+    "games_discover": {
+      "cli": "games discover"
+    },
+    "games_fomod_install": {
+      "cli": "games content fomod install"
+    },
+    "games_fomod_show": {
+      "cli": "games content fomod show"
+    },
+    "games_icon": {
+      "gui": "game icon"
+    },
+    "games_import_mo2": {
+      "cli": "games import mo2"
+    },
+    "games_import_mo2_multi": {
+      "cli": "games import mo2"
+    },
+    "games_import_mo2_scan": {
+      "cli": "games import mo2 scan"
+    },
+    "games_import_mo2_suggest": {
+      "cli": "games import mo2 scan"
+    },
+    "games_import_vortex": {
+      "cli": "games import vortex"
+    },
+    "games_import_vortex_multi": {
+      "cli": "games import vortex"
+    },
+    "games_import_vortex_scan": {
+      "cli": "games import vortex scan"
+    },
+    "games_import_vortex_suggest": {
+      "cli": "games import vortex scan"
+    },
+    "games_ini_get": {
+      "cli": "games instance ini"
+    },
+    "games_ini_set": {
+      "cli": "games instance ini"
+    },
+    "games_instance_check": {
+      "cli": "games instance check"
+    },
+    "games_instance_clone": {
+      "gap": "cloning a game instance"
+    },
+    "games_instance_content_add": {
+      "cli": "games instance content add"
+    },
+    "games_instance_content_list": {
+      "cli": "games instance content list"
+    },
+    "games_instance_content_move": {
+      "cli": "games instance content move"
+    },
+    "games_instance_content_remove": {
+      "cli": "games instance content remove"
+    },
+    "games_instance_content_set_enabled": {
+      "cli": "games instance content enable"
+    },
+    "games_instance_create": {
+      "cli": "games instance create"
+    },
+    "games_instance_delete": {
+      "cli": "games instance delete"
+    },
+    "games_instance_deleted_list": {
+      "gap": "recently deleted game instances"
+    },
+    "games_instance_get": {
+      "cli": "games instance list"
+    },
+    "games_instance_icon": {
+      "gui": "instance icon"
+    },
+    "games_instance_launch": {
+      "cli": "games instance launch"
+    },
+    "games_instance_list": {
+      "cli": "games instance list"
+    },
+    "games_instance_purge_deleted": {
+      "gap": "purging deleted game instances"
+    },
+    "games_instance_rename": {
+      "gap": "renaming a game instance"
+    },
+    "games_instance_restore_deleted": {
+      "gap": "restoring a deleted game instance"
+    },
+    "games_instance_set_deployment": {
+      "cli": "games instance set-deployment"
+    },
+    "games_instance_set_icon": {
+      "gui": "instance icon"
+    },
+    "games_instance_steam_status": {
+      "cli": "games wrap"
+    },
+    "games_instance_stop": {
+      "gap": "stopping a running game"
+    },
+    "games_library_cache_icon": {
+      "gui": "content icon cache"
+    },
+    "games_library_fill_details": {
+      "cli": "games content fill-details"
+    },
+    "games_library_icon": {
+      "gui": "content icon"
+    },
+    "games_library_instances": {
+      "cli": "games content show"
+    },
+    "games_library_list": {
+      "cli": "games content list"
+    },
+    "games_library_unused": {
+      "cli": "games content unused"
+    },
+    "games_list": {
+      "cli": "games list"
+    },
+    "games_mod_ini_get": {
+      "cli": "games instance ini"
+    },
+    "games_mod_ini_keep_game_version": {
+      "gap": "mod INI conflict choices"
+    },
+    "games_mod_ini_reset": {
+      "gap": "mod INI conflict choices"
+    },
+    "games_mod_ini_restore_mine": {
+      "gap": "mod INI conflict choices"
+    },
+    "games_mod_ini_set": {
+      "cli": "games instance ini"
+    },
+    "games_mod_inis_list": {
+      "cli": "games instance ini"
+    },
+    "games_plugins_check": {
+      "cli": "games instance plugins check"
+    },
+    "games_plugins_conflict_action": {
+      "cli": "games instance plugins rule add"
+    },
+    "games_plugins_conflicts": {
+      "cli": "games instance plugins conflicts"
+    },
+    "games_plugins_list": {
+      "cli": "games instance plugins"
+    },
+    "games_plugins_lists": {
+      "cli": "games instance plugins"
+    },
+    "games_plugins_move": {
+      "cli": "games instance plugins move"
+    },
+    "games_plugins_rule_add": {
+      "cli": "games instance plugins rule add"
+    },
+    "games_plugins_rule_remove": {
+      "cli": "games instance plugins rule remove"
+    },
+    "games_plugins_rules": {
+      "cli": "games instance plugins rule list"
+    },
+    "games_plugins_set_active": {
+      "cli": "games instance plugins enable"
+    },
+    "games_plugins_set_locked": {
+      "cli": "games instance plugins lock"
+    },
+    "games_plugins_sort": {
+      "cli": "games instance plugins sort"
+    },
+    "games_plugins_sorter_notes": {
+      "cli": "games instance plugins check"
+    },
+    "games_plugins_update_masterlist": {
+      "cli": "games instance plugins masterlist"
+    },
+    "games_remove_folder": {
+      "cli": "games folder remove"
+    },
+    "games_saves_backup": {
+      "gap": "save backups"
+    },
+    "games_saves_backup_for_session": {
+      "gap": "save backups"
+    },
+    "games_saves_backups": {
+      "gap": "save backups"
+    },
+    "games_saves_get": {
+      "cli": "games instance saves"
+    },
+    "games_saves_restore": {
+      "gap": "save backups"
+    },
+    "games_saves_set": {
+      "cli": "games instance saves"
+    },
+    "games_support_list": {
+      "cli": "plugin official list"
+    },
+    "games_support_set_enabled": {
+      "cli": "plugin enable"
+    },
+    "games_tools_diff": {
+      "cli": "games instance tools diff"
+    },
+    "games_tools_list": {
+      "cli": "games instance tools list"
+    },
+    "games_tools_outputs": {
+      "gap": "tool outputs"
+    },
+    "games_tools_remove": {
+      "cli": "games instance tools remove"
+    },
+    "games_tools_rollback": {
+      "cli": "games instance tools rollback"
+    },
+    "games_tools_run": {
+      "cli": "games instance tools run"
+    },
+    "games_tools_save_inputs": {
+      "gap": "tool inputs"
+    },
+    "games_tools_swap_costs": {
+      "gap": "swap-run cost estimate"
+    },
+    "games_tools_swap_restore": {
+      "cli": "games tools-swap restore"
+    },
+    "games_tools_swap_status": {
+      "cli": "games tools-swap status"
+    },
+    "games_tools_use_output": {
+      "gap": "tool outputs"
+    },
+    "games_user_files_restore": {
+      "cli": "games user-files restore"
+    },
+    "games_user_files_status": {
+      "cli": "games user-files status"
+    },
+    "games_user_tools_add": {
+      "gap": "user tools"
+    },
+    "games_user_tools_find": {
+      "gap": "user tools"
+    },
+    "games_user_tools_list": {
+      "gap": "user tools"
+    },
+    "games_user_tools_outputs": {
+      "gap": "user tools"
+    },
+    "games_user_tools_remove": {
+      "gap": "user tools"
+    },
+    "games_user_tools_run": {
+      "gap": "user tools"
+    },
+    "games_user_tools_use_output": {
+      "gap": "user tools"
+    },
+    "get_auth_status": {
+      "cli": "auth status"
+    },
+    "get_bisect_session": {
+      "cli": "bisect status"
+    },
+    "get_cached_all_updates": {
+      "cli": "instance updates"
+    },
+    "get_cached_instance_updates": {
+      "cli": "instance updates"
+    },
+    "get_connectivity_status": {
+      "gui": "offline banner"
+    },
+    "get_content_sharing": {
+      "gap": "content sharing settings"
+    },
+    "get_crash_answer": {
+      "cli": "crash show"
+    },
+    "get_curated_annotation": {
+      "gui": "curator note on a mod page"
+    },
+    "get_custom_icon": {
+      "gui": "instance icon"
+    },
+    "get_dependency_graph": {
+      "cli": "mod graph"
+    },
+    "get_disable_plan": {
+      "cli": "mod disable-plan"
+    },
+    "get_github_profile": {
+      "gui": "GitHub avatar for voting"
+    },
+    "get_governance_config": {
+      "cli": "governance config"
+    },
+    "get_governance_summary": {
+      "cli": "governance summary"
+    },
+    "get_install_plan": {
+      "cli": "mod install"
+    },
+    "get_instance_detail": {
+      "cli": "get-instance"
+    },
+    "get_item_vote": {
+      "gap": "catalog voting"
+    },
+    "get_launch_history": {
+      "gap": "launch history"
+    },
+    "get_lkg_marker": {
+      "cli": "snapshots list"
+    },
+    "get_mcp_skill_content": {
+      "cli": "skill"
+    },
+    "get_mcp_status": {
+      "gui": "desktop MCP HTTP server (the CLI serves MCP over stdio)"
+    },
+    "get_mcp_token": {
+      "gui": "desktop MCP HTTP server token"
+    },
+    "get_migration_report": {
+      "cli": "migrate-data"
+    },
+    "get_mod_groups": {
+      "gui": "library grouping in the desktop"
+    },
+    "get_orphaned_dependencies": {
+      "cli": "mod orphans"
+    },
+    "get_plugin_settings": {
+      "cli": "plugin settings"
+    },
+    "get_proxy_setting": {
+      "cli": "proxy show"
+    },
+    "get_registry_item": {
+      "gap": "catalog item details"
+    },
+    "get_registry_status": {
+      "cli": "registry status"
+    },
+    "get_removal_plan": {
+      "cli": "mod remove"
+    },
+    "get_setting": {
+      "cli": "settings get"
+    },
+    "get_shared_screenshot_status": {
+      "gui": "screenshot gallery"
+    },
+    "get_update_changelogs": {
+      "cli": "mod changelog"
+    },
+    "get_windows_accent_color": {
+      "gui": "theme"
+    },
+    "github_login": {
+      "gap": "GitHub sign-in for voting"
+    },
+    "github_login_poll": {
+      "gap": "GitHub sign-in for voting"
+    },
+    "github_logout": {
+      "gap": "GitHub sign-in for voting"
+    },
+    "import_backup": {
+      "cli": "backup import"
+    },
+    "import_instance": {
+      "cli": "import run"
+    },
+    "import_instance_pack": {
+      "cli": "import"
+    },
+    "import_lockfile": {
+      "cli": "lockfile import"
+    },
+    "import_modrinth_pack_by_url": {
+      "cli": "import"
+    },
+    "import_world": {
+      "cli": "world import"
+    },
+    "inspect_java_executable": {
+      "cli": "runtime inspect"
+    },
+    "install_catalog_provider_pack": {
+      "gap": "installing a catalog provider pack"
+    },
+    "install_official_plugin": {
+      "cli": "plugin official install"
+    },
+    "install_pack": {
+      "cli": "pack install"
+    },
+    "install_plugin_package": {
+      "cli": "plugin install package"
+    },
+    "install_technic_solder_pack": {
+      "cli": "technic install"
+    },
+    "install_technic_zip_pack": {
+      "cli": "technic install"
+    },
+    "investigate_crash": {
+      "cli": "crash investigate"
+    },
+    "investigate_instance_evidence": {
+      "cli": "crash investigate"
+    },
+    "is_modrinth_enabled": {
+      "cli": "provider list"
+    },
+    "is_portable_mode": {
+      "cli": "paths"
+    },
+    "kill_process": {
+      "gap": "stopping a running game"
+    },
+    "launch_instance": {
+      "cli": "launch"
+    },
+    "launch_instance_direct": {
+      "cli": "launch"
+    },
+    "launch_instance_with_recovery": {
+      "cli": "launch"
+    },
+    "link_shared_screenshots": {
+      "gui": "screenshot gallery"
+    },
+    "list_capturable_template_files": {
+      "cli": "template create"
+    },
+    "list_categories": {
+      "gui": "Browse filters"
+    },
+    "list_content_providers": {
+      "cli": "provider list"
+    },
+    "list_crash_answers": {
+      "cli": "crash list"
+    },
+    "list_governance_events": {
+      "cli": "governance events"
+    },
+    "list_instance_content": {
+      "cli": "mod list"
+    },
+    "list_instance_groups": {
+      "cli": "instance group"
+    },
+    "list_instance_templates": {
+      "cli": "template list"
+    },
+    "list_instance_worlds": {
+      "cli": "world list"
+    },
+    "list_instances": {
+      "cli": "list-instances"
+    },
+    "list_java_runtimes": {
+      "cli": "runtime list"
+    },
+    "list_loader_versions": {
+      "cli": "loader list"
+    },
+    "list_loadout_profiles": {
+      "cli": "loadout list"
+    },
+    "list_loadout_unlisted_mods": {
+      "gap": "mods a loadout does not mention"
+    },
+    "list_manifest_loaders": {
+      "cli": "loader list"
+    },
+    "list_manifest_mc_versions": {
+      "cli": "loader list"
+    },
+    "list_mod_reviews": {
+      "cli": "registry reviews"
+    },
+    "list_mod_versions": {
+      "gap": "listing a mod's versions"
+    },
+    "list_mod_versions_load_more": {
+      "gap": "listing a mod's versions"
+    },
+    "list_modrinth_categories": {
+      "gui": "Browse filters"
+    },
+    "list_modrinth_game_versions": {
+      "gui": "Browse filters"
+    },
+    "list_modrinth_loaders": {
+      "gui": "Browse filters"
+    },
+    "list_official_plugins": {
+      "cli": "plugin official list"
+    },
+    "list_pack_mods": {
+      "gap": "listing a pack's mods before install"
+    },
+    "list_pack_versions": {
+      "cli": "pack versions"
+    },
+    "list_plugin_contributions": {
+      "gui": "plugin UI contributions"
+    },
+    "list_plugins": {
+      "cli": "plugin list"
+    },
+    "list_provider_categories": {
+      "gui": "Browse filters"
+    },
+    "list_raw_modrinth_versions": {
+      "gap": "listing a Modrinth project's versions"
+    },
+    "list_recent_play": {
+      "gui": "Home page history"
+    },
+    "list_recently_deleted": {
+      "cli": "instance deleted"
+    },
+    "list_screenshots": {
+      "gui": "screenshot gallery"
+    },
+    "list_servers": {
+      "cli": "server list"
+    },
+    "list_shareable_logs": {
+      "cli": "log list"
+    },
+    "list_snapshot_versions": {
+      "gap": "Minecraft snapshot versions"
+    },
+    "list_snapshots": {
+      "cli": "snapshots list"
+    },
+    "list_worlds": {
+      "cli": "world list"
+    },
+    "lock_instance": {
+      "cli": "instance lock"
+    },
+    "minecraft_add_stored_content": {
+      "gap": "adding stored content to an instance"
+    },
+    "move_server": {
+      "gap": "reordering servers"
+    },
+    "msa_account_store_status": {
+      "cli": "auth status"
+    },
+    "msa_begin_login": {
+      "cli": "auth login"
+    },
+    "msa_cancel_login": {
+      "gui": "cancel button for sign-in"
+    },
+    "msa_complete_login": {
+      "cli": "auth login"
+    },
+    "msa_get_status": {
+      "cli": "auth status"
+    },
+    "msa_list_accounts": {
+      "cli": "auth list"
+    },
+    "msa_logout": {
+      "cli": "auth logout"
+    },
+    "msa_open_verification_url": {
+      "gui": "opens the browser for sign-in"
+    },
+    "msa_refresh": {
+      "gap": "refreshing a Microsoft sign-in"
+    },
+    "msa_remove_account": {
+      "cli": "auth logout"
+    },
+    "msa_repair_accounts": {
+      "cli": "auth repair"
+    },
+    "msa_switch_account": {
+      "cli": "auth switch"
+    },
+    "open_data_folder": {
+      "gui": "opens a folder in the file manager"
+    },
+    "open_external_url": {
+      "gui": "opens the browser"
+    },
+    "open_instance_folder": {
+      "gui": "opens a folder in the file manager"
+    },
+    "pick_directory": {
+      "gui": "file dialog"
+    },
+    "pick_open_file": {
+      "gui": "file dialog"
+    },
+    "ping_server": {
+      "gap": "pinging a server"
+    },
+    "plan_curated_pack": {
+      "cli": "pack curated"
+    },
+    "plan_launcher_imports": {
+      "cli": "import plan"
+    },
+    "plan_loader_change": {
+      "cli": "instance loader-version"
+    },
+    "plan_pack_import": {
+      "cli": "pack review"
+    },
+    "plan_version_migration": {
+      "gap": "moving an instance to another Minecraft version"
+    },
+    "plugin_apply_update": {
+      "cli": "plugin update"
+    },
+    "plugin_check_update": {
+      "cli": "plugin check-update"
+    },
+    "plugin_instance_opened": {
+      "gui": "plugin UI event"
+    },
+    "plugin_set_surface": {
+      "gui": "plugin UI surface"
+    },
+    "plugin_surfaces": {
+      "gui": "plugin UI surface"
+    },
+    "plugins_emergency_stop": {
+      "cli": "plugin stop"
+    },
+    "preview_content_sharing_conversion": {
+      "gap": "content sharing settings"
+    },
+    "preview_import_name": {
+      "gui": "name suggestion in a dialog"
+    },
+    "preview_loadout_update": {
+      "cli": "loadout update"
+    },
+    "preview_log_share": {
+      "cli": "log share"
+    },
+    "preview_pack_instance_name": {
+      "gui": "name suggestion in a dialog"
+    },
+    "preview_pack_update": {
+      "cli": "pack update-preview"
+    },
+    "preview_plugin_folder": {
+      "cli": "plugin preview development"
+    },
+    "preview_plugin_package": {
+      "cli": "plugin preview package"
+    },
+    "provider_install_pack": {
+      "cli": "pack install"
+    },
+    "provider_install_preview": {
+      "gap": "previewing a provider install"
+    },
+    "provider_project": {
+      "gap": "a provider project's details"
+    },
+    "provider_versions": {
+      "gap": "a provider project's versions"
+    },
+    "purge_deleted_instance": {
+      "cli": "instance purge"
+    },
+    "query_launch_state": {
+      "gui": "play button state"
+    },
+    "read_crash_artifact": {
+      "cli": "crash inspect"
+    },
+    "read_plugin_log": {
+      "cli": "plugin log"
+    },
+    "read_screenshot": {
+      "gui": "screenshot gallery"
+    },
+    "recommend_instance_memory": {
+      "cli": "instance recommend-memory"
+    },
+    "record_bisect_outcome": {
+      "cli": "bisect good"
+    },
+    "regenerate_mcp_token": {
+      "gui": "desktop MCP HTTP server token"
+    },
+    "remove_server": {
+      "cli": "server remove"
+    },
+    "remove_skin_from_library": {
+      "gap": "skin library"
+    },
+    "remove_unused_java_runtimes": {
+      "cli": "runtime remove-unused"
+    },
+    "rename_instance": {
+      "cli": "instance rename"
+    },
+    "rename_mod_group": {
+      "gui": "library grouping in the desktop"
+    },
+    "rename_screenshot": {
+      "gui": "screenshot gallery"
+    },
+    "rename_world": {
+      "cli": "world rename"
+    },
+    "render_plugin_view": {
+      "gui": "plugin UI surface"
+    },
+    "repair_instance_loader": {
+      "cli": "instance repair-loader"
+    },
+    "repair_lockfile": {
+      "cli": "lockfile repair"
+    },
+    "report_still_crashing": {
+      "gap": "telling the crash doctor a fix did not work"
+    },
+    "reset_controlify_offer": {
+      "gui": "controller mod offer in the desktop"
+    },
+    "reset_skin": {
+      "cli": "skin reset"
+    },
+    "resolve_crash_suspect_file": {
+      "gap": "crash suspect lookup"
+    },
+    "resolve_install_plan": {
+      "cli": "mod install"
+    },
+    "restart_app": {
+      "gui": "restarts the desktop app"
+    },
+    "restore_deleted_instance": {
+      "cli": "instance restore"
+    },
+    "restore_plugin_data": {
+      "cli": "plugin restore-data"
+    },
+    "restore_snapshot": {
+      "cli": "snapshots restore"
+    },
+    "retry_pack_import_entries": {
+      "gap": "retrying failed pack entries"
+    },
+    "reveal_crash_artifact": {
+      "gui": "opens a folder in the file manager"
+    },
+    "reveal_path": {
+      "gui": "opens a folder in the file manager"
+    },
+    "revert_instance": {
+      "cli": "instance revert"
+    },
+    "rollback_official_plugin": {
+      "cli": "plugin official rollback"
+    },
+    "run_governance_diagnostics": {
+      "cli": "governance diagnostics"
+    },
+    "run_plugin_command": {
+      "gap": "running a plugin command"
+    },
+    "run_plugin_diagnostic": {
+      "gap": "plugin diagnostics"
+    },
+    "run_plugin_launch_checks": {
+      "gap": "plugin launch checks"
+    },
+    "run_runtime_prune": {
+      "cli": "runtime remove-unused"
+    },
+    "run_version_migration": {
+      "gap": "moving an instance to another Minecraft version"
+    },
+    "save_lockfile_export": {
+      "cli": "lockfile export"
+    },
+    "scan_runtime_prune": {
+      "cli": "runtime remove-unused"
+    },
+    "search_modrinth": {
+      "cli": "mod search"
+    },
+    "set_cape": {
+      "cli": "skin cape"
+    },
+    "set_content_provider_enabled": {
+      "cli": "provider enable"
+    },
+    "set_content_sharing": {
+      "gap": "content sharing settings"
+    },
+    "set_custom_instance_icon": {
+      "gui": "instance icon"
+    },
+    "set_custom_mod_icon": {
+      "gui": "mod icon"
+    },
+    "set_datapack_worlds": {
+      "gap": "choosing a data pack's worlds"
+    },
+    "set_instance_group": {
+      "cli": "instance group"
+    },
+    "set_instance_launch_hooks": {
+      "cli": "instance hooks"
+    },
+    "set_instance_notes": {
+      "cli": "instance notes"
+    },
+    "set_instance_sharing": {
+      "cli": "instance share"
+    },
+    "set_instance_window_size": {
+      "cli": "instance window"
+    },
+    "set_instance_wrapper_command": {
+      "cli": "instance wrapper"
+    },
+    "set_item_vote": {
+      "gap": "catalog voting"
+    },
+    "set_mcp_approval": {
+      "gui": "desktop MCP HTTP server approval"
+    },
+    "set_mod_group": {
+      "gui": "library grouping in the desktop"
+    },
+    "set_mod_update_pinned": {
+      "cli": "mod pin"
+    },
+    "set_plugin_enabled": {
+      "cli": "plugin enable"
+    },
+    "set_plugin_scripts_allowed": {
+      "cli": "plugin scripts"
+    },
+    "set_plugin_setting": {
+      "cli": "plugin set"
+    },
+    "set_plugins_emergency_stop": {
+      "cli": "plugin stop"
+    },
+    "set_proxy_setting": {
+      "cli": "proxy set"
+    },
+    "set_setting": {
+      "cli": "settings set"
+    },
+    "share_log": {
+      "cli": "log share"
+    },
+    "skin_library": {
+      "gap": "skin library"
+    },
+    "skin_profile": {
+      "cli": "skin show"
+    },
+    "start_bisect": {
+      "cli": "bisect start"
+    },
+    "start_mcp_server": {
+      "gui": "desktop MCP HTTP server (the CLI serves MCP over stdio)"
+    },
+    "start_plugins": {
+      "cli": "plugin resume"
+    },
+    "step_back_bisect": {
+      "cli": "bisect back"
+    },
+    "stop_mcp_server": {
+      "gui": "desktop MCP HTTP server"
+    },
+    "sync_instance_datapacks": {
+      "cli": "mod sync-datapacks"
+    },
+    "take_pending_cli_launch": {
+      "gui": "hands a CLI launch request to the open desktop"
+    },
+    "technic_pack_detail": {
+      "cli": "technic search"
+    },
+    "technic_search": {
+      "cli": "technic search"
+    },
+    "test_launcher_path": {
+      "gui": "settings screen check"
+    },
+    "uninstall_plugin": {
+      "cli": "plugin remove"
+    },
+    "unlink_shared_screenshots": {
+      "gui": "screenshot gallery"
+    },
+    "unlock_instance": {
+      "cli": "instance unlock"
+    },
+    "update_instance_java": {
+      "cli": "instance java"
+    },
+    "update_instance_jvm": {
+      "cli": "instance java"
+    },
+    "update_instance_template": {
+      "gap": "editing a template"
+    },
+    "update_loadout_profile": {
+      "cli": "loadout update"
+    },
+    "update_official_plugin": {
+      "cli": "plugin official update"
+    },
+    "update_server": {
+      "gap": "editing a server"
+    },
+    "verify_lockfile": {
+      "cli": "lockfile verify"
+    },
+    "wear_saved_skin": {
+      "cli": "skin wear"
+    }
+  }
+}
