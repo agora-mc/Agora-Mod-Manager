@@ -2196,7 +2196,11 @@ fn repairing_refuses_a_base_that_is_its_own_source_and_leaves_the_file_alone() {
     let mut manifest: agora_core::game_base::BaseManifest =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
     manifest.source_location = location.clone();
-    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
 
     let error = repair_framework(&paths, &base_id, &framework).unwrap_err();
     assert!(

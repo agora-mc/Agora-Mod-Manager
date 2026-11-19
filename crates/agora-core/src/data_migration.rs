@@ -357,7 +357,9 @@ impl DataMigrationService {
             if !destination.is_file() {
                 continue;
             }
-            let target = backup_root.join("overwritten").join(Path::new(&entry.rel_path));
+            let target = backup_root
+                .join("overwritten")
+                .join(Path::new(&entry.rel_path));
             if let Err(e) = copy_file_same_volume(&destination, &target) {
                 let _ = std::fs::remove_dir_all(&backup_root);
                 return Err(LauncherError::MigrationFailed {
@@ -509,14 +511,14 @@ impl DataMigrationService {
         if overwritten.exists() {
             let mut folders = vec![overwritten.clone()];
             while let Some(folder) = folders.pop() {
-                for entry in std::fs::read_dir(&folder).map_err(|e| {
-                    LauncherError::MigrationFailed {
+                for entry in
+                    std::fs::read_dir(&folder).map_err(|e| LauncherError::MigrationFailed {
                         message: format!(
                             "Failed to read backup folder {} during restore: {e}",
                             folder.display()
                         ),
-                    }
-                })? {
+                    })?
+                {
                     let entry = entry.map_err(|e| LauncherError::MigrationFailed {
                         message: format!(
                             "Failed to read a backup entry in {} during restore: {e}",
@@ -1192,7 +1194,10 @@ mod tests {
         fs::write(dst.join("cache/data.bin"), b"old cache").unwrap();
 
         let result = svc.execute(&src).unwrap();
-        assert_eq!(std::fs::read(dst.join("settings.json")).unwrap(), b"new settings");
+        assert_eq!(
+            std::fs::read(dst.join("settings.json")).unwrap(),
+            b"new settings"
+        );
         assert_eq!(
             std::fs::read(dst.join("cache/data.bin")).unwrap(),
             b"new cache"

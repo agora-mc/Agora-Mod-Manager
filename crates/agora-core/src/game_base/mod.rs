@@ -1587,10 +1587,7 @@ pub fn instances_pinning_base(paths: &AppPaths, base_id: &str) -> Result<Vec<Str
 /// The instances in Recently deleted whose entry is still restorable and whose base record names
 /// `base_id`. An entry that cannot be read is an error: a caller about to delete a base must not
 /// take "I could not tell" as "nothing pins it".
-fn trash_instances_pinning_base(
-    paths: &AppPaths,
-    base_id: &str,
-) -> Result<Vec<String>, BaseError> {
+fn trash_instances_pinning_base(paths: &AppPaths, base_id: &str) -> Result<Vec<String>, BaseError> {
     let root = paths.recently_deleted_games_root();
     let read = match std::fs::read_dir(&root) {
         Ok(read) => read,

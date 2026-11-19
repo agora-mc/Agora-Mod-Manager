@@ -1622,7 +1622,19 @@ async fn github_source(
 /// is told the file is unverified and can install anyway), never a mismatch. A bare digest with no
 /// algorithm is treated as SHA-256, as GitHub's API used to return it.
 fn published_sha256(digest: Option<&str>) -> Option<String> {
-    digest.map(|digest| digest.strip_prefix("sha256:").unwrap_or(digest).to_string())
+    let digest = digest?.trim();
+    if digest.is_empty() {
+        return None;
+    }
+    let (algorithm, value) = match digest.split_once(':') {
+        Some((algorithm, value)) => (Some(algorithm), value),
+        None => (None, digest),
+    };
+    if algorithm.is_some_and(|algorithm| !algorithm.eq_ignore_ascii_case("sha256")) {
+        return None;
+    }
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_ascii_lowercase())
 }
 
 fn direct_source(item: &GameCatalogItem, source: &DownloadSource) -> LauncherResult<PlannedSource> {

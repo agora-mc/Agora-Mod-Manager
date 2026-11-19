@@ -7188,6 +7188,10 @@ fn recovery_waits_for_an_external_tool_the_swap_recorded() {
         }
         other => panic!("expected a refusal while the external tool runs, got {other:?}"),
     }
-    assert_eq!(snapshot(&real_data(&f)), before, "the real Data was moved back");
+    assert_eq!(
+        snapshot(&real_data(&f)),
+        before,
+        "the real Data was moved back"
+    );
     assert!(journal_file(&f).exists());
 }
