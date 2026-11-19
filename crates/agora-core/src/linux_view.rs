@@ -383,10 +383,7 @@ mod linux_impl {
             // The fuse daemon is the only mount helper, and the parent finds its mount by the
             // exact mount point field. `mountinfo` escapes spaces and friends, so the probe uses
             // the same escaping.
-            let mut probe = Vec::new();
-            probe.push(b' ');
-            probe.extend(mountinfo_escaped(request.target.as_os_str().as_bytes()));
-            probe.push(b' ');
+            let probe = mountinfo_escaped(request.target.as_os_str().as_bytes());
             Ok(Prepared {
                 refuse,
                 refuse_kernel,
@@ -897,11 +894,14 @@ mod linux_impl {
             unsafe { c::execve(program.as_ptr(), argv.as_ptr(), prepared.envp_ptr.as_ptr()) };
             unsafe { c::_exit(126) };
         }
+        // A mount that was already there (a stale mount from a failed daemon, or the target
+        // named as another line's root) must not be mistaken for this daemon's mount.
+        let before = mount_count(&prepared.fuse_mountinfo_probe);
         // The daemon was started with the status pipe open; it must not keep it open.
         // The parent's write fd is close-on-exec and closes in the daemon on exec, but
         // the daemon inherits the same number. Nothing here depends on the pipe ending.
         for _ in 0..200 {
-            if mount_visible(&prepared.fuse_mountinfo_probe) {
+            if mount_count(&prepared.fuse_mountinfo_probe) > before {
                 return Ok(daemon);
             }
             let delay = c::timespec {
@@ -918,21 +918,22 @@ mod linux_impl {
         Err(FuseFailure::Timeout)
     }
 
-    /// Whether the child's own mount table has a mount point exactly equal to `probe`, which
-    /// begins and ends with a space. Reads `/proc/self/mountinfo` with raw syscalls into a
-    /// stack buffer. A match that spans two reads is found by keeping the tail.
-    fn mount_visible(probe: &[u8]) -> bool {
+    /// How many mounts of `target` (already escaped as in `mountinfo`) the child's own mount
+    /// table has. Reads `/proc/self/mountinfo` with raw syscalls into a stack buffer. A line that
+    /// spans two reads is found by keeping the tail. Comparing this before and after starting the
+    /// daemon proves a NEW mount appeared.
+    fn mount_count(target: &[u8]) -> usize {
         let path = b"/proc/self/mountinfo\0";
         let fd = unsafe { c::open(path.as_ptr() as *const _, c::O_RDONLY | c::O_CLOEXEC) };
         if fd < 0 {
-            return false;
+            return 0;
         }
         let mut buffer = [0u8; 64 * 1024];
-        let keep = probe.len().saturating_sub(1);
         let mut filled = 0;
-        let found = loop {
+        let mut count = 0;
+        loop {
             if filled >= buffer.len() {
-                break false;
+                break;
             }
             let read = unsafe {
                 c::read(
@@ -941,35 +942,71 @@ mod linux_impl {
                     buffer.len() - filled,
                 )
             };
-            if read <= 0 {
-                break false;
+            if read < 0 {
+                if last_errno() == c::EINTR {
+                    continue;
+                }
+                break;
+            }
+            if read == 0 {
+                break;
             }
             filled += read as usize;
-            if contains(&buffer[..filled], probe) {
-                break true;
-            }
-            if keep > 0 && filled > keep {
+            // Count only complete lines now, and slide the last partial line to the front so a
+            // mount entry split across two reads is counted once, on the next pass.
+            let complete = buffer[..filled]
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map(|at| at + 1)
+                .unwrap_or(0);
+            count += count_mount_lines(&buffer[..complete], target);
+            let tail = filled - complete;
+            if tail > 0 {
                 unsafe {
-                    std::ptr::copy(
-                        buffer[filled - keep..filled].as_ptr(),
-                        buffer.as_mut_ptr(),
-                        keep,
-                    );
+                    std::ptr::copy(buffer[complete..].as_ptr(), buffer.as_mut_ptr(), tail);
                 }
-                filled = keep;
             }
-        };
+            filled = tail;
+        }
+        count += count_mount_lines(&buffer[..filled], target);
         unsafe { c::close(fd) };
-        found
+        count
     }
 
-    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-        if needle.is_empty() {
-            return true;
+    /// Count lines whose mount point is `target` and whose file system type is an overlay the
+    /// wrapper could have mounted. A name in the root field, or a different file system, is not
+    /// the daemon's mount even when the bytes are otherwise identical.
+    fn count_mount_lines(text: &[u8], target: &[u8]) -> usize {
+        if target.is_empty() {
+            return 0;
         }
-        haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
+        text.split(|byte| *byte == b'\n')
+            .filter(|line| mount_line_matches(line, target))
+            .count()
+    }
+
+    fn mount_line_matches(line: &[u8], target: &[u8]) -> bool {
+        if target.is_empty() {
+            return false;
+        }
+        // `/proc/self/mountinfo` is space separated; fields holding a path escape their spaces
+        // as `\040`, so splitting on a literal space is safe.
+        let mut fields = line.split(|byte| *byte == b' ');
+        // Field 5 (index 4) is the mount point. A target in field 4 (the root) is unrelated.
+        if fields.nth(4) != Some(target) {
+            return false;
+        }
+        // The fstype is the field after the bare `-` separator.
+        let fstype = loop {
+            match fields.next() {
+                Some(b"-") => break fields.next(),
+                Some(_) => continue,
+                None => return false,
+            }
+        };
+        fstype.is_some_and(|fs| {
+            fs == b"fuse.fuse-overlayfs" || fs == b"fuse.overlay" || fs == b"overlay"
+        })
     }
 
     fn read_message(fd: RawFd) -> Result<Message, String> {
@@ -1040,14 +1077,6 @@ mod linux_impl {
     mod tests {
         use super::*;
 
-        fn probe(target: &str) -> Vec<u8> {
-            let mut probe = Vec::new();
-            probe.push(b' ');
-            probe.extend(mountinfo_escaped(target.as_bytes()));
-            probe.push(b' ');
-            probe
-        }
-
         #[test]
         fn mountinfo_escapes_every_character_the_kernel_escapes() {
             assert_eq!(
@@ -1057,15 +1086,41 @@ mod linux_impl {
         }
 
         #[test]
+        fn a_pre_existing_or_wrong_fstype_mount_is_not_counted() {
+            let target = b"/games/A\\040Game";
+            // A stale fuse mount left by a failed daemon still has the target as its mount point.
+            let stale = b"36 35 98:0 / /games/A\\040Game rw - fuse.fuse-overlayfs lowerdir=x rw\n";
+            // The target named as another line's ROOT is not a mount of the target.
+            let root = b"37 35 98:0 /games/A\\040Game /elsewhere rw - ext4 /dev/sda1 rw\n";
+            // Same mount point, but a different file system: not the fuse daemon's mount.
+            let other_fs = b"38 35 98:0 / /games/A\\040Game rw - ext4 /dev/sda1 rw\n";
+            let before = [stale.as_slice(), root.as_slice(), other_fs.as_slice()].concat();
+            assert_eq!(
+                count_mount_lines(&before, target),
+                1,
+                "only the stale fuse mount of the target counts"
+            );
+            let mut after = before.clone();
+            after.extend_from_slice(
+                b"39 35 0:47 / /games/A\\040Game rw - fuse.fuse-overlayfs lowerdir=y rw\n",
+            );
+            assert_eq!(
+                count_mount_lines(&after, target),
+                2,
+                "a new fuse mount of the target adds exactly one"
+            );
+        }
+
+        #[test]
         fn a_folder_with_a_space_is_found_by_its_escaped_mountinfo_field() {
             // The format `/proc/self/mountinfo` writes, with the mount point in field 5.
             let mountinfo =
                 b"36 35 98:0 / /games/A\\040Game rw,relatime - fuse.overlay /games/A\\040Game rw\n";
-            assert!(contains(mountinfo, &probe("/games/A Game")));
+            assert_eq!(count_mount_lines(mountinfo, b"/games/A\\040Game"), 1);
             // The unescaped path is what the old check looked for, and it never matches.
-            assert!(!contains(mountinfo, b" /games/A Game "));
+            assert_eq!(count_mount_lines(mountinfo, b"/games/A Game"), 0);
             // A sibling whose name merely starts the same is not the mount.
-            assert!(!contains(mountinfo, &probe("/games/A Game Two")));
+            assert_eq!(count_mount_lines(mountinfo, b"/games/A\\040Game Two"), 0);
         }
     }
 }
