@@ -1265,3 +1265,97 @@ fn restoring_a_deleted_instance_under_a_new_id_restores_its_load_order_rules() {
         .unwrap();
     assert_eq!(got, 1, "rules restored under the new id");
 }
+
+
+#[test]
+fn stop_finds_and_stops_a_session_recorded_only_in_the_ledger() {
+    use agora_core::session_ledger::{self, LaunchManifest, Owner};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    let f = Fixture::new();
+    write_instance(&f.ctx, &manifest("grounded-1", "Grounded"));
+    let mut child = if cfg!(windows) {
+        Command::new("cmd")
+            .args(["/C", "ping -n 60 127.0.0.1 > nul"])
+            .spawn()
+            .expect("spawn sleeper")
+    } else {
+        Command::new("sh")
+            .args(["-c", "sleep 60"])
+            .spawn()
+            .expect("spawn sleeper")
+    };
+    let pid = child.id();
+    let mut system = sysinfo::System::new();
+    let spid = sysinfo::Pid::from_u32(pid);
+    system.refresh_process(spid);
+    let started = system.process(spid).expect("child process").start_time();
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).expect("db");
+    session_ledger::begin(
+        &conn,
+        "grounded-1",
+        "2026-01-01T00:00:00Z",
+        &LaunchManifest::default(),
+        Owner { pid, started },
+    )
+    .expect("open ledger session");
+    drop(conn);
+
+    let stopped = game_instance::stop(&f.ctx, "grounded-1", &definition()).expect("stop");
+    assert_eq!(stopped.instance_id, "grounded-1");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            other => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("ledger-only session process was not stopped: {other:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_ledger_only_session_end_records_playtime_once() {
+    use agora_core::session_ledger::{self, LaunchManifest, Owner};
+    use agora_game_api::crash::ExitObservation;
+
+    let f = Fixture::new();
+    write_instance(&f.ctx, &manifest("grounded-1", "Grounded"));
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).expect("db");
+    let session_id = session_ledger::begin(
+        &conn,
+        "grounded-1",
+        "2026-01-01T00:00:00Z",
+        &LaunchManifest::default(),
+        Owner::current(),
+    )
+    .expect("session");
+    drop(conn);
+
+    let report = agora_core::game_launch::SessionExitReport {
+        processes: Vec::new(),
+        relaunched_outside: false,
+        exit: ExitObservation::unavailable("ended"),
+        game_runtime_ms: Some(120_000),
+    };
+    let v1 = session_ledger::record_end(&f.ctx, &session_id, &definition(), &report, 120_000);
+    assert!(v1.is_some(), "first end should close the session");
+    let stats = game_instance::play_stats(&f.ctx, "grounded-1").expect("stats");
+    assert!(
+        stats.total_play_ms >= 120_000,
+        "playtime not recorded: {stats:?}"
+    );
+
+    let v2 = session_ledger::record_end(&f.ctx, &session_id, &definition(), &report, 120_000);
+    assert!(v2.is_none(), "second end must not re-close");
+    let stats2 = game_instance::play_stats(&f.ctx, "grounded-1").expect("stats");
+    assert_eq!(
+        stats2.total_play_ms, stats.total_play_ms,
+        "playtime double-counted"
+    );
+}
