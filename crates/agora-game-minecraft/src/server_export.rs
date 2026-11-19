@@ -1425,9 +1425,11 @@ fn commit_staging(staging: &Path, dest: &Path) -> LauncherResult<()> {
                     ),
                 });
             }
-            std::fs::remove_dir_all(dest).map_err(|e| LauncherError::Generic {
-                code: "ERR_EXPORT_MKDIR".into(),
-                message: format!("Failed to clear destination: {e}"),
+            // remove_dir, not remove_dir_all: if anything appeared since the emptiness check,
+            // this fails instead of deleting it.
+            std::fs::remove_dir(dest).map_err(|e| LauncherError::Generic {
+                code: "ERR_EXPORT_DEST_NOT_EMPTY".into(),
+                message: format!("Failed to replace the empty destination: {e}"),
             })?;
         } else {
             return Err(LauncherError::Generic {
