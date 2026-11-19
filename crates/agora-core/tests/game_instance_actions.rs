@@ -1039,6 +1039,41 @@ fn purge_all_is_scoped_to_one_game() {
 }
 
 #[test]
+fn purge_for_game_takes_one_entry_or_every_entry_of_that_game() {
+    let f = Fixture::new();
+    write_instance(&f.ctx, &manifest("sky-1", "Sky"));
+    write_instance(&f.ctx, &manifest("sky-2", "Sky two"));
+    let mut other = manifest("grounded-1", "Grounded");
+    other.game = GameId::new("grounded").expect("a game id");
+    write_instance(&f.ctx, &other);
+    let first = game_instance::delete(&f.ctx, "sky-1")
+        .expect("the first delete")
+        .trash_entry_id
+        .expect("an entry");
+    game_instance::delete(&f.ctx, "sky-2").expect("the second delete");
+    game_instance::delete(&f.ctx, "grounded-1").expect("the third delete");
+
+    let (trash, _seen) = fake_trash();
+    let one = trash::purge_for_game(&f.ctx, "skyrim-se", Some(&first), &trash).expect("one");
+    assert_eq!(
+        one,
+        PurgeSummary {
+            purged: 1,
+            failed: 0,
+            kept: 0
+        }
+    );
+    assert_eq!(trash::list(&f.ctx, "skyrim-se").len(), 1);
+
+    let all = trash::purge_for_game(&f.ctx, "skyrim-se", None, &trash).expect("all");
+    assert_eq!(all.purged, 1);
+    assert!(trash::list(&f.ctx, "skyrim-se").is_empty());
+    assert_eq!(trash::list(&f.ctx, "grounded").len(), 1);
+
+    assert!(trash::purge_for_game(&f.ctx, "skyrim-se", Some("no-such-entry"), &trash).is_err());
+}
+
+#[test]
 fn a_restore_cut_off_after_the_move_is_finished_by_recovery() {
     let f = Fixture::new();
     write_instance(&f.ctx, &manifest("grounded-1", "Grounded"));

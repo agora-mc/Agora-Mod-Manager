@@ -6840,6 +6840,40 @@ fn a_choice_outside_the_list_is_refused() {
 }
 
 #[test]
+fn a_blank_saved_input_clears_the_stored_value() {
+    let mut t = tool("nemesis", "Nemesis", &["/c", "exit", "0"]);
+    t.inputs = vec![input("profile", ToolInputKind::Text, "--profile")];
+    let f = fixture(vec![t]);
+    let id = ToolId::new("nemesis").unwrap();
+    game_tools::save_tool_input(&f.ctx, f.id(), &f.def, &id, "profile", "fast").unwrap();
+    let stored = game_tools::read_tool_inputs(&f.ctx, f.id()).unwrap();
+    assert_eq!(
+        stored
+            .get("nemesis")
+            .and_then(|values| values.get("profile")),
+        Some(&"fast".to_string())
+    );
+
+    game_tools::save_tool_input(&f.ctx, f.id(), &f.def, &id, "profile", "  ").unwrap();
+    let stored = game_tools::read_tool_inputs(&f.ctx, f.id()).unwrap();
+    assert!(!stored.contains_key("nemesis"), "{stored:?}");
+}
+
+#[test]
+fn a_user_tools_outputs_are_listed_under_the_tool_it_runs_as() {
+    let f = fixture(vec![writes_or_fails("known")]);
+    let json = r#"{"version":1,"tools":[{"id":"mine","name":"Known","exe":"Game.exe","args":[],"known_tool_id":"known"},{"id":"own","name":"Own","exe":"Game.exe","args":[],"known_tool_id":"gone"}]}"#;
+    std::fs::write(f.instance_dir().join("user_tools.json"), json).unwrap();
+
+    let known = game_tools::user_tool_output_id(&f.ctx, f.id(), &f.def, "mine").unwrap();
+    assert_eq!(known.as_str(), "known");
+    // A declared tool the game no longer has falls back to the user tool's own id.
+    let own = game_tools::user_tool_output_id(&f.ctx, f.id(), &f.def, "own").unwrap();
+    assert_eq!(own, game_tools::user_tool_id("own").unwrap());
+    assert!(game_tools::user_tool_output_id(&f.ctx, f.id(), &f.def, "missing").is_err());
+}
+
+#[test]
 fn input_files_ignores_other_content_changes() {
     let mut t = tool("nemesis", "Nemesis", &["/c", "exit", "0"]);
     t.input_files = vec!["mods/A/*".into()];

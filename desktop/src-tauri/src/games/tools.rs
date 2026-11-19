@@ -622,13 +622,8 @@ pub async fn games_tools_save_inputs(
     with_ctx(app, move |ctx| {
         let game = definition_of(&ctx, &instance_id)?;
         for (input_id, value) in values {
-            if value.trim().is_empty() {
-                game_tools::clear_tool_input(&ctx, &instance_id, &tool, &input_id)
-                    .map_err(core_error)?;
-            } else {
-                game_tools::set_tool_input(&ctx, &instance_id, &game, &tool, &input_id, &value)
-                    .map_err(core_error)?;
-            }
+            game_tools::save_tool_input(&ctx, &instance_id, &game, &tool, &input_id, &value)
+                .map_err(core_error)?;
         }
         Ok(())
     })
@@ -971,23 +966,17 @@ pub async fn games_user_tools_run(
 
 fn user_tool_tool_id(ctx: &Ctx, instance_id: &str, id: &str) -> Result<ToolId, GamesError> {
     let game = definition_of(ctx, instance_id)?;
-    let user = game_user_tools::list(ctx, instance_id)
+    if !game_user_tools::list(ctx, instance_id)
         .map_err(core_error)?
-        .into_iter()
-        .find(|tool| tool.id == id)
-        .ok_or_else(|| {
-            GamesError::new(NOT_FOUND, format!("The instance has no user tool '{id}'."))
-        })?;
-    // A tool that names a declared tool records its output under that declared id, so list the same
-    // id rather than the user-tool namespace.
-    if let Some(known) = user.known_tool_id.as_deref() {
-        if let Ok(tool_id) = ToolId::new(known) {
-            if ctx.games.tool(&game.id, &tool_id).is_some() {
-                return Ok(tool_id);
-            }
-        }
+        .iter()
+        .any(|tool| tool.id == id)
+    {
+        return Err(GamesError::new(
+            NOT_FOUND,
+            format!("The instance has no user tool '{id}'."),
+        ));
     }
-    game_tools::user_tool_id(&user.id).map_err(core_error)
+    game_tools::user_tool_output_id(ctx, instance_id, &game, id).map_err(core_error)
 }
 
 /// A user tool's earlier mod outputs, newest last.

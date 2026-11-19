@@ -21,6 +21,7 @@ use agora_game_minecraft::loader_service::LoaderService;
 use agora_game_minecraft::runtime_service::RuntimeService;
 
 mod cli_discovery;
+mod cli_games_parity;
 mod cli_govniche;
 mod cli_network;
 mod cli_official;
@@ -839,6 +840,67 @@ enum GameInstanceCmd {
         #[command(subcommand)]
         action: InstanceToolsCmd,
     },
+    /// Give an instance a new name. Its ID and folder stay the same.
+    Rename {
+        /// Instance ID.
+        instance_id: String,
+        /// The new name.
+        name: String,
+    },
+    /// Make a new instance with the same mods, plugin order, INI files and settings.
+    Clone {
+        /// Instance ID to copy.
+        instance_id: String,
+        /// Name of the new instance.
+        name: String,
+        /// Copy the saves too. Without it the new instance starts with no saves of its own.
+        #[arg(long)]
+        copy_saves: bool,
+    },
+    /// Close the game Agora started for an instance, and end its session as usual.
+    Stop {
+        /// Instance ID.
+        instance_id: String,
+    },
+    /// List a game's instances in Recently deleted, newest first.
+    Deleted {
+        /// Game ID, e.g. skyrim-se.
+        game: String,
+    },
+    /// Bring a deleted instance back from Recently deleted.
+    Restore {
+        /// Entry ID, from `games instance deleted`.
+        entry_id: String,
+        /// Restore it under this new name, e.g. when its old ID is taken again.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Send a deleted instance, or all of a game's deleted instances, to the OS trash now. Agora
+    /// cannot restore them after this.
+    Purge {
+        /// Game ID, e.g. skyrim-se.
+        game: String,
+        /// Entry ID, from `games instance deleted`. Without it, every deleted instance of the game.
+        entry_id: Option<String>,
+        /// Skip the confirmation prompt. Needed when there is no terminal to ask in.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Back up an instance's saves, list the backups, or put one back.
+    SaveBackup {
+        #[command(subcommand)]
+        action: cli_games_parity::SaveBackupCmd,
+    },
+    /// Read and change the INI files the instance's mods ship, as your own copy.
+    ModIni {
+        #[command(subcommand)]
+        action: cli_games_parity::ModIniCmd,
+    },
+    /// Programs you add to an instance yourself, run like a game's tools.
+    UserTools {
+        #[command(subcommand)]
+        action: cli_games_parity::UserToolsCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -889,6 +951,34 @@ enum InstanceToolsCmd {
         /// Tool ID, e.g. nemesis.
         tool: String,
     },
+    /// List a mod-writing tool's earlier outputs, newest last.
+    Outputs {
+        /// Instance ID.
+        instance_id: String,
+        /// Tool ID.
+        tool: String,
+    },
+    /// Use one of a tool's earlier outputs again.
+    UseOutput {
+        /// Instance ID.
+        instance_id: String,
+        /// Tool ID.
+        tool: String,
+        /// The output's item ID, from `tools outputs`.
+        item_id: String,
+    },
+    /// Save a value for one of a tool's inputs. Leave the value out (or empty) to clear it, so
+    /// the input's default applies again.
+    SetInput {
+        /// Instance ID.
+        instance_id: String,
+        /// Tool ID.
+        tool: String,
+        /// The input's ID.
+        input_id: String,
+        /// The value to save.
+        value: Option<String>,
+    },
 }
 
 impl InstanceToolsCmd {
@@ -898,7 +988,10 @@ impl InstanceToolsCmd {
             | InstanceToolsCmd::Run { instance_id, .. }
             | InstanceToolsCmd::Rollback { instance_id, .. }
             | InstanceToolsCmd::Remove { instance_id, .. }
-            | InstanceToolsCmd::Diff { instance_id, .. } => instance_id,
+            | InstanceToolsCmd::Diff { instance_id, .. }
+            | InstanceToolsCmd::Outputs { instance_id, .. }
+            | InstanceToolsCmd::UseOutput { instance_id, .. }
+            | InstanceToolsCmd::SetInput { instance_id, .. } => instance_id,
         }
     }
 }
@@ -9631,6 +9724,35 @@ async fn run_command(
                 GameInstanceCmd::Tools { action } => {
                     instance_tools_command(ctx, json, action)?;
                 }
+                GameInstanceCmd::Rename { instance_id, name } => {
+                    cli_games_parity::rename(ctx, json, &instance_id, &name)?
+                }
+                GameInstanceCmd::Clone {
+                    instance_id,
+                    name,
+                    copy_saves,
+                } => cli_games_parity::clone(ctx, json, &instance_id, &name, copy_saves)?,
+                GameInstanceCmd::Stop { instance_id } => {
+                    cli_games_parity::stop(ctx, json, &instance_id)?
+                }
+                GameInstanceCmd::Deleted { game } => cli_games_parity::deleted(ctx, json, &game)?,
+                GameInstanceCmd::Restore { entry_id, name } => {
+                    cli_games_parity::restore(ctx, json, &entry_id, name.as_deref())?
+                }
+                GameInstanceCmd::Purge {
+                    game,
+                    entry_id,
+                    yes,
+                } => cli_games_parity::purge(ctx, json, &game, entry_id.as_deref(), yes)?,
+                GameInstanceCmd::SaveBackup { action } => {
+                    cli_games_parity::save_backup_command(ctx, json, action)?
+                }
+                GameInstanceCmd::ModIni { action } => {
+                    cli_games_parity::mod_ini_command(ctx, json, action)?
+                }
+                GameInstanceCmd::UserTools { action } => {
+                    cli_games_parity::user_tools_command(ctx, json, action)?
+                }
                 GameInstanceCmd::Saves {
                     instance_id,
                     choice,
@@ -11847,6 +11969,26 @@ fn instance_tools_command(
                 }
             }
         }
+        InstanceToolsCmd::Outputs { tool, .. } => {
+            cli_games_parity::tool_outputs(ctx, json, &instance_id, &tool)?
+        }
+        InstanceToolsCmd::UseOutput { tool, item_id, .. } => {
+            cli_games_parity::tool_use_output(ctx, json, &instance_id, game_def, &tool, &item_id)?
+        }
+        InstanceToolsCmd::SetInput {
+            tool,
+            input_id,
+            value,
+            ..
+        } => cli_games_parity::tool_set_input(
+            ctx,
+            json,
+            &instance_id,
+            game_def,
+            &tool,
+            &input_id,
+            value.as_deref(),
+        )?,
     }
     Ok(())
 }
