@@ -436,3 +436,108 @@ fn a_lingering_log_occurrence_across_session_windows_is_used_once() {
         ),
     }
 }
+
+fn facts_only_pack() -> BuiltInPack {
+    BuiltInPack {
+        file: "test/facts-only/pack.json".to_string(),
+        json: serde_json::json!({
+            "contract": 1,
+            "games": ["test-game"],
+            "sources": [{
+                "id": "facts_log",
+                "where": { "root": "instance", "path": "logs" },
+                "match": { "glob": "facts-*.log" },
+                "format": "probe",
+                "bind": [{ "time": { "before_s": 2, "after_s": 10 } }],
+                "role": "primary",
+                "copy": "facts_only"
+            }],
+            "parsers": [{
+                "id": "probe",
+                "detect": { "all": ["(?m)^ERRORS$"] },
+                "entry": { "generic": { "name": "text_sections", "config": {
+                    "producer": { "format": "probe_log" },
+                    "sections": [{
+                        "id": "errors",
+                        "header": "^ERRORS$",
+                        "kind": "core.exception",
+                        "lines": [{
+                            "pattern": "^(?P<category>\\w+) (?P<mod>\\S+)$",
+                            "attrs": { "category": "category" },
+                            "refs": [{ "kind": "module", "value": "mod", "strength": "exec" }]
+                        }]
+                    }]
+                } } }
+            }],
+            "rules": []
+        })
+        .to_string(),
+        parsers: Vec::new(),
+    }
+}
+
+/// A facts-only artifact is parsed in place and contributes to diagnosis, but its raw file is never
+/// copied into the evidence store.
+#[test]
+fn a_facts_only_artifact_contributes_without_being_copied() {
+    let fixture = Fixture::new();
+    let conn = fixture.conn();
+    let now = SystemTime::now();
+    let pack = facts_only_pack();
+
+    let started = now - Duration::from_secs(2 * 3600);
+    let ended = started + Duration::from_secs(30);
+    let path = fixture.logs_dir.join("facts-crash.log");
+    std::fs::write(&path, "ERRORS\naccess_violation Mod.dll\n").unwrap();
+    set_modified(&path, started + Duration::from_secs(5));
+    let session = begin(&conn, started, Owner::current());
+    session_ledger::finish(
+        &conn,
+        &session,
+        &SessionFinish {
+            ended_at: chrono::DateTime::<chrono::Utc>::from(ended).to_rfc3339(),
+            duration_ms: 30_000,
+            exit: ExitObservation::Code {
+                pid: 5555,
+                image: "Game.exe".to_string(),
+                code: 0xC000_0005,
+            },
+            game_runtime_ms: Some(30_000),
+            normal_exit_codes: vec![0],
+            artifact: None,
+            froze: false,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let answer = agora_core::crash_live::diagnose_session(
+        &fixture.ctx,
+        &session,
+        fixture.live(std::slice::from_ref(&pack)),
+    )
+    .expect("facts-only session is diagnosable");
+
+    match answer.answer {
+        StoredAnswer::Analyzed { .. } => {}
+        other => panic!("facts-only artifact should contribute to diagnosis: {other:?}"),
+    }
+
+    // The raw evidence must not be copied to the store.
+    let session_dir = fixture
+        .ctx
+        .paths
+        .root()
+        .join(agora_core::crash_engine::evidence::EVIDENCE_STORE_DIR)
+        .join(&session);
+    if session_dir.exists() {
+        let mut count = 0usize;
+        for entry in std::fs::read_dir(&session_dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                count += 1;
+            }
+        }
+        assert_eq!(count, 0, "facts-only raw file must not be copied: {session_dir:?}");
+    }
+}

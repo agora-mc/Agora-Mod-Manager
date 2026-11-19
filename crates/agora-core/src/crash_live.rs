@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use agora_game_api::crash::{
-    Artifact, AttrValue, BuiltInPack, CrashAnswer, Fact, GameHandle, MatchedBy, ParserLimits,
+    Artifact, AttrValue, BuiltInPack, CopyPolicy, CrashAnswer, Fact, GameHandle, MatchedBy, ParserLimits,
     Reads, RefMap, RoleRule, Scalar, SessionVerdict, SourceRole, DETECT_HEAD_BYTES,
 };
 use agora_game_api::GamePath;
@@ -1657,7 +1657,9 @@ fn diagnose_record(
     let copied = copied.map_err(|error| format!("the evidence could not be copied: {error}"))?;
     let normal_stop = log_shows_normal_stop(&collection, &game_packs, Some(&copied));
 
-    let files = readable_files(&copied);
+    let mut files = readable_files(&copied);
+    files.sort_by(|left, right| left.name.cmp(&right.name));
+    files.dedup_by(|left, right| left.name == right.name && left.source == right.source);
     if files.is_empty() {
         return Ok(Diagnosed {
             answer: StoredAnswer::NothingToRead {
@@ -1962,6 +1964,28 @@ fn nothing_to_read(
         why.push_str(" Every folder a source names was empty, missing or unreadable.");
     }
     why
+}
+
+/// Bound facts-only file artifacts read in place for diagnosis. The raw file is never copied to the
+/// store; only the parsed facts flow into diagnosis.
+fn facts_only_files(collection: &SourceCollection) -> Vec<CrashFile> {
+    collection
+        .bound
+        .iter()
+        .filter(|found| {
+            found.unit == agora_game_api::crash::ArtifactUnit::File
+                && found.copy == CopyPolicy::FactsOnly
+        })
+        .filter_map(|found| {
+            let bytes = read_for_parsing(&found.path)?;
+            Some(CrashFile {
+                name: found.name.clone(),
+                bytes,
+                origin: crate::crash_engine::CrashFileOrigin::Collected,
+                source: Some(found.source_id.clone()),
+            })
+        })
+        .collect()
 }
 
 fn readable_files(copied: &CopiedSession) -> Vec<CrashFile> {
