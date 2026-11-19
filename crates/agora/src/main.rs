@@ -11867,6 +11867,24 @@ fn print_vortex_run(report: &agora_core::game_import::vortex::VortexRunReport) {
     );
 }
 
+/// The CLI's reading of the shared dispatch: a Steam hand-off ends the command, an ordinary route
+/// falls through to the normal launch, and a failed hand-off is an error (the ordinary path cannot
+/// start a Steam game either).
+#[cfg(target_os = "linux")]
+fn cli_dispatch_outcome(
+    result: Result<agora_core::game_wrap::PlatformLaunch, agora_core::game_wrap::WrapError>,
+) -> Result<
+    Option<agora_core::game_discovery::steam::SteamLaunchStatus>,
+    agora_core::game_wrap::WrapError,
+> {
+    use agora_core::game_wrap::PlatformLaunch;
+    match result {
+        Ok(PlatformLaunch::Steam(status)) => Ok(Some(status)),
+        Ok(PlatformLaunch::Ordinary) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// `games instance launch` on Linux: Steam starts the game, so Agora records what it asked for
 /// and hands the request to Steam. The `games wrap` it starts does the rest. A non-Steam instance
 /// returns `None` and the ordinary launch path runs it. A Steam instance that cannot be handed to
@@ -11878,24 +11896,25 @@ fn cli_linux_launch(
     instance_id: &str,
     json: bool,
 ) -> anyhow::Result<Option<i32>> {
-    use agora_core::game_wrap::{dispatch_launch, LaunchPlatform, PlatformLaunch};
-    let status = match dispatch_launch(ctx, instance_id, LaunchPlatform::Native) {
-        Ok(PlatformLaunch::Steam(status)) => status,
-        Ok(PlatformLaunch::Ordinary) => return Ok(None),
-        Err(error) => {
-            if json {
-                let out = serde_json::json!({
-                    "status": "error",
-                    "error": error.to_string(),
-                    "exitCode": 1,
-                });
-                eprintln!("{}", serde_json::to_string_pretty(&out)?);
-            } else {
-                eprintln!("Error: {error}");
+    use agora_core::game_wrap::{dispatch_launch, LaunchPlatform};
+    let status =
+        match cli_dispatch_outcome(dispatch_launch(ctx, instance_id, LaunchPlatform::Native)) {
+            Ok(Some(status)) => status,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                if json {
+                    let out = serde_json::json!({
+                        "status": "error",
+                        "error": error.to_string(),
+                        "exitCode": 1,
+                    });
+                    eprintln!("{}", serde_json::to_string_pretty(&out)?);
+                } else {
+                    eprintln!("Error: {error}");
+                }
+                return Ok(Some(1));
             }
-            return Ok(Some(1));
-        }
-    };
+        };
 
     if json {
         let out = serde_json::json!({
@@ -17262,18 +17281,32 @@ mod tests {
     }
 
     /// A Steam instance that cannot reach Steam must not be handed to the ordinary launch: that
-    /// path cannot start it. Only a non-Steam instance falls back.
+    /// path cannot start it. Only the dispatch's ordinary route falls through.
     #[cfg(target_os = "linux")]
     #[test]
-    fn only_a_non_steam_instance_falls_back_from_a_failed_steam_handoff() {
-        use agora_core::game_wrap::WrapError;
-        assert!(super::steam_failure_falls_back(&WrapError::NotSteam(
-            "gog".into()
-        )));
-        assert!(!super::steam_failure_falls_back(&WrapError::SteamMissing));
-        assert!(!super::steam_failure_falls_back(
-            &WrapError::InstallNotFound("skyrim".into())
-        ));
+    fn only_an_ordinary_dispatch_falls_through_to_the_cli_launch() {
+        use agora_core::game_discovery::steam::SteamLaunchStatus;
+        use agora_core::game_wrap::{PlatformLaunch, WrapError};
+        let ordinary = super::cli_dispatch_outcome(Ok(PlatformLaunch::Ordinary));
+        assert!(ordinary
+            .expect("an ordinary route is not an error")
+            .is_none());
+        let steam = super::cli_dispatch_outcome(Ok(PlatformLaunch::Steam(SteamLaunchStatus {
+            app_id: "4242".into(),
+            expected: "agora games wrap %command%".into(),
+            configured: None,
+            wrapper_present: true,
+            files: Vec::new(),
+            problems: Vec::new(),
+            launcher: "fake steam".into(),
+        })));
+        assert!(steam
+            .expect("a Steam hand-off ends the CLI launch")
+            .is_some());
+        assert!(super::cli_dispatch_outcome(Err(WrapError::SteamMissing)).is_err());
+        assert!(
+            super::cli_dispatch_outcome(Err(WrapError::InstallNotFound("skyrim".into()))).is_err()
+        );
     }
 
     #[test]
