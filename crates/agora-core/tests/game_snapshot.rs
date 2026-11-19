@@ -754,6 +754,9 @@ fn a_backup_with_bytes_round_trips_into_an_empty_data_folder() {
     // one so the deploy plan has somewhere to read it from.
     let base_dir = ctx.paths.bases_dir().join(base_id);
     std::fs::create_dir_all(&base_dir).unwrap();
+    // The install the base was built from is machine-local and separate from the base folder.
+    let source_dir = empty.path().join("install");
+    std::fs::create_dir_all(&source_dir).unwrap();
     let base_manifest = agora_core::game_base::BaseManifest {
         manifest_version: 1,
         base_id: base_id.to_string(),
@@ -761,7 +764,7 @@ fn a_backup_with_bytes_round_trips_into_an_empty_data_folder() {
         mode: agora_game_api::BaseMode::Linked,
         source_install: InstallId::new("steam:489830").unwrap(),
         source_product: None,
-        source_location: base_dir.clone(),
+        source_location: source_dir,
         location: base_dir,
         created_unix_ms: 0,
         files: Vec::new(),
