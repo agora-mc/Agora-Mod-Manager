@@ -77,7 +77,13 @@ pub fn answer(input: &AnswerInput<'_>) -> CrashAnswer {
         finding.level = finding.level.min(cap);
     }
     if not_a_crash {
-        findings.retain(|finding| finding.candidate.is_none());
+        findings.retain(|finding| {
+            finding.candidate.is_none()
+                || matches!(
+                    finding.cause,
+                    Cause::VersionMismatch | Cause::MissingRequirement | Cause::File
+                )
+        });
     }
     let findings = clean_findings(findings);
 
@@ -87,7 +93,7 @@ pub fn answer(input: &AnswerInput<'_>) -> CrashAnswer {
     let top_candidate_level = candidates.first().map_or(Level::NotSure, |top| top.level);
     let strongest = findings
         .iter()
-        .filter(|finding| finding.level > Level::NotSure)
+        .filter(|finding| finding.level > Level::NotSure || not_a_crash)
         .min_by_key(|finding| {
             (
                 std::cmp::Reverse(finding.level),
@@ -96,6 +102,9 @@ pub fn answer(input: &AnswerInput<'_>) -> CrashAnswer {
             )
         });
     let finding_wins = strongest.is_some_and(|finding| {
+        if not_a_crash {
+            return true;
+        }
         // A strong tie between suspects is the answer, not a gap another finding may fill: a
         // merely possible finding of another kind must not overwrite it. A weak abstention makes
         // no such claim, so a stronger finding there may still lead. A finding at least `Likely`
@@ -124,14 +133,17 @@ pub fn answer(input: &AnswerInput<'_>) -> CrashAnswer {
     };
 
     let headline = match strongest.filter(|_| finding_wins) {
-        Some(finding) if closed_unknown => english(&format!(
-            "The game ended, and Agora cannot tell whether this was a crash. {}",
-            finding
-                .headline
-                .get("en")
-                .map(String::as_str)
-                .unwrap_or_default()
-        )),
+        Some(finding) if closed_unknown => {
+            let caveat = "The game ended, and Agora cannot tell whether this was a crash.";
+            let mut words = LocalText::new();
+            for (locale, text) in &finding.headline {
+                words.insert(locale.clone(), format!("{caveat} {text}"));
+            }
+            if words.is_empty() {
+                words.insert("en".to_string(), caveat.to_string());
+            }
+            words
+        }
         Some(finding) => finding.headline.clone(),
         None => headline(
             input.verdict,

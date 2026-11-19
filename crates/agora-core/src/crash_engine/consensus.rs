@@ -165,6 +165,9 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
         });
     }
 
+    // Core ranks; a boost only breaks an exact core tie. A candidate needs a non-boost clue,
+    // and its total must at least reach the abstention floor.
+    scored.retain(|candidate| candidate.core > 0 && candidate.score >= profile.abstain_below);
     let has_own_evidence = scored
         .iter()
         .any(|candidate| !candidate.demoted && candidate.core > 0);
@@ -172,9 +175,6 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
         // A hook framework or framework keeps its signal only when nothing else has its own.
         scored.retain(|candidate| !candidate.demoted);
     }
-    // Core ranks; a boost only breaks an exact core tie. A candidate needs a non-boost clue,
-    // and its total must at least reach the abstention floor.
-    scored.retain(|candidate| candidate.core > 0 && candidate.score >= profile.abstain_below);
     scored.sort_by(|a, b| {
         b.core
             .cmp(&a.core)
@@ -208,6 +208,10 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
 
     let top = &scored[0];
     let second = scored.get(1);
+    let core_lead: i64 = match second {
+        Some(second) => i64::from(top.core) - i64::from(second.core),
+        None => i64::MAX,
+    };
     // The lead uses the total score, so a boost on the runner-up can make it negative.
     let lead: i64 = match second {
         Some(second) => i64::from(top.score) - i64::from(second.score),
@@ -237,8 +241,9 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
         Level::NotSure
     };
     // A decisive family may skip the lead margin, but not an actual tie.
-    let lead_ok =
-        second.is_none() || lead >= i64::from(profile.medium.lead_min) || (decisive && lead > 0);
+    let lead_ok = second.is_none()
+        || lead >= i64::from(profile.medium.lead_min)
+        || (decisive && (core_lead > 0 || lead > 0));
     if !lead_ok {
         level = Level::NotSure;
     }
@@ -297,4 +302,130 @@ fn scale(score: u32, permille: u32) -> u32 {
     }
     let scaled = (u64::from(score) * u64::from(permille)).div_ceil(1000);
     scaled as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agora_game_api::crash::{Family, Owner, Role, Signal, SourceAttribution};
+
+    fn test_source() -> SourceAttribution {
+        SourceAttribution {
+            plugin_id: "test".to_string(),
+            plugin_name: "test".to_string(),
+            plugin_version: "1.0".to_string(),
+            rule_id: None,
+            rule_version: None,
+            parser_id: None,
+        }
+    }
+
+    #[test]
+    fn test_weak_stray_mod_does_not_evict_framework_suspect() {
+        let framework = Owner::Framework {
+            name: "skse".to_string(),
+        };
+        let stray = Owner::Item {
+            key: "stray".to_string(),
+            name: "Stray".to_string(),
+        };
+
+        let signals = vec![
+            Signal {
+                family: Family::KnownSignature,
+                candidate: framework.clone(),
+                weight: 20,
+                cause: None,
+                also_provided_by: Vec::new(),
+                source: test_source(),
+                evidence: Vec::new(),
+            },
+            Signal {
+                family: Family::Execution,
+                candidate: stray.clone(),
+                weight: 2,
+                cause: None,
+                also_provided_by: Vec::new(),
+                source: test_source(),
+                evidence: Vec::new(),
+            },
+        ];
+
+        let mut roles = BTreeMap::new();
+        roles.insert(owner_key(&framework), Role::Framework);
+
+        let input = ConsensusInput {
+            signals: &signals,
+            roles: &roles,
+            level_caps: &[],
+        };
+        let profile = ConsensusProfile::default();
+        let output = consensus(&input, &profile);
+
+        assert!(
+            !output.candidates.is_empty(),
+            "framework suspect must not be evicted by weak stray mod"
+        );
+        assert!(!output.abstained);
+        assert_eq!(output.candidates[0].owner, framework);
+    }
+
+    #[test]
+    fn test_runner_up_boost_does_not_veto_decisive_verdict() {
+        let decisive_winner = Owner::Item {
+            key: "mod-a".to_string(),
+            name: "Mod A".to_string(),
+        };
+        let boosted_runner_up = Owner::Item {
+            key: "mod-b".to_string(),
+            name: "Mod B".to_string(),
+        };
+
+        let signals = vec![
+            Signal {
+                family: Family::DecisiveVerdict,
+                candidate: decisive_winner.clone(),
+                weight: 14,
+                cause: None,
+                also_provided_by: Vec::new(),
+                source: test_source(),
+                evidence: Vec::new(),
+            },
+            // Runner-up with core 8 + boost 10 = score 18
+            Signal {
+                family: Family::Execution,
+                candidate: boosted_runner_up.clone(),
+                weight: 8,
+                cause: None,
+                also_provided_by: Vec::new(),
+                source: test_source(),
+                evidence: Vec::new(),
+            },
+            Signal {
+                family: Family::ChangeCorrelation,
+                candidate: boosted_runner_up.clone(),
+                weight: 10,
+                cause: None,
+                also_provided_by: Vec::new(),
+                source: test_source(),
+                evidence: Vec::new(),
+            },
+        ];
+
+        let input = ConsensusInput {
+            signals: &signals,
+            roles: &BTreeMap::new(),
+            level_caps: &[],
+        };
+        let profile = ConsensusProfile::default();
+        let output = consensus(&input, &profile);
+
+        assert_eq!(output.candidates[0].owner, decisive_winner);
+        assert_eq!(
+            output.level,
+            Level::VeryLikely,
+            "runner-up boost should not veto decisive verdict when winner has core lead"
+        );
+        assert!(!output.abstained);
+    }
 }

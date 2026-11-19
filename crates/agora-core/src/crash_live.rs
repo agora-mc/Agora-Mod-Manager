@@ -1725,6 +1725,9 @@ fn diagnose_record(
         },
         &engine_facts,
         &changes,
+        effective_verdict.unwrap_or(SessionVerdict::Crashed {
+            how: MatchedBy::Supplied,
+        }),
         history_input.as_ref(),
     )
     .map_err(|error| format!("the crash analysis failed: {error}"))?;

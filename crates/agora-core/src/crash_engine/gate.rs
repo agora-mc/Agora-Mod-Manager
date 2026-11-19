@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agora_game_api::crash::BuiltInPack;
+use agora_game_api::crash::{BuiltInPack, CodeEntry, CrashPack, ParserDecl, Reads};
 use agora_plugin_api::error::PluginResult;
 use agora_plugin_api::host::{ActivationRequest, GameReads, HostBridge, ScriptHost, ScriptReads};
 use agora_plugin_api::manifest::PluginId;
@@ -43,7 +43,7 @@ pub fn names_a_crash(
         source: None,
     }];
     let host = NoHost;
-    match analyze(&AnalyzeInput {
+    if let Ok(output) = analyze(&AnalyzeInput {
         packs: &all,
         files: &files,
         runtime_version,
@@ -51,14 +51,49 @@ pub fn names_a_crash(
         built_in,
         instance: None,
     }) {
-        Ok(output) => {
-            // A finding means a rule recognised something in the text, even when the answer
-            // deliberately caps it at "not sure" because nobody was named.
-            output.read_any()
-                && (!output.answer.candidates.is_empty() || !output.answer.findings.is_empty())
+        // A finding means a rule recognised something in the text, even when the answer
+        // deliberately caps it at "not sure" because nobody was named.
+        if output.read_any()
+            && (!output.answer.candidates.is_empty() || !output.answer.findings.is_empty())
+        {
+            return true;
         }
-        Err(_) => false,
     }
+
+    all.iter()
+        .any(|pack| hosted_primary_names_a_crash(pack, file_name, text))
+}
+
+fn hosted_primary_names_a_crash(pack: &LoadedCrashPack, file_name: &str, text: &str) -> bool {
+    let parsers: Vec<ParserDecl> = pack
+        .pack
+        .parsers
+        .iter()
+        .filter(|parser| {
+            parser.reads == Reads::Primary
+                && matches!(
+                    parser.entry,
+                    CodeEntry::Script { .. } | CodeEntry::Wasm { .. }
+                )
+        })
+        .cloned()
+        .collect();
+    if parsers.is_empty() {
+        return false;
+    }
+    let hosted = CrashPack {
+        contract: pack.pack.contract,
+        games: Vec::new(),
+        sources: Vec::new(),
+        parsers,
+        inspectors: Vec::new(),
+        ref_maps: Vec::new(),
+        roles: Vec::new(),
+        save_risk: None,
+        rules: Vec::new(),
+    };
+    crate::crash_packs::detect_parsers(&hosted, file_name, text.as_bytes())
+        .is_ok_and(|matched| !matched.is_empty())
 }
 
 /// A gate runs only parsers compiled into the binary; a script parser has no host here.
@@ -141,5 +176,98 @@ impl ScriptHost for NoHost {
 
     fn active_plugins(&self) -> Vec<PluginId> {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agora_game_api::crash::{
+        CodeEntry, CrashPack, Detect, ParserDecl, ParserLimits, Reads, CRASH_CONTRACT_VERSION,
+    };
+
+    fn pack_with_parser(id: &str, entry: CodeEntry, detect: Detect) -> LoadedCrashPack {
+        LoadedCrashPack {
+            plugin_id: "test.plugin".to_string(),
+            plugin_name: "Test Plugin".to_string(),
+            plugin_version: "1.0".to_string(),
+            dependencies: Vec::new(),
+            official: true,
+            file: "crash/pack.json".to_string(),
+            pack: CrashPack {
+                contract: CRASH_CONTRACT_VERSION,
+                games: vec!["test-game".to_string()],
+                sources: Vec::new(),
+                parsers: vec![ParserDecl {
+                    id: id.to_string(),
+                    reads: Reads::Primary,
+                    detect,
+                    entry,
+                    limits: Some(ParserLimits::DEFAULT),
+                }],
+                inspectors: Vec::new(),
+                ref_maps: Vec::new(),
+                roles: Vec::new(),
+                save_risk: None,
+                rules: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_hosted_primary_detection_recognises_a_crash_log_without_a_script_host() {
+        let crash_logger = pack_with_parser(
+            "crash_logger",
+            CodeEntry::Script {
+                export: "parseCrashLogger".to_string(),
+            },
+            Detect {
+                name_glob: None,
+                all: vec!["(?m)^CrashLoggerSSE v".to_string()],
+                any: vec!["(?m)^Unhandled exception ".to_string()],
+                magic_hex: None,
+            },
+        );
+
+        let crash_text = "CRASH TIME: 2026-03-01 12:00:00\nSkyrim SSE v1.6.1170\nCrashLoggerSSE v1-20-1-0 Mar  1 2026 00:00:00\n\nUnhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x7FF700001000 ExampleGame.exe+001000\n";
+        assert!(
+            names_a_crash(
+                crash_text,
+                "crash-2026-03-01.log",
+                std::slice::from_ref(&crash_logger),
+                &[],
+                None
+            ),
+            "a hosted primary parser's declared detect must let the gate name a crash"
+        );
+
+        let normal_text = "SKSE64 runtime: initialize (version = 2.2.6)\nimagebase = 00007FF712340000\nloading plugin \"ExampleLoaded\"\n";
+        assert!(
+            !names_a_crash(normal_text, "skse64.log", &[crash_logger], &[], None),
+            "normal log must not be recognised as a crash"
+        );
+
+        let built_in_like = pack_with_parser(
+            "captured_launch",
+            CodeEntry::BuiltIn {
+                name: "captured_launch".to_string(),
+            },
+            Detect {
+                name_glob: None,
+                all: Vec::new(),
+                any: vec!["(?m)^\\[stdout\\] ".to_string()],
+                magic_hex: None,
+            },
+        );
+        assert!(
+            !names_a_crash(
+                "[stdout] [01:02:03] [main/INFO]: Done.\n",
+                "agora-launch-output.log",
+                &[built_in_like],
+                &[],
+                None
+            ),
+            "a built-in parser's broad format detect must not set the launch flag"
+        );
     }
 }

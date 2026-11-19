@@ -16,8 +16,8 @@ use agora_core::crash_history::{self, HistorySetup, LogSweepLimits, PreparedHist
 use agora_core::crash_packs::{load_plugin_packs, LoadedCrashPack};
 use agora_core::game_script::instance_reads;
 use agora_game_api::crash::{
-    CodeEntry, CouldNotCheck, CouldNotCheckReason, GameHandle, LocalText, RefMap, RoleRule,
-    SaveRiskLabel,
+    CodeEntry, CouldNotCheck, CouldNotCheckReason, GameHandle, LocalText, MatchedBy, RefMap,
+    RoleRule, SaveRiskLabel, SessionVerdict,
 };
 use agora_plugin_api::host::{ActivationRequest, GameReads, ScriptHost};
 use agora_plugin_api::manifest::PluginId;
@@ -476,6 +476,9 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
                 },
                 &[],
                 &[],
+                SessionVerdict::Crashed {
+                    how: MatchedBy::Supplied,
+                },
                 history_input.as_ref(),
             )?);
         }
@@ -532,6 +535,9 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
         },
         &[],
         &[],
+        SessionVerdict::Crashed {
+            how: MatchedBy::Supplied,
+        },
         history_input.as_ref(),
     )?;
     add_history_notes(

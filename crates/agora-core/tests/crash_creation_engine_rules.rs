@@ -7,7 +7,7 @@ use agora_core::crash_engine::{
     analyze, analyze_with_history, AnalyzeInput, AnalyzeOutput, CrashFile,
 };
 use agora_core::crash_packs::{load_plugin_packs, LoadedCrashPack};
-use agora_game_api::crash::{Cause, Level, Owner};
+use agora_game_api::crash::{Cause, Level, MatchedBy, Owner, SessionVerdict};
 use agora_plugin_api::host::{ActivationRequest, HostBridge, ScriptHost};
 use agora_plugin_api::manifest::{PluginId, PluginManifest};
 use agora_plugin_api::protocol::{HostRequest, HostResponse, LogLevel};
@@ -659,6 +659,9 @@ fn a_save_load_crash_after_a_settings_change_points_at_the_change() {
         },
         &facts,
         std::slice::from_ref(&change),
+        SessionVerdict::Crashed {
+            how: MatchedBy::Supplied,
+        },
         None,
     )
     .unwrap();

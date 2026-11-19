@@ -3,11 +3,12 @@
 
 use super::*;
 use agora_game_api::crash::{
-    ActionOffer, AttrMatch, AttrValue, Cause, Condition, CouldNotCheck, CouldNotCheckReason,
-    CountQuery, Coverage, CoverageState, Effect, EvidenceLine, Fact, FactQuery, Family, Finding,
-    InspectResult, InspectionRecord, Level, LocalText, MatchOps, NextStepKind, ParseNoteKind, Ref,
-    RepairOffer, RepairRequest, ResolvedRepair, Role, Rule, RuleText, Scalar, Scope, Signal,
-    SourceAttribution, SourceSpan, Strength, TextMatch, TrustNote, Truth,
+    compile_rule_regex, ActionOffer, AttrMatch, AttrValue, Cause, Condition, CouldNotCheck,
+    CouldNotCheckReason, CountQuery, Coverage, CoverageState, Effect, EvidenceLine, Fact,
+    FactQuery, Family, Finding, InspectResult, InspectionRecord, Level, LocalText, MatchOps,
+    NextStepKind, ParseNoteKind, Ref, RepairOffer, RepairRequest, ResolvedRepair, Role, Rule,
+    RuleText, Scalar, Scope, Signal, SourceAttribution, SourceSpan, Strength, TextMatch, TrustNote,
+    Truth,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -666,7 +667,7 @@ fn attr_unknown_reason(entry: &FactEntry, name: &str, test: &AttrMatch) -> Could
         return CouldNotCheckReason::NotCovered;
     };
     if let Some(pattern) = &ops.regex {
-        if regex::Regex::new(pattern).is_err() {
+        if compile_rule_regex(pattern).is_err() {
             return CouldNotCheckReason::CodeFailed;
         }
     }
@@ -994,7 +995,7 @@ fn eval_text(text: &TextMatch, view: &View, limit: usize, bindings: &Bindings) -
             },
         };
     }
-    let regex = match regex::Regex::new(&text.regex) {
+    let regex = match compile_rule_regex(&text.regex) {
         Ok(regex) => regex,
         Err(_) => {
             return EvalResult {
@@ -1131,7 +1132,7 @@ fn eval_whole_file(text: &TextMatch, view: &View, limit: usize, bindings: &Bindi
             overflow: false,
         };
     }
-    let regex = match regex::Regex::new(&text.regex) {
+    let regex = match compile_rule_regex(&text.regex) {
         Ok(regex) => regex,
         Err(_) => {
             return EvalResult {
@@ -1423,7 +1424,7 @@ fn scalar_ops(scalar: &Scalar, ops: &MatchOps, bindings: &Bindings) -> Truth {
         let Some(text) = text else {
             return Truth::False;
         };
-        match regex::Regex::new(pattern) {
+        match compile_rule_regex(pattern) {
             Ok(regex) => {
                 truth = truth.and(if regex.is_match(text) {
                     Truth::True
@@ -2038,7 +2039,7 @@ fn condition_bad_regex(condition: &Condition) -> Option<String> {
             return None;
         };
         let pattern = ops.regex.as_ref()?;
-        regex::Regex::new(pattern)
+        compile_rule_regex(pattern)
             .err()
             .map(|error| format!("a crash rule's pattern `{pattern}` is invalid: {error}"))
     }
@@ -2061,7 +2062,7 @@ fn condition_bad_regex(condition: &Condition) -> Option<String> {
                 .and_then(|reference| reference.value.as_ref())
                 .and_then(check_test)
         }),
-        Condition::Text(text) => regex::Regex::new(&text.regex).err().map(|error| {
+        Condition::Text(text) => compile_rule_regex(&text.regex).err().map(|error| {
             format!(
                 "a crash rule's pattern `{}` is invalid: {error}",
                 text.regex
@@ -2408,7 +2409,7 @@ fn substitute(template: &str, branch: &Branch, resolver: &dyn RefResolver) -> St
     out
 }
 
-fn bucket_predates_change(facts: &[Fact]) -> bool {
+pub(crate) fn bucket_predates_change(facts: &[Fact]) -> bool {
     facts
         .iter()
         .filter(|fact| fact.kind == "core.history")
