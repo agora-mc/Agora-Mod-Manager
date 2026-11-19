@@ -487,7 +487,7 @@ The Tauri app checks `SELECT version FROM schema_version` on startup. If the cac
 The Tauri app tracks the currently cached `registry.db` release tag (e.g., `registry-2026-06-15`) in its local settings store. The update check runs:
 - On every app startup (if online).
 - When the user manually clicks **"Check for Registry Update"** in Settings.
-- No more than once per hour to avoid GitHub API quota waste.
+- No more than once per hour after a successful check or update to avoid GitHub API quota waste; after a failed download, verification, or install, automatic retries wait only 5 minutes and never report `"Catalog is up to date."` while a known newer catalog failed to install.
 
 **Update Check Flow:**
 1. Query GitHub Releases API (`GET /repos/{owner}/{repo}/releases?per_page=100&page=N`, capped at 10 pages) and select the newest non-draft, non-prerelease release whose tag matches `registry-YYYY-MM-DD` and carries `registry.bundle` (ignoring desktop `v*` and official plugin `official-*` releases; never `/releases/latest`). If none qualifies, report `"No catalog release found."` rather than `"up to date"`.

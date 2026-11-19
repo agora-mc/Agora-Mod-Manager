@@ -71,8 +71,12 @@ const fn parse_schema_version(text: &str) -> i64 {
     value
 }
 
-/// Minimum interval between automatic update checks (1 hour).
+/// Minimum interval between automatic update checks after a successful check or install (1 hour).
 const UPDATE_CHECK_INTERVAL_SECS: i64 = 3600;
+/// Shorter cooldown after a failed update attempt (5 minutes): avoids hammering
+/// GitHub if a UI mount or restart loop occurs, while recovering promptly from
+/// transient network or asset glitches instead of waiting an hour.
+const FAILED_UPDATE_RETRY_INTERVAL_SECS: i64 = 300;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -166,10 +170,29 @@ async fn check_and_download_update_inner(
     let cached = cached_catalog_summary_with_trust(app_data_dir, trust);
     let has_cached_db = cached.is_some();
     let cached_schema_version = cached.as_ref().and_then(|summary| summary.schema_version);
+    let failed_tag = get_failed_update_tag(local_state_path)?;
 
-    if !force {
-        if let Some(last_check) = get_last_check_time(local_state_path)? {
-            if now - last_check < UPDATE_CHECK_INTERVAL_SECS && cached_tag.is_some() {
+    if !force && has_cached_db && cached_tag.is_some() {
+        if let Some(failed_tag_name) = failed_tag.as_ref() {
+            if let Some(last_failure) = get_last_failure_time(local_state_path)? {
+                if now - last_failure < FAILED_UPDATE_RETRY_INTERVAL_SECS {
+                    return Ok(RegistryStatus {
+                        has_cached_db,
+                        cached_tag,
+                        cached_schema_version,
+                        latest_tag: Some(failed_tag_name.clone()),
+                        update_available: true,
+                        checked: false,
+                        stale: cached.as_ref().is_some_and(|summary| summary.stale),
+                        expires_at: cached.and_then(|summary| summary.expires_at),
+                        message: format!(
+                            "Catalog update to {failed_tag_name} failed recently; retrying soon."
+                        ),
+                    });
+                }
+            }
+        } else if let Some(last_success) = get_last_success_time(local_state_path)? {
+            if now - last_success < UPDATE_CHECK_INTERVAL_SECS {
                 return Ok(RegistryStatus {
                     has_cached_db,
                     cached_tag,
@@ -209,8 +232,8 @@ async fn check_and_download_update_inner(
                     has_cached_db,
                     cached_tag,
                     cached_schema_version,
-                    latest_tag: None,
-                    update_available: false,
+                    latest_tag: failed_tag.clone(),
+                    update_available: failed_tag.is_some(),
                     checked: false,
                     stale: cached.as_ref().is_some_and(|summary| summary.stale),
                     expires_at: cached.and_then(|summary| summary.expires_at),
@@ -239,6 +262,8 @@ async fn check_and_download_update_inner(
     );
 
     if !update_available && has_cached_db {
+        clear_update_failure(local_state_path)?;
+        set_last_success_time(local_state_path, now)?;
         let cached = cached_catalog_summary_with_trust(app_data_dir, trust);
         return Ok(RegistryStatus {
             has_cached_db,
@@ -256,90 +281,107 @@ async fn check_and_download_update_inner(
     // Register operation only when we are about to start network I/O.
     let _op = operation_manager.map(|m| m.register("Update registry"));
 
-    let bundle_id = latest
-        .find_asset("registry.bundle")
-        .ok_or_else(|| LauncherError::Generic {
-            code: "ERR_REGISTRY_NO_BUNDLE".into(),
-            message: format!(
-                "Release {} does not carry a signed catalog bundle (registry.bundle), so it \
-                 cannot be installed. The cached catalog has been kept.",
-                latest.tag_name
-            ),
-        })?;
+    let install_result: LauncherResult<(i64, String)> = async {
+        let bundle_id =
+            latest
+                .find_asset("registry.bundle")
+                .ok_or_else(|| LauncherError::Generic {
+                    code: "ERR_REGISTRY_NO_BUNDLE".into(),
+                    message: format!(
+                    "Release {} does not carry a signed catalog bundle (registry.bundle), so it \
+                     cannot be installed. The cached catalog has been kept.",
+                    latest.tag_name
+                ),
+                })?;
 
-    // Download via the GitHub Assets API endpoint, which 302-redirects to a
-    // signed URL. The `browser_download_url` returns 404 for this repo.
-    let bundle_url = format!(
-        "https://api.github.com/repos/{}/releases/assets/{}",
-        registry_repo, bundle_id
-    );
-    // A nightly change is usually a few KB against the catalog already here.
-    // Anything that does not line up falls back to the whole bundle.
-    let bundle_bytes = match bundle_from_delta(
-        app_data_dir,
-        &latest,
-        registry_repo,
-        github_token.as_deref(),
-        trust,
-        transport,
-    )
-    .await
-    {
-        Some(bytes) => bytes,
-        None => {
-            transport
-                .download_asset(&bundle_url, github_token.as_deref())
-                .await?
+        // Download via the GitHub Assets API endpoint, which 302-redirects to a
+        // signed URL. The `browser_download_url` returns 404 for this repo.
+        let bundle_url = format!(
+            "https://api.github.com/repos/{}/releases/assets/{}",
+            registry_repo, bundle_id
+        );
+        // A nightly change is usually a few KB against the catalog already here.
+        // Anything that does not line up falls back to the whole bundle.
+        let bundle_bytes = match bundle_from_delta(
+            app_data_dir,
+            &latest,
+            registry_repo,
+            github_token.as_deref(),
+            trust,
+            transport,
+        )
+        .await
+        {
+            Some(bytes) => bytes,
+            None => {
+                transport
+                    .download_asset(&bundle_url, github_token.as_deref())
+                    .await?
+            }
+        };
+
+        let verified =
+            registry_bundle::verify_bundle(&bundle_bytes, trust).map_err(bundle_error)?;
+
+        // Anti-rollback, checked only after the signature so the compared stamp is
+        // one the signing key vouched for. The tag pre-check above works on
+        // unsigned API metadata and can be forged; this cannot.
+        let candidate_built_at = Some(verified.header.built_at.clone());
+        let cached_built_at = read_cached_built_at_checked(app_data_dir, trust)?;
+        if is_rollback(cached_built_at.as_deref(), candidate_built_at.as_deref()) {
+            return Err(LauncherError::Generic {
+                code: "ERR_REGISTRY_ROLLBACK".into(),
+                message: format!(
+                    "Refusing registry {}: it was built at {}, older than the registry already \
+                     installed ({}). The cached registry has been kept.",
+                    latest.tag_name,
+                    candidate_built_at.as_deref().unwrap_or("unknown"),
+                    cached_built_at.as_deref().unwrap_or("unknown"),
+                ),
+            });
+        }
+
+        // An expired bundle is readable but never installed as current: doing so
+        // would replace a good cache with one that already cannot be used for an
+        // install or update.
+        if verified.header.is_expired_at(Utc::now()) {
+            return Err(LauncherError::Generic {
+                code: "ERR_REGISTRY_EXPIRED".into(),
+                message: format!(
+                    "Refusing registry {}: it expired at {}. The cached registry has been kept.",
+                    latest.tag_name, verified.header.expires_at
+                ),
+            });
+        }
+
+        let schema_version = verified.header.schema_version;
+        if schema_version > APP_REGISTRY_SCHEMA_VERSION {
+            return Err(LauncherError::Generic {
+                code: "ERR_REGISTRY_NEWER_SCHEMA".to_string(),
+                message: format!(
+                    "Catalog schema version {} is newer than supported {}. Please update the app.",
+                    schema_version, APP_REGISTRY_SCHEMA_VERSION
+                ),
+            });
+        }
+
+        install_bundle_bytes(app_data_dir, &verified.header, &bundle_bytes, trust)?;
+        set_cached_tag(local_state_path, &latest.tag_name)?;
+        set_cached_asset_id(local_state_path, Some(bundle_id))?;
+        Ok((schema_version, verified.header.expires_at))
+    }
+    .await;
+
+    let (schema_version, expires_at) = match install_result {
+        Ok(ok) => ok,
+        Err(error) => {
+            set_update_failure(local_state_path, now, &latest.tag_name)?;
+            return Err(error);
         }
     };
 
-    let verified = registry_bundle::verify_bundle(&bundle_bytes, trust).map_err(bundle_error)?;
-
-    // Anti-rollback, checked only after the signature so the compared stamp is
-    // one the signing key vouched for. The tag pre-check above works on
-    // unsigned API metadata and can be forged; this cannot.
-    let candidate_built_at = Some(verified.header.built_at.clone());
-    let cached_built_at = read_cached_built_at_checked(app_data_dir, trust)?;
-    if is_rollback(cached_built_at.as_deref(), candidate_built_at.as_deref()) {
-        return Err(LauncherError::Generic {
-            code: "ERR_REGISTRY_ROLLBACK".into(),
-            message: format!(
-                "Refusing registry {}: it was built at {}, older than the registry already \
-                 installed ({}). The cached registry has been kept.",
-                latest.tag_name,
-                candidate_built_at.as_deref().unwrap_or("unknown"),
-                cached_built_at.as_deref().unwrap_or("unknown"),
-            ),
-        });
-    }
-
-    // An expired bundle is readable but never installed as current: doing so
-    // would replace a good cache with one that already cannot be used for an
-    // install or update.
-    if verified.header.is_expired_at(Utc::now()) {
-        return Err(LauncherError::Generic {
-            code: "ERR_REGISTRY_EXPIRED".into(),
-            message: format!(
-                "Refusing registry {}: it expired at {}. The cached registry has been kept.",
-                latest.tag_name, verified.header.expires_at
-            ),
-        });
-    }
-
-    let schema_version = verified.header.schema_version;
-    if schema_version > APP_REGISTRY_SCHEMA_VERSION {
-        return Err(LauncherError::Generic {
-            code: "ERR_REGISTRY_NEWER_SCHEMA".to_string(),
-            message: format!(
-                "Catalog schema version {} is newer than supported {}. Please update the app.",
-                schema_version, APP_REGISTRY_SCHEMA_VERSION
-            ),
-        });
-    }
-
-    install_bundle_bytes(app_data_dir, &verified.header, &bundle_bytes, trust)?;
-    set_cached_tag(local_state_path, &latest.tag_name)?;
-    set_cached_asset_id(local_state_path, Some(bundle_id))?;
+    clear_update_failure(local_state_path)?;
+    set_last_success_time(local_state_path, now)?;
 
     if let Some(op) = _op {
         op.complete();
@@ -353,7 +395,7 @@ async fn check_and_download_update_inner(
         update_available: false,
         checked: true,
         stale: false,
-        expires_at: Some(verified.header.expires_at.clone()),
+        expires_at: Some(expires_at),
         message: format!("Catalog updated to {}.", latest.tag_name),
     })
 }
@@ -1139,10 +1181,6 @@ fn read_cached_built_at_checked(
     Ok(None)
 }
 
-fn cached_catalog_summary(app_data_dir: &Path) -> Option<CachedCatalogSummary> {
-    cached_catalog_summary_with_trust(app_data_dir, &RegistryTrust::production())
-}
-
 fn cached_catalog_summary_with_trust(
     app_data_dir: &Path,
     trust: &RegistryTrust,
@@ -1185,9 +1223,22 @@ pub fn verified_registry_digest(
 
 /// Return the current registry status without performing a network check.
 pub fn get_status(app_data_dir: &Path, local_state_path: &Path) -> RegistryStatus {
-    let cached = cached_catalog_summary(app_data_dir);
+    get_status_with_trust(app_data_dir, local_state_path, &RegistryTrust::production())
+}
+
+fn get_status_with_trust(
+    app_data_dir: &Path,
+    local_state_path: &Path,
+    trust: &RegistryTrust,
+) -> RegistryStatus {
+    let cached = cached_catalog_summary_with_trust(app_data_dir, trust);
     let has_cached_db = cached.is_some();
     let cached_tag = get_cached_tag(local_state_path).ok().flatten();
+    let failed_tag = if has_cached_db {
+        get_failed_update_tag(local_state_path).ok().flatten()
+    } else {
+        None
+    };
     let cached_schema_version = cached.as_ref().and_then(|summary| summary.schema_version);
     let stale = cached.as_ref().is_some_and(|summary| summary.stale);
     let expires_at = cached.and_then(|summary| summary.expires_at);
@@ -1195,8 +1246,8 @@ pub fn get_status(app_data_dir: &Path, local_state_path: &Path) -> RegistryStatu
         has_cached_db,
         cached_tag,
         cached_schema_version,
-        latest_tag: None,
-        update_available: false,
+        latest_tag: failed_tag.clone(),
+        update_available: failed_tag.is_some(),
         checked: false,
         stale,
         expires_at,
@@ -1204,6 +1255,8 @@ pub fn get_status(app_data_dir: &Path, local_state_path: &Path) -> RegistryStatu
             if stale {
                 "Using cached catalog. It is past its signed expiry; installs and updates are disabled until it refreshes."
                     .to_string()
+            } else if let Some(tag) = failed_tag {
+                format!("Using cached catalog; update to {tag} failed and will retry.")
             } else {
                 "Using cached catalog.".to_string()
             }
@@ -1836,6 +1889,7 @@ fn set_cached_asset_id(
         .map_err(|_| LauncherError::LocalStateFailed)
 }
 
+#[cfg(test)]
 fn get_last_check_time(local_state_path: &std::path::Path) -> LauncherResult<Option<i64>> {
     let conn = db::local_state_connection(local_state_path)
         .map_err(|_| LauncherError::LocalStateFailed)?;
@@ -1851,6 +1905,79 @@ fn set_last_check_time(local_state_path: &std::path::Path, timestamp: i64) -> La
         &conn,
         "last_registry_check",
         &serde_json::Value::Number(timestamp.into()),
+    )
+    .map_err(|_| LauncherError::LocalStateFailed)
+}
+
+fn get_last_success_time(local_state_path: &std::path::Path) -> LauncherResult<Option<i64>> {
+    let conn = db::local_state_connection(local_state_path)
+        .map_err(|_| LauncherError::LocalStateFailed)?;
+    db::get_setting(&conn, "last_registry_update_success")
+        .map_err(|_| LauncherError::LocalStateFailed)
+        .map(|v| v.and_then(|v| v.as_i64()))
+}
+
+fn set_last_success_time(local_state_path: &std::path::Path, timestamp: i64) -> LauncherResult<()> {
+    let conn = db::local_state_connection(local_state_path)
+        .map_err(|_| LauncherError::LocalStateFailed)?;
+    db::set_setting(
+        &conn,
+        "last_registry_update_success",
+        &serde_json::Value::Number(timestamp.into()),
+    )
+    .map_err(|_| LauncherError::LocalStateFailed)
+}
+
+fn get_last_failure_time(local_state_path: &std::path::Path) -> LauncherResult<Option<i64>> {
+    let conn = db::local_state_connection(local_state_path)
+        .map_err(|_| LauncherError::LocalStateFailed)?;
+    db::get_setting(&conn, "last_registry_update_failure")
+        .map_err(|_| LauncherError::LocalStateFailed)
+        .map(|v| v.and_then(|v| v.as_i64()))
+}
+
+fn get_failed_update_tag(local_state_path: &std::path::Path) -> LauncherResult<Option<String>> {
+    let conn = db::local_state_connection(local_state_path)
+        .map_err(|_| LauncherError::LocalStateFailed)?;
+    db::get_setting(&conn, "failed_registry_update_tag")
+        .map_err(|_| LauncherError::LocalStateFailed)
+        .map(|v| v.and_then(|v| v.as_str().map(|s| s.to_string())))
+}
+
+fn set_update_failure(
+    local_state_path: &std::path::Path,
+    timestamp: i64,
+    tag: &str,
+) -> LauncherResult<()> {
+    let conn = db::local_state_connection(local_state_path)
+        .map_err(|_| LauncherError::LocalStateFailed)?;
+    db::set_setting(
+        &conn,
+        "last_registry_update_failure",
+        &serde_json::Value::Number(timestamp.into()),
+    )
+    .map_err(|_| LauncherError::LocalStateFailed)?;
+    db::set_setting(
+        &conn,
+        "failed_registry_update_tag",
+        &serde_json::Value::String(tag.to_string()),
+    )
+    .map_err(|_| LauncherError::LocalStateFailed)
+}
+
+fn clear_update_failure(local_state_path: &std::path::Path) -> LauncherResult<()> {
+    let conn = db::local_state_connection(local_state_path)
+        .map_err(|_| LauncherError::LocalStateFailed)?;
+    db::set_setting(
+        &conn,
+        "last_registry_update_failure",
+        &serde_json::Value::Null,
+    )
+    .map_err(|_| LauncherError::LocalStateFailed)?;
+    db::set_setting(
+        &conn,
+        "failed_registry_update_tag",
+        &serde_json::Value::Null,
     )
     .map_err(|_| LauncherError::LocalStateFailed)
 }
@@ -2821,6 +2948,15 @@ v1 key deadbeef deadbeef deadbeef deadbeef
                 .or_default()
                 .push_back(Ok(bytes));
         }
+
+        fn push_asset_err(&self, asset_id: u64, err: LauncherError) {
+            self.assets
+                .lock()
+                .unwrap()
+                .entry(asset_id)
+                .or_default()
+                .push_back(Err(err));
+        }
     }
 
     #[async_trait::async_trait]
@@ -3150,5 +3286,164 @@ v1 key deadbeef deadbeef deadbeef deadbeef
             *transport.pages_requested.lock().unwrap(),
             (1..=MAX_RELEASE_PAGES).collect::<Vec<u32>>()
         );
+    }
+
+    #[tokio::test]
+    async fn failed_catalog_download_retries_sooner_and_never_claims_up_to_date() {
+        let (dir, ls_path, locks) = setup_sync_env();
+        let key = test_key(43);
+        let trust = RegistryTrust::with_key(test_public(&key));
+
+        let old_payload = sample_db_with_built_at("2026-11-17T02:00:00+00:00");
+        let old_header = header_for(
+            &key,
+            &old_payload,
+            "2026-11-17T02:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let old_bundle = signed_bundle(&key, &old_header, &old_payload);
+        install_bundle_bytes(dir.path(), &old_header, &old_bundle, &trust).unwrap();
+        set_cached_tag(&ls_path, "registry-2026-11-17").unwrap();
+        set_cached_asset_id(&ls_path, Some(2999)).unwrap();
+
+        let new_payload = sample_db_with_built_at("2026-11-18T02:00:00+00:00");
+        let new_header = header_for(
+            &key,
+            &new_payload,
+            "2026-11-18T02:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let new_bundle = signed_bundle(&key, &new_header, &new_payload);
+
+        let catalog_release = GitHubRelease {
+            tag_name: "registry-2026-11-18".into(),
+            draft: false,
+            prerelease: false,
+            assets: vec![GitHubAsset {
+                id: 5001,
+                name: "registry.bundle".into(),
+            }],
+        };
+        let transport = FakeRegistryTransport::from_pages(vec![(1, vec![catalog_release])]);
+        // First download fails, second returns corrupt bytes, third succeeds.
+        transport.push_asset_err(5001, LauncherError::RegistryDownloadFailed);
+        transport.push_asset_ok(5001, b"corrupt-bundle".to_vec());
+        transport.push_asset_ok(5001, new_bundle);
+
+        let err = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            false,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_000,
+        )
+        .await
+        .expect_err("first download fails");
+        assert!(matches!(err, LauncherError::RegistryDownloadFailed));
+        assert_eq!(get_last_check_time(&ls_path).unwrap(), Some(1_000_000));
+        assert_eq!(get_last_success_time(&ls_path).unwrap(), None);
+
+        let offline_status = get_status_with_trust(dir.path(), &ls_path, &trust);
+        assert!(offline_status.has_cached_db);
+        assert!(offline_status.update_available);
+        assert_eq!(
+            offline_status.latest_tag.as_deref(),
+            Some("registry-2026-11-18")
+        );
+        assert!(!offline_status
+            .message
+            .to_ascii_lowercase()
+            .contains("up to date"));
+
+        // 1 minute later (within retry cooldown): must NOT claim "Catalog is up to date."
+        let immediate_next = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            false,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_060,
+        )
+        .await
+        .expect("cooldown check returns status");
+        assert!(
+            !immediate_next
+                .message
+                .to_ascii_lowercase()
+                .contains("up to date"),
+            "must never claim 'up to date' while a known newer catalog failed to install: {}",
+            immediate_next.message
+        );
+        assert!(immediate_next.update_available);
+        assert_eq!(
+            immediate_next.latest_tag.as_deref(),
+            Some("registry-2026-11-18")
+        );
+
+        // 6 minutes later (well under 1 hour, past the 5-minute retry window):
+        // retries automatically; second attempt fails verification.
+        let verify_err = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            false,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_360,
+        )
+        .await
+        .expect_err("corrupt bundle must fail verification");
+        assert_eq!(verify_err.code(), "ERR_REGISTRY_BUNDLE_INVALID");
+
+        // 12 minutes later (still under 1 hour, past another 5-minute retry window):
+        // retries again and succeeds!
+        let retried = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            false,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_720,
+        )
+        .await
+        .expect("should retry after shorter failure interval and succeed");
+        assert_eq!(retried.cached_tag.as_deref(), Some("registry-2026-11-18"));
+        assert!(!retried.update_available);
+        assert!(retried.checked);
+
+        // 1 minute after the successful update: normal 1-hour throttle applies.
+        let after_success = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            false,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_780,
+        )
+        .await
+        .expect("post-success check should throttle cleanly");
+        assert!(!after_success.checked);
+        assert!(!after_success.update_available);
+        assert_eq!(after_success.message, "Catalog is up to date.");
     }
 }
