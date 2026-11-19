@@ -1409,15 +1409,34 @@ fn staging_dir_for(dest_dir: &Path) -> LauncherResult<PathBuf> {
 fn commit_staging(staging: &Path, dest: &Path) -> LauncherResult<()> {
     if dest.exists() {
         if dest.is_dir() {
+            let is_empty = std::fs::read_dir(dest)
+                .map_err(|e| LauncherError::Generic {
+                    code: "ERR_EXPORT_READDIR".into(),
+                    message: format!("Failed to read destination: {e}"),
+                })?
+                .next()
+                .is_none();
+            if !is_empty {
+                return Err(LauncherError::Generic {
+                    code: "ERR_EXPORT_DEST_NOT_EMPTY".into(),
+                    message: format!(
+                        "The export destination '{}' already contains files. Choose an empty or new folder.",
+                        dest.display()
+                    ),
+                });
+            }
             std::fs::remove_dir_all(dest).map_err(|e| LauncherError::Generic {
                 code: "ERR_EXPORT_MKDIR".into(),
                 message: format!("Failed to clear destination: {e}"),
             })?;
         } else {
-            std::fs::remove_file(dest).map_err(|e| LauncherError::Generic {
-                code: "ERR_EXPORT_MKDIR".into(),
-                message: format!("Failed to clear destination: {e}"),
-            })?;
+            return Err(LauncherError::Generic {
+                code: "ERR_EXPORT_DEST_NOT_EMPTY".into(),
+                message: format!(
+                    "The export destination '{}' already exists. Choose an empty or new folder.",
+                    dest.display()
+                ),
+            });
         }
     }
     std::fs::rename(staging, dest).map_err(|e| LauncherError::Generic {
@@ -1948,5 +1967,255 @@ side = "CLIENT"
         );
         let error = verify_loader_artifact("forge", &entry, b"bytes").unwrap_err();
         assert!(error.to_string().contains("no published hash"), "{error}");
+    }
+
+    #[test]
+    fn export_refuses_when_destination_is_the_instance() {
+        let tmp = TempDir::new().unwrap();
+        let instance = tmp.path().join("instance");
+        std::fs::create_dir_all(instance.join("mods")).unwrap();
+        std::fs::write(instance.join("mods").join("mod.jar"), b"mod-bytes").unwrap();
+
+        let err = export_server_environment(&instance, &instance, "fabric", "1.21").unwrap_err();
+        assert!(err.to_string().contains("overlaps"), "{err}");
+        assert_eq!(
+            std::fs::read(instance.join("mods").join("mod.jar")).unwrap(),
+            b"mod-bytes"
+        );
+    }
+
+    #[test]
+    fn export_refuses_destination_inside_config_and_inside_world() {
+        let tmp = TempDir::new().unwrap();
+        let instance = tmp.path().join("instance");
+        std::fs::create_dir_all(instance.join("config")).unwrap();
+        std::fs::create_dir_all(instance.join("world")).unwrap();
+
+        let dest = instance.join("config").join("out");
+        let err = export_server_environment(&instance, &dest, "fabric", "1.21").unwrap_err();
+        assert!(err.to_string().contains("overlaps"), "{err}");
+
+        let dest = instance.join("world").join("out");
+        let err = export_server_environment(&instance, &dest, "fabric", "1.21").unwrap_err();
+        assert!(err.to_string().contains("overlaps"), "{err}");
+    }
+
+    #[test]
+    fn export_refuses_destination_that_is_a_parent_of_the_instance() {
+        let tmp = TempDir::new().unwrap();
+        let instance = tmp.path().join("instance");
+        std::fs::create_dir_all(&instance).unwrap();
+
+        let err = export_server_environment(&instance, tmp.path(), "fabric", "1.21").unwrap_err();
+        assert!(err.to_string().contains("overlaps"), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn export_refuses_a_junction_pointing_into_the_instance() {
+        let tmp = TempDir::new().unwrap();
+        let instance = tmp.path().join("instance");
+        std::fs::create_dir_all(&instance).unwrap();
+        let link = tmp.path().join("junction");
+        junction::create(&instance, &link).unwrap();
+
+        let err = export_server_environment(&instance, &link, "fabric", "1.21").unwrap_err();
+        assert!(err.to_string().contains("overlaps"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_refuses_a_symlink_pointing_into_the_instance() {
+        let tmp = TempDir::new().unwrap();
+        let instance = tmp.path().join("instance");
+        std::fs::create_dir_all(&instance).unwrap();
+        let link = tmp.path().join("symlink");
+        std::os::unix::fs::symlink(&instance, &link).unwrap();
+
+        let err = export_server_environment(&instance, &link, "fabric", "1.21").unwrap_err();
+        assert!(err.to_string().contains("overlaps"), "{err}");
+    }
+
+    #[test]
+    fn export_refuses_a_non_empty_destination() {
+        let tmp = TempDir::new().unwrap();
+        let instance = tmp.path().join("instance");
+        std::fs::create_dir_all(&instance).unwrap();
+        let dest = tmp.path().join("server");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("keep.txt"), b"untouched").unwrap();
+
+        let err = export_server_environment(&instance, &dest, "fabric", "1.21").unwrap_err();
+        assert!(err.to_string().contains("already contains"), "{err}");
+        assert_eq!(std::fs::read(dest.join("keep.txt")).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn export_fails_without_leaving_a_destination_or_staging() {
+        let tmp = TempDir::new().unwrap();
+        let instance = tmp.path().join("instance");
+        std::fs::create_dir_all(&instance).unwrap();
+        // `mods` is a file, not a directory: export fails after staging is created.
+        std::fs::write(instance.join("mods"), b"not a dir").unwrap();
+
+        let dest = tmp.path().join("server");
+        let err = export_server_environment(&instance, &dest, "fabric", "1.21").unwrap_err();
+        let _ = err;
+        assert!(
+            !dest.exists(),
+            "a failed export must not leave a destination"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("staging"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging left behind: {leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn export_denied_when_loader_switch_is_off() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = agora_core::ctx::Ctx::for_testing(tmp.path().to_path_buf());
+        let instance = ctx.paths.instance_dir("instance").unwrap();
+        std::fs::create_dir_all(instance.join("mods")).unwrap();
+        let manifest = serde_json::json!({
+            "manifest_version": 3,
+            "game_data": {},
+            "pack_origin": null,
+            "instance_id": "instance",
+            "name": "Test",
+            "created_from_pack": null,
+            "minecraft_version": "1.21",
+            "loader": "fabric",
+            "loader_version": "",
+            "is_locked": false,
+            "mods": [],
+            "resourcepacks": [],
+            "shaders": [],
+            "datapacks": [],
+            "worlds": [],
+            "user_preferences": {}
+        });
+        std::fs::write(
+            ctx.paths.instance_manifest("instance").unwrap(),
+            manifest.to_string(),
+        )
+        .unwrap();
+        agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+        {
+            let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+            agora_core::db::set_setting(&conn, "network_loader_enabled", &serde_json::json!(false))
+                .unwrap();
+        }
+        agora_core::network_gate::install(std::sync::Arc::new(
+            agora_core::network_gate::SettingsGate::new(ctx.paths.local_state_db()),
+        ));
+
+        let dest = tmp.path().join("server");
+        let err = export_ready_server(&ctx, "instance", &dest, None, false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("loader") || err.to_string().contains("Loader"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_denied_when_mojang_switch_is_off() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = agora_core::ctx::Ctx::for_testing(tmp.path().to_path_buf());
+        let instance = ctx.paths.instance_dir("instance").unwrap();
+        std::fs::create_dir_all(&instance).unwrap();
+        let manifest = serde_json::json!({
+            "manifest_version": 3,
+            "game_data": {},
+            "pack_origin": null,
+            "instance_id": "instance",
+            "name": "Test",
+            "created_from_pack": null,
+            "minecraft_version": "1.21",
+            "loader": "vanilla",
+            "loader_version": "",
+            "is_locked": false,
+            "mods": [],
+            "resourcepacks": [],
+            "shaders": [],
+            "datapacks": [],
+            "worlds": [],
+            "user_preferences": {}
+        });
+        std::fs::write(
+            ctx.paths.instance_manifest("instance").unwrap(),
+            manifest.to_string(),
+        )
+        .unwrap();
+        agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+        {
+            let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+            agora_core::db::set_setting(
+                &conn,
+                "network_mojang_metadata_enabled",
+                &serde_json::json!(false),
+            )
+            .unwrap();
+        }
+        agora_core::network_gate::install(std::sync::Arc::new(
+            agora_core::network_gate::SettingsGate::new(ctx.paths.local_state_db()),
+        ));
+
+        let dest = tmp.path().join("server");
+        let err = export_ready_server(&ctx, "instance", &dest, None, false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("mojang")
+                || err.to_string().to_lowercase().contains("metadata"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_denied_when_database_unreadable() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = agora_core::ctx::Ctx::for_testing(tmp.path().to_path_buf());
+        let instance = ctx.paths.instance_dir("instance").unwrap();
+        std::fs::create_dir_all(&instance).unwrap();
+        let manifest = serde_json::json!({
+            "manifest_version": 3,
+            "game_data": {},
+            "pack_origin": null,
+            "instance_id": "instance",
+            "name": "Test",
+            "created_from_pack": null,
+            "minecraft_version": "1.21",
+            "loader": "fabric",
+            "loader_version": "",
+            "is_locked": false,
+            "mods": [],
+            "resourcepacks": [],
+            "shaders": [],
+            "datapacks": [],
+            "worlds": [],
+            "user_preferences": {}
+        });
+        std::fs::write(
+            ctx.paths.instance_manifest("instance").unwrap(),
+            manifest.to_string(),
+        )
+        .unwrap();
+        // Make the db path a directory so opening it fails.
+        if let Some(parent) = ctx.paths.local_state_db().parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::create_dir_all(ctx.paths.local_state_db()).unwrap();
+
+        let dest = tmp.path().join("server");
+        let err = export_ready_server(&ctx, "instance", &dest, None, false)
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().is_empty());
     }
 }
