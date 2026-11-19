@@ -765,6 +765,67 @@ fn fuse_overlay_runs_when_the_kernel_refuses() {
 /// Agora holds is the short-lived wrapper, so neither `PR_SET_PDEATHSIG` nor the stop signal binds
 /// to the process that owns the mount. `-f` keeps the daemon in the foreground (fuse-overlayfs(1)).
 #[test]
+fn a_symlinked_work_folder_is_removed_as_a_link_and_is_per_session() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let session_work = fixture
+        .instance_dir()
+        .join(format!("view-work.{}", std::process::id()));
+    let victim = fixture._tmp.path().join("victim-work");
+    write(&victim.join("keep.txt"), b"keep");
+    // A leftover link must be unlinked. Following it would wipe the folder it points at.
+    std::os::unix::fs::symlink(&victim, &session_work).unwrap();
+    let target = fixture._tmp.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let request = ViewRequest {
+        instance_id: fixture.instance_id.clone(),
+        target,
+        command: fixture.command("exit 0\n"),
+        per_user_files: vec![],
+    };
+
+    let run = ran(run_view(&fixture, &request)).expect("the fixture host must run the view");
+    assert!(run.status.success(), "the command failed: {:?}", run.status);
+    assert_eq!(read(&victim.join("keep.txt")), b"keep");
+    let meta = std::fs::symlink_metadata(&session_work).expect("a per-session work folder");
+    assert!(
+        meta.is_dir() && !meta.file_type().is_symlink(),
+        "the session work folder must be a real directory, not a link"
+    );
+}
+
+#[test]
+fn a_symlinked_per_user_file_is_refused_before_any_mount() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let target = fixture._tmp.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let real = fixture._tmp.path().join("real.txt");
+    write(&real, b"real");
+    let elsewhere = fixture._tmp.path().join("elsewhere.txt");
+    write(&elsewhere, b"elsewhere");
+    let linked = fixture._tmp.path().join("linked.txt");
+    std::os::unix::fs::symlink(&elsewhere, &linked).unwrap();
+    let request = ViewRequest {
+        instance_id: fixture.instance_id.clone(),
+        target,
+        command: fixture.command("exit 0\n"),
+        per_user_files: vec![PerUserMount {
+            real_path: real,
+            instance_copy: linked.clone(),
+        }],
+    };
+
+    let error = linux_view::native()
+        .view_and_run(&fixture.ctx, &fixture.def, &request)
+        .expect_err("a symlinked per-user copy is not a plain file to bind");
+    assert!(
+        matches!(error, linux_view::ViewError::UnreadablePerUserFile(ref path) if path == &linked),
+        "{error}"
+    );
+}
+
+#[test]
 fn a_program_that_does_not_exist_is_a_launch_failure_not_a_run() {
     let _serial = serial();
     let fixture = Fixture::new();

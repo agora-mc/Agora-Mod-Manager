@@ -238,12 +238,19 @@ mod linux_impl {
                 .instance_dir(&request.instance_id)
                 .map_err(|e| ViewError::Setup(e.to_string()))?;
             let upper = instance_dir.join("writable");
-            let work = instance_dir.join("view-work");
+            // One work folder per wrapper process. Wiping a shared one would break a concurrent
+            // tool run or a second game session that still has it mounted.
+            let work = instance_dir.join(format!("view-work.{}", std::process::id()));
             std::fs::create_dir_all(&upper)?;
             // Overlay needs an empty work folder. One left by a stopped view is not trusted
-            // (a half-written copy-up is not something to carry into the next run).
-            if work.exists() {
-                std::fs::remove_dir_all(&work)?;
+            // (a half-written copy-up is not something to carry into the next run). Never follow
+            // a link here: `remove_dir_all` through it would delete a folder Agora does not own.
+            if let Ok(meta) = std::fs::symlink_metadata(&work) {
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    std::fs::remove_file(&work)?;
+                } else {
+                    std::fs::remove_dir_all(&work)?;
+                }
             }
             std::fs::create_dir_all(&work)?;
 
@@ -268,14 +275,21 @@ mod linux_impl {
             return Err(ViewError::InvalidTarget(request.target.clone()));
         }
         for file in &request.per_user_files {
-            if !file.instance_copy.is_file() {
+            // The mount binds these paths into the namespace. A link could point anywhere, so
+            // inspect the entry itself, never what it resolves to.
+            if !plain_file(&file.instance_copy) {
                 return Err(ViewError::UnreadablePerUserFile(file.instance_copy.clone()));
             }
-            if !file.real_path.exists() {
+            if !plain_file(&file.real_path) {
                 return Err(ViewError::UnreadablePerUserFile(file.real_path.clone()));
             }
         }
         Ok(())
+    }
+
+    /// A regular file and not a symlink, checked without following the entry.
+    fn plain_file(path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
     }
 
     /// Everything the child needs, allocated before `fork`, so the child only makes
@@ -590,6 +604,17 @@ mod linux_impl {
 
     fn last_errno() -> i32 {
         std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    }
+
+    /// Retry an operation that reported an interrupted system call. Taking the attempt as a
+    /// closure lets the retry itself be tested without sending signals to the test process.
+    fn retry_eintr<T>(mut attempt: impl FnMut() -> T, interrupted: impl Fn(&T) -> bool) -> T {
+        loop {
+            let result = attempt();
+            if !interrupted(&result) {
+                return result;
+            }
+        }
     }
 
     fn write_raw(fd: RawFd, mut bytes: &[u8]) -> bool {
@@ -954,17 +979,19 @@ mod linux_impl {
             if filled >= buffer.len() {
                 break;
             }
-            let read = unsafe {
-                c::read(
-                    fd,
-                    buffer[filled..].as_mut_ptr() as *mut _,
-                    buffer.len() - filled,
-                )
-            };
+            let read = retry_eintr(
+                || {
+                    unsafe {
+                        c::read(
+                            fd,
+                            buffer[filled..].as_mut_ptr() as *mut _,
+                            buffer.len() - filled,
+                        )
+                    }
+                },
+                |read| *read < 0 && last_errno() == c::EINTR,
+            );
             if read < 0 {
-                if last_errno() == c::EINTR {
-                    continue;
-                }
                 break;
             }
             if read == 0 {
@@ -1035,17 +1062,19 @@ mod linux_impl {
         let mut bytes = [0u8; 32];
         let mut filled = 0;
         loop {
-            let read = unsafe {
-                c::read(
-                    fd,
-                    bytes[filled..].as_mut_ptr() as *mut _,
-                    bytes.len() - filled,
-                )
-            };
+            let read = retry_eintr(
+                || {
+                    unsafe {
+                        c::read(
+                            fd,
+                            bytes[filled..].as_mut_ptr() as *mut _,
+                            bytes.len() - filled,
+                        )
+                    }
+                },
+                |read| *read < 0 && last_errno() == c::EINTR,
+            );
             if read < 0 {
-                if last_errno() == c::EINTR {
-                    continue;
-                }
                 return Err(ViewError::Setup(format!(
                     "cannot confirm the command started: {}",
                     std::io::Error::last_os_error()
@@ -1078,7 +1107,10 @@ mod linux_impl {
         let mut bytes = Vec::new();
         let mut chunk = [0u8; 256];
         loop {
-            let read = unsafe { c::read(fd, chunk.as_mut_ptr() as *mut _, chunk.len()) };
+            let read = retry_eintr(
+                || unsafe { c::read(fd, chunk.as_mut_ptr() as *mut _, chunk.len()) },
+                |read| *read < 0 && last_errno() == c::EINTR,
+            );
             if read < 0 {
                 return Err(format!(
                     "cannot read the view helper's report: {}",
@@ -1141,6 +1173,24 @@ mod linux_impl {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn a_read_interrupted_by_a_signal_is_retried() {
+            let mut calls = 0;
+            let read = retry_eintr(
+                || {
+                    calls += 1;
+                    if calls < 3 {
+                        -1
+                    } else {
+                        12
+                    }
+                },
+                |result| *result == -1,
+            );
+            assert_eq!(read, 12);
+            assert_eq!(calls, 3);
+        }
 
         #[test]
         fn mountinfo_escapes_every_character_the_kernel_escapes() {
