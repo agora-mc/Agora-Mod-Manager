@@ -69,7 +69,7 @@ export interface SaveFolderRow {
   path: string;
   /** False when the folder has not been made yet. The game makes it. */
   exists: boolean;
-  saves: number;
+  saves: number | null;
   newest: string | null;
 }
 
@@ -79,7 +79,7 @@ export interface SavesView {
   /** The folder the game reads and writes for this instance. */
   inUse: SaveFolderRow;
   /** The other folder. Its saves stay where they are when the choice changes. */
-  other: SaveFolderRow;
+  other: SaveFolderRow | null;
   settingFile: string;
   /** `section/key` of the game setting that points at a folder. */
   setting: string;
@@ -88,7 +88,7 @@ export interface SavesView {
 }
 
 export interface SettingChangeRow {
-  action: 'set' | 'unchanged' | 'restored' | 'removed' | 'left_alone' | 'nothing_recorded';
+  action: 'no_setting' | 'set' | 'unchanged' | 'restored' | 'removed' | 'left_alone' | 'nothing_recorded';
   value: string | null;
 }
 
@@ -187,7 +187,7 @@ function isSaveFolderRow(value: unknown): value is SaveFolderRow {
   return isObject(value)
     && typeof value.path === 'string'
     && typeof value.exists === 'boolean'
-    && typeof value.saves === 'number'
+    && (value.saves === null || typeof value.saves === 'number')
     && isNullableString(value.newest);
 }
 
@@ -196,7 +196,7 @@ function isSavesView(value: unknown): value is SavesView {
     && typeof value.instanceId === 'string'
     && isSaveChoice(value.choice)
     && isSaveFolderRow(value.inUse)
-    && isSaveFolderRow(value.other)
+    && (value.other === null || isSaveFolderRow(value.other))
     && typeof value.settingFile === 'string'
     && typeof value.setting === 'string'
     && isNullableString(value.settingValue)

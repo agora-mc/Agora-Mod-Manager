@@ -654,7 +654,7 @@ pub struct GameDefinition {
     #[serde(default)]
     pub user_files: Vec<UserFileMapping>,
     #[serde(default)]
-    pub save_paths: Vec<GamePath>,
+    pub save_paths: Vec<SaveFolderSpec>,
     #[serde(default)]
     pub linked_archive_patterns: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -671,7 +671,7 @@ pub struct GameDefinition {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_files: Vec<RuntimeFileRule>,
     /// Where the game keeps its saves and how an instance gets its own (MASTER_SPEC §26.5). Empty
-    /// when the game has no such setting; the instance then always shares the game's saves.
+    /// when the game has no such setting; `save_paths` can describe those folders instead.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub save_location: Vec<SaveLocationRule>,
     /// Checks of individual settings in the game's per-user INI files. Each is a warning the

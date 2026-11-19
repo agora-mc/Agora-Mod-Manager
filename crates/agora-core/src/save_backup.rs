@@ -22,9 +22,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::ctx::Ctx;
 use crate::game_ini;
-use crate::game_instance::{self, InstanceError, SavesChoice};
+use crate::game_instance::{self, InstanceError};
 use crate::game_saves::{self, SavesError};
 use crate::helpers;
+use crate::instance_runtime::InstanceGuard;
 
 /// The newest backups kept per instance. A crash test makes one per suspect tried; five covers a
 /// normal round of testing while bounding the store, and each backup is a full copy of the folder.
@@ -32,7 +33,7 @@ pub const MAX_BACKUPS: usize = 5;
 
 /// A backup format change that an older reader must refuse rather than guess at.
 const BACKUP_SCHEMA_VERSION: u32 = 1;
-const BACKUP_DIR: &str = ".agora_save_backups";
+pub(crate) const BACKUP_DIR: &str = ".agora_save_backups";
 const BACKUP_MANIFEST: &str = "backup.json";
 const BACKUP_FILES: &str = "files";
 const STAGING_PREFIX: &str = ".staging-";
@@ -151,17 +152,7 @@ pub fn save_folder(
     instance_id: &str,
     definition: &GameDefinition,
 ) -> Result<PathBuf, SaveBackupError> {
-    let manifest = manifest_of(ctx, instance_id)?;
-    let store =
-        game_ini::store_of(ctx, instance_id).map_err(|e| SaveBackupError::Other(e.to_string()))?;
-    let rule = game_saves::rule_for(definition, &store).ok_or(SaveBackupError::NoSaveFolder)?;
-    match manifest.saves {
-        SavesChoice::Own => {
-            game_saves::own_folder_scoped(rule, instance_id, manifest.save_scope.as_deref())
-        }
-        SavesChoice::Shared => game_saves::shared_folder(rule),
-    }
-    .map_err(SaveBackupError::from)
+    Ok(game_saves::in_use_folder(ctx, instance_id, definition)?)
 }
 
 fn is_valid_id(id: &str) -> bool {
@@ -185,47 +176,6 @@ fn write_error(path: &Path, source: std::io::Error) -> SaveBackupError {
     }
 }
 
-/// Every file under `folder`, as `/`-separated relative paths, with its size.
-fn collect_files(folder: &Path) -> Result<Vec<(String, u64)>, SaveBackupError> {
-    fn walk(dir: &Path, rel: &str, out: &mut Vec<(String, u64)>) -> Result<(), SaveBackupError> {
-        let entries = fs::read_dir(dir).map_err(|source| read_error(dir, source))?;
-        for entry in entries {
-            let entry = entry.map_err(|source| read_error(dir, source))?;
-            let path = entry.path();
-            let metadata =
-                fs::symlink_metadata(&path).map_err(|source| read_error(&path, source))?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            let child_rel = if rel.is_empty() {
-                name
-            } else {
-                format!("{rel}/{name}")
-            };
-            if metadata.file_type().is_symlink() {
-                return Err(SaveBackupError::Other(format!(
-                    "cannot back up {}: symbolic links are not supported",
-                    path.display()
-                )));
-            }
-            if metadata.is_dir() {
-                walk(&path, &child_rel, out)?;
-            } else if metadata.is_file() {
-                out.push((child_rel, metadata.len()));
-            } else {
-                return Err(SaveBackupError::Other(format!(
-                    "cannot back up {}: it is not a file or a folder",
-                    path.display()
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    let mut files = Vec::new();
-    walk(folder, "", &mut files)?;
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(files)
-}
-
 /// Refuse a copy the disk cannot hold, naming what is needed and what is free. Unknown free space
 /// is not treated as a refusal: the copy itself still fails loudly if it runs out.
 fn check_room(needed: u64, free: Option<u64>) -> Result<(), SaveBackupError> {
@@ -237,7 +187,7 @@ fn check_room(needed: u64, free: Option<u64>) -> Result<(), SaveBackupError> {
     Ok(())
 }
 
-fn copy_tree(
+pub(crate) fn copy_save_files(
     files: &[(String, u64)],
     source: &Path,
     destination: &Path,
@@ -245,6 +195,8 @@ fn copy_tree(
     for (rel, _) in files {
         let from = source.join(rel);
         let to = destination.join(rel);
+        game_saves::checked_metadata(&from)?;
+        game_saves::checked_metadata(&to)?;
         if let Some(parent) = to.parent() {
             fs::create_dir_all(parent).map_err(|source| write_error(parent, source))?;
         }
@@ -386,16 +338,43 @@ pub fn backup(
     instance_id: &str,
     definition: &GameDefinition,
 ) -> Result<SaveBackup, SaveBackupError> {
-    let folder = save_folder(ctx, instance_id, definition)?;
-    if !folder.is_dir() {
+    backup_while_running(ctx, instance_id, definition, false)
+}
+
+/// Back up with the caller's explicit approval to read saves while a game is running.
+pub fn backup_while_running(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    allow_while_running: bool,
+) -> Result<SaveBackup, SaveBackupError> {
+    let guard = if allow_while_running {
+        InstanceGuard::for_mutation_while_running(ctx, instance_id, "save_backup")
+    } else {
+        InstanceGuard::for_mutation(ctx, instance_id, "save_backup")
+    };
+    let _guard = guard.map_err(|error| SaveBackupError::Other(error.to_string()))?;
+    let manifest = manifest_of(ctx, instance_id)?;
+    let store =
+        game_ini::store_of(ctx, instance_id).map_err(|e| SaveBackupError::Other(e.to_string()))?;
+    let folders = game_saves::save_folders(
+        definition,
+        &store,
+        instance_id,
+        manifest.save_scope.as_deref(),
+    )?;
+    let area = folders.in_use(manifest.saves)?;
+    let folder = &area.path;
+    if game_saves::checked_metadata(folder)?.is_none() {
         return Err(SaveBackupError::NoSaveFolder);
     }
-    let files = collect_files(&folder)?;
+    let files = area.files()?;
     if files.is_empty() {
         return Err(SaveBackupError::EmptySaveFolder);
     }
     let bytes = files.iter().map(|(_, size)| *size).sum::<u64>();
     let root = backup_root(ctx, instance_id)?;
+    game_saves::checked_metadata(&root)?;
     check_room(bytes, helpers::available_disk_space_bytes(&root))?;
 
     let id = new_id();
@@ -405,7 +384,7 @@ pub fn backup(
     let created_at = Utc::now().to_rfc3339();
 
     let result = (|| -> Result<(), SaveBackupError> {
-        copy_tree(&files, &folder, &files_dir)?;
+        copy_save_files(&files, folder, &files_dir)?;
         let stored = StoredBackup {
             schema_version: BACKUP_SCHEMA_VERSION,
             id: id.clone(),
@@ -436,7 +415,7 @@ pub fn backup(
         path: root.join(&id),
         id,
         created_at,
-        source: folder,
+        source: folder.clone(),
         file_count: files.len(),
         bytes,
     })
@@ -501,12 +480,7 @@ pub(crate) fn safe_relative(path: &str) -> Option<PathBuf> {
     }
     let mut out = PathBuf::new();
     for part in path.split('/') {
-        if part.is_empty()
-            || part == "."
-            || part == ".."
-            || part.contains('\\')
-            || part.contains(':')
-        {
+        if !game_saves::is_safe_save_component(part) {
             return None;
         }
         out.push(part);
@@ -629,7 +603,7 @@ fn copy_into_place(
 pub fn restore(
     ctx: &Ctx,
     instance_id: &str,
-    _definition: &GameDefinition,
+    definition: &GameDefinition,
     backup_id: &str,
 ) -> Result<SaveRestore, SaveBackupError> {
     if !is_valid_id(backup_id) {
@@ -639,17 +613,14 @@ pub fn restore(
     // refuse while the game is running: writing saves under a live game corrupts them. The one
     // activity check also sees an open session with no journaled files and a Linux view session,
     // and refuses when a store that would answer cannot be read.
-    let _guard = crate::instance_runtime::InstanceGuard::for_mutation(
-        ctx,
-        instance_id,
-        "restore_save_backup",
-    )
-    .map_err(|error| SaveBackupError::Other(error.to_string()))?;
+    let _guard = InstanceGuard::for_mutation(ctx, instance_id, "restore_save_backup")
+        .map_err(|error| SaveBackupError::Other(error.to_string()))?;
     let root = backup_root(ctx, instance_id)?;
     let dir = root.join(backup_id);
-    if !dir.is_dir() {
+    if game_saves::checked_metadata(&dir)?.is_none() {
         return Err(SaveBackupError::BackupNotFound(backup_id.to_string()));
     }
+    game_saves::checked_metadata(&dir.join(BACKUP_MANIFEST))?;
     let stored = read_manifest(&dir)?;
     if stored.id != backup_id {
         return Err(SaveBackupError::Other(format!(
@@ -662,12 +633,22 @@ pub fn restore(
     // current Shared/Own choice may have changed since, and the restore must not follow it: a
     // backup taken under Own belongs back in the Own folder, and a shared save belongs in the
     // shared folder it came from.
-    let folder = PathBuf::from(&stored.source);
-    fs::create_dir_all(&folder).map_err(|source| write_error(&folder, source))?;
+    let manifest = manifest_of(ctx, instance_id)?;
+    let store =
+        game_ini::store_of(ctx, instance_id).map_err(|e| SaveBackupError::Other(e.to_string()))?;
+    let folders = game_saves::save_folders(
+        definition,
+        &store,
+        instance_id,
+        manifest.save_scope.as_deref(),
+    )?;
+    let recorded = Path::new(&stored.source);
+    let area = std::iter::once(&folders.shared).chain(folders.own.as_ref())
+        .find(|area| area.path == recorded)
+        .ok_or_else(|| SaveBackupError::Other(format!("backup {backup_id} names a folder that does not belong to this instance's save rule")))?;
+    let folder = &area.path;
     let files_dir = dir.join(BACKUP_FILES);
-
-    let mut restored = 0usize;
-    let mut kept_current = Vec::new();
+    let mut files = Vec::new();
     for file in &stored.files {
         let Some(relative) = safe_relative(&file.path) else {
             return Err(SaveBackupError::Other(format!(
@@ -675,23 +656,48 @@ pub fn restore(
                 file.path
             )));
         };
-        let from = files_dir.join(&relative);
         let to = folder.join(&relative);
+        if area.excludes(&to) {
+            continue;
+        }
+        let from = files_dir.join(relative);
+        let metadata = game_saves::checked_metadata(&from)?
+            .ok_or_else(|| read_error(&from, std::io::ErrorKind::NotFound.into()))?;
+        if !metadata.is_file() || metadata.len() != file.size {
+            return Err(SaveBackupError::Other(format!(
+                "backup {backup_id} holds a missing or invalid file ({})",
+                file.path
+            )));
+        }
+        if game_saves::checked_metadata(&to)?.is_some_and(|meta| !meta.is_file()) {
+            return Err(SaveBackupError::Other(format!(
+                "the restore destination {} is not a file",
+                to.display()
+            )));
+        }
+        files.push((from, to));
+    }
+    if files.is_empty() {
+        return Err(SaveBackupError::EmptySaveFolder);
+    }
+
+    let mut kept_current = Vec::new();
+    for (from, to) in &files {
+        game_saves::checked_metadata(from)?;
+        let current = game_saves::checked_metadata(to)?;
         if let Some(parent) = to.parent() {
             fs::create_dir_all(parent).map_err(|source| write_error(parent, source))?;
         }
-        if to.is_file() && same_contents(&from, &to)? {
-            restored += 1;
+        if current.is_some_and(|meta| meta.is_file()) && same_contents(from, to)? {
             continue;
         }
-        copy_into_place(&from, &to, &mut kept_current)?;
-        restored += 1;
+        copy_into_place(from, to, &mut kept_current)?;
     }
 
     Ok(SaveRestore {
         backup_id: backup_id.to_string(),
-        folder,
-        restored,
+        folder: folder.clone(),
+        restored: files.len(),
         kept_current,
     })
 }

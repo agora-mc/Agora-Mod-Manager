@@ -457,17 +457,36 @@ impl GameRegistryBuilder {
                         });
                     }
                 }
-                let own_is_usable = !rule.own_value.trim().is_empty()
-                    && !rule.own_value.contains(['\r', '\n'])
-                    && rule.own_value.contains("{instance}");
-                if rule.section.trim().is_empty() || rule.key.trim().is_empty() || !own_is_usable {
+                if rule.section.trim().is_empty() || rule.key.trim().is_empty() {
                     return Err(GameRegistryError::InvalidSaveLocation {
                         game_id: game.id.clone(),
-                        reason: "the section and key must be named, and own_value must be one \
-                                 line that contains {instance}"
-                            .to_string(),
+                        reason: "the section and key must be named".into(),
                     });
                 }
+                crate::game_saves::validate_own_template(
+                    &rule.own_value,
+                    &rule.relative_to,
+                    &rule.shared_dir,
+                )
+                .and_then(|()| crate::game_saves::validate_recognition(rule.recognition.as_ref()))
+                .map_err(|error| GameRegistryError::InvalidSaveLocation {
+                    game_id: game.id.clone(),
+                    reason: error.to_string(),
+                })?;
+            }
+            for folder in &game.save_paths {
+                let result = crate::game_saves::validate_folder_path(folder.path())
+                    .and_then(|_| crate::game_saves::validate_recognition(folder.recognition()))
+                    .and_then(|()| {
+                        if let Some((value, base)) = folder.own_layout() {
+                            crate::game_saves::validate_own_template(value, base, folder.path())?;
+                        }
+                        Ok(())
+                    });
+                result.map_err(|error| GameRegistryError::InvalidSaveLocation {
+                    game_id: game.id.clone(),
+                    reason: error.to_string(),
+                })?;
             }
         }
 

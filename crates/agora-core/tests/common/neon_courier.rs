@@ -12,8 +12,9 @@ use std::sync::Arc;
 use agora_core::game_registry::{GameRegistry, PackageSource};
 use agora_game_api::{
     ContentLayout, ContentMatch, ContentRule, DeploymentStrategy, GameDefinition, GameId,
-    GamePackage, GamePath, LaunchRecipe, PackageDefinition, RelPath, SaveLocationRule, StoreId,
-    StoreIdentifier, UserDataLocation, UserFileMapping, UserFileStrategy, VersionSource,
+    GamePackage, GamePath, LaunchRecipe, PackageDefinition, RelPath, SaveFolderRule,
+    SaveFolderSpec, SaveLocationRule, SaveRecognition, StoreId, StoreIdentifier, UserDataLocation,
+    UserFileMapping, UserFileStrategy, VersionSource,
 };
 
 pub const GAME_ID: &str = "neon-courier";
@@ -88,7 +89,12 @@ pub fn definition() -> GameDefinition {
             },
         }),
         user_files: vec![],
-        save_paths: vec![documents(SAVES_DIR)],
+        save_paths: vec![SaveFolderSpec::Rule(SaveFolderRule {
+            path: documents(SAVES_DIR),
+            recognition: Some(SaveRecognition::Folders),
+            own_value: Some("Agora/{instance}/characters".into()),
+            relative_to: None,
+        })],
         linked_archive_patterns: vec![],
         declared_writes: vec![],
         copy_patterns: vec![],
@@ -115,9 +121,10 @@ pub fn with_save_rule() -> GameDefinition {
         ini: RelPath::new("user/settings.ini").unwrap(),
         section: "Saves".into(),
         key: "Path".into(),
-        own_value: r"Saves\{instance}\".into(),
+        own_value: r"Saves\Agora\{instance}\".into(),
         shared_dir: documents(SAVES_DIR),
         relative_to: documents("Neon Courier"),
+        recognition: Some(agora_game_api::SaveRecognition::Folders),
         stores: vec![store()],
     }];
     def
@@ -134,6 +141,12 @@ impl GamePackage for TestPackage {
 /// Register a Neon Courier definition as a compiled test package, the way the desktop registers
 /// shipped ones.
 pub fn registry(def: GameDefinition) -> Arc<GameRegistry> {
+    try_registry(def).expect("the Neon Courier test package registers")
+}
+
+pub fn try_registry(
+    def: GameDefinition,
+) -> Result<Arc<GameRegistry>, agora_core::game_registry::GameRegistryError> {
     let package = PackageDefinition {
         id: format!("test.{GAME_ID}"),
         version: semver::Version::new(0, 1, 0),
@@ -146,13 +159,11 @@ pub fn registry(def: GameDefinition) -> Arc<GameRegistry> {
         tools: vec![],
     };
     let mut builder = GameRegistry::builder();
-    builder
-        .add(
-            PackageSource::Compiled {
-                crate_name: "second-game-test".into(),
-            },
-            Arc::new(TestPackage(package)),
-        )
-        .expect("the Neon Courier test package registers");
-    Arc::new(builder.build())
+    builder.add(
+        PackageSource::Compiled {
+            crate_name: "second-game-test".into(),
+        },
+        Arc::new(TestPackage(package)),
+    )?;
+    Ok(Arc::new(builder.build()))
 }

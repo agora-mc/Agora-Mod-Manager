@@ -348,16 +348,17 @@ fn status_counts_the_saves_in_the_folder_in_use_and_in_the_other() {
 
     let shared = game_saves::status(&h.ctx, "counted", &def).unwrap();
     assert_eq!(shared.choice, SavesChoice::Shared);
-    assert_eq!(shared.in_use.saves, 2);
+    assert_eq!(shared.in_use.saves, Some(2));
     assert!(shared.in_use.newest.is_some());
-    assert_eq!(shared.other.saves, 0);
-    assert!(!shared.other.exists);
+    let other = shared.other.unwrap();
+    assert_eq!(other.saves, Some(0));
+    assert!(!other.exists);
 
     h.choice("counted", &def, SavesChoice::Own);
     let own = game_saves::status(&h.ctx, "counted", &def).unwrap();
     assert_eq!(own.choice, SavesChoice::Own);
-    assert_eq!(own.in_use.saves, 0);
-    assert_eq!(own.other.saves, 2);
+    assert_eq!(own.in_use.saves, Some(0));
+    assert_eq!(own.other.unwrap().saves, Some(2));
     assert_eq!(own.setting_value.as_deref(), Some(r"Saves\Agora\counted\"));
 }
 

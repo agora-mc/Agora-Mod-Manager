@@ -66,6 +66,9 @@ pub fn skyrim_definition() -> GameDefinition {
         own_value: r"Saves\Agora\{instance}\".into(),
         shared_dir: user(documents.clone(), &format!("My Games/{folder}/Saves")),
         relative_to: user(documents.clone(), &format!("My Games/{folder}")),
+        recognition: Some(agora_game_api::SaveRecognition::Files {
+            patterns: vec!["*.ess".into()],
+        }),
         stores: vec![store],
     })
     .collect();

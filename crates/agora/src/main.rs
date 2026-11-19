@@ -13151,9 +13151,12 @@ fn folder_summary(folder: &agora_core::game_saves::SaveFolder) -> String {
         return "the folder does not exist yet".to_string();
     }
     match (&folder.newest, folder.saves) {
-        (_, 0) => "no saves".to_string(),
-        (Some(newest), n) => format!("{n} save{}, newest {newest}", if n == 1 { "" } else { "s" }),
-        (None, n) => format!("{n} save{}", if n == 1 { "" } else { "s" }),
+        (_, None) => "could not tell how many saves it holds".to_string(),
+        (_, Some(0)) => "no saves".to_string(),
+        (Some(newest), Some(n)) => {
+            format!("{n} save{}, newest {newest}", if n == 1 { "" } else { "s" })
+        }
+        (None, Some(n)) => format!("{n} save{}", if n == 1 { "" } else { "s" }),
     }
 }
 
@@ -13195,22 +13198,26 @@ fn saves_command(
             status.in_use.path.display(),
             folder_summary(&status.in_use)
         );
-        println!(
-            "Other folder: {} ({}). Switching never moves saves.",
-            status.other.path.display(),
-            folder_summary(&status.other)
-        );
-        let set_to = status.setting_value.as_deref().unwrap_or("not set");
-        println!(
-            "The game's setting {} {} is {set_to} (from {}).",
-            status.setting_file,
-            status.setting,
-            match status.setting_source {
-                agora_core::game_ini::IniSource::Copy => "the instance's copy",
-                agora_core::game_ini::IniSource::GameFile => "the game's file",
-                agora_core::game_ini::IniSource::Nothing => "no file yet",
-            }
-        );
+        if let Some(other) = &status.other {
+            println!(
+                "Other folder: {} ({}). Switching never moves saves.",
+                other.path.display(),
+                folder_summary(other)
+            );
+        }
+        if !status.setting_file.is_empty() {
+            let set_to = status.setting_value.as_deref().unwrap_or("not set");
+            println!(
+                "The game's setting {} {} is {set_to} (from {}).",
+                status.setting_file,
+                status.setting,
+                match status.setting_source {
+                    agora_core::game_ini::IniSource::Copy => "the instance's copy",
+                    agora_core::game_ini::IniSource::GameFile => "the game's file",
+                    agora_core::game_ini::IniSource::Nothing => "no file yet",
+                }
+            );
+        }
         return Ok(());
     };
 
@@ -13234,6 +13241,7 @@ fn saves_command(
         );
     }
     match &change.setting {
+        SettingChange::NoSetting => {}
         SettingChange::Set { value } => {
             println!("The game's save setting now names {value}.");
         }
@@ -13259,15 +13267,17 @@ fn saves_command(
         }
     }
     println!(
-        "The game reads and writes saves in {} ({}).",
+        "Save folder in use: {} ({}).",
         change.in_use.path.display(),
         folder_summary(&change.in_use)
     );
-    println!(
-        "The saves in {} ({}) stay where they are; nothing was moved, copied or deleted.",
-        change.other.path.display(),
-        folder_summary(&change.other)
-    );
+    if let Some(other) = &change.other {
+        println!(
+            "The saves in {} ({}) stay where they are; nothing was moved, copied or deleted.",
+            other.path.display(),
+            folder_summary(other)
+        );
+    }
     Ok(())
 }
 

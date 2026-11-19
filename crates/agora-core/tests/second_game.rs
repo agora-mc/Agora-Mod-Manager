@@ -23,11 +23,13 @@ use agora_core::game_base::BaseMode;
 use agora_core::game_deploy::{self, add_to_instance, AddToInstance, DeployMode, DeployOutcome};
 use agora_core::game_discovery::{DiscoveredInstall, InstallCapabilities};
 use agora_core::game_import::{self, Mo2Request, RunOptions};
-use agora_core::game_instance::{self, create, get_manifest, GameInstanceRecord, SavesChoice};
+use agora_core::game_instance::{
+    self, create, get_manifest, CloneOptions, GameInstanceRecord, SavesChoice,
+};
 use agora_core::game_loadout;
 use agora_core::game_registry::{GameInventory, IdentifiedInstall, RuntimeResolution};
-use agora_core::game_saves;
 use agora_core::snapshot_service::SnapshotService;
+use agora_core::{game_ini, game_saves, instance_runtime, save_backup};
 use agora_game_api::{
     BaseReference, GameDefinition, GameId, InstallId, InstallKind, RuntimeIdentity, StoreId,
 };
@@ -117,6 +119,77 @@ impl Fixture {
             std::fs::write(folder.join("data.bin"), b"save bytes").unwrap();
         }
         root
+    }
+}
+
+const CHARACTER: &str = "slot-one/data.bin";
+
+struct SaveFixture {
+    game: Fixture,
+    source: String,
+    private: [String; 2],
+    characters: [PathBuf; 2],
+}
+
+impl SaveFixture {
+    fn new(def: GameDefinition) -> Self {
+        let game = Fixture::new(def);
+        let source = game.create("Shared Courier").instance_id;
+        let private = ["Amber Courier", "Indigo Courier"].map(|name| game.create(name).instance_id);
+        game.write_folder_saves();
+        let characters = private.each_ref().map(|id| {
+            let change =
+                game_saves::set_choice(&game.ctx, id, &game.def, SavesChoice::Own).unwrap();
+            change.in_use.path.join(CHARACTER)
+        });
+        for (path, bytes) in characters.iter().zip([b"amber".as_slice(), b"indigo"]) {
+            write(path, bytes);
+        }
+        Self {
+            game,
+            source,
+            private,
+            characters,
+        }
+    }
+
+    fn character(&self, private: usize) -> &Path {
+        &self.characters[private]
+    }
+
+    fn assert_private(&self) {
+        assert_eq!(std::fs::read(self.character(0)).unwrap(), b"amber");
+        assert_eq!(std::fs::read(self.character(1)).unwrap(), b"indigo");
+    }
+
+    fn source_dir(&self) -> PathBuf {
+        self.game.ctx.paths.instance_dir(&self.source).unwrap()
+    }
+
+    fn clone(
+        &self,
+        name: &str,
+        copy_saves: bool,
+    ) -> Result<game_instance::ClonedInstance, game_instance::InstanceError> {
+        game_instance::clone_instance(
+            &self.game.ctx,
+            &self.source,
+            name,
+            &self.game.def,
+            CloneOptions { copy_saves },
+        )
+    }
+
+    fn mark_running(&self) {
+        let paths = &self.game.ctx.paths;
+        let generation = instance_runtime::publish_starting(paths, &self.source).unwrap();
+        instance_runtime::publish_running(
+            paths,
+            &self.source,
+            &generation,
+            agora_core::process_identity::capture(std::process::id()).unwrap(),
+        )
+        .unwrap();
     }
 }
 
@@ -333,8 +406,14 @@ fn a_loadout_saves_and_applies_the_layer_set() {
         .expect("the loadout is saved");
     game_deploy::set_content_enabled(&f.ctx, &inst.instance_id, &item, false)
         .expect("the layer is disabled");
-    game_loadout::apply_game_profile_with_undo(&f.ctx, &inst.instance_id, &f.def, "Everything On")
-        .expect("the loadout applies");
+    game_loadout::apply_game_profile_with_undo(
+        &f.ctx,
+        &inst.instance_id,
+        &f.def,
+        "Everything On",
+        false,
+    )
+    .expect("the loadout applies");
 
     let manifest = get_manifest(&f.ctx, &inst.instance_id).unwrap();
     let layer = manifest
@@ -392,44 +471,282 @@ fn the_crash_doctor_reads_an_instance_with_no_plugin_list() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "second-game: saves need an INI-backed save_location; save_paths and folder saves are never surveyed"]
 fn the_save_survey_counts_folder_saves() {
-    let f = Fixture::new(neon_courier::definition());
-    let inst = f.create("Saves");
-    f.write_folder_saves();
+    let saves = SaveFixture::new(neon_courier::definition());
+    let f = &saves.game;
 
-    let status = game_saves::status(&f.ctx, &inst.instance_id, &f.def)
+    let status = game_saves::status(&f.ctx, &saves.source, &f.def)
         .expect("the save survey reads the game's declared save folder");
-    assert_eq!(status.in_use.saves, 2, "both folder-saves are counted");
+    assert_eq!(
+        status.in_use.saves,
+        Some(2),
+        "both folder-saves are counted"
+    );
     assert_eq!(status.in_use.path, f.saves_root());
+    saves.assert_private();
 }
 
 #[test]
-#[ignore = "second-game: survey counts only files ending in .ess, so a folder save is invisible"]
 fn the_save_survey_does_not_require_the_ess_extension() {
-    let f = Fixture::new(neon_courier::with_save_rule());
-    let inst = f.create("Folder Saves");
-    f.write_folder_saves();
+    let saves = SaveFixture::new(neon_courier::with_save_rule());
+    let f = &saves.game;
 
-    let status = game_saves::status(&f.ctx, &inst.instance_id, &f.def)
+    let status = game_saves::status(&f.ctx, &saves.source, &f.def)
         .expect("the save survey reads the shared folder");
-    assert_eq!(status.in_use.saves, 2, "both folder-saves are counted");
+    assert_eq!(
+        status.in_use.saves,
+        Some(2),
+        "both folder-saves are counted"
+    );
+    saves.assert_private();
 }
 
 #[test]
-#[ignore = "second-game: own saves require an INI setting to redirect; a game without one cannot take its own saves"]
 fn an_instance_can_own_and_share_its_saves() {
-    let f = Fixture::new(neon_courier::definition());
-    let inst = f.create("Own Saves");
+    let saves = SaveFixture::new(neon_courier::definition());
+    let f = &saves.game;
+    let id = &saves.source;
 
-    let change = game_saves::set_choice(&f.ctx, &inst.instance_id, &f.def, SavesChoice::Own)
+    let change = game_saves::set_choice(&f.ctx, id, &f.def, SavesChoice::Own)
         .expect("a game with folder saves can take saves of its own");
     assert_eq!(change.choice, SavesChoice::Own);
-    let status = game_saves::status(&f.ctx, &inst.instance_id, &f.def).expect("the status");
+    let status = game_saves::status(&f.ctx, id, &f.def).expect("the status");
     assert_eq!(status.choice, SavesChoice::Own);
+    assert_eq!(
+        status.in_use.path,
+        f.saves_root().join("Agora").join(id).join("characters")
+    );
+    assert!(status.in_use.path.is_dir());
+    saves.assert_private();
 
-    game_saves::set_choice(&f.ctx, &inst.instance_id, &f.def, SavesChoice::Shared)
+    let shared = game_saves::set_choice(&f.ctx, id, &f.def, SavesChoice::Shared)
         .expect("the instance can go back to the shared saves");
+    assert_eq!(shared.in_use.path, f.saves_root());
+    saves.assert_private();
+}
+
+#[test]
+fn package_registration_refuses_escaping_own_saves() {
+    let saves = SaveFixture::new(neon_courier::with_save_rule());
+    let mut def = saves.game.def.clone();
+    def.save_location[0].own_value = r"Saves\Agora\{instance}\..\Indigo".into();
+    let result = neon_courier::try_registry(def);
+    saves.assert_private();
+    assert!(matches!(
+        result,
+        Err(agora_core::game_registry::GameRegistryError::InvalidSaveLocation { .. })
+    ));
+}
+
+#[test]
+fn choosing_own_saves_validates_the_path_before_editing_the_ini() {
+    let saves = SaveFixture::new(neon_courier::with_save_rule());
+    let f = &saves.game;
+    let mut def = f.def.clone();
+    def.save_location[0].own_value = format!(r"Saves\Agora\{{instance}}\..\{}", saves.private[1]);
+    let result = game_saves::set_choice(&f.ctx, &saves.source, &def, SavesChoice::Own);
+    saves.assert_private();
+    assert!(result.is_err(), "the unsafe path was accepted: {result:?}");
+    assert!(!saves.source_dir().join("user/settings.ini").exists());
+}
+
+#[test]
+fn a_shared_save_backup_never_copies_private_saves() {
+    let saves = SaveFixture::new(neon_courier::with_save_rule());
+    let f = &saves.game;
+    let backup = save_backup::backup(&f.ctx, &saves.source, &f.def).unwrap();
+    saves.assert_private();
+    assert_eq!(backup.file_count, 4);
+    assert!(!backup.path.join("files/Agora").exists());
+}
+
+#[test]
+fn a_legacy_shared_save_backup_never_restores_private_saves() {
+    let saves = SaveFixture::new(neon_courier::with_save_rule());
+    let f = &saves.game;
+    let backup = save_backup::backup(&f.ctx, &saves.source, &f.def).unwrap();
+    let manifest = backup.path.join("backup.json");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    let relative = format!("Agora/{}/{CHARACTER}", saves.private[1]);
+    let files = stored["files"].as_array_mut().unwrap();
+    files.retain(|file| file["path"] != relative);
+    files.push(serde_json::json!({"path": relative, "size": 8}));
+    let count = files.len();
+    let bytes = files
+        .iter()
+        .map(|file| file["size"].as_u64().unwrap())
+        .sum::<u64>();
+    stored["file_count"] = count.into();
+    stored["bytes"] = bytes.into();
+    write(&backup.path.join("files").join(relative), b"outdated");
+    write(&manifest, &serde_json::to_vec(&stored).unwrap());
+    write(&f.saves_root().join(CHARACTER), b"changed shared save");
+
+    let restored = save_backup::restore(&f.ctx, &saves.source, &f.def, &backup.id).unwrap();
+    saves.assert_private();
+    assert_eq!(restored.restored, 4);
+    assert_eq!(
+        std::fs::read(f.saves_root().join(CHARACTER)).unwrap(),
+        b"save bytes"
+    );
+}
+
+#[test]
+fn save_restore_rejects_a_destination_owned_by_another_instance() {
+    let saves = SaveFixture::new(neon_courier::with_save_rule());
+    let f = &saves.game;
+    let backup = save_backup::backup(&f.ctx, &saves.source, &f.def).unwrap();
+    let manifest = backup.path.join("backup.json");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    stored["source"] = f
+        .saves_root()
+        .join("Agora")
+        .join(&saves.private[1])
+        .to_str()
+        .unwrap()
+        .into();
+    write(&manifest, &serde_json::to_vec(&stored).unwrap());
+
+    let result = save_backup::restore(&f.ctx, &saves.source, &f.def, &backup.id);
+    saves.assert_private();
+    assert!(
+        result.is_err(),
+        "the foreign destination was accepted: {result:?}"
+    );
+}
+
+#[test]
+fn a_live_no_journal_session_refuses_save_backup_without_an_override() {
+    let saves = SaveFixture::new(neon_courier::with_save_rule());
+    let f = &saves.game;
+    saves.mark_running();
+    let backup = save_backup::backup(&f.ctx, &saves.source, &f.def);
+    saves.assert_private();
+    let error = backup.unwrap_err();
+    assert!(error.to_string().contains("running"), "{error}");
+    let backup = save_backup::backup_while_running(&f.ctx, &saves.source, &f.def, true).unwrap();
+    assert_eq!(backup.file_count, 4);
+    saves.assert_private();
+}
+
+#[test]
+fn a_live_no_journal_session_refuses_a_save_clone() {
+    let saves = SaveFixture::new(neon_courier::with_save_rule());
+    saves.mark_running();
+    let clone = saves.clone("Active Copy", true).unwrap_err();
+    saves.assert_private();
+    assert!(
+        matches!(clone, game_instance::InstanceError::Running(_)),
+        "{clone:?}"
+    );
+}
+
+#[test]
+fn an_unrecognised_save_format_has_no_count() {
+    let mut def = neon_courier::with_save_rule();
+    def.save_location[0].recognition = None;
+    let saves = SaveFixture::new(def);
+    let f = &saves.game;
+    let status = game_saves::status(&f.ctx, &saves.source, &f.def).unwrap();
+    saves.assert_private();
+    assert!(serde_json::to_value(status).unwrap()["in_use"]["saves"].is_null());
+}
+
+#[test]
+fn a_shared_save_clone_copies_only_eligible_shared_files() {
+    let saves = SaveFixture::new(neon_courier::with_save_rule());
+    let clone = saves.clone("Shared Copy", true).unwrap();
+    let clone_folder = saves
+        .game
+        .saves_root()
+        .join("Agora")
+        .join(clone.instance_id);
+    saves.assert_private();
+    assert_eq!(
+        std::fs::read(clone_folder.join(CHARACTER)).unwrap(),
+        b"save bytes"
+    );
+    assert!(!clone_folder.join("Agora").exists());
+}
+
+#[test]
+fn a_clone_copies_loadouts_without_their_undo_or_save_backup_history() {
+    let saves = SaveFixture::new(neon_courier::with_save_rule());
+    write(
+        &saves.source_dir().join(".agora_loadouts/undo/last.json"),
+        b"undo",
+    );
+    write(
+        &saves.source_dir().join(".agora_loadouts/profile.json"),
+        b"profile",
+    );
+    write(
+        &saves
+            .source_dir()
+            .join(".agora_save_backups/old/backup.json"),
+        b"backup",
+    );
+    let clone = saves.clone("History Copy", false).unwrap();
+    let dir = saves
+        .game
+        .ctx
+        .paths
+        .instance_dir(&clone.instance_id)
+        .unwrap();
+    saves.assert_private();
+    assert_eq!(
+        std::fs::read(dir.join(".agora_loadouts/profile.json")).unwrap(),
+        b"profile"
+    );
+    assert!(!dir.join(".agora_loadouts/undo").exists());
+    assert!(!dir.join(".agora_save_backups").exists());
+}
+
+#[test]
+fn a_save_clone_never_follows_a_junction_to_private_saves() {
+    let saves = SaveFixture::new(neon_courier::with_save_rule());
+    junction::create(
+        saves.character(1).parent().unwrap(),
+        saves.source_dir().join("linked"),
+    )
+    .unwrap();
+    let result = saves.clone("Linked Copy", false);
+    saves.assert_private();
+    assert!(
+        result.is_err(),
+        "a private save was copied through the junction: {result:?}"
+    );
+}
+
+#[test]
+fn sharing_an_own_save_clone_restores_the_pre_isolation_setting() {
+    let saves = SaveFixture::new(neon_courier::with_save_rule());
+    let f = &saves.game;
+    write(
+        &saves.source_dir().join("user/settings.ini"),
+        b"[Saves]\nPath=Saves\\\n",
+    );
+    let own = game_saves::set_choice(&f.ctx, &saves.source, &f.def, SavesChoice::Own).unwrap();
+    write(&own.in_use.path.join(CHARACTER), b"private source");
+    let clone = saves.clone("Own Copy", false).unwrap();
+    let shared =
+        game_saves::set_choice(&f.ctx, &clone.instance_id, &f.def, SavesChoice::Shared).unwrap();
+    saves.assert_private();
+    let ini = game_ini::read(&f.ctx, &clone.instance_id, &f.def, "user/settings.ini").unwrap();
+    let value = ini.document.get("Saves", "Path").unwrap();
+    assert_eq!(value, r"Saves\");
+    let actual = f.saves_root().parent().unwrap().join(value);
+    assert_eq!(shared.in_use.path, f.saves_root());
+    assert_eq!(
+        std::fs::read(actual.join(CHARACTER)).unwrap(),
+        b"save bytes"
+    );
+    assert_eq!(
+        std::fs::read(own.in_use.path.join(CHARACTER)).unwrap(),
+        b"private source"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -136,6 +136,7 @@ export function readableWhen(value: string): string {
 
 export function folderLine(folder: SaveFolderRow): string {
   if (!folder.exists) return 'Not made yet. The game creates it.';
+  if (folder.saves === null) return 'Could not tell how many saves this folder holds.';
   if (folder.saves === 0) return 'No saves yet.';
   const count = `${folder.saves} ${folder.saves === 1 ? 'save' : 'saves'}`;
   return folder.newest ? `${count}, newest ${readableWhen(folder.newest)}` : count;
@@ -162,6 +163,8 @@ function settingSourceWords(source: IniSourceName): string {
 function settingNotice(change: SavesChange): string {
   const { action, value } = change.setting;
   switch (action) {
+    case 'no_setting':
+      return '';
     case 'set':
       return `The game's save setting now names ${value ?? 'that folder'}.`;
     case 'unchanged':
@@ -195,7 +198,7 @@ function SavesSection({ instanceId }: { instanceId: string }) {
       const moved = change.previous === change.saves.choice
         ? `This instance already keeps ${SAVE_CHOICE_WORDS[choice].label.toLowerCase()}.`
         : `This instance now keeps ${SAVE_CHOICE_WORDS[choice].label.toLowerCase()}.`;
-      setNotice(`${moved} ${settingNotice(change)} Your saves were not moved, copied or deleted.`);
+      setNotice([moved, settingNotice(change), 'Your saves were not moved, copied or deleted.'].filter(Boolean).join(' '));
     } catch (failure: unknown) {
       setError(describeFailure(failure));
     } finally {
@@ -209,14 +212,16 @@ function SavesSection({ instanceId }: { instanceId: string }) {
       {state.status === 'failed' && <FailureNote message={state.message} onRetry={refetch} />}
       {state.status === 'loaded' && (
         <div className="space-y-4" data-testid="saves-panel">
-          <p className="max-w-2xl text-sm text-muted-foreground">
-            The game keeps its saves in one of two folders. Switching changes which one this instance uses. It never
-            moves a save: the saves in the other folder stay where they are.
-          </p>
+          {state.value.other && (
+            <p className="max-w-2xl text-sm text-muted-foreground">
+              Switching changes the save folder this instance uses. Existing saves stay where they are.
+            </p>
+          )}
           <div className="grid gap-3 md:grid-cols-2">
             {(['shared', 'own'] as const).map((choice) => {
               const current = state.value.choice === choice;
               const folder = current ? state.value.inUse : state.value.other;
+              if (!folder) return null;
               return (
                 <div
                   key={choice}
@@ -245,16 +250,18 @@ function SavesSection({ instanceId }: { instanceId: string }) {
               );
             })}
           </div>
-          <p className="text-xs text-muted-foreground" data-testid="saves-setting">
-            The game finds the folder through{' '}
-            <code className="rounded bg-muted px-1 py-0.5 font-mono">{state.value.setting}</code> in {state.value.settingFile}:{' '}
-            {state.value.settingValue === null ? (
-              'not set'
-            ) : (
-              <code className="rounded bg-muted px-1 py-0.5 font-mono">{state.value.settingValue}</code>
-            )}{' '}
-            (from {settingSourceWords(state.value.settingSource)}).
-          </p>
+          {state.value.settingFile && (
+            <p className="text-xs text-muted-foreground" data-testid="saves-setting">
+              The game finds the folder through{' '}
+              <code className="rounded bg-muted px-1 py-0.5 font-mono">{state.value.setting}</code> in {state.value.settingFile}:{' '}
+              {state.value.settingValue === null ? (
+                'not set'
+              ) : (
+                <code className="rounded bg-muted px-1 py-0.5 font-mono">{state.value.settingValue}</code>
+              )}{' '}
+              (from {settingSourceWords(state.value.settingSource)}).
+            </p>
+          )}
         </div>
       )}
       {error && (
