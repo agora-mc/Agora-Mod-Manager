@@ -64,7 +64,29 @@ pub trait CompiledServices: Send + Sync {
 
 /// The instance operations the plugin host and repair actions perform.
 pub trait InstanceBackend: Send + Sync {
+    /// A human-readable name for warning messages when this backend cannot be read.
+    fn backend_name(&self) -> &'static str {
+        "a game package instance backend"
+    }
     fn list(&self, ctx: &Ctx) -> LauncherResult<Vec<crate::models::InstanceRow>>;
+
+    /// List instances, reporting a backend read failure as a warning instead of failing the whole
+    /// collection. Mutating operations must still establish ownership and refuse when they cannot.
+    fn list_reported(
+        &self,
+        ctx: &Ctx,
+    ) -> (Vec<crate::models::InstanceRow>, Vec<String>) {
+        match self.list(ctx) {
+            Ok(rows) => (rows, Vec::new()),
+            Err(error) => (
+                Vec::new(),
+                vec![format!(
+                    "cannot read instances from {}: {error}",
+                    self.backend_name()
+                )],
+            ),
+        }
+    }
     fn get(
         &self,
         ctx: &Ctx,
@@ -152,6 +174,9 @@ fn generic_row(
 }
 
 impl InstanceBackend for GenericInstanceBackend {
+    fn backend_name(&self) -> &'static str {
+        "game instances"
+    }
     fn list(&self, ctx: &Ctx) -> LauncherResult<Vec<crate::models::InstanceRow>> {
         let records = crate::game_instance::list(ctx).map_err(instance_error)?;
         Ok(records
@@ -277,22 +302,50 @@ pub(crate) struct InstanceBackends(pub(crate) Vec<Arc<dyn InstanceBackend>>);
 
 impl InstanceBackends {
     fn owner(&self, ctx: &Ctx, instance_id: &str) -> LauncherResult<&Arc<dyn InstanceBackend>> {
+        let mut first_error = None;
         for backend in &self.0 {
-            if backend.get(ctx, instance_id)?.is_some() {
-                return Ok(backend);
+            match backend.get(ctx, instance_id) {
+                Ok(Some(_)) => return Ok(backend),
+                Ok(None) => {}
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(&self.0[0])
     }
 }
 
 impl InstanceBackend for InstanceBackends {
+    fn backend_name(&self) -> &'static str {
+        "instance backends"
+    }
+
     fn list(&self, ctx: &Ctx) -> LauncherResult<Vec<crate::models::InstanceRow>> {
         let mut all = Vec::new();
         for backend in &self.0 {
             all.extend(backend.list(ctx)?);
         }
         Ok(all)
+    }
+
+    fn list_reported(
+        &self,
+        ctx: &Ctx,
+    ) -> (Vec<crate::models::InstanceRow>, Vec<String>) {
+        let mut all = Vec::new();
+        let mut warnings = Vec::new();
+        for backend in &self.0 {
+            let (rows, mut more) = backend.list_reported(ctx);
+            all.extend(rows);
+            warnings.append(&mut more);
+        }
+        (all, warnings)
     }
 
     fn get(
@@ -305,12 +358,23 @@ impl InstanceBackend for InstanceBackends {
             Option<crate::models::InstanceManifest>,
         )>,
     > {
+        let mut first_error = None;
         for backend in &self.0 {
-            if let Some(found) = backend.get(ctx, instance_id)? {
-                return Ok(Some(found));
+            match backend.get(ctx, instance_id) {
+                Ok(Some(found)) => return Ok(Some(found)),
+                Ok(None) => {}
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
-        Ok(None)
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(None)
+        }
     }
 
     fn rename(&self, ctx: &Ctx, instance_id: &str, name: &str) -> LauncherResult<()> {
@@ -484,6 +548,115 @@ mod tests {
         fn set_update_pinned(&self, _: &Ctx, _: &str, _: &str, _: bool) -> LauncherResult<bool> {
             Ok(false)
         }
+    }
+
+    struct FailingBackend(&'static str);
+
+    impl InstanceBackend for FailingBackend {
+        fn backend_name(&self) -> &'static str {
+            self.0
+        }
+        fn list(&self, _: &Ctx) -> LauncherResult<Vec<crate::models::InstanceRow>> {
+            Err(crate::error::LauncherError::Generic {
+                code: "ERR_BACKEND".into(),
+                message: "boom".into(),
+            })
+        }
+        fn get(
+            &self,
+            _: &Ctx,
+            _: &str,
+        ) -> LauncherResult<
+            Option<(
+                crate::models::InstanceRow,
+                Option<crate::models::InstanceManifest>,
+            )>,
+        > {
+            Err(crate::error::LauncherError::Generic {
+                code: "ERR_BACKEND".into(),
+                message: "boom".into(),
+            })
+        }
+        fn rename(&self, _: &Ctx, _: &str, _: &str) -> LauncherResult<()> {
+            Err(crate::error::LauncherError::Generic {
+                code: "ERR_BACKEND".into(),
+                message: "boom".into(),
+            })
+        }
+        fn update_jvm(
+            &self,
+            _: &Ctx,
+            _: &str,
+            _: i64,
+            _: &str,
+            _: bool,
+            _: &str,
+            _: &str,
+        ) -> LauncherResult<()> {
+            Err(crate::error::LauncherError::Generic {
+                code: "ERR_BACKEND".into(),
+                message: "boom".into(),
+            })
+        }
+        fn content(
+            &self,
+            _: &Ctx,
+            _: &str,
+            _: Option<&str>,
+        ) -> LauncherResult<Option<Vec<agora_plugin_api::dto::ContentEntry>>> {
+            Err(crate::error::LauncherError::Generic {
+                code: "ERR_BACKEND".into(),
+                message: "boom".into(),
+            })
+        }
+        fn set_update_pinned(&self, _: &Ctx, _: &str, _: &str, _: bool) -> LauncherResult<bool> {
+            Err(crate::error::LauncherError::Generic {
+                code: "ERR_BACKEND".into(),
+                message: "boom".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_failing_backend_does_not_hide_instances_from_healthy_backends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::ctx::CoreContext::for_testing(tmp.path().to_path_buf());
+        let healthy = Arc::new(Backend {
+            ids: vec!["ok-1"],
+            renamed: Mutex::default(),
+        });
+        let all = InstanceBackends(vec![Arc::new(FailingBackend("broken-backend")), healthy]);
+
+        let (rows, warnings) = all.list_reported(&ctx);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].instance_id, "ok-1");
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("broken-backend"),
+            "warning did not name backend: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn mutating_operations_refuse_when_ownership_cannot_be_established() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::ctx::CoreContext::for_testing(tmp.path().to_path_buf());
+        let healthy = Arc::new(Backend {
+            ids: vec!["ok-1"],
+            renamed: Mutex::default(),
+        });
+        let all = InstanceBackends(vec![Arc::new(FailingBackend("broken-backend")), healthy]);
+
+        let err = all.rename(&ctx, "missing-1", "x").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("boom") || msg.contains("ERR_BACKEND"),
+            "unexpected error: {msg}"
+        );
+        assert!(all.0[1]
+            .get(&ctx, "ok-1")
+            .is_ok(), "sanity");
     }
 
     #[test]

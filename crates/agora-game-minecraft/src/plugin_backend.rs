@@ -10,6 +10,10 @@ use agora_plugin_api::dto;
 pub struct MinecraftInstances;
 
 impl InstanceBackend for MinecraftInstances {
+    fn backend_name(&self) -> &'static str {
+        "Minecraft instances"
+    }
+
     fn list(&self, ctx: &Ctx) -> LauncherResult<Vec<InstanceRow>> {
         crate::instance_service::InstanceService::new(ctx.clone()).list()
     }
