@@ -674,7 +674,9 @@ fn run_step_down(
     // after the player's files change still puts them back before this process exits.
     let _stop = install_step_down_stop();
 
-    crate::game_deploy::deploy(ctx, instance_id, definition, mode)?;
+    // The wrapper opened its own session before deploying; `wrap` already refused while
+    // another session was live, and the instance lock is still taken here.
+    crate::game_deploy::deploy_while_running(ctx, instance_id, definition, mode, true)?;
     let farm = crate::game_deploy::deployment_dir(ctx, instance_id)?.ok_or_else(|| {
         crate::game_deploy::DeployError::Other(format!(
             "the deployment for '{instance_id}' was not built"

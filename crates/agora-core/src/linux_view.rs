@@ -219,7 +219,18 @@ mod linux_impl {
             // The lower layer is the instance's farm with the writable layer left out.
             // `DeployMode::Virtual` is exactly that plan: the writable layer is shown
             // on top by the view instead of being placed in the farm.
-            crate::game_deploy::deploy(ctx, &request.instance_id, definition, DeployMode::Virtual)?;
+            //
+            // The wrapper records its session before this call so a crash during the
+            // view is diagnosable, so the deploy must allow the session it opened
+            // itself; `wrap` already refused while any other session was live. The
+            // instance lock is still taken.
+            crate::game_deploy::deploy_while_running(
+                ctx,
+                &request.instance_id,
+                definition,
+                DeployMode::Virtual,
+                true,
+            )?;
             let lower = crate::game_deploy::deployment_dir(ctx, &request.instance_id)?
                 .ok_or_else(|| ViewError::NoDeployment(request.instance_id.clone()))?;
             let instance_dir = ctx
