@@ -27,7 +27,7 @@ import {
   type VortexScanProfile,
   type VortexScanReply,
 } from './api';
-import type { ImportDone, ImportFlowState, ImportStep } from './Mo2ImportFlow';
+import type { ImportFlowState, ImportStep } from './Mo2ImportFlow';
 import { ImportProgressView } from './ImportProgressView';
 import { MultiProfilesSection } from './MultiProfilesSection';
 
@@ -124,12 +124,12 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
     }
   };
 
-  const choose = async (game: VortexScanGame, profile: VortexScanProfile) => {
+  const preview = async (
+    game: VortexScanGame,
+    profile: VortexScanProfile,
+    options: { copySaves: boolean; allMods: boolean },
+  ) => {
     if (!game.game) return;
-    setSelected({ game, profile });
-    setInstanceName('');
-    setCopySaves(false);
-    setAllMods(false);
     setRun({ status: 'idle' });
     setPlan({ status: 'busy' });
     try {
@@ -141,8 +141,8 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
         dryRun: true,
         install: null,
         addFolder: false,
-        copySaves,
-        allMods,
+        copySaves: options.copySaves,
+        allMods: options.allMods,
       });
       if (!mounted.current) return;
       if (reply.kind !== 'plan') throw new Error('The preview did not return a plan.');
@@ -150,6 +150,15 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
     } catch (error) {
       if (mounted.current) setPlan({ status: 'error', message: formatError(error) });
     }
+  };
+
+  const choose = async (game: VortexScanGame, profile: VortexScanProfile) => {
+    if (!game.game) return;
+    setSelected({ game, profile });
+    setInstanceName('');
+    setCopySaves(false);
+    setAllMods(false);
+    await preview(game, profile, { copySaves: false, allMods: false });
   };
 
   const importProfile = async (current: VortexPlanDto) => {
@@ -193,13 +202,24 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
           ? 'preview'
           : 'setup';
   const running = run.status === 'running';
-  const report: ImportDone | null =
-    run.status === 'done'
-      ? { instanceId: run.report.instanceId, instanceName: run.report.instanceName }
-      : null;
+  const doneInstanceId = run.status === 'done' ? run.report.instanceId : null;
+  const doneInstanceName = run.status === 'done' ? run.report.instanceName : null;
+  const reportedDoneKey = useRef<string | null>(null);
   useEffect(() => {
-    onStateChange?.({ step, running, report });
-  }, [onStateChange, step, running, report]);
+    if (step === 'done' && doneInstanceId != null && doneInstanceName != null) {
+      const key = `${doneInstanceId}\0${doneInstanceName}`;
+      if (reportedDoneKey.current === key) return;
+      reportedDoneKey.current = key;
+      onStateChange?.({
+        step,
+        running,
+        report: { instanceId: doneInstanceId, instanceName: doneInstanceName },
+      });
+      return;
+    }
+    reportedDoneKey.current = null;
+    onStateChange?.({ step, running, report: null });
+  }, [onStateChange, step, running, doneInstanceId, doneInstanceName]);
 
   if (run.status === 'done') {
     const result = run.report;
@@ -399,7 +419,13 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
                       you ask, as MO2’s import does.
                     </p>
                     <label className="flex items-center gap-2 text-sm">
-                      <Switch checked={copySaves} onCheckedChange={setCopySaves} />
+                      <Switch
+                        checked={copySaves}
+                        onCheckedChange={(next) => {
+                          setCopySaves(next);
+                          if (selected) void preview(selected.game, selected.profile, { copySaves: next, allMods });
+                        }}
+                      />
                       Copy the profile’s saves into the new instance
                     </label>
                   </div>
@@ -505,7 +531,13 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
         <>
           <p className="break-all font-mono text-xs text-muted-foreground">{scan.reply.store}</p>
           <label className="flex items-center gap-2 text-sm">
-            <Switch checked={allMods} onCheckedChange={setAllMods} />
+            <Switch
+              checked={allMods}
+              onCheckedChange={(next) => {
+                setAllMods(next);
+                if (selected) void preview(selected.game, selected.profile, { copySaves, allMods: next });
+              }}
+            />
             Also bring the profile’s disabled mods (they arrive turned off)
           </label>
           {scan.reply.games.length === 0 && (

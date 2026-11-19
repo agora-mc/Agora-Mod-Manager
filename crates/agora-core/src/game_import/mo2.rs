@@ -578,7 +578,10 @@ gamePath=@ByteArray(D:\\\\SteamLibrary\\\\steamapps\\\\common\\\\Skyrim Special 
         let text = "[Settings]\nbase_directory=E:\\\\Base\nmod_directory=mods_alt\nprofiles_directory=sub\\profiles\n";
         let ini = parse_ini(text, PathBuf::from(r"D:\Setup"));
         assert_eq!(ini.mods, PathBuf::from(r"E:\Base").join("mods_alt"));
-        assert_eq!(ini.profiles, PathBuf::from(r"E:\Base").join(r"sub\profiles"));
+        assert_eq!(
+            ini.profiles,
+            PathBuf::from(r"E:\Base").join(r"sub\profiles")
+        );
     }
 
     #[test]
