@@ -40,7 +40,7 @@ pub fn parse_ini(text: &str, ini_dir: PathBuf) -> Mo2Ini {
     let base = match get(SETTINGS, "base_directory").filter(|s| !s.trim().is_empty()) {
         Some(value) => {
             let path = PathBuf::from(value.trim());
-            if path.is_relative() {
+            if !is_absolute_setting_path(&path) {
                 ini_dir.join(path)
             } else {
                 path
@@ -60,7 +60,7 @@ pub fn parse_ini(text: &str, ini_dir: PathBuf) -> Mo2Ini {
             ));
         }
         let path = PathBuf::from(value);
-        if path.is_relative() {
+        if !is_absolute_setting_path(&path) {
             base.join(path)
         } else {
             path
@@ -82,6 +82,22 @@ pub fn parse_ini(text: &str, ini_dir: PathBuf) -> Mo2Ini {
         downloads,
         warnings,
     }
+}
+
+/// MO2's files come from Windows, so their paths are Windows paths even when Agora runs on Linux
+/// (MO2 under Proton). `Path::is_absolute` only knows the host, which would read `D:\Setup` as a
+/// relative name there.
+fn is_absolute_setting_path(path: &std::path::Path) -> bool {
+    if path.is_absolute() {
+        return true;
+    }
+    let text = path.to_string_lossy();
+    let bytes = text.as_bytes();
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    drive || text.starts_with(r"\\")
 }
 
 /// The raw value of `key` in `[section]`, with the file's own quoting and escaping still in it.
@@ -563,6 +579,19 @@ gamePath=@ByteArray(D:\\\\SteamLibrary\\\\steamapps\\\\common\\\\Skyrim Special 
         let ini = parse_ini(text, PathBuf::from(r"D:\Setup"));
         assert_eq!(ini.base, PathBuf::from(r"E:\Mods\Base"));
         assert_eq!(ini.mods, PathBuf::from(r"E:\Mods\Base/mods"));
+    }
+
+    #[test]
+    fn windows_paths_are_absolute_on_every_host() {
+        let text = "[Settings]\nbase_directory=C:/Mods/Base\n";
+        let ini = parse_ini(text, PathBuf::from(r"D:\Setup"));
+        assert_eq!(ini.base, PathBuf::from("C:/Mods/Base"));
+        assert_eq!(ini.mods, PathBuf::from("C:/Mods/Base/mods"));
+
+        let unc = "[Settings]\nbase_directory=\\\\\\\\server\\\\share\\\\Base\n";
+        let ini = parse_ini(unc, PathBuf::from(r"D:\Setup"));
+        assert_eq!(ini.base, PathBuf::from(r"\\server\share\Base"));
+        assert_eq!(ini.mods, PathBuf::from(r"\\server\share\Base/mods"));
     }
 
     #[test]
