@@ -333,8 +333,14 @@ fn a_loadout_saves_and_applies_the_layer_set() {
         .expect("the loadout is saved");
     game_deploy::set_content_enabled(&f.ctx, &inst.instance_id, &item, false)
         .expect("the layer is disabled");
-    game_loadout::apply_game_profile_with_undo(&f.ctx, &inst.instance_id, &f.def, "Everything On")
-        .expect("the loadout applies");
+    game_loadout::apply_game_profile_with_undo(
+        &f.ctx,
+        &inst.instance_id,
+        &f.def,
+        "Everything On",
+        false,
+    )
+    .expect("the loadout applies");
 
     let manifest = get_manifest(&f.ctx, &inst.instance_id).unwrap();
     let layer = manifest
@@ -355,14 +361,38 @@ fn a_snapshot_restores_the_instance_manifest() {
         .create(&inst.instance_id, Some("before"))
         .expect("the snapshot");
 
+    let added = f.add(
+        &inst.instance_id,
+        "After Snapshot",
+        &[("After/archive.json", b"{}")],
+    );
+    let added_id = match added {
+        AddToInstance::Added { item_id, .. } => item_id,
+        other => panic!("the item was not added: {other:?}"),
+    };
+    let names_it = |manifest: &agora_core::game_instance::GameInstanceManifest| {
+        manifest
+            .layers
+            .layers()
+            .iter()
+            .any(|layer| matches!(&layer.source, agora_game_api::LayerSource::Content { content } if content == &added_id))
+    };
+    assert!(
+        names_it(&get_manifest(&f.ctx, &inst.instance_id).unwrap()),
+        "the layer added after the snapshot is in the manifest"
+    );
+
     game_instance::rename(&f.ctx, &inst.instance_id, "Renamed").expect("the rename");
     snapshots
         .restore(&inst.instance_id, &snapshot.id)
         .expect("the restore");
-    assert_eq!(
-        get_manifest(&f.ctx, &inst.instance_id).unwrap().name,
-        "Snapshot"
+
+    let restored = get_manifest(&f.ctx, &inst.instance_id).unwrap();
+    assert!(
+        !names_it(&restored),
+        "the layer added after the snapshot is gone"
     );
+    assert_eq!(restored.name, "Renamed", "a restore keeps the live name");
 }
 
 #[test]
