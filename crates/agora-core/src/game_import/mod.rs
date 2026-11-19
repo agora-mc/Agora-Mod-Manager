@@ -1241,6 +1241,9 @@ pub struct Mo2RunReport {
     pub saves_copied: usize,
     pub saves_skipped_existing: usize,
     pub saves_folder: Option<PathBuf>,
+    /// Files this import wrote outside the instance folder (copied save files under Documents).
+    #[serde(default)]
+    pub external_files_written: Vec<PathBuf>,
     /// Programs from MO2's executables list added to the instance's own tools, by name. A tool the
     /// game declares is found in its mod by itself and is not repeated here.
     pub tools_added: Vec<String>,
@@ -1313,6 +1316,82 @@ pub fn abandon_half_made_instance(ctx: &Ctx, instance_id: &str, cause: ImportErr
     }
 }
 
+struct RunDetail {
+    report: Mo2RunReport,
+    overwrite_item: Option<String>,
+}
+
+struct RunInnerError {
+    error: ImportError,
+    external_files_written: Vec<PathBuf>,
+}
+
+impl<E: Into<ImportError>> From<E> for Box<RunInnerError> {
+    fn from(error: E) -> Self {
+        Box::new(RunInnerError {
+            error: error.into(),
+            external_files_written: Vec::new(),
+        })
+    }
+}
+
+fn single_copy_bytes(plan: &Mo2Plan, copy_saves: bool) -> u64 {
+    let saves = if copy_saves && plan.saves.local && plan.saves.from.is_some() {
+        plan.saves.bytes
+    } else {
+        0
+    };
+    plan.bytes.saturating_add(saves)
+}
+
+fn multi_copy_bytes(plans: &[Mo2Plan], grouping: profiles::Grouping, copy_saves: bool) -> u64 {
+    // Separate mode invokes single-profile import per profile, storing every listed mod (enabled
+    // or disabled) into the deduplicated content store. Merged mode stores only the union of
+    // enabled mods across the chosen profiles (MASTER_SPEC §26.10).
+    let include_disabled = grouping == profiles::Grouping::Separate;
+    let mut union: BTreeMap<String, u64> = BTreeMap::new();
+    for plan in plans {
+        for item in &plan.mods {
+            if include_disabled || item.enabled {
+                union.insert(fold_path_case(&item.folder), item.bytes);
+            }
+        }
+    }
+    let mods_bytes = union.values().copied().fold(0u64, u64::saturating_add);
+    let overwrite_bytes = match grouping {
+        profiles::Grouping::Merged => plans.first().map(|plan| plan.overwrite.bytes).unwrap_or(0),
+        profiles::Grouping::Separate => {
+            // Unclaimed overwrite rest goes into the deduplicated content store once;
+            // tool-claimed generated files are copied into each separate instance.
+            let rest_once = plans
+                .first()
+                .map(|plan| plan.overwrite.rest_bytes)
+                .unwrap_or(0);
+            let generated_per_instance = plans
+                .iter()
+                .map(|plan| {
+                    plan.overwrite
+                        .bytes
+                        .saturating_sub(plan.overwrite.rest_bytes)
+                })
+                .fold(0u64, u64::saturating_add);
+            rest_once.saturating_add(generated_per_instance)
+        }
+    };
+    let saves_bytes = if copy_saves {
+        plans
+            .iter()
+            .filter(|plan| plan.saves.local && plan.saves.from.is_some())
+            .map(|plan| plan.saves.bytes)
+            .fold(0u64, u64::saturating_add)
+    } else {
+        0
+    };
+    mods_bytes
+        .saturating_add(overwrite_bytes)
+        .saturating_add(saves_bytes)
+}
+
 /// Run an import: store the bytes, make the instance, and set it up from the profile. The plan is
 /// made first, so a refusal happens before anything is written.
 pub fn run(
@@ -1322,7 +1401,29 @@ pub fn run(
     options: RunOptions,
     progress: &dyn Fn(ImportProgress),
 ) -> Result<Mo2RunReport, ImportError> {
+    run_inner(ctx, inventory, request, options, progress, false, true)
+        .map(|detail| detail.report)
+        .map_err(|err| err.error)
+}
+
+fn run_inner(
+    ctx: &Ctx,
+    inventory: &GameInventory,
+    request: &Mo2Request,
+    options: RunOptions,
+    progress: &dyn Fn(ImportProgress),
+    only_enabled_mods: bool,
+    check_space: bool,
+) -> Result<RunDetail, Box<RunInnerError>> {
     let plan = plan(ctx, inventory, request)?;
+    if check_space {
+        let needed = single_copy_bytes(&plan, request.copy_saves);
+        if let Some(free) = crate::game_tool_swap::available_bytes(&ctx.paths.content_root()) {
+            if needed > free {
+                return Err(ImportError::NotEnoughSpace { needed, free }.into());
+            }
+        }
+    }
     let install = inventory
         .installs
         .iter()
@@ -1356,22 +1457,29 @@ pub fn run(
         saves_copied: 0,
         saves_skipped_existing: 0,
         saves_folder: None,
+        external_files_written: Vec::new(),
         tools_added: Vec::new(),
         next_steps: Vec::new(),
     };
 
-    // 1. Bytes first: every listed mod, as it is on disk. The bar measures the mods alone: the
-    // overwrite folder is copied later and cannot be measured, so adding its bytes here would stop
-    // the bar short of its end.
-    let mods_total = plan.mods.len();
-    let mods_bytes: u64 = plan.mods.iter().map(|m| m.bytes).sum();
+    // 1. Bytes first: every listed mod (or enabled mods only for a merged base), as it is on disk.
+    // The bar measures the mods alone: the overwrite folder is copied later and cannot be measured,
+    // so adding its bytes here would stop the bar short of its end.
+    let mods_to_store: Vec<(usize, &PlannedMod)> = plan
+        .mods
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| !only_enabled_mods || m.enabled)
+        .collect();
+    let mods_total = mods_to_store.len();
+    let mods_bytes: u64 = mods_to_store.iter().map(|(_, m)| m.bytes).sum();
     let mut stored: Vec<(usize, String)> = Vec::new();
     let mut bytes_done = 0u64;
-    for (index, planned) in plan.mods.iter().enumerate() {
+    for (step, (plan_index, planned)) in mods_to_store.into_iter().enumerate() {
         progress(ImportProgress {
             phase: ImportPhase::Storing,
             current_mod: Some(planned.folder.clone()),
-            mods_done: index,
+            mods_done: step,
             mods_total,
             bytes_done,
             bytes_total: mods_bytes,
@@ -1389,13 +1497,13 @@ pub fn run(
         let (files, _) = collect_mod_files(&planned.path).map_err(store_error)?;
         let outcome = content_store::add_collected(ctx, &planned.folder, files, source)
             .map_err(store_error)?;
-        stored.push((index, outcome.item().item_id.clone()));
+        stored.push((plan_index, outcome.item().item_id.clone()));
         bytes_done += planned.bytes;
         report.stored_mods += 1;
         progress(ImportProgress {
             phase: ImportPhase::Storing,
             current_mod: None,
-            mods_done: index + 1,
+            mods_done: step + 1,
             mods_total,
             bytes_done,
             bytes_total: mods_bytes,
@@ -1403,10 +1511,13 @@ pub fn run(
         if options
             .stop_after_mods
             .is_some_and(|n| report.stored_mods >= n)
-            && index + 1 < mods_total
+            && step + 1 < mods_total
         {
             report.interrupted = true;
-            return Ok(report);
+            return Ok(RunDetail {
+                report,
+                overwrite_item: None,
+            });
         }
     }
 
@@ -1472,6 +1583,7 @@ pub fn run(
 
     // Everything from here sets the new instance up. If any of it fails, the half-made instance is
     // removed, so a second run starts clean rather than being refused as already imported.
+    let mut external_files_written: Vec<PathBuf> = Vec::new();
     let populated: Result<(), ImportError> = (|| {
         let mut manifest: GameInstanceManifest = game_instance::get_manifest(ctx, &instance_id)?;
         manifest.imported_from = Some(ImportRecord {
@@ -1515,8 +1627,17 @@ pub fn run(
             }
         }
         if let Some(item_id) = &overwrite_item {
-            game_deploy::add_content(ctx, &instance_id, item_id, mount_arg, None)?;
-            report.content_layers += 1;
+            let existing = game_instance::get_manifest(ctx, &instance_id)?
+                .layers
+                .layers()
+                .iter()
+                .any(|l| matches!(&l.source, agora_game_api::LayerSource::Content { content } if content == item_id));
+            if existing {
+                game_deploy::set_content_enabled(ctx, &instance_id, item_id, true)?;
+            } else {
+                game_deploy::add_content(ctx, &instance_id, item_id, mount_arg, None)?;
+                report.content_layers += 1;
+            }
         }
 
         // 4. Generated layers, one per tool, from the files the tools claim.
@@ -1614,6 +1735,7 @@ pub fn run(
                                 continue;
                             }
                             std::fs::copy(entry.path(), &dest)?;
+                            external_files_written.push(dest);
                             report.saves_copied += 1;
                         }
                     }
@@ -1631,8 +1753,12 @@ pub fn run(
         Ok(())
     })();
     if let Err(error) = populated {
-        return Err(abandon_half_made_instance(ctx, &instance_id, error));
+        return Err(Box::new(RunInnerError {
+            error: abandon_half_made_instance(ctx, &instance_id, error),
+            external_files_written,
+        }));
     }
+    report.external_files_written = external_files_written;
 
     // 8. MO2's executables become the instance's own tools. A tool that cannot be added is a note,
     // never a failed import: the instance is complete without it.
@@ -1646,7 +1772,10 @@ pub fn run(
             p.reason
         )
     }));
-    Ok(report)
+    Ok(RunDetail {
+        report,
+        overwrite_item,
+    })
 }
 
 /// The folders of `path` below `folder`, compared without case and without caring whether the
@@ -1847,18 +1976,7 @@ pub fn mo2_plan_profiles(
         };
         plans.push(plan(ctx, inventory, &request)?);
     }
-    let mut union: BTreeMap<String, u64> = BTreeMap::new();
-    let mut separate_bytes = 0u64;
-    for plan in &plans {
-        for item in plan.mods.iter().filter(|m| m.enabled) {
-            union.insert(item.folder.clone(), item.bytes);
-            separate_bytes = separate_bytes.saturating_add(item.bytes);
-        }
-    }
-    let bytes = match grouping {
-        profiles::Grouping::Merged => union.values().sum(),
-        profiles::Grouping::Separate => separate_bytes,
-    };
+    let bytes = multi_copy_bytes(&plans, grouping, base.copy_saves);
     let free_bytes = crate::game_tool_swap::available_bytes(&ctx.paths.content_root());
     let fits = free_bytes.is_none_or(|free| bytes <= free);
     let suggestion = profiles::suggest_grouping(&sets);
@@ -1885,11 +2003,30 @@ pub fn mo2_plan_profiles(
     })
 }
 
+/// Outcome of one profile in a multi-profile MO2 import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Mo2ProfileOutcome {
+    pub profile: String,
+    /// The created instance id (or the shared instance id in merged mode), or `None` if this
+    /// profile failed to import.
+    pub instance_id: Option<String>,
+    /// Error message when importing this profile failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Files the import wrote outside the instance folder (such as copied saves under Documents),
+    /// kept even when a later step failed so nothing is silently forgotten.
+    #[serde(default)]
+    pub external_files_written: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Mo2MultiReport {
     pub plan: Mo2MultiPlan,
     pub instances: Vec<String>,
     pub loadouts: Vec<String>,
+    /// Per-profile result (instance id or error) and any files written outside the instance.
+    #[serde(default)]
+    pub profiles: Vec<Mo2ProfileOutcome>,
 }
 
 fn add_mo2_mod_to_merged(
@@ -1937,41 +2074,135 @@ fn add_mo2_mod_to_merged(
     Ok(item_id)
 }
 
+struct MergedLayers {
+    layer_mods: HashMap<String, Vec<String>>,
+    folder_to_layer: HashMap<String, String>,
+    overwrite_layer_id: Option<String>,
+}
+
 fn mo2_state_for_merge(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
     plan: &Mo2Plan,
-    layer_mod: &HashMap<String, Option<String>>,
+    profile_dir: &Path,
+    merged: &MergedLayers,
 ) -> Result<crate::game_loadout::GameLoadout, ImportError> {
-    let mut state =
-        crate::game_loadout::capture(ctx, instance_id, definition).map_err(ImportError::Other)?;
-    let enabled: std::collections::BTreeSet<&str> = plan
+    let manifest = game_instance::get_manifest(ctx, instance_id)?;
+    let store = game_ini::store_of(ctx, instance_id)?;
+    let overwrite_layer_id = merged.overwrite_layer_id.as_deref();
+
+    let enabled: HashSet<String> = plan
         .mods
         .iter()
         .filter(|m| m.enabled)
-        .map(|m| m.folder.as_str())
+        .map(|m| fold_path_case(&m.folder))
         .collect();
-    for item in &mut state.content {
-        item.enabled = layer_mod
-            .get(item.item.as_str())
-            .and_then(|folder| folder.as_deref())
-            .is_some_and(|folder| enabled.contains(folder));
+    let mut content = Vec::new();
+    for layer in manifest.layers.layers() {
+        if matches!(
+            layer.source,
+            agora_game_api::LayerSource::Content { .. }
+                | agora_game_api::LayerSource::InstanceContent { .. }
+        ) {
+            let id = layer.id.as_str().to_string();
+            let is_overwrite = overwrite_layer_id == Some(id.as_str());
+            let is_enabled = is_overwrite
+                || merged
+                    .layer_mods
+                    .get(id.as_str())
+                    .is_some_and(|folders| folders.iter().any(|folder| enabled.contains(folder)));
+            content.push(crate::game_loadout::GameLoadoutContent {
+                item: id,
+                enabled: is_enabled,
+            });
+        }
     }
-    if plan.plugins.kept {
-        if let Some(rule) = definition.load_orders.first() {
+
+    // Order content layers lowest-priority first (matching LayerStack): `plan.mods` is highest
+    // priority first. Enabled entries take precedence over disabled aliases of the same layer.
+    // MO2's shared overwrite layer always sits on top of every mod.
+    let mut layer_rank: HashMap<String, usize> = HashMap::new();
+    for (idx, m) in plan.mods.iter().enumerate() {
+        if m.enabled {
+            if let Some(layer_id) = merged.folder_to_layer.get(&fold_path_case(&m.folder)) {
+                if overwrite_layer_id != Some(layer_id.as_str()) {
+                    layer_rank.entry(layer_id.clone()).or_insert(idx);
+                }
+            }
+        }
+    }
+    for (idx, m) in plan.mods.iter().enumerate() {
+        if !m.enabled {
+            if let Some(layer_id) = merged.folder_to_layer.get(&fold_path_case(&m.folder)) {
+                if overwrite_layer_id != Some(layer_id.as_str()) {
+                    layer_rank.entry(layer_id.clone()).or_insert(idx);
+                }
+            }
+        }
+    }
+    let mut ranked: Vec<(usize, String)> = layer_rank
+        .into_iter()
+        .map(|(layer_id, idx)| (idx, layer_id))
+        .collect();
+    // Higher modlist index = lower priority = earlier in LayerStack.
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut layer_order: Vec<String> = ranked.into_iter().map(|(_, id)| id).collect();
+    let placed: HashSet<&str> = layer_order.iter().map(String::as_str).collect();
+    let mut rest: Vec<String> = content
+        .iter()
+        .filter(|item| {
+            !placed.contains(item.item.as_str()) && overwrite_layer_id != Some(item.item.as_str())
+        })
+        .map(|item| item.item.clone())
+        .collect();
+    layer_order.append(&mut rest);
+    if let Some(ow) = overwrite_layer_id {
+        if content.iter().any(|item| item.item == ow) {
+            layer_order.push(ow.to_string());
+        }
+    }
+
+    // Start from the shared base (every list and INI absent = None) rather than capturing
+    // profile 1's state, so later profiles never inherit profile 1's private settings.
+    let own_plugins = profile_dir.join("plugins.txt").is_file();
+    let first_rule = definition.load_orders.first();
+    let plugin_contents = if own_plugins && plan.plugins.kept {
+        first_rule.map(|rule| {
             let lines: Vec<(String, bool)> = plan
                 .plugins
                 .lines
                 .iter()
                 .map(|line| (line.name.clone(), line.active))
                 .collect();
-            let bytes = crate::game_plugins::list_bytes(rule, &lines);
-            if let Some(list) = state.plugin_lists.iter_mut().find(|l| l.list == rule.id) {
-                list.contents = Some(bytes);
-            }
+            crate::game_plugins::list_bytes(rule, &lines)
+        })
+    } else {
+        None
+    };
+    let mut plugin_lists: Vec<crate::game_loadout::GameLoadoutPluginList> = definition
+        .load_orders
+        .iter()
+        .map(|rule| crate::game_loadout::GameLoadoutPluginList {
+            list: rule.id.clone(),
+            contents: None,
+        })
+        .collect();
+    if let Some(rule) = first_rule {
+        if let Some(list) = plugin_lists.iter_mut().find(|l| l.list == rule.id) {
+            list.contents = plugin_contents.clone();
         }
     }
+
+    let mut inis: Vec<crate::game_loadout::GameLoadoutIni> = definition
+        .user_files
+        .iter()
+        .filter(|m| m.applies_to_store(&store))
+        .map(|mapping| crate::game_loadout::GameLoadoutIni {
+            file: mapping.instance_path.as_str().to_string(),
+            contents: None,
+        })
+        .collect();
     for ini in &plan.inis {
         let contents = match std::fs::read(&ini.from) {
             Ok(bytes) => Some(bytes),
@@ -1982,21 +2213,46 @@ fn mo2_state_for_merge(
                 )))
             }
         };
-        if let Some(existing) = state.inis.iter_mut().find(|i| i.file == ini.instance_path) {
+        if let Some(existing) = inis.iter_mut().find(|i| i.file == ini.instance_path) {
             existing.contents = contents;
         } else {
-            state.inis.push(crate::game_loadout::GameLoadoutIni {
+            inis.push(crate::game_loadout::GameLoadoutIni {
                 file: ini.instance_path.clone(),
                 contents,
             });
         }
     }
-    state.saves = if plan.saves.local {
-        crate::game_instance::SavesChoice::Own
-    } else {
-        crate::game_instance::SavesChoice::Shared
-    };
-    Ok(state)
+    // The game's plugin list is also a user file, so keep its INI-shaped entry in step with
+    // `plugin_lists` rather than deleting it after writing the plugin list.
+    if let Some(rule) = first_rule {
+        if let Some(ini) = inis.iter_mut().find(|ini| ini.file == rule.file.as_str()) {
+            ini.contents = plugin_contents;
+        }
+    }
+
+    let rules = definition
+        .load_orders
+        .iter()
+        .map(|rule| crate::game_loadout::GameLoadoutRules {
+            list: rule.id.clone(),
+            rules: Vec::new(),
+        })
+        .collect();
+
+    Ok(crate::game_loadout::GameLoadout {
+        content,
+        layer_order,
+        plugin_lists,
+        inis,
+        rules,
+        saves: if plan.saves.local {
+            SavesChoice::Own
+        } else {
+            SavesChoice::Shared
+        },
+        // Each merged profile with local saves gets its own scoped folder under the instance.
+        save_folder: plan.saves.local.then(|| plan.profile.clone()),
+    })
 }
 
 pub fn mo2_run_profiles(
@@ -2018,6 +2274,7 @@ pub fn mo2_run_profiles(
     match grouping {
         profiles::Grouping::Separate => {
             let mut instances = Vec::new();
+            let mut outcomes = Vec::with_capacity(profiles.len());
             for profile in profiles {
                 let request = Mo2Request {
                     profile: profile.clone(),
@@ -2029,77 +2286,229 @@ pub fn mo2_run_profiles(
                     ),
                     ..base.clone()
                 };
-                let report = run(ctx, inventory, &request, options, progress)?;
-                if let Some(instance) = report.instance_id {
-                    instances.push(instance);
+                match run_inner(ctx, inventory, &request, options, progress, false, false) {
+                    Ok(detail) => {
+                        let report = detail.report;
+                        if let Some(instance) = &report.instance_id {
+                            instances.push(instance.clone());
+                        }
+                        outcomes.push(Mo2ProfileOutcome {
+                            profile: profile.clone(),
+                            instance_id: report.instance_id,
+                            error: None,
+                            external_files_written: report.external_files_written,
+                        });
+                    }
+                    Err(err) => {
+                        outcomes.push(Mo2ProfileOutcome {
+                            profile: profile.clone(),
+                            instance_id: None,
+                            error: Some(err.error.to_string()),
+                            external_files_written: err.external_files_written,
+                        });
+                    }
                 }
             }
             Ok(Mo2MultiReport {
                 plan: multi,
                 instances,
                 loadouts: Vec::new(),
+                profiles: outcomes,
             })
         }
         profiles::Grouping::Merged => {
             let request = Mo2Request {
                 profile: profiles[0].clone(),
+                // The merged branch copies each local-save profile into its own scoped folder.
+                copy_saves: false,
                 ..base.clone()
             };
-            let report = run(ctx, inventory, &request, options, progress)?;
+            let detail = run_inner(ctx, inventory, &request, options, progress, true, false)
+                .map_err(|err| err.error)?;
+            let report = detail.report;
+            let overwrite_item = detail.overwrite_item;
             let instance_id = report
                 .instance_id
                 .clone()
                 .ok_or_else(|| ImportError::Other("the base import made no instance".into()))?;
-            let definition = ctx
-                .games
-                .game(&multi.plans[0].game)
-                .cloned()
-                .ok_or_else(|| ImportError::Other("the game definition is missing".into()))?;
 
-            let mut folder_to_item: HashMap<String, String> = HashMap::new();
-            for profile_plan in &multi.plans {
-                for item in profile_plan.mods.iter().filter(|m| m.enabled) {
-                    if folder_to_item.contains_key(&item.folder) {
-                        continue;
+            // Everything after the first profile's instance exists is one recoverable unit:
+            // any failure removes the half-made instance so a normal retry succeeds cleanly
+            // instead of hitting AlreadyImported.
+            let mut copied_saves_all: Vec<PathBuf> = Vec::new();
+            let merged = (|| -> Result<(Vec<String>, Vec<Mo2ProfileOutcome>), ImportError> {
+                let definition = ctx
+                    .games
+                    .game(&multi.plans[0].game)
+                    .cloned()
+                    .ok_or_else(|| ImportError::Other("the game definition is missing".into()))?;
+
+                let mut folder_to_item: HashMap<String, String> = HashMap::new();
+                for profile_plan in &multi.plans {
+                    for item in profile_plan.mods.iter().filter(|m| m.enabled) {
+                        let key = fold_path_case(&item.folder);
+                        if folder_to_item.contains_key(&key) {
+                            continue;
+                        }
+                        let item_id = add_mo2_mod_to_merged(
+                            ctx,
+                            &instance_id,
+                            &definition,
+                            profile_plan,
+                            item,
+                        )?;
+                        folder_to_item.insert(key, item_id);
                     }
-                    let item_id =
-                        add_mo2_mod_to_merged(ctx, &instance_id, &definition, profile_plan, item)?;
-                    folder_to_item.insert(item.folder.clone(), item_id);
                 }
-            }
-            let reverse: HashMap<String, String> = folder_to_item
-                .iter()
-                .map(|(folder, item_id)| (item_id.clone(), folder.clone()))
-                .collect();
-            let manifest = game_instance::get_manifest(ctx, &instance_id)?;
-            let mut layer_mod: HashMap<String, Option<String>> = HashMap::new();
-            for layer in manifest.layers.layers() {
-                if let agora_game_api::LayerSource::Content { content } = &layer.source {
-                    layer_mod.insert(layer.id.as_str().to_string(), reverse.get(content).cloned());
+                let mut item_folders: HashMap<String, Vec<String>> = HashMap::new();
+                for (folder_key, item_id) in &folder_to_item {
+                    item_folders
+                        .entry(item_id.clone())
+                        .or_default()
+                        .push(folder_key.clone());
                 }
-            }
+                let manifest = game_instance::get_manifest(ctx, &instance_id)?;
+                let mut layer_mods: HashMap<String, Vec<String>> = HashMap::new();
+                let mut item_to_layer: HashMap<String, String> = HashMap::new();
+                for layer in manifest.layers.layers() {
+                    if let agora_game_api::LayerSource::Content { content } = &layer.source {
+                        layer_mods.insert(
+                            layer.id.as_str().to_string(),
+                            item_folders.get(content).cloned().unwrap_or_default(),
+                        );
+                        item_to_layer.insert(content.clone(), layer.id.as_str().to_string());
+                    }
+                }
+                let folder_to_layer: HashMap<String, String> = folder_to_item
+                    .iter()
+                    .filter_map(|(folder_key, item_id)| {
+                        item_to_layer
+                            .get(item_id)
+                            .map(|layer_id| (folder_key.clone(), layer_id.clone()))
+                    })
+                    .collect();
 
-            let mut loadouts = Vec::new();
-            for (profile, profile_plan) in profiles.iter().zip(multi.plans.iter()) {
-                let state =
-                    mo2_state_for_merge(ctx, &instance_id, &definition, profile_plan, &layer_mod)?;
-                crate::game_loadout::save_game_profile(ctx, &instance_id, profile, state)
-                    .map_err(ImportError::Other)?;
-                loadouts.push(profile.clone());
+                let overwrite_layer_id = overwrite_item
+                    .as_ref()
+                    .and_then(|item_id| item_to_layer.get(item_id).cloned());
+
+                let merged_layers = MergedLayers {
+                    layer_mods,
+                    folder_to_layer,
+                    overwrite_layer_id,
+                };
+
+                let ini_text = read_text_optional(&base.ini_path)?.unwrap_or_default();
+                let ini_dir = base
+                    .ini_path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                let mo2_ini = mo2::parse_ini(&ini_text, ini_dir);
+
+                let mut loadouts = Vec::new();
+                for (profile, profile_plan) in profiles.iter().zip(multi.plans.iter()) {
+                    let profile_dir = mo2_ini.profiles.join(profile);
+                    let state = mo2_state_for_merge(
+                        ctx,
+                        &instance_id,
+                        &definition,
+                        profile_plan,
+                        &profile_dir,
+                        &merged_layers,
+                    )?;
+                    crate::game_loadout::save_game_profile(ctx, &instance_id, profile, state)
+                        .map_err(ImportError::Other)?;
+                    loadouts.push(profile.clone());
+                }
+                crate::game_loadout::apply_game_profile_with_undo(
+                    ctx,
+                    &instance_id,
+                    &definition,
+                    &profiles[0],
+                    false,
+                )
+                .map_err(|e| ImportError::Other(e.to_string()))?;
+
+                let mut per_profile_external: HashMap<String, Vec<PathBuf>> = HashMap::new();
+                if base.copy_saves {
+                    let store = game_ini::store_of(ctx, &instance_id)?;
+                    if let Some(rule) = game_saves::rule_for(&definition, &store) {
+                        for (profile, profile_plan) in profiles.iter().zip(multi.plans.iter()) {
+                            if !profile_plan.saves.local {
+                                continue;
+                            }
+                            let Some(from) = &profile_plan.saves.from else {
+                                continue;
+                            };
+                            let folder =
+                                game_saves::own_folder_scoped(rule, &instance_id, Some(profile))?;
+                            let entries = saves_entries(from)?;
+                            let mut created_dir = false;
+                            let written = per_profile_external.entry(profile.clone()).or_default();
+                            for entry in entries {
+                                let path = entry.path();
+                                let meta = std::fs::symlink_metadata(&path)
+                                    .map_err(|e| saves_unreadable(&path, &e))?;
+                                if content_store::is_reparse_point_or_symlink(&meta)
+                                    || !meta.is_file()
+                                {
+                                    continue;
+                                }
+                                if !created_dir {
+                                    std::fs::create_dir_all(&folder)?;
+                                    created_dir = true;
+                                }
+                                let dest = folder.join(entry.file_name());
+                                if dest.exists() {
+                                    continue;
+                                }
+                                std::fs::copy(&path, &dest)?;
+                                written.push(dest.clone());
+                                copied_saves_all.push(dest);
+                            }
+                        }
+                    }
+                }
+
+                let outcomes = profiles
+                    .iter()
+                    .map(|profile| Mo2ProfileOutcome {
+                        profile: profile.clone(),
+                        instance_id: Some(instance_id.clone()),
+                        error: None,
+                        external_files_written: per_profile_external
+                            .remove(profile)
+                            .unwrap_or_default(),
+                    })
+                    .collect();
+
+                Ok((loadouts, outcomes))
+            })();
+
+            match merged {
+                Ok((loadouts, outcomes)) => Ok(Mo2MultiReport {
+                    plan: multi,
+                    instances: vec![instance_id],
+                    loadouts,
+                    profiles: outcomes,
+                }),
+                Err(error) => {
+                    let error = if copied_saves_all.is_empty() {
+                        error
+                    } else {
+                        let listed: Vec<String> = copied_saves_all
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect();
+                        ImportError::Other(format!(
+                            "{error} (files already copied outside the instance were left untouched: {})",
+                            listed.join(", ")
+                        ))
+                    };
+                    Err(abandon_half_made_instance(ctx, &instance_id, error))
+                }
             }
-            crate::game_loadout::apply_game_profile_with_undo(
-                ctx,
-                &instance_id,
-                &definition,
-                &profiles[0],
-                false,
-            )
-            .map_err(|e| ImportError::Other(e.to_string()))?;
-            Ok(Mo2MultiReport {
-                plan: multi,
-                instances: vec![instance_id],
-                loadouts,
-            })
         }
     }
 }
