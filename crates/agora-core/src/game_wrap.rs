@@ -1143,7 +1143,7 @@ exit 0
         let flatpak = make("flatpak");
         assert_eq!(
             launcher_in(Some(&path), true),
-            Some(SteamLauncher::Native(steam))
+            Some(StoreSteamLauncher::Native(steam))
         );
 
         std::fs::remove_file(
@@ -1153,7 +1153,7 @@ exit 0
         .unwrap();
         assert_eq!(
             launcher_in(Some(&path), true),
-            Some(SteamLauncher::Flatpak(flatpak))
+            Some(StoreSteamLauncher::Flatpak(flatpak))
         );
         assert_eq!(launcher_in(Some(&path), false), None);
         assert_eq!(launcher_in(None, true), None);
