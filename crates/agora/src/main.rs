@@ -11098,7 +11098,14 @@ fn run_games_import(
                 if json {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 } else {
-                    print_vortex_multi_run(&report.instances, &report.loadouts, &report.saves);
+                    print_vortex_multi_run(&report);
+                }
+                if report
+                    .profiles
+                    .iter()
+                    .any(|outcome| outcome.error.is_some())
+                {
+                    anyhow::bail!("one or more Vortex profiles could not be imported");
                 }
                 return Ok(());
             }
@@ -11304,13 +11311,18 @@ fn print_vortex_multi_plan(plan: &agora_core::game_import::vortex::MultiProfileP
     }
 }
 
-fn print_vortex_multi_run(
-    instances: &[String],
-    loadouts: &[String],
-    saves: &[agora_core::game_import::vortex::ProfileSavesReport],
-) {
-    print_multi_run(instances, loadouts);
-    for save in saves {
+fn print_vortex_multi_run(report: &agora_core::game_import::vortex::MultiProfileReport) {
+    print_multi_run(&report.instances, &report.loadouts);
+    for outcome in &report.profiles {
+        if let Some(instance) = &outcome.instance_id {
+            println!("Profile '{}' imported as {instance}.", outcome.profile);
+        }
+    }
+    print_profile_outcomes(&report.profiles);
+    for warning in &report.plan.warnings {
+        eprintln!("warning: {warning}");
+    }
+    for save in &report.saves {
         if save.copied > 0 {
             println!(
                 "Copied {} save file(s) from profile '{}'.",
@@ -11319,7 +11331,7 @@ fn print_vortex_multi_run(
         }
         if save.skipped_existing > 0 {
             println!(
-                "Kept {} save file(s) already in the merged instance's save folder, from profile '{}'.",
+                "Kept {} save file(s) already in the destination for profile '{}'.",
                 save.skipped_existing, save.profile
             );
         }
@@ -11331,7 +11343,11 @@ fn print_vortex_multi_run(
 
 fn print_mo2_multi_run(report: &agora_core::game_import::Mo2MultiReport) {
     print_multi_run(&report.instances, &report.loadouts);
-    for outcome in &report.profiles {
+    print_profile_outcomes(&report.profiles);
+}
+
+fn print_profile_outcomes(outcomes: &[agora_core::game_import::Mo2ProfileOutcome]) {
+    for outcome in outcomes {
         if let Some(error) = &outcome.error {
             eprintln!("Profile '{}' failed: {error}", outcome.profile);
         }
@@ -11880,6 +11896,9 @@ fn print_vortex_run(report: &agora_core::game_import::vortex::VortexRunReport) {
             "  saves copied: {} ({} already there, left alone)",
             report.saves_copied, report.saves_skipped_existing
         );
+    }
+    for path in &report.external_files_written {
+        println!("  save written outside the instance: {}", path.display());
     }
     for step in &report.next_steps {
         println!("  next: {step}");

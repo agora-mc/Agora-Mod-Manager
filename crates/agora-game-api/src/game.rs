@@ -1486,7 +1486,10 @@ pub fn suggest_placement_with_rules(
             RulePlacement::Ambiguous(top_level) => {
                 return Suggestion::Unknown {
                     top_level,
-                    note: None,
+                    note: Some(format!(
+                        "Could not tell which folder to use for the {} rule.",
+                        rule.kind
+                    )),
                 }
             }
         }

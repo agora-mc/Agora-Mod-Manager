@@ -207,10 +207,27 @@ export function MultiProfilesSection({
           <p className="text-sm font-medium text-foreground">
             {run.instances.length === 1 ? 'One instance imported.' : `${run.instances.length} instances imported.`}
           </p>
-          {run.instances.map((instance) => (
+          {run.profiles?.length ? run.profiles.map((outcome) => (
+            <div key={outcome.profile}>
+              {outcome.error ? (
+                <p role="alert">{outcome.profile} failed. {outcome.error}</p>
+              ) : (
+                <p>{outcome.profile} imported as <span className="font-mono">{outcome.instance_id}</span></p>
+              )}
+              {outcome.external_files_written.length > 0 && (
+                <>
+                  <p>Saves written outside the instance</p>
+                  <ul>
+                    {outcome.external_files_written.map((path) => <li key={path}>{path}</li>)}
+                  </ul>
+                </>
+              )}
+            </div>
+          )) : run.instances.map((instance) => (
             <p key={instance} className="font-mono">{instance}</p>
           ))}
           {run.loadouts.length > 0 && <p>Loadouts: {run.loadouts.join(', ')}</p>}
+          {run.warnings?.map((warning) => <p key={warning} role="status">{warning}</p>)}
         </div>
       )}
     </div>

@@ -4236,8 +4236,8 @@ Most people who will try this already have a setup. Import has to be good.
 - **Vortex (designed 2026-11-15; Phase 6).** Vortex keeps its state in a LevelDB store
   (`%APPDATA%\Vortex\state.v2`; keys are state paths joined with `###`, values are JSON) and
   writes `vortex.deployment.json` (which mod supplied each deployed file) into each game's mod
-  folder. Agora reads a copy of the store, never the live one, and refuses while Vortex is running
-  (the store's `LOCK`), saying to close Vortex. Read with the pure-Rust `rusty-leveldb`: Vortex's
+  folder. Agora holds the store's `LOCK` until it finishes the scratch copy. If Vortex holds the
+  lock, Agora asks the player to close it. `rusty-leveldb` reads the scratch copy. Vortex's
   current backend attaches the same LevelDB files through DuckDB's `level_pivot`, so the files on
   disk are still LevelDB. What is imported, as for MO2: each Vortex profile becomes an instance;
   each mod's staging folder
@@ -4245,19 +4245,21 @@ Most people who will try this already have a setup. Import has to be good.
   content store as it is on disk, with its name, version and Nexus ids; enabled state per profile
   (the default imports only the mods the profile enables, since one staging folder serves every
   profile; `--all-mods` brings the rest turned off);
-  the plugin list from the profile's `plugins.txt` / `loadorder.txt` (Vortex's original shape
-  lists only active plugins with no prefix; the Fallout 4 shape uses `*`), and the profile's LOOT
+  the plugin list from the profile's `plugins.txt` / `loadorder.txt` using the game's declared list
+  format, and the profile's LOOT
   `userlist.yaml` `after` entries as load-after rules (a rule that is unknown, self or cyclic is
   refused with a reason; `req`/`inc` have no Agora equivalent and are reported). Vortex orders mods by rules,
   not by a list, so the layer order is taken from the deployment manifest (the mod that supplied a
   file wins it) with Vortex's rules as the tie-breaker, and any file the manifest and the rules
-  disagree on is reported. Downloads are not copied; they are referenced when their hashes match.
+  disagree on is reported. The preview and import report also name any deployed file whose winner
+  the chosen layer order cannot reproduce. Both importers use the game's placement rules for mod
+  files. Downloads are referenced when their hashes match.
 
 - **Loadouts for game instances (designed 2026-11-15).** Minecraft instances already have loadouts
   (`agora loadout`, the desktop's loadout picker): named sets of which content is on, applied with
   an undo snapshot. Game instances get the same loadouts, through the same commands, picker and
   store, not a second feature. For a game whose package declares them, a loadout also records the
-  plugin list (active set and order), the INIs (its own copies, or the instance's shared ones),
+  layer order, the plugin list (active set and order), the INIs (its own copies, or the instance's shared ones),
   its load-after rules (§31.4) and its save choice; applying it restores all of them, and is
   refused while the game runs. The content store keeps one copy of each file, so loadouts cost no
   extra disk.
@@ -4270,6 +4272,8 @@ Most people who will try this already have a setup. Import has to be good.
   profiles' enabled mods, and each profile's loadout turns its own set on. Before copying anything
   the import states the bytes the chosen profiles bring in and the free space on the content
   store's drive, and refuses only when they cannot fit.
+  A separate Vortex import reports each profile's created instance or error and any saves written
+  outside its instance, including saves written before a failure.
 
 ### 26.11 Game Support Packages and the Plugin System
 

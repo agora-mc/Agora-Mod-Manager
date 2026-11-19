@@ -513,6 +513,58 @@ fn mount_point(def: &GameDefinition) -> String {
         .unwrap_or_else(|| "Data".to_string())
 }
 
+fn add_imported_mod(
+    ctx: &Ctx,
+    instance: &str,
+    definition: &GameDefinition,
+    item: &str,
+) -> Result<(), ImportError> {
+    let layout = definition.content_layout.clone().unwrap_or_default();
+    let content = content_store::get_item(ctx, item)?;
+    let placement_error = |reason| {
+        ImportError::Other(format!(
+            "could not place imported mod '{}': {reason}",
+            content.name
+        ))
+    };
+    let decision =
+        game_deploy::placement_for_instance_item(ctx, instance, definition, &layout, &content)
+            .map_err(|error| placement_error(error.to_string()))?;
+    let (mount, source) =
+        imported_mod_destination(definition, decision).map_err(placement_error)?;
+    game_deploy::add_content(
+        ctx,
+        instance,
+        item,
+        (!mount.is_empty()).then_some(&mount),
+        (!source.is_empty()).then_some(&source),
+    )?;
+    Ok(())
+}
+
+fn imported_mod_destination(
+    definition: &GameDefinition,
+    decision: game_deploy::PlacementDecision,
+) -> Result<(String, String), String> {
+    use game_deploy::PlacementDecision;
+    match decision {
+        PlacementDecision::Place {
+            mount_path,
+            source_path,
+            ..
+        } => Ok((mount_path, source_path)),
+        // An installed mod can contain plain files (such as readmes) that would be
+        // insufficient to classify an archive. Keep those under the declared data mount.
+        PlacementDecision::Unknown { note: None, .. } if definition.content_layout.is_some() => {
+            Ok((mount_point(definition), String::new()))
+        }
+        PlacementDecision::Installer { reason, .. } => Err(reason),
+        PlacementDecision::Unknown { note, .. } => {
+            Err(note.unwrap_or_else(|| "the game declares no placement for these files".into()))
+        }
+    }
+}
+
 fn normalise_path(path: &Path) -> String {
     // Vortex, a game store and a user can all spell one folder differently: an
     // 8.3 short name, another case, a trailing separator, `/` for `\`, or the
@@ -1619,7 +1671,7 @@ fn run_inner(
                 }
                 continue;
             }
-            game_deploy::add_content(ctx, &instance_id, item_id, mount_arg, None)?;
+            add_imported_mod(ctx, &instance_id, &def, item_id)?;
             report.content_layers += 1;
             if !planned.enabled {
                 game_deploy::set_content_enabled(ctx, &instance_id, item_id, false)?;
@@ -2058,13 +2110,7 @@ fn add_mo2_mod_to_merged(
         matches!(&layer.source, agora_game_api::LayerSource::Content { content } if content == &item_id)
     });
     if !present {
-        let mount = mount_point(definition);
-        let mount_arg = if mount.is_empty() {
-            None
-        } else {
-            Some(mount.as_str())
-        };
-        game_deploy::add_content(ctx, instance_id, &item_id, mount_arg, None).map_err(|e| {
+        add_imported_mod(ctx, instance_id, definition, &item_id).map_err(|e| {
             ImportError::Other(format!(
                 "'{}' could not be put on the merged instance: {e}",
                 item.folder

@@ -76,39 +76,65 @@ pub enum LockProbe {
     Unknown,
 }
 
-/// Check the store's `LOCK` without opening the store. LevelDB holds an exclusive OS lock on this
-/// file for as long as it is open (`src_main_src_store_LevelPersist.ts:38-39`).
+/// Check the store's `LOCK` without opening the database.
 pub fn lock_probe(store_dir: &Path) -> LockProbe {
-    let lock = store_dir.join(LOCK_FILE_NAME);
-    if !lock.is_file() {
-        return LockProbe::Free;
+    #[cfg(unix)]
+    let Ok(_process_lock) = PROCESS_LOCK.lock() else {
+        return LockProbe::Unknown;
+    };
+    match acquire_store_lock(store_dir) {
+        Ok(_) => LockProbe::Free,
+        Err(probe) => probe,
     }
-    probe_lock_file(&lock)
+}
+
+// POSIX record locks belong to a process. Closing another descriptor for the same LOCK would
+// release the snapshot lock, so probe and snapshot must not open competing descriptors.
+#[cfg(unix)]
+static PROCESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn acquire_store_lock(store_dir: &Path) -> Result<std::fs::File, LockProbe> {
+    let lock = store_dir.join(LOCK_FILE_NAME);
+    let meta = match std::fs::symlink_metadata(&lock) {
+        Ok(meta) => meta,
+        #[cfg(windows)]
+        Err(error) => return Err(windows_lock_error(&error)),
+        #[cfg(not(windows))]
+        Err(_) => return Err(LockProbe::Unknown),
+    };
+    if !meta.is_file() || crate::content_store::is_reparse_point_or_symlink(&meta) {
+        return Err(LockProbe::Unknown);
+    }
+    lock_file(&lock)
 }
 
 #[cfg(windows)]
-fn probe_lock_file(lock: &Path) -> LockProbe {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{
-        GetLastError, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
-    };
+fn windows_lock_error(error: &io::Error) -> LockProbe {
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+    match error.raw_os_error().map(|code| code as u32) {
+        Some(ERROR_LOCK_VIOLATION | ERROR_SHARING_VIOLATION) => LockProbe::Held,
+        _ => LockProbe::Unknown,
+    }
+}
+
+#[cfg(windows)]
+fn lock_file(lock: &Path) -> Result<std::fs::File, LockProbe> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
-        LockFileEx, UnlockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+        LockFileEx, FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK,
+        LOCKFILE_FAIL_IMMEDIATELY,
     };
 
-    let Ok(file) = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .open(lock)
-    else {
-        return LockProbe::Unknown;
-    };
+        .map_err(|error| windows_lock_error(&error))?;
     let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-    // SAFETY: `handle` is a valid open file handle, and the overlapped structure is zeroed as the
-    // API requires for a lock on a byte range that starts at zero when Offset is zero.
-    let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
-    // SAFETY: the handle and the overlapped structure live across the call.
-    let locked = unsafe {
+    // SAFETY: the handle is open and the zeroed OVERLAPPED starts the lock at byte zero.
+    let mut overlapped = unsafe { std::mem::zeroed() };
+    if unsafe {
         LockFileEx(
             handle,
             LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
@@ -117,56 +143,60 @@ fn probe_lock_file(lock: &Path) -> LockProbe {
             0,
             &mut overlapped,
         )
-    };
-    if locked != 0 {
-        // SAFETY: the same handle and overlapped structure the lock was taken with.
-        unsafe {
-            UnlockFileEx(handle, 0, 1, 0, &mut overlapped);
-        }
-        return LockProbe::Free;
+    } == 0
+    {
+        return Err(windows_lock_error(&io::Error::last_os_error()));
     }
-    // SAFETY: GetLastError reads the calling thread's last-error value, set by LockFileEx.
-    match unsafe { GetLastError() } {
-        ERROR_LOCK_VIOLATION | ERROR_SHARING_VIOLATION => LockProbe::Held,
-        _ => LockProbe::Unknown,
-    }
+    // Closing the handle releases the byte-range lock.
+    Ok(file)
 }
 
 #[cfg(unix)]
-fn probe_lock_file(lock: &Path) -> LockProbe {
-    use std::os::unix::io::AsRawFd;
+fn lock_file(lock: &Path) -> Result<std::fs::File, LockProbe> {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::OpenOptionsExt;
 
-    // LOCK_EX and LOCK_NB, from <sys/file.h>. Declared here rather than adding a libc
-    // dependency for four constants and one call.
-    const LOCK_EX: i32 = 2;
-    const LOCK_NB: i32 = 4;
-    const LOCK_UN: i32 = 8;
-    extern "C" {
-        fn flock(fd: i32, operation: i32) -> i32;
-    }
+    use nix::fcntl::{fcntl, FcntlArg};
+    use nix::libc;
 
-    let Ok(file) = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(lock)
-    else {
-        return LockProbe::Unknown;
-    };
-    // SAFETY: the descriptor is valid for as long as `file` lives.
-    if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
-        // SAFETY: the same descriptor, which we just locked.
-        unsafe {
-            flock(file.as_raw_fd(), LOCK_UN);
-        }
-        LockProbe::Free
-    } else {
-        LockProbe::Held
+        .map_err(|_| LockProbe::Unknown)?;
+    // SAFETY: all fields of the C record are integers, with unused fields reserved as zero.
+    let mut record: libc::flock = unsafe { std::mem::zeroed() };
+    record.l_type = libc::F_WRLCK as _;
+    record.l_whence = libc::SEEK_SET as _;
+    // With start and length zero the lock covers the whole file, as in LevelDB.
+    match fcntl(file.as_fd(), FcntlArg::F_SETLK(&record)) {
+        Ok(_) => Ok(file),
+        Err(nix::errno::Errno::EACCES | nix::errno::Errno::EAGAIN) => Err(LockProbe::Held),
+        Err(_) => Err(LockProbe::Unknown),
     }
 }
 
-#[cfg(not(any(unix, windows)))]
-fn probe_lock_file(_lock: &Path) -> LockProbe {
-    LockProbe::Unknown
+#[cfg(not(any(windows, unix)))]
+fn lock_file(_lock: &Path) -> Result<std::fs::File, LockProbe> {
+    Err(LockProbe::Unknown)
+}
+
+fn with_store_lock<T>(
+    store_dir: &Path,
+    snapshot: impl FnOnce() -> Result<T, VortexStoreError>,
+) -> Result<T, VortexStoreError> {
+    let unknown = || VortexStoreError::LockUnknown {
+        path: store_dir.to_path_buf(),
+        reason: "could not acquire the store's LOCK file".into(),
+    };
+    #[cfg(unix)]
+    let _process_lock = PROCESS_LOCK.lock().map_err(|_| unknown())?;
+    let _lock = acquire_store_lock(store_dir).map_err(|probe| match probe {
+        LockProbe::Held => VortexStoreError::Locked(store_dir.to_path_buf()),
+        _ => unknown(),
+    })?;
+    snapshot()
 }
 
 /// One key/value pair of the store, both as text. A key that is not UTF-8 is kept lossily and
@@ -256,27 +286,29 @@ fn insert_nested(root: &mut Map<String, Value>, segments: &[&str], value: Value)
 /// Read the store: refuse while Vortex holds it, copy it to a scratch folder (without `LOCK`), and
 /// read the copy. The live store is never opened.
 pub fn read_store(store_dir: &Path) -> Result<VortexStore, VortexStoreError> {
-    if !store_dir.is_dir() {
-        return Err(VortexStoreError::NotFound(store_dir.to_path_buf()));
-    }
-    match lock_probe(store_dir) {
-        LockProbe::Held => return Err(VortexStoreError::Locked(store_dir.to_path_buf())),
-        LockProbe::Unknown => {
-            return Err(VortexStoreError::LockUnknown {
-                path: store_dir.to_path_buf(),
-                reason: "the lock file could not be checked".into(),
-            })
+    let unreadable = |reason| VortexStoreError::Unreadable {
+        path: store_dir.to_path_buf(),
+        reason,
+    };
+    let metadata = match std::fs::symlink_metadata(store_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(VortexStoreError::NotFound(store_dir.to_path_buf()));
         }
-        LockProbe::Free => {}
+        Err(error) => return Err(unreadable(error.to_string())),
+    };
+    if !metadata.is_dir() || crate::content_store::is_reparse_point_or_symlink(&metadata) {
+        return Err(unreadable("expected a plain store directory".into()));
     }
-    if !has_database_files(store_dir) {
+    if !has_database_files(store_dir).map_err(|error| unreadable(error.to_string()))? {
         return Err(VortexStoreError::Empty(store_dir.to_path_buf()));
     }
 
-    let scratch = Scratch::new(store_dir)?;
-    copy_store(store_dir, &scratch.path).map_err(|error| VortexStoreError::Unreadable {
-        path: store_dir.to_path_buf(),
-        reason: format!("the scratch copy failed: {error}"),
+    let scratch = with_store_lock(store_dir, || {
+        let scratch = Scratch::new(store_dir)?;
+        copy_store(store_dir, &scratch.path)
+            .map_err(|error| unreadable(format!("the scratch copy failed: {error}")))?;
+        Ok(scratch)
     })?;
 
     let options = Options {
@@ -337,23 +369,36 @@ pub fn read_store(store_dir: &Path) -> Result<VortexStore, VortexStoreError> {
 
 /// Whether the folder holds a LevelDB database. `CURRENT`, a `MANIFEST-*`, a table (`.ldb`) or a
 /// write log (`.log`) is enough to try; a folder of unrelated files is empty for our purpose.
-fn has_database_files(dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
+fn has_database_files(dir: &Path) -> io::Result<bool> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
-        name == "CURRENT"
+        if name == "CURRENT"
             || name.starts_with("MANIFEST-")
             || name.ends_with(".ldb")
             || name.ends_with(".log")
             || name.ends_with(".sst")
-    })
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Copy a store's files to `to`, leaving out every `LOCK`. LevelDB needs `CURRENT`, its manifest,
 /// its tables and its log; a link would let a copy reach outside the store, so it is refused.
 fn copy_store(from: &Path, to: &Path) -> io::Result<()> {
+    let check = |path: &Path, meta: &std::fs::Metadata| {
+        if crate::content_store::is_reparse_point_or_symlink(meta) {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is a link or reparse point", path.display()),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check(from, &std::fs::symlink_metadata(from)?)?;
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
@@ -363,16 +408,16 @@ fn copy_store(from: &Path, to: &Path) -> io::Result<()> {
         }
         let path = entry.path();
         let meta = std::fs::symlink_metadata(&path)?;
-        if meta.file_type().is_symlink() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{} is a link; it was not followed", path.display()),
-            ));
-        }
+        check(&path, &meta)?;
         if meta.is_dir() {
             copy_store(&path, &to.join(&name))?;
-        } else {
+        } else if meta.is_file() {
             std::fs::copy(&path, to.join(&name))?;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not a plain file", path.display()),
+            ));
         }
     }
     Ok(())
@@ -447,7 +492,46 @@ mod tests {
         assert!(matches!(error, VortexStoreError::NotFound(_)), "{error}");
     }
 
+    #[cfg(any(unix, windows))]
     #[test]
+    fn a_linked_directory_is_refused_in_the_scratch_copy() {
+        let dir = scratch_dir("linked");
+        let from = dir.path().join("store");
+        let target = dir.path().join("target");
+        std::fs::create_dir(&from).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("fixture"), b"outside the store").unwrap();
+        let link = from.join("linked");
+        #[cfg(windows)]
+        junction::create(&target, &link).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let to = dir.path().join("copy");
+        let error = copy_store(&link, &to).expect_err("the scratch copy must reject a linked root");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!to.join("fixture").exists());
+        let error = copy_store(&from, &to).expect_err("the scratch copy must reject the link");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!to.join("linked/fixture").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_lock_opened_without_sharing_is_reported_as_held() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = scratch_dir("exclusive");
+        let _lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(0)
+            .open(dir.path().join(LOCK_FILE_NAME))
+            .unwrap();
+        assert_eq!(lock_probe(dir.path()), LockProbe::Held);
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn a_store_vortex_holds_is_refused_and_named() {
         let dir = scratch_dir("locked");
         // An open DB holds LOCK, exactly as a running Vortex does.
@@ -463,6 +547,58 @@ mod tests {
         let error = read_store(dir.path()).expect_err("a held store is refused");
         assert!(matches!(error, VortexStoreError::Locked(_)), "{error}");
         drop(db);
+        assert_eq!(lock_probe(dir.path()), LockProbe::Free);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_snapshot_keeps_lock_until_the_copy_finishes() {
+        let dir = scratch_dir("snapshot-lock");
+        write_db(dir.path(), &[("fixture", "true")]);
+        let scratch = scratch_dir("snapshot-copy");
+        with_store_lock(dir.path(), || {
+            assert_eq!(lock_probe(dir.path()), LockProbe::Held);
+            copy_store(dir.path(), scratch.path()).unwrap();
+            assert_eq!(lock_probe(dir.path()), LockProbe::Held);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(lock_probe(dir.path()), LockProbe::Free);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_probe_detects_a_leveldb_record_lock() {
+        const CHILD: &str = "AGORA_TEST_VORTEX_LOCK_CHILD";
+        if let Some(store) = std::env::var_os(CHILD) {
+            assert_eq!(lock_probe(Path::new(&store)), LockProbe::Held);
+            return;
+        }
+        let dir = scratch_dir("record-lock");
+        let lock_path = dir.path().join(LOCK_FILE_NAME);
+        let file = std::fs::File::create(&lock_path).unwrap();
+        use nix::fcntl::{fcntl, FcntlArg};
+        use nix::libc;
+        use std::os::fd::AsFd;
+        // SAFETY: the C record contains only integers and zero denotes the whole range.
+        let mut record: libc::flock = unsafe { std::mem::zeroed() };
+        record.l_type = libc::F_WRLCK as _;
+        record.l_whence = libc::SEEK_SET as _;
+        fcntl(file.as_fd(), FcntlArg::F_SETLK(&record)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "game_import::vortex_store::tests::unix_probe_detects_a_leveldb_record_lock",
+            ])
+            .env(CHILD, dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        drop(file);
         assert_eq!(lock_probe(dir.path()), LockProbe::Free);
     }
 
