@@ -9,6 +9,8 @@
 mod alias;
 #[path = "../../tests/support/names.rs"]
 mod names;
+#[path = "probe/regressions.rs"]
+mod regressions;
 
 use std::ffi::{c_void, OsStr};
 use std::fs;
@@ -327,6 +329,10 @@ fn names_after(args: &[String], flag: &str) -> Vec<String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(case) = arg(&args, "--regression") {
+        regressions::run(&case);
+        return;
+    }
     // The unhooked name answers of a real file, for the test's reference (run without the DLL).
     if let Some(file) = arg(&args, "--parity-of") {
         let out = arg(&args, "--out").expect("--out required");

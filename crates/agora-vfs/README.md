@@ -12,7 +12,9 @@ The launcher creates the game suspended and then rewrites its import table in me
 `DetourUpdateProcessWithDll`). When the process is resumed, Windows' own loader loads the DLL before
 the game's other DLLs, so the hooks exist before any of them runs code. The DLL therefore exports a
 function at **ordinal 1** (`agora_vfs_ordinal1`, forced by `build.rs`); Detours imports it by number.
-The DLL's `CreateProcessInternalW` hook does the same to every process the game starts.
+The DLL's `CreateProcessInternalW` hook does the same to every process the game starts. It starts
+the child's Windows loader on a separate thread after patching the import table. This lets the
+first import install the hooks while the child's primary thread is still suspended.
 
 On attach, before anything else, the DLL calls Detours' `DetourRestoreAfterWith`, which puts back the
 headers and import table the injection rewrote. Without it the game's own code sees a patched image:
@@ -23,35 +25,45 @@ injection, and Engine Fixes' early `d3dx9_42.log` write landed in the writable l
 If the import table cannot be rewritten, a remote `LoadLibraryW` thread is the fallback. It loads the
 DLL only after the program's static imports have run their `DllMain`s, so it is a fallback and the
 log says when it was used. A process of another architecture is refused before anything is written.
-`AGORA_VFS_INJECTION=remote-thread` skips the import table and uses the fallback.
+`AGORA_VFS_INJECTION=remote-thread` explicitly skips the import table and allows early static
+imports to run before the VFS. For children, an import-table failure by default fails the start.
 
 ## How it works
 
 When injected into a process:
-1. It reads its configuration from the file path pointed to by the `AGORA_VFS_CONFIG` environment variable.
+1. A launched game reads the file named by `AGORA_VFS_CONFIG`. A child reads the parent's validated
+   configuration snapshot from a pagefile-backed mapping named for the child's PID. The mapping
+   also contains an event handle duplicated into the child. The parent keeps both objects alive
+   through the handshake, and a conflicting mapping makes the start fail. The child's environment
+   is passed through unchanged.
 2. It installs NT API hooks (`NtCreateFile`, `NtOpenFile`, `NtSetInformationFile`, `NtQueryAttributesFile`,
    `NtQueryFullAttributesFile`, `NtQueryInformationByName`, `NtQueryDirectoryFile`, `NtQueryDirectoryFileEx`,
-   `NtClose`, and `CreateProcessInternalW`).
+   `NtDeleteFile`, `NtClose`, and `CreateProcessInternalW`).
 3. If all hooks install successfully, it opens and signals the named Win32 event specified in `ready_event`
    so the launcher knows the process is protected. (With import-table injection the launcher has already
    resumed the process, which is how the DLL gets to load; it waits for the event or for the process to
    end, and kills the process on a timeout. With the fallback it resumes only after the event.)
    If `AGORA_VFS_CONFIG` names a configuration that cannot be loaded, or the hooks cannot be installed,
-   the DLL ends its own process (exit code `0xA6F50001`) rather than let it run unprotected. With no
-   `AGORA_VFS_CONFIG` at all it does nothing. Before it ends a process it logs one line,
+   the DLL ends its own process (exit code `0xA6F50001`). An independently loaded DLL with no
+   handoff or `AGORA_VFS_CONFIG` does nothing. Before it ends a process it logs one line,
    `[pid] ending the process <exe>: <why>` (to `AGORA_VFS_LOG` when its own configuration, and so its
    log path, could not be read), so a program the game started that disappears can be named.
 4. Any attempt to write or truncate a file located in a lower layer copies the file up to the `upper`
    directory first (or skips copy for full file rewrites).
 5. Any delete of a lower layer records a whiteout marker (`<upper>\.agvfs-wh\<rel>.wh`).
 6. Folder directory listings merge the upper layer over lower layers, with whiteout markers removed.
-7. Any calls creating child processes (`CreateProcessInternalW`) intercept process creation and inject
-   `agora_vfs.dll` into the child before resumption. A child that cannot be injected is ended and the
-   start fails; it never runs unprotected. A child of the other bitness cannot be injected from here
+   A scan keeps the first search pattern for that handle, including after a restart, as specified
+   by [Microsoft's `NtQueryDirectoryFile` contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntquerydirectoryfile).
+7. The child signals its own event only after all hooks install. The parent waits for the signal
+   before resuming the primary thread and preserves an explicit caller request to leave it suspended.
+   If loading or acknowledgment fails, the parent ends the child, returns `ERROR_ACCESS_DENIED`
+   to the game, and logs the program name and reason for Agora's launch diagnostics.
+   A child of the other bitness cannot be injected from here
    (its import table and its DLL load belong to a process of its own bitness), so the DLL of the
    child's bitness is handed to `agora-vfs-helper.exe` of that bitness: it is started through the
    original `CreateProcessInternalW` (so this hook does not try to inject it), waited for, and
-   ended after 15 seconds. The helper never resumes the child.
+   ended after 15 seconds. The helper initializes the loader and the parent waits for the same
+   acknowledgment.
 8. **Aliases (configuration version 2).** Each alias folder shows exactly the view of `mount`. A path
    under an alias resolves to the same mount-relative path, so a tool that reads the real install
    folder (Nemesis reads it from the registry, BodySlide hard-codes it) sees the mod files at its own
@@ -86,6 +98,13 @@ and matches any of them, case-insensitively:
 `...\Skyrim Special Edition\DATA~1\x.esp` is not in the view. Only the folder's own 8.3 form is.
 
 ## Configuration Format
+
+During process attach, Detours must restore the import table, the DLL must obtain its layer and
+path mappings, and every hook must be installed before the DLL signals readiness. The root still
+reads the configuration file and discovers NT path forms during attach because other static
+imports can use those paths immediately. Children receive those forms from the parent and skip
+both disk tasks. The parent or launcher writes successful startup diagnostics after the handshake.
+The DLL writes failure diagnostics before termination so the launcher can identify the cause.
 
 Configuration is loaded as JSON from the path in `AGORA_VFS_CONFIG`:
 
@@ -125,7 +144,8 @@ Configuration is loaded as JSON from the path in `AGORA_VFS_CONFIG`:
 - `verbose` (`bool`, default `false`): If true, logs every unique file opened through the mount.
 - `ready_event` (`string`, optional): Name of the Win32 event object (`OpenEventW` with `EVENT_MODIFY_STATE`) signaled once all hooks are active.
 
-If `AGORA_VFS_CONFIG` is not set the DLL installs no hooks and does not signal `ready_event`. If it is set but the configuration cannot be read or is invalid, the DLL ends the process (see above).
+The launcher uses `AGORA_VFS_CONFIG` and `ready_event`. Children use the parent's mapping and their
+own event, including when started with an empty environment.
 
 ## Tests
 
@@ -139,8 +159,8 @@ cargo test -p agora-core --test game_deploy -- --ignored  # real injection, incl
 ```
 
 - `tests/matrix.rs`: the six-topology write matrix.
-- `tests/early_import.rs`: a DLL that cannot do its job ends the process before it runs; no
-  configuration installs nothing.
+- `tests/early_import.rs`: startup failures, an independent load without configuration, and an
+  empty-environment child that reads the merged view and redirects its static DLL's early write.
 - `tests/bitness.rs`: a 64-bit parent with a 32-bit child (through the 32-bit helper), a 32-bit parent
   with a 64-bit child (through the 64-bit helper), a missing 32-bit DLL (the child is ended and the
   reason names the path), and a helper that hangs (`agora-vfs-sleeper`, a bin that

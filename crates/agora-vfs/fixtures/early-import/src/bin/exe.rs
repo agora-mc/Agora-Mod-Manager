@@ -23,6 +23,30 @@ fn main() {
     if marker != 0xA60A {
         std::process::exit(2);
     }
+    if std::env::args().nth(1).as_deref() == Some("read-view") {
+        let observed = std::fs::read("view-marker.txt").unwrap_or_default();
+        std::process::exit(if observed == b"visible only through the view" {
+            0
+        } else {
+            4
+        });
+    }
+    if std::env::args().nth(1).as_deref() == Some("spawn-empty-environment") {
+        let child = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("Child.exe")));
+        let code = child
+            .and_then(|child| {
+                std::process::Command::new(child)
+                    .env_clear()
+                    .arg("read-view")
+                    .status()
+                    .ok()
+            })
+            .and_then(|status| status.code())
+            .unwrap_or(3);
+        std::process::exit(code);
+    }
     if std::env::args().nth(1).as_deref() == Some("headers") {
         std::process::exit(if headers_match_the_file() { 0 } else { 1 });
     }

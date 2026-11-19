@@ -2,6 +2,11 @@ use crate::nt::{NTSTATUS, STATUS_ACCESS_DENIED};
 use std::cell::Cell;
 use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+pub fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 thread_local! {
     static INSIDE: Cell<bool> = const { Cell::new(false) };

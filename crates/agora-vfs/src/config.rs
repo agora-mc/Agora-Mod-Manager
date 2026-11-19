@@ -181,19 +181,6 @@ impl VfsConfig {
     }
 }
 
-/// Load configuration from file pointed to by AGORA_VFS_CONFIG
-pub fn load_config_from_env() -> Option<RuntimeConfig> {
-    let path = std::env::var_os("AGORA_VFS_CONFIG")?;
-    let content = std::fs::read_to_string(path).ok()?;
-    match VfsConfig::from_json_str(&content) {
-        Ok(cfg) => Some(cfg),
-        Err(e) => {
-            eprintln!("[agora-vfs] Invalid config: {e}");
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

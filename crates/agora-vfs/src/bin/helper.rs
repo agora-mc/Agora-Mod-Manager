@@ -6,8 +6,9 @@
 //! DLL does for a same-bitness child (`agora_vfs_inject::inject_child`). The helper never resumes the
 //! target: whoever started the target does that.
 //!
-//! Exit code 0 means the DLL is in the target's import table or was loaded by a remote thread. On
-//! failure it exits 1 and writes one line to stderr saying why.
+//! With `--initialize` it also drives the loader while the primary thread stays suspended.
+//! The parent that requested it owns the event that confirms hook installation.
+//! On failure the helper exits 1 and writes one line to stderr saying why.
 
 #![cfg(windows)]
 
@@ -16,7 +17,7 @@ use std::path::PathBuf;
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS};
 
-const USAGE: &str = "usage: agora-vfs-helper --pid <pid> --dll <path>";
+const USAGE: &str = "usage: agora-vfs-helper --pid <pid> --dll <path> [--initialize]";
 
 fn main() {
     match run(std::env::args().skip(1).collect()) {
@@ -31,8 +32,13 @@ fn main() {
 fn run(args: Vec<String>) -> Result<(), String> {
     let mut pid = None;
     let mut dll = None;
+    let mut initialize = false;
     let mut rest = args.into_iter();
     while let Some(flag) = rest.next() {
+        if flag == "--initialize" {
+            initialize = true;
+            continue;
+        }
         let value = rest.next();
         match (flag.as_str(), value) {
             ("--pid", Some(value)) => {
@@ -61,8 +67,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 GetLastError()
             ));
         }
-        let result = agora_vfs_inject::inject_child(process, &dll);
+        let result = if initialize {
+            agora_vfs_inject::initialize_child(process, &dll).map(|_| ())
+        } else {
+            agora_vfs_inject::inject_child(process, &dll).map(|_| ())
+        };
         CloseHandle(process);
-        result.map(|_| ())
+        result
     }
 }

@@ -48,6 +48,8 @@ pub const FILE_CREATE: u32 = 2;
 pub const FILE_OPEN_IF: u32 = 3;
 pub const FILE_OVERWRITE: u32 = 4;
 pub const FILE_OVERWRITE_IF: u32 = 5;
+// IoStatusBlock.Information after a successful create.
+pub const FILE_CREATED: usize = 2;
 
 // Create options
 pub const FILE_DIRECTORY_FILE: u32 = 0x1;
@@ -56,9 +58,11 @@ pub const FILE_OPEN_BY_FILE_ID: u32 = 0x2000;
 
 // Information classes
 pub const FILE_RENAME_INFORMATION: u32 = 10;
+pub const FILE_LINK_INFORMATION: u32 = 11;
 pub const FILE_DISPOSITION_INFORMATION: u32 = 13;
 pub const FILE_DISPOSITION_INFORMATION_EX: u32 = 64;
 pub const FILE_RENAME_INFORMATION_EX: u32 = 65;
+pub const FILE_LINK_INFORMATION_EX: u32 = 72;
 pub const FILE_RENAME_REPLACE_IF_EXISTS: u32 = 0x1;
 pub const FILE_DISPOSITION_DELETE: u32 = 0x1;
 

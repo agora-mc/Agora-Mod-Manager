@@ -3770,7 +3770,7 @@ mechanisms, each covering what the one before cannot:
      the game starts) that hooks the NT calls every Win32 file API funnels through: `NtCreateFile`,
      `NtOpenFile`, `NtSetInformationFile`, `NtQueryAttributesFile`, `NtQueryFullAttributesFile`,
      `NtQueryInformationByName` (Windows 11 24H2's `GetFileAttributes*`), `NtQueryDirectoryFile(Ex)`,
-     `NtClose`.
+     `NtDeleteFile`, `NtClose`.
    - A lower file is never opened with write or delete rights. Writing to it copies it to layer 4
      first; a whole-file rewrite (`OVERWRITE`, `SUPERSEDE`) needs no copy. Deleting it records a
      whiteout, a marker file in layer 4 (`.agvfs-wh\<path>.wh`). Renaming it copies it to the new name
