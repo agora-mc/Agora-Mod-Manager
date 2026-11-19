@@ -968,7 +968,10 @@ impl InstallPipeline {
         let manifest =
             agora_core::helpers::read_manifest(&instance_dir.join("instance_manifest.json"))
                 .map_err(|e| format!("failed to read instance manifest: {e}"))?;
-        let live_index = agora_core::snapshot::live_file_index(instance_dir)?;
+        let live_index = agora_core::snapshot::live_file_index(
+            instance_dir,
+            crate::snapshot_scope::tracked_entries(),
+        )?;
         let instance_state_hash = hash_serializable(&live_index)?;
 
         let PreparedPlan {
@@ -1617,8 +1620,11 @@ impl InstallPipeline {
         let state_dir = instance_dir.to_path_buf();
         let current_state_hash =
             match run_blocking_phase(scheduler, "install state verification", move || {
-                agora_core::snapshot::live_file_index(&state_dir)
-                    .and_then(|index| hash_serializable(&index))
+                agora_core::snapshot::live_file_index(
+                    &state_dir,
+                    crate::snapshot_scope::tracked_entries(),
+                )
+                .and_then(|index| hash_serializable(&index))
             })
             .await
             {
@@ -1764,7 +1770,11 @@ impl InstallPipeline {
         let snapshot_dir = instance_dir.to_path_buf();
         let snapshot_label = plan.snapshot.label.clone();
         let snapshot = match run_blocking_phase(scheduler, "install recovery snapshot", move || {
-            agora_core::snapshot::create_snapshot(&snapshot_dir, Some(&snapshot_label))
+            agora_core::snapshot::create_snapshot(
+                &snapshot_dir,
+                Some(&snapshot_label),
+                crate::snapshot_scope::tracked_entries(),
+            )
         })
         .await
         {
@@ -1818,7 +1828,11 @@ impl InstallPipeline {
             let restore_dir = instance_dir.to_path_buf();
             let restore_id = snapshot.id.clone();
             let restore = run_blocking_phase(scheduler, "install rollback", move || {
-                agora_core::snapshot::restore_snapshot(&restore_dir, &restore_id)
+                agora_core::snapshot::restore_snapshot(
+                    &restore_dir,
+                    &restore_id,
+                    crate::snapshot_scope::tracked_entries(),
+                )
             })
             .await;
             cleanup_staging_dir(scheduler, &staging_dir).await;
@@ -1905,7 +1919,11 @@ impl InstallPipeline {
                         let restore_id = snapshot.id.clone();
                         let restore =
                             run_blocking_phase(scheduler, "install health rollback", move || {
-                                agora_core::snapshot::restore_snapshot(&restore_dir, &restore_id)
+                                agora_core::snapshot::restore_snapshot(
+                                    &restore_dir,
+                                    &restore_id,
+                                    crate::snapshot_scope::tracked_entries(),
+                                )
                             })
                             .await;
                         cleanup_staging_dir(scheduler, &staging_dir).await;
@@ -4746,7 +4764,11 @@ mod tests {
             conflicts: vec![],
             registry_revision: "registry-rev".into(),
         };
-        let before = agora_core::snapshot::live_file_index(&instance_dir).unwrap();
+        let before = agora_core::snapshot::live_file_index(
+            &instance_dir,
+            crate::snapshot_scope::tracked_entries(),
+        )
+        .unwrap();
         let first = rt.block_on(async {
             let reporter = NoopReporter;
             pipeline
@@ -4766,7 +4788,11 @@ mod tests {
         assert_eq!(first.files_to_add.len(), 1);
         assert_eq!(first.fingerprint, second.fingerprint);
         assert_eq!(
-            agora_core::snapshot::live_file_index(&instance_dir).unwrap(),
+            agora_core::snapshot::live_file_index(
+                &instance_dir,
+                crate::snapshot_scope::tracked_entries()
+            )
+            .unwrap(),
             before
         );
         assert!(!instance_dir.join(".agora").exists());
@@ -6428,7 +6454,11 @@ mod tests {
         let source_path = tmp.path().join("source.jar");
         std::fs::write(&source_path, b"verified local artifact").unwrap();
         let plan = resolve_local_plan(&instance_dir, &source_path, "manual.jar", None);
-        let before = agora_core::snapshot::live_file_index(&instance_dir).unwrap();
+        let before = agora_core::snapshot::live_file_index(
+            &instance_dir,
+            crate::snapshot_scope::tracked_entries(),
+        )
+        .unwrap();
         set_install_failpoint(Some("manifest-serialize"));
         let outcome =
             tokio::runtime::Runtime::new()
@@ -6451,7 +6481,11 @@ mod tests {
             }
         ));
         assert_eq!(
-            agora_core::snapshot::live_file_index(&instance_dir).unwrap(),
+            agora_core::snapshot::live_file_index(
+                &instance_dir,
+                crate::snapshot_scope::tracked_entries()
+            )
+            .unwrap(),
             before
         );
     }
@@ -6524,7 +6558,11 @@ mod tests {
                 "depends": { "missing_required": "*" }
             }),
         );
-        let before = agora_core::snapshot::live_file_index(&instance_dir).unwrap();
+        let before = agora_core::snapshot::live_file_index(
+            &instance_dir,
+            crate::snapshot_scope::tracked_entries(),
+        )
+        .unwrap();
         let mut plan = resolve_local_plan(&instance_dir, &source_path, "blocked.jar", None);
         plan.intent.overrides.skip_health_scan = false;
         plan.fingerprint = compute_plan_fingerprint(&plan).unwrap();
@@ -6543,7 +6581,11 @@ mod tests {
         // user can inspect and repair. The snapshot remains available for
         // manual rollback.
         assert!(matches!(outcome, InstallOutcome::HealthRollback { .. }));
-        let after = agora_core::snapshot::live_file_index(&instance_dir).unwrap();
+        let after = agora_core::snapshot::live_file_index(
+            &instance_dir,
+            crate::snapshot_scope::tracked_entries(),
+        )
+        .unwrap();
         assert_ne!(after, before);
         assert!(instance_dir.join("mods/blocked.jar").exists());
         if let InstallOutcome::HealthRollback {
@@ -6553,9 +6595,18 @@ mod tests {
         } = outcome
         {
             assert!(!health_report.blockers.is_empty());
-            agora_core::snapshot::restore_snapshot(&instance_dir, &snapshot_id).unwrap();
+            agora_core::snapshot::restore_snapshot(
+                &instance_dir,
+                &snapshot_id,
+                crate::snapshot_scope::tracked_entries(),
+            )
+            .unwrap();
             assert_eq!(
-                agora_core::snapshot::live_file_index(&instance_dir).unwrap(),
+                agora_core::snapshot::live_file_index(
+                    &instance_dir,
+                    crate::snapshot_scope::tracked_entries()
+                )
+                .unwrap(),
                 before
             );
             assert!(!instance_dir.join("mods/blocked.jar").exists());
@@ -6636,7 +6687,12 @@ mod tests {
         assert!(!instance_dir.join("mods/alpha-1.jar").exists());
         assert!(!instance_dir.join("mods/beta-1.jar").exists());
 
-        agora_core::snapshot::restore_snapshot(&instance_dir, &snapshot_id).unwrap();
+        agora_core::snapshot::restore_snapshot(
+            &instance_dir,
+            &snapshot_id,
+            crate::snapshot_scope::tracked_entries(),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read(instance_dir.join("mods/alpha-1.jar")).unwrap(),
             b"alpha old"
@@ -7123,7 +7179,11 @@ mod tests {
         let source_path = tmp.path().join("source.jar");
         std::fs::write(&source_path, b"verified local artifact").unwrap();
         let plan = resolve_local_plan(&instance_dir, &source_path, "manual.jar", None);
-        let before = agora_core::snapshot::live_file_index(&instance_dir).unwrap();
+        let before = agora_core::snapshot::live_file_index(
+            &instance_dir,
+            crate::snapshot_scope::tracked_entries(),
+        )
+        .unwrap();
         set_install_failpoint(Some(failpoint));
         let outcome =
             tokio::runtime::Runtime::new()
@@ -7145,7 +7205,11 @@ mod tests {
             }
         ));
         assert_eq!(
-            agora_core::snapshot::live_file_index(&instance_dir).unwrap(),
+            agora_core::snapshot::live_file_index(
+                &instance_dir,
+                crate::snapshot_scope::tracked_entries()
+            )
+            .unwrap(),
             before
         );
         assert!(!instance_dir.join("mods/manual.jar").exists());

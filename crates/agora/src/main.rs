@@ -1355,6 +1355,10 @@ enum ContentCmd {
     Remove {
         /// Item ID or unique prefix to remove.
         item: String,
+        /// Remove it even when a snapshot manifest cannot be read. The ignored
+        /// snapshots are named on stderr and can no longer restore the item.
+        #[arg(long)]
+        ignore_unreadable_snapshots: bool,
     },
     /// Show or change whether instances share mod files, and optionally convert existing ones.
     Share {
@@ -2059,6 +2063,10 @@ enum SnapshotsCmd {
     Restore {
         instance: String,
         snapshot_id: String,
+        /// Restore a game instance even though its game is running or could not
+        /// be proven idle. The running game may write over the restored files.
+        #[arg(long)]
+        force: bool,
     },
     Delete {
         instance: String,
@@ -2066,6 +2074,22 @@ enum SnapshotsCmd {
     },
     #[command(flatten)]
     Parity(cli_content_parity::SnapshotsParityCmd),
+    /// Show the setup that last launched well, and how the last launch ended.
+    Lkg {
+        instance: String,
+    },
+    /// Show what changed since the setup that last launched well.
+    LkgDiff {
+        instance: String,
+    },
+    /// Restore the setup that last launched well.
+    RestoreLkg {
+        instance: String,
+        /// Restore a game instance even though its game is running or could not
+        /// be proven idle. The running game may write over the restored files.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2641,7 +2665,13 @@ async fn async_main() {
             agora_core::plugins::official::RegistryTrust::production(),
             &local_state_options,
         ) {
-            Ok(result) => result,
+            Ok((ctx, warnings, report)) => (
+                ctx.with_minecraft_snapshot_entries(
+                    agora_game_minecraft::snapshot_scope::tracked_entries(),
+                ),
+                warnings,
+                report,
+            ),
             Err(error) => {
                 progress.log("error", &format!("Core initialization failed: {error}"));
                 eprintln!("Error initializing Agora core: {error}");
@@ -5183,13 +5213,23 @@ async fn run_snapshots_command(
                     .map(|s| {
                         vec![
                             s.id.clone(),
-                            s.label.clone().unwrap_or_default(),
+                            s.label.clone().unwrap_or_else(|| {
+                                if s.is_unreadable() {
+                                    "unreadable".to_string()
+                                } else {
+                                    String::new()
+                                }
+                            }),
                             s.created_at.clone(),
                             s.file_count.to_string(),
+                            s.unreadable.clone().unwrap_or_default(),
                         ]
                     })
                     .collect();
-                print_table(&["ID", "Label", "Created", "Files"], &rows);
+                print_table(
+                    &["ID", "Label", "Created", "Files", "Unreadable because"],
+                    &rows,
+                );
             }
         }
         SnapshotsCmd::Create { instance, label } => {
@@ -5197,12 +5237,10 @@ async fn run_snapshots_command(
             if !instance_dir.exists() {
                 anyhow::bail!("Instance '{}' not found", instance);
             }
-            let snapshot = agora_core::snapshot::create_snapshot_with_origin(
-                &instance_dir,
-                label.as_deref(),
-                agora_core::snapshot::SnapshotOrigin::User,
-            )
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            // The same core service the desktop uses: it picks a game instance's
+            // declared scope, and takes the instance lock and idle check.
+            let snapshot = agora_core::snapshot_service::SnapshotService::new(ctx.clone())
+                .create(&instance, label.as_deref())?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&snapshot)?);
             } else {
@@ -5216,6 +5254,7 @@ async fn run_snapshots_command(
         SnapshotsCmd::Restore {
             instance,
             snapshot_id,
+            force,
         } => {
             let instance_dir = agora_core::paths::instance_dir(data_dir, &instance)?;
             if !instance_dir.exists() {
@@ -5225,7 +5264,7 @@ async fn run_snapshots_command(
             // the launch-exclusion check, and the undo snapshot are not
             // things a second front end gets to skip.
             let outcome = agora_core::snapshot_service::SnapshotService::new(ctx.clone())
-                .restore(&instance, &snapshot_id)?;
+                .restore_forcing(&instance, &snapshot_id, force)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
             } else {
@@ -5275,8 +5314,170 @@ async fn run_snapshots_command(
                 );
             }
         }
+        SnapshotsCmd::Lkg { instance } => {
+            let instance_dir = agora_core::paths::instance_dir(data_dir, &instance)?;
+            if !instance_dir.exists() {
+                anyhow::bail!("Instance '{}' not found", instance);
+            }
+            let state = agora_core::lkg::read_lkg_state(&instance_dir)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "instanceId": instance,
+                        "snapshotId": state.current_lkg_snapshot_id,
+                        "lastPromotedAt": state.last_promoted_at,
+                        "lastLaunchSessionId": state.last_launch_session_id,
+                        "lastLaunchOutcome": state.last_launch_outcome,
+                    })
+                );
+            } else {
+                match &state.current_lkg_snapshot_id {
+                    Some(snapshot_id) => {
+                        println!("Last-known-good snapshot: {snapshot_id}");
+                        if let Some(at) = &state.last_promoted_at {
+                            println!("Recorded: {at}");
+                        }
+                        if let Some(outcome) = &state.last_launch_outcome {
+                            println!("Last launch ended: {outcome:?}");
+                        }
+                    }
+                    None => println!(
+                        "'{instance}' has no last-known-good setup yet: launch it once to record one."
+                    ),
+                }
+            }
+        }
+        SnapshotsCmd::LkgDiff { instance } => {
+            let instance_dir = agora_core::paths::instance_dir(data_dir, &instance)?;
+            if !instance_dir.exists() {
+                anyhow::bail!("Instance '{}' not found", instance);
+            }
+            let game = agora_core::game_instance::get(ctx, &instance)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if let Some(record) = game {
+                let definition = ctx.games.game(&record.game).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the definition for game '{}' is not installed",
+                        record.game.as_str()
+                    )
+                })?;
+                let diff = agora_core::game_snapshot::diff_since_lkg(ctx, &instance, definition)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&diff)?);
+                } else {
+                    print_lkg_file_diff(&diff.files);
+                    if !diff.added_content.is_empty() {
+                        println!("Content added: {}", diff.added_content.join(", "));
+                    }
+                    if !diff.removed_content.is_empty() {
+                        println!("Content removed: {}", diff.removed_content.join(", "));
+                    }
+                    if !diff.rules_changed.is_empty() {
+                        println!(
+                            "Load-after rules changed: {}",
+                            diff.rules_changed.join(", ")
+                        );
+                    }
+                }
+            } else {
+                let state = agora_core::lkg::read_lkg_state(&instance_dir)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let snapshot_id = state.current_lkg_snapshot_id.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "'{instance}' has no last-known-good setup yet: launch it once to record one"
+                    )
+                })?;
+                let reference =
+                    agora_core::snapshot::snapshot_file_index(&instance_dir, &snapshot_id)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let scope = agora_core::snapshot::restore_scope(&instance_dir, &snapshot_id)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let scope_refs: Vec<&str> = scope.iter().map(String::as_str).collect();
+                let current = agora_core::snapshot::live_file_index(&instance_dir, &scope_refs)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let diff =
+                    agora_core::lkg::compute_diff(&reference, &current, Some(snapshot_id), None);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&diff)?);
+                } else {
+                    print_lkg_file_diff(&diff);
+                }
+            }
+        }
+        SnapshotsCmd::RestoreLkg { instance, force } => {
+            let instance_dir = agora_core::paths::instance_dir(data_dir, &instance)?;
+            if !instance_dir.exists() {
+                anyhow::bail!("Instance '{}' not found", instance);
+            }
+            let game = agora_core::game_instance::get(ctx, &instance)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if let Some(record) = game {
+                let definition = ctx.games.game(&record.game).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the definition for game '{}' is not installed",
+                        record.game.as_str()
+                    )
+                })?;
+                let outcome =
+                    agora_core::game_snapshot::restore_to_lkg(ctx, &instance, definition, force)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&outcome)?);
+                } else {
+                    println!(
+                        "Restored '{}' to its last-known-good setup (undo snapshot {}).",
+                        instance, outcome.undo_snapshot_id
+                    );
+                }
+            } else {
+                let state = agora_core::lkg::read_lkg_state(&instance_dir)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let snapshot_id = state.current_lkg_snapshot_id.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "'{instance}' has no last-known-good setup yet: launch it once to record one"
+                    )
+                })?;
+                let outcome = agora_core::snapshot_service::SnapshotService::new(ctx.clone())
+                    .restore_forcing(&instance, &snapshot_id, force)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&outcome)?);
+                } else {
+                    println!(
+                        "Restored '{}' to its last-known-good snapshot {}.",
+                        instance, snapshot_id
+                    );
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Print a file diff the way the snapshot commands do.
+fn print_lkg_file_diff(diff: &agora_core::lkg::Diff) {
+    if diff.added.is_empty() && diff.removed.is_empty() && diff.modified.is_empty() {
+        println!("No changes since the last-known-good setup.");
+        return;
+    }
+    for entry in &diff.added {
+        println!("  + {}", entry.path);
+    }
+    for entry in &diff.removed {
+        println!("  - {}", entry.path);
+    }
+    for entry in &diff.modified {
+        println!("  ~ {}", entry.path);
+    }
+    println!(
+        "{} added, {} removed, {} modified, {} unchanged",
+        diff.added.len(),
+        diff.removed.len(),
+        diff.modified.len(),
+        diff.unchanged_count
+    );
 }
 
 async fn run_auth_command(
@@ -7956,8 +8157,17 @@ async fn run_command(
                         }
                     }
                 }
-                ContentCmd::Remove { item } => {
-                    match agora_core::content_store::remove_item(ctx, &item) {
+                ContentCmd::Remove {
+                    item,
+                    ignore_unreadable_snapshots,
+                } => {
+                    match agora_core::content_store::remove_item_with_options(
+                        ctx,
+                        &item,
+                        agora_core::content_store::RemoveOptions {
+                            ignore_unreadable_snapshots,
+                        },
+                    ) {
                         Ok(()) => {
                             if json {
                                 let out = serde_json::json!({
@@ -8491,6 +8701,12 @@ async fn run_command(
                             }
                         };
 
+                        // The recovery point this launch may promote if the session ends well.
+                        // Taken after deployment has settled the instance's state.
+                        let launch_point =
+                            agora_core::game_snapshot::prepare_launch(ctx, &instance_id, game_def)
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
                         if let Some(deploy_outcome) = &prepared.deploy_outcome {
                             if !json {
                                 match deploy_outcome {
@@ -8694,6 +8910,16 @@ async fn run_command(
                             game_def,
                             &store,
                         );
+                        if let Err(error) = agora_core::game_snapshot::record_launch_point(
+                            ctx,
+                            &instance_id,
+                            session_id.as_deref(),
+                            &launch_point,
+                        ) {
+                            eprintln!(
+                                "[lkg] could not record the launch recovery point for '{instance_id}': {error}"
+                            );
+                        }
 
                         if !json && !prepared.generated_findings.is_empty() {
                             for finding in &prepared.generated_findings {
@@ -8810,6 +9036,7 @@ async fn run_command(
 
                             let exit_report = agora_core::game_instance::watch_session(
                                 ctx,
+                                &instance_id,
                                 game_def,
                                 session_id.as_deref(),
                                 &watch_dir,
@@ -17644,6 +17871,9 @@ mod tests {
         let mut games = agora_core::game_registry::GameRegistry::builder();
         agora_game_minecraft::register_into(&mut games).unwrap();
         let (ctx, _) = agora_core::ctx::CoreContext::initialize(paths.clone(), games).unwrap();
+        let ctx = ctx.with_minecraft_snapshot_entries(
+            agora_game_minecraft::snapshot_scope::tracked_entries(),
+        );
         let progress = super::CliProgressSink::new(&root.join("cli.log"), false).unwrap();
 
         let entry_id = "20200101T000000Z-test";

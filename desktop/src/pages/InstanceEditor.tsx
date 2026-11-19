@@ -47,6 +47,7 @@ import {
   exportServerEnvironment,
   listWorlds,
   formatError,
+  errorCode,
   inspectJavaExecutable,
   pickOpenFile,
   getCustomIcon,
@@ -2664,10 +2665,10 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
           </div>
 
           <p className="text-xs text-muted-foreground">
-            A snapshot is a restore point. It copies your mods, configs, resource packs, shader packs, data packs and options.txt. Worlds are included in full snapshots, but not in the quick ones taken before each launch. Logs, screenshots and other files are not included.
+            A snapshot is a restore point. For Minecraft it copies your mods, configs, resource packs, shader packs, data packs and options.txt; worlds are included in full snapshots, but not in the quick ones taken before each launch. For a game instance it records the instance's own state — its content layers, plugin lists, INI copies, loadouts, save choice and load-after rules — while the mod files stay once in the content store. Logs, screenshots and other files are not included.
           </p>
           <p className="text-xs text-muted-foreground">
-            Agora takes an automatic snapshot before changes to an existing instance: launches, mod installs, updates and removals, pack updates, templates, and pack mods added after an import. It keeps the last 5 of those. Turning a mod on or off takes none, and neither does importing a pack into a new instance, since there is nothing to go back to. Snapshots you create yourself, and ones from version moves, are kept until you delete them.
+            Agora takes an automatic snapshot before changes to an existing instance: launches, mod installs, updates and removals, pack updates, templates, pack mods added after an import, and for game instances its content, plugin list, INI, rule and loadout changes. It keeps the last 5 of those. Turning a mod on or off takes none, and neither does importing a pack into a new instance, since there is nothing to go back to. Snapshots you create yourself, and ones from version moves, are kept until you delete them.
           </p>
           {snapshots.length === 0 ? (
             <p className="text-sm text-muted-foreground">
@@ -2679,14 +2680,17 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                 <div key={snap.id} className="flex items-center justify-between rounded-lg border border-border px-3 py-2 text-sm">
                   <div className="min-w-0 flex-1">
                     <span className="font-medium flex items-center gap-2">
-                      <span>{snap.label}</span>
-                      {snap.effective_origin === 'automatic' && (
+                      <span>{snap.unreadable ? 'Unreadable snapshot' : snap.label}</span>
+                      {snap.unreadable && (
+                        <span className="rounded-full bg-destructive/10 px-2 py-0.5 text-xs text-destructive" title={snap.unreadable}>Unreadable</span>
+                      )}
+                      {!snap.unreadable && snap.effective_origin === 'automatic' && (
                         <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground" title="Taken by Agora before a change; only the last 5 are kept">Automatic</span>
                       )}
-                      {snap.effective_origin === 'lock' && (
+                      {!snap.unreadable && snap.effective_origin === 'lock' && (
                         <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-xs text-amber-700 dark:text-amber-300" title="Taken when the instance was locked. Revert returns to it until the next lock replaces it.">Lock</span>
                       )}
-                      {snap.effective_origin === 'migration' && (
+                      {!snap.unreadable && snap.effective_origin === 'migration' && (
                         <span className="rounded-full bg-sky-500/10 px-2 py-0.5 text-xs text-sky-700 dark:text-sky-300" title="Recovery point from a version move; kept">Migration</span>
                       )}
                       {snap.is_current_lkg && (
@@ -2702,6 +2706,9 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                     <span className="text-xs text-muted-foreground">
                       {formatDateTime(snap.created_at)} · {snap.file_count} file{snap.file_count !== 1 ? 's' : ''}
                     </span>
+                    {snap.unreadable && (
+                      <span className="block text-xs text-destructive">{snap.unreadable}</span>
+                    )}
                   </div>
                   <div className="flex gap-2 ml-3">
                     <button
@@ -2717,7 +2724,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                           setSnapshotDiffBusy(null);
                         }
                       }}
-                       disabled={snapshotDiffBusy === snap.id || snapshotBusy === snap.id}
+                       disabled={Boolean(snap.unreadable) || snapshotDiffBusy === snap.id || snapshotBusy === snap.id}
                       className="text-xs text-primary hover:underline disabled:opacity-50"
                     >
                       {snapshotDiffBusy === snap.id ? 'Loading diff…' : 'Show diff'}
@@ -2726,20 +2733,39 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                       onClick={async () => {
                         setSnapshotBusy(snap.id);
                         setError(null);
-                        try {
-                          await restoreSnapshot(instanceId, snap.id);
+                        const run = async (force: boolean) => {
+                          await restoreSnapshot(instanceId, snap.id, force);
                           // An expanded diff compared the pre-restore files;
                           // it would keep showing changes the restore undid.
                           setSnapshotDiff(null);
                           await reloadInstance();
                           setStatus('Snapshot restored.');
+                        };
+                        try {
+                          await run(false);
                         } catch (e) {
-                          setError(formatError(e));
+                          const message = formatError(e);
+                          const gameMayBeRunning = errorCode(e) === 'ERR_SNAPSHOT_NOT_IDLE';
+                          if (gameMayBeRunning && await confirm({
+                            title: 'The game is running',
+                            body: `${message}
+
+Restoring while the game runs can be overwritten by the game. Restore anyway?`,
+                            confirmLabel: 'Restore anyway',
+                          })) {
+                            try {
+                              await run(true);
+                            } catch (retryError) {
+                              setError(formatError(retryError));
+                            }
+                          } else {
+                            setError(message);
+                          }
                         } finally {
                           setSnapshotBusy(null);
                         }
                       }}
-                       disabled={snapshotBusy === snap.id || snapshotOperationPending}
+                       disabled={Boolean(snap.unreadable) || snapshotBusy === snap.id || snapshotOperationPending}
                       className="text-xs text-foreground hover:underline disabled:opacity-50"
                     >
                       {snapshotBusy === snap.id ? 'Restoring…' : 'Restore'}

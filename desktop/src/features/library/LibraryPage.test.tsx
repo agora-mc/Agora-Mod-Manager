@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
@@ -238,12 +239,137 @@ describe('LibraryPage', () => {
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith('games_content_remove', {
         itemId: unusedItem.itemId,
+        ignoreUnreadableSnapshots: false,
       });
     });
     expect(await screen.findByRole('status')).toHaveTextContent('Removed 1 item.');
     await waitFor(() => {
       expect(screen.queryByTestId('unused-summary')).not.toBeInTheDocument();
     });
+  });
+
+  it('offers to delete an unreadable snapshot that blocks removal', async () => {
+    const snapshots = [{
+      instanceId: 'mc1',
+      snapshotId: 'snap-1',
+      label: null,
+      createdAt: '2026-01-01T00:00:00Z',
+      path: 'instances/mc1/.agora_snapshots/snap-1.json',
+      error: 'not valid json',
+      command: 'agora snapshots delete mc1 snap-1',
+      inTrash: false,
+    }];
+    let attempts = 0;
+    invokeMock.mockImplementation(async (command: string) => {
+      switch (command) {
+        case 'games_library_list':
+          return { items: [first], damaged: [], warnings: [] };
+        case 'games_library_instances':
+          return { instances: [], warnings: [] };
+        case 'games_library_unused':
+          return { items: [], totalSize: 0, warnings: [] };
+        case 'games_library_icon':
+          return null;
+        case 'games_content_remove':
+          attempts += 1;
+          if (attempts === 1) {
+            throw {
+              code: 'UNREADABLE_SNAPSHOTS',
+              message:
+                "cannot remove item First item: snapshot 'snap-1' of instance 'mc1' cannot be read; "
+                + 'delete it with: agora snapshots delete mc1 snap-1',
+              details: { snapshots },
+            };
+          }
+          return null;
+        case 'delete_snapshot':
+          return null;
+        default:
+          throw new Error(`unmocked command in a library test: ${command}`);
+      }
+    });
+
+    render(<ConfirmProvider><LibraryPage /></ConfirmProvider>);
+    await screen.findByText('A saved description.');
+    await userEvent.click(screen.getByRole('button', { name: 'More for First item' }));
+    await userEvent.click(await screen.findByRole('menuitem', { name: /Remove from library/ }));
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Remove' }));
+
+    expect(await screen.findByText(/Delete that snapshot/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Delete snapshot(s)' }));
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('delete_snapshot', {
+        instanceId: 'mc1',
+        snapshotId: 'snap-1',
+      });
+    });
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('games_content_remove', {
+        itemId: first.itemId,
+        ignoreUnreadableSnapshots: false,
+      });
+    });
+    expect(await screen.findByRole('status')).toHaveTextContent('Removed First item.');
+  });
+
+  it('lets the person remove the item anyway after an unreadable snapshot', async () => {
+    const snapshots = [{
+      instanceId: 'mc1',
+      snapshotId: 'snap-1',
+      label: null,
+      createdAt: '2026-01-01T00:00:00Z',
+      path: 'instances/mc1/.agora_snapshots/snap-1.json',
+      error: 'not valid json',
+      command: 'agora snapshots delete mc1 snap-1',
+      inTrash: false,
+    }];
+    let attempts = 0;
+    invokeMock.mockImplementation(async (command: string) => {
+      switch (command) {
+        case 'games_library_list':
+          return { items: [first], damaged: [], warnings: [] };
+        case 'games_library_instances':
+          return { instances: [], warnings: [] };
+        case 'games_library_unused':
+          return { items: [], totalSize: 0, warnings: [] };
+        case 'games_library_icon':
+          return null;
+        case 'games_content_remove':
+          attempts += 1;
+          if (attempts === 1) {
+            throw {
+              code: 'UNREADABLE_SNAPSHOTS',
+              message: "cannot remove item First item: snapshot 'snap-1' cannot be read",
+              details: { snapshots },
+            };
+          }
+          return null;
+        default:
+          throw new Error(`unmocked command in a library test: ${command}`);
+      }
+    });
+
+    render(<ConfirmProvider><LibraryPage /></ConfirmProvider>);
+    await screen.findByText('A saved description.');
+    await userEvent.click(screen.getByRole('button', { name: 'More for First item' }));
+    await userEvent.click(await screen.findByRole('menuitem', { name: /Remove from library/ }));
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Remove' }));
+
+    expect(await screen.findByText(/Delete that snapshot/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(
+      await screen.findByText(/Those snapshots will no longer be able to restore this item/),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Remove anyway' }));
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('games_content_remove', {
+        itemId: first.itemId,
+        ignoreUnreadableSnapshots: true,
+      });
+    });
+    expect(await screen.findByRole('status')).toHaveTextContent('Removed First item.');
   });
 
   it('offers nothing unused while an instance cannot be read, and says which one', async () => {

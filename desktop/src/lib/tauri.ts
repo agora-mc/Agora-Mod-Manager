@@ -2509,6 +2509,8 @@ export interface Snapshot {
   is_lkg: boolean;
   is_current_lkg: boolean;
   is_pre_restore: boolean;
+  /** Set when the snapshot was found on disk but its manifest cannot be read. */
+  unreadable?: string;
 }
 
 /** One item a profile records, with the on/off state it was saved in. */
@@ -2641,10 +2643,15 @@ export interface RestoreOutcome {
   preservedRoots: string[];
   cleanupWarning?: string;
   preservedRecoveryDir?: string;
+  undoSnapshotId?: string;
 }
 
-export const restoreSnapshot = (instanceId: string, snapshotId: string) =>
-  invoke<RestoreOutcome>('restore_snapshot', { instanceId, snapshotId });
+export const restoreSnapshot = (
+  instanceId: string,
+  snapshotId: string,
+  force = false,
+) =>
+  invoke<RestoreOutcome>('restore_snapshot', { instanceId, snapshotId, force });
 
 /** One plain sentence describing what a restore covered, or null if it was a
  *  complete restore with nothing worth remarking on. */
@@ -2712,13 +2719,36 @@ export interface CapturableFile {
  * Point it at a folder Dropbox or OneDrive already syncs and backups go offsite
  * with no service behind them.
  */
-export const exportBackup = (instanceId: string, snapshotId: string, exportDir: string) =>
-  invoke<string>('export_backup', { instanceId, snapshotId, exportDir });
+export const exportBackup = (
+  instanceId: string,
+  snapshotId: string,
+  exportDir: string,
+  withBytes = false,
+) => invoke<string>('export_backup', { instanceId, snapshotId, exportDir, withBytes });
+
+/** The bytes a game backup's mod objects would add, so the cost is shown first. */
+export const gameBackupBytes = (instanceId: string, snapshotId: string) =>
+  invoke<number>('game_backup_bytes', { instanceId, snapshotId });
 
 /** Read a backup artifact back into an instance. Fully validated before it
  *  touches the instance directory — the file is untrusted input. */
-export const importBackup = (instanceId: string, artifactPath: string) =>
-  invoke<Snapshot>('import_backup', { instanceId, artifactPath });
+export const importBackup = (
+  instanceId: string,
+  artifactPath: string,
+  fetchMissing = false,
+) => invoke<Snapshot>('import_backup', { instanceId, artifactPath, fetchMissing });
+
+export interface BackupImportPreview {
+  snapshotId: string;
+  missingItems: string[];
+  missingObjects: number;
+  missingBytes: number;
+  totalItems: number;
+}
+
+/** The content a backup needs before it can be applied, read without downloading. */
+export const previewBackupImport = (instanceId: string, artifactPath: string) =>
+  invoke<BackupImportPreview>('preview_backup_import', { instanceId, artifactPath });
 
 /** Apply a retention policy; resolves to the snapshot ids that were removed. */
 export const applyBackupRetention = (

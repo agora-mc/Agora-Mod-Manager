@@ -1489,6 +1489,25 @@ fn guard_for(
     }
 }
 
+/// Mark the instance's deployment for a rebuild at its next launch, without
+/// touching the deployed folder. Removing the record is enough: a deploy that
+/// finds no record cannot call the folder up to date.
+pub fn mark_for_redeploy(ctx: &Ctx, instance_id: &str) -> Result<(), DeployError> {
+    let Some(game_dir) = deployment_dir(ctx, instance_id)? else {
+        return Ok(());
+    };
+    let Some(deployment_dir) = game_dir.parent() else {
+        return Ok(());
+    };
+    match std::fs::remove_file(deployment_dir.join("deployment.json")) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DeployError::Other(format!(
+            "the deployment record could not be cleared for a rebuild: {error}"
+        ))),
+    }
+}
+
 pub fn deploy(
     ctx: &Ctx,
     instance_id: &str,
@@ -3338,6 +3357,11 @@ pub fn add_content_locked(
         .unwrap_or(layers.len());
     layers.insert(insert_pos, new_layer.clone());
 
+    // A recovery point before the change, the way an install into a Minecraft
+    // instance takes one. The instance lock is already held.
+    crate::game_snapshot::snapshot_before_change_locked(ctx, instance_id, "before-content-add")
+        .map_err(DeployError::Other)?;
+
     manifest.layers = LayerStack::new(layers)?;
     write_instance_manifest_atomic(ctx, instance_id, &manifest)?;
 
@@ -3756,6 +3780,9 @@ pub fn remove_content_locked(
 
     let mut layers = manifest.layers.layers().to_vec();
     let idx = resolve_content_layer(&layers, item_id_or_prefix)?;
+
+    crate::game_snapshot::snapshot_before_change_locked(ctx, instance_id, "before-content-remove")
+        .map_err(DeployError::Other)?;
 
     layers.remove(idx);
     manifest.layers = LayerStack::new(layers)?;

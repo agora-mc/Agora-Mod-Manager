@@ -72,6 +72,7 @@ pub mod runtime_service;
 pub mod server_export;
 pub mod server_ping;
 pub mod skins;
+pub mod snapshot_scope;
 pub mod state;
 pub mod technic;
 pub mod template_service;

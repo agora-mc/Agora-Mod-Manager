@@ -244,7 +244,10 @@ pub fn run_snapshots(
             let dir = require_instance(ctx, &instance)?;
             let reference = agora_core::snapshot::snapshot_file_index(&dir, &snapshot_id)
                 .map_err(|error| anyhow::anyhow!(error))?;
-            let current = agora_core::snapshot::live_file_index(&dir)
+            let scope = agora_core::snapshot::restore_scope(&dir, &snapshot_id)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let scope_refs: Vec<&str> = scope.iter().map(String::as_str).collect();
+            let current = agora_core::snapshot::live_file_index(&dir, &scope_refs)
                 .map_err(|error| anyhow::anyhow!(error))?;
             let diff = agora_core::lkg::compute_diff(&reference, &current, Some(snapshot_id), None);
             if json {

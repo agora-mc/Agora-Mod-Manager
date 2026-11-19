@@ -32,6 +32,7 @@ import {
 } from '@/features/games/content/api';
 import { isGamesError, MINECRAFT_GAME_ID } from '@/features/games/shared/types';
 import { cn } from '@/lib/utils';
+import { deleteSnapshot } from '@/lib/tauri';
 import {
   addLibraryItem,
   fillMissingLibraryDetails,
@@ -61,6 +62,34 @@ function errorMessage(error: unknown): string {
   if (isGamesError(error)) return error.message;
   if (error instanceof Error) return error.message;
   return 'Something went wrong. Try again.';
+}
+
+interface UnreadableSnapshotDetail {
+  instanceId: string;
+  snapshotId: string;
+  createdAt: string;
+  command: string;
+  inTrash: boolean;
+}
+
+function unreadableSnapshots(details: unknown): UnreadableSnapshotDetail[] {
+  if (!details || typeof details !== 'object') return [];
+  const list = (details as { snapshots?: unknown }).snapshots;
+  if (!Array.isArray(list)) return [];
+  return list.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object') return [];
+    const snapshot = entry as Record<string, unknown>;
+    if (typeof snapshot.instanceId !== 'string' || typeof snapshot.snapshotId !== 'string') {
+      return [];
+    }
+    return [{
+      instanceId: snapshot.instanceId,
+      snapshotId: snapshot.snapshotId,
+      createdAt: typeof snapshot.createdAt === 'string' ? snapshot.createdAt : '',
+      command: typeof snapshot.command === 'string' ? snapshot.command : '',
+      inTrash: snapshot.inTrash === true,
+    }];
+  });
 }
 
 export interface LibraryPageProps {
@@ -235,7 +264,41 @@ export function LibraryPage({
     clearMessages();
     setBusy(item.itemId);
     try {
-      await removeLibraryItem(item.itemId);
+      try {
+        await removeLibraryItem(item.itemId);
+      } catch (error) {
+        // An unreadable snapshot may still need the item. The core names the
+        // snapshot and the command; offer to delete it, or to remove anyway.
+        if (!(isGamesError(error) && error.code === 'UNREADABLE_SNAPSHOTS')) throw error;
+        const snapshots = unreadableSnapshots(error.details);
+        const live = snapshots.filter((snapshot) => !snapshot.inTrash);
+        const deleteThem = live.length > 0 && await confirm({
+          title: `Remove ${item.name} from your library?`,
+          body: `${error.message}
+
+Delete ${live.length === 1 ? 'that snapshot' : `those ${live.length} snapshots`} and try again?`,
+          confirmLabel: 'Delete snapshot(s)',
+          tone: 'danger',
+        });
+        if (deleteThem) {
+          for (const snapshot of live) {
+            await deleteSnapshot(snapshot.instanceId, snapshot.snapshotId);
+          }
+          await removeLibraryItem(item.itemId);
+        } else if (await confirm({
+          title: `Remove ${item.name} anyway?`,
+          body: `${error.message}
+
+Those snapshots will no longer be able to restore this item.`,
+          confirmLabel: 'Remove anyway',
+          tone: 'danger',
+        })) {
+          await removeLibraryItem(item.itemId, true);
+        } else {
+          setActionError(`Could not remove ${item.name}: ${error.message}`);
+          return;
+        }
+      }
       setNotice(`Removed ${item.name}.`);
       setReports((current) => {
         const next = { ...current };

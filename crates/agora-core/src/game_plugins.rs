@@ -1103,6 +1103,8 @@ pub fn set_active_in_locked(
     if !guard.allows_running() {
         ensure_copy_editable(ctx, instance_id, definition)?;
     }
+    crate::game_snapshot::snapshot_before_change_locked(ctx, instance_id, "before-plugin-toggle")
+        .map_err(PluginListError::Other)?;
 
     let dir = instance_dir(ctx, instance_id)?;
     let path = dir.join(rule.file.as_str());
@@ -1267,6 +1269,8 @@ pub fn import_list_in_locked(
     if !guard.allows_running() {
         ensure_copy_editable(ctx, instance_id, definition)?;
     }
+    crate::game_snapshot::snapshot_before_change_locked(ctx, instance_id, "before-plugin-import")
+        .map_err(PluginListError::Other)?;
     let dir = instance_dir(ctx, instance_id)?;
     let path = dir.join(rule.file.as_str());
     let doc = match &rule.format {
@@ -1398,6 +1402,8 @@ pub fn write_order_locked_in(
 ) -> Result<bool, PluginListError> {
     let rule = rule_of(definition, list_id)?;
     ensure_copy_editable(ctx, instance_id, definition)?;
+    crate::game_snapshot::snapshot_before_change_locked(ctx, instance_id, "before-plugin-order")
+        .map_err(PluginListError::Other)?;
     let dir = instance_dir(ctx, instance_id)?;
     let path = dir.join(rule.file.as_str());
     let Some(bytes) = read_optional(&path)? else {

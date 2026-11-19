@@ -2016,6 +2016,7 @@ impl LauncherImportService {
                     agora_core::snapshot::create_snapshot(
                         &final_dir,
                         Some("Before launcher import update"),
+                        crate::snapshot_scope::tracked_entries(),
                     )
                     .map_err(|error| {
                         let _ = rollback_staging();

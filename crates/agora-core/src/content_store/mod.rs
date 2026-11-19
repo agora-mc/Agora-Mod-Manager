@@ -335,6 +335,15 @@ pub enum ContentError {
         manifest: String,
         error: String,
     },
+    /// Snapshots that cannot be read might still name the item. The message
+    /// names each one and the command that deletes it; `snapshots` carries the
+    /// same facts for a front end that offers the action.
+    #[error("cannot remove item {item_id}: {message}")]
+    UnreadableSnapshots {
+        item_id: String,
+        message: String,
+        snapshots: Vec<crate::game_snapshot::UnreadableSnapshotReference>,
+    },
     #[error("unsupported archive format: supported formats are zip, 7z, rar")]
     UnsupportedArchiveFormat,
     #[error("archive is password-protected: password-protected archives are not supported")]
@@ -2358,7 +2367,24 @@ pub fn verify_all(
 /// Then every other content manifest is read and validated; if any cannot be read
 /// or parsed, removal refuses and deletes nothing to prevent sweeping objects that
 /// an unreadable item still needs.
+/// Answers for [`remove_item_with_options`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RemoveOptions {
+    /// Proceed even when a snapshot manifest cannot be read. The ignored
+    /// snapshots are named on stderr. The caller has told the user that those
+    /// snapshots will no longer be able to restore the item.
+    pub ignore_unreadable_snapshots: bool,
+}
+
 pub fn remove_item(ctx: &Ctx, item_id_or_prefix: &str) -> Result<(), ContentError> {
+    remove_item_with_options(ctx, item_id_or_prefix, RemoveOptions::default())
+}
+
+pub fn remove_item_with_options(
+    ctx: &Ctx,
+    item_id_or_prefix: &str,
+    options: RemoveOptions,
+) -> Result<(), ContentError> {
     let _lock = ctx
         .lock_manager
         .acquire(LockResource::ContentStore, "content-remove")?;
@@ -2422,6 +2448,83 @@ pub fn remove_item(ctx: &Ctx, item_id_or_prefix: &str) -> Result<(), ContentErro
                 .join(", "),
             instance_ids: using.into_iter().map(|(_, id)| id).collect(),
         });
+    }
+
+    // A game-instance snapshot names its content-store items in its manifest. Removing an item a
+    // snapshot still holds would make that restore point unusable, so it refuses, naming the
+    // snapshots and the command that deletes each. An unreadable snapshot manifest refuses too
+    // (it might name any item) unless the caller explicitly overrides it.
+    let snapshot_usage =
+        crate::game_snapshot::snapshots_using_content(ctx, &item_id).map_err(|error| {
+            ContentError::UnreadableManifest {
+                item_id: item_id.clone(),
+                manifest: "game-instance snapshots".into(),
+                error,
+            }
+        })?;
+    if !snapshot_usage.using.is_empty() {
+        let mut instance_ids: Vec<String> = snapshot_usage
+            .using
+            .iter()
+            .map(|snapshot| snapshot.instance_id.clone())
+            .collect();
+        instance_ids.sort();
+        instance_ids.dedup();
+        let instances = snapshot_usage
+            .using
+            .iter()
+            .map(|snapshot| {
+                format!(
+                    "snapshot '{}' of instance '{}' ({}); delete it with: {}",
+                    snapshot.label.as_deref().unwrap_or(&snapshot.snapshot_id),
+                    snapshot.instance_id,
+                    snapshot.created_at,
+                    snapshot.command
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ContentError::InUse {
+            item_id,
+            instances,
+            instance_ids,
+        });
+    }
+    if !snapshot_usage.unreadable.is_empty() {
+        if options.ignore_unreadable_snapshots {
+            for snapshot in &snapshot_usage.unreadable {
+                eprintln!(
+                    "[content] removing {item_id} while ignoring unreadable snapshot '{}' of                      instance '{}' ({}): {}; delete it with: {}",
+                    snapshot.snapshot_id,
+                    snapshot.instance_id,
+                    snapshot.created_at,
+                    snapshot.error,
+                    snapshot.command
+                );
+            }
+        } else {
+            let message = snapshot_usage
+                .unreadable
+                .iter()
+                .map(|snapshot| {
+                    format!(
+                        "snapshot '{}' of instance '{}' ({}) at {} cannot be read ({}), so it                          might use the item; delete it with: {}",
+                        snapshot.snapshot_id,
+                        snapshot.instance_id,
+                        snapshot.created_at,
+                        snapshot.path,
+                        snapshot.error,
+                        snapshot.command
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ContentError::UnreadableSnapshots {
+                item_id,
+                message,
+                snapshots: snapshot_usage.unreadable,
+            });
+        }
     }
 
     // The target's own manifest is not parsed, so a corrupt item can still be removed. Another

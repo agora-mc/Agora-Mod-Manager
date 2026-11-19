@@ -3142,7 +3142,7 @@ Keeping instances safe to change: safe operations, Last Known Good, content-addr
 3. **React dialogs return user decisions and do not execute business operations.** A dialog's only side effect is calling `onConfirm()` or `onCancel()`. The parent component dispatches backend commands.
 4. **Process state survives navigation.** Running-instance identity, PID, console subscription, and exit status live in a controller that outlives page components. React may query backend state after remount.
 5. **User-changing operations are previewable and reversible.** Every manifest mutation produces a plan that shows what changes before execution. Snapshots enable rollback.
-6. **Existing snapshots become the basis of last-known-good recovery.** A successful launch establishes LKG state. Changes since LKG are visible. One-click restore returns to LKG.
+6. **Existing snapshots become the basis of Last Known Good recovery.** A successful launch establishes LKG state. Changes since LKG are visible. One-click restore returns to LKG.
 7. **Desktop UX work must include meaningful integration tests.** Mocked UI tests, Rust integration tests, and native smoke checks are separate layers. A test that only asserts the page rendered is not sufficient.
 
 #### 19.13.3 Release C install-transaction architecture
@@ -3255,6 +3255,44 @@ by their own count (10) and are the last to go under the storage cap.
 Snapshots written before the field existed are classified by label. A single
 shared count used to let the next launch delete a user's or a migration's
 recovery point without warning.
+
+**Game instances (Wave 1 recovery).** A generic game instance (§26) gets the
+same manifest and object store, but its scope is declared rather than a folder
+walk. Core owns two pieces (`instance_manifest.json` and `.agora_loadouts`);
+the game definition adds its plugin-list files and INI copies. A state file may
+sit beside content (Cyberpunk's `mods/modlist.txt`), so those files are captured
+individually as data, never by sweeping their folder. The save choice is in the
+manifest and the load-after rules go into the snapshot as data, then restore in
+one database transaction. Mod bytes never enter the snapshot. A restore is
+refused while the game runs or cannot be proven idle (a CLI `--force` and a
+desktop confirmation override it), takes a pre-restore snapshot first, writes
+the files atomically, and marks the deployment for a rebuild. Content-store
+removal refuses while a game-instance snapshot still names the item, and an
+unreadable snapshot refuses too; `list_snapshots` lists a damaged snapshot as
+unreadable with the reason and retention leaves it alone. The Minecraft folder
+list has moved out of core into the Minecraft package, which declares it, so
+core holds no game's folders.
+
+**Game-instance Last Known Good and backups.** A game-instance launch takes a
+pre-launch snapshot after deployment settles the state, and skips it when the
+content hash of the declared state is unchanged since the newest snapshot. When
+the session ends, the session ledger's verdict is mapped to §23.2's classes
+(clean exit after the minimum runtime with no crash evidence is a success; a
+crash, a freeze or a start failure is a crash; a player Stop is cancelled; an
+unwatched end is unknown; a clean exit that was too short is abandoned) and only
+a success promotes the pre-launch snapshot to LKG. Retention is the existing
+policy, with the current LKG evicted last. Changes since LKG are the state-file
+diff plus the content items and load-after lists that changed, and restore-to-LKG
+uses the guarded snapshot restore. A backup always holds the state and each
+content item's file hashes and recorded source; the mod bytes are included only
+when the player asks (the size is shown first). Import verifies every hash
+before writing, and a backup without bytes either finds every object in the
+store or refuses the whole import naming the missing items; with the explicit
+fetch option it first refetches each object from the source the backup recorded,
+through the same hash-checked catalog path an install uses, and still refuses
+the whole import if any object cannot be completed. Importing a game backup into
+an empty data folder registers the instance (row and manifest) through the same
+core path a normal create uses, so it is listed, opened and deploy-plannable.
 
 ### 23.4 Health, Crash Doctor, Memory, Authentication, and Launch Reliability (formerly §19.19)
 

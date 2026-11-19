@@ -265,6 +265,28 @@ pub fn generate_instance_id_from_name(name: &str) -> String {
     format!("{slug}-{hex}")
 }
 
+/// The one insert a new game instance uses, whether it came from an install,
+/// a clone, a restored deletion or an imported backup.
+fn insert_instance_row(
+    conn: &rusqlite::Connection,
+    instance_id: &str,
+    game: &GameId,
+    name: &str,
+    base: &BaseReference,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO game_instances (instance_id, game, name, base_json, created_at, last_launched_at)
+         VALUES (?1, ?2, ?3, ?4, datetime('now'), NULL)",
+        rusqlite::params![
+            instance_id,
+            game.as_str(),
+            name,
+            serde_json::to_string(base).unwrap_or_default()
+        ],
+    )?;
+    Ok(())
+}
+
 fn check_id_exists(
     paths: &AppPaths,
     conn: &rusqlite::Connection,
@@ -448,16 +470,12 @@ pub fn create_with_options(
     let write_result: Result<(), InstanceError> = (|| {
         std::fs::write(&tmp_path, &manifest_bytes)?;
         std::fs::rename(&tmp_path, &manifest_path)?;
-        let base_json = serde_json::to_string(&base_ref)?;
-        conn.execute(
-            "INSERT INTO game_instances (instance_id, game, name, base_json, created_at, last_launched_at)
-             VALUES (?1, ?2, ?3, ?4, datetime('now'), NULL)",
-            rusqlite::params![
-                &instance_id,
-                definition.id.as_str(),
-                instance_name,
-                &base_json
-            ],
+        insert_instance_row(
+            &conn,
+            &instance_id,
+            &definition.id,
+            instance_name,
+            &base_ref,
         )?;
         Ok(())
     })();
@@ -482,6 +500,131 @@ pub fn create_with_options(
         last_launched_at: None,
         build_outcome,
     })
+}
+
+/// Register an instance whose manifest already exists, or write the manifest
+/// and register it. This is the one core path a backup import and a normal
+/// create share, so an imported instance is listed and opened the same way.
+pub fn register_manifest(
+    ctx: &Ctx,
+    manifest: &GameInstanceManifest,
+) -> Result<GameInstanceRecord, InstanceError> {
+    let instance_id = manifest.instance_id.as_str();
+    let instance_dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| InstanceError::InvalidId(instance_id.to_string(), e.to_string()))?;
+    if ctx.games.game(&manifest.game).is_none() {
+        return Err(InstanceError::Other(format!(
+            "the definition for game '{}' is not installed, so an instance of it cannot be registered",
+            manifest.game.as_str()
+        )));
+    }
+
+    let manifest_path = instance_dir.join("instance_manifest.json");
+    if manifest_path.exists() {
+        let bytes = std::fs::read(&manifest_path)?;
+        let existing: GameInstanceManifest = serde_json::from_slice(&bytes).map_err(|error| {
+            InstanceError::Other(format!(
+                "the instance manifest at {} cannot be read: {error}",
+                manifest_path.display()
+            ))
+        })?;
+        if existing != *manifest {
+            return Err(InstanceError::AlreadyExists(instance_id.to_string()));
+        }
+    } else {
+        std::fs::create_dir_all(&instance_dir)?;
+        let bytes = serde_json::to_vec_pretty(manifest)?;
+        crate::snapshot::atomic_write_pub(&manifest_path, &bytes).map_err(InstanceError::Other)?;
+    }
+
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db())
+        .map_err(|e| InstanceError::Other(e.to_string()))?;
+    let registered: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM game_instances WHERE instance_id = ?1",
+            [instance_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if registered.is_some() {
+        return Err(InstanceError::AlreadyExists(instance_id.to_string()));
+    }
+    insert_instance_row(
+        &conn,
+        instance_id,
+        &manifest.game,
+        manifest.name.as_str(),
+        &manifest.base,
+    )?;
+    let created_at: String = conn.query_row(
+        "SELECT created_at FROM game_instances WHERE instance_id = ?1",
+        [instance_id],
+        |row| row.get(0),
+    )?;
+    Ok(GameInstanceRecord {
+        instance_id: instance_id.to_string(),
+        game: manifest.game.clone(),
+        name: manifest.name.clone(),
+        base: manifest.base.clone(),
+        created_at,
+        last_launched_at: None,
+        build_outcome: None,
+    })
+}
+
+/// Make an imported game snapshot into a usable instance: read the manifest it
+/// carries, write it into the empty instance folder, and register the row
+/// through [`register_manifest`]. The snapshot stays restorable; nothing else
+/// in the live instance is touched.
+pub fn adopt_imported_snapshot(
+    ctx: &Ctx,
+    instance_id: &str,
+    snapshot_id: &str,
+) -> Result<GameInstanceRecord, InstanceError> {
+    let instance_dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| InstanceError::InvalidId(instance_id.to_string(), e.to_string()))?;
+    if get(ctx, instance_id)?.is_some() {
+        return Err(InstanceError::AlreadyExists(instance_id.to_string()));
+    }
+    let entries = crate::snapshot::snapshot_file_entries(&instance_dir, snapshot_id)
+        .map_err(InstanceError::Other)?;
+    let entry = entries
+        .iter()
+        .find(|entry| entry.relative_path == "instance_manifest.json" && !entry.absent)
+        .ok_or_else(|| {
+            InstanceError::Other(format!(
+                "snapshot {snapshot_id} carries no instance manifest, so it cannot create an instance"
+            ))
+        })?;
+    let hash = entry.sha256.as_deref().ok_or_else(|| {
+        InstanceError::Other(format!(
+            "snapshot {snapshot_id} has no hash for its instance manifest"
+        ))
+    })?;
+    let bytes = std::fs::read(crate::snapshot::snapshot_blob_path(&instance_dir, hash))?;
+    if bytes.len() as u64 != entry.size
+        || !crate::snapshot::sha256_hex(&bytes).eq_ignore_ascii_case(hash)
+    {
+        return Err(InstanceError::Other(format!(
+            "snapshot {snapshot_id}'s instance manifest does not match its recorded hash"
+        )));
+    }
+    let mut manifest: GameInstanceManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        InstanceError::Other(format!(
+            "snapshot {snapshot_id}'s instance manifest cannot be read: {error}"
+        ))
+    })?;
+    // Importing under a different id is how a backup becomes a second copy on
+    // the same machine. The row and the live manifest use the destination id;
+    // the snapshot itself keeps the source instance's recorded state.
+    if manifest.instance_id != instance_id {
+        manifest.instance_id = instance_id.to_string();
+    }
+    register_manifest(ctx, &manifest)
 }
 
 /// Retrieve a generic instance record by ID.
@@ -2233,6 +2376,11 @@ pub fn launch_with(
     let prepared =
         prepare_launch_with(ctx, id, definition, options.clone(), discover_fn, launcher)?;
 
+    // The recovery point the session may promote: taken after deployment has
+    // settled the instance's state, before anything runs.
+    let launch_point =
+        crate::game_snapshot::prepare_launch(ctx, id, definition).map_err(InstanceError::Other)?;
+
     // 2. Determine store and running_from
     let (store, running_from) = match &record.base {
         BaseReference::Pinned { id: base_id, .. } => {
@@ -2307,6 +2455,11 @@ pub fn launch_with(
     // 7. Open the session ledger row: what this launch ran with. Best effort by construction;
     //    a launch is never blocked or failed by its own bookkeeping.
     let session_id = crate::session_ledger::record_launch(ctx, id, definition, &store);
+    if let Err(error) =
+        crate::game_snapshot::record_launch_point(ctx, id, session_id.as_deref(), &launch_point)
+    {
+        eprintln!("[lkg] could not record the launch recovery point for '{id}': {error}");
+    }
 
     Ok(LaunchedInstance {
         launched,

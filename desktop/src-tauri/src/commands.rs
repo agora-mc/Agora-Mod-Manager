@@ -2526,13 +2526,22 @@ pub async fn check_mod_compat(
 fn create_or_reuse_prelaunch_snapshot(instance_dir: &Path, label: &str) -> Result<String, String> {
     let lkg = agora_core::lkg::read_lkg_state(instance_dir)?;
     if let Some(snapshot_id) = lkg.current_lkg_snapshot_id {
-        if agora_core::snapshot::snapshot_matches_live_incremental(instance_dir, &snapshot_id)
-            .unwrap_or(false)
+        if agora_core::snapshot::snapshot_matches_live_incremental(
+            instance_dir,
+            &snapshot_id,
+            agora_game_minecraft::snapshot_scope::tracked_entries(),
+        )
+        .unwrap_or(false)
         {
             return Ok(snapshot_id);
         }
     }
-    agora_core::snapshot::create_snapshot(instance_dir, Some(label)).map(|snapshot| snapshot.id)
+    agora_core::snapshot::create_snapshot(
+        instance_dir,
+        Some(label),
+        agora_game_minecraft::snapshot_scope::tracked_entries(),
+    )
+    .map(|snapshot| snapshot.id)
 }
 
 /// Batch compatibility from the signed registry metadata. This avoids one
@@ -4213,6 +4222,9 @@ pub async fn restore_snapshot(
     state: tauri::State<'_, LauncherState>,
     instance_id: String,
     snapshot_id: String,
+    // Restore a game instance even though its game is running, after the
+    // player confirmed the warning. `None` and `false` both refuse.
+    force: Option<bool>,
 ) -> LauncherResult<agora_core::snapshot::RestoreOutcome> {
     let sanitized = paths::sanitize_id(&instance_id);
 
@@ -4227,7 +4239,7 @@ pub async fn restore_snapshot(
             .values()
             .any(|process| process.instance_id == sanitized);
         let launch_active = shared.launch_reservations.contains(&sanitized);
-        if direct_active || launch_active {
+        if !force.unwrap_or(false) && (direct_active || launch_active) {
             return Err(LauncherError::Generic {
                 code: "ERR_INSTANCE_RUNNING".into(),
                 message: "Stop the running game before restoring this instance.".into(),
@@ -4241,8 +4253,11 @@ pub async fn restore_snapshot(
         .run_blocking(
             agora_core::task_scheduler::BlockingPriority::UserInitiated,
             move || {
-                agora_core::snapshot_service::SnapshotService::new(ctx.clone())
-                    .restore(&sanitized, &snapshot_id)
+                agora_core::snapshot_service::SnapshotService::new(ctx.clone()).restore_forcing(
+                    &sanitized,
+                    &snapshot_id,
+                    force.unwrap_or(false),
+                )
             },
         )
         .await
@@ -4959,15 +4974,47 @@ pub async fn export_backup(
     instance_id: String,
     snapshot_id: String,
     export_dir: String,
+    with_bytes: Option<bool>,
 ) -> LauncherResult<String> {
     let ctx = crate::core_context(&app)?;
-    agora_core::backup::export_instance_backup(
-        &ctx,
-        &instance_id,
-        &snapshot_id,
-        std::path::Path::new(&export_dir),
-    )
-    .await
+    let is_game = agora_core::game_instance::get(&ctx, &instance_id)
+        .map_err(|error| LauncherError::Generic {
+            code: "ERR_LOCAL_STATE_FAILED".into(),
+            message: format!("cannot read instance '{instance_id}': {error}"),
+        })?
+        .is_some();
+    if is_game {
+        agora_core::backup::export_game_instance_backup(
+            &ctx,
+            &instance_id,
+            &snapshot_id,
+            std::path::Path::new(&export_dir),
+            with_bytes.unwrap_or(false),
+        )
+        .await
+    } else {
+        agora_core::backup::export_instance_backup(
+            &ctx,
+            &instance_id,
+            &snapshot_id,
+            std::path::Path::new(&export_dir),
+            agora_game_minecraft::snapshot_scope::tracked_entries(),
+        )
+        .await
+    }
+}
+
+/// The bytes a game backup's content objects would add, so the page can show
+/// the cost before the player asks to include them.
+#[tauri::command]
+pub async fn game_backup_bytes(
+    app: tauri::AppHandle,
+    _state: tauri::State<'_, LauncherState>,
+    instance_id: String,
+    snapshot_id: String,
+) -> LauncherResult<u64> {
+    let ctx = crate::core_context(&app)?;
+    agora_core::backup::game_instance_backup_content_bytes(&ctx, &instance_id, &snapshot_id)
 }
 
 /// Read a backup artifact back into an instance.
@@ -4981,14 +5028,33 @@ pub async fn import_backup(
     _state: tauri::State<'_, LauncherState>,
     instance_id: String,
     artifact_path: String,
+    fetch_missing: Option<bool>,
 ) -> LauncherResult<agora_core::snapshot::Snapshot> {
     let ctx = crate::core_context(&app)?;
-    agora_core::backup::import_instance_backup(
+    agora_core::backup::import_instance_backup_fetching(
+        &ctx,
+        &instance_id,
+        std::path::Path::new(&artifact_path),
+        fetch_missing.unwrap_or(false),
+    )
+    .await
+}
+
+/// What a backup import would need before it can be applied, so the page can
+/// ask before downloading anything.
+#[tauri::command]
+pub async fn preview_backup_import(
+    app: tauri::AppHandle,
+    _state: tauri::State<'_, LauncherState>,
+    instance_id: String,
+    artifact_path: String,
+) -> LauncherResult<agora_core::backup::BackupImportPreview> {
+    let ctx = crate::core_context(&app)?;
+    agora_core::backup::preview_backup_import(
         &ctx,
         &instance_id,
         std::path::Path::new(&artifact_path),
     )
-    .await
 }
 
 /// Apply a retention policy, returning the snapshot ids that were removed.
@@ -6125,13 +6191,48 @@ pub async fn detect_drift(
     snapshot_id: String,
 ) -> LauncherResult<serde_json::Value> {
     let sanitized = crate::paths::sanitize_id(&instance_id);
+    let ctx = crate::core_context(&app)?;
+    // A game instance has no Minecraft folder list: compare its declared state
+    // files and rules instead.
+    if let Some(record) = agora_core::game_instance::get(&ctx, &sanitized).map_err(|error| {
+        LauncherError::Generic {
+            code: "ERR_LOCAL_STATE_FAILED".into(),
+            message: format!("cannot read instance '{sanitized}': {error}"),
+        }
+    })? {
+        let definition = ctx
+            .games
+            .game(&record.game)
+            .ok_or_else(|| LauncherError::Generic {
+                code: "ERR_GAME_DEFINITION".into(),
+                message: format!(
+                    "the definition for game '{}' is not installed",
+                    record.game.as_str()
+                ),
+            })?;
+        let diff = agora_core::game_snapshot::diff_against_snapshot(
+            &ctx,
+            &sanitized,
+            definition,
+            &snapshot_id,
+        )
+        .map_err(|error| LauncherError::Generic {
+            code: "ERR_DRIFT".into(),
+            message: error,
+        })?;
+        return Ok(serde_json::to_value(&diff.files).unwrap_or_default());
+    }
+
     let instance_dir = crate::paths::instance_dir(&app, &sanitized)
         .map_err(|_| LauncherError::LocalStateFailed)?;
     let snapshot_id_for_task = snapshot_id.clone();
     let (ref_files, current_files) = tokio::task::spawn_blocking(move || {
         let reference =
             agora_core::snapshot::snapshot_file_index(&instance_dir, &snapshot_id_for_task)?;
-        let current = agora_core::snapshot::live_file_index(&instance_dir)?;
+        let current = agora_core::snapshot::live_file_index(
+            &instance_dir,
+            agora_game_minecraft::snapshot_scope::tracked_entries(),
+        )?;
         Ok::<_, String>((reference, current))
     })
     .await
@@ -6171,8 +6272,11 @@ pub async fn verify_lockfile(
     let instance_dir = crate::paths::instance_dir(&app, &sanitized)
         .map_err(|error| lockfile_error("ERR_INSTANCE_PATH", error.to_string()))?;
     tokio::task::spawn_blocking(move || {
-        let index = agora_core::snapshot::live_file_index(&instance_dir)
-            .map_err(|error| lockfile_error("ERR_DRIFT", error))?;
+        let index = agora_core::snapshot::live_file_index(
+            &instance_dir,
+            agora_game_minecraft::snapshot_scope::tracked_entries(),
+        )
+        .map_err(|error| lockfile_error("ERR_DRIFT", error))?;
         let live_files = index
             .iter()
             .filter(|entry| {
@@ -6256,7 +6360,7 @@ pub async fn repair_lockfile(
             ));
         }
 
-        let live_index = agora_core::snapshot::live_file_index(&repair_dir)
+        let live_index = agora_core::snapshot::live_file_index(&repair_dir, agora_game_minecraft::snapshot_scope::tracked_entries())
             .map_err(|error| lockfile_error("ERR_DRIFT", error))?;
         let live_hashes = live_index
             .iter()
@@ -6423,7 +6527,11 @@ pub async fn repair_lockfile(
         let post_registry_db = paths::registry_db_path(&app).ok();
         let post_result = tokio::task::spawn_blocking(move || {
             if let Err(error) = apply_lockfile_metadata(&post_dir, &post_lockfile) {
-                let restored = agora_core::snapshot::restore_snapshot(&post_dir, &post_snapshot_id);
+                let restored = agora_core::snapshot::restore_snapshot(
+                    &post_dir,
+                    &post_snapshot_id,
+                    agora_game_minecraft::snapshot_scope::tracked_entries(),
+                );
                 return Err(lockfile_error(
                     "ERR_LOCKFILE_FINALIZE",
                     format!(
@@ -6433,7 +6541,11 @@ pub async fn repair_lockfile(
             }
             let report = lockfile_health_report(&post_dir, post_registry_db.as_deref())?;
             if !report.blockers.is_empty() {
-                let restored = agora_core::snapshot::restore_snapshot(&post_dir, &post_snapshot_id);
+                let restored = agora_core::snapshot::restore_snapshot(
+                    &post_dir,
+                    &post_snapshot_id,
+                    agora_game_minecraft::snapshot_scope::tracked_entries(),
+                );
                 return match restored {
                     Ok(_) => Ok(
                         agora_game_minecraft::install_pipeline::InstallOutcome::HealthRollback {
@@ -6640,12 +6752,15 @@ fn export_lockfile_sync(
         });
     }
 
-    let mut config_index = agora_core::snapshot::live_file_index(&instance_dir)
-        .map_err(|error| lockfile_error("ERR_CONFIG_HASH", error))?
-        .into_iter()
-        .filter(|entry| entry.path.starts_with("config/"))
-        .map(|entry| (entry.path, entry.sha256))
-        .collect::<Vec<_>>();
+    let mut config_index = agora_core::snapshot::live_file_index(
+        &instance_dir,
+        agora_game_minecraft::snapshot_scope::tracked_entries(),
+    )
+    .map_err(|error| lockfile_error("ERR_CONFIG_HASH", error))?
+    .into_iter()
+    .filter(|entry| entry.path.starts_with("config/"))
+    .map(|entry| (entry.path, entry.sha256))
+    .collect::<Vec<_>>();
     config_index.sort();
     let config_hash = if config_index.is_empty() {
         None
@@ -6906,7 +7021,11 @@ pub async fn import_lockfile(
         let restore_dir = instance_dir.clone();
         let restore_snap = snapshot_id.clone();
         let restore_result = tokio::task::spawn_blocking(move || {
-            agora_core::snapshot::restore_snapshot(&restore_dir, &restore_snap)
+            agora_core::snapshot::restore_snapshot(
+                &restore_dir,
+                &restore_snap,
+                agora_game_minecraft::snapshot_scope::tracked_entries(),
+            )
         })
         .await
         .map_err(|e| lockfile_error("ERR_LOCKFILE_RESTORE", e.to_string()));
@@ -6936,7 +7055,11 @@ pub async fn import_lockfile(
         let restore_dir = instance_dir.clone();
         let restore_snap = snapshot_id.clone();
         let restore_result = tokio::task::spawn_blocking(move || {
-            agora_core::snapshot::restore_snapshot(&restore_dir, &restore_snap)
+            agora_core::snapshot::restore_snapshot(
+                &restore_dir,
+                &restore_snap,
+                agora_game_minecraft::snapshot_scope::tracked_entries(),
+            )
         })
         .await
         .map_err(|e| lockfile_error("ERR_LOCKFILE_RESTORE", e.to_string()));
@@ -6953,7 +7076,11 @@ pub async fn import_lockfile(
             let restore_dir = instance_dir.clone();
             let restore_snap = snapshot_id.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                agora_core::snapshot::restore_snapshot(&restore_dir, &restore_snap)
+                agora_core::snapshot::restore_snapshot(
+                    &restore_dir,
+                    &restore_snap,
+                    agora_game_minecraft::snapshot_scope::tracked_entries(),
+                )
             })
             .await;
             let _ = crate::instances::delete_instance(&app, &instance_id);

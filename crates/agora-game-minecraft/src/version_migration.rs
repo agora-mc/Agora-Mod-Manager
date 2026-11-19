@@ -561,8 +561,11 @@ pub async fn plan_migration(
         .paths
         .instance_dir(&plan.instance_id)
         .map_err(MigrationRejection::infra)?;
-    let live_index = agora_core::snapshot::live_file_index(&instance_dir)
-        .map_err(|error| reject("ERR_MIGRATION_STATE", error, None))?;
+    let live_index = agora_core::snapshot::live_file_index(
+        &instance_dir,
+        crate::snapshot_scope::tracked_entries(),
+    )
+    .map_err(|error| reject("ERR_MIGRATION_STATE", error, None))?;
     plan.instance_state_hash = hash_serializable(&live_index);
     plan.fingerprint = plan_fingerprint(&plan);
     Ok(plan)
@@ -703,7 +706,10 @@ pub async fn execute_migration(
     // Same freshness rule the install pipeline applies: the live file index
     // must match what the plan reviewed, so untracked drift (a file dropped
     // into mods/ without a manifest entry) aborts the migration too.
-    let live_index = match agora_core::snapshot::live_file_index(&instance_dir) {
+    let live_index = match agora_core::snapshot::live_file_index(
+        &instance_dir,
+        crate::snapshot_scope::tracked_entries(),
+    ) {
         Ok(index) => index,
         Err(error) => return failed("precondition", error),
     };
@@ -807,6 +813,7 @@ pub async fn execute_migration(
             "migration-{}",
             &plan.fingerprint[..16.min(plan.fingerprint.len())]
         )),
+        crate::snapshot_scope::tracked_entries(),
         agora_core::snapshot::SnapshotOrigin::Migration,
     ) {
         Ok(snapshot) => snapshot,
@@ -928,7 +935,11 @@ pub async fn execute_migration(
             // A committed migration that health-checks red is exactly the
             // crash-loop case: undo it completely, snapshot restore + DB
             // revert, rather than hand the user a broken instance.
-            let restore = agora_core::snapshot::restore_snapshot(&instance_dir, &snapshot_id);
+            let restore = agora_core::snapshot::restore_snapshot(
+                &instance_dir,
+                &snapshot_id,
+                crate::snapshot_scope::tracked_entries(),
+            );
             if let Err(error) = restore {
                 return MigrationOutcome::Failed {
                     phase: "health".into(),
@@ -2853,7 +2864,9 @@ mod tests {
         );
         let build_a = target_build("moda-2.0.jar", "2.0", &fabric_jar("moda", "2.0", None));
         let dir = ctx.paths.instance_dir("det").unwrap();
-        let before = agora_core::snapshot::live_file_index(&dir).unwrap();
+        let before =
+            agora_core::snapshot::live_file_index(&dir, crate::snapshot_scope::tracked_entries())
+                .unwrap();
         let first = plan_migration(
             &ctx,
             "det",
@@ -2876,7 +2889,8 @@ mod tests {
         assert_eq!(first.swaps.len(), 1);
         assert_eq!(first.swaps[0].new_filename, "moda-2.0.jar");
         assert_eq!(
-            agora_core::snapshot::live_file_index(&dir).unwrap(),
+            agora_core::snapshot::live_file_index(&dir, crate::snapshot_scope::tracked_entries())
+                .unwrap(),
             before,
             "planning must not touch the instance"
         );

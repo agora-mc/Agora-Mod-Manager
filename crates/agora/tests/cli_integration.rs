@@ -2481,8 +2481,12 @@ fn prepare_launch_state(data_dir: &Path, exit_code: i32, java_major: i64) -> Str
     // Pre-create a snapshot and write LKG state so the child process's
     // `create_or_reuse_snapshot` finds a matching index and skips the call.
     let instance_dir = data_dir.join("instances").join(instance_id);
-    let snapshot = agora_core::snapshot::create_snapshot(&instance_dir, Some("Initial"))
-        .expect("create initial snapshot");
+    let snapshot = agora_core::snapshot::create_snapshot(
+        &instance_dir,
+        Some("Initial"),
+        agora_game_minecraft::snapshot_scope::tracked_entries(),
+    )
+    .expect("create initial snapshot");
     let lkg = serde_json::json!({
         "currentLkgSnapshotId": snapshot.id,
         "lastPromotedAt": null,

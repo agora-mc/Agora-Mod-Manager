@@ -242,7 +242,7 @@ impl InstanceService {
         let snapshot = agora_core::snapshot::create_snapshot_scoped_with_origin(
             &instance_dir,
             Some(&label),
-            agora_core::snapshot::prelaunch_tracked_entries(),
+            crate::snapshot_scope::prelaunch_tracked_entries(),
             agora_core::snapshot::SnapshotOrigin::Lock,
         )
         .map_err(|error| LauncherError::Generic {
@@ -425,9 +425,13 @@ impl InstanceService {
             None
         } else {
             Some(
-                agora_core::snapshot::create_snapshot(&instance_dir, Some("pre-template"))
-                    .map_err(template_error)?
-                    .id,
+                agora_core::snapshot::create_snapshot(
+                    &instance_dir,
+                    Some("pre-template"),
+                    crate::snapshot_scope::tracked_entries(),
+                )
+                .map_err(template_error)?
+                .id,
             )
         };
 
@@ -439,7 +443,11 @@ impl InstanceService {
             Ok(applied) => applied,
             Err(message) => {
                 if let Some(snapshot_id) = undo_snapshot_id.as_deref() {
-                    let _ = agora_core::snapshot::restore_snapshot(&instance_dir, snapshot_id);
+                    let _ = agora_core::snapshot::restore_snapshot(
+                        &instance_dir,
+                        snapshot_id,
+                        crate::snapshot_scope::tracked_entries(),
+                    );
                 }
                 return Err(template_error(message));
             }
@@ -449,7 +457,11 @@ impl InstanceService {
             Ok(applied) => applied,
             Err(error) => {
                 if let Some(snapshot_id) = undo_snapshot_id.as_deref() {
-                    let _ = agora_core::snapshot::restore_snapshot(&instance_dir, snapshot_id);
+                    let _ = agora_core::snapshot::restore_snapshot(
+                        &instance_dir,
+                        snapshot_id,
+                        crate::snapshot_scope::tracked_entries(),
+                    );
                 }
                 return Err(error);
             }

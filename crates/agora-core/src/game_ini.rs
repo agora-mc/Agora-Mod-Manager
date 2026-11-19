@@ -675,6 +675,12 @@ pub fn set_value_locked(
     check_value(value)?;
     let store = store_of(ctx, guard.instance_id())?;
     let _user_files = user_files_lock_for_edit(ctx, definition, &store)?;
+    crate::game_snapshot::snapshot_before_change_locked(
+        ctx,
+        guard.instance_id(),
+        "before-ini-edit",
+    )
+    .map_err(IniError::Invalid)?;
     edit_locked_with_session_check(
         ctx,
         guard.instance_id(),
@@ -728,6 +734,12 @@ pub fn unset_value_locked(
     check_names(section, key)?;
     let store = store_of(ctx, guard.instance_id())?;
     let _user_files = user_files_lock_for_edit(ctx, definition, &store)?;
+    crate::game_snapshot::snapshot_before_change_locked(
+        ctx,
+        guard.instance_id(),
+        "before-ini-edit",
+    )
+    .map_err(IniError::Invalid)?;
     edit_locked_with_session_check(
         ctx,
         guard.instance_id(),

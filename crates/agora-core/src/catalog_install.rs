@@ -43,7 +43,7 @@ use crate::game_deploy::{self, PlacementDecision};
 use crate::game_frameworks::{self, FrameworkStatus};
 use crate::game_instance::{self, GameInstanceManifest};
 use crate::github_release::{self, GitHubAuth, GitHubRelease};
-use crate::http_client::HttpClients;
+use crate::http_client::{ClientCategory, HttpClients};
 use crate::registry::{
     self, DownloadSource, FrameworkRequirement, GameCatalogItem, GameCompatibility, RegistryService,
 };
@@ -1717,6 +1717,124 @@ async fn fetch_bytes(
             "This entry is downloaded by the player, so Agora has no file to fetch.",
         )),
     }
+}
+
+/// Fetch the exact archive a recorded [`ContentSource::Catalog`] names, through the same
+/// transport and network gate an install uses, and verify it against the recorded SHA-256.
+///
+/// This is for re-fetching content a backup named but no longer holds. It never falls back to a
+/// different release or asset: the bytes must match the recorded hash or the caller is told.
+pub async fn fetch_recorded_archive(
+    transport: &dyn CatalogTransport,
+    item: &GameCatalogItem,
+    recorded: &ContentSource,
+) -> LauncherResult<Vec<u8>> {
+    let ContentSource::Catalog {
+        release,
+        asset,
+        sha256,
+        ..
+    } = recorded
+    else {
+        return Err(generic(
+            "ERR_CATALOG_NOT_A_CATALOG_SOURCE",
+            "the recorded source is not a catalog download",
+        ));
+    };
+    if sha256.trim().is_empty() {
+        return Err(generic(
+            "ERR_CATALOG_NO_HASH",
+            format!(
+                "the backup records no SHA-256 for '{}', so a download cannot be checked",
+                asset
+            ),
+        ));
+    }
+
+    let verify = |bytes: &[u8]| -> LauncherResult<()> {
+        let actual = crate::download::sha256_hex(bytes);
+        if actual.eq_ignore_ascii_case(sha256) {
+            Ok(())
+        } else {
+            Err(generic(
+                "ERR_CATALOG_HASH_MISMATCH",
+                format!(
+                    "the file downloaded for '{asset}' does not match the backup's SHA-256 (expected {sha256}, got {actual})"
+                ),
+            ))
+        }
+    };
+
+    if let Some(source) = item
+        .download_sources
+        .iter()
+        .find(|source| source.strategy == "github_release")
+    {
+        crate::network_gate::authorize(ClientCategory::GitHub)?;
+        let mut page = 1;
+        loop {
+            let (releases, total_pages) = transport.releases_page(&source.identifier, page).await?;
+            for release_info in releases {
+                if release
+                    .as_deref()
+                    .is_some_and(|tag| tag != release_info.tag_name)
+                {
+                    continue;
+                }
+                let Some(found) = release_info
+                    .assets
+                    .iter()
+                    .find(|candidate| candidate.name.eq_ignore_ascii_case(asset))
+                else {
+                    continue;
+                };
+                let bytes = transport.fetch(&found.browser_download_url, None).await?;
+                verify(&bytes)?;
+                return Ok(bytes);
+            }
+            if page >= total_pages {
+                break;
+            }
+            page += 1;
+        }
+        return Err(generic(
+            "ERR_CATALOG_NO_ASSET",
+            format!(
+                "no release of {} has '{asset}'{}",
+                source.identifier,
+                release
+                    .as_deref()
+                    .map(|tag| format!(" in release {tag}"))
+                    .unwrap_or_default()
+            ),
+        ));
+    }
+
+    if let Some(source) = item
+        .download_sources
+        .iter()
+        .find(|source| source.strategy == "direct_hash")
+    {
+        let url = reqwest::Url::parse(&source.identifier).map_err(|_| {
+            generic(
+                "ERR_CATALOG_BAD_URL",
+                format!("'{}' has a download URL that is not valid.", item.id),
+            )
+        })?;
+        let host = url.host_str().unwrap_or_default().to_string();
+        crate::network_gate::authorize(ClientCategory::PinnedArtifact)?;
+        let bytes = transport.fetch(&source.identifier, Some(&host)).await?;
+        verify(&bytes)?;
+        return Ok(bytes);
+    }
+
+    Err(generic(
+        "ERR_CATALOG_NO_SOURCE",
+        format!(
+            "'{}' has no automatic download source a backup can fetch from",
+            item.id
+        ),
+    ))
 }
 
 /// Check the bytes against what their source published, the curator's pin, and an earlier install.

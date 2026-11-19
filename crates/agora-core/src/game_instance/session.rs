@@ -43,8 +43,10 @@ pub struct StopOutcome {
 /// executable), which is not the launched program when a framework loader starts the game and
 /// exits. `session_id` is [`LaunchedInstance::session_id`](super::LaunchedInstance). Recording is
 /// best effort: the report comes back whether or not it could be written.
+#[allow(clippy::too_many_arguments)]
 pub fn watch_session(
     ctx: &Ctx,
+    instance_id: &str,
     definition: &GameDefinition,
     session_id: Option<&str>,
     running_from: &std::path::Path,
@@ -58,7 +60,20 @@ pub fn watch_session(
         crate::game_launch::wait_for_exit_watching(running_from, launched, &images, poll, grace);
     if let Some(session_id) = session_id {
         let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-        crate::session_ledger::record_end(ctx, session_id, definition, &report, duration_ms);
+        let verdict =
+            crate::session_ledger::record_end(ctx, session_id, definition, &report, duration_ms);
+        // Promote this launch's recovery point only when the session is a success. The verdict is
+        // the ledger's; without one Agora cannot tell how the game ended, and does not promote.
+        let runtime_ms = report
+            .game_runtime_ms
+            .unwrap_or_else(|| u64::try_from(duration_ms).unwrap_or(0));
+        let _ = crate::game_snapshot::finish_launch_session(
+            ctx,
+            instance_id,
+            session_id,
+            verdict,
+            runtime_ms,
+        );
     }
     report
 }

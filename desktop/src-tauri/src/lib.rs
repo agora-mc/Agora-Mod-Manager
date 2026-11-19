@@ -61,8 +61,12 @@ pub fn core_context<R: tauri::Runtime>(
         }
     })?;
     let games = build_game_registry();
-    agora_core::ctx::CoreContext::initialize(paths, games)
-        .map(|(ctx, _)| plugins::with_events(app, ctx))
+    agora_core::ctx::CoreContext::initialize(paths, games).map(|(ctx, _)| {
+        let ctx = ctx.with_minecraft_snapshot_entries(
+            agora_game_minecraft::snapshot_scope::tracked_entries(),
+        );
+        plugins::with_events(app, ctx)
+    })
 }
 
 /// Pull the instance id out of a `--launch <id>` / `--launch=<id>` argv.
@@ -398,7 +402,9 @@ pub fn run() {
             commands::step_back_bisect,
             commands::cancel_bisect,
             commands::export_backup,
+            commands::game_backup_bytes,
             commands::import_backup,
+            commands::preview_backup_import,
             commands::apply_backup_retention,
             commands::get_mod_groups,
             commands::set_mod_group,
@@ -740,6 +746,9 @@ pub fn run() {
                             eprintln!("[core] {w}");
                         }
                         show_startup_notices(&report);
+                        let ctx = ctx.with_minecraft_snapshot_entries(
+                            agora_game_minecraft::snapshot_scope::tracked_entries(),
+                        );
                         let maintenance_ctx = ctx.clone();
                         watch_external_changes(
                             app.handle().clone(),

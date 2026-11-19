@@ -118,7 +118,9 @@ pub fn registry() -> Arc<GameRegistry> {
 /// A test context with Minecraft registered: `CoreContext::for_testing` plus
 /// [`registry`].
 pub fn testing_context(root: PathBuf) -> Ctx {
-    agora_core::ctx::CoreContext::for_testing(root).with_games(registry())
+    agora_core::ctx::CoreContext::for_testing(root)
+        .with_games(registry())
+        .with_minecraft_snapshot_entries(crate::snapshot_scope::tracked_entries())
 }
 
 /// The network category of one of Minecraft's hosts (Mojang's, or a pinned
