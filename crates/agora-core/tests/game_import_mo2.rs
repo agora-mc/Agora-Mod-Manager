@@ -1580,3 +1580,83 @@ fn two_profiles_import_merged_with_a_loadout_for_each() {
     let alt = enabled("Alt");
     assert!(alt["Alpha"] && alt["Beta"] && !alt["Gamma"], "{alt:?}");
 }
+
+fn planned_file_bytes(f: &Fixture, instance: &str, game_path: &str) -> Vec<u8> {
+    let plan = game_deploy::plan(&f.ctx, instance, &f.def, DeployMode::Links).unwrap();
+    let entry = plan
+        .files
+        .iter()
+        .find(|p| p.path.as_str() == game_path)
+        .unwrap_or_else(|| panic!("{game_path} is not in the deploy plan"));
+    match &entry.source {
+        FileSource::Content { sha256, .. } => {
+            content_store::read_object_bytes(&f.ctx, sha256).unwrap()
+        }
+        FileSource::Base { path, .. }
+        | FileSource::Generated { path, .. }
+        | FileSource::Writable { path }
+        | FileSource::Override { path, .. } => std::fs::read(path).unwrap(),
+    }
+}
+
+#[test]
+fn f1h_merged_profiles_preserve_opposite_mod_priorities() {
+    use agora_core::game_import::profiles::Grouping;
+
+    let f = fixture();
+    // "Reverse" enables the exact same two mods as "Test Profile" (Alpha and Gamma),
+    // but puts Gamma ABOVE Alpha so Gamma's shared.txt must win.
+    let reverse = f.setup.join("profiles/Reverse");
+    write(
+        &reverse.join("modlist.txt"),
+        b"# Mod Organizer\r\n+Gamma\r\n-Beta\r\n+Alpha\r\n",
+    );
+    write(
+        &reverse.join("plugins.txt"),
+        b"# Mod Organizer\r\n*Alpha.esp\r\n*Gamma.esp\r\n",
+    );
+    write(
+        &reverse.join("loadorder.txt"),
+        b"# Mod Organizer\r\nSkyrim.esm\r\nUpdate.esm\r\nAlpha.esp\r\nGamma.esp\r\n",
+    );
+
+    let profiles = vec!["Test Profile".to_string(), "Reverse".to_string()];
+    let report = agora_core::game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("Opposite Order"), false),
+        &profiles,
+        Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("merged import runs");
+    let instance = &report.instances[0];
+
+    assert_eq!(
+        planned_file_bytes(&f, instance, "Data/shared.txt"),
+        b"from alpha",
+        "Test Profile puts Alpha above Gamma"
+    );
+
+    agora_core::game_loadout::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "Reverse")
+        .expect("switching to Reverse succeeds");
+    assert_eq!(
+        planned_file_bytes(&f, instance, "Data/shared.txt"),
+        b"from gamma",
+        "Reverse puts Gamma above Alpha"
+    );
+
+    agora_core::game_loadout::apply_game_profile_with_undo(
+        &f.ctx,
+        instance,
+        &f.def,
+        "Test Profile",
+    )
+    .expect("switching back to Test Profile succeeds");
+    assert_eq!(
+        planned_file_bytes(&f, instance, "Data/shared.txt"),
+        b"from alpha",
+        "switching back restores Alpha winning over Gamma"
+    );
+}

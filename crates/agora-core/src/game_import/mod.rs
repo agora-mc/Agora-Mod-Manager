@@ -1941,6 +1941,7 @@ fn mo2_state_for_merge(
     definition: &GameDefinition,
     plan: &Mo2Plan,
     layer_mod: &HashMap<String, Option<String>>,
+    folder_to_layer: &HashMap<String, String>,
 ) -> Result<crate::game_loadout::GameLoadout, ImportError> {
     let mut state =
         crate::game_loadout::capture(ctx, instance_id, definition).map_err(ImportError::Other)?;
@@ -1956,6 +1957,39 @@ fn mo2_state_for_merge(
             .and_then(|folder| folder.as_deref())
             .is_some_and(|folder| enabled.contains(folder));
     }
+    // Order content layers lowest-priority first (matching LayerStack): `plan.mods` is highest
+    // priority first. Enabled entries take precedence over disabled aliases of the same layer.
+    let mut layer_rank: HashMap<String, usize> = HashMap::new();
+    for (idx, m) in plan.mods.iter().enumerate() {
+        if m.enabled {
+            if let Some(layer_id) = folder_to_layer.get(&fold_path_case(&m.folder)) {
+                layer_rank.entry(layer_id.clone()).or_insert(idx);
+            }
+        }
+    }
+    for (idx, m) in plan.mods.iter().enumerate() {
+        if !m.enabled {
+            if let Some(layer_id) = folder_to_layer.get(&fold_path_case(&m.folder)) {
+                layer_rank.entry(layer_id.clone()).or_insert(idx);
+            }
+        }
+    }
+    let mut ranked: Vec<(usize, String)> = layer_rank
+        .into_iter()
+        .map(|(layer_id, idx)| (idx, layer_id))
+        .collect();
+    // Higher modlist index = lower priority = earlier in LayerStack.
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut layer_order: Vec<String> = ranked.into_iter().map(|(_, id)| id).collect();
+    let placed: HashSet<&str> = layer_order.iter().map(String::as_str).collect();
+    let mut rest: Vec<String> = state
+        .content
+        .iter()
+        .filter(|item| !placed.contains(item.item.as_str()))
+        .map(|item| item.item.clone())
+        .collect();
+    layer_order.append(&mut rest);
+    state.layer_order = layer_order;
     if plan.plugins.kept {
         if let Some(rule) = definition.load_orders.first() {
             let lines: Vec<(String, bool)> = plan
@@ -2071,16 +2105,32 @@ pub fn mo2_run_profiles(
                 .collect();
             let manifest = game_instance::get_manifest(ctx, &instance_id)?;
             let mut layer_mod: HashMap<String, Option<String>> = HashMap::new();
+            let mut item_to_layer: HashMap<String, String> = HashMap::new();
             for layer in manifest.layers.layers() {
                 if let agora_game_api::LayerSource::Content { content } = &layer.source {
                     layer_mod.insert(layer.id.as_str().to_string(), reverse.get(content).cloned());
+                    item_to_layer.insert(content.clone(), layer.id.as_str().to_string());
                 }
             }
+            let folder_to_layer: HashMap<String, String> = folder_to_item
+                .iter()
+                .filter_map(|(folder, item_id)| {
+                    item_to_layer
+                        .get(item_id)
+                        .map(|layer_id| (fold_path_case(folder), layer_id.clone()))
+                })
+                .collect();
 
             let mut loadouts = Vec::new();
             for (profile, profile_plan) in profiles.iter().zip(multi.plans.iter()) {
-                let state =
-                    mo2_state_for_merge(ctx, &instance_id, &definition, profile_plan, &layer_mod)?;
+                let state = mo2_state_for_merge(
+                    ctx,
+                    &instance_id,
+                    &definition,
+                    profile_plan,
+                    &layer_mod,
+                    &folder_to_layer,
+                )?;
                 crate::game_loadout::save_game_profile(ctx, &instance_id, profile, state)
                     .map_err(ImportError::Other)?;
                 loadouts.push(profile.clone());
