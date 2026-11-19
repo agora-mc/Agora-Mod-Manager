@@ -1217,7 +1217,9 @@ pub fn verify_base(
     walk_base_dir(&manifest.location, Path::new(""), &mut actual_files);
     for actual_rel in actual_files {
         if !manifest_file_set.contains(actual_rel.as_str()) {
-            if is_declared_write(&actual_rel) {
+            if actual_rel == BASE_MARKER_FILE {
+                // Agora's own "I built this folder" marker, not a game file.
+            } else if is_declared_write(&actual_rel) {
                 game_writes.push(actual_rel);
             } else if is_excluded(&actual_rel) {
                 // Stray excluded files appearing in the base later are ignored, not Unexpected.
@@ -1435,7 +1437,10 @@ pub fn sweep_stale_staging(paths: &AppPaths) -> Result<usize, BaseError> {
     let live = live_process_ids();
     let mut removed = 0usize;
     for root in known_base_roots(paths)? {
-        removed += sweep_staging_in(&root, &["partial-", "stale-"], &live)?;
+        removed += sweep_staging_in(&root, ".partial-", false, &live)?;
+        // A `.stale-` folder is one a build moved aside. It is removed only when its own marker
+        // says Agora built it: an unmarked one was kept on purpose, for the person to inspect.
+        removed += sweep_staging_in(&root, ".stale-", true, &live)?;
         let deployments = root.join("deployments");
         let read = match std::fs::read_dir(&deployments) {
             Ok(read) => read,
@@ -1452,7 +1457,7 @@ pub fn sweep_stale_staging(paths: &AppPaths) -> Result<usize, BaseError> {
             if !instance_dir.is_dir() {
                 continue;
             }
-            removed += sweep_staging_in(&instance_dir, &["game.partial-"], &live)?;
+            removed += sweep_staging_in(&instance_dir, "game.partial-", false, &live)?;
         }
     }
     Ok(removed)
@@ -1460,7 +1465,8 @@ pub fn sweep_stale_staging(paths: &AppPaths) -> Result<usize, BaseError> {
 
 fn sweep_staging_in(
     folder: &Path,
-    markers: &[&str],
+    marker: &str,
+    require_base_marker: bool,
     live: &std::collections::HashSet<u32>,
 ) -> Result<usize, BaseError> {
     let read = match std::fs::read_dir(folder) {
@@ -1479,14 +1485,20 @@ fn sweep_staging_in(
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let owner = markers.iter().find_map(|marker| {
-            name.rsplit_once(marker)
-                .and_then(|(_, rest)| rest.split('-').next())
-                .and_then(|pid| pid.parse::<u32>().ok())
-        });
-        let Some(owner) = owner else {
+        // Names are `<prefix><marker><pid>-<uuid>`, as the builders write them.
+        let Some((prefix, rest)) = name.rsplit_once(marker) else {
             continue;
         };
+        let Some(owner) = rest
+            .split('-')
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if require_base_marker && !base_marker_matches(&path, prefix) {
+            continue;
+        }
         if live.contains(&owner) {
             continue;
         }
@@ -1509,7 +1521,8 @@ fn live_process_ids() -> std::collections::HashSet<u32> {
     system.processes().keys().map(|pid| pid.as_u32()).collect()
 }
 
-/// The folder to delete for `base_id`, derived from folders Agora knows rather than from the path/// a record states: `<root>/<base_id>` for the data folder's `bases` folder or a root a build
+/// The folder to delete for `base_id`, derived from folders Agora knows rather than from the path
+/// a record states: `<root>/<base_id>` for the data folder's `bases` folder or a root a build
 /// registered. The record's location only has to agree with it. A manifest is a user-writable
 /// file, so a record that names any other folder is refused and nothing is deleted. The base
 /// folder must also not overlap the install it was built from.

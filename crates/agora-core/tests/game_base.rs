@@ -461,7 +461,7 @@ fn in_place_store_patch_and_store_update_by_replacement() {
 
     // Verify initially clean
     let ver0 = verify_base(manifest, VerifyDepth::Quick, &|_| false, &|_| false);
-    assert!(ver0.problems.is_empty());
+    assert!(ver0.problems.is_empty(), "{:?}", ver0.problems);
 
     // 1. In-place store patch: append to the source's Data/A.bsa (a hardlink target)
     // Quick verify reports Data/A.bsa
@@ -2267,6 +2267,8 @@ fn stale_staging_whose_owner_is_gone_is_swept_and_a_live_ones_is_kept() {
     std::fs::create_dir_all(&root).unwrap();
     let dead = root.join("demo.partial-999999999-abc");
     let stale = root.join("demo.stale-999999999-abc");
+    // Moved aside by a build but carrying no Agora marker: kept on purpose for the person.
+    let stale_unmarked = root.join("demo.stale-999999998-abc");
     let live = root.join(format!("demo.partial-{}-abc", std::process::id()));
     let deploy_dead = root
         .join("deployments")
@@ -2276,15 +2278,27 @@ fn stale_staging_whose_owner_is_gone_is_swept_and_a_live_ones_is_kept() {
         .join("deployments")
         .join("inst")
         .join(format!("game.partial-{}-abc", std::process::id()));
-    for folder in [&dead, &stale, &live, &deploy_dead, &deploy_live] {
+    for folder in [
+        &dead,
+        &stale,
+        &stale_unmarked,
+        &live,
+        &deploy_dead,
+        &deploy_live,
+    ] {
         std::fs::create_dir_all(folder).unwrap();
         std::fs::write(folder.join("marker"), b"x").unwrap();
     }
+    std::fs::write(stale.join(".agora-base.json"), br#"{"base_id":"demo"}"#).unwrap();
 
     let removed = sweep_stale_staging(&paths).unwrap();
     assert_eq!(removed, 3);
     assert!(!dead.exists());
     assert!(!stale.exists());
+    assert!(
+        stale_unmarked.exists(),
+        "an unmarked stale folder is kept for the person to inspect"
+    );
     assert!(live.exists());
     assert!(!deploy_dead.exists());
     assert!(deploy_live.exists());
