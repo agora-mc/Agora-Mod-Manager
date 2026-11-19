@@ -264,9 +264,88 @@ pub struct SaveLocationRule {
     pub shared_dir: GamePath,
     /// The folder `own_value` is relative to.
     pub relative_to: GamePath,
+    /// How Agora recognises a save inside either folder. Absent means it cannot tell, and the save
+    /// view says "could not tell" instead of "no saves".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recognition: Option<SaveRecognition>,
     /// The stores this rule applies to; empty means every store.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stores: Vec<StoreId>,
+}
+
+/// How a save folder's contents are counted (MASTER_SPEC §26.5). A game that declares neither
+/// shape leaves its saves unrecognised: Agora reports that it could not tell, never "no saves".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SaveRecognition {
+    /// Each file whose name matches one of the globs is one save.
+    Files {
+        /// Globs matched against a file name, case-insensitively, such as `*.ess`.
+        patterns: Vec<String>,
+    },
+    /// Each folder directly inside the save folder is one save.
+    Folders,
+}
+
+/// One of a game's save folders, and how its saves are recognised and owned when the game has no
+/// INI setting that moves them (MASTER_SPEC §26.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SaveFolderRule {
+    /// The save folder itself.
+    pub path: GamePath,
+    /// How Agora recognises a save inside it. Absent means it cannot tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recognition: Option<SaveRecognition>,
+    /// The value that gives an instance its own saves, relative to `relative_to`; `{instance}` is
+    /// replaced by the instance's save folder name. Absent means the game cannot own saves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_value: Option<String>,
+    /// The folder `own_value` is relative to; the save folder itself when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_to: Option<GamePath>,
+}
+
+/// A game's declared save folder: a bare path (recognised only as "could not tell") or a rule
+/// that also declares recognition and own-save layout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SaveFolderSpec {
+    Path(GamePath),
+    Rule(SaveFolderRule),
+}
+
+impl From<GamePath> for SaveFolderSpec {
+    fn from(path: GamePath) -> Self {
+        SaveFolderSpec::Path(path)
+    }
+}
+
+impl SaveFolderSpec {
+    pub fn path(&self) -> &GamePath {
+        match self {
+            SaveFolderSpec::Path(path) => path,
+            SaveFolderSpec::Rule(rule) => &rule.path,
+        }
+    }
+
+    pub fn recognition(&self) -> Option<&SaveRecognition> {
+        match self {
+            SaveFolderSpec::Path(_) => None,
+            SaveFolderSpec::Rule(rule) => rule.recognition.as_ref(),
+        }
+    }
+
+    /// The own-save layout declared by this folder, if any.
+    pub fn own_layout(&self) -> Option<(&str, &GamePath)> {
+        match self {
+            SaveFolderSpec::Path(_) => None,
+            SaveFolderSpec::Rule(rule) => {
+                let value = rule.own_value.as_deref()?;
+                Some((value, rule.relative_to.as_ref().unwrap_or(&rule.path)))
+            }
+        }
+    }
 }
 
 impl SaveLocationRule {
