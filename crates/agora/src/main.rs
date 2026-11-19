@@ -1704,6 +1704,11 @@ enum PluginCmd {
             help = "Accept capabilities the installed version was not granted"
         )]
         yes: bool,
+        #[arg(
+            long,
+            help = "Allow the scripts in the new version to run (a separate choice from --yes)"
+        )]
+        allow_scripts: bool,
     },
     /// Put a plugin's stored data back to the copy kept before its last
     /// data-shape change.
@@ -3347,6 +3352,17 @@ fn accept_plugin_code(
     ))
 }
 
+/// The consent an update is given. `--yes` confirms the release's capabilities;
+/// running its scripts is a separate, explicit decision, so a non-interactive
+/// yes can never allow code the person using this computer was not shown.
+fn plugin_update_consent(yes: bool, allow_scripts: bool) -> agora_core::plugins::Consent {
+    agora_core::plugins::Consent {
+        capabilities: yes,
+        scripts: allow_scripts,
+        previewed_digest: None,
+    }
+}
+
 fn print_plugin_preview(
     preview: &InstallPreview,
     json: bool,
@@ -3809,15 +3825,27 @@ async fn run_plugin_command(
                 }
             }
         }
-        PluginCmd::Update { id, yes } => {
+        PluginCmd::Update {
+            id,
+            yes,
+            allow_scripts,
+        } => {
             let plugin_id = parse_plugin_id(&id)?;
-            let outcome = service.apply_update(&plugin_id, yes).await?;
+            let outcome = service
+                .apply_update(&plugin_id, plugin_update_consent(yes, allow_scripts))
+                .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
             } else {
                 match outcome {
                     agora_core::plugins::UpdateOutcome::Installed { plugin } => {
                         println!("Updated plugin {} to v{}.", plugin.id, plugin.version);
+                        if plugin.runs_code && !plugin.scripts_allowed {
+                            println!(
+                                "Its code was not allowed to run. Allow it with `agora plugin scripts {} allow`, or re-run this update with --allow-scripts once the person using this computer has agreed.",
+                                plugin.id
+                            );
+                        }
                     }
                     // Deliberately not applied and deliberately not an error:
                     // the release is fine, it just wants something the user
@@ -3834,7 +3862,7 @@ async fn run_plugin_command(
                             println!("  - may contact {host}");
                         }
                         println!();
-                        println!("Re-run with --yes to accept, once the person using this computer has agreed.");
+                        println!("Re-run with --yes to accept capabilities, and --allow-scripts to allow its code, once the person using this computer has agreed.");
                     }
                 }
             }
@@ -15798,6 +15826,64 @@ mod tests {
             missing.is_empty(),
             "docs/CLI.md does not document these CLI leaf commands: {missing:?}"
         );
+    }
+
+    #[test]
+    fn plugin_update_script_consent_has_its_own_flag() {
+        use clap::CommandFactory;
+
+        let root = Cli::command();
+        let plugin = root.find_subcommand("plugin").expect("plugin command");
+        let update = plugin
+            .find_subcommand("update")
+            .expect("plugin update command");
+        let flags: Vec<&str> = update
+            .get_arguments()
+            .filter_map(|arg| arg.get_long())
+            .collect();
+        assert!(
+            flags.contains(&"allow-scripts"),
+            "plugin update must have a separate script-consent flag, found {flags:?}"
+        );
+
+        let cli = Cli::try_parse_from(["agora", "plugin", "update", "acme.community", "--yes"])
+            .expect("--yes still confirms the update");
+        let Commands::Plugin { action } = cli.command else {
+            panic!("expected a plugin command");
+        };
+        let super::PluginCmd::Update {
+            yes, allow_scripts, ..
+        } = action
+        else {
+            panic!("expected a plugin update");
+        };
+        assert!(yes);
+        assert!(!allow_scripts);
+        let consent = super::plugin_update_consent(yes, allow_scripts);
+        assert!(consent.capabilities, "--yes grants capabilities");
+        assert!(
+            !consent.scripts,
+            "--yes alone must not grant script consent"
+        );
+
+        let cli = Cli::try_parse_from([
+            "agora",
+            "plugin",
+            "update",
+            "acme.community",
+            "--allow-scripts",
+        ])
+        .expect("--allow-scripts should be accepted on its own");
+        let Commands::Plugin { action } = cli.command else {
+            panic!("expected a plugin command");
+        };
+        let super::PluginCmd::Update {
+            allow_scripts: true,
+            ..
+        } = action
+        else {
+            panic!("expected --allow-scripts to be parsed");
+        };
     }
 
     #[test]
