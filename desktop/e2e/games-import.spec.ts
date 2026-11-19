@@ -519,7 +519,7 @@ test.describe('Import dialog', () => {
         { command: 'games_import_vortex', match: { dryRun: true }, reply: vortexPlan },
         { command: 'games_import_vortex', match: { dryRun: false }, reply: vortexRun },
         {
-          command: 'games_import_vortex_profiles',
+          command: 'games_import_vortex_multi',
           match: { dryRun: true, mode: 'separate' },
           reply: {
             kind: 'plan', manager: 'vortex', grouping: 'separate', profiles: ['Main', 'Alt'],
@@ -527,7 +527,7 @@ test.describe('Import dialog', () => {
           },
         },
         {
-          command: 'games_import_vortex_profiles',
+          command: 'games_import_vortex_multi',
           match: { dryRun: false, mode: 'separate' },
           reply: {
             kind: 'run', instances: ['inst-9'], loadouts: [], warnings: [fidelityWarning],
