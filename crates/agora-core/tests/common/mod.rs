@@ -6,6 +6,10 @@
 #[allow(dead_code)]
 pub mod data_root;
 
+// The invented second game, used by the second-game tests; other binaries carry it unused.
+#[allow(dead_code)]
+pub mod neon_courier;
+
 use agora_game_api::{
     DeploymentStrategy, GameDefinition, GameId, GamePath, RelPath, SaveLocationRule, StoreId,
     StoreIdentifier, UserDataLocation, UserFileMapping, UserFileStrategy,
