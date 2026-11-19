@@ -1896,3 +1896,62 @@ fn f1c_overwrite_layer_stays_enabled_and_wins_in_every_merged_loadout() {
         "MO2 overwrite must outrank mods under Alt"
     );
 }
+
+#[test]
+fn f1d_byte_identical_alias_folders_stay_enabled_in_each_profiles_loadout() {
+    use agora_core::game_import::profiles::Grouping;
+
+    let f = fixture();
+    write(
+        &f.setup.join("mods/DeltaAlias/AliasShared.esp"),
+        b"IDENTICAL BYTES",
+    );
+    write(
+        &f.setup.join("mods/EchoAlias/AliasShared.esp"),
+        b"IDENTICAL BYTES",
+    );
+    // Profile 1 enables DeltaAlias (and disables EchoAlias).
+    write(
+        &f.setup.join("profiles/Test Profile/modlist.txt"),
+        b"# Mod Organizer\r\n+Alpha\r\n+DeltaAlias\r\n-EchoAlias\r\n-Beta\r\n+Gamma\r\n",
+    );
+    // Profile 2 enables EchoAlias (and disables DeltaAlias).
+    let alt = f.setup.join("profiles/Alt");
+    write(
+        &alt.join("modlist.txt"),
+        b"# Mod Organizer\r\n+Alpha\r\n-DeltaAlias\r\n+EchoAlias\r\n+Beta\r\n-Gamma\r\n",
+    );
+    write(
+        &alt.join("plugins.txt"),
+        b"# Mod Organizer\r\n*Alpha.esp\r\n*Beta.esp\r\n*AliasShared.esp\r\n",
+    );
+
+    let profiles = vec!["Test Profile".to_string(), "Alt".to_string()];
+    let report = agora_core::game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("Alias Merge"), false),
+        &profiles,
+        Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("merged import runs");
+    let instance = &report.instances[0];
+
+    // Under Test Profile (DeltaAlias enabled): AliasShared.esp must be deployed.
+    assert_eq!(
+        planned_file_bytes(&f, instance, "Data/AliasShared.esp"),
+        b"IDENTICAL BYTES",
+        "DeltaAlias must keep the shared content item enabled under Test Profile"
+    );
+
+    // Under Alt (EchoAlias enabled): AliasShared.esp must STILL be deployed.
+    agora_core::game_loadout::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "Alt")
+        .expect("apply Alt");
+    assert_eq!(
+        planned_file_bytes(&f, instance, "Data/AliasShared.esp"),
+        b"IDENTICAL BYTES",
+        "EchoAlias must keep the shared content item enabled under Alt"
+    );
+}

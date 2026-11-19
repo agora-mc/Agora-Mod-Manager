@@ -1971,18 +1971,18 @@ fn mo2_state_for_merge(
     definition: &GameDefinition,
     plan: &Mo2Plan,
     profile_dir: &Path,
-    layer_mod: &HashMap<String, Option<String>>,
+    layer_mods: &HashMap<String, Vec<String>>,
     folder_to_layer: &HashMap<String, String>,
     overwrite_layer_id: Option<&str>,
 ) -> Result<crate::game_loadout::GameLoadout, ImportError> {
     let manifest = game_instance::get_manifest(ctx, instance_id)?;
     let store = game_ini::store_of(ctx, instance_id)?;
 
-    let enabled: std::collections::BTreeSet<&str> = plan
+    let enabled: HashSet<String> = plan
         .mods
         .iter()
         .filter(|m| m.enabled)
-        .map(|m| m.folder.as_str())
+        .map(|m| fold_path_case(&m.folder))
         .collect();
     let mut content = Vec::new();
     for layer in manifest.layers.layers() {
@@ -1994,10 +1994,9 @@ fn mo2_state_for_merge(
             let id = layer.id.as_str().to_string();
             let is_overwrite = overwrite_layer_id == Some(id.as_str());
             let is_enabled = is_overwrite
-                || layer_mod
+                || layer_mods
                     .get(id.as_str())
-                    .and_then(|folder| folder.as_deref())
-                    .is_some_and(|folder| enabled.contains(folder));
+                    .is_some_and(|folders| folders.iter().any(|folder| enabled.contains(folder)));
             content.push(crate::game_loadout::GameLoadoutContent {
                 item: id,
                 enabled: is_enabled,
@@ -2206,33 +2205,40 @@ pub fn mo2_run_profiles(
             let mut folder_to_item: HashMap<String, String> = HashMap::new();
             for profile_plan in &multi.plans {
                 for item in profile_plan.mods.iter().filter(|m| m.enabled) {
-                    if folder_to_item.contains_key(&item.folder) {
+                    let key = fold_path_case(&item.folder);
+                    if folder_to_item.contains_key(&key) {
                         continue;
                     }
                     let item_id =
                         add_mo2_mod_to_merged(ctx, &instance_id, &definition, profile_plan, item)?;
-                    folder_to_item.insert(item.folder.clone(), item_id);
+                    folder_to_item.insert(key, item_id);
                 }
             }
-            let reverse: HashMap<String, String> = folder_to_item
-                .iter()
-                .map(|(folder, item_id)| (item_id.clone(), folder.clone()))
-                .collect();
+            let mut item_folders: HashMap<String, Vec<String>> = HashMap::new();
+            for (folder_key, item_id) in &folder_to_item {
+                item_folders
+                    .entry(item_id.clone())
+                    .or_default()
+                    .push(folder_key.clone());
+            }
             let manifest = game_instance::get_manifest(ctx, &instance_id)?;
-            let mut layer_mod: HashMap<String, Option<String>> = HashMap::new();
+            let mut layer_mods: HashMap<String, Vec<String>> = HashMap::new();
             let mut item_to_layer: HashMap<String, String> = HashMap::new();
             for layer in manifest.layers.layers() {
                 if let agora_game_api::LayerSource::Content { content } = &layer.source {
-                    layer_mod.insert(layer.id.as_str().to_string(), reverse.get(content).cloned());
+                    layer_mods.insert(
+                        layer.id.as_str().to_string(),
+                        item_folders.get(content).cloned().unwrap_or_default(),
+                    );
                     item_to_layer.insert(content.clone(), layer.id.as_str().to_string());
                 }
             }
             let folder_to_layer: HashMap<String, String> = folder_to_item
                 .iter()
-                .filter_map(|(folder, item_id)| {
+                .filter_map(|(folder_key, item_id)| {
                     item_to_layer
                         .get(item_id)
-                        .map(|layer_id| (fold_path_case(folder), layer_id.clone()))
+                        .map(|layer_id| (folder_key.clone(), layer_id.clone()))
                 })
                 .collect();
 
@@ -2257,7 +2263,7 @@ pub fn mo2_run_profiles(
                     &definition,
                     profile_plan,
                     &profile_dir,
-                    &layer_mod,
+                    &layer_mods,
                     &folder_to_layer,
                     overwrite_layer_id.as_deref(),
                 )?;
