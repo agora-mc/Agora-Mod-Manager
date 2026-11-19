@@ -24,7 +24,7 @@ use core_api::ctx::Ctx;
 use core_api::error::{LauncherError, LauncherResult};
 use core_api::helpers::read_manifest;
 use core_api::http_client::{self, ClientCategory, HttpClients};
-use core_api::network::NetworkPolicy;
+use core_api::network::{NetworkCategory, NetworkPolicy};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -69,13 +69,29 @@ pub fn export_server_environment(
     loader: &str,
     mc_version: &str,
 ) -> LauncherResult<ExportResult> {
-    export_local(
+    check_export_destination(instance_dir, dest_dir)?;
+    let staging = staging_dir_for(dest_dir)?;
+    std::fs::create_dir_all(&staging).map_err(|e| LauncherError::Generic {
+        code: "ERR_EXPORT_MKDIR".into(),
+        message: format!("Failed to create staging dir: {e}"),
+    })?;
+    let result = export_local(
         instance_dir,
-        dest_dir,
+        &staging,
         loader,
         mc_version,
         &LocalExportOptions::default(),
-    )
+    );
+    match result {
+        Ok(value) => {
+            commit_staging(&staging, dest_dir)?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            Err(error)
+        }
+    }
 }
 
 struct LocalExportOptions {
@@ -218,12 +234,47 @@ pub async fn export_ready_server(
             message: format!("Instance '{instance_id}' not found."),
         });
     }
+    check_export_destination(&instance_dir, dest_dir)?;
+    let staging = staging_dir_for(dest_dir)?;
+    std::fs::create_dir_all(&staging).map_err(|e| LauncherError::Generic {
+        code: "ERR_EXPORT_MKDIR".into(),
+        message: format!("Failed to create staging dir: {e}"),
+    })?;
+    let result =
+        export_ready_server_impl(ctx, instance_id, &staging, world, allow_unverified_loader).await;
+    match result {
+        Ok(value) => {
+            commit_staging(&staging, dest_dir)?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            Err(error)
+        }
+    }
+}
+
+async fn export_ready_server_impl(
+    ctx: &Ctx,
+    instance_id: &str,
+    dest_dir: &Path,
+    world: Option<&str>,
+    allow_unverified_loader: bool,
+) -> LauncherResult<ExportResult> {
+    let id = core_api::paths::sanitize_id(instance_id);
+    let instance_dir = ctx.paths.instance_dir(&id)?;
+    if !instance_dir.is_dir() {
+        return Err(LauncherError::Generic {
+            code: "ERR_INSTANCE_NOT_FOUND".into(),
+            message: format!("Instance '{instance_id}' not found."),
+        });
+    }
     let manifest = read_manifest(&ctx.paths.instance_manifest(&id)?)?;
 
     let mut notes = Vec::new();
     let (heap_mb, gc_profile, loader_version) = instance_launch_settings(ctx, &id, &manifest);
 
-    let mut policy = NetworkPolicy::all_enabled();
+    let mut policy = NetworkPolicy::all_disabled();
     if let Ok(conn) = core_api::db::local_state_connection(&ctx.paths.local_state_db()) {
         policy = NetworkPolicy::from_db(&conn);
     }
@@ -761,11 +812,12 @@ async fn prepare_loader(
                 ),
             });
         }
-        let profile = fetch_loader_bytes(clients, &entry.source_url, &entry.file_name).await?;
+        let profile =
+            fetch_loader_bytes(clients, policy, &entry.source_url, &entry.file_name).await?;
         verify_loader_artifact(&loader_key, &entry, &profile)?;
 
         let (artifact_name, bytes, installer_version, hash_verified) =
-            prepare_official_installer(clients, &loader_key, allow_unverified).await?;
+            prepare_official_installer(clients, policy, &loader_key, allow_unverified).await?;
         if !hash_verified {
             notes.push(format!(
                 "No published .sha512 was found beside the {loader} installer {installer_version}; it was downloaded because unverified loader downloads were allowed."
@@ -797,7 +849,7 @@ async fn prepare_loader(
         });
     }
 
-    let bytes = fetch_loader_bytes(clients, &entry.source_url, &entry.file_name).await?;
+    let bytes = fetch_loader_bytes(clients, policy, &entry.source_url, &entry.file_name).await?;
     verify_loader_artifact(&loader_key, &entry, &bytes)?;
     let artifact_name = format!("{loader_key}-installer.jar");
     notes.push(format!(
@@ -856,6 +908,7 @@ fn quilt_installer_server_args(mc_version: &str, loader_version: &str) -> Vec<St
 /// case `allow_unverified` may override.
 async fn prepare_official_installer(
     clients: &HttpClients,
+    policy: &NetworkPolicy,
     loader: &str,
     allow_unverified: bool,
 ) -> LauncherResult<(String, Vec<u8>, String, bool)> {
@@ -870,14 +923,14 @@ async fn prepare_official_installer(
         }
     };
     let metadata_url = format!("{base}/maven-metadata.xml");
-    let metadata = fetch_loader_bytes(clients, &metadata_url, "maven-metadata.xml").await?;
+    let metadata = fetch_loader_bytes(clients, policy, &metadata_url, "maven-metadata.xml").await?;
     let installer_version = parse_maven_metadata_latest(&String::from_utf8_lossy(&metadata))?;
     let jar_name = format!("{loader}-installer-{installer_version}.jar");
     let jar_url = format!("{base}/{installer_version}/{jar_name}");
-    let bytes = fetch_loader_bytes(clients, &jar_url, &jar_name).await?;
+    let bytes = fetch_loader_bytes(clients, policy, &jar_url, &jar_name).await?;
     let hash_url = format!("{jar_url}.sha512");
     let published =
-        match fetch_loader_bytes(clients, &hash_url, &format!("{jar_name}.sha512")).await {
+        match fetch_loader_bytes(clients, policy, &hash_url, &format!("{jar_name}.sha512")).await {
             Ok(text) => Some(String::from_utf8_lossy(&text).into_owned()),
             Err(error) if is_http_not_found(&error) => None,
             Err(error) => return Err(error),
@@ -999,6 +1052,7 @@ async fn download_vanilla_server(
             code: "ERR_EXPORT_NO_SERVER_JAR".into(),
             message: format!("Minecraft {mc_version} publishes no server jar."),
         })?;
+    policy.check(NetworkCategory::MojangContent)?;
     let bytes = http_client::checked_get_bytes(
         &ctx.http_clients,
         ClientCategory::MojangContent,
@@ -1056,9 +1110,11 @@ fn pinned_entry(
 
 async fn fetch_loader_bytes(
     clients: &HttpClients,
+    policy: &NetworkPolicy,
     url: &str,
     file_name: &str,
 ) -> LauncherResult<Vec<u8>> {
+    policy.check(NetworkCategory::LoaderMetadataAndContent)?;
     loader_manifests::ensure_allowed_domain(url).inspect_err(|_| {
         eprintln!(
             "[server-export] rejected loader host file={file_name} url={}",
@@ -1293,6 +1349,81 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> LauncherResult<()> {
             })?;
         }
     }
+    Ok(())
+}
+
+fn canonicalize_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    if let Some(parent) = path.parent() {
+        if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+            return canonical_parent.join(path.file_name().unwrap_or_default());
+        }
+    }
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    }
+}
+
+fn check_export_destination(instance_dir: &Path, dest_dir: &Path) -> LauncherResult<()> {
+    let instance = canonicalize_path(instance_dir);
+    let dest = canonicalize_path(dest_dir);
+    if instance == dest || dest.starts_with(&instance) || instance.starts_with(&dest) {
+        return Err(LauncherError::Generic {
+            code: "ERR_EXPORT_DEST_OVERLAPS_INSTANCE".into(),
+            message: format!(
+                "The export destination '{}' overlaps the instance '{}'; refusing to avoid damaging the source.",
+                dest_dir.display(),
+                instance_dir.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn staging_dir_for(dest_dir: &Path) -> LauncherResult<PathBuf> {
+    let parent = dest_dir.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| LauncherError::Generic {
+        code: "ERR_EXPORT_MKDIR".into(),
+        message: format!("Failed to create destination parent: {e}"),
+    })?;
+    let base_name = dest_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("server");
+    let mut staging = parent.join(format!(".{base_name}.staging-{}", std::process::id()));
+    let mut counter = 0u32;
+    while staging.exists() {
+        counter += 1;
+        staging = parent.join(format!(
+            ".{base_name}.staging-{}-{counter}",
+            std::process::id()
+        ));
+    }
+    Ok(staging)
+}
+
+fn commit_staging(staging: &Path, dest: &Path) -> LauncherResult<()> {
+    if dest.exists() {
+        if dest.is_dir() {
+            std::fs::remove_dir_all(dest).map_err(|e| LauncherError::Generic {
+                code: "ERR_EXPORT_MKDIR".into(),
+                message: format!("Failed to clear destination: {e}"),
+            })?;
+        } else {
+            std::fs::remove_file(dest).map_err(|e| LauncherError::Generic {
+                code: "ERR_EXPORT_MKDIR".into(),
+                message: format!("Failed to clear destination: {e}"),
+            })?;
+        }
+    }
+    std::fs::rename(staging, dest).map_err(|e| LauncherError::Generic {
+        code: "ERR_EXPORT_WRITE".into(),
+        message: format!("Failed to finalize export: {e}"),
+    })?;
     Ok(())
 }
 
