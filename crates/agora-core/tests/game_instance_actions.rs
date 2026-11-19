@@ -1149,3 +1149,33 @@ fn without_a_job_a_game_whose_launcher_exited_is_refused_and_left_alone() {
     );
     let _ = agora_core::process_job::terminate(&job);
 }
+
+#[test]
+fn delete_refuses_a_running_instance_whose_session_is_known_only_to_the_ledger() {
+    use agora_core::session_ledger::{self, LaunchManifest, Owner};
+
+    let f = Fixture::new();
+    write_instance(&f.ctx, &manifest("grounded-1", "Grounded"));
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db())
+        .expect("a connection");
+    session_ledger::begin(
+        &conn,
+        "grounded-1",
+        "2026-01-01T00:00:00Z",
+        &LaunchManifest::default(),
+        Owner::current(),
+    )
+    .expect("an open session");
+
+    let error = game_instance::delete(&f.ctx, "grounded-1").expect_err("a running game");
+    assert!(
+        matches!(error, InstanceError::Running(_)),
+        "deleted while a ledger-only session was live: {error}"
+    );
+    assert!(f
+        .ctx
+        .paths
+        .instance_dir("grounded-1")
+        .expect("a dir")
+        .exists());
+}
