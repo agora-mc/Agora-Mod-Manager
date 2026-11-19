@@ -161,6 +161,12 @@ impl SnapshotService {
 
         crate::instance_runtime::check_idle(&self.ctx.paths, instance_id)?;
         let entries = self.require_minecraft_entries()?;
+        // A snapshot can carry another instance's manifest (an imported backup,
+        // a clone's source). The restore replaces state, never identity.
+        let identity =
+            crate::helpers::read_manifest(&self.ctx.paths.instance_manifest(instance_id)?)
+                .ok()
+                .map(|manifest| (manifest.instance_id, manifest.name));
 
         // Validate the target before capturing anything: an invalid request
         // should not cost the user a snapshot.
@@ -180,12 +186,46 @@ impl SnapshotService {
 
         let outcome = snapshot::restore_snapshot(&instance_dir, snapshot_id, &entries)
             .map_err(snapshot_error)?;
+        self.restore_manifest_identity(instance_id, identity.as_ref())?;
         self.sync_row_from_restored_manifest(instance_id)?;
 
         if let Err(error) = crate::lkg::run_retention(&instance_dir) {
             eprintln!("[snapshot] retention after restore failed: {error}");
         }
         Ok(outcome)
+    }
+
+    /// Keep the live instance's id and name when the restored manifest came
+    /// from another instance. Everything else in the manifest is state.
+    fn restore_manifest_identity(
+        &self,
+        instance_id: &str,
+        identity: Option<&(String, String)>,
+    ) -> LauncherResult<()> {
+        let path = self.ctx.paths.instance_manifest(instance_id)?;
+        if !path.exists() {
+            return Ok(());
+        }
+        let mut manifest = crate::helpers::read_manifest(&path)?;
+        let (wanted_id, wanted_name) = match identity {
+            Some((id, name)) => (id.as_str(), Some(name.as_str())),
+            None => (instance_id, None),
+        };
+        let mut changed = false;
+        if manifest.instance_id != wanted_id {
+            manifest.instance_id = wanted_id.to_string();
+            changed = true;
+        }
+        if let Some(name) = wanted_name {
+            if manifest.name != name {
+                manifest.name = name.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            crate::helpers::atomic_write_manifest(&path, &manifest)?;
+        }
+        Ok(())
     }
 
     /// A restore replaces `instance_manifest.json` wholesale, but the
@@ -447,6 +487,74 @@ mod tests {
         // Columns that are not manifest-derived are left alone.
         assert_eq!(restored.name, "Demo");
         assert_eq!(restored.jvm_memory_mb, 4096);
+    }
+
+    /// A snapshot can come from another instance (an imported backup). Its
+    /// state restores, but the live instance keeps its own id and name.
+    #[test]
+    fn restore_keeps_the_live_instance_identity() {
+        let (_root, service, ctx, id) = service();
+        let dir = ctx.paths.instance_dir(&id).unwrap();
+        let manifest_path = ctx.paths.instance_manifest(&id).unwrap();
+        let write_manifest = |manifest_id: &str, name: &str, version: &str| {
+            let manifest = crate::models::InstanceManifest {
+                manifest_version: crate::models::CURRENT_MANIFEST_VERSION,
+                pack_origin: None,
+                instance_id: manifest_id.to_string(),
+                name: name.to_string(),
+                created_from_pack: None,
+                minecraft_version: version.into(),
+                loader: "fabric".into(),
+                loader_version: "0.20.0".into(),
+                is_locked: false,
+                mods: vec![],
+                resourcepacks: vec![],
+                shaders: vec![],
+                datapacks: vec![],
+                worlds: vec![],
+                user_preferences: serde_json::json!({}),
+                game_data: Default::default(),
+            };
+            fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        };
+        let row = crate::models::InstanceRow {
+            instance_id: id.clone(),
+            name: "Demo".into(),
+            minecraft_version: "26.1.2".into(),
+            loader: "fabric".into(),
+            loader_version: "0.20.0".into(),
+            is_modpack: false,
+            is_locked: false,
+            last_launched_at: None,
+            jvm_memory_mb: 4096,
+            jvm_memory_mode: "auto".into(),
+            jvm_gc: "auto".into(),
+            jvm_custom_args: String::new(),
+            jvm_always_pre_touch: true,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            java_path: None,
+            java_incompatible_override: false,
+            icon_path: None,
+            launch_mode_override: "auto".into(),
+            import_source: None,
+            total_play_ms: 0,
+        };
+        let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        crate::db::upsert_instance(&conn, &row).unwrap();
+
+        // Snapshot an instance from elsewhere, then restore it here.
+        write_manifest("another-instance", "Another", "26.2");
+        let snap = snapshot::create_snapshot(&dir, Some("imported"), TRACKED).unwrap();
+        write_manifest(&id, "Demo", "26.1.2");
+
+        service.restore(&id, &snap.id).unwrap();
+
+        let restored = crate::helpers::read_manifest(&manifest_path).unwrap();
+        assert_eq!(restored.instance_id, id);
+        assert_eq!(restored.name, "Demo");
+        assert_eq!(restored.minecraft_version, "26.2");
+        let record = crate::db::get_instance(&conn, &id).unwrap().unwrap();
+        assert_eq!(record.name, "Demo");
     }
 
     /// A restore must not proceed while a game may be writing to the instance.

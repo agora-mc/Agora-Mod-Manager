@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use agora_game_api::crash::SessionVerdict;
 
 use crate::ctx::Ctx;
-use crate::game_instance;
+use crate::game_instance::{self, GameInstanceManifest};
 use crate::game_load_order::{self, LoadAfterRule};
 use crate::game_loadout::GameLoadoutRules;
 use crate::lkg::{self, Diff, FileEntry, LaunchOutcome, LkgState};
@@ -791,6 +791,46 @@ pub fn missing_content(ctx: &Ctx, refs: &[String]) -> Vec<String> {
     missing
 }
 
+/// Keep the live instance's id and name after a snapshot wrote its manifest.
+/// A snapshot captured from another instance (an imported backup, a clone's
+/// source) may carry a different identity; restoring its state must not rename
+/// the instance or change its id.
+fn restore_manifest_identity(
+    ctx: &Ctx,
+    instance_id: &str,
+    instance_dir: &Path,
+    identity: Option<&(String, String)>,
+) -> Result<(), String> {
+    let manifest_path = instance_dir.join(INSTANCE_MANIFEST_ROOT);
+    if !manifest_path.is_file() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("cannot read the restored manifest: {error}"))?;
+    let mut manifest: GameInstanceManifest = serde_json::from_str(&text)
+        .map_err(|error| format!("the restored manifest cannot be read: {error}"))?;
+    let (wanted_id, wanted_name) = match identity {
+        Some((id, name)) => (id.as_str(), Some(name.as_str())),
+        None => (instance_id, None),
+    };
+    let mut changed = false;
+    if manifest.instance_id != wanted_id {
+        manifest.instance_id = wanted_id.to_string();
+        changed = true;
+    }
+    if let Some(name) = wanted_name {
+        if manifest.name != name {
+            manifest.name = name.to_string();
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    crate::game_deploy::write_instance_manifest_atomic(ctx, instance_id, &manifest)
+        .map_err(|error| format!("the restored manifest could not keep its identity: {error}"))
+}
+
 fn pre_restore_label(at: chrono::DateTime<chrono::Utc>) -> String {
     format!(
         "pre-restore-{}",
@@ -862,6 +902,18 @@ pub fn restore_locked(
         .paths
         .instance_dir(instance_id)
         .map_err(|e| e.to_string())?;
+    // A restore replaces the manifest, but never the instance's identity. The
+    // row is the authority; fall back to the live manifest for an instance that
+    // has not been registered yet.
+    let identity = game_instance::get(ctx, instance_id)
+        .ok()
+        .flatten()
+        .map(|record| (record.instance_id, record.name))
+        .or_else(|| {
+            game_instance::get_manifest(ctx, instance_id)
+                .ok()
+                .map(|manifest| (manifest.instance_id, manifest.name))
+        });
 
     let forced_while_not_idle = match activity_is_running(ctx, instance_id) {
         Ok(false) => false,
@@ -932,6 +984,19 @@ pub fn restore_locked(
             }));
         }
     };
+
+    if let Err(error) = restore_manifest_identity(ctx, instance_id, &dir, identity.as_ref()) {
+        let rollback = snapshot::restore_snapshot_data(&dir, &undo.id);
+        let _ = std::fs::remove_file(pending_path(&dir));
+        return Err(GameRestoreError::Other(match rollback {
+            Ok(_) => format!("{error}; the instance was put back as it was"),
+            Err(rollback) => format!(
+                "{error}; putting the instance back also failed ({rollback}). Restore snapshot {} \
+                 to try again.",
+                undo.id
+            ),
+        }));
+    }
 
     let rules: Vec<(String, Vec<LoadAfterRule>)> = data
         .rules

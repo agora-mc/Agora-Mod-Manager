@@ -818,6 +818,18 @@ fn a_backup_with_bytes_round_trips_into_an_empty_data_folder() {
         b"[General]\nValue=1\n"
     );
     assert!(dir.join("instance_manifest.json").is_file());
+
+    // The snapshot came from the source instance, but restoring it keeps the
+    // imported instance's identity: it still lists and opens under its new id
+    // and name.
+    let after = agora_core::game_instance::get_manifest(&ctx, id).unwrap();
+    assert_eq!(after.instance_id, id);
+    assert_eq!(after.name, "Test");
+    assert!(agora_core::game_instance::get(&ctx, id).unwrap().is_some());
+    assert!(agora_core::game_instance::list(&ctx)
+        .unwrap()
+        .iter()
+        .any(|record| record.instance_id == id && record.name == "Test"));
 }
 
 #[test]
