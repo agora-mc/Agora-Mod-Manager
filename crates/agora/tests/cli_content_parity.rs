@@ -98,7 +98,6 @@ fn reading_a_missing_instance_or_item_fails_with_exit_1() {
         &["--json", "loadout", "unlisted", "nothing", "profile"],
         &["--json", "snapshots", "drift", "nothing", "snap"],
         &["--json", "instance", "stop", "nothing"],
-        &["--json", "registry", "item", "nothing"],
     ] {
         let output = agora(tmp.path(), args);
         assert_eq!(
@@ -109,4 +108,14 @@ fn reading_a_missing_instance_or_item_fails_with_exit_1() {
             String::from_utf8_lossy(&output.stdout)
         );
     }
+
+    // A fresh data root has no cached catalog, which the exit-code table documents as 13
+    // ("catalog missing"), not the generic 1 a missing instance or file uses.
+    let output = agora(tmp.path(), &["--json", "registry", "item", "nothing"]);
+    assert_eq!(
+        output.status.code(),
+        Some(13),
+        "`agora registry item` with no catalog should fail with 13: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }

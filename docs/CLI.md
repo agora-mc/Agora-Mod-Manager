@@ -507,7 +507,7 @@ agora skin show
 agora skin wear <FILE.png> [--slim]
 agora skin reset
 agora skin cape <NAME | none>
-agora skin library [list]
+agora skin library list
 agora skin library add <FILE.png> [--name <NAME>] [--slim]
 agora skin library remove <ID>
 ```

@@ -484,7 +484,7 @@ fn ensure_mutation_allowed(ctx: &Ctx, instance_id: &str) -> LauncherResult<()> {
         GameActivity::CouldNotTell(reason) => Err(LauncherError::Generic {
             code: "ERR_INSTANCE_LAUNCH_INDETERMINATE".into(),
             message: format!(
-                "Could not tell whether the game is running in '{instance_id}' ({reason}); \
+                "could not tell whether the game is running in '{instance_id}' ({reason}); \
                  refusing to change this instance."
             ),
         }),
