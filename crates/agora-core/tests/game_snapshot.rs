@@ -779,7 +779,9 @@ fn a_backup_with_bytes_round_trips_into_an_empty_data_folder() {
     let imported = backup::import_instance_backup_blocking(&ctx, id, &artifact).unwrap();
     assert_eq!(imported.id, snap.id);
 
-    // Import made a usable instance: it is listed, opens, and can be planned.
+    // Import made a usable instance: it is registered, listed, opens, and can
+    // be planned.
+    assert!(agora_core::game_instance::get(&ctx, id).unwrap().is_some());
     let listed = agora_core::game_instance::list(&ctx).unwrap();
     assert!(listed.iter().any(|record| record.instance_id == id));
     let opened = agora_core::game_instance::get_manifest(&ctx, id).unwrap();
