@@ -3010,6 +3010,7 @@ fn journal_of(f: &Fixture, run: &str, kind: CopyKind) -> SwapJournal {
         copy_kind: kind,
         copy_dir: game_tool_copy::copy_dir_for(kind, &loc, run),
         swap_dir: loc.swap_dir.clone(),
+        processes: Vec::new(),
     }
 }
 
@@ -7172,4 +7173,39 @@ fn ask_mode_never_runs_unasked() {
     )
     .unwrap();
     assert!(log.contains("chose to launch anyway"), "{log}");
+}
+
+#[test]
+fn recovery_waits_for_an_external_tool_the_swap_recorded() {
+    let _swap = SwapTest::same_volume();
+    let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let mut busy = Command::new(r"C:\Windows\System32\cmd.exe")
+        .args(["/c", "ping", "-n", "60", "127.0.0.1"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let identity = process_identity::capture(busy.id()).unwrap();
+    let mut journal = crash_after(&f, 6, CopyKind::Kept, "external");
+    journal.processes.push(identity);
+    swap::write_journal(&f.ctx, &journal).unwrap();
+    let before = snapshot(&real_data(&f));
+
+    let result = swap::recover_game(&f.ctx, &f.def);
+    let _ = busy.kill();
+    let _ = busy.wait();
+
+    match result {
+        Err(SwapError::Refused(message)) => {
+            assert!(message.contains("still going"), "{message}");
+        }
+        other => panic!("expected a refusal while the external tool runs, got {other:?}"),
+    }
+    assert_eq!(
+        snapshot(&real_data(&f)),
+        before,
+        "the real Data was moved back"
+    );
+    assert!(journal_file(&f).exists());
 }

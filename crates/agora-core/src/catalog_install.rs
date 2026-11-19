@@ -1597,10 +1597,7 @@ async fn github_source(
             ),
         ));
     };
-    let published_sha256 = asset
-        .digest
-        .as_deref()
-        .map(|digest| digest.strip_prefix("sha256:").unwrap_or(digest).to_string());
+    let published_sha256 = published_sha256(asset.digest.as_deref());
     let pin = source
         .pins
         .iter()
@@ -1618,6 +1615,26 @@ async fn github_source(
         size: asset.size,
         pin,
     })
+}
+
+/// A published asset digest as a lowercase SHA-256 hex string. The algorithm name is matched
+/// without regard to case; a digest under any other algorithm is "nothing published" (the player
+/// is told the file is unverified and can install anyway), never a mismatch. A bare digest with no
+/// algorithm is treated as SHA-256, as GitHub's API used to return it.
+fn published_sha256(digest: Option<&str>) -> Option<String> {
+    let digest = digest?.trim();
+    if digest.is_empty() {
+        return None;
+    }
+    let (algorithm, value) = match digest.split_once(':') {
+        Some((algorithm, value)) => (Some(algorithm), value),
+        None => (None, digest),
+    };
+    if algorithm.is_some_and(|algorithm| !algorithm.eq_ignore_ascii_case("sha256")) {
+        return None;
+    }
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_ascii_lowercase())
 }
 
 fn direct_source(item: &GameCatalogItem, source: &DownloadSource) -> LauncherResult<PlannedSource> {
@@ -2208,6 +2225,23 @@ mod tests {
         assert!(!version_matches("1.6.1170.*", "1.6.1170"));
         assert!(!version_matches("1.6.11", "1.6.1170.0"));
         assert!(!version_matches("1.6.1179.0", "1.6.1179.0.1"));
+    }
+
+    #[test]
+    fn a_published_digest_names_sha256_in_any_case_and_other_algorithms_are_not_a_pin() {
+        let hex = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        assert_eq!(
+            published_sha256(Some(&format!("sha256:{}", hex.to_ascii_uppercase()))),
+            Some(hex.to_string())
+        );
+        assert_eq!(
+            published_sha256(Some(&format!("SHA256:{hex}"))),
+            Some(hex.to_string())
+        );
+        assert_eq!(published_sha256(Some(hex)), Some(hex.to_string()));
+        assert_eq!(published_sha256(Some(&format!("md5:{hex}"))), None);
+        assert_eq!(published_sha256(Some("")), None);
+        assert_eq!(published_sha256(None), None);
     }
 
     #[test]

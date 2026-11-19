@@ -769,8 +769,14 @@ fn a_bad_chosen_id_is_refused_before_any_base_is_built() {
         BaseReference::Pinned { id, .. } => id,
         _ => unreachable!(),
     };
-    // With the only instance gone and its base removed, nothing exists to reuse.
+    // With the only instance gone and its base removed, nothing exists to reuse. A deleted
+    // instance still pins its base while it sits in Recently deleted, so empty that first.
     delete(&ctx, "taken").unwrap();
+    let os_trash: agora_core::game_instance::TrashFn =
+        std::sync::Arc::new(|path: &std::path::Path| {
+            std::fs::remove_dir_all(path).map_err(|error| error.to_string())
+        });
+    agora_core::game_instance::trash::purge_all(&ctx, &def.id, &os_trash);
     remove_base(&ctx.paths, &base_id).unwrap();
     let conn = rusqlite::Connection::open(ctx.paths.local_state_db()).unwrap();
     conn.execute(
@@ -1038,4 +1044,47 @@ fn instance_reads_include_base_and_content_before_deploy() {
         b"cool",
         "content is in the view even though nothing was deployed"
     );
+}
+
+#[test]
+fn a_deleted_instance_still_protects_its_pinned_base_until_it_is_purged() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let def = make_test_definition();
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Recoverable",
+        Some("skyrim-recoverable".into()),
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = match &rec.base {
+        BaseReference::Pinned { id, .. } => id.clone(),
+        other => panic!("expected a pinned base, got {other:?}"),
+    };
+
+    let deleted = delete(&ctx, &rec.instance_id).unwrap();
+    let entry_id = deleted.trash_entry_id.expect("a restorable entry");
+    match remove_base(&ctx.paths, &base_id) {
+        Err(BaseError::InUse { instances }) => {
+            assert!(
+                instances.contains(&rec.instance_id),
+                "the deleted instance still pins the base: {instances:?}"
+            );
+        }
+        other => panic!("expected BaseError::InUse, got {other:?}"),
+    }
+
+    agora_core::game_instance::trash::restore(&ctx, &entry_id, None)
+        .expect("the instance can be restored");
+    assert!(remove_base(&ctx.paths, &base_id).is_err());
 }

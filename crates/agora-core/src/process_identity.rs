@@ -213,7 +213,7 @@ fn has_exited(pid: u32) -> bool {
 /// **not** serialised to the frontend.  The public
 /// `RunningProcess` (in the Minecraft package's `state`) carries only the fields
 /// the UI needs (instance_id, pid, session_id).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProcessIdentity {
     pub pid: u32,
     /// The process start time reported by the OS (seconds since epoch).
