@@ -162,6 +162,11 @@ pub enum SkinCmd {
     Reset,
     /// Show a cape by its name (see `skin show`), or `none` to hide capes.
     Cape { name: String },
+    /// List, add, or remove skins saved on this computer.
+    Library {
+        #[command(subcommand)]
+        action: Option<crate::cli_misc_parity::SkinLibraryCmd>,
+    },
 }
 
 pub async fn run_skin_command(
@@ -171,6 +176,9 @@ pub async fn run_skin_command(
 ) -> anyhow::Result<()> {
     use agora_game_minecraft::skins::{self, SkinVariant};
     match action {
+        SkinCmd::Library { action } => {
+            return crate::cli_misc_parity::run_skin_library(action, ctx, output_fmt);
+        }
         SkinCmd::Show => {}
         SkinCmd::Wear { file, slim } => {
             let bytes = std::fs::read(&file)?;

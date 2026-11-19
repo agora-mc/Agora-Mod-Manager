@@ -912,6 +912,8 @@ pub enum TemplateCmd {
         #[arg(long, help = "Delete without asking")]
         yes: bool,
     },
+    /// Change a template's name, description, or JVM settings.
+    Update(crate::cli_misc_parity::TemplateUpdateArgs),
     /// Copy a template's files and JVM settings onto an existing instance.
     /// Agora takes an undo snapshot first.
     Apply {
@@ -1043,6 +1045,9 @@ pub fn run_template_command(
             } else {
                 println!("Deleted template '{template}'.");
             }
+        }
+        TemplateCmd::Update(args) => {
+            crate::cli_misc_parity::run_template_update(ctx, args, output_fmt)?
         }
         TemplateCmd::Apply { template, instance } => {
             let outcome = InstanceService::new(ctx.clone()).apply_template(

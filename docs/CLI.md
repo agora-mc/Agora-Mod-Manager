@@ -364,6 +364,9 @@ in the desktop app's Library. Nothing is imported, and no file is moved, changed
 | Command | Purpose |
 | --- | --- |
 | `agora downloads scan [--folder <path>] [--json]` | Classify the common mod archives (`.zip`, `.7z`, `.rar`, `.jar`, `.mrpack`) in a folder and print each one's game, kind and the reason it was recognised. Browser partials are skipped, and an unrelated archive is left out. Anything already in the content store is marked `already in your library`. The default folder is the one Agora watches, else your Downloads folder |
+| `agora downloads list [--json]` | List the new downloads Agora noticed while download watching was on in the app, as the Library shows them. Files that no longer exist are dropped |
+| `agora downloads add <ID \| FILE_NAME> [--json]` | Add a noticed download to your library through its game's own flow. `ID` is the start of its SHA-256 as `downloads list` prints it. The file is checked against the hash Agora saw and is only read, never moved or changed. An archive with an installer is stored and named, ready for `games content fomod` |
+| `agora downloads ignore <ID \| FILE_NAME>` | Stop offering a download. It is remembered by its contents, so downloading it again does not bring it back |
 
 ### Catalog
 
@@ -378,7 +381,7 @@ Use `--registry-repo` only for an intentional development or sandbox catalog. A 
 
 ### Registry review and governance
 
-These commands only read. They never vote, and they never post to GitHub.
+These commands only read, except `registry vote`, which changes only your own vote.
 
 | Command | Purpose |
 | --- | --- |
@@ -386,6 +389,7 @@ These commands only read. They never vote, and they never post to GitHub.
 | `agora registry reviews <ITEM>` | Show the curator reviews recorded for one item |
 | `agora registry audit-log [--limit N]` | Show recent audit log entries, newest first (1-1000, default 200) |
 | `agora registry resolutions [--limit N]` | Show recent triage resolutions (1-1000, default 50) |
+| `agora registry vote <ITEM> [up \| down \| clear]` | Show your vote on a curated item, or vote up or down, or take your vote back. A vote is your own reaction on the item's GitHub voting issue, so it needs `agora auth github login`. Curator-protected items do not take votes. Covered by Lockdown Mode |
 | `agora governance summary <ITEM>` | Show the vote counts and status for one item |
 | `agora governance events [--item <ITEM>] [--limit N]` | List governance events, newest first (1-1000, default 100) |
 | `agora governance config` | Show the governance repository and environment this build uses |
@@ -478,11 +482,16 @@ agora world import <INSTANCE_ID> <FILE.zip>
 agora server list <INSTANCE_ID> [--ping]
 agora server add <INSTANCE_ID> <ADDRESS> [--name <NAME>]
 agora server remove <INSTANCE_ID> <POSITION>
+agora server edit <INSTANCE_ID> <POSITION | NAME> [--name <NAME>] [--address <ADDRESS>]
+agora server move <INSTANCE_ID> <POSITION | NAME> up|down
+agora server ping <ADDRESS>
 ```
 
 A world is named by its folder under `saves/`, which `world list` shows. `world rename` changes the name shown in game and keeps the folder, so data pack choices and `launch --world` keep pointing at it. `world delete` moves the world to the system recycle bin and asks first unless you pass `--yes`. `world import` accepts a zip holding the world at its root or inside one folder, and picks a free folder name.
 
 `server` edits the game's own multiplayer list (`servers.dat`), keeping the icons and other details the game stored. Positions start at 1, in the order `server list` prints. `--ping` also asks each server whether it is online, with its player count and latency, using the game's own status protocol (Minecraft 1.7 and later). Servers reachable only through a DNS `SRV` record show as offline. Pinging is covered by Lockdown Mode and the Server status switch on the Privacy page.
+
+`server edit` renames a server or changes its address; whatever you leave out stays as it is. `server move` swaps a server with the one above or below it. `server ping` checks any address without adding it to a list.
 
 ### Logs, proxy and skins
 
@@ -497,6 +506,9 @@ agora skin show
 agora skin wear <FILE.png> [--slim]
 agora skin reset
 agora skin cape <NAME | none>
+agora skin library [list]
+agora skin library add <FILE.png> [--name <NAME>] [--slim]
+agora skin library remove <ID>
 ```
 
 `log share` uploads the latest game log or a recent crash report to mclo.gs and prints the link. User folder names, anything shaped like a token and the signed-in account's own token are removed first; `--preview` prints exactly what would be sent. It asks before uploading unless `--yes`, and is covered by Lockdown Mode and the Log sharing switch.
@@ -504,6 +516,8 @@ agora skin cape <NAME | none>
 `proxy` sets how Agora's own requests reach the internet: `system` uses the `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` environment variables (the default), `none` connects directly, and `set` takes an `http`, `https`, `socks5` or `socks5h` URL. A password is read from the `AGORA_PROXY_PASSWORD` environment variable and kept in the operating-system credential store. The change applies the next time Agora starts. Minecraft itself does not use this proxy.
 
 `skin` changes the active Microsoft account's skin and cape, as changing them on minecraft.net would. A skin must be a 64×64 (or 64×32) PNG.
+
+`skin library` keeps skins on this computer, the same list as the app's skin page; it needs no sign-in and uploads nothing. `add` names the skin after its file unless you pass `--name`. In `--json`, each saved skin includes the image as a data URL.
 
 All of these refuse to run while the game has the instance open, because Minecraft rewrites both files when it closes.
 
@@ -654,6 +668,7 @@ A loadout does not revert mod versions or configuration files.
 agora template list
 agora template create <NAME> [--from <INSTANCE> --include <FILE>...] [--memory <MB>] [--gc <GC>] [--java-path <FILE>] [--jvm-args <ARGS>] [--description <TEXT>]
 agora template apply <TEMPLATE_ID> <INSTANCE>
+agora template update <TEMPLATE_ID> [--name <NAME>] [--description <TEXT> | --clear-description] [--clear-jvm] [--memory <MB>] [--gc <GC>] [--java-path <FILE>] [--jvm-args <ARGS>]
 agora template delete <TEMPLATE_ID> [--yes]
 ```
 
@@ -665,7 +680,7 @@ agora template create "Big heap" --memory 8192 --gc low_latency
 agora template apply <TEMPLATE_ID> <INSTANCE_ID>
 ```
 
-A template keeps chosen configuration files and JVM settings so you can copy them to another instance. Only the files named with `--include` are captured, by path relative to the source instance; `--include` needs `--from`. A template with no files and no JVM setting is refused. Applying a template copies its files over the same paths in the target instance, and takes an undo point first when it copies any. A JVM setting the template does not name is left alone. Deleting a template asks first; without a terminal, pass `--yes`.
+A template keeps chosen configuration files and JVM settings so you can copy them to another instance. Only the files named with `--include` are captured, by path relative to the source instance; `--include` needs `--from`. A template with no files and no JVM setting is refused. Applying a template copies its files over the same paths in the target instance, and takes an undo point first when it copies any. A JVM setting the template does not name is left alone. `template update` changes only what you pass; its JVM flags change the settings they name and keep the others, and `--clear-jvm` drops them all first. It does not change the captured files. Deleting a template asks first; without a terminal, pass `--yes`.
 
 ### Mod bisect
 
@@ -748,6 +763,10 @@ agora plugin remove <PLUGIN_ID> --purge-data
 agora plugin restore-data <PLUGIN_ID> [--yes]
 agora plugin log <PLUGIN_ID> --lines 200
 agora plugin disable-all
+agora plugin run <PLUGIN_ID> <COMMAND> [--args <JSON>]
+agora plugin diagnose <PLUGIN_ID> <DIAGNOSTIC> <INSTANCE_ID>
+agora plugin repair <PLUGIN_ID> <DIAGNOSTIC> <INSTANCE_ID> <FIX> [--yes]
+agora plugin launch-checks <INSTANCE_ID>
 agora plugin settings <PLUGIN_ID>
 agora plugin set <PLUGIN_ID> <KEY> <VALUE>
 agora plugin check-update [PLUGIN_ID]
@@ -758,6 +777,8 @@ agora plugin sign <DOCUMENT> --key <PATH> --key-id <ID>
 ```
 
 `plugin settings` prints the settings a plugin declares, with their types and current values. `plugin set` writes one of them. The value is read as JSON (`true`, `42`, `"text"`); text that is not valid JSON is taken as a plain string. Core checks the value against the type the plugin declared and refuses a wrong type or an undeclared key, so nothing is stored in that case.
+
+`plugin run`, `plugin diagnose`, `plugin repair` and `plugin launch-checks` do what the app does when you use a plugin's command, check or fix. They run plugin code, so the same rules apply: the plugin must be enabled, its code allowed, and the emergency stop released, and it can only use the permissions it was granted. `COMMAND` and `DIAGNOSTIC` are export names from the plugin's manifest. `plugin diagnose` prints what a check found and the fixes it offers. `plugin repair` runs the check again, shows exactly what the chosen fix will change, and asks first (`--yes` skips the question); Agora re-checks every step against the instance as it is now, and reports anything it skipped or could not do. `plugin launch-checks` runs the checks a launch would run, without launching.
 
 `plugin list` reads the core-resolved install state without starting plugins. Its status column explains why an installed plugin is not runnable, including disabled plugins, incompatible host APIs, dependency problems, cycles, and recorded activation failures. `plugin status` is a convenience alias.
 
@@ -900,9 +921,17 @@ agora auth list
 agora auth switch <USERNAME_OR_UUID>
 agora auth logout [--account <USERNAME_OR_UUID>]
 agora auth repair
+agora auth refresh
+agora auth github login [--no-browser]
+agora auth github status
+agora auth github logout
 ```
 
-These commands manage the Microsoft/Xbox/Minecraft identity used for direct launch. They are separate from the GitHub account used by desktop governance features.
+These commands manage the Microsoft/Xbox/Minecraft identity used for direct launch, except `auth github`, which manages the separate GitHub account used for voting (`registry vote`).
+
+`auth refresh` renews the active Microsoft account's sign-in now instead of at the next launch.
+
+`auth github login` works like the app's GitHub sign-in: it prints a code and a github.com link, opens the link unless `--no-browser`, and waits until you approve (Ctrl-C cancels). The sign-in is stored exactly as the app stores it (the operating-system credential store, or Agora's encrypted file), so with the same data folder, signing in or out here does the same in the app. `auth github status` only reads that store and does not go online.
 
 `auth login` uses the Microsoft device-code flow: it prints a short code and a verification URL, opens the URL in your browser unless `--no-browser` is given, and then waits until you finish signing in. Press Ctrl-C to cancel. The device code and every token stay inside Agora; nothing is pasted back into the terminal.
 

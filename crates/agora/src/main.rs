@@ -24,6 +24,7 @@ use agora_game_minecraft::runtime_service::RuntimeService;
 mod cli_discovery;
 mod cli_games_parity;
 mod cli_govniche;
+mod cli_misc_parity;
 mod cli_network;
 mod cli_official;
 mod cli_tools;
@@ -460,6 +461,18 @@ enum DownloadsCmd {
         /// Folder to scan. Defaults to the folder Agora watches, else your Downloads folder.
         #[arg(long)]
         folder: Option<PathBuf>,
+    },
+    /// List the new downloads Agora noticed and would offer to add.
+    List,
+    /// Add a noticed download to your library. The downloaded file is only read.
+    Add {
+        /// Its ID from `downloads list` (the start of its SHA-256), or its file name.
+        download: String,
+    },
+    /// Stop offering a download, even if it is downloaded again.
+    Ignore {
+        /// Its ID from `downloads list` (the start of its SHA-256), or its file name.
+        download: String,
     },
 }
 
@@ -1590,6 +1603,35 @@ enum PluginCmd {
         lines: usize,
     },
     /// Disable every installed plugin as a recovery action.
+    /// Run a command a plugin adds. Its permissions and code settings apply as in the app.
+    Run {
+        id: String,
+        /// The command's export name, from the plugin's manifest.
+        command: String,
+        #[arg(long, help = "Arguments as JSON")]
+        args: Option<String>,
+    },
+    /// Run one of a plugin's checks against an instance and show what it found.
+    Diagnose {
+        id: String,
+        /// The diagnostic's export name, from the plugin's manifest.
+        diagnostic: String,
+        instance: String,
+    },
+    /// Apply a fix a plugin's check offers. Shows what it will do and asks first unless --yes.
+    Repair {
+        id: String,
+        /// The diagnostic that offers the fix.
+        diagnostic: String,
+        instance: String,
+        /// The fix's ID, as `plugin diagnose` shows it.
+        fix: String,
+        #[arg(long, help = "Apply without asking")]
+        yes: bool,
+    },
+    /// Run every plugin's pre-launch checks for an instance, without launching.
+    #[command(name = "launch-checks")]
+    LaunchChecks { instance: String },
     #[command(name = "disable-all")]
     DisableAll,
     /// Allow or stop one plugin's code (scripts). Data-only plugins have none.
@@ -1965,6 +2007,14 @@ enum RegistryCmd {
     },
     #[command(flatten)]
     Parity(cli_content_parity::RegistryParityCmd),
+    /// Show your vote on a curated item, or vote up, down, or clear it. Needs `auth github login`.
+    Vote {
+        /// Registry item ID.
+        item: String,
+        /// up, down, or clear. Omit to show your current vote.
+        #[arg(value_enum)]
+        vote: Option<cli_misc_parity::VoteChoice>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2012,6 +2062,13 @@ enum AuthCmd {
     },
     /// Rebuild the saved account list after it could not be read.
     Repair,
+    /// Renew the active Microsoft account's sign-in now.
+    Refresh,
+    /// Sign in to or out of GitHub, used for voting on curated items.
+    Github {
+        #[command(subcommand)]
+        action: cli_misc_parity::GithubAuthCmd,
+    },
 }
 
 /// Find a signed-in account by username (case-insensitive) or UUID.
@@ -3604,6 +3661,34 @@ async fn run_plugin_command(
             } else {
                 println!("Removed plugin {id}; stored data was kept.");
             }
+        }
+        PluginCmd::Run { id, command, args } => {
+            cli_misc_parity::run_plugin_run(service, &id, &command, args, output_fmt)?
+        }
+        PluginCmd::Diagnose {
+            id,
+            diagnostic,
+            instance,
+        } => {
+            cli_misc_parity::run_plugin_diagnose(service, &id, &diagnostic, &instance, output_fmt)?
+        }
+        PluginCmd::Repair {
+            id,
+            diagnostic,
+            instance,
+            fix,
+            yes,
+        } => cli_misc_parity::run_plugin_repair(
+            service,
+            &id,
+            &diagnostic,
+            &instance,
+            &fix,
+            yes,
+            output_fmt,
+        )?,
+        PluginCmd::LaunchChecks { instance } => {
+            cli_misc_parity::run_plugin_launch_checks(service, &instance, output_fmt)?
         }
         PluginCmd::Log { id, lines } => {
             let plugin_id = parse_plugin_id(&id)?;
@@ -5312,6 +5397,8 @@ async fn run_auth_command(
                 println!("Now using {}.", active.username);
             }
         }
+        AuthCmd::Refresh => cli_misc_parity::run_msa_refresh(ctx, data_dir, output_fmt).await?,
+        AuthCmd::Github { action } => cli_misc_parity::run_github_auth(action, output_fmt).await?,
         AuthCmd::Repair => {
             let report = agora_game_minecraft::msa::repair_account_store()?;
             if json {
@@ -5790,6 +5877,9 @@ async fn run_registry_command(
     let json = output_fmt.is_json_output();
     match action {
         RegistryCmd::Parity(action) => cli_content_parity::run_registry(action, ctx, output_fmt)?,
+        RegistryCmd::Vote { item, vote } => {
+            cli_misc_parity::run_registry_vote(ctx, &item, vote, output_fmt).await?
+        }
         RegistryCmd::Status => {
             let local_state = data_dir.join("local_state.db");
             let _repo = agora_core::registry_sync::resolve_registry_repo(registry_repo);
@@ -6930,6 +7020,13 @@ async fn run_command(
             }
         },
         Commands::Downloads { action } => match action {
+            DownloadsCmd::List => cli_misc_parity::run_downloads_list(ctx, output_fmt)?,
+            DownloadsCmd::Add { download } => {
+                cli_misc_parity::run_downloads_add(ctx, &download, output_fmt)?
+            }
+            DownloadsCmd::Ignore { download } => {
+                cli_misc_parity::run_downloads_ignore(ctx, &download, output_fmt)?
+            }
             DownloadsCmd::Scan { folder } => {
                 let folder = match folder {
                     Some(folder) => folder,

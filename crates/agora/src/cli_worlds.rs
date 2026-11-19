@@ -59,6 +59,29 @@ pub enum ServerCmd {
     },
     /// Remove the server at a position shown by `server list`.
     Remove { instance: String, position: usize },
+    /// Rename a server or change its address.
+    Edit {
+        instance: String,
+        /// Its position from `server list`, or its name.
+        server: String,
+        #[arg(long, help = "New name shown in the multiplayer list")]
+        name: Option<String>,
+        #[arg(long, help = "New address (host or host:port)")]
+        address: Option<String>,
+    },
+    /// Move a server one place up or down the list.
+    Move {
+        instance: String,
+        /// Its position from `server list`, or its name.
+        server: String,
+        #[arg(value_enum)]
+        direction: crate::cli_misc_parity::MoveDirection,
+    },
+    /// Ask any server whether it is online, without adding it.
+    Ping {
+        /// host or host:port
+        address: String,
+    },
 }
 
 pub fn run_world_command(
@@ -239,6 +262,24 @@ pub async fn run_server_command(
             if !json {
                 println!("Added {address}.");
             }
+        }
+        ServerCmd::Edit {
+            instance,
+            server,
+            name,
+            address,
+        } => crate::cli_misc_parity::run_server_edit(
+            ctx, &instance, &server, name, address, output_fmt,
+        )?,
+        ServerCmd::Move {
+            instance,
+            server,
+            direction,
+        } => {
+            crate::cli_misc_parity::run_server_move(ctx, &instance, &server, direction, output_fmt)?
+        }
+        ServerCmd::Ping { address } => {
+            crate::cli_misc_parity::run_server_ping(&address, output_fmt).await?
         }
         ServerCmd::Remove { instance, position } => {
             let index = position
