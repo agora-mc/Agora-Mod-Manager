@@ -573,9 +573,7 @@ fn finish_restore(
             .map_err(|e| io_err("ERR_INSTANCE_RESTORE", "Cannot update manifest", e))?;
     }
     let row = &stored.row;
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(db_err)?;
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
     tx.execute(
         "INSERT INTO game_instances
              (instance_id, game, name, base_json, created_at, last_launched_at,

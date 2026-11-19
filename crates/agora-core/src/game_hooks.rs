@@ -72,10 +72,7 @@ pub trait InstanceBackend: Send + Sync {
 
     /// List instances, reporting a backend read failure as a warning instead of failing the whole
     /// collection. Mutating operations must still establish ownership and refuse when they cannot.
-    fn list_reported(
-        &self,
-        ctx: &Ctx,
-    ) -> (Vec<crate::models::InstanceRow>, Vec<String>) {
+    fn list_reported(&self, ctx: &Ctx) -> (Vec<crate::models::InstanceRow>, Vec<String>) {
         match self.list(ctx) {
             Ok(rows) => (rows, Vec::new()),
             Err(error) => (
@@ -149,6 +146,9 @@ fn generic_row(
         .and_then(|manifest| manifest.runtime_identity)
         .map(|runtime| runtime.version)
         .unwrap_or_default();
+    let total_play_ms = crate::game_instance::play_stats(ctx, &record.instance_id)
+        .map(|stats| stats.total_play_ms)
+        .unwrap_or(0);
     crate::models::InstanceRow {
         instance_id: record.instance_id.clone(),
         name: record.name.clone(),
@@ -169,7 +169,7 @@ fn generic_row(
         icon_path: None,
         launch_mode_override: "auto".to_string(),
         import_source: None,
-        total_play_ms: 0,
+        total_play_ms,
     }
 }
 
@@ -334,10 +334,7 @@ impl InstanceBackend for InstanceBackends {
         Ok(all)
     }
 
-    fn list_reported(
-        &self,
-        ctx: &Ctx,
-    ) -> (Vec<crate::models::InstanceRow>, Vec<String>) {
+    fn list_reported(&self, ctx: &Ctx) -> (Vec<crate::models::InstanceRow>, Vec<String>) {
         let mut all = Vec::new();
         let mut warnings = Vec::new();
         for backend in &self.0 {
@@ -654,9 +651,7 @@ mod tests {
             msg.contains("boom") || msg.contains("ERR_BACKEND"),
             "unexpected error: {msg}"
         );
-        assert!(all.0[1]
-            .get(&ctx, "ok-1")
-            .is_ok(), "sanity");
+        assert!(all.0[1].get(&ctx, "ok-1").is_ok(), "sanity");
     }
 
     #[test]
@@ -673,8 +668,8 @@ mod tests {
         };
         let conn = crate::db::local_state_connection(&paths.local_state_db()).unwrap();
         conn.execute(
-            "INSERT INTO game_instances (instance_id, game, name, base_json, created_at)
-             VALUES ('generic-1', 'test-game', 'Generic', ?1, '2026-11-06T00:00:00Z')",
+            "INSERT INTO game_instances (instance_id, game, name, base_json, created_at, total_play_ms)
+             VALUES ('generic-1', 'test-game', 'Generic', ?1, '2026-11-06T00:00:00Z', 1234)",
             [serde_json::to_string(&base).unwrap()],
         )
         .unwrap();
@@ -712,9 +707,11 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].instance_id, "generic-1");
         assert_eq!(rows[0].loader, "test-game");
+        assert_eq!(rows[0].total_play_ms, 1234);
 
         let (row, _) = backend.get(&ctx, "generic-1").unwrap().unwrap();
         assert_eq!(row.name, "Generic");
+        assert_eq!(row.total_play_ms, 1234);
         assert!(backend.get(&ctx, "nobody").unwrap().is_none());
 
         let content = backend.content(&ctx, "generic-1", None).unwrap().unwrap();

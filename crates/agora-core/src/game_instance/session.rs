@@ -171,7 +171,8 @@ pub fn stop(
         .map_err(|error| InstanceError::Other(error.to_string()))?;
     drop(conn);
 
-    let journal_running = has_running_journal_session(ctx, instance_id, definition).unwrap_or(false);
+    let journal_running =
+        has_running_journal_session(ctx, instance_id, definition).unwrap_or(false);
     if !journal_running {
         for session in &open {
             if let Some(outcome) = stop_ledger_session(ctx, instance_id, definition, session)? {
@@ -284,7 +285,11 @@ fn finish_ledger_session_playtime(
 ) -> Result<i64, InstanceError> {
     let now = chrono::DateTime::<chrono::Utc>::from(ctx.clock.now());
     let duration_ms = chrono::DateTime::parse_from_rfc3339(started_at)
-        .map(|started| (now - started.with_timezone(&chrono::Utc)).num_milliseconds().max(0))
+        .map(|started| {
+            (now - started.with_timezone(&chrono::Utc))
+                .num_milliseconds()
+                .max(0)
+        })
         .unwrap_or(0);
     let report = crate::game_launch::SessionExitReport {
         processes: Vec::new(),

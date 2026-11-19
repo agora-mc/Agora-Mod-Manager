@@ -1180,7 +1180,6 @@ fn delete_refuses_a_running_instance_whose_session_is_known_only_to_the_ledger()
         .exists());
 }
 
-
 #[test]
 fn delete_and_restore_preserves_load_order_rules() {
     let f = Fixture::new();
@@ -1265,7 +1264,6 @@ fn restoring_a_deleted_instance_under_a_new_id_restores_its_load_order_rules() {
         .unwrap();
     assert_eq!(got, 1, "rules restored under the new id");
 }
-
 
 #[test]
 fn stop_finds_and_stops_a_session_recorded_only_in_the_ledger() {
