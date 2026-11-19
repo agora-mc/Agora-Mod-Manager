@@ -82,12 +82,21 @@ pub(crate) struct GameRow {
     last_played_at: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StoredRule {
+    list_id: String,
+    item: String,
+    after: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredEntry {
     version: u32,
     #[serde(flatten)]
     entry: DeletedEntry,
     row: GameRow,
+    #[serde(default)]
+    load_order_rules: Vec<StoredRule>,
 }
 
 fn err(code: &'static str, message: impl Into<String>) -> InstanceError {
@@ -333,11 +342,37 @@ pub(crate) fn read_row(conn: &Connection, instance_id: &str) -> Result<GameRow, 
     .ok_or_else(|| InstanceError::NotFound(instance_id.to_string()))
 }
 
+/// Snapshot the instance's plugin load-order rules before its row is deleted. The delete
+/// trigger removes them from the database, so a recoverable delete keeps them in the entry.
+pub(crate) fn read_load_order_rules(
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<Vec<StoredRule>, InstanceError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT list_id, item, after_item FROM plugin_load_order_rules
+              WHERE instance_id = ?1
+              ORDER BY list_id, id",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([instance_id], |row| {
+            Ok(StoredRule {
+                list_id: row.get(0)?,
+                item: row.get(1)?,
+                after: row.get(2)?,
+            })
+        })
+        .map_err(db_err)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+}
+
 /// Move a live instance folder into a new entry. The caller deletes the row afterwards and
 /// rolls the move back if that fails. On any failure here nothing is changed.
 pub(crate) fn stash(
     root: &Path,
     row: GameRow,
+    load_order_rules: Vec<StoredRule>,
     instance_dir: &Path,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<DeletedEntry, InstanceError> {
@@ -364,6 +399,7 @@ pub(crate) fn stash(
         version: ENTRY_VERSION,
         entry: entry.clone(),
         row,
+        load_order_rules,
     };
     let bytes = serde_json::to_vec_pretty(&stored)
         .map_err(|e| err("ERR_INSTANCE_DELETE", format!("Cannot record entry: {e}")))?;
@@ -537,7 +573,8 @@ fn finish_restore(
             .map_err(|e| io_err("ERR_INSTANCE_RESTORE", "Cannot update manifest", e))?;
     }
     let row = &stored.row;
-    conn.execute(
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    tx.execute(
         "INSERT INTO game_instances
              (instance_id, game, name, base_json, created_at, last_launched_at,
               total_play_ms, last_played_at)
@@ -554,6 +591,15 @@ fn finish_restore(
         ],
     )
     .map_err(db_err)?;
+    for rule in &stored.load_order_rules {
+        tx.execute(
+            "INSERT INTO plugin_load_order_rules (instance_id, list_id, item, after_item)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![&restoring.new_id, &rule.list_id, &rule.item, &rule.after],
+        )
+        .map_err(db_err)?;
+    }
+    tx.commit().map_err(db_err)?;
     Ok(())
 }
 

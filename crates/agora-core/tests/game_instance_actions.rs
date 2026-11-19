@@ -1149,3 +1149,211 @@ fn without_a_job_a_game_whose_launcher_exited_is_refused_and_left_alone() {
     );
     let _ = agora_core::process_job::terminate(&job);
 }
+
+#[test]
+fn delete_refuses_a_running_instance_whose_session_is_known_only_to_the_ledger() {
+    use agora_core::session_ledger::{self, LaunchManifest, Owner};
+
+    let f = Fixture::new();
+    write_instance(&f.ctx, &manifest("grounded-1", "Grounded"));
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db())
+        .expect("a connection");
+    session_ledger::begin(
+        &conn,
+        "grounded-1",
+        "2026-01-01T00:00:00Z",
+        &LaunchManifest::default(),
+        Owner::current(),
+    )
+    .expect("an open session");
+
+    let error = game_instance::delete(&f.ctx, "grounded-1").expect_err("a running game");
+    assert!(
+        matches!(error, InstanceError::Running(_)),
+        "deleted while a ledger-only session was live: {error}"
+    );
+    assert!(f
+        .ctx
+        .paths
+        .instance_dir("grounded-1")
+        .expect("a dir")
+        .exists());
+}
+
+#[test]
+fn delete_and_restore_preserves_load_order_rules() {
+    let f = Fixture::new();
+    write_instance(&f.ctx, &manifest("grounded-1", "Grounded"));
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "INSERT INTO plugin_load_order_rules (instance_id, list_id, item, after_item) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params!["grounded-1", "plugins", "B.esp", "A.esp"],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO plugin_load_order_rules (instance_id, list_id, item, after_item) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params!["grounded-1", "other", "D.esp", "C.esp"],
+    )
+    .unwrap();
+    drop(conn);
+
+    let entry_id = game_instance::delete(&f.ctx, "grounded-1")
+        .unwrap()
+        .trash_entry_id
+        .unwrap();
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).unwrap();
+    let remaining: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM plugin_load_order_rules WHERE instance_id = 'grounded-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0, "delete trigger removed the rules");
+    drop(conn);
+
+    trash::restore(&f.ctx, &entry_id, None).unwrap();
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT list_id, item, after_item FROM plugin_load_order_rules WHERE instance_id = 'grounded-1' ORDER BY list_id, item, after_item",
+        )
+        .unwrap();
+    let got: Vec<(String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("other".into(), "D.esp".into(), "C.esp".into()),
+            ("plugins".into(), "B.esp".into(), "A.esp".into()),
+        ]
+    );
+}
+
+#[test]
+fn restoring_a_deleted_instance_under_a_new_id_restores_its_load_order_rules() {
+    let f = Fixture::new();
+    write_instance(&f.ctx, &manifest("grounded-1", "Grounded"));
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "INSERT INTO plugin_load_order_rules (instance_id, list_id, item, after_item) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params!["grounded-1", "plugins", "B.esp", "A.esp"],
+    )
+    .unwrap();
+    drop(conn);
+
+    let entry_id = game_instance::delete(&f.ctx, "grounded-1")
+        .unwrap()
+        .trash_entry_id
+        .unwrap();
+    // The original id is free again, but restoring under a new name must move the rules too.
+    let restored = trash::restore(&f.ctx, &entry_id, Some("Grounded Restored")).unwrap();
+    assert!(restored.renamed);
+    assert_ne!(restored.instance_id, "grounded-1");
+
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).unwrap();
+    let got: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM plugin_load_order_rules WHERE instance_id = ?1 AND list_id = 'plugins' AND item = 'B.esp' AND after_item = 'A.esp'",
+            [&restored.instance_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(got, 1, "rules restored under the new id");
+}
+
+#[test]
+fn stop_finds_and_stops_a_session_recorded_only_in_the_ledger() {
+    use agora_core::session_ledger::{self, LaunchManifest, Owner};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    let f = Fixture::new();
+    write_instance(&f.ctx, &manifest("grounded-1", "Grounded"));
+    let mut child = if cfg!(windows) {
+        Command::new("cmd")
+            .args(["/C", "ping -n 60 127.0.0.1 > nul"])
+            .spawn()
+            .expect("spawn sleeper")
+    } else {
+        Command::new("sh")
+            .args(["-c", "sleep 60"])
+            .spawn()
+            .expect("spawn sleeper")
+    };
+    let pid = child.id();
+    let mut system = sysinfo::System::new();
+    let spid = sysinfo::Pid::from_u32(pid);
+    system.refresh_process(spid);
+    let started = system.process(spid).expect("child process").start_time();
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).expect("db");
+    session_ledger::begin(
+        &conn,
+        "grounded-1",
+        "2026-01-01T00:00:00Z",
+        &LaunchManifest::default(),
+        Owner { pid, started },
+    )
+    .expect("open ledger session");
+    drop(conn);
+
+    let stopped = game_instance::stop(&f.ctx, "grounded-1", &definition()).expect("stop");
+    assert_eq!(stopped.instance_id, "grounded-1");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            other => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("ledger-only session process was not stopped: {other:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_ledger_only_session_end_records_playtime_once() {
+    use agora_core::session_ledger::{self, LaunchManifest, Owner};
+    use agora_game_api::crash::ExitObservation;
+
+    let f = Fixture::new();
+    write_instance(&f.ctx, &manifest("grounded-1", "Grounded"));
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).expect("db");
+    let session_id = session_ledger::begin(
+        &conn,
+        "grounded-1",
+        "2026-01-01T00:00:00Z",
+        &LaunchManifest::default(),
+        Owner::current(),
+    )
+    .expect("session");
+    drop(conn);
+
+    let report = agora_core::game_launch::SessionExitReport {
+        processes: Vec::new(),
+        relaunched_outside: false,
+        exit: ExitObservation::unavailable("ended"),
+        game_runtime_ms: Some(120_000),
+    };
+    let v1 = session_ledger::record_end(&f.ctx, &session_id, &definition(), &report, 120_000);
+    assert!(v1.is_some(), "first end should close the session");
+    let stats = game_instance::play_stats(&f.ctx, "grounded-1").expect("stats");
+    assert!(
+        stats.total_play_ms >= 120_000,
+        "playtime not recorded: {stats:?}"
+    );
+
+    let v2 = session_ledger::record_end(&f.ctx, &session_id, &definition(), &report, 120_000);
+    assert!(v2.is_none(), "second end must not re-close");
+    let stats2 = game_instance::play_stats(&f.ctx, "grounded-1").expect("stats");
+    assert_eq!(
+        stats2.total_play_ms, stats.total_play_ms,
+        "playtime double-counted"
+    );
+}

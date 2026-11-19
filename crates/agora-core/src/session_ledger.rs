@@ -1108,9 +1108,34 @@ pub struct SessionFinish {
     pub froze: bool,
 }
 
+fn record_play_time_ms(
+    conn: &Connection,
+    instance_id: &str,
+    ended_at: &str,
+    duration_ms: i64,
+) -> rusqlite::Result<()> {
+    let elapsed = duration_ms.max(0);
+    let last_played_at = chrono::DateTime::parse_from_rfc3339(ended_at)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|_| ended_at.to_string());
+    conn.execute(
+        "UPDATE game_instances
+            SET total_play_ms = total_play_ms + ?1,
+                last_played_at = ?2
+          WHERE instance_id = ?3",
+        params![elapsed, last_played_at, instance_id],
+    )?;
+    Ok(())
+}
+
 /// Close a session: judge it, and store the exit and the verdict. An already-closed session is
 /// left alone, so two watchers cannot overwrite each other. Returns the verdict, or `None` when
-/// there was no open session with this id.
+/// there was no open session with this id. When it closes the session, it also records playtime
+/// once for the instance.
 pub fn finish(
     conn: &Connection,
     session_id: &str,
@@ -1137,7 +1162,7 @@ pub fn finish(
         artifact: done.artifact,
         froze: done.froze,
     });
-    write_end(
+    let closed = write_end(
         conn,
         row_id,
         &done.ended_at,
@@ -1145,6 +1170,14 @@ pub fn finish(
         &done.exit,
         judged,
     )?;
+    if !closed {
+        return Ok(None);
+    }
+    let played_ms = done
+        .game_runtime_ms
+        .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX))
+        .unwrap_or_else(|| done.duration_ms.max(0));
+    let _ = record_play_time_ms(conn, &instance_id, &done.ended_at, played_ms);
     // The history is trimmed with its manifests; a failure to trim is not a failure to record.
     let _ = crate::launch_history::prune_history(conn, &instance_id);
     Ok(Some(judged))
@@ -1193,8 +1226,8 @@ fn write_end(
     duration_ms: Option<i64>,
     exit: &ExitObservation,
     judged: SessionVerdict,
-) -> anyhow::Result<()> {
-    conn.execute(
+) -> anyhow::Result<bool> {
+    let changed = conn.execute(
         "UPDATE launch_history
             SET ended_at = ?2, duration_ms = ?3, exit_json = ?4, verdict = ?5, outcome = ?6
           WHERE id = ?1 AND ended_at IS NULL",
@@ -1207,7 +1240,7 @@ fn write_end(
             LaunchResult::from(judged).as_str(),
         ],
     )?;
-    Ok(())
+    Ok(changed > 0)
 }
 
 /// An open session the catch-up closed.
@@ -1299,7 +1332,10 @@ pub fn close_open_session(
             froze: false,
         })
     });
-    write_end(conn, row_id, now, None, &exit, judged)?;
+    let closed = write_end(conn, row_id, now, None, &exit, judged)?;
+    if !closed {
+        return Ok(None);
+    }
     Ok(Some(ClosedSession {
         session_id: session_id.to_string(),
         instance_id,
@@ -1402,12 +1438,13 @@ fn close_unwatched(
             artifact: None,
             froze: false,
         });
-        write_end(conn, row_id, now, None, &exit, judged)?;
-        closed.push(ClosedSession {
-            session_id,
-            instance_id,
-            verdict: judged,
-        });
+        if write_end(conn, row_id, now, None, &exit, judged)? {
+            closed.push(ClosedSession {
+                session_id,
+                instance_id,
+                verdict: judged,
+            });
+        }
     }
     Ok(closed)
 }

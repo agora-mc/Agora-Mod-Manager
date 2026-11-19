@@ -1034,10 +1034,12 @@ pub fn delete_with_options(
         // Move the folder into Agora's own holding area before the row goes, so a crash leaves
         // either a restorable entry or a live instance, never a row with no files.
         let row = trash::read_row(&conn, id)?;
+        let load_order_rules = trash::read_load_order_rules(&conn, id)?;
         let entry = if instance_dir.exists() {
             let entry = trash::stash(
                 &ctx.paths.recently_deleted_games_root(),
                 row,
+                load_order_rules,
                 &instance_dir,
                 chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()),
             )?;
@@ -2513,15 +2515,13 @@ pub fn list_all(ctx: &Ctx) -> (Vec<InstanceSummary>, Vec<String>) {
         }
     }
 
-    // 2. Minecraft instances through ctx.games.instance_backend()
-    if let Ok(backend) = ctx.games.instance_backend() {
-        let mc_rows = backend.list(ctx).unwrap_or_else(|e| {
-            warnings.push(format!("cannot read Minecraft instances: {e}"));
-            Vec::new()
-        });
-        {
-            for row in mc_rows {
-                // The combined backend also lists the generic instances added above. Keep the
+    // 2. Package-provided instances (e.g. Minecraft) behind registered backends.
+    match ctx.games.instance_backend() {
+        Ok(backend) => {
+            let (rows, mut backend_warnings) = backend.list_reported(ctx);
+            warnings.append(&mut backend_warnings);
+            for row in rows {
+                // A combined backend can also list generic instances added above. Keep the
                 // richer generic summary and do not count any instance twice.
                 if summaries
                     .iter()
@@ -2544,6 +2544,7 @@ pub fn list_all(ctx: &Ctx) -> (Vec<InstanceSummary>, Vec<String>) {
                 });
             }
         }
+        Err(error) => warnings.push(format!("cannot read instance backends: {error}")),
     }
 
     summaries.sort_by(|a, b| {
