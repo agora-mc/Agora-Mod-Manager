@@ -697,9 +697,7 @@ pub fn analyze_with_history(
             .extend(super::history::repeat_findings(summary, &scored.candidates));
     }
     let mut crash_answer = answer(&AnswerInput {
-        verdict: SessionVerdict::Crashed {
-            how: MatchedBy::Supplied,
-        },
+        verdict,
         evaluated: &evaluated,
         consensus: &scored,
     });
@@ -968,6 +966,119 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn pack_with_rule(rule: serde_json::Value) -> LoadedCrashPack {
+        let json = serde_json::json!({
+            "contract": 1,
+            "games": ["test-game"],
+            "parsers": [{
+                "id": "test_parser",
+                "detect": { "all": ["(?m)^==="] },
+                "entry": { "generic": { "name": "text_sections", "config": {
+                    "sections": [{
+                        "id": "main",
+                        "header": "^===$",
+                        "kind": "core.frame",
+                        "lines": [{
+                            "pattern": "^(?P<index>\\d+) (?P<module>\\S+)$",
+                            "attrs": { "index": "index" },
+                            "refs": [{ "kind": "module", "value": "module", "strength": "exec" }]
+                        }]
+                    }]
+                } } }
+            }],
+            "rules": [rule]
+        });
+        LoadedCrashPack {
+            plugin_id: "test.plugin".to_string(),
+            plugin_name: "Test Plugin".to_string(),
+            plugin_version: "1.0".to_string(),
+            dependencies: Vec::new(),
+            official: false,
+            file: "test/crash.json".to_string(),
+            pack: serde_json::from_value(json).unwrap(),
+        }
+    }
+
+    fn analyze_with(pack: LoadedCrashPack, verdict: SessionVerdict) -> AnalyzeOutput {
+        analyze_with_history(
+            &AnalyzeInput {
+                packs: &[pack],
+                files: &[CrashFile {
+                    name: "crash.log".to_string(),
+                    bytes: b"===\n0 modA.dll\n".to_vec(),
+                    origin: CrashFileOrigin::Collected,
+                    source: None,
+                }],
+                runtime_version: None,
+                host: &NoHost,
+                built_in: &[],
+                instance: Some(InstanceAnalysis {
+                    game_id: "test-game",
+                    resolver: &TestResolver,
+                    inspector: &NoInspector,
+                    could_not_check: &[],
+                }),
+            },
+            &[],
+            &[],
+            verdict,
+            None,
+        )
+        .expect("analyze succeeds")
+    }
+
+    #[test]
+    fn test_real_verdict_reaches_the_answer_and_caveat_keeps_every_language() {
+        let pack = pack_with_rule(serde_json::json!({
+            "id": "r1",
+            "version": 1,
+            "when": { "fact": { "kind": "core.frame", "ref": { "kind": "module", "bind": "m" } } },
+            "effects": [{ "finding": {
+                "cause": "version_mismatch", "scope": "mechanism", "level": "possible"
+            } }],
+            "text": { "headline": {
+                "en": "A module was on the stack.",
+                "de": "Ein Mod war im Stapel."
+            } }
+        }));
+        let output = analyze_with(pack, SessionVerdict::ClosedUnknown);
+        assert_eq!(output.answer.verdict, SessionVerdict::ClosedUnknown);
+        let en = output.answer.headline.get("en").expect("en headline");
+        let de = output.answer.headline.get("de").expect("de headline must survive");
+        assert!(en.contains("cannot tell whether"), "{en}");
+        assert!(en.contains("A module was on the stack."), "{en}");
+        assert!(de.contains("cannot tell whether"), "{de}");
+        assert!(de.contains("Ein Mod war im Stapel."), "{de}");
+    }
+
+    #[test]
+    fn test_clean_exit_keeps_the_startup_refusal_warning() {
+        let pack = pack_with_rule(serde_json::json!({
+            "id": "r1",
+            "version": 1,
+            "when": { "fact": { "kind": "core.frame", "ref": { "kind": "module", "bind": "m" } } },
+            "effects": [{ "finding": {
+                "cause": "version_mismatch", "scope": "root_cause", "level": "possible",
+                "candidate": { "owner_of": "m" }, "family": "execution", "weight": 10
+            } }],
+            "text": { "headline": {
+                "en": "The game refused to load {owner:m}: update it or turn it off."
+            } }
+        }));
+        let output = analyze_with(pack, SessionVerdict::Normal);
+        assert_eq!(output.answer.verdict, SessionVerdict::Normal);
+        assert!(
+            output.answer.candidates.is_empty(),
+            "a clean exit accuses nobody"
+        );
+        assert!(
+            !output.answer.findings.is_empty(),
+            "a refused plugin is still a warning after a clean exit"
+        );
+        let headline = output.answer.headline.get("en").cloned().unwrap_or_default();
+        assert!(headline.contains("refused to load"), "{headline}");
     }
 
     #[test]
