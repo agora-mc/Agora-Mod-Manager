@@ -455,6 +455,27 @@ fn launch(
     )
 }
 
+/// Close the launch's session ledger row after its process has exited. The low-level `launch`
+/// runs no game watcher, so without this the open session makes the next mutation refuse.
+fn finish_test_session(ctx: &CoreContext, session_id: Option<&str>) {
+    let Some(session_id) = session_id else {
+        return;
+    };
+    let Ok(conn) = agora_core::db::local_state_connection(&ctx.paths.local_state_db()) else {
+        return;
+    };
+    let done = agora_core::session_ledger::SessionFinish {
+        ended_at: chrono::Utc::now().to_rfc3339(),
+        duration_ms: 0,
+        exit: agora_core::session_ledger::ExitObservation::unavailable("test launch"),
+        game_runtime_ms: Some(0),
+        normal_exit_codes: vec![0],
+        artifact: None,
+        froze: false,
+    };
+    let _ = agora_core::session_ledger::finish(&conn, session_id, &done);
+}
+
 impl Fixture {
     fn id(&self) -> &str {
         &self.inst.instance_id
@@ -2420,8 +2441,10 @@ fn real_injection_rollback_changes_the_bytes_the_game_reads() {
     f.run_ok("nemesis", &RealLauncher::new(&[("AGORA_TEST_TAG", "1")]));
     f.run_ok("nemesis", &RealLauncher::new(&[("AGORA_TEST_TAG", "2")]));
     let launched = launch(&f.ctx, f.id(), &read_def, &RealLauncher::new(&[])).expect("launch");
+    let session_id = launched.session_id.clone();
     let mut child = launched.launched;
     assert!(child.child.wait().unwrap().success());
+    finish_test_session(&f.ctx, session_id.as_deref());
     assert_eq!(
         read_back().trim(),
         "tag 2",
@@ -2430,8 +2453,10 @@ fn real_injection_rollback_changes_the_bytes_the_game_reads() {
 
     game_tools::rollback(&f.ctx, f.id(), &f.def, &ToolId::new("nemesis").unwrap()).unwrap();
     let launched = launch(&f.ctx, f.id(), &read_def, &RealLauncher::new(&[])).expect("launch");
+    let session_id = launched.session_id.clone();
     let mut child = launched.launched;
     assert!(child.child.wait().unwrap().success());
+    finish_test_session(&f.ctx, session_id.as_deref());
     assert_eq!(
         read_back().trim(),
         "tag 1",
@@ -2507,8 +2532,10 @@ fn real_injection_a_game_deletion_is_seen_by_a_tool_run() {
     let mut delete_def = f.def.clone();
     delete_def.launch.as_mut().unwrap().arguments = literal_args(&["/c", "del", r"Data\mod.txt"]);
     let launched = launch(&f.ctx, f.id(), &delete_def, &RealLauncher::new(&[])).expect("launch");
+    let session_id = launched.session_id.clone();
     let mut child = launched.launched;
     assert!(child.child.wait().unwrap().success());
+    finish_test_session(&f.ctx, session_id.as_deref());
     assert!(
         f.writable_dir().join(".agvfs-wh/Data/mod.txt.wh").is_file(),
         "the game's deletion left no whiteout in its writable layer"
