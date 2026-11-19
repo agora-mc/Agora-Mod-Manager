@@ -491,20 +491,33 @@ mod linux_impl {
     }
 
     fn run_prepared(prepared: Prepared) -> Result<ViewOutcome, ViewError> {
-        let (read_fd, write_fd) = pipe2(OFlag::O_CLOEXEC).map_err(std::io::Error::from)?;
-        let read_raw = read_fd.as_raw_fd();
-        let write_raw = write_fd.as_raw_fd();
+        let (status_read, status_write) = pipe2(OFlag::O_CLOEXEC).map_err(std::io::Error::from)?;
+        // A separate close-on-exec pipe proves the command actually started: the child writes to
+        // it only when `execve` fails, and EOF on it means the exec succeeded. The status pipe is
+        // written before the exec (the `K` line), so stopping at its first newline used to hide
+        // an `execve` failure behind a normal-looking run.
+        let (error_read, error_write) = pipe2(OFlag::O_CLOEXEC).map_err(std::io::Error::from)?;
+        let status_read_raw = status_read.as_raw_fd();
+        let status_write_raw = status_write.as_raw_fd();
+        let error_read_raw = error_read.as_raw_fd();
+        let error_write_raw = error_write.as_raw_fd();
         match unsafe { fork() }.map_err(std::io::Error::from)? {
             ForkResult::Child => {
                 // The child never returns: it either execs the command or exits after
                 // reporting why. Nothing is dropped here, so no destructor runs twice.
-                unsafe { c::close(read_raw) };
-                child(&prepared, write_raw);
+                unsafe {
+                    c::close(status_read_raw);
+                    c::close(error_read_raw);
+                }
+                child(&prepared, status_write_raw, error_write_raw);
             }
             ForkResult::Parent { child } => {
-                drop(write_fd);
-                let message = read_message(read_raw);
-                drop(read_fd);
+                drop(status_write);
+                drop(error_write);
+                let message = read_message(status_read_raw);
+                drop(status_read);
+                let exec_error = read_exec_error(error_read_raw)?;
+                drop(error_read);
                 let status = wait_for(child);
                 // Only the `fuse-overlayfs` daemon Agora started is ended. The game's own
                 // process group may hold a wineserver that belongs to the prefix and that
@@ -515,6 +528,13 @@ mod linux_impl {
                 }) = &message
                 {
                     stop_fuse_daemon(*daemon);
+                }
+                if let Some(errno) = exec_error {
+                    let detail = std::io::Error::from_raw_os_error(errno);
+                    return Err(ViewError::Setup(format!(
+                        "cannot start the command '{}': {detail}",
+                        prepared.program.to_string_lossy()
+                    )));
                 }
                 match message {
                     Ok(Message::Ran { mechanism, .. }) => {
@@ -647,10 +667,10 @@ mod linux_impl {
         error
     }
 
-    fn child(prepared: &Prepared, pipe: RawFd) -> ! {
+    fn child(prepared: &Prepared, status: RawFd, error_fd: RawFd) -> ! {
         if unsafe { c::unshare(c::CLONE_NEWUSER) } != 0 {
             step_down(
-                pipe,
+                status,
                 &[
                     Piece::Text(b"unprivileged user namespaces are unavailable: errno "),
                     Piece::Number(last_errno()),
@@ -663,7 +683,7 @@ mod linux_impl {
         let error = write_proc(&prepared.proc_uid_map, &prepared.uid_map);
         if error != 0 {
             step_down(
-                pipe,
+                status,
                 &[
                     Piece::Text(b"cannot map the caller's uid: errno "),
                     Piece::Number(error),
@@ -673,7 +693,7 @@ mod linux_impl {
         let error = write_proc(&prepared.proc_gid_map, &prepared.gid_map);
         if error != 0 {
             step_down(
-                pipe,
+                status,
                 &[
                     Piece::Text(b"cannot map the caller's gid: errno "),
                     Piece::Number(error),
@@ -689,7 +709,7 @@ mod linux_impl {
         // changing the mapping.
         if unsafe { c::unshare(c::CLONE_NEWNS) } != 0 {
             step_down(
-                pipe,
+                status,
                 &[
                     Piece::Text(b"cannot create a mount namespace: errno "),
                     Piece::Number(last_errno()),
@@ -707,7 +727,7 @@ mod linux_impl {
         } != 0
         {
             step_down(
-                pipe,
+                status,
                 &[
                     Piece::Text(b"cannot make the mount namespace private: errno "),
                     Piece::Number(last_errno()),
@@ -716,7 +736,7 @@ mod linux_impl {
         }
         if prepared.refuse {
             step_down(
-                pipe,
+                status,
                 &[Piece::Text(
                     b"overlay mounting was refused by AGORA_LINUX_VIEW_REFUSE_OVERLAY (test hook)",
                 )],
@@ -750,7 +770,7 @@ mod linux_impl {
             match try_fuse(prepared) {
                 Ok(daemon) => Some(daemon),
                 Err(fuse) => step_down(
-                    pipe,
+                    status,
                     &[
                         Piece::Text(b"kernel overlayfs with userxattr (errno "),
                         Piece::Number(kernel_error),
@@ -775,7 +795,7 @@ mod linux_impl {
             {
                 kill_daemon(daemon);
                 failed(
-                    pipe,
+                    status,
                     &[
                         Piece::Text(b"cannot bind the instance copy over '"),
                         Piece::Text(real.to_bytes()),
@@ -790,7 +810,7 @@ mod linux_impl {
             if unsafe { c::chdir(directory.as_ptr()) } != 0 {
                 kill_daemon(daemon);
                 failed(
-                    pipe,
+                    status,
                     &[
                         Piece::Text(b"cannot enter the working folder: errno "),
                         Piece::Number(last_errno()),
@@ -801,21 +821,20 @@ mod linux_impl {
 
         match daemon {
             None => {
-                if !write_raw(pipe, &prepared.kernel_message) {
+                if !write_raw(status, &prepared.kernel_message) {
                     unsafe { c::_exit(125) };
                 }
             }
             Some(daemon) => {
-                let wrote = write_raw(pipe, &prepared.fuse_message_prefix)
-                    && write_number(pipe, daemon)
-                    && write_raw(pipe, b"\n");
+                let wrote = write_raw(status, &prepared.fuse_message_prefix)
+                    && write_number(status, daemon)
+                    && write_raw(status, b"\n");
                 if !wrote {
                     kill_daemon(Some(daemon));
                     unsafe { c::_exit(125) };
                 }
             }
         }
-        // The write end is close-on-exec, so it goes away exactly when the command starts.
         unsafe {
             c::execve(
                 prepared.program.as_ptr(),
@@ -823,14 +842,14 @@ mod linux_impl {
                 prepared.envp_ptr.as_ptr(),
             )
         };
+        // `execve` only returns on failure. The status pipe already carries the `K` line, so the
+        // errno goes on the separate close-on-exec pipe: EOF there is proof the command started.
+        let errno = last_errno();
+        let _ = write_raw(error_fd, b"E\t");
+        let _ = write_number(error_fd, errno);
+        let _ = write_raw(error_fd, b"\n");
         kill_daemon(daemon);
-        failed(
-            pipe,
-            &[
-                Piece::Text(b"cannot start the command: errno "),
-                Piece::Number(last_errno()),
-            ],
-        );
+        unsafe { c::_exit(FAILED_EXIT) };
     }
 
     fn kill_daemon(daemon: Option<i32>) {
@@ -1007,6 +1026,52 @@ mod linux_impl {
         fstype.is_some_and(|fs| {
             fs == b"fuse.fuse-overlayfs" || fs == b"fuse.overlay" || fs == b"overlay"
         })
+    }
+
+    /// Read the close-on-exec error pipe to EOF. `None` means the command started; `Some(errno)`
+    /// is what `execve` failed with. An unreadable or unexpected report is an error, never
+    /// permission to claim a run happened.
+    fn read_exec_error(fd: RawFd) -> Result<Option<i32>, ViewError> {
+        let mut bytes = [0u8; 32];
+        let mut filled = 0;
+        loop {
+            let read = unsafe {
+                c::read(
+                    fd,
+                    bytes[filled..].as_mut_ptr() as *mut _,
+                    bytes.len() - filled,
+                )
+            };
+            if read < 0 {
+                if last_errno() == c::EINTR {
+                    continue;
+                }
+                return Err(ViewError::Setup(format!(
+                    "cannot confirm the command started: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            if read == 0 {
+                break;
+            }
+            filled += read as usize;
+            if bytes[..filled].contains(&b'\n') || filled == bytes.len() {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&bytes[..filled]);
+        let line = text.lines().next().unwrap_or_default();
+        if line.is_empty() {
+            return Ok(None);
+        }
+        match line.strip_prefix("E\t") {
+            Some(detail) => detail.trim().parse::<i32>().map(Some).map_err(|_| {
+                ViewError::Setup(format!("the view helper reported an unreadable exec error: {line}"))
+            }),
+            None => Err(ViewError::Setup(format!(
+                "the view helper reported an unexpected exec error: {line}"
+            ))),
+        }
     }
 
     fn read_message(fd: RawFd) -> Result<Message, String> {

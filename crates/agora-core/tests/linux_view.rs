@@ -765,6 +765,50 @@ fn fuse_overlay_runs_when_the_kernel_refuses() {
 /// Agora holds is the short-lived wrapper, so neither `PR_SET_PDEATHSIG` nor the stop signal binds
 /// to the process that owns the mount. `-f` keeps the daemon in the foreground (fuse-overlayfs(1)).
 #[test]
+fn a_program_that_does_not_exist_is_a_launch_failure_not_a_run() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    let target = fixture._tmp.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let missing = fixture._tmp.path().join("no-such-program");
+    let request = ViewRequest {
+        instance_id: fixture.instance_id.clone(),
+        target,
+        command: CommandSpec {
+            program: missing.clone(),
+            args: vec![],
+            environment: None,
+            working_directory: None,
+        },
+        per_user_files: vec![],
+    };
+    match linux_view::native().view_and_run(&fixture.ctx, &fixture.def, &request) {
+        Err(error) => {
+            let text = error.to_string();
+            assert!(text.contains("cannot start"), "the error must name the failure: {text}");
+            assert!(
+                text.contains("No such") || text.contains("errno 2"),
+                "the error must name why execve failed: {text}"
+            );
+        }
+        Ok(ViewOutcome::SteppedDown(step)) => {
+            // A host that cannot make user namespaces never reaches execve. Say so; never pass
+            // silently.
+            assert!(
+                std::env::var_os(KNOWN_RESTRICTED_ENV).is_some(),
+                "the view did not run on a capable host: {}",
+                step.reason
+            );
+            eprintln!("SKIPPED on a host marked known-restricted: {}", step.reason);
+        }
+        Ok(ViewOutcome::Ran(run)) => panic!(
+            "a missing program was reported as a normal run (exit {:?})",
+            run.status.code()
+        ),
+    }
+}
+
+#[test]
 fn fuse_daemon_does_not_outlive_the_view() {
     let _serial = serial();
     if !fuse_overlayfs_installed() {
