@@ -420,7 +420,11 @@ pub async fn install_provider_pack(
     print_import_result(&result, json, &format!("'{item}'"))
 }
 
-fn print_import_result(result: &ImportResult, json: bool, what: &str) -> anyhow::Result<()> {
+pub(crate) fn print_import_result(
+    result: &ImportResult,
+    json: bool,
+    what: &str,
+) -> anyhow::Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(result)?);
     } else {

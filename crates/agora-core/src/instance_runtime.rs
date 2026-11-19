@@ -378,6 +378,60 @@ fn ledger_session_running(ctx: &Ctx, instance_id: &str) -> Result<bool, String> 
     Ok(game_has_record(&ctx.paths, instance_id) && !game_is_provably_gone(&ctx.paths, instance_id))
 }
 
+/// Stop the game running an instance, from any process.
+///
+/// A session this process launched is stopped through the session it tracks. Otherwise the game
+/// is found through the runtime lease the launch published, which carries its OS identity, and is
+/// stopped through [`ProcessSessionManager::terminate`](crate::process_session_manager::ProcessSessionManager::terminate)
+/// with the same pid and identity checks: a pid that now belongs to another program is never
+/// killed. A launch that recorded no identity (one that never finished starting, or the official
+/// launcher's, which Agora does not track) cannot be stopped here. Returns the stopped pid.
+pub fn stop_game(ctx: &Ctx, instance_id: &str) -> LauncherResult<u32> {
+    let sessions = &ctx.process_session_manager;
+    if let Some(session) = sessions
+        .list()
+        .into_iter()
+        .find(|session| session.instance_id == instance_id)
+    {
+        sessions.terminate(session.session_id, session.pid)?;
+        return Ok(session.pid);
+    }
+    let not_running = || LauncherError::Generic {
+        code: "ERR_GAME_NOT_RUNNING".into(),
+        message: format!("Agora has no record of a running game for '{instance_id}'."),
+    };
+    let lease = read(&ctx.paths, instance_id)?.ok_or_else(not_running)?;
+    let identity = match (lease.state, lease.identity) {
+        (RuntimeState::Running, Some(identity)) => identity,
+        (RuntimeState::Running, None) | (RuntimeState::Starting, _) => {
+            return Err(LauncherError::Generic {
+                code: "ERR_GAME_IDENTITY_UNKNOWN".into(),
+                message: format!(
+                    "A launch of '{instance_id}' was recorded without the game's process identity, \
+                     so Agora cannot safely tell which process to stop. Close the game yourself."
+                ),
+            })
+        }
+    };
+    let pid = identity.pid;
+    let session_id = uuid::Uuid::new_v4().as_u64_pair().0;
+    sessions.register(crate::process_session_manager::ProcessSession {
+        instance_id: instance_id.to_string(),
+        session_id,
+        pid,
+        process_identity: identity,
+        snapshot_id: String::new(),
+        start_time: std::time::SystemTime::now(),
+        attached: false,
+        user_cancelled: false,
+    })?;
+    let result = sessions.terminate(session_id, pid);
+    // The session existed only to run the checks; nothing in this process waits on its exit.
+    sessions.remove(session_id);
+    sessions.take_user_stop(session_id);
+    result.map(|()| pid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +525,46 @@ mod tests {
             !game_is_provably_gone(&paths, "demo"),
             "an unfinished launch is not proof"
         );
+    }
+
+    fn stop_ctx() -> (Ctx, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = crate::ctx::CoreContext::for_testing(tmp.path().to_path_buf());
+        fs::create_dir_all(ctx.paths.locks_root()).unwrap();
+        (ctx, tmp)
+    }
+
+    #[test]
+    fn stopping_an_instance_with_no_launch_record_is_an_error() {
+        let (ctx, _tmp) = stop_ctx();
+        let error = stop_game(&ctx, "demo").unwrap_err();
+        assert_eq!(error.code(), "ERR_GAME_NOT_RUNNING");
+    }
+
+    #[test]
+    fn a_launch_without_an_identity_is_never_guessed_at() {
+        let (ctx, _tmp) = stop_ctx();
+        publish_starting(&ctx.paths, "demo").unwrap();
+        let error = stop_game(&ctx, "demo").unwrap_err();
+        assert_eq!(error.code(), "ERR_GAME_IDENTITY_UNKNOWN");
+        assert!(ctx.process_session_manager.list().is_empty());
+    }
+
+    #[test]
+    fn a_recorded_game_that_is_gone_is_reported_stale_and_nothing_is_kept() {
+        let (ctx, _tmp) = stop_ctx();
+        let me = process_identity::capture_self().expect("identity of this test process");
+        let gone = ProcessIdentity {
+            pid: u32::MAX - 2,
+            ..me
+        };
+        let generation = publish_starting(&ctx.paths, "demo").unwrap();
+        publish_running(&ctx.paths, "demo", &generation, gone).unwrap();
+        let error = stop_game(&ctx, "demo").unwrap_err();
+        assert!(
+            matches!(error, LauncherError::ProcessStale { .. }),
+            "{error:?}"
+        );
+        assert!(ctx.process_session_manager.list().is_empty());
     }
 }

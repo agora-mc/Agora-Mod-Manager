@@ -3410,28 +3410,12 @@ pub async fn report_still_crashing(
 ) -> LauncherResult<agora_core::crash_service::InvestigationResult> {
     tokio::task::spawn_blocking(move || {
         let ctx = crate::core_context(&app)?;
-        let some_answer = latest_analyzed_answer(&ctx, &instance_id)?;
-        let Some(answer) = some_answer else {
-            return Ok(agora_core::crash_service::InvestigationResult {
-                suspects: Vec::new(),
-                suggested_action: agora_core::crash_service::SuggestedAction::NoSuspects,
-                ruled_out: vec![ruled_out_owner_key],
-            });
-        };
-        let view = crash_instance_view(&ctx, &instance_id)?;
-        let mut suspects = agora_core::crash_live::suspects_for_test(&answer, view.as_ref());
-        suspects.retain(|suspect| suspect.mod_id != ruled_out_owner_key);
-        let suggested_action = suspects.first().map_or(
-            agora_core::crash_service::SuggestedAction::NoSuspects,
-            |next| agora_core::crash_service::SuggestedAction::GuidedDisable {
-                next_suspect: next.clone(),
-            },
-        );
-        Ok(agora_core::crash_service::InvestigationResult {
-            suspects,
-            suggested_action,
-            ruled_out: vec![ruled_out_owner_key],
-        })
+        agora_core::crash_live::report_still_crashing(
+            &ctx,
+            &instance_id,
+            &ruled_out_owner_key,
+            Some(&agora_game_minecraft::installed_content::MinecraftInstanceProvider),
+        )
     })
     .await
     .map_err(|_| LauncherError::LocalStateFailed)?
@@ -3448,30 +3432,12 @@ pub async fn resolve_crash_suspect_file(
 ) -> LauncherResult<String> {
     tokio::task::spawn_blocking(move || {
         let ctx = crate::core_context(&app)?;
-        let view =
-            crash_instance_view(&ctx, &instance_id)?.ok_or_else(|| LauncherError::Generic {
-                code: "ERR_CRASH_INSTANCE_VIEW".into(),
-                message: format!("Instance '{instance_id}' could not be read."),
-            })?;
-        let content_key =
-            owner_key
-                .strip_prefix("item:")
-                .ok_or_else(|| LauncherError::Generic {
-                    code: "ERR_CRASH_SUSPECT_NOT_ITEM".into(),
-                    message: "That suspect is not an installed item, so it cannot be turned off."
-                        .to_string(),
-                })?;
-        let file = view
-            .item_files(content_key)
-            .and_then(|files| files.into_iter().next())
-            .and_then(|path| path.rsplit(['/', '\\']).next().map(str::to_string))
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| LauncherError::Generic {
-                code: "ERR_CRASH_SUSPECT_NO_FILE".into(),
-                message: "Agora could not find the file for that suspect in this instance."
-                    .to_string(),
-            })?;
-        Ok(file)
+        agora_core::crash_live::resolve_suspect_file(
+            &ctx,
+            &instance_id,
+            &owner_key,
+            Some(&agora_game_minecraft::installed_content::MinecraftInstanceProvider),
+        )
     })
     .await
     .map_err(|_| LauncherError::LocalStateFailed)?
@@ -3481,23 +3447,7 @@ fn latest_analyzed_answer(
     ctx: &agora_core::ctx::Ctx,
     instance_id: &str,
 ) -> LauncherResult<Option<agora_game_api::crash::CrashAnswer>> {
-    let conn =
-        agora_core::db::local_state_connection(&ctx.paths.local_state_db()).map_err(|error| {
-            LauncherError::Generic {
-                code: "ERR_LOCAL_STATE_FAILED".into(),
-                message: error.to_string(),
-            }
-        })?;
-    let stored = agora_core::crash_live::latest_answer(&conn, instance_id).map_err(|error| {
-        LauncherError::Generic {
-            code: "ERR_CRASH_ANSWER".into(),
-            message: error.to_string(),
-        }
-    })?;
-    Ok(stored.and_then(|stored| match stored.answer {
-        agora_core::crash_live::StoredAnswer::Analyzed { answer, .. } => Some(*answer),
-        _ => None,
-    }))
+    agora_core::crash_live::latest_analyzed_answer(ctx, instance_id)
 }
 
 fn crash_instance_view(

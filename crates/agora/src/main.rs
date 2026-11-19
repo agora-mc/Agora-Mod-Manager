@@ -1,5 +1,6 @@
 #![warn(clippy::large_futures)]
 mod cli_bisect;
+mod cli_content_parity;
 mod cli_crash;
 mod cli_packs;
 
@@ -1468,6 +1469,8 @@ enum InstanceCmd {
     RepairLoader { id: String },
     /// Explain the current automatic memory estimate without changing settings.
     RecommendMemory { id: String },
+    #[command(flatten)]
+    Parity(cli_content_parity::InstanceParityCmd),
     /// Check installed content for newer versions. With --apply, plan the updates
     /// as one batch (one snapshot, full rollback); add --yes to run that plan.
     Updates {
@@ -1503,6 +1506,8 @@ enum ProviderCmd {
     /// Print the plan digest a curator pins as `sha256` for a `provider_pack`
     /// catalog entry. IDENTIFIER is `<provider-id>:<project-id>@<version-id>`.
     PlanDigest { identifier: String },
+    #[command(flatten)]
+    Parity(cli_content_parity::ProviderParityCmd),
 }
 
 #[derive(Subcommand)]
@@ -1900,6 +1905,8 @@ enum ModsCmd {
     /// Dependency graph, orphans, why a mod is here, and disable impact (read-only).
     #[command(flatten)]
     Tools(cli_tools::ModsToolsCmd),
+    #[command(flatten)]
+    Parity(cli_content_parity::ModsParityCmd),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1956,6 +1963,8 @@ enum RegistryCmd {
         )]
         limit: u32,
     },
+    #[command(flatten)]
+    Parity(cli_content_parity::RegistryParityCmd),
 }
 
 #[derive(Subcommand)]
@@ -1976,6 +1985,8 @@ enum SnapshotsCmd {
         instance: String,
         snapshot_id: String,
     },
+    #[command(flatten)]
+    Parity(cli_content_parity::SnapshotsParityCmd),
 }
 
 #[derive(Subcommand)]
@@ -2112,6 +2123,8 @@ enum PackCmd {
         #[arg(long, help = "Apply the update without asking")]
         yes: bool,
     },
+    #[command(flatten)]
+    Parity(cli_content_parity::PackParityCmd),
 }
 
 #[derive(Subcommand)]
@@ -2139,6 +2152,8 @@ enum LoadoutCmd {
     },
     /// Delete a loadout profile.
     Delete { instance: String, name: String },
+    #[command(flatten)]
+    Parity(cli_content_parity::LoadoutParityCmd),
 }
 
 #[derive(Subcommand)]
@@ -2222,6 +2237,8 @@ enum CrashCmd {
         #[arg(long, requires = "json")]
         facts: bool,
     },
+    #[command(flatten)]
+    Parity(cli_content_parity::CrashParityCmd),
 }
 
 #[derive(Subcommand)]
@@ -4346,6 +4363,7 @@ async fn run_mods_command(
             cli_updates::mod_changelog(ctx, &instance, &file, json).await?
         }
         ModsCmd::Tools(action) => cli_tools::run_mods_tools(action, ctx, output_fmt)?,
+        ModsCmd::Parity(action) => cli_content_parity::run_mods(action, ctx, output_fmt).await?,
         ModsCmd::UpdateAll {
             instance,
             include_optional,
@@ -4630,6 +4648,9 @@ async fn run_instance_command(
                 println!("Unlocked instance '{}'", id);
             }
         }
+        InstanceCmd::Parity(action) => {
+            Box::pin(cli_content_parity::run_instance(action, ctx, output_fmt)).await?
+        }
         InstanceCmd::Tools(action) => {
             Box::pin(cli_tools::run_instance_tools(action, ctx, output_fmt)).await?
         }
@@ -4785,6 +4806,9 @@ async fn run_pack_command(
     let json = output_fmt.is_json_output();
     match action {
         PackCmd::Export(args) => cli_packs::pack_export(args, data_dir, ctx, output_fmt).await?,
+        PackCmd::Parity(action) => {
+            Box::pin(cli_content_parity::run_pack(action, ctx, output_fmt)).await?
+        }
         PackCmd::Review(args) => cli_packs::pack_review(args, ctx, output_fmt).await?,
         PackCmd::Import(args) => cli_packs::pack_import(args, ctx, output_fmt).await?,
         PackCmd::Install {
@@ -4995,6 +5019,7 @@ async fn run_snapshots_command(
 ) -> anyhow::Result<()> {
     let json = output_fmt.is_json_output();
     match action {
+        SnapshotsCmd::Parity(action) => cli_content_parity::run_snapshots(action, ctx, output_fmt)?,
         SnapshotsCmd::List { instance } => {
             let instance_dir = agora_core::paths::instance_dir(data_dir, &instance)?;
             if !instance_dir.exists() {
@@ -5415,6 +5440,7 @@ async fn run_crash_command(
 ) -> anyhow::Result<()> {
     let json = output_fmt.is_json_output();
     match action {
+        CrashCmd::Parity(action) => cli_content_parity::run_crash(action, ctx, output_fmt)?,
         CrashCmd::List { instance } => {
             catch_up_crash_answers(ctx, &instance);
             let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())?;
@@ -5763,6 +5789,7 @@ async fn run_registry_command(
 ) -> anyhow::Result<()> {
     let json = output_fmt.is_json_output();
     match action {
+        RegistryCmd::Parity(action) => cli_content_parity::run_registry(action, ctx, output_fmt)?,
         RegistryCmd::Status => {
             let local_state = data_dir.join("local_state.db");
             let _repo = agora_core::registry_sync::resolve_registry_repo(registry_repo);
@@ -5891,6 +5918,7 @@ async fn run_loadout_command(
 ) -> anyhow::Result<()> {
     let json = output_fmt.is_json_output();
     match action {
+        LoadoutCmd::Parity(action) => cli_content_parity::run_loadout(action, ctx, output_fmt)?,
         LoadoutCmd::Create { instance, name } => {
             let instance_dir = agora_core::paths::instance_dir(data_dir, &instance)?;
             if !instance_dir.exists() {
@@ -6271,6 +6299,10 @@ async fn run_command(
                             if enabled { "on" } else { "off" }
                         );
                     }
+                }
+                ProviderCmd::Parity(action) => {
+                    cli_content_parity::run_provider(action.clone(), ctx, &registry, output_fmt)
+                        .await?
                 }
                 ProviderCmd::PlanDigest { identifier } => {
                     let digest = agora_game_minecraft::providers::install::curated_pack_digest(

@@ -1134,7 +1134,7 @@ fn places_word(count: usize) -> &'static str {
     }
 }
 
-fn suspect_line(candidate: &agora_game_api::crash::Candidate) -> String {
+pub(crate) fn suspect_line(candidate: &agora_game_api::crash::Candidate) -> String {
     let risk = candidate
         .save_risk
         .map(save_risk_words)
@@ -1231,7 +1231,7 @@ fn cause_words(cause: agora_game_api::crash::Cause) -> &'static str {
     }
 }
 
-fn english(text: &LocalText) -> &str {
+pub(crate) fn english(text: &LocalText) -> &str {
     text.get("en").map(String::as_str).unwrap_or("")
 }
 
