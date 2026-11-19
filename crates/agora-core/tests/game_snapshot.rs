@@ -932,13 +932,17 @@ impl CatalogTransport for FakeCatalogTransport {
 }
 
 fn zip_archive_bytes() -> Vec<u8> {
+    zip_archive_bytes_named("Data/Test.esp", b"plugin bytes")
+}
+
+fn zip_archive_bytes_named(name: &str, bytes: &[u8]) -> Vec<u8> {
     let mut cursor = Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut cursor);
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored);
-        writer.start_file("Data/Test.esp", options).unwrap();
-        writer.write_all(b"plugin bytes").unwrap();
+        writer.start_file(name, options).unwrap();
+        writer.write_all(bytes).unwrap();
         writer.finish().unwrap();
     }
     cursor.into_inner()
@@ -1128,4 +1132,133 @@ async fn a_backup_fetch_is_refused_when_the_network_is_off() {
         "no request is made when the gate refuses"
     );
     assert!(agora_core::game_instance::get(&ctx, id).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_partial_fetch_leaves_nothing_applied_and_keeps_fetched_objects() {
+    let h = Harness::new();
+    let bytes_one = zip_archive_bytes();
+    let sha_one = agora_core::download::sha256_hex(&bytes_one);
+    let path_one = h.dir().join("one.zip");
+    std::fs::write(&path_one, &bytes_one).unwrap();
+    let item_one = content_store::add_archive_with_source(
+        &h.ctx,
+        &path_one,
+        Some("Fetchable mod"),
+        |sha256, _path| ContentSource::Catalog {
+            item_id: "fake-mod".into(),
+            game: "skyrim-se".into(),
+            release: Some("v1".into()),
+            asset: "fake.zip".into(),
+            sha256: sha256.to_string(),
+            verified: true,
+            added_at_unix_ms: 0,
+        },
+    )
+    .unwrap()
+    .item()
+    .item_id
+    .clone();
+
+    let bytes_two = zip_archive_bytes_named("Data/Other.esp", b"other bytes");
+    let path_two = h.dir().join("two.zip");
+    std::fs::write(&path_two, &bytes_two).unwrap();
+    let item_two = content_store::add_archive_with_source(
+        &h.ctx,
+        &path_two,
+        Some("Missing mod"),
+        |sha256, _path| ContentSource::Catalog {
+            item_id: "missing-mod".into(),
+            game: "skyrim-se".into(),
+            release: Some("v1".into()),
+            asset: "missing.zip".into(),
+            sha256: sha256.to_string(),
+            verified: true,
+            added_at_unix_ms: 0,
+        },
+    )
+    .unwrap()
+    .item()
+    .item_id
+    .clone();
+
+    let mut manifest = h.manifest();
+    manifest.layers = LayerStack::new(vec![
+        Layer {
+            id: LayerId::new("content:one").unwrap(),
+            enabled: true,
+            mount_path: RelPath::default(),
+            source_path: RelPath::default(),
+            source: LayerSource::Content {
+                content: item_one.clone(),
+            },
+            whiteouts: Vec::new(),
+            own_copy: false,
+        },
+        Layer {
+            id: LayerId::new("content:two").unwrap(),
+            enabled: true,
+            mount_path: RelPath::default(),
+            source_path: RelPath::default(),
+            source: LayerSource::Content {
+                content: item_two.clone(),
+            },
+            whiteouts: Vec::new(),
+            own_copy: false,
+        },
+    ])
+    .unwrap();
+    h.write_manifest(&manifest);
+    let snap =
+        game_snapshot::create(&h.ctx, &h.id, &h.def, Some("base"), SnapshotOrigin::User).unwrap();
+    let export = TempDir::new().unwrap();
+    let artifact = backup::export_game_snapshot(
+        &h.dir(),
+        &snap.id,
+        export.path(),
+        &h.ctx.paths.content_root(),
+        false,
+    )
+    .unwrap();
+
+    let empty = TempDir::new().unwrap();
+    let ctx = fresh_context(&h.def, empty.path());
+    let id = "partial";
+    let fetchable = fake_catalog_item(&sha_one);
+    let transport = FakeCatalogTransport::with_archive(bytes_one);
+
+    let error = backup::import_instance_backup_with(
+        &ctx,
+        id,
+        &artifact,
+        true,
+        &transport,
+        move |item_id| {
+            if item_id == "fake-mod" {
+                Ok(Some(fetchable.clone()))
+            } else {
+                Ok(None)
+            }
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(format!("{error}").contains("Missing mod"), "{error}");
+    // The item that could be fetched stays in the store for a retry.
+    let parsed: content_store::ContentItem = serde_json::from_str(
+        &std::fs::read_to_string(ctx.paths.content_item_path(&item_one)).unwrap(),
+    )
+    .unwrap();
+    for file in &parsed.files {
+        assert!(ctx.paths.content_object_path(&file.sha256).is_file());
+    }
+    // Nothing was applied to an instance.
+    assert!(agora_core::game_instance::get(&ctx, id).unwrap().is_none());
+    assert!(!ctx
+        .paths
+        .instance_dir(id)
+        .unwrap()
+        .join(".agora_snapshots")
+        .exists());
 }
