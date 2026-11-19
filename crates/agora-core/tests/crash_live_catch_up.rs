@@ -627,16 +627,18 @@ fn historical_attribution_uses_the_session_launch_manifest() {
     let ended = started + Duration::from_secs(30);
     fixture.write_log("crash-hist.log", started + Duration::from_secs(5));
 
-    let mut manifest = LaunchManifest::default();
-    manifest.owner_layers = vec![LayerView::new(
-        "mod-a",
-        true,
-        LayerOwner::Item {
-            key: "mod-a".to_string(),
-            name: "Mod A".to_string(),
-        },
-        vec!["mods/Mod.dll".to_string()],
-    )];
+    let manifest = LaunchManifest {
+        owner_layers: vec![LayerView::new(
+            "mod-a",
+            true,
+            LayerOwner::Item {
+                key: "mod-a".to_string(),
+                name: "Mod A".to_string(),
+            },
+            vec!["mods/Mod.dll".to_string()],
+        )],
+        ..LaunchManifest::default()
+    };
     let session = session_ledger::begin(
         &conn,
         "inst",
