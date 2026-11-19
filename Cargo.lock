@@ -280,6 +280,7 @@ dependencies = [
  "retour 0.4.0-alpha.4",
  "serde",
  "serde_json",
+ "tempfile",
  "windows-sys 0.59.0",
 ]
 

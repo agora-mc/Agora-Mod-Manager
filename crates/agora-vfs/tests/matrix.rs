@@ -270,7 +270,7 @@ fn run_matrix_case(
     acl: bool,
     bits: Bits,
 ) -> MatrixResult {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|error| error.into_inner());
     let (dll, probe) = find_built_artifacts(bits);
     setup(sb, readonly, acl);
     let results = sb.join("results");

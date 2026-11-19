@@ -12,10 +12,13 @@ use windows_sys::Win32::Foundation::HANDLE;
 use crate::handles;
 #[cfg(windows)]
 use crate::nt::{unicode, ObjectAttributes};
+#[cfg(windows)]
+use crate::util::lock_recover;
 
 /// Which folder a path was opened through: the mount, or one of the configured aliases (by its
 /// index in `aliases`). An alias shows exactly the view of the mount.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(windows, derive(serde::Serialize, serde::Deserialize))]
 pub enum Via {
     Mount,
     Alias(usize),
@@ -30,6 +33,7 @@ pub struct Located {
 
 /// One folder the view is shown at (the mount, or an alias).
 #[derive(Debug, Clone)]
+#[cfg_attr(windows, derive(serde::Serialize, serde::Deserialize))]
 pub struct Prefix {
     pub via: Via,
     /// The folder as configured: normalized, original case, no trailing backslash.
@@ -221,12 +225,29 @@ pub fn whited_out(rel: &str, upper: &Path) -> bool {
     whiteout_path(rel, upper).is_file()
 }
 
-pub fn add_whiteout(rel: &str, upper: &Path) {
+/// Return whether this call created the marker, so a failed operation can undo its own change.
+pub fn add_whiteout(rel: &str, upper: &Path) -> std::io::Result<bool> {
+    if rel.is_empty() || normalize_rel(rel).is_none() {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
     let p = whiteout_path(rel, upper);
     if let Some(parent) = p.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
-    let _ = std::fs::write(p, b"");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&p)
+    {
+        Ok(_) => Ok(true),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::symlink_metadata(&p)?.file_type().is_file() =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub fn clear_whiteout(rel: &str, upper: &Path) {
@@ -290,13 +311,14 @@ pub fn upper_for_write(rel: &str, upper_root: &Path) -> PathBuf {
     p
 }
 
-/// A delete-on-close handle that closes: if a lower layer holds the same path, the lower file would
-/// reappear once the handle (and the upper copy, when it was copied up) is gone, so record a
-/// whiteout. The caller still closes the real handle.
-pub fn note_close(t: &crate::Tracked, cfg: &RuntimeConfig) {
-    if t.delete_on_close && in_any_lower(&t.rel, &cfg.lowers).is_some() {
-        add_whiteout(&t.rel, &cfg.upper);
+/// Record a whiteout if removing an upper entry would expose a lower entry.
+pub fn whiteout_lower(rel: &str, cfg: &RuntimeConfig) -> std::io::Result<bool> {
+    for layer in &cfg.lowers {
+        if layer.join(rel).try_exists()? {
+            return add_whiteout(rel, &cfg.upper);
+        }
     }
+    Ok(false)
 }
 
 #[cfg(windows)]
@@ -315,13 +337,13 @@ pub unsafe fn rel_of_handle(
     handle: HANDLE,
     cfg: &RuntimeConfig,
 ) -> Result<Option<Located>, Unresolved> {
-    if let Some(t) = handles().lock().unwrap().get(&(handle as usize)) {
+    if let Some(t) = lock_recover(handles()).get(&(handle as usize)) {
         return Ok(Some(Located {
             rel: t.rel.clone(),
             via: t.via,
         }));
     }
-    if let Some(cached) = roots().lock().unwrap().get(&(handle as usize)) {
+    if let Some(cached) = lock_recover(roots()).get(&(handle as usize)) {
         return Ok(cached.clone());
     }
     // A name can be longer than MAX_PATH; grow the buffer to the length Windows asks for. A path
@@ -347,16 +369,12 @@ pub unsafe fn rel_of_handle(
         }
         buf.resize(n + 1, 0);
     };
-    let located = if n == 0 {
-        None
-    } else {
-        let path = String::from_utf16_lossy(&buf[..n]);
-        locate(path.strip_prefix(r"\\?\").unwrap_or(&path), cfg)
-    };
-    roots()
-        .lock()
-        .unwrap()
-        .insert(handle as usize, located.clone());
+    if n == 0 {
+        return Err(Unresolved);
+    }
+    let path = String::from_utf16_lossy(&buf[..n]);
+    let located = locate(path.strip_prefix(r"\\?\").unwrap_or(&path), cfg);
+    lock_recover(roots()).insert(handle as usize, located.clone());
     Ok(located)
 }
 
@@ -379,7 +397,16 @@ pub unsafe fn rel_of_attrs(
     if (*oa).root_directory.is_null() || name.starts_with('\\') {
         return Ok(locate(&name, cfg));
     }
-    let Some(root) = rel_of_handle((*oa).root_directory, cfg)? else {
+    locate_relative((*oa).root_directory, &name, cfg)
+}
+
+#[cfg(windows)]
+pub unsafe fn locate_relative(
+    handle: HANDLE,
+    name: &str,
+    cfg: &RuntimeConfig,
+) -> Result<Option<Located>, Unresolved> {
+    let Some(root) = rel_of_handle(handle, cfg)? else {
         return Ok(None);
     };
     let name = name.trim_end_matches('\\');

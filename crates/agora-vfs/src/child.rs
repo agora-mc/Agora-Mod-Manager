@@ -16,7 +16,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr::{null, null_mut};
 
-use agora_vfs_inject::{Failure, Method, OWN_MACHINE};
+use agora_vfs_inject::{Method, OWN_MACHINE};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, HANDLE, TRUE};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::ReadFile;
@@ -38,8 +38,7 @@ use crate::util::{is_inside, set_inside};
 const REASON_LIMIT: usize = 4096;
 
 /// Get `agora_vfs.dll` into the suspended child `process` (process id `pid`), by the child's own
-/// bitness. Returns how it was done, and the reason a remote thread was used when the import table
-/// could not be (as [`agora_vfs_inject::inject_child`] does).
+/// bitness. Returns only after the child confirms its hooks are active.
 ///
 /// # Safety
 /// `process` must be a live handle to a suspended child that has not been resumed.
@@ -47,7 +46,7 @@ pub(crate) unsafe fn inject(
     process: HANDLE,
     pid: u32,
     c: &RuntimeConfig,
-) -> Result<(Method, Option<Failure>), String> {
+) -> Result<Method, String> {
     let machine = agora_vfs_inject::process_machine(process).ok_or_else(|| {
         format!(
             "could not tell what architecture the child {pid} is (error {})",
@@ -66,21 +65,27 @@ pub(crate) unsafe fn inject(
                 ))
             }
         },
-        // Another architecture: the injection refuses it, and nothing is touched.
-        _ => return agora_vfs_inject::inject_child(process, &c.dll),
+        _ => return Err(format!("child {pid} runs on an unsupported architecture")),
     };
     if !dll.is_file() {
         return Err(not_found(process, machine, &dll.display().to_string()));
     }
-    if machine == OWN_MACHINE {
-        return agora_vfs_inject::inject_child(process, &dll);
-    }
-    let helper = agora_vfs_inject::helper_beside(&dll);
-    if !helper.is_file() {
-        return Err(not_found(process, machine, &helper.display().to_string()));
-    }
-    run_helper(&helper, pid, &dll)?;
-    Ok((Method::Helper, None))
+    let config = crate::CONFIG_JSON
+        .get()
+        .ok_or("the parent has no VFS configuration")?;
+    let handoff = crate::bootstrap::Handoff::publish(process, pid, config, &c.prefixes)?;
+    let method = if machine == OWN_MACHINE {
+        agora_vfs_inject::initialize_child(process, &dll)?
+    } else {
+        let helper = agora_vfs_inject::helper_beside(&dll);
+        if !helper.is_file() {
+            return Err(not_found(process, machine, &helper.display().to_string()));
+        }
+        run_helper(&helper, pid, &dll)?;
+        Method::Helper
+    };
+    handoff.wait(process)?;
+    Ok(method)
 }
 
 /// The reason a 32-bit or 64-bit child could not be protected because its VFS files are missing.
@@ -177,7 +182,10 @@ unsafe fn spawn_helper(
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.StartupInfo.hStdError = stderr;
     startup.lpAttributeList = list;
-    let mut command = wide(&agora_vfs_inject::helper_command_line(helper, pid, dll));
+    let mut command = wide(&format!(
+        "{} --initialize",
+        agora_vfs_inject::helper_command_line(helper, pid, dll)
+    ));
     let mut info: PROCESS_INFORMATION = std::mem::zeroed();
     let was_inside = is_inside();
     set_inside(true);

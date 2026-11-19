@@ -2,14 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use windows_sys::Win32::Foundation::HANDLE;
 
 use crate::config::RuntimeConfig;
 use crate::hooks::hooks;
 use crate::nt::*;
 use crate::paths::whited_out;
-use crate::util::{guarded, log};
+use crate::util::{guarded, lock_recover, log};
 
 /// (offset of FileNameLength, offset of FileName) for the listing formats we merge.
 pub fn name_offsets(class: u32) -> Option<(usize, usize)> {
@@ -33,18 +33,52 @@ pub struct Listing {
     pub returned_any: bool,
 }
 
-static LISTINGS: OnceLock<Mutex<HashMap<usize, Listing>>> = OnceLock::new();
-pub fn listings() -> &'static Mutex<HashMap<usize, Listing>> {
+#[derive(Default)]
+pub struct DirectoryScan {
+    pattern: OnceLock<Option<String>>,
+    listing: Mutex<Option<Listing>>,
+}
+
+static LISTINGS: OnceLock<Mutex<HashMap<usize, Arc<DirectoryScan>>>> = OnceLock::new();
+pub fn listings() -> &'static Mutex<HashMap<usize, Arc<DirectoryScan>>> {
     LISTINGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn with_listing<T>(
+    slot: &Mutex<Option<Listing>>,
+    class: u32,
+    restart: bool,
+    build: impl FnOnce() -> Vec<Vec<u8>>,
+    consume: impl FnOnce(&mut Listing) -> T,
+) -> T {
+    if !restart {
+        let mut slot = lock_recover(slot);
+        if let Some(listing) = slot.as_mut().filter(|listing| listing.class == class) {
+            return consume(listing);
+        }
+    }
+
+    // Enumerating real directories can block. The handle's slot survives a racing close without
+    // repopulating the table for a reused handle number.
+    let entries = build();
+    let mut slot = lock_recover(slot);
+    if restart || slot.as_ref().is_some_and(|listing| listing.class != class) {
+        *slot = None;
+    }
+    let listing = slot.get_or_insert(Listing {
+        class,
+        entries,
+        cursor: 0,
+        returned_any: false,
+    });
+    consume(listing)
 }
 
 static UNMERGED_CLASSES: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 pub fn log_unmerged_class_once(class: u32, rel: &str) {
-    let mut set = UNMERGED_CLASSES
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap();
-    if set.insert(class) {
+    let first =
+        lock_recover(UNMERGED_CLASSES.get_or_init(|| Mutex::new(HashSet::new()))).insert(class);
+    if first {
         log(format!(
             "listing class {class} not merged for {rel} (passed through)"
         ));
@@ -174,7 +208,7 @@ fn is_whiteout_dir(folded_name: &str) -> bool {
 pub unsafe fn build_listing(
     rel: &str,
     class: u32,
-    pattern: Option<String>,
+    pattern: Option<&str>,
     cfg: &RuntimeConfig,
 ) -> Vec<Vec<u8>> {
     let mut sources = Vec::new();
@@ -217,7 +251,7 @@ pub unsafe fn build_listing(
                     continue;
                 }
             }
-            if let Some(p) = &pattern {
+            if let Some(p) = pattern {
                 if !wildcard(p, &name) {
                     continue;
                 }
@@ -243,45 +277,57 @@ pub unsafe fn query_directory(
     if crate::util::is_inside() {
         return None;
     }
-    let tracked = crate::handles()
-        .lock()
-        .unwrap()
-        .get(&(handle as usize))
-        .cloned()?;
-    if !tracked.dir {
-        return None;
-    }
-    if name_offsets(class).is_none() {
+    let (tracked, slot) = {
+        // Keep the handle table locked through slot acquisition, so NtClose cannot remove a
+        // tracked handle and leave a newly created slot behind for the same number.
+        let handles = lock_recover(crate::handles());
+        let tracked = handles
+            .get(&(handle as usize))
+            .filter(|tracked| tracked.dir)?
+            .clone();
+        let slot = name_offsets(class).map(|_| {
+            lock_recover(listings())
+                .entry(handle as usize)
+                .or_default()
+                .clone()
+        });
+        (tracked, slot)
+    };
+    let Some(slot) = slot else {
         guarded(|| log_unmerged_class_once(class, &tracked.rel));
         return None;
-    }
+    };
+    // NtQueryDirectoryFile captures FileName on the first call for a handle. RestartScan
+    // rewinds the scan without changing that search expression.
+    // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntquerydirectoryfile
+    let pattern = slot
+        .pattern
+        .get_or_init(|| unicode(pattern).filter(|p| !p.is_empty() && p != "*"))
+        .as_deref();
     guarded(|| {
         log(format!(
-            "list {:?} class {class} single {single} restart {restart} pattern {:?}",
-            tracked.rel,
-            unicode(pattern)
+            "list {:?} class {class} single {single} restart {restart} pattern {pattern:?}",
+            tracked.rel
         ))
     });
-    let mut map = listings().lock().unwrap();
-    let needs_build = restart
-        || map
-            .get(&(handle as usize))
-            .map(|l| l.class != class)
-            .unwrap_or(true);
-    if needs_build {
-        let pattern = unicode(pattern).filter(|p| !p.is_empty() && p != "*");
-        let entries = guarded(|| build_listing(&tracked.rel, class, pattern, cfg))?;
-        map.insert(
-            handle as usize,
-            Listing {
-                class,
-                entries,
-                cursor: 0,
-                returned_any: false,
-            },
-        );
-    }
-    let listing = map.get_mut(&(handle as usize)).unwrap();
+    guarded(|| {
+        with_listing(
+            &slot.listing,
+            class,
+            restart,
+            || build_listing(&tracked.rel, class, pattern, cfg),
+            |listing| write_listing(listing, iosb, out, length, single),
+        )
+    })
+}
+
+unsafe fn write_listing(
+    listing: &mut Listing,
+    iosb: *mut c_void,
+    out: *mut c_void,
+    length: u32,
+    single: bool,
+) -> NTSTATUS {
     let out_bytes = std::slice::from_raw_parts_mut(out as *mut u8, length as usize);
     let mut written = 0usize;
     let mut last_entry_at: Option<usize> = None;
@@ -293,7 +339,7 @@ pub unsafe fn query_directory(
                 let iosb = iosb as *mut usize;
                 *iosb = STATUS_BUFFER_OVERFLOW as u32 as usize;
                 *iosb.add(1) = 0;
-                return Some(STATUS_BUFFER_OVERFLOW);
+                return STATUS_BUFFER_OVERFLOW;
             }
             break;
         }
@@ -320,12 +366,32 @@ pub unsafe fn query_directory(
     let iosb = iosb as *mut usize;
     *iosb = status as u32 as usize;
     *iosb.add(1) = written;
-    Some(status)
+    status
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_whiteout_dir;
+    use super::{is_whiteout_dir, listings, with_listing};
+
+    #[test]
+    fn directory_listing_io_does_not_hold_the_listing_table_lock() {
+        let table_available = std::cell::Cell::new(false);
+        let slot = std::sync::Mutex::new(None);
+        with_listing(
+            &slot,
+            12,
+            true,
+            || {
+                table_available.set(listings().try_lock().is_ok() && slot.try_lock().is_ok());
+                Vec::new()
+            },
+            |_| (),
+        );
+        assert!(
+            table_available.get(),
+            "directory I/O held the listing table lock"
+        );
+    }
 
     #[test]
     fn whiteout_folder_name_matches_whatever_its_case() {

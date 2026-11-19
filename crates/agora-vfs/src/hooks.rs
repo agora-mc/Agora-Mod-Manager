@@ -1,14 +1,19 @@
 use std::collections::HashSet;
 use std::ffi::c_void;
+use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use retour::GenericDetour;
-use windows_sys::Win32::Foundation::{CloseHandle, SetLastError, BOOL, HANDLE};
-use windows_sys::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+use windows_sys::Win32::Foundation::{
+    CloseHandle, SetLastError, BOOL, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, HANDLE,
+};
+use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, FILE_RENAME_INFO};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Threading::*;
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 use crate::cfg;
 use crate::config::RuntimeConfig;
@@ -19,7 +24,7 @@ use crate::paths::*;
 use crate::reverse::{
     fill_name_block, fill_object_name, FILE_ALL_MIN_LEN, FILE_ALL_NAME_AT, FILE_NAME_MIN_LEN,
 };
-use crate::util::{catch_hook_panic, guarded, is_inside, log};
+use crate::util::{catch_hook_panic, guarded, is_inside, lock_recover, log};
 use crate::Tracked;
 
 /// Win32 error codes a refused process start reports.
@@ -31,6 +36,7 @@ type NtQueryInformationFileFn =
     unsafe extern "system" fn(HANDLE, *mut c_void, *mut c_void, u32, u32) -> NTSTATUS;
 type NtQueryObjectFn =
     unsafe extern "system" fn(HANDLE, u32, *mut c_void, u32, *mut u32) -> NTSTATUS;
+type NtDeleteFileFn = unsafe extern "system" fn(*mut ObjectAttributes) -> NTSTATUS;
 
 type NtCreateFileFn = unsafe extern "system" fn(
     *mut HANDLE,
@@ -112,6 +118,7 @@ pub struct Hooks {
     pub query_attr: GenericDetour<NtQueryAttributesFileFn>,
     pub query_full_attr: GenericDetour<NtQueryAttributesFileFn>,
     pub close: GenericDetour<NtCloseFn>,
+    pub delete: GenericDetour<NtDeleteFileFn>,
     pub create_process: GenericDetour<CreateProcessInternalWFn>,
     pub query_dir: GenericDetour<NtQueryDirectoryFileFn>,
     pub query_dir_ex: GenericDetour<NtQueryDirectoryFileExFn>,
@@ -300,7 +307,9 @@ pub fn plan_open(
                 // always does: the file's data must survive while the stream is written beside it.
                 let upper = upper_for_write(&base, &cfg.upper);
                 if !truncates || stream.is_some() {
-                    if let Err(e) = std::fs::copy(&lower, &upper) {
+                    if let Err(e) = copy_up(&lower, &upper, |from, to| {
+                        std::fs::copy(from, to).map(|_| ())
+                    }) {
                         log(format!("copy-up {rel} failed: {e}"));
                         return Plan::Fail(STATUS_ACCESS_DENIED);
                     }
@@ -359,7 +368,6 @@ pub fn plan_open(
             if !creates {
                 return Plan::Fail(STATUS_OBJECT_NAME_NOT_FOUND);
             }
-            clear_whiteout(&base, &cfg.upper);
             let path = with_stream(upper_for_write(&base, &cfg.upper), stream);
             Plan::Open {
                 path,
@@ -372,6 +380,55 @@ pub fn plan_open(
     }
 }
 
+pub(crate) fn copy_up(
+    lower: &Path,
+    upper: &Path,
+    copy: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    static NEXT_COPY: AtomicU64 = AtomicU64::new(0);
+    let dir = upper.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    let temp = loop {
+        let id = NEXT_COPY.fetch_add(1, Ordering::Relaxed);
+        let temp = dir.join(format!(".agvfs-copy-{}-{id}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(_) => break temp,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let outcome = copy(lower, &temp).and_then(|()| {
+        let from: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = upper.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: both paths are nul-terminated. Flags 0 never replace another writer's copy.
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } != 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error().map(|code| code as u32) {
+            Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS) if upper.is_file() => Ok(false),
+            _ => Err(error),
+        }
+    });
+    if matches!(outcome, Ok(true)) {
+        return Ok(());
+    }
+    // CopyFile preserves the source's read-only attribute. Only the staging file is changed here.
+    if let Ok(metadata) = std::fs::metadata(&temp) {
+        let mut permissions = metadata.permissions();
+        if permissions.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)] // Windows file attribute.
+            permissions.set_readonly(false);
+            let _ = std::fs::set_permissions(&temp, permissions);
+        }
+    }
+    let cleanup = std::fs::remove_file(temp);
+    outcome.and(cleanup)
+}
+
 static OPENED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 /// With `verbose=true`, log each file the game opens through the mount, once.
@@ -379,10 +436,7 @@ fn note_open(t: &Tracked, path: &Path, cfg: &RuntimeConfig) {
     if !cfg.verbose || t.dir {
         return;
     }
-    let first = OPENED
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap()
+    let first = lock_recover(OPENED.get_or_init(|| Mutex::new(HashSet::new())))
         .insert(agora_game_api::fold_path_case(&t.rel));
     if first {
         guarded(|| log(format!("opened {} -> {}", t.rel, path.display())));
@@ -390,7 +444,33 @@ fn note_open(t: &Tracked, path: &Path, cfg: &RuntimeConfig) {
 }
 
 fn track(handle: HANDLE, t: Tracked) {
-    handles().lock().unwrap().insert(handle as usize, t);
+    lock_recover(handles()).insert(handle as usize, t);
+}
+
+fn record_whiteout(t: &Tracked, c: &RuntimeConfig) -> Result<bool, NTSTATUS> {
+    let result = if t.lower {
+        add_whiteout(&t.rel, &c.upper)
+    } else {
+        whiteout_lower(&t.rel, c)
+    };
+    result.map_err(|error| {
+        log(format!("whiteout {} failed: {error}", t.rel));
+        STATUS_ACCESS_DENIED
+    })
+}
+
+fn stage_delete_on_close(t: &Tracked, options: u32, c: &RuntimeConfig) -> Result<bool, NTSTATUS> {
+    if options & FILE_DELETE_ON_CLOSE != 0 {
+        guarded(|| record_whiteout(t, c)).unwrap_or(Err(STATUS_ACCESS_DENIED))
+    } else {
+        Ok(false)
+    }
+}
+
+fn undo_whiteout(created: bool, t: &Tracked, c: &RuntimeConfig) {
+    if created {
+        guarded(|| clear_whiteout(&t.rel, &c.upper));
+    }
 }
 
 // ---------------------------------------------------------------- Hook Implementations
@@ -451,6 +531,10 @@ unsafe extern "system" fn nt_create_file(
                 options,
                 track: t,
             }) => {
+                let marker = match stage_delete_on_close(&t, options, c) {
+                    Ok(created) => created,
+                    Err(status) => return status,
+                };
                 let r = redirect(oa, &path);
                 let status = original(
                     handle,
@@ -460,6 +544,7 @@ unsafe extern "system" fn nt_create_file(
                     options,
                 );
                 if status < 0 {
+                    undo_whiteout(marker, &t, c);
                     guarded(|| {
                         log(format!(
                             "NtCreateFile {} -> {} failed {status:#x}",
@@ -469,6 +554,18 @@ unsafe extern "system" fn nt_create_file(
                     });
                 }
                 if status >= 0 {
+                    if !t.lower
+                        && options & FILE_DELETE_ON_CLOSE == 0
+                        && status == STATUS_SUCCESS
+                        && !iosb.is_null()
+                        && (*iosb.cast::<IO_STATUS_BLOCK>()).Information == FILE_CREATED
+                    {
+                        guarded(|| {
+                            if let Some((base, None)) = split_stream(&t.rel) {
+                                clear_whiteout(&base, &c.upper);
+                            }
+                        });
+                    }
                     note_open(&t, &path, c);
                     track(*handle, t);
                 }
@@ -519,6 +616,10 @@ unsafe extern "system" fn nt_open_file(
                 track: t,
                 ..
             }) => {
+                let marker = match stage_delete_on_close(&t, options, c) {
+                    Ok(created) => created,
+                    Err(status) => return status,
+                };
                 let r = redirect(oa, &path);
                 let status = hooks().open.call(
                     handle,
@@ -529,6 +630,7 @@ unsafe extern "system" fn nt_open_file(
                     options,
                 );
                 if status < 0 {
+                    undo_whiteout(marker, &t, c);
                     guarded(|| {
                         log(format!(
                             "NtOpenFile {} -> {} failed {status:#x}",
@@ -555,13 +657,29 @@ unsafe extern "system" fn nt_set_information_file(
     class: u32,
 ) -> NTSTATUS {
     catch_hook_panic("NtSetInformationFile", || {
-        let tracked = handles().lock().unwrap().get(&(handle as usize)).cloned();
-        let (Some(t), false) = (tracked, is_inside()) else {
+        if is_inside() {
             return hooks().set_info.call(handle, iosb, info, len, class);
-        };
+        }
+        let tracked = tracked_of(handle);
         let c = cfg();
         match class {
+            FILE_LINK_INFORMATION | FILE_LINK_INFORMATION_EX
+                if tracked.as_ref().is_some_and(|t| t.lower) =>
+            {
+                STATUS_ACCESS_DENIED
+            }
             FILE_DISPOSITION_INFORMATION | FILE_DISPOSITION_INFORMATION_EX => {
+                let Some(t) = tracked else {
+                    return hooks().set_info.call(handle, iosb, info, len, class);
+                };
+                let required = if class == FILE_DISPOSITION_INFORMATION {
+                    1
+                } else {
+                    4
+                };
+                if info.is_null() || len < required {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
                 let delete = if class == FILE_DISPOSITION_INFORMATION {
                     *(info as *const u8) != 0
                 } else {
@@ -570,20 +688,19 @@ unsafe extern "system" fn nt_set_information_file(
                 if !delete {
                     return hooks().set_info.call(handle, iosb, info, len, class);
                 }
+                let marker = match guarded(|| record_whiteout(&t, c)) {
+                    Some(Ok(created)) => created,
+                    Some(Err(status)) => return status,
+                    None => return STATUS_ACCESS_DENIED,
+                };
                 if t.lower {
-                    guarded(|| {
-                        add_whiteout(&t.rel, &c.upper);
-                        log(format!("whiteout {} (delete of a lower file)", t.rel));
-                    });
+                    guarded(|| log(format!("whiteout {} (delete of a lower file)", t.rel)));
+                    set_iosb(iosb, STATUS_SUCCESS, 0);
                     return STATUS_SUCCESS;
                 }
                 let status = hooks().set_info.call(handle, iosb, info, len, class);
-                if status >= 0 {
-                    guarded(|| {
-                        if in_any_lower(&t.rel, &c.lowers).is_some() {
-                            add_whiteout(&t.rel, &c.upper);
-                        }
-                    });
+                if status < 0 {
+                    undo_whiteout(marker, &t, c);
                 }
                 status
             }
@@ -591,35 +708,54 @@ unsafe extern "system" fn nt_set_information_file(
                 // The layout is FILE_RENAME_INFO's: flags/ReplaceIfExists first, then RootDirectory,
                 // FileNameLength and FileName. Its offsets differ by bitness (x64: 8, 16, 20; i686: 4, 8, 12).
                 let base = info as *const u8;
-                let replace = if class == FILE_RENAME_INFORMATION {
-                    *base != 0
-                } else {
-                    *(base as *const u32) & FILE_RENAME_REPLACE_IF_EXISTS != 0
-                };
                 let root_at = std::mem::offset_of!(FILE_RENAME_INFO, RootDirectory);
                 let length_at = std::mem::offset_of!(FILE_RENAME_INFO, FileNameLength);
                 let name_at = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-                let root = *(base.add(root_at) as *const HANDLE);
-                let name_len = *(base.add(length_at) as *const u32) as usize / 2;
-                let name = String::from_utf16_lossy(std::slice::from_raw_parts(
-                    base.add(name_at) as *const u16,
-                    name_len,
-                ));
-                let target = if root.is_null() {
-                    guarded(|| locate(&name, c)).flatten()
+                if base.is_null() || (len as usize) < name_at {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let name_len = (base.add(length_at) as *const u32).read_unaligned() as usize;
+                if name_len == 0 || !name_len.is_multiple_of(2) || name_len > len as usize - name_at
+                {
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let replace = if class == FILE_RENAME_INFORMATION {
+                    *base != 0
                 } else {
-                    None
+                    (base as *const u32).read_unaligned() & FILE_RENAME_REPLACE_IF_EXISTS != 0
+                };
+                let root = (base.add(root_at) as *const HANDLE).read_unaligned();
+                let name_bytes = std::slice::from_raw_parts(base.add(name_at), name_len);
+                let name = String::from_utf16_lossy(
+                    &name_bytes
+                        .chunks_exact(2)
+                        .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+                        .collect::<Vec<_>>(),
+                );
+                let target = guarded(|| {
+                    if root.is_null() {
+                        Ok(locate(&name, c))
+                    } else {
+                        locate_relative(root, &name, c)
+                    }
+                });
+                let Some(Ok(target)) = target else {
+                    return STATUS_ACCESS_DENIED;
                 };
                 let Some(Located {
                     rel: target_rel,
                     via: target_via,
                 }) = target
                 else {
-                    if t.lower {
+                    if tracked.as_ref().is_some_and(|t| t.lower) {
                         // Moving a lower file out of the mount would take it from its layer.
                         return STATUS_ACCESS_DENIED;
                     }
                     return hooks().set_info.call(handle, iosb, info, len, class);
+                };
+                let Some(t) = tracked else {
+                    // A move into the view from an untracked source must not reach the mount.
+                    return STATUS_ACCESS_DENIED;
                 };
                 let Some(target_rel) = normalize_rel(&target_rel) else {
                     // A target with `..`, a stream or a device name would land outside the view.
@@ -637,8 +773,13 @@ unsafe extern "system" fn nt_set_information_file(
                     if t.lower {
                         let source =
                             in_any_lower(&t.rel, &c.lowers).ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-                        std::fs::copy(&source, &target).map_err(|_| STATUS_ACCESS_DENIED)?;
-                        add_whiteout(&t.rel, &c.upper);
+                        let marker = record_whiteout(&t, c)?;
+                        if std::fs::copy(&source, &target).is_err() {
+                            if marker {
+                                clear_whiteout(&t.rel, &c.upper);
+                            }
+                            return Err(STATUS_ACCESS_DENIED);
+                        }
                         clear_whiteout(&target_rel, &c.upper);
                         log(format!(
                             "rename {} -> {} (copied from a lower layer)",
@@ -654,6 +795,11 @@ unsafe extern "system" fn nt_set_information_file(
                     Some(Err(status)) => status,
                     Some(Ok(None)) => STATUS_SUCCESS,
                     Some(Ok(Some(target))) => {
+                        let marker = match guarded(|| record_whiteout(&t, c)) {
+                            Some(Ok(created)) => created,
+                            Some(Err(status)) => return status,
+                            None => return STATUS_ACCESS_DENIED,
+                        };
                         // Upper-to-upper: the real rename, pointed at the upper path.
                         let wide: Vec<u16> = "\\??\\"
                             .encode_utf16()
@@ -661,9 +807,6 @@ unsafe extern "system" fn nt_set_information_file(
                             .collect();
                         // The FILE_RENAME_INFO layout differs by bitness: the root handle is at 8 on
                         // x64 and 4 on i686, and the name is after its length.
-                        let root_at = std::mem::offset_of!(FILE_RENAME_INFO, RootDirectory);
-                        let length_at = std::mem::offset_of!(FILE_RENAME_INFO, FileNameLength);
-                        let name_at = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
                         let new_len = name_at + wide.len() * 2;
                         let mut buf = vec![0u64; new_len.div_ceil(8)];
                         let p = buf.as_mut_ptr() as *mut u8;
@@ -684,24 +827,60 @@ unsafe extern "system" fn nt_set_information_file(
                             class,
                         );
                         if status >= 0 {
-                            guarded(|| {
-                                if in_any_lower(&t.rel, &c.lowers).is_some() {
-                                    add_whiteout(&t.rel, &c.upper);
-                                }
-                                clear_whiteout(&target_rel, &c.upper);
-                            });
-                            if let Some(entry) =
-                                handles().lock().unwrap().get_mut(&(handle as usize))
+                            guarded(|| clear_whiteout(&target_rel, &c.upper));
+                            if let Some(entry) = lock_recover(handles()).get_mut(&(handle as usize))
                             {
                                 entry.rel = target_rel;
                                 entry.via = target_via;
                             }
+                        } else {
+                            undo_whiteout(marker, &t, c);
                         }
                         status
                     }
                 }
             }
             _ => hooks().set_info.call(handle, iosb, info, len, class),
+        }
+    })
+}
+
+unsafe extern "system" fn nt_delete_file(oa: *mut ObjectAttributes) -> NTSTATUS {
+    catch_hook_panic("NtDeleteFile", || {
+        let c = cfg();
+        match guarded(|| {
+            let located = rel_of_attrs(oa, c).map_err(|_| STATUS_ACCESS_DENIED)?;
+            let Some(located) = located else {
+                return Ok(None);
+            };
+            let Some(rel) = normalize_rel(&located.rel).filter(|rel| !rel.is_empty()) else {
+                return Err(STATUS_ACCESS_DENIED);
+            };
+            match resolve(&rel, c) {
+                Resolved::WhitedOut | Resolved::Missing => Err(STATUS_OBJECT_NAME_NOT_FOUND),
+                Resolved::Lower(path) => {
+                    // The lower file is never submitted to the kernel for deletion.
+                    if path.is_dir() {
+                        return Err(STATUS_ACCESS_DENIED);
+                    }
+                    add_whiteout(&rel, &c.upper).map_err(|_| STATUS_ACCESS_DENIED)?;
+                    Ok(Some(STATUS_SUCCESS))
+                }
+                Resolved::Upper(path) => {
+                    let marker = whiteout_lower(&rel, c).map_err(|_| STATUS_ACCESS_DENIED)?;
+                    let redirected = redirect(oa, &path);
+                    let status = hooks()
+                        .delete
+                        .call(&*redirected.attrs as *const _ as *mut _);
+                    if status < 0 && marker {
+                        clear_whiteout(&rel, &c.upper);
+                    }
+                    Ok(Some(status))
+                }
+            }
+        }) {
+            None | Some(Ok(None)) => hooks().delete.call(oa),
+            Some(Ok(Some(status)) | Err(status)) => status,
         }
     })
 }
@@ -789,31 +968,19 @@ unsafe extern "system" fn nt_query_information_by_name(
 
 unsafe extern "system" fn nt_close(handle: HANDLE) -> NTSTATUS {
     catch_hook_panic("NtClose", || {
-        // Our own file work closes handles while holding the listing lock; those handles were never
-        // tracked, and taking the lock again on this thread would deadlock.
+        // Our internal file work never adds handles to these tables.
         if is_inside() {
             return hooks().close.call(handle);
         }
-        if let Ok(mut m) = listings().lock() {
-            m.remove(&(handle as usize));
-        }
-        if let Ok(mut m) = roots().lock() {
-            m.remove(&(handle as usize));
-        }
-        let removed = handles()
-            .lock()
-            .ok()
-            .and_then(|mut m| m.remove(&(handle as usize)));
-        if let Some(t) = removed {
-            if t.delete_on_close {
-                // A copied-up file is really deleted from the upper layer; without a marker the
-                // lower original would reappear. A lower handle is never really deleted, so this
-                // is its delete.
-                let c = cfg();
-                guarded(|| note_close(&t, c));
-            }
-        }
-        hooks().close.call(handle)
+        let removed = lock_recover(handles()).remove(&(handle as usize));
+        lock_recover(listings()).remove(&(handle as usize));
+        lock_recover(roots()).remove(&(handle as usize));
+        // A lower handle never carries native delete-on-close. Its logical delete is the marker.
+        let marker = removed
+            .filter(|t| t.lower && t.delete_on_close)
+            .map(|t| guarded(|| record_whiteout(&t, cfg())).unwrap_or(Err(STATUS_ACCESS_DENIED)));
+        let status = hooks().close.call(handle);
+        marker.and_then(Result::err).unwrap_or(status)
     })
 }
 
@@ -867,27 +1034,33 @@ unsafe extern "system" fn create_process_internal_w(
         // Our own file work (the short path name, the log) must not be redirected.
         let was_inside = is_inside();
         crate::util::set_inside(true);
-        let injected = crate::child::inject((*pi).hProcess, (*pi).dwProcessId, c);
+        let injected =
+            crate::child::inject((*pi).hProcess, (*pi).dwProcessId, c).and_then(|method| {
+                if flags & CREATE_SUSPENDED == 0 && ResumeThread((*pi).hThread) == u32::MAX {
+                    return Err(format!(
+                        "could not resume the protected child (error {})",
+                        windows_sys::Win32::Foundation::GetLastError()
+                    ));
+                }
+                Ok(method)
+            });
         crate::util::set_inside(was_inside);
         match injected {
-            Ok((method, fallback_from)) => {
+            Ok(method) => {
                 log(format!(
-                    "injected child {} by {}{}",
+                    "injected child {} by {} and confirmed its hooks",
                     (*pi).dwProcessId,
                     method.describe(),
-                    fallback_from
-                        .map(|why| format!(" (import-table injection was not possible: {why})"))
-                        .unwrap_or_default()
                 ));
-                if flags & CREATE_SUSPENDED == 0 {
-                    ResumeThread((*pi).hThread);
-                }
             }
             Err(e) => {
                 // A child that is not under the VFS must not run: it could write to the layers.
+                let exe = agora_vfs_inject::image_path((*pi).hProcess)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| format!("child {}", (*pi).dwProcessId));
                 log(format!(
-                    "inject into child {} failed, so it is ended: {e}",
-                    (*pi).dwProcessId
+                    "ending the process {exe}: injection into child {} failed, so it is ended: {e}",
+                    (*pi).dwProcessId,
                 ));
                 TerminateProcess((*pi).hProcess, crate::EXIT_UNPROTECTED);
                 CloseHandle((*pi).hThread);
@@ -1117,8 +1290,8 @@ unsafe extern "system" fn nt_query_directory_file_ex(
 }
 
 /// The tracked record of a handle, if the DLL opened it.
-unsafe fn tracked_of(handle: HANDLE) -> Option<Tracked> {
-    handles().lock().unwrap().get(&(handle as usize)).cloned()
+fn tracked_of(handle: HANDLE) -> Option<Tracked> {
+    lock_recover(handles()).get(&(handle as usize)).cloned()
 }
 
 /// Write an IO_STATUS_BLOCK: the status, then the information.
@@ -1253,6 +1426,10 @@ pub unsafe fn install_hooks() -> Result<(), retour::Error> {
         nt_query_full_attributes_file,
     )?;
     let close = GenericDetour::new(proc_addr::<NtCloseFn>("ntdll.dll", "NtClose"), nt_close)?;
+    let delete = GenericDetour::new(
+        proc_addr::<NtDeleteFileFn>("ntdll.dll", "NtDeleteFile"),
+        nt_delete_file,
+    )?;
     let create_process = GenericDetour::new(
         proc_addr::<CreateProcessInternalWFn>("kernelbase.dll", "CreateProcessInternalW"),
         create_process_internal_w,
@@ -1285,6 +1462,7 @@ pub unsafe fn install_hooks() -> Result<(), retour::Error> {
         query_attr,
         query_full_attr,
         close,
+        delete,
         create_process,
         query_dir,
         query_dir_ex,
@@ -1307,13 +1485,14 @@ pub unsafe fn install_hooks() -> Result<(), retour::Error> {
         }
     }
 
-    let all_hooks: [&dyn HookEnable; 12] = [
+    let all_hooks: [&dyn HookEnable; 13] = [
         &h.create,
         &h.open,
         &h.set_info,
         &h.query_attr,
         &h.query_full_attr,
         &h.close,
+        &h.delete,
         &h.create_process,
         &h.query_dir,
         &h.query_dir_ex,
@@ -1342,6 +1521,33 @@ pub unsafe fn install_hooks() -> Result<(), retour::Error> {
 mod start_tests {
     use super::*;
     use crate::config::VfsConfig;
+
+    #[test]
+    fn a_poisoned_handle_table_remains_usable() {
+        let panicked = std::thread::spawn(|| {
+            let _table = handles().lock().unwrap_or_else(|error| error.into_inner());
+            panic!("synthetic hook panic");
+        })
+        .join();
+        assert!(panicked.is_err());
+
+        let handle = usize::MAX as HANDLE;
+        track(
+            handle,
+            Tracked {
+                rel: "probe.txt".to_string(),
+                via: Via::Mount,
+                lower: true,
+                delete_on_close: false,
+                dir: false,
+            },
+        );
+        assert_eq!(tracked_of(handle).unwrap().rel, "probe.txt");
+        handles()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&(handle as usize));
+    }
 
     /// A mount that is also the lowest layer, holding `SkyrimSE.exe` and `Data\`, as a game launch has.
     fn mount_config(root: &Path) -> RuntimeConfig {

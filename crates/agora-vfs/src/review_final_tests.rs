@@ -6,11 +6,55 @@ use crate::config::{RuntimeConfig, VfsConfig};
 use crate::hooks::{plan_open, Plan};
 use crate::nt::*;
 use crate::paths::{
-    add_system_forms, add_whiteout, normalize_rel, note_close, rel_of_handle, resolve,
-    upper_for_write, whited_out, Resolved, Via,
+    add_system_forms, add_whiteout, normalize_rel, rel_of_handle, resolve, upper_for_write,
+    whited_out, whiteout_lower, Resolved, Via,
 };
-use crate::Tracked;
 use std::path::{Path, PathBuf};
+
+#[test]
+fn copy_up_stays_private_and_does_not_replace_a_winner() {
+    use std::io::Write;
+    use std::sync::mpsc::channel;
+
+    use crate::hooks::copy_up;
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("lower.txt");
+    let target = root.path().join("upper.txt");
+    std::fs::write(&source, b"first second").unwrap();
+    let (half_written, half) = channel();
+    let (finish, may_finish) = channel();
+    let (published_early, winner, delayed) = std::thread::scope(|scope| {
+        let source = &source;
+        let target = &target;
+        let delayed = scope.spawn(move || {
+            copy_up(source, target, |_, to| {
+                let mut file = std::fs::File::create(to)?;
+                file.write_all(b"first")?;
+                half_written.send(()).unwrap();
+                may_finish.recv().unwrap();
+                file.write_all(b" second")
+            })
+        });
+        half.recv().unwrap();
+        let published_early = target.try_exists();
+        let winner = copy_up(source, target, |from, to| {
+            std::fs::copy(from, to).map(|_| ())
+        })
+        .and_then(|()| std::fs::write(target, b"edited by the winner"));
+        finish.send(()).unwrap();
+        (published_early, winner, delayed.join().unwrap())
+    });
+    assert!(
+        !published_early.unwrap(),
+        "a partial copy appeared in the view"
+    );
+    winner.unwrap();
+    delayed.unwrap();
+    assert_eq!(std::fs::read(target).unwrap(), b"edited by the winner");
+    assert_eq!(std::fs::read(source).unwrap(), b"first second");
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+}
 
 fn temp_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("agvfs-final-{name}-{}", std::process::id()));
@@ -146,7 +190,7 @@ fn bug_a_directory_whiteout_leaves_the_files_below_it_reachable() {
     std::fs::write(game.join("Meshes").join("a.nif"), b"x").unwrap();
     let c = config(&game, &root.join("upper"), &[&game]);
 
-    add_whiteout("Meshes", &c.upper);
+    add_whiteout("Meshes", &c.upper).unwrap();
     assert_eq!(resolve("Meshes", &c), Resolved::WhitedOut);
     assert_eq!(
         resolve(r"Meshes\a.nif", &c),
@@ -266,9 +310,7 @@ fn a_handle_path_over_1023_characters_is_still_located() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Delete-on-close of a copied-up file deletes the upper copy at `NtClose`; without a marker the
-/// lower original reappears. `note_close` is the decision the hook makes (the hook itself only
-/// runs under injection).
+/// A copied-up file with native delete-on-close must have a marker before the upper copy goes away.
 #[test]
 fn delete_on_close_of_a_copied_up_file_leaves_a_whiteout() {
     let root = temp_root("delclose");
@@ -278,15 +320,8 @@ fn delete_on_close_of_a_copied_up_file_leaves_a_whiteout() {
     let c = config(&game, &root.join("upper"), &[&game]);
     let upper = upper_for_write(r"Data\a.esp", &c.upper);
     std::fs::write(&upper, b"UPPER COPY").unwrap();
+    assert!(whiteout_lower(r"Data\a.esp", &c).unwrap());
     std::fs::remove_file(&upper).unwrap();
-    let t = Tracked {
-        rel: r"Data\a.esp".to_string(),
-        via: Via::Mount,
-        lower: false,
-        delete_on_close: true,
-        dir: false,
-    };
-    note_close(&t, &c);
     assert!(whited_out(r"Data\a.esp", &c.upper));
     assert_eq!(resolve(r"Data\a.esp", &c), Resolved::WhitedOut);
     let _ = std::fs::remove_dir_all(&root);

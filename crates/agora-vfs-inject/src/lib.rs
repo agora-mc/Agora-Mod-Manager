@@ -436,3 +436,23 @@ pub unsafe fn inject_child(
         },
     }
 }
+
+/// Initialize the patched image's loader while its primary thread remains suspended.
+/// The caller must independently verify that the DLL installed its hooks.
+///
+/// # Safety
+/// `process` must be a live handle to a suspended process of the caller's bitness.
+pub unsafe fn initialize_child(process: HANDLE, dll: &Path) -> Result<Method, String> {
+    let method = if std::env::var_os(FORCE_REMOTE_THREAD_ENV).is_some_and(|v| v == "remote-thread")
+    {
+        check_architecture(process).map_err(|why| why.to_string())?;
+        Method::RemoteThread
+    } else {
+        inject_import_table(process, dll).map_err(|why| why.to_string())?;
+        Method::ImportTable
+    };
+    if inject_remote_thread(process, dll, Duration::from_secs(10))? == 0 {
+        return Err("LoadLibraryW returned NULL in the suspended child".to_string());
+    }
+    Ok(method)
+}

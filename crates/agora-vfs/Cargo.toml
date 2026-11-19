@@ -30,6 +30,9 @@ agora-game-api = { path = "../agora-game-api" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 # retour 0.3.1 does not compile for i686 (it names the win64 ABI), so the 32-bit DLL uses the
 # 0.4 alpha. The 64-bit DLL keeps 0.3.1, the version that has run real launches: nothing in its
 # behaviour changes.

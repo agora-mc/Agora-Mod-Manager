@@ -2,7 +2,7 @@
 //!
 //! Hooks the NT file system APIs (`NtCreateFile`, `NtOpenFile`, `NtSetInformationFile`,
 //! `NtQueryAttributesFile`, `NtQueryFullAttributesFile`, `NtQueryInformationByName`,
-//! `NtQueryDirectoryFile`, `NtQueryDirectoryFileEx`, `NtClose`, `CreateProcessInternalW`)
+//! `NtQueryDirectoryFile`, `NtQueryDirectoryFileEx`, `NtDeleteFile`, `NtClose`, `CreateProcessInternalW`)
 //! so that operations targeting lower layers (game bases and shared mods) never alter,
 //! truncate, or delete real lower files. Writes and edits are copied up to the instance's
 //! writable upper layer, deletions are recorded as whiteout markers (`.agvfs-wh\<path>.wh`),
@@ -21,6 +21,8 @@ pub mod paths;
 #[cfg(all(test, windows))]
 mod review_final_tests;
 
+#[cfg(windows)]
+mod bootstrap;
 #[cfg(windows)]
 pub mod child;
 #[cfg(windows)]
@@ -63,6 +65,8 @@ pub struct Tracked {
 }
 
 static CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
+#[cfg(windows)]
+static CONFIG_JSON: OnceLock<String> = OnceLock::new();
 
 pub fn maybe_cfg() -> Option<&'static RuntimeConfig> {
     CONFIG.get()
@@ -139,36 +143,58 @@ pub unsafe extern "system" fn DllMain(
         // Put back the import table that import-table injection rewrote, before the program
         // reads it. A no-op when the DLL was loaded any other way.
         agora_vfs_inject::restore_after_import_injection();
-        let Some(mut config) = config::load_config_from_env() else {
-            // No `AGORA_VFS_CONFIG` at all: this process was never meant to run under the VFS
-            // (a child started with its own environment block), so install nothing.
-            if std::env::var_os("AGORA_VFS_CONFIG").is_none() {
-                return 1;
+        let (json, handoff) = match bootstrap::receive() {
+            Ok(Some(child)) => (child.json, Some((child.prefixes, child.ready))),
+            Ok(None) => {
+                let Some(path) = std::env::var_os("AGORA_VFS_CONFIG") else {
+                    return 1;
+                };
+                match std::fs::read_to_string(path) {
+                    Ok(json) => (json, None),
+                    Err(_) => end_unprotected("the configuration could not be loaded"),
+                }
             }
-            // A configuration that is named but unreadable or invalid: the process was meant to
-            // be protected and cannot be.
-            eprintln!("[agora-vfs] the configuration could not be loaded");
-            end_unprotected("the configuration could not be loaded");
+            Err(why) => end_unprotected(&why),
         };
-        // The names the mount and each alias answer to: the volume GUID, device and 8.3 forms.
-        paths::add_system_forms(&mut config);
+        let mut config = match config::VfsConfig::from_json_str(&json) {
+            Ok(config) => config,
+            Err(why) => end_unprotected(&format!("the configuration could not be loaded: {why}")),
+        };
+        // A child uses the parent's computed forms so its attach needs no path discovery.
+        let child_ready = if let Some((prefixes, ready)) = handoff {
+            if prefixes.len() != config.prefixes.len()
+                || prefixes
+                    .iter()
+                    .zip(&config.prefixes)
+                    .any(|(actual, expected)| {
+                        actual.via != expected.via
+                            || actual.original != expected.original
+                            || actual.forms.first() != Some(&expected.original)
+                    })
+            {
+                end_unprotected("the child configuration has invalid path forms");
+            }
+            config.prefixes = prefixes;
+            Some(ready)
+        } else {
+            // Launcher-provided roots need their NT path forms before any static import runs.
+            paths::add_system_forms(&mut config);
+            None
+        };
         let ready_event = config.ready_event.clone();
+        let _ = CONFIG_JSON.set(json);
         let _ = CONFIG.set(config);
         util::set_inside(true);
         let result = hooks::install_hooks();
         util::set_inside(false);
         match result {
             Ok(()) => {
-                util::log(format!(
-                    "hooks installed in {}",
-                    std::env::current_exe()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default()
-                ));
-                if let Some(event_name) = &ready_event {
-                    if signal_ready(event_name) {
-                        util::log(format!("Signaled ready event '{event_name}'"));
+                if let Some(ready) = child_ready {
+                    if !bootstrap::acknowledge(ready) {
+                        end_unprotected("its VFS hooks could not be acknowledged");
                     }
+                } else if let Some(event_name) = &ready_event {
+                    signal_ready(event_name);
                 }
             }
             Err(e) => {
