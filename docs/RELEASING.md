@@ -8,7 +8,7 @@ Agora has three independent release streams:
 | Desktop | `vX.Y.Z` | Platform installers and application bundles |
 | Official plugin | `official-<name>-v<version>` | One plugin package zip, such as Skyrim SE |
 
-Do not treat a successful catalog release as proof that a desktop package was built correctly, or vice versa.
+Do not treat a successful catalog release as proof that a desktop package was built correctly, or vice versa. Because all three streams publish releases to the same repository, neither the catalog sync nor the desktop updater uses GitHub's `/releases/latest` endpoint: catalog sync scans `/releases` for the newest `registry-YYYY-MM-DD` release carrying `registry.bundle`, and the desktop updater reads `latest.json` from the dedicated `updater` prerelease (`releases/download/updater/latest.json`).
 
 ## Official plugin releases
 
@@ -300,6 +300,7 @@ After the packaged smoke test passes, publish the draft:
 
 After publishing:
 
+- Confirm [`.github/workflows/desktop-updater.yml`](../.github/workflows/desktop-updater.yml) publishes the new `latest.json` to the dedicated `updater` prerelease (`releases/download/updater/latest.json`) without altering its installer URLs or minisign signatures. If needed (for example, if the release was published via an automation token), run that workflow manually with `tag: vX.Y.Z` or run `python scripts/publish_updater_manifest.py --repo agora-mc/Agora-Mod-Manager --tag "$TAG"`.
 - Confirm the website download control selects the intended release.
 - Perform one clean public download.
 - Confirm update checks can see the release.
@@ -450,7 +451,7 @@ When a desktop release is broken:
 1. Stop promoting the release.
 2. Document the affected platforms and user-visible failure.
 3. Preserve the failed artifacts for investigation.
-4. Publish or restore a known-good release according to updater behavior.
+4. Restore the `updater` prerelease's `latest.json` to a known-good `vX.Y.Z` release (`python scripts/publish_updater_manifest.py --repo agora-mc/Agora-Mod-Manager --tag vX.Y.Z --allow-downgrade`, or dispatch `.github/workflows/desktop-updater.yml` with `allow_downgrade: true`), or publish a new patched release.
 5. Test migration from both the broken and previous good versions.
 6. Explain whether users must take manual action.
 

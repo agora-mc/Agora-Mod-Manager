@@ -1,0 +1,64 @@
+name: Desktop Updater Manifest
+
+# Publishes the desktop updater manifest (`latest.json`) to the dedicated
+# `updater` prerelease whenever a `vX.Y.Z` desktop release is published.
+# Kept separate from `/releases/latest` so catalog (`registry-*`) and official
+# plugin (`official-*-v*`) releases never break desktop update checks, and kept
+# triggered on `published` rather than draft creation so clients never see a
+# draft whose installer URLs return 404.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published desktop release tag (e.g. v0.9.5)"
+        required: true
+      allow_downgrade:
+        description: "Allow replacing a newer updater manifest with an older vX.Y.Z release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-updater-manifest
+  cancel-in-progress: false
+
+env:
+  UPDATER_TAG: updater
+
+jobs:
+  publish-updater:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (startsWith(github.event.release.tag_name, 'v') &&
+       !github.event.release.draft &&
+       !github.event.release.prerelease)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Publish desktop updater manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+          ALLOW_DOWNGRADE: ${{ github.event.inputs.allow_downgrade || 'false' }}
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          if [ "$ALLOW_DOWNGRADE" = "true" ]; then
+            EXTRA_ARGS+=(--allow-downgrade)
+          fi
+          python3 scripts/publish_updater_manifest.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "$TAG" \
+            --updater-tag "$UPDATER_TAG" \
+            "${EXTRA_ARGS[@]}"

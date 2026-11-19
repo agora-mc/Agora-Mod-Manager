@@ -32,6 +32,7 @@ import deploy_release_assets
 import catalog_delta
 import check_cli_coverage
 import finalize_release_assets as fra
+import publish_updater_manifest as pum
 import refresh_loader_manifests
 import validate_loader_catalog_delta
 import build_docs_web as bdw
@@ -4480,6 +4481,139 @@ class CliCoverageTests(unittest.TestCase):
         lib = bindings.LIB_RS.read_text(encoding="utf-8")
         desktop = bindings.parse_rust_commands(lib)
         self.assertEqual(check_cli_coverage.check(coverage, desktop), [])
+
+
+class TestDesktopUpdaterEndpoint(unittest.TestCase):
+    """Desktop updater endpoint must point to a desktop-only manifest release."""
+
+    def test_tauri_updater_endpoint_is_isolated_from_releases_latest(self):
+        repo_root = Path(__file__).resolve().parent.parent
+        tauri_conf = json.loads(
+            (repo_root / "desktop" / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8")
+        )
+        updater = tauri_conf["plugins"]["updater"]
+        endpoints = updater["endpoints"]
+        self.assertTrue(endpoints, "updater must configure at least one endpoint")
+        self.assertTrue(updater.get("pubkey"), "updater must keep signature pubkey")
+        for endpoint in endpoints:
+            self.assertNotIn(
+                "/releases/latest/",
+                endpoint,
+                "desktop updater must not share /releases/latest/ with catalog or plugin releases",
+            )
+            match = re.fullmatch(
+                r"https://github\.com/agora-mc/Agora-Mod-Manager/releases/download/([^/]+)/latest\.json",
+                endpoint,
+            )
+            self.assertIsNotNone(
+                match,
+                f"expected dedicated release download URL for latest.json, got {endpoint!r}",
+            )
+            updater_tag = match.group(1)
+            self.assertNotEqual(updater_tag, "latest")
+
+        # The workflow that publishes the updater manifest must target that exact tag
+        # and only accept desktop vX.Y.Z releases (never registry-* or official-*).
+        workflow_path = repo_root / ".github" / "workflows" / "desktop-updater.yml"
+        self.assertTrue(
+            workflow_path.is_file(),
+            f"expected {workflow_path} to publish the desktop updater manifest",
+        )
+        workflow_text = workflow_path.read_text(encoding="utf-8")
+        self.assertIn(f"UPDATER_TAG: {updater_tag}", workflow_text)
+        self.assertIn("scripts/publish_updater_manifest.py", workflow_text)
+
+        # Catalog and plugin workflows must never publish to the updater release or upload latest.json.
+        for other in ("compile.yml", "official-plugins.yml"):
+            other_text = (repo_root / ".github" / "workflows" / other).read_text(encoding="utf-8")
+            self.assertNotIn("latest.json", other_text)
+            self.assertNotIn("publish_updater_manifest.py", other_text)
+
+    def _valid_manifest(self, tag: str = "v0.9.5") -> dict:
+        version = tag.lstrip("v")
+        base = f"https://github.com/agora-mc/Agora-Mod-Manager/releases/download/{tag}"
+        return {
+            "version": version,
+            "platforms": {
+                "windows-x86_64": {"signature": "sig-win", "url": f"{base}/agora-desktop-{tag}-windows-x64-setup.exe"},
+                "windows-x86_64-msi": {"signature": "sig-msi", "url": f"{base}/agora-desktop-{tag}-windows-x64.msi"},
+                "windows-x86_64-nsis": {"signature": "sig-nsis", "url": f"{base}/agora-desktop-{tag}-windows-x64-setup.exe"},
+                "darwin-aarch64": {"signature": "sig-arm", "url": f"{base}/agora-desktop-{tag}-macos-arm64.app.tar.gz"},
+            },
+        }
+
+    def test_publish_updater_manifest_rejects_catalog_and_plugin_tags(self):
+        for bad_tag in ("registry-2026-11-18", "official-skyrim-se-v0.1.0", "updater", "site-assets", "v1.2"):
+            with self.subTest(bad_tag=bad_tag):
+                with self.assertRaises(pum.UpdaterPublishError):
+                    pum.publish_updater_manifest("agora-mc/Agora-Mod-Manager", bad_tag)
+
+    def test_publish_updater_manifest_rejects_draft_or_unsigned_manifest(self):
+        with mock.patch.object(
+            pum,
+            "fetch_release_metadata",
+            return_value={"tagName": "v0.9.5", "isDraft": True, "isPrerelease": False, "assets": [{"name": "latest.json"}]},
+        ):
+            with self.assertRaisesRegex(pum.UpdaterPublishError, "draft"):
+                pum.publish_updater_manifest("agora-mc/Agora-Mod-Manager", "v0.9.5")
+
+        bad_manifest = self._valid_manifest("v0.9.5")
+        bad_manifest["platforms"]["darwin-aarch64"]["signature"] = ""
+        with self.assertRaisesRegex(pum.UpdaterPublishError, "no signature"):
+            pum.validate_updater_manifest(bad_manifest, "v0.9.5")
+
+    def test_publish_updater_manifest_publishes_valid_desktop_release_to_updater(self):
+        manifest = self._valid_manifest("v0.9.5")
+        calls: list[tuple[str, ...]] = []
+
+        def fake_run_gh(*args: str, check: bool = True):
+            calls.append(args)
+            if args[:2] == ("release", "view") and args[2] == "updater":
+                return mock.MagicMock(returncode=1, stdout="", stderr="not found")
+            if args[:2] == ("release", "download") and args[2] == "v0.9.5":
+                out_idx = args.index("--output") + 1
+                Path(args[out_idx]).write_text(json.dumps(manifest), encoding="utf-8")
+            if args[:2] == ("release", "download") and args[2] == "updater":
+                return mock.MagicMock(returncode=1, stdout="", stderr="not found")
+            return mock.MagicMock(returncode=0, stdout="{}", stderr="")
+
+        with (
+            mock.patch.object(
+                pum,
+                "fetch_release_metadata",
+                return_value={"tagName": "v0.9.5", "isDraft": False, "isPrerelease": False, "assets": [{"name": "latest.json"}]},
+            ),
+            mock.patch.object(pum, "run_gh", side_effect=fake_run_gh),
+        ):
+            pum.publish_updater_manifest("agora-mc/Agora-Mod-Manager", "v0.9.5")
+
+        self.assertTrue(any(c[:3] == ("release", "create", "updater") and "--prerelease" in c for c in calls))
+        self.assertTrue(any(c[:3] == ("release", "upload", "updater") and "--clobber" in c for c in calls))
+
+    def test_publish_updater_manifest_blocks_accidental_downgrade_unless_allowed(self):
+        older = self._valid_manifest("v0.9.4")
+        newer = self._valid_manifest("v0.9.5")
+
+        def fake_run_gh(*args: str, check: bool = True):
+            if args[:2] == ("release", "download") and args[2] == "v0.9.4":
+                out_idx = args.index("--output") + 1
+                Path(args[out_idx]).write_text(json.dumps(older), encoding="utf-8")
+            elif args[:2] == ("release", "download") and args[2] == "updater":
+                out_idx = args.index("--output") + 1
+                Path(args[out_idx]).write_text(json.dumps(newer), encoding="utf-8")
+            return mock.MagicMock(returncode=0, stdout="{}", stderr="")
+
+        with (
+            mock.patch.object(
+                pum,
+                "fetch_release_metadata",
+                return_value={"tagName": "v0.9.4", "isDraft": False, "isPrerelease": False, "assets": [{"name": "latest.json"}]},
+            ),
+            mock.patch.object(pum, "run_gh", side_effect=fake_run_gh),
+        ):
+            with self.assertRaisesRegex(pum.UpdaterPublishError, "Refusing to replace newer"):
+                pum.publish_updater_manifest("agora-mc/Agora-Mod-Manager", "v0.9.4")
+            pum.publish_updater_manifest("agora-mc/Agora-Mod-Manager", "v0.9.4", allow_downgrade=True)
 
 
 if __name__ == "__main__":
