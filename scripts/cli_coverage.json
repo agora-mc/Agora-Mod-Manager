@@ -243,6 +243,9 @@
     "for_you_items": {
       "gui": "For You recommendations on Home"
     },
+    "game_backup_bytes": {
+      "cli": "backup export"
+    },
     "games_add_folder": {
       "cli": "games folder add"
     },
@@ -342,11 +345,17 @@
     "games_instance_content_set_enabled": {
       "cli": "games instance content enable"
     },
+    "games_instance_content_set_own_copy": {
+      "cli": "games instance content own-copy"
+    },
     "games_instance_create": {
       "cli": "games instance create"
     },
     "games_instance_delete": {
       "cli": "games instance delete"
+    },
+    "games_instance_deploy": {
+      "cli": "games instance deploy"
     },
     "games_instance_deleted_list": {
       "gap": "recently deleted game instances"
@@ -356,6 +365,9 @@
     },
     "games_instance_icon": {
       "gui": "instance icon"
+    },
+    "games_instance_is_default": {
+      "gui": "default-instance badge on the instance page"
     },
     "games_instance_launch": {
       "cli": "games instance launch"
@@ -372,6 +384,9 @@
     "games_instance_restore_deleted": {
       "gap": "restoring a deleted game instance"
     },
+    "games_instance_set_default": {
+      "cli": "games instance default"
+    },
     "games_instance_set_deployment": {
       "cli": "games instance set-deployment"
     },
@@ -383,6 +398,9 @@
     },
     "games_instance_stop": {
       "gap": "stopping a running game"
+    },
+    "games_instance_undeploy": {
+      "cli": "games instance undeploy"
     },
     "games_library_cache_icon": {
       "gui": "content icon cache"
@@ -515,6 +533,9 @@
     },
     "games_tools_swap_costs": {
       "gap": "swap-run cost estimate"
+    },
+    "games_tools_swap_remove_copy": {
+      "cli": "games tools-swap remove-copy"
     },
     "games_tools_swap_restore": {
       "cli": "games tools-swap restore"
@@ -840,6 +861,9 @@
     "list_worlds": {
       "cli": "world list"
     },
+    "local_state_report": {
+      "cli": "doctor"
+    },
     "lock_instance": {
       "cli": "instance lock"
     },
@@ -936,6 +960,9 @@
     "plugins_emergency_stop": {
       "cli": "plugin stop"
     },
+    "preview_backup_import": {
+      "cli": "backup import"
+    },
     "preview_content_sharing_conversion": {
       "gap": "content sharing settings"
     },
@@ -995,6 +1022,15 @@
     },
     "regenerate_mcp_token": {
       "gui": "desktop MCP HTTP server token"
+    },
+    "registry_audit_log": {
+      "cli": "registry audit-log"
+    },
+    "registry_resolutions": {
+      "cli": "registry resolutions"
+    },
+    "registry_under_review": {
+      "cli": "registry under-review"
     },
     "remove_server": {
       "cli": "server remove"

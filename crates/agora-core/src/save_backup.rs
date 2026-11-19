@@ -25,7 +25,6 @@ use crate::game_ini;
 use crate::game_instance::{self, InstanceError, SavesChoice};
 use crate::game_saves::{self, SavesError};
 use crate::helpers;
-use crate::lock_manager::LockResource;
 
 /// The newest backups kept per instance. A crash test makes one per suspect tried; five covers a
 /// normal round of testing while bounding the store, and each backup is a full copy of the folder.
@@ -636,19 +635,16 @@ pub fn restore(
     if !is_valid_id(backup_id) {
         return Err(SaveBackupError::InvalidBackupId(backup_id.to_string()));
     }
-    // Hold the instance lock across the whole restore, exactly as a snapshot restore does, and
+    // Hold the instance guard across the whole restore, exactly as a snapshot restore does, and
     // refuse while the game is running: writing saves under a live game corrupts them. The one
     // activity check also sees an open session with no journaled files and a Linux view session,
     // and refuses when a store that would answer cannot be read.
-    let _guard = ctx
-        .lock_manager
-        .acquire(
-            LockResource::Instance(instance_id.to_string()),
-            "restore_save_backup",
-        )
-        .map_err(|error| SaveBackupError::Other(error.to_string()))?;
-    crate::instance_runtime::ensure_game_not_running(ctx, instance_id, "restoring its saves")
-        .map_err(SaveBackupError::Other)?;
+    let _guard = crate::instance_runtime::InstanceGuard::for_mutation(
+        ctx,
+        instance_id,
+        "restore_save_backup",
+    )
+    .map_err(|error| SaveBackupError::Other(error.to_string()))?;
     let root = backup_root(ctx, instance_id)?;
     let dir = root.join(backup_id);
     if !dir.is_dir() {

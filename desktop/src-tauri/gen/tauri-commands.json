@@ -3,9 +3,9 @@
   "generator": "scripts/check_tauri_bindings.py",
   "limitation": "Name-presence only, not type signatures. A true generator would need a Rust proc-macro crate or TypeScript compiler plugin.",
   "summary": {
-    "registered_rust": 420,
-    "defined_rust": 420,
-    "ts_wrappers": 419,
+    "registered_rust": 422,
+    "defined_rust": 422,
+    "ts_wrappers": 421,
     "rust_only": 1,
     "ts_only": 0,
     "defined_not_registered": 0
