@@ -83,6 +83,10 @@ pub struct SwapJournal {
     pub copy_dir: PathBuf,
     /// The instance's swap folder under its base's deployments folder.
     pub swap_dir: PathBuf,
+    /// The processes this swap started, recorded so recovery can see a run that is still going
+    /// even when the tool runs from outside the install folder.
+    #[serde(default)]
+    pub processes: Vec<crate::process_identity::ProcessIdentity>,
 }
 
 /// A journal found on disk, for `games tools-swap status`.
@@ -690,9 +694,35 @@ pub fn recover_store_unlocked(
             processes_list(&procs)
         )));
     }
+    if let Some(process) = recorded_process_running(&journal) {
+        return Err(SwapError::Refused(format!(
+            "a tool run for instance {} is still going (pid {}{}). Let it finish or close it, then retry. Nothing was changed.",
+            journal.instance_id,
+            process.pid,
+            process
+                .expected_exe
+                .as_ref()
+                .map(|exe| format!(" ({exe})"))
+                .unwrap_or_default()
+        )));
+    }
     restore_and_discard(&journal)?;
     remove_journal(ctx, &journal)?;
     Ok(Some(journal))
+}
+
+/// Whether a process the swap recorded is still alive. An external tool runs from outside the
+/// install folder, so the install-folder scan alone would miss it.
+fn recorded_process_running(
+    journal: &SwapJournal,
+) -> Option<&crate::process_identity::ProcessIdentity> {
+    journal.processes.iter().find(|process| {
+        crate::process_identity::verify(process).is_ok()
+            || process
+                .job
+                .as_deref()
+                .is_some_and(|job| crate::process_job::active(job) > 0)
+    })
 }
 
 /// The per-game check: for each store of the game with a journal, take the game's user-files lock
@@ -743,7 +773,8 @@ pub fn pending(ctx: &Ctx) -> Vec<PendingSwap> {
             }
             match read_journal(&path) {
                 Ok(journal) => {
-                    let running = !processes_running_from(&journal.install_dir).is_empty();
+                    let running = !processes_running_from(&journal.install_dir).is_empty()
+                        || recorded_process_running(&journal).is_some();
                     out.push(PendingSwap {
                         game: definition.id.to_string(),
                         store: store.to_string(),

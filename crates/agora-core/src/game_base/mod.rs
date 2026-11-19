@@ -574,6 +574,32 @@ fn pause_after_rename_if_asked(base_root: &Path) {
     BASE_RENAME_PAUSED.store(false, Ordering::SeqCst);
 }
 
+/// The marker Agora writes into a base folder it built, so a rebuild only removes a folder it can
+/// prove is its own.
+const BASE_MARKER_FILE: &str = ".agora-base.json";
+
+fn base_marker_path(dir: &Path) -> PathBuf {
+    dir.join(BASE_MARKER_FILE)
+}
+
+fn write_base_marker(dir: &Path, base_id: &str) -> Result<(), std::io::Error> {
+    let marker = serde_json::json!({ "base_id": base_id });
+    std::fs::write(base_marker_path(dir), serde_json::to_vec(&marker)?)
+}
+
+fn base_marker_matches(dir: &Path, base_id: &str) -> bool {
+    std::fs::read_to_string(base_marker_path(dir))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| {
+            value
+                .get("base_id")
+                .and_then(|id| id.as_str())
+                .map(|id| id == base_id)
+        })
+        .unwrap_or(false)
+}
+
 pub fn build_base(
     paths: &AppPaths,
     install: &IdentifiedInstall,
@@ -870,14 +896,22 @@ pub fn build_base_with_frameworks(
 
     let final_base_dir = base_root.join(&base_id);
 
+    // The marker travels with the staging folder, so the folder this build puts in place can be
+    // told apart from one Agora did not build.
+    write_base_marker(&staging_dir, &base_id)?;
+
     // A folder under our own name with no readable manifest is what an
     // interrupted build leaves (renamed into place, manifest never written).
-    // Move it aside and delete it, or this base id could never be built again.
+    // Move it aside, or this base id could never be built again. It is deleted
+    // only when its own marker says this build made it; anything else survives
+    // under the stale name for the person to inspect.
     // A damaged record is no readable manifest either (the new manifest replaces it below).
     if final_base_dir.exists() && (damaged_record || !manifest_path.exists()) {
         let stale = base_root.join(format!("{base_id}.stale-{unique}"));
         std::fs::rename(&final_base_dir, &stale)?;
-        std::fs::remove_dir_all(&stale)?;
+        if base_marker_matches(&stale, &base_id) {
+            std::fs::remove_dir_all(&stale)?;
+        }
     }
 
     // 6. Rename staging folder to <root>/<base_id>/
@@ -1394,12 +1428,92 @@ fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// The folder to delete for `base_id`, derived from folders Agora knows rather than from the path
-/// a record states: `<root>/<base_id>` for the data folder's `bases` folder or a root a build
+/// Remove staging folders a build or deploy left behind, when the process that made them is no
+/// longer running. A folder whose owner cannot be parsed, or whose process is alive, is left alone:
+/// a live operation must never lose its staging. Called at startup.
+pub fn sweep_stale_staging(paths: &AppPaths) -> Result<usize, BaseError> {
+    let live = live_process_ids();
+    let mut removed = 0usize;
+    for root in known_base_roots(paths)? {
+        removed += sweep_staging_in(&root, &["partial-", "stale-"], &live)?;
+        let deployments = root.join("deployments");
+        let read = match std::fs::read_dir(&deployments) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(BaseError::Other(format!(
+                    "cannot read {} to sweep stale staging: {error}",
+                    deployments.display()
+                )))
+            }
+        };
+        for entry in read.flatten() {
+            let instance_dir = entry.path();
+            if !instance_dir.is_dir() {
+                continue;
+            }
+            removed += sweep_staging_in(&instance_dir, &["game.partial-"], &live)?;
+        }
+    }
+    Ok(removed)
+}
+
+fn sweep_staging_in(
+    folder: &Path,
+    markers: &[&str],
+    live: &std::collections::HashSet<u32>,
+) -> Result<usize, BaseError> {
+    let read = match std::fs::read_dir(folder) {
+        Ok(read) => read,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(BaseError::Other(format!(
+                "cannot read {} to sweep stale staging: {error}",
+                folder.display()
+            )))
+        }
+    };
+    let mut removed = 0usize;
+    for entry in read.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let owner = markers.iter().find_map(|marker| {
+            name.rsplit_once(marker)
+                .and_then(|(_, rest)| rest.split('-').next())
+                .and_then(|pid| pid.parse::<u32>().ok())
+        });
+        let Some(owner) = owner else {
+            continue;
+        };
+        if live.contains(&owner) {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        std::fs::remove_dir_all(&path)?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn live_process_ids() -> std::collections::HashSet<u32> {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes();
+    system.processes().keys().map(|pid| pid.as_u32()).collect()
+}
+
+/// The folder to delete for `base_id`, derived from folders Agora knows rather than from the path/// a record states: `<root>/<base_id>` for the data folder's `bases` folder or a root a build
 /// registered. The record's location only has to agree with it. A manifest is a user-writable
 /// file, so a record that names any other folder is refused and nothing is deleted. The base
 /// folder must also not overlap the install it was built from.
-fn trusted_base_folder(
+pub(crate) fn trusted_base_folder(
     paths: &AppPaths,
     manifest: &BaseManifest,
     base_id: &str,
@@ -1460,7 +1574,101 @@ pub fn instances_pinning_base(paths: &AppPaths, base_id: &str) -> Result<Vec<Str
             instances.push(instance_id);
         }
     }
+    // An instance in Recently deleted is still restorable, so its base must stay.
+    for instance_id in trash_instances_pinning_base(paths, base_id)? {
+        if !instances.contains(&instance_id) {
+            instances.push(instance_id);
+        }
+    }
     instances.sort();
+    Ok(instances)
+}
+
+/// The instances in Recently deleted whose entry is still restorable and whose base record names
+/// `base_id`. An entry that cannot be read is an error: a caller about to delete a base must not
+/// take "I could not tell" as "nothing pins it".
+fn trash_instances_pinning_base(
+    paths: &AppPaths,
+    base_id: &str,
+) -> Result<Vec<String>, BaseError> {
+    let root = paths.recently_deleted_games_root();
+    let read = match std::fs::read_dir(&root) {
+        Ok(read) => read,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(BaseError::Other(format!(
+                "cannot read {}, so Agora cannot tell which deleted instances use base {base_id}: {error}",
+                root.display()
+            )))
+        }
+    };
+    let now = chrono::Utc::now();
+    let mut instances = Vec::new();
+    for entry in read {
+        let entry = entry.map_err(|error| {
+            BaseError::Other(format!(
+                "cannot read {}, so Agora cannot tell which deleted instances use base {base_id}: {error}",
+                root.display()
+            ))
+        })?;
+        let entry_path = entry.path();
+        let record = entry_path.join("entry.json");
+        let text = match std::fs::read_to_string(&record) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(BaseError::Other(format!(
+                    "cannot read the deleted entry {}, so Agora cannot tell whether base {base_id} is in use: {error}",
+                    record.display()
+                )))
+            }
+        };
+        let stored: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+            BaseError::Other(format!(
+                "cannot read the deleted entry {}, so Agora cannot tell whether base {base_id} is in use: {error}",
+                record.display()
+            ))
+        })?;
+        let instance_id = stored
+            .get("row")
+            .and_then(|row| row.get("instance_id"))
+            .and_then(|id| id.as_str())
+            .ok_or_else(|| {
+                BaseError::Other(format!(
+                    "the deleted entry {} names no instance, so Agora cannot tell whether base {base_id} is in use",
+                    record.display()
+                ))
+            })?;
+        let base_json = stored
+            .get("row")
+            .and_then(|row| row.get("base_json"))
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                BaseError::Other(format!(
+                    "the deleted entry {} names no base, so Agora cannot tell whether base {base_id} is in use",
+                    record.display()
+                ))
+            })?;
+        let base_ref: agora_game_api::BaseReference =
+            serde_json::from_str(base_json).map_err(|error| {
+                BaseError::Other(format!(
+                    "the deleted entry {} has an unreadable base record, so Agora cannot tell whether base {base_id} is in use: {error}",
+                    record.display()
+                ))
+            })?;
+        if !matches!(&base_ref, agora_game_api::BaseReference::Pinned { id, .. } if id == base_id) {
+            continue;
+        }
+        // An entry whose expiry cannot be read is counted, so a damaged entry keeps the base.
+        let expired = stored
+            .get("expires_at")
+            .and_then(|value| value.as_str())
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|at| at <= now);
+        if !expired {
+            instances.push(instance_id.to_string());
+        }
+    }
     Ok(instances)
 }
 
@@ -1617,6 +1825,15 @@ pub fn repair_framework(
             manifest.source_location.display()
         )));
     }
+    // Copying a file onto itself zeroes it. A base whose source install is its own folder cannot
+    // be repaired by copying, so nothing is written.
+    if same_path(&manifest.location, &manifest.source_location) {
+        return Err(BaseError::Other(format!(
+            "refusing to repair {}: the base folder and its source install are the same folder ({})",
+            framework.name,
+            manifest.location.display()
+        )));
+    }
 
     let _lock = crate::lock_manager::LockManager::new(paths.locks_root())
         .acquire(
@@ -1632,34 +1849,74 @@ pub fn repair_framework(
     let mut missing_from_source = Vec::new();
     for required in &detection.required {
         let required = required.as_str();
-        if manifest
+        let recorded = manifest
             .files
             .iter()
-            .any(|file| fold_path_case(&file.path) == fold_path_case(required))
-        {
+            .position(|file| fold_path_case(&file.path) == fold_path_case(required));
+        let destination = match recorded {
+            Some(index) => manifest.location.join(&manifest.files[index].path),
+            None => manifest.location.join(required),
+        };
+        let source = manifest.source_location.join(required);
+        if same_path(&source, &destination) {
+            return Err(BaseError::Other(format!(
+                "refusing to repair {required}: its source and destination are the same file ({})",
+                source.display()
+            )));
+        }
+        // The manifest's word is not enough: the file has to be on disk with the size and digest
+        // the record states, or it is replaced.
+        let present_and_correct = recorded.is_some_and(|index| {
+            let file = &manifest.files[index];
+            std::fs::metadata(&destination).is_ok_and(|metadata| {
+                metadata.is_file()
+                    && metadata.len() == file.size
+                    && hash_file(&destination).is_ok_and(|sha256| sha256 == file.sha256)
+            })
+        });
+        if present_and_correct {
             already_present.push(required.to_string());
             continue;
         }
-        let source = manifest.source_location.join(required);
         if !source.is_file() {
             missing_from_source.push(required.to_string());
             continue;
         }
-        let destination = manifest.location.join(required);
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::copy(&source, &destination)?;
         let sha256 = hash_file(&destination)?;
         let metadata = std::fs::metadata(&destination)?;
-        manifest.files.push(BaseFile {
-            path: required.to_string(),
-            size: metadata.len(),
-            sha256,
-            linked: false,
-            identity: get_file_identity(&destination),
-            modified_unix_ms: get_modified_unix_ms(&metadata),
-        });
+        let source_sha256 = hash_file(&source)?;
+        let source_size = std::fs::metadata(&source)?.len();
+        if sha256 != source_sha256 || metadata.len() != source_size {
+            return Err(BaseError::Other(format!(
+                "the copy of {required} into {} does not match its source {}",
+                destination.display(),
+                source.display()
+            )));
+        }
+        let identity = get_file_identity(&destination);
+        let modified_unix_ms = get_modified_unix_ms(&metadata);
+        match recorded {
+            Some(index) => {
+                let file = &mut manifest.files[index];
+                file.size = metadata.len();
+                file.sha256 = sha256;
+                file.linked = false;
+                file.identity = identity;
+                file.modified_unix_ms = modified_unix_ms;
+            }
+            None => manifest.files.push(BaseFile {
+                path: required.to_string(),
+                size: metadata.len(),
+                sha256,
+                linked: false,
+                identity,
+                modified_unix_ms,
+            }),
+        }
         copied.push(required.to_string());
     }
     manifest

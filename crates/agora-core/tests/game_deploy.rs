@@ -3206,3 +3206,53 @@ fn a_writable_copy_and_an_override_give_the_same_answer_in_every_strategy() {
         "the VFS view lists the path once"
     );
 }
+
+#[test]
+fn a_base_location_outside_agoras_roots_is_refused_before_a_deploy_or_undeploy() {
+    let tmp = TempDir::new().unwrap();
+    let def = make_test_definition();
+    let ctx = create_test_context(&tmp, &def);
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let install = make_test_install(&install_dir, true, true);
+    let inst = create_pinned_instance(&ctx, &install, &def, "Tampered");
+
+    let base_id = match &get_manifest(&ctx, &inst.instance_id).unwrap().base {
+        BaseReference::Pinned { id, .. } => id.clone(),
+        other => panic!("expected a pinned base, got {other:?}"),
+    };
+    let manifest_path = ctx.paths.base_manifest_path(&base_id);
+    let mut manifest: agora_core::game_base::BaseManifest =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let outside = tmp.path().join("outside").join("AgoraBases");
+    let tampered = outside.join(&base_id);
+    std::fs::create_dir_all(&tampered).unwrap();
+    manifest.location = tampered.clone();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let error = deploy(&ctx, &inst.instance_id, &def, DeployMode::Links).unwrap_err();
+    assert!(
+        error.to_string().contains("base folder Agora made"),
+        "unexpected deploy error: {error}"
+    );
+    assert!(!outside.join("deployments").exists());
+
+    let sentinel = outside
+        .join("deployments")
+        .join(&inst.instance_id)
+        .join("game")
+        .join("sentinel.txt");
+    std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+    std::fs::write(&sentinel, b"keep").unwrap();
+    let error = undeploy(&ctx, &inst.instance_id).unwrap_err();
+    assert!(
+        error.to_string().contains("base folder Agora made"),
+        "unexpected undeploy error: {error}"
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+}

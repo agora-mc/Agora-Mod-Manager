@@ -588,7 +588,11 @@ impl CoreContext {
             }
         }
 
-        // 5. Validate lock directory is usable (warning only).
+        // 5. Sweep base and deploy staging folders whose owning process is gone. A live build or
+        //    deploy keeps its staging.
+        let _ = crate::game_base::sweep_stale_staging(&paths);
+
+        // 6. Validate lock directory is usable (warning only).
         //    Known write: every open, read or write, creates and removes `locks/.probe`, which
         //    changes the folder's modified time and leaves no file behind. It is the writability
         //    check itself, so it stays.
@@ -632,7 +636,7 @@ impl CoreContext {
         };
         ctx.extensions.insert(behaviour_runtime);
 
-        // 6. Let game packages load their catalogs from the signed registry
+        // 7. Let game packages load their catalogs from the signed registry
         //    (or fall back to embedded data when there is none).
         if ctx.games.is_empty() {
             warnings.push(

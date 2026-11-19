@@ -409,6 +409,31 @@ struct LayerContribution {
     whiteouts: Vec<String>,
 }
 
+/// The first 16 characters of an item id, never splitting a multibyte character.
+fn item_prefix_16(item_id: &str) -> &str {
+    item_id
+        .char_indices()
+        .nth(16)
+        .map(|(index, _)| &item_id[..index])
+        .unwrap_or(item_id)
+}
+
+/// The root a base's deployment folder goes under. The base record is user-writable, so its
+/// `location` is only trusted when it is the folder Agora made for this base under a root it
+/// knows; the same check removal uses.
+fn trusted_bases_root(
+    ctx: &Ctx,
+    base_manifest: &BaseManifest,
+    base_id: &str,
+) -> Result<PathBuf, DeployError> {
+    let folder = crate::game_base::trusted_base_folder(&ctx.paths, base_manifest, base_id)
+        .map_err(|error| DeployError::Other(error.to_string()))?;
+    folder
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| DeployError::Other("base location has no parent".into()))
+}
+
 pub fn plan(
     ctx: &Ctx,
     instance_id: &str,
@@ -508,10 +533,7 @@ fn plan_inner(
     let base_manifest: BaseManifest = serde_json::from_str(&base_content)
         .map_err(|e| DeployError::UnreadableBaseManifest(e.to_string()))?;
 
-    let bases_root = base_manifest
-        .location
-        .parent()
-        .ok_or_else(|| DeployError::Other("base location has no parent".into()))?;
+    let bases_root = trusted_bases_root(ctx, &base_manifest, &base_id)?;
     let deployment_dir = bases_root.join("deployments").join(instance_id);
     let game_dir = deployment_dir.join("game");
     let instance_dir = ctx
@@ -1459,9 +1481,7 @@ pub fn deployment_dir(ctx: &Ctx, instance_id: &str) -> Result<Option<PathBuf>, D
         .map_err(|e| DeployError::UnreadableBaseManifest(e.to_string()))?;
     let base_manifest: BaseManifest = serde_json::from_str(&base_content)
         .map_err(|e| DeployError::UnreadableBaseManifest(e.to_string()))?;
-    let Some(bases_root) = base_manifest.location.parent() else {
-        return Ok(None);
-    };
+    let bases_root = trusted_bases_root(ctx, &base_manifest, base_id)?;
     let deployment_dir = bases_root.join("deployments").join(instance_id);
     let game_dir = deployment_dir.join("game");
     let record_path = deployment_dir.join("deployment.json");
@@ -1649,10 +1669,7 @@ fn deploy_target(ctx: &Ctx, instance_id: &str) -> Result<DeployTarget, DeployErr
     let base_manifest: BaseManifest = serde_json::from_str(&base_content)
         .map_err(|e| DeployError::UnreadableBaseManifest(e.to_string()))?;
 
-    let bases_root = base_manifest
-        .location
-        .parent()
-        .ok_or_else(|| DeployError::Other("base location has no parent".into()))?;
+    let bases_root = trusted_bases_root(ctx, &base_manifest, &base_id)?;
     let deployment_dir = bases_root.join("deployments").join(instance_id);
     let game_dir = deployment_dir.join("game");
     let record_path = deployment_dir.join("deployment.json");
@@ -2328,9 +2345,7 @@ pub(crate) fn undeploy_locked(ctx: &Ctx, instance_id: &str) -> Result<HarvestRep
     let base_manifest: BaseManifest = serde_json::from_str(&base_content)
         .map_err(|e| DeployError::UnreadableBaseManifest(e.to_string()))?;
 
-    let Some(bases_root) = base_manifest.location.parent() else {
-        return Ok(HarvestReport::default());
-    };
+    let bases_root = trusted_bases_root(ctx, &base_manifest, base_id)?;
     let deployment_dir = bases_root.join("deployments").join(instance_id);
     let game_dir = deployment_dir.join("game");
     let record_path = deployment_dir.join("deployment.json");
@@ -3196,7 +3211,7 @@ pub fn add_content(
         }
     }
 
-    let prefix_16 = &item_id[..item_id.len().min(16)];
+    let prefix_16 = item_prefix_16(&item_id);
     let layer_id = LayerId::new(format!("content:{prefix_16}")).map_err(DeployError::Id)?;
 
     let mount_rel = match mount_path {
@@ -3742,6 +3757,16 @@ pub fn move_content(
 mod placement_tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn an_item_prefix_never_splits_a_multibyte_character() {
+        assert_eq!(item_prefix_16("abcdefghijklmnop"), "abcdefghijklmnop");
+        assert_eq!(item_prefix_16("abcdefghijklmnopq"), "abcdefghijklmnop");
+        let multibyte = "ééééééééééééééééé";
+        let prefix = item_prefix_16(multibyte);
+        assert_eq!(prefix.chars().count(), 16);
+        assert_eq!(prefix, &multibyte[..prefix.len()]);
+    }
 
     fn base_file(path: &Path, rel: &str, placement: Placement, size: u64) -> PlannedFile {
         PlannedFile {

@@ -201,7 +201,7 @@ impl DataMigrationService {
         let resolved_source = Self::resolve_path(source_root)?;
 
         // Phase 1: Create a timestamped backup of the current destination state.
-        let backup_dir = self.create_backup()?;
+        let backup_dir = self.create_backup(&plan.source_inventory)?;
 
         // Phase 2: Stage copies on the same volume, then promote.
         let result = self.stage_and_promote(&resolved_source, &plan.source_inventory);
@@ -286,8 +286,9 @@ impl DataMigrationService {
     ///
     /// Copies `local_state.db`, the signed catalog bundle, the readable
     /// `registry.db`, and the `instances/` directory to a
-    /// `migration-backups/<timestamp>/` dir under the staging root.
-    fn create_backup(&self) -> LauncherResult<PathBuf> {
+    /// `migration-backups/<timestamp>/` dir under the staging root. Any other destination file the
+    /// migration will overwrite is copied too, so a failed promotion can put every file back.
+    fn create_backup(&self, inventory: &MigrationInventory) -> LauncherResult<PathBuf> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -336,6 +337,33 @@ impl DataMigrationService {
                     message: format!(
                         "Failed to back up instances directory {}: {e}",
                         instances_root.display()
+                    ),
+                });
+            }
+        }
+
+        // Every other destination file the promotion will overwrite, kept with its relative path
+        // so restore can put it back exactly.
+        for entry in &inventory.files {
+            if entry.rel_path.starts_with("instances/")
+                || matches!(
+                    entry.rel_path.as_str(),
+                    "local_state.db" | "registry.db" | "registry.bundle" | "registry.bundle.prev"
+                )
+            {
+                continue;
+            }
+            let destination = self.dest.root().join(Path::new(&entry.rel_path));
+            if !destination.is_file() {
+                continue;
+            }
+            let target = backup_root.join("overwritten").join(Path::new(&entry.rel_path));
+            if let Err(e) = copy_file_same_volume(&destination, &target) {
+                let _ = std::fs::remove_dir_all(&backup_root);
+                return Err(LauncherError::MigrationFailed {
+                    message: format!(
+                        "Failed to back up {} before overwriting it: {e}",
+                        destination.display()
                     ),
                 });
             }
@@ -474,6 +502,37 @@ impl DataMigrationService {
                 })?;
             }
             copy_dir_same_volume(&backup_instances, &dest_instances)?;
+        }
+
+        // Restore the other files the promotion overwrote, by their relative paths.
+        let overwritten = backup_dir.join("overwritten");
+        if overwritten.exists() {
+            let mut folders = vec![overwritten.clone()];
+            while let Some(folder) = folders.pop() {
+                for entry in std::fs::read_dir(&folder).map_err(|e| {
+                    LauncherError::MigrationFailed {
+                        message: format!(
+                            "Failed to read backup folder {} during restore: {e}",
+                            folder.display()
+                        ),
+                    }
+                })? {
+                    let entry = entry.map_err(|e| LauncherError::MigrationFailed {
+                        message: format!(
+                            "Failed to read a backup entry in {} during restore: {e}",
+                            folder.display()
+                        ),
+                    })?;
+                    let path = entry.path();
+                    if path.is_dir() {
+                        folders.push(path);
+                    } else if path.is_file() {
+                        let rel = path.strip_prefix(&overwritten).unwrap_or(&path);
+                        let destination = self.dest.root().join(rel);
+                        copy_file_same_volume(&path, &destination)?;
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -1118,5 +1177,34 @@ mod tests {
         // Second execution should also succeed (no-op).
         let result = svc.execute(&src).unwrap();
         assert_eq!(result.files_migrated, 0);
+    }
+
+    #[test]
+    fn a_colliding_file_that_is_not_a_database_is_backed_up_before_it_is_overwritten() {
+        let src = unique_dir();
+        fs::create_dir_all(src.join("cache")).unwrap();
+        fs::write(src.join("settings.json"), b"new settings").unwrap();
+        fs::write(src.join("cache/data.bin"), b"new cache").unwrap();
+        let dst = unique_dir();
+        let svc = make_service(&dst);
+        fs::write(dst.join("settings.json"), b"old settings").unwrap();
+        fs::create_dir_all(dst.join("cache")).unwrap();
+        fs::write(dst.join("cache/data.bin"), b"old cache").unwrap();
+
+        let result = svc.execute(&src).unwrap();
+        assert_eq!(std::fs::read(dst.join("settings.json")).unwrap(), b"new settings");
+        assert_eq!(
+            std::fs::read(dst.join("cache/data.bin")).unwrap(),
+            b"new cache"
+        );
+        let backup = std::path::Path::new(&result.backup_path);
+        assert_eq!(
+            std::fs::read(backup.join("overwritten/settings.json")).unwrap(),
+            b"old settings"
+        );
+        assert_eq!(
+            std::fs::read(backup.join("overwritten/cache/data.bin")).unwrap(),
+            b"old cache"
+        );
     }
 }

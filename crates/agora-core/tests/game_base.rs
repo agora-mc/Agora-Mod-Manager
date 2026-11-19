@@ -5,8 +5,8 @@ use agora_core::app_paths::AppPaths;
 use agora_core::game_base::{
     build_base, build_base_with_frameworks, evaluate_link_support, get_file_identity, install_size,
     is_plain_base_id, list_bases, make_base_id, remove_base, repair_framework,
-    sanitize_base_id_part, verify_base, BaseEntry, BaseError, BaseMode, BuildOptions, BuildOutcome,
-    ProblemKind, VerifyDepth,
+    sanitize_base_id_part, sweep_stale_staging, verify_base, BaseEntry, BaseError, BaseMode,
+    BuildOptions, BuildOutcome, ProblemKind, VerifyDepth,
 };
 use agora_core::game_discovery::{DiscoveredInstall, InstallKind};
 use agora_core::game_registry::{IdentifiedInstall, RuntimeResolution};
@@ -2133,4 +2133,155 @@ fn repairing_reports_exactly_the_scripts_the_source_install_lacks() {
     assert_eq!(repaired.missing_from_source, required[2..4].to_vec());
     assert!(!repaired.is_complete());
     assert_eq!(repaired.required_total, 4);
+}
+
+#[test]
+fn repairing_a_framework_replaces_a_recorded_file_that_is_missing_or_wrong() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, install_dir, install) = built(&tmp, Some("framework-verify"));
+    std::fs::write(install_dir.join("skse64_loader.exe"), b"loader").unwrap();
+    std::fs::create_dir_all(install_dir.join("Data/Scripts")).unwrap();
+    std::fs::write(install_dir.join("Data/Scripts/SKSE.pex"), b"right bytes").unwrap();
+    let framework = framework_with_required("skse64_loader.exe", &["Data/Scripts/SKSE.pex"]);
+    let outcome = build_base_with_frameworks(
+        &paths,
+        &install,
+        &test_definition(),
+        &[&framework],
+        BaseMode::Copied,
+        Some(&tmp.path().join("AgoraBases")),
+        BuildOptions::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+    let base_file = outcome.manifest().location.join("Data/Scripts/SKSE.pex");
+    assert_eq!(std::fs::read(&base_file).unwrap(), b"right bytes");
+
+    std::fs::remove_file(&base_file).unwrap();
+    let repaired = repair_framework(&paths, &base_id, &framework).unwrap();
+    assert_eq!(repaired.copied, vec!["Data/Scripts/SKSE.pex"]);
+    assert_eq!(std::fs::read(&base_file).unwrap(), b"right bytes");
+
+    std::fs::write(&base_file, b"tampered").unwrap();
+    let repaired = repair_framework(&paths, &base_id, &framework).unwrap();
+    assert_eq!(repaired.copied, vec!["Data/Scripts/SKSE.pex"]);
+    assert_eq!(std::fs::read(&base_file).unwrap(), b"right bytes");
+}
+
+#[test]
+fn repairing_refuses_a_base_that_is_its_own_source_and_leaves_the_file_alone() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, install_dir, install) = built(&tmp, Some("framework-self"));
+    std::fs::write(install_dir.join("skse64_loader.exe"), b"loader").unwrap();
+    let framework = framework_with_required("skse64_loader.exe", &["Data/Scripts/SKSE.pex"]);
+    let outcome = build_base_with_frameworks(
+        &paths,
+        &install,
+        &test_definition(),
+        &[&framework],
+        BaseMode::Copied,
+        Some(&tmp.path().join("AgoraBases")),
+        BuildOptions::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+    let location = outcome.manifest().location.clone();
+    let script = location.join("Data/Scripts/SKSE.pex");
+    std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+    std::fs::write(&script, b"must survive").unwrap();
+
+    let manifest_path = paths.base_manifest_path(&base_id);
+    let mut manifest: agora_core::game_base::BaseManifest =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest.source_location = location.clone();
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+
+    let error = repair_framework(&paths, &base_id, &framework).unwrap_err();
+    assert!(
+        error.to_string().contains("same folder"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(std::fs::read(&script).unwrap(), b"must survive");
+}
+
+#[test]
+fn a_base_build_keeps_a_folder_its_marker_does_not_claim() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("base-marker"));
+    let root = tmp.path().join("AgoraBases");
+    let definition = test_definition();
+    let first = build_base(
+        &paths,
+        &install,
+        &definition,
+        BaseMode::Copied,
+        Some(&root),
+        BuildOptions::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = first.manifest().base_id.clone();
+    let location = first.manifest().location.clone();
+    std::fs::remove_file(paths.base_manifest_path(&base_id)).unwrap();
+    std::fs::remove_file(location.join(".agora-base.json")).unwrap();
+    std::fs::write(location.join("mine.txt"), b"do not delete me").unwrap();
+
+    build_base(
+        &paths,
+        &install,
+        &definition,
+        BaseMode::Copied,
+        Some(&root),
+        BuildOptions::default(),
+        &|_| {},
+    )
+    .expect("the build replaces its own folder");
+
+    let stale = std::fs::read_dir(&root)
+        .unwrap()
+        .flatten()
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{base_id}.stale-"))
+        })
+        .expect("a folder without the marker is kept aside, not deleted");
+    assert_eq!(
+        std::fs::read(stale.path().join("mine.txt")).unwrap(),
+        b"do not delete me"
+    );
+}
+
+#[test]
+fn stale_staging_whose_owner_is_gone_is_swept_and_a_live_ones_is_kept() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, _install) = built(&tmp, Some("sweep"));
+    let root = paths.bases_dir();
+    std::fs::create_dir_all(&root).unwrap();
+    let dead = root.join("demo.partial-999999999-abc");
+    let stale = root.join("demo.stale-999999999-abc");
+    let live = root.join(format!("demo.partial-{}-abc", std::process::id()));
+    let deploy_dead = root
+        .join("deployments")
+        .join("inst")
+        .join("game.partial-999999999-abc");
+    let deploy_live = root
+        .join("deployments")
+        .join("inst")
+        .join(format!("game.partial-{}-abc", std::process::id()));
+    for folder in [&dead, &stale, &live, &deploy_dead, &deploy_live] {
+        std::fs::create_dir_all(folder).unwrap();
+        std::fs::write(folder.join("marker"), b"x").unwrap();
+    }
+
+    let removed = sweep_stale_staging(&paths).unwrap();
+    assert_eq!(removed, 3);
+    assert!(!dead.exists());
+    assert!(!stale.exists());
+    assert!(live.exists());
+    assert!(!deploy_dead.exists());
+    assert!(deploy_live.exists());
 }

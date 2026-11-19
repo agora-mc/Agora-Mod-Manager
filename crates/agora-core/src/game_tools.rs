@@ -3387,7 +3387,7 @@ fn run_by_swap(
     // for this game when the recovery check runs.
     let swapped = game_user_files::swap_in(ctx, instance_id, definition, &store, &install)?;
 
-    let journal = SwapJournal {
+    let mut journal = SwapJournal {
         version: game_tool_swap::JOURNAL_VERSION,
         game: definition.id.to_string(),
         store: store.as_str().to_string(),
@@ -3401,6 +3401,7 @@ fn run_by_swap(
         copy_kind: copy.kind,
         copy_dir: copy.copy_dir.clone(),
         swap_dir: copy.location.swap_dir.clone(),
+        processes: Vec::new(),
     };
     // The journal is written, and made durable, before the copy or the real Data is touched.
     if let Err(e) = game_tool_swap::write_journal(ctx, &journal) {
@@ -3485,6 +3486,11 @@ fn run_by_swap(
         }
     };
     let _ = game_user_files::record_process(ctx, &definition.id, &store, launched.identity.clone());
+
+    // Record the tool's identity in the swap journal too, so recovery can tell a run is still going
+    // when the tool runs from outside the install folder.
+    journal.processes.push(launched.identity.clone());
+    let _ = game_tool_swap::write_journal(ctx, &journal);
 
     let exit = wait_for_tree(&install, &mut launched, cancel);
     let installed = watch.finish();
