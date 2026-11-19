@@ -159,6 +159,7 @@ fn stored_answer(session: &str, hashes: Vec<String>) -> SessionAnswer {
             changes: Vec::new(),
             record: None,
             artifact_hashes: hashes,
+            artifact_occurrences: Vec::new(),
         },
     }
 }
@@ -277,5 +278,551 @@ fn without_a_later_session_the_window_ends_now_and_still_sees_the_crash() {
     assert!(
         answer.is_some(),
         "with no later session the window ends at now, so the crash is still its evidence"
+    );
+}
+
+/// Two separate crashes can produce byte-identical logs. Each session must still read its own
+/// evidence; a content hash alone does not make them the same event.
+#[test]
+fn identical_logs_in_separate_session_windows_are_both_evidence() {
+    let fixture = Fixture::new();
+    let conn = fixture.conn();
+    let now = SystemTime::now();
+    let pack = time_pack();
+
+    // Session 1 crashes and writes its own log.
+    let s1_start = now - Duration::from_secs(4 * 3600);
+    let s1_end = s1_start + Duration::from_secs(30);
+    fixture.write_log("crash-first.log", s1_start + Duration::from_secs(5));
+    let s1 = begin(&conn, s1_start, Owner::current());
+    session_ledger::finish(
+        &conn,
+        &s1,
+        &SessionFinish {
+            ended_at: chrono::DateTime::<chrono::Utc>::from(s1_end).to_rfc3339(),
+            duration_ms: 30_000,
+            exit: ExitObservation::Code {
+                pid: 1111,
+                image: "Game.exe".to_string(),
+                code: 0xC000_0005,
+            },
+            game_runtime_ms: Some(30_000),
+            normal_exit_codes: vec![0],
+            artifact: None,
+            froze: false,
+        },
+    )
+    .unwrap();
+
+    // A separate crash later writes a different log file with identical bytes.
+    let s2_start = now - Duration::from_secs(2 * 3600);
+    let s2_end = s2_start + Duration::from_secs(30);
+    fixture.write_log("crash-second.log", s2_start + Duration::from_secs(5));
+    let s2 = begin(&conn, s2_start, Owner::current());
+    session_ledger::finish(
+        &conn,
+        &s2,
+        &SessionFinish {
+            ended_at: chrono::DateTime::<chrono::Utc>::from(s2_end).to_rfc3339(),
+            duration_ms: 30_000,
+            exit: ExitObservation::Code {
+                pid: 2222,
+                image: "Game.exe".to_string(),
+                code: 0xC000_0005,
+            },
+            game_runtime_ms: Some(30_000),
+            normal_exit_codes: vec![0],
+            artifact: None,
+            froze: false,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let packs = [pack];
+    let a1 = agora_core::crash_live::diagnose_session(&fixture.ctx, &s1, fixture.live(&packs))
+        .expect("session 1 is diagnosable");
+    let a2 = agora_core::crash_live::diagnose_session(&fixture.ctx, &s2, fixture.live(&packs))
+        .expect("session 2 is diagnosable");
+
+    assert!(
+        matches!(a1.answer, StoredAnswer::Analyzed { .. }),
+        "session 1 should read its own crash log: {:?}",
+        a1.answer
+    );
+    assert!(
+        matches!(a2.answer, StoredAnswer::Analyzed { .. }),
+        "session 2's identical log is a separate crash and must not be dropped: {:?}",
+        a2.answer
+    );
+}
+
+/// The same log file occurrence that another session already read must not be consumed again.
+#[test]
+fn a_lingering_log_occurrence_across_session_windows_is_used_once() {
+    let fixture = Fixture::new();
+    let conn = fixture.conn();
+    let now = SystemTime::now();
+    let pack = time_pack();
+
+    let log_modified = now - Duration::from_secs(90 * 60);
+    fixture.write_log("crash-shared.log", log_modified);
+
+    // Session 1 answers this log.
+    let s1_start = now - Duration::from_secs(2 * 3600);
+    let s1 = begin(&conn, s1_start, Owner::current());
+    let ended = now - Duration::from_secs(80 * 60);
+    session_ledger::finish(
+        &conn,
+        &s1,
+        &SessionFinish {
+            ended_at: chrono::DateTime::<chrono::Utc>::from(ended).to_rfc3339(),
+            duration_ms: 2_400_000,
+            exit: ExitObservation::Code {
+                pid: 4242,
+                image: "Game.exe".to_string(),
+                code: 0xC000_0005,
+            },
+            game_runtime_ms: Some(2_400_000),
+            normal_exit_codes: vec![0],
+            artifact: None,
+            froze: false,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let packs = [pack];
+    let a1 = agora_core::crash_live::diagnose_session(&fixture.ctx, &s1, fixture.live(&packs))
+        .expect("session 1 is diagnosable");
+    assert!(
+        matches!(a1.answer, StoredAnswer::Analyzed { .. }),
+        "session 1 should read the crash log: {:?}",
+        a1.answer
+    );
+
+    // Another session window still covers the same lingering log file occurrence.
+    let conn = fixture.conn();
+    let s2_start = now - Duration::from_secs(100 * 60);
+    let s2 = begin(&conn, s2_start, Owner::current());
+    let ended = now - Duration::from_secs(70 * 60);
+    session_ledger::finish(
+        &conn,
+        &s2,
+        &SessionFinish {
+            ended_at: chrono::DateTime::<chrono::Utc>::from(ended).to_rfc3339(),
+            duration_ms: 1_800_000,
+            exit: ExitObservation::Code {
+                pid: 4343,
+                image: "Game.exe".to_string(),
+                code: 0xC000_0005,
+            },
+            game_runtime_ms: Some(1_800_000),
+            normal_exit_codes: vec![0],
+            artifact: None,
+            froze: false,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let a2 = agora_core::crash_live::diagnose_session(&fixture.ctx, &s2, fixture.live(&packs))
+        .expect("session 2 is diagnosable");
+    match a2.answer {
+        StoredAnswer::NothingToRead { .. } => {}
+        other => panic!(
+            "the same lingering log occurrence belongs to session 1, so session 2 has nothing to read: {other:?}"
+        ),
+    }
+}
+
+fn facts_only_pack() -> BuiltInPack {
+    BuiltInPack {
+        file: "test/facts-only/pack.json".to_string(),
+        json: serde_json::json!({
+            "contract": 1,
+            "games": ["test-game"],
+            "sources": [{
+                "id": "facts_log",
+                "where": { "root": "instance", "path": "logs" },
+                "match": { "glob": "facts-*.log" },
+                "format": "probe",
+                "bind": [{ "time": { "before_s": 2, "after_s": 10 } }],
+                "role": "primary",
+                "copy": "facts_only"
+            }],
+            "parsers": [{
+                "id": "probe",
+                "detect": { "all": ["(?m)^ERRORS$"] },
+                "entry": { "generic": { "name": "text_sections", "config": {
+                    "producer": { "format": "probe_log" },
+                    "sections": [{
+                        "id": "errors",
+                        "header": "^ERRORS$",
+                        "kind": "core.exception",
+                        "lines": [{
+                            "pattern": "^(?P<category>\\w+) (?P<mod>\\S+)$",
+                            "attrs": { "category": "category" },
+                            "refs": [{ "kind": "module", "value": "mod", "strength": "exec" }]
+                        }]
+                    }]
+                } } }
+            }],
+            "rules": []
+        })
+        .to_string(),
+        parsers: Vec::new(),
+    }
+}
+
+/// A facts-only artifact is parsed in place and contributes to diagnosis, but its raw file is never
+/// copied into the evidence store.
+#[test]
+fn a_facts_only_artifact_contributes_without_being_copied() {
+    let fixture = Fixture::new();
+    let conn = fixture.conn();
+    let now = SystemTime::now();
+    let pack = facts_only_pack();
+
+    let started = now - Duration::from_secs(2 * 3600);
+    let ended = started + Duration::from_secs(30);
+    let path = fixture.logs_dir.join("facts-crash.log");
+    std::fs::write(&path, "ERRORS\naccess_violation Mod.dll\n").unwrap();
+    set_modified(&path, started + Duration::from_secs(5));
+    let session = begin(&conn, started, Owner::current());
+    session_ledger::finish(
+        &conn,
+        &session,
+        &SessionFinish {
+            ended_at: chrono::DateTime::<chrono::Utc>::from(ended).to_rfc3339(),
+            duration_ms: 30_000,
+            exit: ExitObservation::Code {
+                pid: 5555,
+                image: "Game.exe".to_string(),
+                code: 0xC000_0005,
+            },
+            game_runtime_ms: Some(30_000),
+            normal_exit_codes: vec![0],
+            artifact: None,
+            froze: false,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let answer = agora_core::crash_live::diagnose_session(
+        &fixture.ctx,
+        &session,
+        fixture.live(std::slice::from_ref(&pack)),
+    )
+    .expect("facts-only session is diagnosable");
+
+    match answer.answer {
+        StoredAnswer::Analyzed { .. } => {}
+        other => panic!("facts-only artifact should contribute to diagnosis: {other:?}"),
+    }
+
+    // The raw evidence must not be copied to the store.
+    let session_dir = fixture
+        .ctx
+        .paths
+        .root()
+        .join(agora_core::crash_engine::evidence::EVIDENCE_STORE_DIR)
+        .join(&session);
+    if session_dir.exists() {
+        let mut count = 0usize;
+        for entry in std::fs::read_dir(&session_dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                count += 1;
+            }
+        }
+        assert_eq!(
+            count, 0,
+            "facts-only raw file must not be copied: {session_dir:?}"
+        );
+    }
+}
+
+/// A historical session's ownership comes from its launch manifest, not the current setup.
+#[test]
+fn historical_attribution_uses_the_session_launch_manifest() {
+    use agora_core::crash_engine::attribution::{LayerOwner, LayerView};
+
+    let fixture = Fixture::new();
+    let conn = fixture.conn();
+    let now = SystemTime::now();
+    let pack = BuiltInPack {
+        file: "test/owner/pack.json".to_string(),
+        json: serde_json::json!({
+            "contract": 1,
+            "games": ["test-game"],
+            "sources": [{
+                "id": "crash_log",
+                "where": { "root": "instance", "path": "logs" },
+                "match": { "glob": "crash-*.log" },
+                "format": "probe",
+                "bind": [{ "time": { "before_s": 2, "after_s": 10 } }],
+                "role": "primary"
+            }],
+            "parsers": [{
+                "id": "probe",
+                "detect": { "all": ["(?m)^ERRORS$"] },
+                "entry": { "generic": { "name": "text_sections", "config": {
+                    "producer": { "format": "probe_log" },
+                    "sections": [{
+                        "id": "errors",
+                        "header": "^ERRORS$",
+                        "kind": "core.exception",
+                        "lines": [{
+                            "pattern": "^(?P<category>\\w+) (?P<mod>\\S+)$",
+                            "attrs": { "category": "category" },
+                            "refs": [{ "kind": "module", "value": "mod", "strength": "exec" }]
+                        }]
+                    }]
+                } } }
+            }],
+            "ref_maps": [{
+                "kind": "module",
+                "lookup": { "path": { "patterns": ["mods/{value}"] } },
+                "match": "casefold"
+            }],
+            "rules": [{
+                "id": "module_owner",
+                "version": 1,
+                "when": { "fact": { "kind": "core.exception", "ref": { "kind": "module", "bind": "m" } } },
+                "effects": [{ "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 12 } }],
+                "text": { "headline": { "en": "{owner:m} crashed." } }
+            }]
+        })
+        .to_string(),
+        parsers: Vec::new(),
+    };
+
+    struct CurrentB;
+    impl ExtraInstanceProvider for CurrentB {
+        fn resolve(
+            &self,
+            _ctx: &agora_core::ctx::Ctx,
+            _instance_id: &str,
+        ) -> agora_core::error::LauncherResult<Option<ResolvedCrashInstance>> {
+            Ok(Some(ResolvedCrashInstance {
+                game_id: "test-game".to_string(),
+                runtime_version: Some("1.0".to_string()),
+                view: InstanceView::new(vec![LayerView::new(
+                    "mod-b",
+                    true,
+                    LayerOwner::Item {
+                        key: "mod-b".to_string(),
+                        name: "Mod B".to_string(),
+                    },
+                    vec!["mods/Mod.dll".to_string()],
+                )]),
+                could_not_check: Vec::new(),
+            }))
+        }
+    }
+
+    let started = now - Duration::from_secs(2 * 3600);
+    let ended = started + Duration::from_secs(30);
+    fixture.write_log("crash-hist.log", started + Duration::from_secs(5));
+
+    let manifest = LaunchManifest {
+        owner_layers: vec![LayerView::new(
+            "mod-a",
+            true,
+            LayerOwner::Item {
+                key: "mod-a".to_string(),
+                name: "Mod A".to_string(),
+            },
+            vec!["mods/Mod.dll".to_string()],
+        )],
+        ..LaunchManifest::default()
+    };
+    let session = session_ledger::begin(
+        &conn,
+        "inst",
+        &chrono::DateTime::<chrono::Utc>::from(started).to_rfc3339(),
+        &manifest,
+        Owner::current(),
+    )
+    .unwrap();
+    session_ledger::finish(
+        &conn,
+        &session,
+        &SessionFinish {
+            ended_at: chrono::DateTime::<chrono::Utc>::from(ended).to_rfc3339(),
+            duration_ms: 30_000,
+            exit: ExitObservation::Code {
+                pid: 7777,
+                image: "Game.exe".to_string(),
+                code: 0xC000_0005,
+            },
+            game_runtime_ms: Some(30_000),
+            normal_exit_codes: vec![0],
+            artifact: None,
+            froze: false,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let live = LivePacks {
+        packs: &[],
+        built_in: std::slice::from_ref(&pack),
+        host: &fixture.host,
+        instances: Some(&CurrentB),
+    };
+    let answer = agora_core::crash_live::diagnose_session(&fixture.ctx, &session, live)
+        .expect("historical session is diagnosable");
+    let StoredAnswer::Analyzed { answer, .. } = answer.answer else {
+        panic!("expected analyzed answer");
+    };
+    let owner = answer.candidates.first().and_then(|c| match &c.owner {
+        agora_game_api::crash::Owner::Item { key, .. } => Some(key.as_str()),
+        _ => None,
+    });
+    assert_eq!(
+        owner,
+        Some("mod-a"),
+        "historical session must name the mod that owned the file then: {answer:?}"
+    );
+    assert!(
+        !answer.could_not_check.iter().any(|n| n
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("attributed with the current setup"))),
+        "manifest ownership was known, so no current-setup caveat: {answer:?}"
+    );
+}
+
+#[test]
+fn an_older_session_without_recorded_ownership_states_the_current_setup_caveat() {
+    use agora_core::crash_engine::attribution::{LayerOwner, LayerView};
+
+    let fixture = Fixture::new();
+    let conn = fixture.conn();
+    let now = SystemTime::now();
+    let pack = BuiltInPack {
+        file: "test/owner-old/pack.json".to_string(),
+        json: serde_json::json!({
+            "contract": 1,
+            "games": ["test-game"],
+            "sources": [{
+                "id": "crash_log",
+                "where": { "root": "instance", "path": "logs" },
+                "match": { "glob": "crash-*.log" },
+                "format": "probe",
+                "bind": [{ "time": { "before_s": 2, "after_s": 10 } }],
+                "role": "primary"
+            }],
+            "parsers": [{
+                "id": "probe",
+                "detect": { "all": ["(?m)^ERRORS$"] },
+                "entry": { "generic": { "name": "text_sections", "config": {
+                    "producer": { "format": "probe_log" },
+                    "sections": [{
+                        "id": "errors",
+                        "header": "^ERRORS$",
+                        "kind": "core.exception",
+                        "lines": [{
+                            "pattern": "^(?P<category>\\w+) (?P<mod>\\S+)$",
+                            "attrs": { "category": "category" },
+                            "refs": [{ "kind": "module", "value": "mod", "strength": "exec" }]
+                        }]
+                    }]
+                } } }
+            }],
+            "ref_maps": [{
+                "kind": "module",
+                "lookup": { "path": { "patterns": ["mods/{value}"] } },
+                "match": "casefold"
+            }],
+            "rules": [{
+                "id": "module_owner",
+                "version": 1,
+                "when": { "fact": { "kind": "core.exception", "ref": { "kind": "module", "bind": "m" } } },
+                "effects": [{ "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 12 } }],
+                "text": { "headline": { "en": "{owner:m} crashed." } }
+            }]
+        })
+        .to_string(),
+        parsers: Vec::new(),
+    };
+
+    struct CurrentB;
+    impl ExtraInstanceProvider for CurrentB {
+        fn resolve(
+            &self,
+            _ctx: &agora_core::ctx::Ctx,
+            _instance_id: &str,
+        ) -> agora_core::error::LauncherResult<Option<ResolvedCrashInstance>> {
+            Ok(Some(ResolvedCrashInstance {
+                game_id: "test-game".to_string(),
+                runtime_version: Some("1.0".to_string()),
+                view: InstanceView::new(vec![LayerView::new(
+                    "mod-b",
+                    true,
+                    LayerOwner::Item {
+                        key: "mod-b".to_string(),
+                        name: "Mod B".to_string(),
+                    },
+                    vec!["mods/Mod.dll".to_string()],
+                )]),
+                could_not_check: Vec::new(),
+            }))
+        }
+    }
+
+    let started = now - Duration::from_secs(2 * 3600);
+    let ended = started + Duration::from_secs(30);
+    fixture.write_log("crash-old.log", started + Duration::from_secs(5));
+
+    let manifest = LaunchManifest::default();
+    let session = session_ledger::begin(
+        &conn,
+        "inst",
+        &chrono::DateTime::<chrono::Utc>::from(started).to_rfc3339(),
+        &manifest,
+        Owner::current(),
+    )
+    .unwrap();
+    session_ledger::finish(
+        &conn,
+        &session,
+        &SessionFinish {
+            ended_at: chrono::DateTime::<chrono::Utc>::from(ended).to_rfc3339(),
+            duration_ms: 30_000,
+            exit: ExitObservation::Code {
+                pid: 8888,
+                image: "Game.exe".to_string(),
+                code: 0xC000_0005,
+            },
+            game_runtime_ms: Some(30_000),
+            normal_exit_codes: vec![0],
+            artifact: None,
+            froze: false,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let live = LivePacks {
+        packs: &[],
+        built_in: std::slice::from_ref(&pack),
+        host: &fixture.host,
+        instances: Some(&CurrentB),
+    };
+    let answer = agora_core::crash_live::diagnose_session(&fixture.ctx, &session, live)
+        .expect("older session is diagnosable");
+    let StoredAnswer::Analyzed { answer, .. } = answer.answer else {
+        panic!("expected analyzed answer");
+    };
+    assert!(
+        answer.could_not_check.iter().any(|n| n
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("attributed with the current setup"))),
+        "older session without ownership map must state the caveat: {answer:?}"
     );
 }

@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use agora_game_api::crash::{
-    Artifact, AttrValue, BuiltInPack, CrashAnswer, Fact, GameHandle, MatchedBy, ParserLimits,
-    Reads, RefMap, RoleRule, Scalar, SessionVerdict, SourceRole, DETECT_HEAD_BYTES,
+    Artifact, AttrValue, BuiltInPack, CopyPolicy, CrashAnswer, Fact, GameHandle, MatchedBy,
+    ParserLimits, Reads, RefMap, RoleRule, Scalar, SessionVerdict, SourceRole, DETECT_HEAD_BYTES,
 };
 use agora_game_api::GamePath;
 use agora_plugin_api::host::{ScriptHost, ScriptReads};
@@ -62,16 +62,45 @@ pub enum StoredAnswer {
         /// this field existed have none, and are still read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         record: Option<RecordedCrash>,
-        /// Whole-file content hashes of the artifacts this session read. The sweep uses them to
-        /// recognise this crash's own logs and not count it again, including a log too large to
-        /// copy whole. Older answers have none.
+        /// Whole-file content hashes of the artifacts this session read. Kept for storage dedup and
+        /// history sweep identity; live evidence exclusion uses occurrences. Older answers have none.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         artifact_hashes: Vec<String>,
+        /// Artifact occurrences this session read. Two separate crashes with byte-identical logs are
+        /// different occurrences and both remain evidence. Older answers have none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        artifact_occurrences: Vec<ArtifactOccurrence>,
     },
     /// Nothing was readable for this session. That is not a clean bill of health.
     NothingToRead { why: String },
     /// The analysis itself failed or panicked. The launch path was not touched.
     CouldNotAnalyze { why: String },
+}
+
+/// One artifact occurrence a session read as evidence: file origin plus when it was last written,
+/// bound to the session that consumed it. The same bytes elsewhere or at another time are not the
+/// same event.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ArtifactOccurrence {
+    /// The artifact's path when it was read.
+    pub path: String,
+    /// When the file was last written, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<String>,
+    /// File size when read, to tell a rewritten-in-place file apart when times are coarse.
+    #[serde(default)]
+    pub size: u64,
+}
+
+/// Evidence identities another session's stored answer already consumed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnsweredEvidence {
+    /// Occurrences read by answers that recorded them.
+    pub occurrences: BTreeSet<ArtifactOccurrence>,
+    /// Content hashes from every answered artifact, for storage/history dedup.
+    pub hashes: BTreeSet<String>,
+    /// Hashes from answers that predate occurrence tracking; used only as a compatibility fallback.
+    pub legacy_hashes: BTreeSet<String>,
 }
 
 /// One session's stored answer, with the ids needed to show it.
@@ -1275,6 +1304,7 @@ fn clean_exit_answer(answer: StoredAnswer) -> StoredAnswer {
             changes,
             record,
             artifact_hashes,
+            artifact_occurrences,
         } => {
             let mut answer = *answer;
             answer.verdict = SessionVerdict::Normal;
@@ -1285,6 +1315,7 @@ fn clean_exit_answer(answer: StoredAnswer) -> StoredAnswer {
                 changes,
                 record,
                 artifact_hashes,
+                artifact_occurrences,
             }
         }
         other => other,
@@ -1508,21 +1539,34 @@ fn exclude_answered_evidence(
     record: &SessionRecord,
     collection: &mut SourceCollection,
 ) -> Result<(), String> {
-    let answered = crate::crash_history::answered_artifact_hashes(
+    let answered = crate::crash_history::answered_artifact_identities(
         conn,
         &record.instance_id,
         Some(&record.session_id),
     )
     .map_err(|error| format!("the stored crash answers could not be read: {error}"))?;
-    if answered.is_empty() {
+    if answered.occurrences.is_empty() && answered.legacy_hashes.is_empty() {
         return Ok(());
     }
     let mut kept = Vec::with_capacity(collection.bound.len());
     for found in collection.bound.drain(..) {
-        let already = found.unit == agora_game_api::crash::ArtifactUnit::File
-            && crate::crash_history::content_hash_file(&found.path)
-                .ok()
-                .is_some_and(|hash| answered.contains(&hash));
+        let already = if found.unit == agora_game_api::crash::ArtifactUnit::File {
+            if let Some(occurrence) = artifact_occurrence(&found) {
+                if answered.occurrences.contains(&occurrence) {
+                    true
+                } else if !answered.legacy_hashes.is_empty() {
+                    crate::crash_history::content_hash_file(&found.path)
+                        .ok()
+                        .is_some_and(|hash| answered.legacy_hashes.contains(&hash))
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         if already {
             collection
                 .seen
@@ -1543,6 +1587,38 @@ fn exclude_answered_evidence(
         .seen
         .sort_by(|left, right| (&left.source_id, &left.name).cmp(&(&right.source_id, &right.name)));
     Ok(())
+}
+
+fn artifact_occurrence(found: &FoundArtifact) -> Option<ArtifactOccurrence> {
+    (found.unit == agora_game_api::crash::ArtifactUnit::File).then(|| ArtifactOccurrence {
+        path: found.path.to_string_lossy().into_owned(),
+        modified_at: found.modified.map(crate::crash_engine::evidence::rfc3339),
+        size: found.size,
+    })
+}
+
+fn manifest_owner_view(
+    record: &SessionRecord,
+) -> Option<crate::crash_engine::attribution::InstanceView> {
+    let manifest = record.manifest.as_ref()?;
+    if manifest.owner_layers.is_empty() {
+        return None;
+    }
+    Some(crate::crash_engine::attribution::InstanceView::new(
+        manifest.owner_layers.clone(),
+    ))
+}
+
+fn attribution_caveat_note() -> agora_game_api::crash::CouldNotCheck {
+    agora_game_api::crash::CouldNotCheck {
+        reason: agora_game_api::crash::CouldNotCheckReason::InstanceIncomplete,
+        subject: "file ownership at crash time".to_string(),
+        detail: Some(
+            "This older session did not record which mod owned each file, so it was attributed with the current setup."
+                .to_string(),
+        ),
+        source: None,
+    }
 }
 
 fn diagnose_record(
@@ -1605,7 +1681,11 @@ fn diagnose_record(
     let copied = copied.map_err(|error| format!("the evidence could not be copied: {error}"))?;
     let normal_stop = log_shows_normal_stop(&collection, &game_packs, Some(&copied));
 
-    let files = readable_files(&copied);
+    let mut files = readable_files(&copied);
+    // Facts-only artifacts are parsed in place within the copy budget and never stored raw.
+    files.extend(facts_only_files(&collection));
+    files.sort_by(|left, right| left.name.cmp(&right.name));
+    files.dedup_by(|left, right| left.name == right.name && left.source == right.source);
     if files.is_empty() {
         return Ok(Diagnosed {
             answer: StoredAnswer::NothingToRead {
@@ -1625,7 +1705,11 @@ fn diagnose_record(
         .iter()
         .flat_map(|pack| pack.pack.roles.iter().cloned())
         .collect();
-    let resolver = Resolver::new(resolved.view, ref_maps, roles);
+    let (owner_view, attributed_with_current_setup) = match manifest_owner_view(record) {
+        Some(view) => (view, false),
+        None => (resolved.view, true),
+    };
+    let resolver = Resolver::new(owner_view, ref_maps, roles);
     let scope = std::sync::Arc::new(
         crate::game_script::instance_reads(ctx, &record.instance_id)
             .map_err(|error| format!("the instance files could not be opened: {error}"))?,
@@ -1671,14 +1755,25 @@ fn diagnose_record(
     }
 
     // The same crash's own files may sit in a source folder, so leave them out of the history
-    // comparison by their content hash. Hash the whole source file, never the stored copy: a log
-    // over the copy limit is kept as head and tail, and its copy's hash would not match the whole
-    // file the sweep reads, so the crash would count itself as history.
-    let exclude_hashes: Vec<String> = collection
+    // comparison by their content identity. Identity is computed once and bounded for large logs
+    // (head+tail, like the copy the store keeps) so a huge log is not read in full.
+    let identity_limits = CopyLimits::default();
+    let bound_files: Vec<&FoundArtifact> = collection
         .bound
         .iter()
         .filter(|found| found.unit == agora_game_api::crash::ArtifactUnit::File)
-        .filter_map(|found| crate::crash_history::content_hash_file(&found.path).ok())
+        .collect();
+    let exclude_hashes: Vec<String> = bound_files
+        .iter()
+        .filter_map(|found| {
+            crate::crash_history::bounded_content_identity(&found.path, &identity_limits)
+                .ok()
+                .map(|id| id.hash)
+        })
+        .collect();
+    let artifact_occurrences: Vec<ArtifactOccurrence> = bound_files
+        .iter()
+        .filter_map(|found| artifact_occurrence(found))
         .collect();
     let setup_hash = record.manifest.as_ref().map(|manifest| manifest.hash());
     let limits = crate::crash_history::LogSweepLimits::default();
@@ -1744,6 +1839,12 @@ fn diagnose_record(
             format!("the older crash logs could not be read: {why}"),
         );
     }
+    if attributed_with_current_setup {
+        output
+            .answer
+            .could_not_check
+            .push(attribution_caveat_note());
+    }
 
     let at_unix_ms = Some(crate::crash_engine::evidence::unix_ms(window.started));
     let recorded = RecordedCrash {
@@ -1764,6 +1865,7 @@ fn diagnose_record(
             changes,
             record: Some(recorded),
             artifact_hashes: exclude_hashes,
+            artifact_occurrences,
         },
         crash_artifact,
         normal_stop,
@@ -1901,6 +2003,28 @@ fn nothing_to_read(
         why.push_str(" Every folder a source names was empty, missing or unreadable.");
     }
     why
+}
+
+/// Bound facts-only file artifacts read in place for diagnosis. The raw file is never copied to the
+/// store; only the parsed facts flow into diagnosis.
+fn facts_only_files(collection: &SourceCollection) -> Vec<CrashFile> {
+    collection
+        .bound
+        .iter()
+        .filter(|found| {
+            found.unit == agora_game_api::crash::ArtifactUnit::File
+                && found.copy == CopyPolicy::FactsOnly
+        })
+        .filter_map(|found| {
+            let bytes = read_for_parsing(&found.path)?;
+            Some(CrashFile {
+                name: found.name.clone(),
+                bytes,
+                origin: crate::crash_engine::CrashFileOrigin::Collected,
+                source: Some(found.source_id.clone()),
+            })
+        })
+        .collect()
 }
 
 fn readable_files(copied: &CopiedSession) -> Vec<CrashFile> {

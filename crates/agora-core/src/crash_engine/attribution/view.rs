@@ -3,11 +3,13 @@
 use std::collections::BTreeMap;
 
 use agora_game_api::crash::Owner;
+use serde::{Deserialize, Serialize};
 
 use super::index::FileIndex;
 
 /// Who a layer belongs to, in the terms [`Owner`] uses.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LayerOwner {
     /// The unmodified game.
     Base,
@@ -56,7 +58,7 @@ impl LayerOwner {
 }
 
 /// One layer of the instance, in load order, with the files the game would see from it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayerView {
     /// The layer's id in the instance stack.
     pub id: String,

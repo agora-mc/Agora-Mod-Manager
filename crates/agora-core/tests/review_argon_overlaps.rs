@@ -657,6 +657,7 @@ fn new_since_last_launch_ignores_inactive_plugin_moving_in_previous_manifest() {
                 active: true,
             },
         ],
+        owner_layers: Vec::new(),
         ..LaunchManifest::default()
     };
     session_ledger::begin(

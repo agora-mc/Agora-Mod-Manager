@@ -239,14 +239,23 @@ pub fn stored_log_count(conn: &Connection, instance_id: &str) -> anyhow::Result<
 }
 
 /// The whole-file hashes of artifacts that a live diagnosis already read, from its stored answer.
-/// A stored answer this build cannot decode simply contributes none. A caller diagnosing one
-/// session passes its id as `exclude_session` so the session's own earlier answer does not hide
-/// the evidence it is about to read again; every other session's evidence is not reused.
+/// Kept for storage/history dedup; live evidence exclusion uses [`answered_artifact_identities`].
 pub(crate) fn answered_artifact_hashes(
     conn: &Connection,
     instance_id: &str,
     exclude_session: Option<&str>,
 ) -> Result<BTreeSet<String>, String> {
+    Ok(answered_artifact_identities(conn, instance_id, exclude_session)?.hashes)
+}
+
+/// Evidence identities from stored answers. Occurrences identify which event was read; content
+/// hashes remain for storage dedup. Answers written before occurrence tracking contribute only
+/// legacy hashes, used as a compatibility fallback for a lingering file.
+pub(crate) fn answered_artifact_identities(
+    conn: &Connection,
+    instance_id: &str,
+    exclude_session: Option<&str>,
+) -> Result<crate::crash_live::AnsweredEvidence, String> {
     let mut stmt = conn
         .prepare("SELECT session_id, answer_json FROM session_answers WHERE instance_id = ?1")
         .map_err(|error| error.to_string())?;
@@ -255,7 +264,7 @@ pub(crate) fn answered_artifact_hashes(
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(|error| error.to_string())?;
-    let mut hashes = BTreeSet::new();
+    let mut answered = crate::crash_live::AnsweredEvidence::default();
     for row in rows {
         let Ok((session_id, json)) = row else {
             continue;
@@ -264,13 +273,20 @@ pub(crate) fn answered_artifact_hashes(
             continue;
         }
         if let Ok(StoredAnswer::Analyzed {
-            artifact_hashes, ..
+            artifact_hashes,
+            artifact_occurrences,
+            ..
         }) = serde_json::from_str::<StoredAnswer>(&json)
         {
-            hashes.extend(artifact_hashes);
+            answered.hashes.extend(artifact_hashes.iter().cloned());
+            if artifact_occurrences.is_empty() {
+                answered.legacy_hashes.extend(artifact_hashes);
+            } else {
+                answered.occurrences.extend(artifact_occurrences);
+            }
         }
     }
-    Ok(hashes)
+    Ok(answered)
 }
 
 /// List every file the applicable packs' `sources` point at, analyse the newest ones once, and
@@ -582,22 +598,65 @@ pub fn content_hash(bytes: &[u8]) -> String {
     hex_digest(&digest)
 }
 
+/// Content identity for a log. Large files may be identified by a bounded sample (head and tail),
+/// recorded as partial so callers know it is not a whole-file hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentIdentity {
+    pub hash: String,
+    pub partial: bool,
+}
+
 /// The `content_hash` of a file on disk, read in bounded chunks. Used for the current session's
 /// artifacts, which may be far larger than the evidence copy keeps.
 pub fn content_hash_file(path: &std::path::Path) -> std::io::Result<String> {
-    use std::io::Read;
+    bounded_content_identity(path, &crate::crash_engine::evidence::CopyLimits::default())
+        .map(|id| id.hash)
+}
+
+/// Compute a file identity bounded by the copy budget: whole-file hash when small enough, otherwise
+/// hash the head and tail that would be kept and mark the identity partial.
+pub fn bounded_content_identity(
+    path: &std::path::Path,
+    limits: &crate::crash_engine::evidence::CopyLimits,
+) -> std::io::Result<ContentIdentity> {
+    use std::io::{Read, Seek, SeekFrom};
 
     let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    let size = file.metadata()?.len();
+    if size <= limits.max_file_bytes {
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
         }
-        hasher.update(&buffer[..read]);
+        return Ok(ContentIdentity {
+            hash: hex_digest(&hasher.finalize()),
+            partial: false,
+        });
     }
-    Ok(hex_digest(&hasher.finalize()))
+
+    let mut hasher = Sha256::new();
+    let mut head = vec![0u8; limits.head_bytes.min(size) as usize];
+    let read = file.read(&mut head)?;
+    head.truncate(read);
+    hasher.update(&head);
+
+    let tail_len = limits.tail_bytes.min(size.saturating_sub(read as u64)) as usize;
+    if tail_len > 0 {
+        file.seek(SeekFrom::End(-(tail_len as i64)))?;
+        let mut tail = vec![0u8; tail_len];
+        let read_tail = file.read(&mut tail)?;
+        tail.truncate(read_tail);
+        hasher.update(&tail);
+    }
+    Ok(ContentIdentity {
+        hash: hex_digest(&hasher.finalize()),
+        partial: true,
+    })
 }
 
 fn hex_digest(digest: &[u8]) -> String {

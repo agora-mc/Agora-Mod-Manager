@@ -50,6 +50,7 @@ fn answer(session: &str, instance: &str, created: &str, headline: &str) -> Sessi
             changes: Vec::new(),
             record: None,
             artifact_hashes: Vec::new(),
+            artifact_occurrences: Vec::new(),
         },
     }
 }
@@ -316,6 +317,7 @@ fn the_change_summary_survives_a_round_trip() {
         }],
         record: None,
         artifact_hashes: Vec::new(),
+        artifact_occurrences: Vec::new(),
     };
     store_answer(&conn, &stored).unwrap();
 

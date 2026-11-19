@@ -673,6 +673,7 @@ fn manifest(items: &[&str]) -> agora_core::session_ledger::LaunchManifest {
         settings_hash: Some("settings".to_string()),
         settings: Vec::new(),
         unreadable: Vec::new(),
+        owner_layers: Vec::new(),
     }
 }
 

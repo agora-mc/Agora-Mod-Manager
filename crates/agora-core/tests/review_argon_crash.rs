@@ -57,6 +57,7 @@ fn make_answer(session: &str, instance: &str, created: &str, headline: &str) -> 
             changes: Vec::new(),
             record: None,
             artifact_hashes: Vec::new(),
+            artifact_occurrences: Vec::new(),
         },
     }
 }

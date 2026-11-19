@@ -198,6 +198,10 @@ pub struct LaunchManifest {
     /// Parts of the manifest that could not be read, in words.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unreadable: Vec<String>,
+    /// File-to-owner layers as they were when the session ran, so a historical crash can be
+    /// attributed to that setup. Empty in manifests recorded before this was kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_layers: Vec<crate::crash_engine::attribution::LayerView>,
 }
 
 /// One key an instance's INI file sets, with the file and section that hold it.
@@ -849,6 +853,11 @@ pub fn build_manifest(
         }
         Err(e) => manifest.unreadable.push(format!("settings: {e}")),
     }
+
+    match crate::crash_engine::attribution::from_instance(ctx, instance_id) {
+        Ok(view) => manifest.owner_layers = view.layers().to_vec(),
+        Err(error) => manifest.unreadable.push(format!("file ownership: {error}")),
+    }
     manifest
 }
 
@@ -902,6 +911,7 @@ pub fn minecraft_manifest(instance: &crate::models::InstanceManifest) -> LaunchM
         ),
         load_orders_hash: Some(sha_hex(b"")),
         settings_hash: None,
+        owner_layers: Vec::new(),
         ..LaunchManifest::default()
     };
     manifest
@@ -1910,6 +1920,7 @@ mod tests {
             settings_hash: Some(sha_hex(b"settings")),
             settings: Vec::new(),
             unreadable: vec![],
+            owner_layers: Vec::new(),
         }
     }
 
@@ -2009,6 +2020,7 @@ mod tests {
             runtime: "steam:1".into(),
             load_orders_hash: Some(sha_hex(b"")),
             settings_hash: Some(sha_hex(b"")),
+            owner_layers: Vec::new(),
             ..LaunchManifest::default()
         };
         let id = begin(&conn, "skyrim", "2026-01-01T00:00:00Z", &manifest, owner(1)).unwrap();

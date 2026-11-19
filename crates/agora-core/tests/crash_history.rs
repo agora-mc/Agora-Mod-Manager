@@ -356,3 +356,50 @@ fn managed_frame(index: f64, class: &str, symbol: &str) -> Fact {
         span: None,
     }
 }
+
+#[test]
+fn large_log_identity_is_bounded_to_head_and_tail() {
+    use agora_core::crash_engine::evidence::CopyLimits;
+    use agora_core::crash_history::{bounded_content_identity, content_hash};
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("huge.log");
+    let limits = CopyLimits {
+        max_file_bytes: 1024,
+        head_bytes: 128,
+        tail_bytes: 128,
+        ..CopyLimits::default()
+    };
+
+    let mut file = std::fs::File::create(&path).unwrap();
+    let head = vec![b'H'; 128];
+    let middle = vec![b'M'; 4096];
+    let tail = vec![b'T'; 128];
+    file.write_all(&head).unwrap();
+    file.write_all(&middle).unwrap();
+    file.write_all(&tail).unwrap();
+    drop(file);
+
+    let id = bounded_content_identity(&path, &limits).unwrap();
+    assert!(
+        id.partial,
+        "a log over the copy budget must have a partial identity"
+    );
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&head);
+    expected.extend_from_slice(&tail);
+    assert_eq!(id.hash, content_hash(&expected));
+    assert_ne!(
+        id.hash,
+        content_hash(&{
+            let mut all = Vec::new();
+            all.extend_from_slice(&head);
+            all.extend_from_slice(&middle);
+            all.extend_from_slice(&tail);
+            all
+        }),
+        "middle bytes must not affect a partial identity"
+    );
+}
