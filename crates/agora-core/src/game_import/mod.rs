@@ -2196,130 +2196,147 @@ pub fn mo2_run_profiles(
                 .instance_id
                 .clone()
                 .ok_or_else(|| ImportError::Other("the base import made no instance".into()))?;
-            let definition = ctx
-                .games
-                .game(&multi.plans[0].game)
-                .cloned()
-                .ok_or_else(|| ImportError::Other("the game definition is missing".into()))?;
 
-            let mut folder_to_item: HashMap<String, String> = HashMap::new();
-            for profile_plan in &multi.plans {
-                for item in profile_plan.mods.iter().filter(|m| m.enabled) {
-                    let key = fold_path_case(&item.folder);
-                    if folder_to_item.contains_key(&key) {
-                        continue;
+            // Everything after the first profile's instance exists is one recoverable unit:
+            // any failure removes the half-made instance so a normal retry succeeds cleanly
+            // instead of hitting AlreadyImported.
+            let merged = (|| -> Result<Vec<String>, ImportError> {
+                let definition = ctx
+                    .games
+                    .game(&multi.plans[0].game)
+                    .cloned()
+                    .ok_or_else(|| ImportError::Other("the game definition is missing".into()))?;
+
+                let mut folder_to_item: HashMap<String, String> = HashMap::new();
+                for profile_plan in &multi.plans {
+                    for item in profile_plan.mods.iter().filter(|m| m.enabled) {
+                        let key = fold_path_case(&item.folder);
+                        if folder_to_item.contains_key(&key) {
+                            continue;
+                        }
+                        let item_id = add_mo2_mod_to_merged(
+                            ctx,
+                            &instance_id,
+                            &definition,
+                            profile_plan,
+                            item,
+                        )?;
+                        folder_to_item.insert(key, item_id);
                     }
-                    let item_id =
-                        add_mo2_mod_to_merged(ctx, &instance_id, &definition, profile_plan, item)?;
-                    folder_to_item.insert(key, item_id);
                 }
-            }
-            let mut item_folders: HashMap<String, Vec<String>> = HashMap::new();
-            for (folder_key, item_id) in &folder_to_item {
-                item_folders
-                    .entry(item_id.clone())
-                    .or_default()
-                    .push(folder_key.clone());
-            }
-            let manifest = game_instance::get_manifest(ctx, &instance_id)?;
-            let mut layer_mods: HashMap<String, Vec<String>> = HashMap::new();
-            let mut item_to_layer: HashMap<String, String> = HashMap::new();
-            for layer in manifest.layers.layers() {
-                if let agora_game_api::LayerSource::Content { content } = &layer.source {
-                    layer_mods.insert(
-                        layer.id.as_str().to_string(),
-                        item_folders.get(content).cloned().unwrap_or_default(),
-                    );
-                    item_to_layer.insert(content.clone(), layer.id.as_str().to_string());
+                let mut item_folders: HashMap<String, Vec<String>> = HashMap::new();
+                for (folder_key, item_id) in &folder_to_item {
+                    item_folders
+                        .entry(item_id.clone())
+                        .or_default()
+                        .push(folder_key.clone());
                 }
-            }
-            let folder_to_layer: HashMap<String, String> = folder_to_item
-                .iter()
-                .filter_map(|(folder_key, item_id)| {
-                    item_to_layer
-                        .get(item_id)
-                        .map(|layer_id| (folder_key.clone(), layer_id.clone()))
-                })
-                .collect();
+                let manifest = game_instance::get_manifest(ctx, &instance_id)?;
+                let mut layer_mods: HashMap<String, Vec<String>> = HashMap::new();
+                let mut item_to_layer: HashMap<String, String> = HashMap::new();
+                for layer in manifest.layers.layers() {
+                    if let agora_game_api::LayerSource::Content { content } = &layer.source {
+                        layer_mods.insert(
+                            layer.id.as_str().to_string(),
+                            item_folders.get(content).cloned().unwrap_or_default(),
+                        );
+                        item_to_layer.insert(content.clone(), layer.id.as_str().to_string());
+                    }
+                }
+                let folder_to_layer: HashMap<String, String> = folder_to_item
+                    .iter()
+                    .filter_map(|(folder_key, item_id)| {
+                        item_to_layer
+                            .get(item_id)
+                            .map(|layer_id| (folder_key.clone(), layer_id.clone()))
+                    })
+                    .collect();
 
-            let overwrite_layer_id = overwrite_item
-                .as_ref()
-                .and_then(|item_id| item_to_layer.get(item_id).cloned());
+                let overwrite_layer_id = overwrite_item
+                    .as_ref()
+                    .and_then(|item_id| item_to_layer.get(item_id).cloned());
 
-            let ini_text = read_text_optional(&base.ini_path)?.unwrap_or_default();
-            let ini_dir = base
-                .ini_path
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_default();
-            let mo2_ini = mo2::parse_ini(&ini_text, ini_dir);
+                let ini_text = read_text_optional(&base.ini_path)?.unwrap_or_default();
+                let ini_dir = base
+                    .ini_path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                let mo2_ini = mo2::parse_ini(&ini_text, ini_dir);
 
-            let mut loadouts = Vec::new();
-            for (profile, profile_plan) in profiles.iter().zip(multi.plans.iter()) {
-                let profile_dir = mo2_ini.profiles.join(profile);
-                let state = mo2_state_for_merge(
+                let mut loadouts = Vec::new();
+                for (profile, profile_plan) in profiles.iter().zip(multi.plans.iter()) {
+                    let profile_dir = mo2_ini.profiles.join(profile);
+                    let state = mo2_state_for_merge(
+                        ctx,
+                        &instance_id,
+                        &definition,
+                        profile_plan,
+                        &profile_dir,
+                        &layer_mods,
+                        &folder_to_layer,
+                        overwrite_layer_id.as_deref(),
+                    )?;
+                    crate::game_loadout::save_game_profile(ctx, &instance_id, profile, state)
+                        .map_err(ImportError::Other)?;
+                    loadouts.push(profile.clone());
+                }
+                crate::game_loadout::apply_game_profile_with_undo(
                     ctx,
                     &instance_id,
                     &definition,
-                    profile_plan,
-                    &profile_dir,
-                    &layer_mods,
-                    &folder_to_layer,
-                    overwrite_layer_id.as_deref(),
-                )?;
-                crate::game_loadout::save_game_profile(ctx, &instance_id, profile, state)
-                    .map_err(ImportError::Other)?;
-                loadouts.push(profile.clone());
-            }
-            crate::game_loadout::apply_game_profile_with_undo(
-                ctx,
-                &instance_id,
-                &definition,
-                &profiles[0],
-            )
-            .map_err(|e| ImportError::Other(e.to_string()))?;
+                    &profiles[0],
+                )
+                .map_err(|e| ImportError::Other(e.to_string()))?;
 
-            if base.copy_saves {
-                let store = game_ini::store_of(ctx, &instance_id)?;
-                if let Some(rule) = game_saves::rule_for(&definition, &store) {
-                    for (profile, profile_plan) in profiles.iter().zip(multi.plans.iter()) {
-                        if !profile_plan.saves.local {
-                            continue;
-                        }
-                        let Some(from) = &profile_plan.saves.from else {
-                            continue;
-                        };
-                        let folder =
-                            game_saves::own_folder_scoped(rule, &instance_id, Some(profile))?;
-                        let entries = saves_entries(from)?;
-                        let mut created_dir = false;
-                        for entry in entries {
-                            let path = entry.path();
-                            let meta = std::fs::symlink_metadata(&path)
-                                .map_err(|e| saves_unreadable(&path, &e))?;
-                            if content_store::is_reparse_point_or_symlink(&meta) || !meta.is_file()
-                            {
+                if base.copy_saves {
+                    let store = game_ini::store_of(ctx, &instance_id)?;
+                    if let Some(rule) = game_saves::rule_for(&definition, &store) {
+                        for (profile, profile_plan) in profiles.iter().zip(multi.plans.iter()) {
+                            if !profile_plan.saves.local {
                                 continue;
                             }
-                            if !created_dir {
-                                std::fs::create_dir_all(&folder)?;
-                                created_dir = true;
-                            }
-                            let dest = folder.join(entry.file_name());
-                            if dest.exists() {
+                            let Some(from) = &profile_plan.saves.from else {
                                 continue;
+                            };
+                            let folder =
+                                game_saves::own_folder_scoped(rule, &instance_id, Some(profile))?;
+                            let entries = saves_entries(from)?;
+                            let mut created_dir = false;
+                            for entry in entries {
+                                let path = entry.path();
+                                let meta = std::fs::symlink_metadata(&path)
+                                    .map_err(|e| saves_unreadable(&path, &e))?;
+                                if content_store::is_reparse_point_or_symlink(&meta)
+                                    || !meta.is_file()
+                                {
+                                    continue;
+                                }
+                                if !created_dir {
+                                    std::fs::create_dir_all(&folder)?;
+                                    created_dir = true;
+                                }
+                                let dest = folder.join(entry.file_name());
+                                if dest.exists() {
+                                    continue;
+                                }
+                                std::fs::copy(&path, &dest)?;
                             }
-                            std::fs::copy(&path, &dest)?;
                         }
                     }
                 }
-            }
 
-            Ok(Mo2MultiReport {
-                plan: multi,
-                instances: vec![instance_id],
-                loadouts,
-            })
+                Ok(loadouts)
+            })();
+
+            match merged {
+                Ok(loadouts) => Ok(Mo2MultiReport {
+                    plan: multi,
+                    instances: vec![instance_id],
+                    loadouts,
+                }),
+                Err(error) => Err(abandon_half_made_instance(ctx, &instance_id, error)),
+            }
         }
     }
 }

@@ -1955,3 +1955,65 @@ fn f1d_byte_identical_alias_folders_stay_enabled_in_each_profiles_loadout() {
         "EchoAlias must keep the shared content item enabled under Alt"
     );
 }
+
+#[test]
+fn f1e_late_merge_failure_cleans_up_and_retry_succeeds() {
+    use agora_core::game_import::{profiles::Grouping, ImportPhase};
+
+    let f = fixture();
+    // Create a mod folder enabled only in Alt, plus Alt profile.
+    let only_in_alt = f.setup.join("mods/OnlyInAlt");
+    write(&only_in_alt.join("OnlyInAlt.esp"), b"ALT ONLY");
+    let alt = f.setup.join("profiles/Alt");
+    write(
+        &alt.join("modlist.txt"),
+        b"# Mod Organizer\r\n+Alpha\r\n+OnlyInAlt\r\n",
+    );
+    write(
+        &alt.join("plugins.txt"),
+        b"# Mod Organizer\r\n*Alpha.esp\r\n*OnlyInAlt.esp\r\n",
+    );
+
+    let profiles = vec!["Test Profile".to_string(), "Alt".to_string()];
+    // Once profile 1 reaches Finishing (after planning succeeded and the instance was created),
+    // remove OnlyInAlt so adding profile 2's mod fails after profile 1 has committed.
+    let removed = std::cell::Cell::new(false);
+    let err = agora_core::game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, None, false),
+        &profiles,
+        Grouping::Merged,
+        Default::default(),
+        &|p| {
+            if p.phase == ImportPhase::Finishing && !removed.replace(true) {
+                std::fs::remove_dir_all(&only_in_alt).unwrap();
+            }
+        },
+    )
+    .expect_err("missing second-profile mod must fail the merge");
+    assert!(
+        matches!(err, ImportError::Store { .. }),
+        "expected store failure, got {err:?}"
+    );
+    assert!(
+        game_instance::list(&f.ctx).unwrap().is_empty(),
+        "a failed merge must not leave a partial instance listed"
+    );
+
+    // Restore the missing folder and retry with the default name (name: None):
+    // must succeed rather than returning AlreadyImported.
+    write(&only_in_alt.join("OnlyInAlt.esp"), b"ALT ONLY");
+    let retry = agora_core::game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, None, false),
+        &profiles,
+        Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("retry after fixing the source folder must succeed, not return AlreadyImported");
+    assert_eq!(retry.instances.len(), 1);
+    assert_eq!(retry.loadouts, profiles);
+}
