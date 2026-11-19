@@ -2091,7 +2091,8 @@ fn mo2_state_for_merge(
         } else {
             SavesChoice::Shared
         },
-        save_folder: None,
+        // Each merged profile with local saves gets its own scoped folder under the instance.
+        save_folder: plan.saves.local.then(|| plan.profile.clone()),
     })
 }
 
@@ -2139,6 +2140,8 @@ pub fn mo2_run_profiles(
         profiles::Grouping::Merged => {
             let request = Mo2Request {
                 profile: profiles[0].clone(),
+                // The merged branch copies each local-save profile into its own scoped folder.
+                copy_saves: false,
                 ..base.clone()
             };
             let report = run(ctx, inventory, &request, options, progress)?;
@@ -2216,6 +2219,43 @@ pub fn mo2_run_profiles(
                 &profiles[0],
             )
             .map_err(|e| ImportError::Other(e.to_string()))?;
+
+            if base.copy_saves {
+                let store = game_ini::store_of(ctx, &instance_id)?;
+                if let Some(rule) = game_saves::rule_for(&definition, &store) {
+                    for (profile, profile_plan) in profiles.iter().zip(multi.plans.iter()) {
+                        if !profile_plan.saves.local {
+                            continue;
+                        }
+                        let Some(from) = &profile_plan.saves.from else {
+                            continue;
+                        };
+                        let folder =
+                            game_saves::own_folder_scoped(rule, &instance_id, Some(profile))?;
+                        let entries = saves_entries(from)?;
+                        let mut created_dir = false;
+                        for entry in entries {
+                            let path = entry.path();
+                            let meta = std::fs::symlink_metadata(&path)
+                                .map_err(|e| saves_unreadable(&path, &e))?;
+                            if content_store::is_reparse_point_or_symlink(&meta) || !meta.is_file()
+                            {
+                                continue;
+                            }
+                            if !created_dir {
+                                std::fs::create_dir_all(&folder)?;
+                                created_dir = true;
+                            }
+                            let dest = folder.join(entry.file_name());
+                            if dest.exists() {
+                                continue;
+                            }
+                            std::fs::copy(&path, &dest)?;
+                        }
+                    }
+                }
+            }
+
             Ok(Mo2MultiReport {
                 plan: multi,
                 instances: vec![instance_id],

@@ -1775,3 +1775,74 @@ fn f1a_merged_profile_without_own_settings_uses_shared_not_profile_1() {
         "OwnPlugins Plugins.txt should have only *Beta.esp, got:\n{plugins_text}"
     );
 }
+
+#[test]
+fn f1b_merged_local_saves_get_distinct_scoped_folders_and_copy_each_profiles_saves() {
+    use agora_core::game_import::profiles::Grouping;
+
+    let f = fixture();
+    add_second_mo2_profile(&f);
+    let alt = f.setup.join("profiles/Alt");
+    write(
+        &alt.join("settings.ini"),
+        b"[General]\r\nLocalSaves=true\r\nLocalSettings=false\r\n",
+    );
+    write(&alt.join("saves/AltSave.ess"), b"ALT SAVE");
+
+    let profiles = vec!["Test Profile".to_string(), "Alt".to_string()];
+    let report = agora_core::game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("Scoped Saves Merge"), true),
+        &profiles,
+        Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("merged import with copy_saves runs");
+    let instance = &report.instances[0];
+    let rule = game_saves::rule_for(&f.def, &StoreId::steam()).expect("save rule");
+
+    let unscoped = game_saves::own_folder(rule, instance).unwrap();
+    let main_folder = game_saves::own_folder_scoped(rule, instance, Some("Test Profile")).unwrap();
+    let alt_folder = game_saves::own_folder_scoped(rule, instance, Some("Alt")).unwrap();
+    assert_ne!(main_folder, alt_folder);
+    assert!(
+        !unscoped.join("Save1.ess").exists(),
+        "profile 1 saves must go to its scoped folder, not the unscoped own folder"
+    );
+    assert_eq!(
+        std::fs::read(main_folder.join("Save1.ess")).expect("Test Profile save copied"),
+        b"SAVE ONE"
+    );
+    assert!(!main_folder.join("AltSave.ess").exists());
+    assert_eq!(
+        std::fs::read(alt_folder.join("AltSave.ess")).expect("Alt save copied"),
+        b"ALT SAVE"
+    );
+    assert!(!alt_folder.join("Save1.ess").exists());
+
+    // Active profile (Test Profile) points at Test Profile's scoped folder.
+    assert_eq!(
+        game_saves::in_use_folder(&f.ctx, instance, &f.def).unwrap(),
+        main_folder
+    );
+    let main_status = game_saves::status(&f.ctx, instance, &f.def).unwrap();
+    assert_eq!(
+        main_status.setting_value.as_deref(),
+        Some(game_saves::own_value_scoped(rule, instance, Some("Test Profile")).as_str())
+    );
+
+    // Switching to Alt points at Alt's scoped folder.
+    agora_core::game_loadout::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "Alt")
+        .expect("apply Alt");
+    assert_eq!(
+        game_saves::in_use_folder(&f.ctx, instance, &f.def).unwrap(),
+        alt_folder
+    );
+    let alt_status = game_saves::status(&f.ctx, instance, &f.def).unwrap();
+    assert_eq!(
+        alt_status.setting_value.as_deref(),
+        Some(game_saves::own_value_scoped(rule, instance, Some("Alt")).as_str())
+    );
+}
