@@ -1034,10 +1034,12 @@ pub fn delete_with_options(
         // Move the folder into Agora's own holding area before the row goes, so a crash leaves
         // either a restorable entry or a live instance, never a row with no files.
         let row = trash::read_row(&conn, id)?;
+        let load_order_rules = trash::read_load_order_rules(&conn, id)?;
         let entry = if instance_dir.exists() {
             let entry = trash::stash(
                 &ctx.paths.recently_deleted_games_root(),
                 row,
+                load_order_rules,
                 &instance_dir,
                 chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()),
             )?;

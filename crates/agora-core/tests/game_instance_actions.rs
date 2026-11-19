@@ -1179,3 +1179,89 @@ fn delete_refuses_a_running_instance_whose_session_is_known_only_to_the_ledger()
         .expect("a dir")
         .exists());
 }
+
+
+#[test]
+fn delete_and_restore_preserves_load_order_rules() {
+    let f = Fixture::new();
+    write_instance(&f.ctx, &manifest("grounded-1", "Grounded"));
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "INSERT INTO plugin_load_order_rules (instance_id, list_id, item, after_item) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params!["grounded-1", "plugins", "B.esp", "A.esp"],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO plugin_load_order_rules (instance_id, list_id, item, after_item) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params!["grounded-1", "other", "D.esp", "C.esp"],
+    )
+    .unwrap();
+    drop(conn);
+
+    let entry_id = game_instance::delete(&f.ctx, "grounded-1")
+        .unwrap()
+        .trash_entry_id
+        .unwrap();
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).unwrap();
+    let remaining: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM plugin_load_order_rules WHERE instance_id = 'grounded-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0, "delete trigger removed the rules");
+    drop(conn);
+
+    trash::restore(&f.ctx, &entry_id, None).unwrap();
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT list_id, item, after_item FROM plugin_load_order_rules WHERE instance_id = 'grounded-1' ORDER BY list_id, item, after_item",
+        )
+        .unwrap();
+    let got: Vec<(String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("other".into(), "D.esp".into(), "C.esp".into()),
+            ("plugins".into(), "B.esp".into(), "A.esp".into()),
+        ]
+    );
+}
+
+#[test]
+fn restoring_a_deleted_instance_under_a_new_id_restores_its_load_order_rules() {
+    let f = Fixture::new();
+    write_instance(&f.ctx, &manifest("grounded-1", "Grounded"));
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "INSERT INTO plugin_load_order_rules (instance_id, list_id, item, after_item) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params!["grounded-1", "plugins", "B.esp", "A.esp"],
+    )
+    .unwrap();
+    drop(conn);
+
+    let entry_id = game_instance::delete(&f.ctx, "grounded-1")
+        .unwrap()
+        .trash_entry_id
+        .unwrap();
+    // The original id is free again, but restoring under a new name must move the rules too.
+    let restored = trash::restore(&f.ctx, &entry_id, Some("Grounded Restored")).unwrap();
+    assert!(restored.renamed);
+    assert_ne!(restored.instance_id, "grounded-1");
+
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).unwrap();
+    let got: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM plugin_load_order_rules WHERE instance_id = ?1 AND list_id = 'plugins' AND item = 'B.esp' AND after_item = 'A.esp'",
+            [&restored.instance_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(got, 1, "rules restored under the new id");
+}
