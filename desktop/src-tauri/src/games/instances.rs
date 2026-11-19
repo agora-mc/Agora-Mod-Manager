@@ -882,18 +882,9 @@ fn purge_deleted(
 ) -> Result<PurgedDeleted, GamesError> {
     let game = parse_game_id(game_id)?;
     let ctx = crate::core_context(app)?;
-    let trash = trash_adapter();
-    let summary = match entry_id {
-        Some(entry_id) => {
-            game_instance::trash::purge(&ctx, entry_id, &trash).map_err(map_error)?;
-            game_instance::trash::PurgeSummary {
-                purged: 1,
-                failed: 0,
-                kept: 0,
-            }
-        }
-        None => game_instance::trash::purge_all(&ctx, game.as_str(), &trash),
-    };
+    let summary =
+        game_instance::trash::purge_for_game(&ctx, game.as_str(), entry_id, &trash_adapter())
+            .map_err(map_error)?;
     Ok(PurgedDeleted {
         purged: summary.purged,
         failed: summary.failed,

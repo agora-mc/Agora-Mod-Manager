@@ -809,6 +809,28 @@ pub fn purge_all(ctx: &Ctx, game_id: &str, trash: &TrashFn) -> PurgeSummary {
     summary
 }
 
+/// Send one entry to the OS trash, or every entry of `game_id` when no entry is named. "All" is
+/// scoped to that game: another game's entries are not its to empty. One entry that cannot go is an
+/// error; a pass over all of them counts its failures instead.
+pub fn purge_for_game(
+    ctx: &Ctx,
+    game_id: &str,
+    entry_id: Option<&str>,
+    trash: &TrashFn,
+) -> Result<PurgeSummary, InstanceError> {
+    match entry_id {
+        Some(entry_id) => {
+            purge(ctx, entry_id, trash)?;
+            Ok(PurgeSummary {
+                purged: 1,
+                failed: 0,
+                kept: 0,
+            })
+        }
+        None => Ok(purge_all(ctx, game_id, trash)),
+    }
+}
+
 /// Purge entries past the retention window. Failures are counted, never raised: one unreadable
 /// entry must not stop the rest from being cleaned up.
 pub fn cleanup(ctx: &Ctx, now: chrono::DateTime<chrono::Utc>, trash: &TrashFn) -> PurgeSummary {

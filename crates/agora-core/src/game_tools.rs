@@ -1261,6 +1261,23 @@ pub fn set_tool_input(
     write_tool_inputs(ctx, instance_id, inputs)
 }
 
+/// Save a value the player filled in for a tool's input. A blank value removes the saved one, so the
+/// input's default (if any) applies again; anything else is checked and stored by [`set_tool_input`].
+pub fn save_tool_input(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    input_id: &str,
+    value: &str,
+) -> Result<(), ToolError> {
+    if value.trim().is_empty() {
+        clear_tool_input(ctx, instance_id, tool_id, input_id)
+    } else {
+        set_tool_input(ctx, instance_id, definition, tool_id, input_id, value)
+    }
+}
+
 /// Remove a stored value, so the input's default (if any) applies again.
 pub fn clear_tool_input(
     ctx: &Ctx,
@@ -2565,6 +2582,26 @@ pub fn run_after_vfs_refusal(
                 .into(),
         )),
     }
+}
+
+/// The tool id a user tool's output is recorded under. A user tool that names a tool the game still
+/// declares runs as that tool (see [`run_user_tool`]), so its outputs are listed under that id;
+/// any other user tool uses its own `user-` id. An id the instance's list does not have is an error.
+pub fn user_tool_output_id(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    user_tool_id_in_list: &str,
+) -> Result<ToolId, ToolError> {
+    let user = find_user_tool(ctx, instance_id, user_tool_id_in_list)?;
+    if let Some(known) = user.known_tool_id.as_deref() {
+        if let Ok(id) = ToolId::new(known) {
+            if ctx.games.tool(&definition.id, &id).is_some() {
+                return Ok(id);
+            }
+        }
+    }
+    user_tool_id(&user.id)
 }
 
 /// The user's tool in an instance's list.
