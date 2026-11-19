@@ -238,12 +238,19 @@ mod linux_impl {
                 .instance_dir(&request.instance_id)
                 .map_err(|e| ViewError::Setup(e.to_string()))?;
             let upper = instance_dir.join("writable");
-            let work = instance_dir.join("view-work");
+            // One work folder per wrapper process. Wiping a shared one would break a concurrent
+            // tool run or a second game session that still has it mounted.
+            let work = instance_dir.join(format!("view-work.{}", std::process::id()));
             std::fs::create_dir_all(&upper)?;
             // Overlay needs an empty work folder. One left by a stopped view is not trusted
-            // (a half-written copy-up is not something to carry into the next run).
-            if work.exists() {
-                std::fs::remove_dir_all(&work)?;
+            // (a half-written copy-up is not something to carry into the next run). Never follow
+            // a link here: `remove_dir_all` through it would delete a folder Agora does not own.
+            if let Ok(meta) = std::fs::symlink_metadata(&work) {
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    std::fs::remove_file(&work)?;
+                } else {
+                    std::fs::remove_dir_all(&work)?;
+                }
             }
             std::fs::create_dir_all(&work)?;
 
@@ -268,14 +275,21 @@ mod linux_impl {
             return Err(ViewError::InvalidTarget(request.target.clone()));
         }
         for file in &request.per_user_files {
-            if !file.instance_copy.is_file() {
+            // The mount binds these paths into the namespace. A link could point anywhere, so
+            // inspect the entry itself, never what it resolves to.
+            if !plain_file(&file.instance_copy) {
                 return Err(ViewError::UnreadablePerUserFile(file.instance_copy.clone()));
             }
-            if !file.real_path.exists() {
+            if !plain_file(&file.real_path) {
                 return Err(ViewError::UnreadablePerUserFile(file.real_path.clone()));
             }
         }
         Ok(())
+    }
+
+    /// A regular file and not a symlink, checked without following the entry.
+    fn plain_file(path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
     }
 
     /// Everything the child needs, allocated before `fork`, so the child only makes
@@ -307,6 +321,7 @@ mod linux_impl {
         working_directory: Option<CString>,
         per_user: Vec<(CString, CString)>,
         fuse_program: Option<CString>,
+        fuse_foreground: CString,
         fuse_dash_o: CString,
         fuse_data: CString,
         fuse_mountinfo_probe: Vec<u8>,
@@ -382,10 +397,7 @@ mod linux_impl {
             // The fuse daemon is the only mount helper, and the parent finds its mount by the
             // exact mount point field. `mountinfo` escapes spaces and friends, so the probe uses
             // the same escaping.
-            let mut probe = Vec::new();
-            probe.push(b' ');
-            probe.extend(mountinfo_escaped(request.target.as_os_str().as_bytes()));
-            probe.push(b' ');
+            let probe = mountinfo_escaped(request.target.as_os_str().as_bytes());
             Ok(Prepared {
                 refuse,
                 refuse_kernel,
@@ -414,6 +426,7 @@ mod linux_impl {
                     .transpose()?,
                 per_user,
                 fuse_program: find_fuse_overlayfs(),
+                fuse_foreground: CString::new("-f").expect("a fixed value"),
                 fuse_dash_o: CString::new("-o").expect("a fixed value"),
                 fuse_data: CString::new(fuse_data)
                     .map_err(|_| ViewError::Setup("a view path contains a NUL".into()))?,
@@ -492,20 +505,33 @@ mod linux_impl {
     }
 
     fn run_prepared(prepared: Prepared) -> Result<ViewOutcome, ViewError> {
-        let (read_fd, write_fd) = pipe2(OFlag::O_CLOEXEC).map_err(std::io::Error::from)?;
-        let read_raw = read_fd.as_raw_fd();
-        let write_raw = write_fd.as_raw_fd();
+        let (status_read, status_write) = pipe2(OFlag::O_CLOEXEC).map_err(std::io::Error::from)?;
+        // A separate close-on-exec pipe proves the command actually started: the child writes to
+        // it only when `execve` fails, and EOF on it means the exec succeeded. The status pipe is
+        // written before the exec (the `K` line), so stopping at its first newline used to hide
+        // an `execve` failure behind a normal-looking run.
+        let (error_read, error_write) = pipe2(OFlag::O_CLOEXEC).map_err(std::io::Error::from)?;
+        let status_read_raw = status_read.as_raw_fd();
+        let status_write_raw = status_write.as_raw_fd();
+        let error_read_raw = error_read.as_raw_fd();
+        let error_write_raw = error_write.as_raw_fd();
         match unsafe { fork() }.map_err(std::io::Error::from)? {
             ForkResult::Child => {
                 // The child never returns: it either execs the command or exits after
                 // reporting why. Nothing is dropped here, so no destructor runs twice.
-                unsafe { c::close(read_raw) };
-                child(&prepared, write_raw);
+                unsafe {
+                    c::close(status_read_raw);
+                    c::close(error_read_raw);
+                }
+                child(&prepared, status_write_raw, error_write_raw);
             }
             ForkResult::Parent { child } => {
-                drop(write_fd);
-                let message = read_message(read_raw);
-                drop(read_fd);
+                drop(status_write);
+                drop(error_write);
+                let message = read_message(status_read_raw);
+                drop(status_read);
+                let exec_error = read_exec_error(error_read_raw)?;
+                drop(error_read);
                 let status = wait_for(child);
                 // Only the `fuse-overlayfs` daemon Agora started is ended. The game's own
                 // process group may hold a wineserver that belongs to the prefix and that
@@ -516,6 +542,13 @@ mod linux_impl {
                 }) = &message
                 {
                     stop_fuse_daemon(*daemon);
+                }
+                if let Some(errno) = exec_error {
+                    let detail = std::io::Error::from_raw_os_error(errno);
+                    return Err(ViewError::Setup(format!(
+                        "cannot start the command '{}': {detail}",
+                        prepared.program.to_string_lossy()
+                    )));
                 }
                 match message {
                     Ok(Message::Ran { mechanism, .. }) => {
@@ -571,6 +604,17 @@ mod linux_impl {
 
     fn last_errno() -> i32 {
         std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    }
+
+    /// Retry an operation that reported an interrupted system call. Taking the attempt as a
+    /// closure lets the retry itself be tested without sending signals to the test process.
+    fn retry_eintr<T>(mut attempt: impl FnMut() -> T, interrupted: impl Fn(&T) -> bool) -> T {
+        loop {
+            let result = attempt();
+            if !interrupted(&result) {
+                return result;
+            }
+        }
     }
 
     fn write_raw(fd: RawFd, mut bytes: &[u8]) -> bool {
@@ -648,10 +692,10 @@ mod linux_impl {
         error
     }
 
-    fn child(prepared: &Prepared, pipe: RawFd) -> ! {
+    fn child(prepared: &Prepared, status: RawFd, error_fd: RawFd) -> ! {
         if unsafe { c::unshare(c::CLONE_NEWUSER) } != 0 {
             step_down(
-                pipe,
+                status,
                 &[
                     Piece::Text(b"unprivileged user namespaces are unavailable: errno "),
                     Piece::Number(last_errno()),
@@ -664,7 +708,7 @@ mod linux_impl {
         let error = write_proc(&prepared.proc_uid_map, &prepared.uid_map);
         if error != 0 {
             step_down(
-                pipe,
+                status,
                 &[
                     Piece::Text(b"cannot map the caller's uid: errno "),
                     Piece::Number(error),
@@ -674,7 +718,7 @@ mod linux_impl {
         let error = write_proc(&prepared.proc_gid_map, &prepared.gid_map);
         if error != 0 {
             step_down(
-                pipe,
+                status,
                 &[
                     Piece::Text(b"cannot map the caller's gid: errno "),
                     Piece::Number(error),
@@ -690,7 +734,7 @@ mod linux_impl {
         // changing the mapping.
         if unsafe { c::unshare(c::CLONE_NEWNS) } != 0 {
             step_down(
-                pipe,
+                status,
                 &[
                     Piece::Text(b"cannot create a mount namespace: errno "),
                     Piece::Number(last_errno()),
@@ -708,7 +752,7 @@ mod linux_impl {
         } != 0
         {
             step_down(
-                pipe,
+                status,
                 &[
                     Piece::Text(b"cannot make the mount namespace private: errno "),
                     Piece::Number(last_errno()),
@@ -717,7 +761,7 @@ mod linux_impl {
         }
         if prepared.refuse {
             step_down(
-                pipe,
+                status,
                 &[Piece::Text(
                     b"overlay mounting was refused by AGORA_LINUX_VIEW_REFUSE_OVERLAY (test hook)",
                 )],
@@ -751,7 +795,7 @@ mod linux_impl {
             match try_fuse(prepared) {
                 Ok(daemon) => Some(daemon),
                 Err(fuse) => step_down(
-                    pipe,
+                    status,
                     &[
                         Piece::Text(b"kernel overlayfs with userxattr (errno "),
                         Piece::Number(kernel_error),
@@ -776,7 +820,7 @@ mod linux_impl {
             {
                 kill_daemon(daemon);
                 failed(
-                    pipe,
+                    status,
                     &[
                         Piece::Text(b"cannot bind the instance copy over '"),
                         Piece::Text(real.to_bytes()),
@@ -791,7 +835,7 @@ mod linux_impl {
             if unsafe { c::chdir(directory.as_ptr()) } != 0 {
                 kill_daemon(daemon);
                 failed(
-                    pipe,
+                    status,
                     &[
                         Piece::Text(b"cannot enter the working folder: errno "),
                         Piece::Number(last_errno()),
@@ -802,21 +846,20 @@ mod linux_impl {
 
         match daemon {
             None => {
-                if !write_raw(pipe, &prepared.kernel_message) {
+                if !write_raw(status, &prepared.kernel_message) {
                     unsafe { c::_exit(125) };
                 }
             }
             Some(daemon) => {
-                let wrote = write_raw(pipe, &prepared.fuse_message_prefix)
-                    && write_number(pipe, daemon)
-                    && write_raw(pipe, b"\n");
+                let wrote = write_raw(status, &prepared.fuse_message_prefix)
+                    && write_number(status, daemon)
+                    && write_raw(status, b"\n");
                 if !wrote {
                     kill_daemon(Some(daemon));
                     unsafe { c::_exit(125) };
                 }
             }
         }
-        // The write end is close-on-exec, so it goes away exactly when the command starts.
         unsafe {
             c::execve(
                 prepared.program.as_ptr(),
@@ -824,14 +867,14 @@ mod linux_impl {
                 prepared.envp_ptr.as_ptr(),
             )
         };
+        // `execve` only returns on failure. The status pipe already carries the `K` line, so the
+        // errno goes on the separate close-on-exec pipe: EOF there is proof the command started.
+        let errno = last_errno();
+        let _ = write_raw(error_fd, b"E\t");
+        let _ = write_number(error_fd, errno);
+        let _ = write_raw(error_fd, b"\n");
         kill_daemon(daemon);
-        failed(
-            pipe,
-            &[
-                Piece::Text(b"cannot start the command: errno "),
-                Piece::Number(last_errno()),
-            ],
-        );
+        unsafe { c::_exit(FAILED_EXIT) };
     }
 
     fn kill_daemon(daemon: Option<i32>) {
@@ -880,8 +923,13 @@ mod linux_impl {
                 unsafe { c::_exit(127) };
             }
             unsafe { c::prctl(c::PR_SET_PDEATHSIG, c::SIGKILL) };
-            let argv: [*const c::c_char; 5] = [
+            // fuse-overlayfs(1): `-f`, `--foreground` keeps the daemon in the foreground instead
+            // of detaching. Without it the pid below is the short-lived wrapper, so both
+            // PR_SET_PDEATHSIG and the later stop signal bind to the wrong process and the real
+            // mount helper outlives the view.
+            let argv: [*const c::c_char; 6] = [
                 program.as_ptr(),
+                prepared.fuse_foreground.as_ptr(),
                 prepared.fuse_dash_o.as_ptr(),
                 prepared.fuse_data.as_ptr(),
                 prepared.target.as_ptr(),
@@ -890,11 +938,14 @@ mod linux_impl {
             unsafe { c::execve(program.as_ptr(), argv.as_ptr(), prepared.envp_ptr.as_ptr()) };
             unsafe { c::_exit(126) };
         }
+        // A mount that was already there (a stale mount from a failed daemon, or the target
+        // named as another line's root) must not be mistaken for this daemon's mount.
+        let before = mount_count(&prepared.fuse_mountinfo_probe);
         // The daemon was started with the status pipe open; it must not keep it open.
         // The parent's write fd is close-on-exec and closes in the daemon on exec, but
         // the daemon inherits the same number. Nothing here depends on the pipe ending.
         for _ in 0..200 {
-            if mount_visible(&prepared.fuse_mountinfo_probe) {
+            if mount_count(&prepared.fuse_mountinfo_probe) > before {
                 return Ok(daemon);
             }
             let delay = c::timespec {
@@ -904,68 +955,160 @@ mod linux_impl {
             unsafe { c::nanosleep(&delay, std::ptr::null_mut()) };
         }
         unsafe { c::kill(daemon, c::SIGKILL) };
+        // The daemon is a child of this process until the command is exec'd, so a daemon that
+        // never mounted would otherwise be left as a zombie. Reap it before reporting the
+        // step-down.
+        let _ = waitpid(Pid::from_raw(daemon), None);
         Err(FuseFailure::Timeout)
     }
 
-    /// Whether the child's own mount table has a mount point exactly equal to `probe`, which
-    /// begins and ends with a space. Reads `/proc/self/mountinfo` with raw syscalls into a
-    /// stack buffer. A match that spans two reads is found by keeping the tail.
-    fn mount_visible(probe: &[u8]) -> bool {
+    /// How many mounts of `target` (already escaped as in `mountinfo`) the child's own mount
+    /// table has. Reads `/proc/self/mountinfo` with raw syscalls into a stack buffer. A line that
+    /// spans two reads is found by keeping the tail. Comparing this before and after starting the
+    /// daemon proves a NEW mount appeared.
+    fn mount_count(target: &[u8]) -> usize {
         let path = b"/proc/self/mountinfo\0";
         let fd = unsafe { c::open(path.as_ptr() as *const _, c::O_RDONLY | c::O_CLOEXEC) };
         if fd < 0 {
-            return false;
+            return 0;
         }
         let mut buffer = [0u8; 64 * 1024];
-        let keep = probe.len().saturating_sub(1);
         let mut filled = 0;
-        let found = loop {
+        let mut count = 0;
+        loop {
             if filled >= buffer.len() {
-                break false;
+                break;
             }
-            let read = unsafe {
-                c::read(
-                    fd,
-                    buffer[filled..].as_mut_ptr() as *mut _,
-                    buffer.len() - filled,
-                )
-            };
-            if read <= 0 {
-                break false;
+            let read = retry_eintr(
+                || unsafe {
+                    c::read(
+                        fd,
+                        buffer[filled..].as_mut_ptr() as *mut _,
+                        buffer.len() - filled,
+                    )
+                },
+                |read| *read < 0 && last_errno() == c::EINTR,
+            );
+            if read < 0 {
+                break;
+            }
+            if read == 0 {
+                break;
             }
             filled += read as usize;
-            if contains(&buffer[..filled], probe) {
-                break true;
-            }
-            if keep > 0 && filled > keep {
+            // Count only complete lines now, and slide the last partial line to the front so a
+            // mount entry split across two reads is counted once, on the next pass.
+            let complete = buffer[..filled]
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map(|at| at + 1)
+                .unwrap_or(0);
+            count += count_mount_lines(&buffer[..complete], target);
+            let tail = filled - complete;
+            if tail > 0 {
                 unsafe {
-                    std::ptr::copy(
-                        buffer[filled - keep..filled].as_ptr(),
-                        buffer.as_mut_ptr(),
-                        keep,
-                    );
+                    std::ptr::copy(buffer[complete..].as_ptr(), buffer.as_mut_ptr(), tail);
                 }
-                filled = keep;
             }
-        };
+            filled = tail;
+        }
+        count += count_mount_lines(&buffer[..filled], target);
         unsafe { c::close(fd) };
-        found
+        count
     }
 
-    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-        if needle.is_empty() {
-            return true;
+    /// Count lines whose mount point is `target` and whose file system type is an overlay the
+    /// wrapper could have mounted. A name in the root field, or a different file system, is not
+    /// the daemon's mount even when the bytes are otherwise identical.
+    fn count_mount_lines(text: &[u8], target: &[u8]) -> usize {
+        if target.is_empty() {
+            return 0;
         }
-        haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
+        text.split(|byte| *byte == b'\n')
+            .filter(|line| mount_line_matches(line, target))
+            .count()
+    }
+
+    fn mount_line_matches(line: &[u8], target: &[u8]) -> bool {
+        if target.is_empty() {
+            return false;
+        }
+        // `/proc/self/mountinfo` is space separated; fields holding a path escape their spaces
+        // as `\040`, so splitting on a literal space is safe.
+        let mut fields = line.split(|byte| *byte == b' ');
+        // Field 5 (index 4) is the mount point. A target in field 4 (the root) is unrelated.
+        if fields.nth(4) != Some(target) {
+            return false;
+        }
+        // The fstype is the field after the bare `-` separator.
+        let fstype = loop {
+            match fields.next() {
+                Some(b"-") => break fields.next(),
+                Some(_) => continue,
+                None => return false,
+            }
+        };
+        fstype.is_some_and(|fs| {
+            fs == b"fuse.fuse-overlayfs" || fs == b"fuse.overlay" || fs == b"overlay"
+        })
+    }
+
+    /// Read the close-on-exec error pipe to EOF. `None` means the command started; `Some(errno)`
+    /// is what `execve` failed with. An unreadable or unexpected report is an error, never
+    /// permission to claim a run happened.
+    fn read_exec_error(fd: RawFd) -> Result<Option<i32>, ViewError> {
+        let mut bytes = [0u8; 32];
+        let mut filled = 0;
+        loop {
+            let read = retry_eintr(
+                || unsafe {
+                    c::read(
+                        fd,
+                        bytes[filled..].as_mut_ptr() as *mut _,
+                        bytes.len() - filled,
+                    )
+                },
+                |read| *read < 0 && last_errno() == c::EINTR,
+            );
+            if read < 0 {
+                return Err(ViewError::Setup(format!(
+                    "cannot confirm the command started: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            if read == 0 {
+                break;
+            }
+            filled += read as usize;
+            if bytes[..filled].contains(&b'\n') || filled == bytes.len() {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&bytes[..filled]);
+        let line = text.lines().next().unwrap_or_default();
+        if line.is_empty() {
+            return Ok(None);
+        }
+        match line.strip_prefix("E\t") {
+            Some(detail) => detail.trim().parse::<i32>().map(Some).map_err(|_| {
+                ViewError::Setup(format!(
+                    "the view helper reported an unreadable exec error: {line}"
+                ))
+            }),
+            None => Err(ViewError::Setup(format!(
+                "the view helper reported an unexpected exec error: {line}"
+            ))),
+        }
     }
 
     fn read_message(fd: RawFd) -> Result<Message, String> {
         let mut bytes = Vec::new();
         let mut chunk = [0u8; 256];
         loop {
-            let read = unsafe { c::read(fd, chunk.as_mut_ptr() as *mut _, chunk.len()) };
+            let read = retry_eintr(
+                || unsafe { c::read(fd, chunk.as_mut_ptr() as *mut _, chunk.len()) },
+                |read| *read < 0 && last_errno() == c::EINTR,
+            );
             if read < 0 {
                 return Err(format!(
                     "cannot read the view helper's report: {}",
@@ -1029,12 +1172,22 @@ mod linux_impl {
     mod tests {
         use super::*;
 
-        fn probe(target: &str) -> Vec<u8> {
-            let mut probe = Vec::new();
-            probe.push(b' ');
-            probe.extend(mountinfo_escaped(target.as_bytes()));
-            probe.push(b' ');
-            probe
+        #[test]
+        fn a_read_interrupted_by_a_signal_is_retried() {
+            let mut calls = 0;
+            let read = retry_eintr(
+                || {
+                    calls += 1;
+                    if calls < 3 {
+                        -1
+                    } else {
+                        12
+                    }
+                },
+                |result| *result == -1,
+            );
+            assert_eq!(read, 12);
+            assert_eq!(calls, 3);
         }
 
         #[test]
@@ -1046,15 +1199,41 @@ mod linux_impl {
         }
 
         #[test]
+        fn a_pre_existing_or_wrong_fstype_mount_is_not_counted() {
+            let target = b"/games/A\\040Game";
+            // A stale fuse mount left by a failed daemon still has the target as its mount point.
+            let stale = b"36 35 98:0 / /games/A\\040Game rw - fuse.fuse-overlayfs lowerdir=x rw\n";
+            // The target named as another line's ROOT is not a mount of the target.
+            let root = b"37 35 98:0 /games/A\\040Game /elsewhere rw - ext4 /dev/sda1 rw\n";
+            // Same mount point, but a different file system: not the fuse daemon's mount.
+            let other_fs = b"38 35 98:0 / /games/A\\040Game rw - ext4 /dev/sda1 rw\n";
+            let before = [stale.as_slice(), root.as_slice(), other_fs.as_slice()].concat();
+            assert_eq!(
+                count_mount_lines(&before, target),
+                1,
+                "only the stale fuse mount of the target counts"
+            );
+            let mut after = before.clone();
+            after.extend_from_slice(
+                b"39 35 0:47 / /games/A\\040Game rw - fuse.fuse-overlayfs lowerdir=y rw\n",
+            );
+            assert_eq!(
+                count_mount_lines(&after, target),
+                2,
+                "a new fuse mount of the target adds exactly one"
+            );
+        }
+
+        #[test]
         fn a_folder_with_a_space_is_found_by_its_escaped_mountinfo_field() {
             // The format `/proc/self/mountinfo` writes, with the mount point in field 5.
             let mountinfo =
                 b"36 35 98:0 / /games/A\\040Game rw,relatime - fuse.overlay /games/A\\040Game rw\n";
-            assert!(contains(mountinfo, &probe("/games/A Game")));
+            assert_eq!(count_mount_lines(mountinfo, b"/games/A\\040Game"), 1);
             // The unescaped path is what the old check looked for, and it never matches.
-            assert!(!contains(mountinfo, b" /games/A Game "));
+            assert_eq!(count_mount_lines(mountinfo, b"/games/A Game"), 0);
             // A sibling whose name merely starts the same is not the mount.
-            assert!(!contains(mountinfo, &probe("/games/A Game Two")));
+            assert_eq!(count_mount_lines(mountinfo, b"/games/A\\040Game Two"), 0);
         }
     }
 }

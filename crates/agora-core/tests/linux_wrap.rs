@@ -301,6 +301,78 @@ impl Fixture {
     }
 }
 
+/// The CLI and the desktop share this dispatch. A Steam instance must be handed to Steam, with
+/// the exact URL a fake launcher receives recorded, rather than started directly.
+#[test]
+fn the_shared_dispatch_hands_a_steam_instance_to_steam() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    struct FakeSteam {
+        urls: Arc<Mutex<Vec<String>>>,
+    }
+    impl game_wrap::SteamLauncher for FakeSteam {
+        fn start(&self, url: &str) -> std::io::Result<()> {
+            self.urls.lock().unwrap().push(url.to_string());
+            Ok(())
+        }
+        fn describe(&self) -> String {
+            "fake steam".to_string()
+        }
+    }
+    let urls = Arc::new(Mutex::new(Vec::new()));
+    let fake = FakeSteam {
+        urls: Arc::clone(&urls),
+    };
+    let dispatch = game_wrap::dispatch_launch_with(
+        &fixture.ctx,
+        &fixture.instance_id,
+        game_wrap::LaunchPlatform::Linux,
+        &fake,
+    )
+    .expect("the fake Steam launcher succeeded");
+    match dispatch {
+        game_wrap::PlatformLaunch::Steam(status) => {
+            assert_eq!(status.app_id, "4242");
+            assert_eq!(status.launcher, "fake steam");
+        }
+        game_wrap::PlatformLaunch::Ordinary => {
+            panic!("a Steam instance was started directly instead of through Steam")
+        }
+    }
+    assert_eq!(
+        urls.lock().unwrap().as_slice(),
+        &["steam://rungameid/4242".to_string()]
+    );
+}
+
+/// A launcher that cannot start is a launch failure, and its pending record is cleared so it
+/// cannot claim a later launch.
+#[test]
+fn the_shared_dispatch_fails_closed_when_steam_cannot_start() {
+    let _serial = serial();
+    let fixture = Fixture::new();
+    struct BrokenSteam;
+    impl game_wrap::SteamLauncher for BrokenSteam {
+        fn start(&self, _url: &str) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "no permission",
+            ))
+        }
+        fn describe(&self) -> String {
+            "broken steam".to_string()
+        }
+    }
+    let error = game_wrap::dispatch_launch_with(
+        &fixture.ctx,
+        &fixture.instance_id,
+        game_wrap::LaunchPlatform::Linux,
+        &BrokenSteam,
+    )
+    .expect_err("a failed Steam start is an error");
+    assert!(matches!(error, WrapError::SteamStart(_)), "{error}");
+}
+
 struct CrashParser;
 
 impl BuiltInParser for CrashParser {
