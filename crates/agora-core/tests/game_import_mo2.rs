@@ -1846,3 +1846,53 @@ fn f1b_merged_local_saves_get_distinct_scoped_folders_and_copy_each_profiles_sav
         Some(game_saves::own_value_scoped(rule, instance, Some("Alt")).as_str())
     );
 }
+
+#[test]
+fn f1c_overwrite_layer_stays_enabled_and_wins_in_every_merged_loadout() {
+    use agora_core::game_import::profiles::Grouping;
+
+    let f = fixture();
+    add_second_mo2_profile(&f);
+    write(&f.setup.join("mods/Alpha/override_check.txt"), b"from alpha");
+    write(&f.setup.join("mods/Beta/override_check.txt"), b"from beta");
+    write(&f.setup.join("overwrite/override_check.txt"), b"from overwrite");
+
+    let profiles = vec!["Test Profile".to_string(), "Alt".to_string()];
+    let report = agora_core::game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("Overwrite Merge"), false),
+        &profiles,
+        Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("merged import runs");
+    let instance = &report.instances[0];
+
+    // Profile 1 (applied initially): unclaimed overwrite mesh is deployed, and overwrite wins conflicts.
+    assert_eq!(
+        planned_file_bytes(&f, instance, "Data/meshes/armor/helm.nif"),
+        b"NIF",
+        "MO2 overwrite mesh must stay enabled under Test Profile"
+    );
+    assert_eq!(
+        planned_file_bytes(&f, instance, "Data/override_check.txt"),
+        b"from overwrite",
+        "MO2 overwrite must outrank mods under Test Profile"
+    );
+
+    // Switching to Profile 2: overwrite still stays enabled and still wins conflicts.
+    agora_core::game_loadout::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "Alt")
+        .expect("apply Alt");
+    assert_eq!(
+        planned_file_bytes(&f, instance, "Data/meshes/armor/helm.nif"),
+        b"NIF",
+        "MO2 overwrite mesh must stay enabled under Alt"
+    );
+    assert_eq!(
+        planned_file_bytes(&f, instance, "Data/override_check.txt"),
+        b"from overwrite",
+        "MO2 overwrite must outrank mods under Alt"
+    );
+}

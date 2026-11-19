@@ -1314,6 +1314,11 @@ pub fn abandon_half_made_instance(ctx: &Ctx, instance_id: &str, cause: ImportErr
     }
 }
 
+struct RunDetail {
+    report: Mo2RunReport,
+    overwrite_item: Option<String>,
+}
+
 /// Run an import: store the bytes, make the instance, and set it up from the profile. The plan is
 /// made first, so a refusal happens before anything is written.
 pub fn run(
@@ -1323,6 +1328,16 @@ pub fn run(
     options: RunOptions,
     progress: &dyn Fn(ImportProgress),
 ) -> Result<Mo2RunReport, ImportError> {
+    run_inner(ctx, inventory, request, options, progress).map(|detail| detail.report)
+}
+
+fn run_inner(
+    ctx: &Ctx,
+    inventory: &GameInventory,
+    request: &Mo2Request,
+    options: RunOptions,
+    progress: &dyn Fn(ImportProgress),
+) -> Result<RunDetail, ImportError> {
     let plan = plan(ctx, inventory, request)?;
     let install = inventory
         .installs
@@ -1407,7 +1422,10 @@ pub fn run(
             && index + 1 < mods_total
         {
             report.interrupted = true;
-            return Ok(report);
+            return Ok(RunDetail {
+                report,
+                overwrite_item: None,
+            });
         }
     }
 
@@ -1516,8 +1534,17 @@ pub fn run(
             }
         }
         if let Some(item_id) = &overwrite_item {
-            game_deploy::add_content(ctx, &instance_id, item_id, mount_arg, None)?;
-            report.content_layers += 1;
+            let existing = game_instance::get_manifest(ctx, &instance_id)?
+                .layers
+                .layers()
+                .iter()
+                .any(|l| matches!(&l.source, agora_game_api::LayerSource::Content { content } if content == item_id));
+            if existing {
+                game_deploy::set_content_enabled(ctx, &instance_id, item_id, true)?;
+            } else {
+                game_deploy::add_content(ctx, &instance_id, item_id, mount_arg, None)?;
+                report.content_layers += 1;
+            }
         }
 
         // 4. Generated layers, one per tool, from the files the tools claim.
@@ -1644,7 +1671,10 @@ pub fn run(
             p.reason
         )
     }));
-    Ok(report)
+    Ok(RunDetail {
+        report,
+        overwrite_item,
+    })
 }
 
 /// The folders of `path` below `folder`, compared without case and without caring whether the
@@ -1943,6 +1973,7 @@ fn mo2_state_for_merge(
     profile_dir: &Path,
     layer_mod: &HashMap<String, Option<String>>,
     folder_to_layer: &HashMap<String, String>,
+    overwrite_layer_id: Option<&str>,
 ) -> Result<crate::game_loadout::GameLoadout, ImportError> {
     let manifest = game_instance::get_manifest(ctx, instance_id)?;
     let store = game_ini::store_of(ctx, instance_id)?;
@@ -1961,10 +1992,12 @@ fn mo2_state_for_merge(
                 | agora_game_api::LayerSource::InstanceContent { .. }
         ) {
             let id = layer.id.as_str().to_string();
-            let is_enabled = layer_mod
-                .get(id.as_str())
-                .and_then(|folder| folder.as_deref())
-                .is_some_and(|folder| enabled.contains(folder));
+            let is_overwrite = overwrite_layer_id == Some(id.as_str());
+            let is_enabled = is_overwrite
+                || layer_mod
+                    .get(id.as_str())
+                    .and_then(|folder| folder.as_deref())
+                    .is_some_and(|folder| enabled.contains(folder));
             content.push(crate::game_loadout::GameLoadoutContent {
                 item: id,
                 enabled: is_enabled,
@@ -1974,18 +2007,23 @@ fn mo2_state_for_merge(
 
     // Order content layers lowest-priority first (matching LayerStack): `plan.mods` is highest
     // priority first. Enabled entries take precedence over disabled aliases of the same layer.
+    // MO2's shared overwrite layer always sits on top of every mod.
     let mut layer_rank: HashMap<String, usize> = HashMap::new();
     for (idx, m) in plan.mods.iter().enumerate() {
         if m.enabled {
             if let Some(layer_id) = folder_to_layer.get(&fold_path_case(&m.folder)) {
-                layer_rank.entry(layer_id.clone()).or_insert(idx);
+                if overwrite_layer_id != Some(layer_id.as_str()) {
+                    layer_rank.entry(layer_id.clone()).or_insert(idx);
+                }
             }
         }
     }
     for (idx, m) in plan.mods.iter().enumerate() {
         if !m.enabled {
             if let Some(layer_id) = folder_to_layer.get(&fold_path_case(&m.folder)) {
-                layer_rank.entry(layer_id.clone()).or_insert(idx);
+                if overwrite_layer_id != Some(layer_id.as_str()) {
+                    layer_rank.entry(layer_id.clone()).or_insert(idx);
+                }
             }
         }
     }
@@ -1999,10 +2037,18 @@ fn mo2_state_for_merge(
     let placed: HashSet<&str> = layer_order.iter().map(String::as_str).collect();
     let mut rest: Vec<String> = content
         .iter()
-        .filter(|item| !placed.contains(item.item.as_str()))
+        .filter(|item| {
+            !placed.contains(item.item.as_str())
+                && overwrite_layer_id != Some(item.item.as_str())
+        })
         .map(|item| item.item.clone())
         .collect();
     layer_order.append(&mut rest);
+    if let Some(ow) = overwrite_layer_id {
+        if content.iter().any(|item| item.item == ow) {
+            layer_order.push(ow.to_string());
+        }
+    }
 
     // Start from the shared base (every list and INI absent = None) rather than capturing
     // profile 1's state, so later profiles never inherit profile 1's private settings.
@@ -2144,7 +2190,9 @@ pub fn mo2_run_profiles(
                 copy_saves: false,
                 ..base.clone()
             };
-            let report = run(ctx, inventory, &request, options, progress)?;
+            let detail = run_inner(ctx, inventory, &request, options, progress)?;
+            let report = detail.report;
+            let overwrite_item = detail.overwrite_item;
             let instance_id = report
                 .instance_id
                 .clone()
@@ -2188,6 +2236,10 @@ pub fn mo2_run_profiles(
                 })
                 .collect();
 
+            let overwrite_layer_id = overwrite_item
+                .as_ref()
+                .and_then(|item_id| item_to_layer.get(item_id).cloned());
+
             let ini_text = read_text_optional(&base.ini_path)?.unwrap_or_default();
             let ini_dir = base
                 .ini_path
@@ -2207,6 +2259,7 @@ pub fn mo2_run_profiles(
                     &profile_dir,
                     &layer_mod,
                     &folder_to_layer,
+                    overwrite_layer_id.as_deref(),
                 )?;
                 crate::game_loadout::save_game_profile(ctx, &instance_id, profile, state)
                     .map_err(ImportError::Other)?;
