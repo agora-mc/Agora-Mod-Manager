@@ -2673,6 +2673,7 @@ fn the_check_reports_conflicts_and_warns_only_about_a_pair_new_since_the_last_la
                 active: true,
             },
         ],
+        owner_layers: Vec::new(),
         ..Default::default()
     };
     agora_core::session_ledger::begin(
