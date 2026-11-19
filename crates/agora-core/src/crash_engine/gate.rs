@@ -234,7 +234,7 @@ mod tests {
             names_a_crash(
                 crash_text,
                 "crash-2026-03-01.log",
-                &[crash_logger.clone()],
+                std::slice::from_ref(&crash_logger),
                 &[],
                 None
             ),

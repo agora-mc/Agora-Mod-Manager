@@ -1196,9 +1196,8 @@ mod tests {
         )
         .expect("analyze succeeds");
 
-        assert_eq!(
+        assert!(
             output.files[0].read_by.is_some(),
-            true,
             "file should be read: {:?}",
             output.files[0]
         );
