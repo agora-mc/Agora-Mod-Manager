@@ -980,14 +980,12 @@ mod linux_impl {
                 break;
             }
             let read = retry_eintr(
-                || {
-                    unsafe {
-                        c::read(
-                            fd,
-                            buffer[filled..].as_mut_ptr() as *mut _,
-                            buffer.len() - filled,
-                        )
-                    }
+                || unsafe {
+                    c::read(
+                        fd,
+                        buffer[filled..].as_mut_ptr() as *mut _,
+                        buffer.len() - filled,
+                    )
                 },
                 |read| *read < 0 && last_errno() == c::EINTR,
             );
@@ -1063,14 +1061,12 @@ mod linux_impl {
         let mut filled = 0;
         loop {
             let read = retry_eintr(
-                || {
-                    unsafe {
-                        c::read(
-                            fd,
-                            bytes[filled..].as_mut_ptr() as *mut _,
-                            bytes.len() - filled,
-                        )
-                    }
+                || unsafe {
+                    c::read(
+                        fd,
+                        bytes[filled..].as_mut_ptr() as *mut _,
+                        bytes.len() - filled,
+                    )
                 },
                 |read| *read < 0 && last_errno() == c::EINTR,
             );
@@ -1095,7 +1091,9 @@ mod linux_impl {
         }
         match line.strip_prefix("E\t") {
             Some(detail) => detail.trim().parse::<i32>().map(Some).map_err(|_| {
-                ViewError::Setup(format!("the view helper reported an unreadable exec error: {line}"))
+                ViewError::Setup(format!(
+                    "the view helper reported an unreadable exec error: {line}"
+                ))
             }),
             None => Err(ViewError::Setup(format!(
                 "the view helper reported an unexpected exec error: {line}"

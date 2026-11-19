@@ -846,7 +846,10 @@ fn a_program_that_does_not_exist_is_a_launch_failure_not_a_run() {
     match linux_view::native().view_and_run(&fixture.ctx, &fixture.def, &request) {
         Err(error) => {
             let text = error.to_string();
-            assert!(text.contains("cannot start"), "the error must name the failure: {text}");
+            assert!(
+                text.contains("cannot start"),
+                "the error must name the failure: {text}"
+            );
             assert!(
                 text.contains("No such") || text.contains("errno 2"),
                 "the error must name why execve failed: {text}"
