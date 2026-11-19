@@ -428,6 +428,34 @@ fn write_journal(journal_path: &Path, journal: &Journal) -> Result<(), UserFiles
     Ok(())
 }
 
+/// Owns the "starting" mark a launch writes into the journal. The mark keeps a swap that has not
+/// yet spawned from being restored under it, but it must not outlive the call that wrote it: a
+/// failed swap keeps its journal for recovery, and a live mark would make that recovery and every
+/// later launch refuse. `swap_in` disarms the guard when it hands the launch back to its caller,
+/// which then owns clearing the mark through `record_process` or `finish_starting_launch`.
+struct StartingMarkGuard<'a> {
+    journal_path: &'a Path,
+    finished: bool,
+}
+
+impl Drop for StartingMarkGuard<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(self.journal_path) else {
+            return;
+        };
+        let Ok(mut journal) = serde_json::from_str::<Journal>(&text) else {
+            return;
+        };
+        if journal.starting_launcher.is_some() {
+            journal.starting_launcher = None;
+            let _ = write_journal(self.journal_path, &journal);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Running session detection
 // ---------------------------------------------------------------------------
@@ -618,6 +646,10 @@ pub fn swap_in(
     };
 
     write_journal(&journal_path, &journal)?;
+    let mut starting_mark = StartingMarkGuard {
+        journal_path: &journal_path,
+        finished: false,
+    };
 
     // 5. Hash first, then back up, then journal, then swap. Every journal write is fsynced, so a
     // stop leaves a record of exactly what the disk may hold: a complete backup is never mistaken
@@ -734,6 +766,7 @@ pub fn swap_in(
         });
     }
 
+    starting_mark.finished = true;
     Ok(SwapOutcome {
         swapped_files: journal.files.len(),
         launch_id,
