@@ -1580,3 +1580,934 @@ fn two_profiles_import_merged_with_a_loadout_for_each() {
     let alt = enabled("Alt");
     assert!(alt["Alpha"] && alt["Beta"] && !alt["Gamma"], "{alt:?}");
 }
+
+fn planned_file_bytes(f: &Fixture, instance: &str, game_path: &str) -> Vec<u8> {
+    let plan = game_deploy::plan(&f.ctx, instance, &f.def, DeployMode::Links).unwrap();
+    let entry = plan
+        .files
+        .iter()
+        .find(|p| p.path.as_str() == game_path)
+        .unwrap_or_else(|| panic!("{game_path} is not in the deploy plan"));
+    match &entry.source {
+        FileSource::Content { sha256, .. } => {
+            content_store::read_object_bytes(&f.ctx, sha256).unwrap()
+        }
+        FileSource::Base { path, .. }
+        | FileSource::Generated { path, .. }
+        | FileSource::Writable { path }
+        | FileSource::Override { path, .. } => std::fs::read(path).unwrap(),
+    }
+}
+
+#[test]
+fn f1h_merged_profiles_preserve_opposite_mod_priorities() {
+    use agora_core::game_import::profiles::Grouping;
+
+    let f = fixture();
+    // "Reverse" enables the exact same two mods as "Test Profile" (Alpha and Gamma),
+    // but puts Gamma ABOVE Alpha so Gamma's shared.txt must win.
+    let reverse = f.setup.join("profiles/Reverse");
+    write(
+        &reverse.join("modlist.txt"),
+        b"# Mod Organizer\r\n+Gamma\r\n-Beta\r\n+Alpha\r\n",
+    );
+    write(
+        &reverse.join("plugins.txt"),
+        b"# Mod Organizer\r\n*Alpha.esp\r\n*Gamma.esp\r\n",
+    );
+    write(
+        &reverse.join("loadorder.txt"),
+        b"# Mod Organizer\r\nSkyrim.esm\r\nUpdate.esm\r\nAlpha.esp\r\nGamma.esp\r\n",
+    );
+
+    let profiles = vec!["Test Profile".to_string(), "Reverse".to_string()];
+    let report = agora_core::game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("Opposite Order"), false),
+        &profiles,
+        Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("merged import runs");
+    let instance = &report.instances[0];
+
+    assert_eq!(
+        planned_file_bytes(&f, instance, "Data/shared.txt"),
+        b"from alpha",
+        "Test Profile puts Alpha above Gamma"
+    );
+
+    agora_core::game_loadout::apply_game_profile_with_undo(
+        &f.ctx, instance, &f.def, "Reverse", false,
+    )
+    .expect("switching to Reverse succeeds");
+    assert_eq!(
+        planned_file_bytes(&f, instance, "Data/shared.txt"),
+        b"from gamma",
+        "Reverse puts Gamma above Alpha"
+    );
+
+    agora_core::game_loadout::apply_game_profile_with_undo(
+        &f.ctx,
+        instance,
+        &f.def,
+        "Test Profile",
+        false,
+    )
+    .expect("switching back to Test Profile succeeds");
+    assert_eq!(
+        planned_file_bytes(&f, instance, "Data/shared.txt"),
+        b"from alpha",
+        "switching back restores Alpha winning over Gamma"
+    );
+}
+
+#[test]
+fn f1a_merged_profile_without_own_settings_uses_shared_not_profile_1() {
+    use agora_core::game_import::profiles::Grouping;
+
+    let f = fixture();
+    // "Shared" has no LocalSettings and no plugins.txt of its own.
+    let shared_prof = f.setup.join("profiles/Shared");
+    write(
+        &shared_prof.join("modlist.txt"),
+        b"# Mod Organizer\r\n+Alpha\r\n+Beta\r\n-Gamma\r\n",
+    );
+    write(
+        &shared_prof.join("settings.ini"),
+        b"[General]\r\nLocalSaves=false\r\nLocalSettings=false\r\n",
+    );
+
+    // "OwnPlugins" has shared INIs (LocalSettings=false) but its own plugins.txt (*Beta.esp only).
+    let own_plugins = f.setup.join("profiles/OwnPlugins");
+    write(
+        &own_plugins.join("modlist.txt"),
+        b"# Mod Organizer\r\n+Beta\r\n",
+    );
+    write(
+        &own_plugins.join("settings.ini"),
+        b"[General]\r\nLocalSaves=false\r\nLocalSettings=false\r\n",
+    );
+    write(
+        &own_plugins.join("plugins.txt"),
+        b"# Mod Organizer\r\n*Beta.esp\r\n",
+    );
+    write(
+        &own_plugins.join("loadorder.txt"),
+        b"# Mod Organizer\r\nSkyrim.esm\r\nUpdate.esm\r\nBeta.esp\r\n",
+    );
+
+    let profiles = vec![
+        "Test Profile".to_string(),
+        "Shared".to_string(),
+        "OwnPlugins".to_string(),
+    ];
+    let report = agora_core::game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("Shared Settings Merge"), false),
+        &profiles,
+        Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("merged import runs");
+    let instance = &report.instances[0];
+    let dir = f.ctx.paths.instance_dir(instance).unwrap();
+
+    let loadouts = agora_core::loadout::list_profiles(&dir).unwrap();
+    let get_loadout = |name: &str| {
+        loadouts
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("missing loadout '{name}'"))
+            .game
+            .clone()
+            .expect("game loadout")
+    };
+
+    // Shared profile: every INI and plugin list must be explicitly absent (None).
+    let shared_state = get_loadout("Shared");
+    assert!(
+        !shared_state.inis.is_empty() && shared_state.inis.iter().all(|i| i.contents.is_none()),
+        "Shared must not inherit Profile 1 INIs: {:?}",
+        shared_state.inis
+    );
+    assert!(
+        !shared_state.plugin_lists.is_empty()
+            && shared_state
+                .plugin_lists
+                .iter()
+                .all(|l| l.contents.is_none()),
+        "Shared has no plugins.txt of its own, so its plugin list must be None: {:?}",
+        shared_state.plugin_lists
+    );
+
+    // Switching to Shared removes Profile 1's private INI copies and plugin list.
+    agora_core::game_loadout::apply_game_profile_with_undo(
+        &f.ctx, instance, &f.def, "Shared", false,
+    )
+    .expect("apply Shared");
+    assert!(
+        !dir.join("user/Skyrim.ini").exists(),
+        "Profile 1 Skyrim.ini must not remain under Shared"
+    );
+    assert!(
+        !dir.join("user/SkyrimCustom.ini").exists(),
+        "Profile 1 SkyrimCustom.ini must not remain under Shared"
+    );
+    assert!(
+        !dir.join("user/Plugins.txt").exists(),
+        "Profile 1 Plugins.txt must not remain under Shared"
+    );
+
+    // Switching to OwnPlugins keeps INIs shared, while writing OwnPlugins' own Plugins.txt.
+    agora_core::game_loadout::apply_game_profile_with_undo(
+        &f.ctx,
+        instance,
+        &f.def,
+        "OwnPlugins",
+        false,
+    )
+    .expect("apply OwnPlugins");
+    assert!(!dir.join("user/Skyrim.ini").exists());
+    assert!(!dir.join("user/SkyrimCustom.ini").exists());
+    let plugins_text = std::fs::read_to_string(dir.join("user/Plugins.txt"))
+        .expect("OwnPlugins writes its own Plugins.txt");
+    assert!(
+        plugins_text.contains("*Beta.esp") && !plugins_text.contains("*Alpha.esp"),
+        "OwnPlugins Plugins.txt should have only *Beta.esp, got:\n{plugins_text}"
+    );
+}
+
+#[test]
+fn f1b_merged_local_saves_get_distinct_scoped_folders_and_copy_each_profiles_saves() {
+    use agora_core::game_import::profiles::Grouping;
+
+    let f = fixture();
+    add_second_mo2_profile(&f);
+    let alt = f.setup.join("profiles/Alt");
+    write(
+        &alt.join("settings.ini"),
+        b"[General]\r\nLocalSaves=true\r\nLocalSettings=false\r\n",
+    );
+    write(&alt.join("saves/AltSave.ess"), b"ALT SAVE");
+
+    let profiles = vec!["Test Profile".to_string(), "Alt".to_string()];
+    let report = agora_core::game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("Scoped Saves Merge"), true),
+        &profiles,
+        Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("merged import with copy_saves runs");
+    let instance = &report.instances[0];
+    let rule = game_saves::rule_for(&f.def, &StoreId::steam()).expect("save rule");
+
+    let unscoped = game_saves::own_folder(rule, instance).unwrap();
+    let main_folder = game_saves::own_folder_scoped(rule, instance, Some("Test Profile")).unwrap();
+    let alt_folder = game_saves::own_folder_scoped(rule, instance, Some("Alt")).unwrap();
+    assert_ne!(main_folder, alt_folder);
+    assert!(
+        !unscoped.join("Save1.ess").exists(),
+        "profile 1 saves must go to its scoped folder, not the unscoped own folder"
+    );
+    assert_eq!(
+        std::fs::read(main_folder.join("Save1.ess")).expect("Test Profile save copied"),
+        b"SAVE ONE"
+    );
+    assert!(!main_folder.join("AltSave.ess").exists());
+    assert_eq!(
+        std::fs::read(alt_folder.join("AltSave.ess")).expect("Alt save copied"),
+        b"ALT SAVE"
+    );
+    assert!(!alt_folder.join("Save1.ess").exists());
+
+    // Active profile (Test Profile) points at Test Profile's scoped folder.
+    assert_eq!(
+        game_saves::in_use_folder(&f.ctx, instance, &f.def).unwrap(),
+        main_folder
+    );
+    let main_status = game_saves::status(&f.ctx, instance, &f.def).unwrap();
+    assert_eq!(
+        main_status.setting_value.as_deref(),
+        Some(game_saves::own_value_scoped(rule, instance, Some("Test Profile")).as_str())
+    );
+
+    // Switching to Alt points at Alt's scoped folder.
+    agora_core::game_loadout::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "Alt", false)
+        .expect("apply Alt");
+    assert_eq!(
+        game_saves::in_use_folder(&f.ctx, instance, &f.def).unwrap(),
+        alt_folder
+    );
+    let alt_status = game_saves::status(&f.ctx, instance, &f.def).unwrap();
+    assert_eq!(
+        alt_status.setting_value.as_deref(),
+        Some(game_saves::own_value_scoped(rule, instance, Some("Alt")).as_str())
+    );
+}
+
+#[test]
+fn f1c_overwrite_layer_stays_enabled_and_wins_in_every_merged_loadout() {
+    use agora_core::game_import::profiles::Grouping;
+
+    let f = fixture();
+    add_second_mo2_profile(&f);
+    write(
+        &f.setup.join("mods/Alpha/override_check.txt"),
+        b"from alpha",
+    );
+    write(&f.setup.join("mods/Beta/override_check.txt"), b"from beta");
+    write(
+        &f.setup.join("overwrite/override_check.txt"),
+        b"from overwrite",
+    );
+
+    let profiles = vec!["Test Profile".to_string(), "Alt".to_string()];
+    let report = agora_core::game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("Overwrite Merge"), false),
+        &profiles,
+        Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("merged import runs");
+    let instance = &report.instances[0];
+
+    // Profile 1 (applied initially): unclaimed overwrite mesh is deployed, and overwrite wins conflicts.
+    assert_eq!(
+        planned_file_bytes(&f, instance, "Data/meshes/armor/helm.nif"),
+        b"NIF",
+        "MO2 overwrite mesh must stay enabled under Test Profile"
+    );
+    assert_eq!(
+        planned_file_bytes(&f, instance, "Data/override_check.txt"),
+        b"from overwrite",
+        "MO2 overwrite must outrank mods under Test Profile"
+    );
+
+    // Switching to Profile 2: overwrite still stays enabled and still wins conflicts.
+    agora_core::game_loadout::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "Alt", false)
+        .expect("apply Alt");
+    assert_eq!(
+        planned_file_bytes(&f, instance, "Data/meshes/armor/helm.nif"),
+        b"NIF",
+        "MO2 overwrite mesh must stay enabled under Alt"
+    );
+    assert_eq!(
+        planned_file_bytes(&f, instance, "Data/override_check.txt"),
+        b"from overwrite",
+        "MO2 overwrite must outrank mods under Alt"
+    );
+}
+
+#[test]
+fn f1d_byte_identical_alias_folders_stay_enabled_in_each_profiles_loadout() {
+    use agora_core::game_import::profiles::Grouping;
+
+    let f = fixture();
+    write(
+        &f.setup.join("mods/DeltaAlias/AliasShared.esp"),
+        b"IDENTICAL BYTES",
+    );
+    write(
+        &f.setup.join("mods/EchoAlias/AliasShared.esp"),
+        b"IDENTICAL BYTES",
+    );
+    // Profile 1 enables DeltaAlias (and disables EchoAlias).
+    write(
+        &f.setup.join("profiles/Test Profile/modlist.txt"),
+        b"# Mod Organizer\r\n+Alpha\r\n+DeltaAlias\r\n-EchoAlias\r\n-Beta\r\n+Gamma\r\n",
+    );
+    // Profile 2 enables EchoAlias (and disables DeltaAlias).
+    let alt = f.setup.join("profiles/Alt");
+    write(
+        &alt.join("modlist.txt"),
+        b"# Mod Organizer\r\n+Alpha\r\n-DeltaAlias\r\n+EchoAlias\r\n+Beta\r\n-Gamma\r\n",
+    );
+    write(
+        &alt.join("plugins.txt"),
+        b"# Mod Organizer\r\n*Alpha.esp\r\n*Beta.esp\r\n*AliasShared.esp\r\n",
+    );
+
+    let profiles = vec!["Test Profile".to_string(), "Alt".to_string()];
+    let report = agora_core::game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("Alias Merge"), false),
+        &profiles,
+        Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("merged import runs");
+    let instance = &report.instances[0];
+
+    // Under Test Profile (DeltaAlias enabled): AliasShared.esp must be deployed.
+    assert_eq!(
+        planned_file_bytes(&f, instance, "Data/AliasShared.esp"),
+        b"IDENTICAL BYTES",
+        "DeltaAlias must keep the shared content item enabled under Test Profile"
+    );
+
+    // Under Alt (EchoAlias enabled): AliasShared.esp must STILL be deployed.
+    agora_core::game_loadout::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "Alt", false)
+        .expect("apply Alt");
+    assert_eq!(
+        planned_file_bytes(&f, instance, "Data/AliasShared.esp"),
+        b"IDENTICAL BYTES",
+        "EchoAlias must keep the shared content item enabled under Alt"
+    );
+}
+
+#[test]
+fn f1e_late_merge_failure_cleans_up_and_retry_succeeds() {
+    use agora_core::game_import::{profiles::Grouping, ImportPhase};
+
+    let f = fixture();
+    // Create a mod folder enabled only in Alt, plus Alt profile.
+    let only_in_alt = f.setup.join("mods/OnlyInAlt");
+    write(&only_in_alt.join("OnlyInAlt.esp"), b"ALT ONLY");
+    let alt = f.setup.join("profiles/Alt");
+    write(
+        &alt.join("modlist.txt"),
+        b"# Mod Organizer\r\n+Alpha\r\n+OnlyInAlt\r\n",
+    );
+    write(
+        &alt.join("plugins.txt"),
+        b"# Mod Organizer\r\n*Alpha.esp\r\n*OnlyInAlt.esp\r\n",
+    );
+
+    let profiles = vec!["Test Profile".to_string(), "Alt".to_string()];
+    // Once profile 1 reaches Finishing (after planning succeeded and the instance was created),
+    // remove OnlyInAlt so adding profile 2's mod fails after profile 1 has committed.
+    let removed = std::cell::Cell::new(false);
+    let err = agora_core::game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, None, false),
+        &profiles,
+        Grouping::Merged,
+        Default::default(),
+        &|p| {
+            if p.phase == ImportPhase::Finishing && !removed.replace(true) {
+                std::fs::remove_dir_all(&only_in_alt).unwrap();
+            }
+        },
+    )
+    .expect_err("missing second-profile mod must fail the merge");
+    assert!(
+        matches!(err, ImportError::Store { .. }),
+        "expected store failure, got {err:?}"
+    );
+    assert!(
+        game_instance::list(&f.ctx).unwrap().is_empty(),
+        "a failed merge must not leave a partial instance listed"
+    );
+
+    // Restore the missing folder and retry with the default name (name: None):
+    // must succeed rather than returning AlreadyImported.
+    write(&only_in_alt.join("OnlyInAlt.esp"), b"ALT ONLY");
+    let retry = agora_core::game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, None, false),
+        &profiles,
+        Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("retry after fixing the source folder must succeed, not return AlreadyImported");
+    assert_eq!(retry.instances.len(), 1);
+    assert_eq!(retry.loadouts, profiles);
+}
+
+struct VolumeSeamGuard;
+
+impl VolumeSeamGuard {
+    fn set(free_bytes: u64) -> Self {
+        agora_core::game_tool_swap::set_volume_seam(Some(agora_core::game_tool_swap::VolumeSeam {
+            same_volume: None,
+            free_bytes: Some(free_bytes),
+        }));
+        Self
+    }
+}
+
+impl Drop for VolumeSeamGuard {
+    fn drop(&mut self) {
+        agora_core::game_tool_swap::set_volume_seam(None);
+    }
+}
+
+#[test]
+fn f1f_space_preflight_matches_exact_copies_in_merged_and_separate_modes() {
+    use agora_core::game_import::profiles::Grouping;
+
+    let f = fixture();
+    // Add a large mod that is disabled in BOTH profiles.
+    write(
+        &f.setup.join("mods/HugeDisabled/big.bin"),
+        &vec![b'X'; 8192],
+    );
+    write(
+        &f.setup.join("profiles/Test Profile/modlist.txt"),
+        b"# Mod Organizer\r\n+Alpha\r\n-Beta\r\n+Gamma\r\n-HugeDisabled\r\n",
+    );
+    let alt = f.setup.join("profiles/Alt");
+    write(
+        &alt.join("modlist.txt"),
+        b"# Mod Organizer\r\n+Alpha\r\n+Beta\r\n-Gamma\r\n-HugeDisabled\r\n",
+    );
+    write(
+        &alt.join("plugins.txt"),
+        b"# Mod Organizer\r\n*Alpha.esp\r\n*Beta.esp\r\n",
+    );
+    write(
+        &alt.join("settings.ini"),
+        b"[General]\r\nLocalSaves=true\r\nLocalSettings=false\r\n",
+    );
+    write(&alt.join("saves/AltSave.ess"), &vec![b'S'; 512]);
+
+    let profiles = vec!["Test Profile".to_string(), "Alt".to_string()];
+
+    let p_main = game_import::plan(&f.ctx, &f.inventory, &request(&f, None, false)).unwrap();
+    let p_alt = game_import::plan(
+        &f.ctx,
+        &f.inventory,
+        &Mo2Request {
+            profile: "Alt".into(),
+            ..request(&f, None, false)
+        },
+    )
+    .unwrap();
+
+    let mod_bytes = |name: &str| p_main.mods.iter().find(|m| m.folder == name).unwrap().bytes;
+    let enabled_union = mod_bytes("Alpha") + mod_bytes("Beta") + mod_bytes("Gamma");
+    let all_union = enabled_union + mod_bytes("HugeDisabled");
+    let ow_total = p_main.overwrite.bytes;
+    let ow_rest = p_main.overwrite.rest_bytes;
+    let ow_gen = ow_total - ow_rest;
+    let total_saves = p_main.saves.bytes + p_alt.saves.bytes;
+    assert!(ow_rest > 0 && ow_gen > 0 && total_saves > 0);
+
+    // 1. Merged without copy_saves: enabled union + overwrite once (no HugeDisabled, no saves).
+    let merged_no_saves = game_import::mo2_plan_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("M1"), false),
+        &profiles,
+        Grouping::Merged,
+    )
+    .unwrap();
+    assert_eq!(
+        merged_no_saves.bytes,
+        enabled_union + ow_total,
+        "merged (no saves) must count enabled union + overwrite once, not HugeDisabled"
+    );
+
+    // 2. Merged with copy_saves: adds both profiles' local saves.
+    let merged_with_saves = game_import::mo2_plan_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("M2"), true),
+        &profiles,
+        Grouping::Merged,
+    )
+    .unwrap();
+    assert_eq!(
+        merged_with_saves.bytes,
+        enabled_union + ow_total + total_saves,
+        "merged (copy_saves) must include both profiles' local saves"
+    );
+
+    // 3. Separate without copy_saves: union of all listed mods (incl. HugeDisabled, no double
+    //    count of Alpha/Beta/Gamma) + overwrite rest once + generated per instance.
+    let sep_no_saves = game_import::mo2_plan_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("S1"), false),
+        &profiles,
+        Grouping::Separate,
+    )
+    .unwrap();
+    assert_eq!(
+        sep_no_saves.bytes,
+        all_union + ow_rest + ow_gen * 2,
+        "separate (no saves) must count all listed mods once + overwrite rest once + generated per instance"
+    );
+
+    // 4. Separate with copy_saves: adds both profiles' local saves.
+    let sep_with_saves = game_import::mo2_plan_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("S2"), true),
+        &profiles,
+        Grouping::Separate,
+    )
+    .unwrap();
+    assert_eq!(
+        sep_with_saves.bytes,
+        all_union + ow_rest + ow_gen * 2 + total_saves,
+        "separate (copy_saves) must include both profiles' local saves"
+    );
+
+    // Executing Merged must NOT copy HugeDisabled into the content store.
+    game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("M-Run"), false),
+        &profiles,
+        Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("merged import runs");
+    let stored_names: Vec<String> = stored_items(&f.ctx).into_iter().map(|i| i.name).collect();
+    assert!(
+        !stored_names.iter().any(|n| n == "HugeDisabled"),
+        "merged execution must not store mods disabled in every chosen profile: {stored_names:?}"
+    );
+}
+
+#[test]
+fn f1f_single_profile_run_checks_free_space_before_copying() {
+    let f = fixture();
+    let req = request(&f, Some("Tight Disk"), true);
+    let planned = game_import::plan(&f.ctx, &f.inventory, &req).unwrap();
+    let needed = planned.bytes + planned.saves.bytes;
+    assert!(needed > 1);
+
+    {
+        let _guard = VolumeSeamGuard::set(needed - 1);
+        let err = game_import::run(&f.ctx, &f.inventory, &req, RunOptions::default(), &|_| {})
+            .expect_err("single-profile run must refuse when disk space is short by 1 byte");
+        assert!(
+            matches!(err, ImportError::NotEnoughSpace { needed: n, free } if n == needed && free == needed - 1),
+            "expected NotEnoughSpace {{ needed: {needed}, free: {} }}, got {err:?}",
+            needed - 1
+        );
+    }
+    assert!(
+        stored_items(&f.ctx).is_empty(),
+        "nothing may be stored when preflight refuses"
+    );
+    assert!(
+        game_instance::list(&f.ctx).unwrap().is_empty(),
+        "no instance may be created when preflight refuses"
+    );
+
+    {
+        let _guard = VolumeSeamGuard::set(needed);
+        game_import::run(&f.ctx, &f.inventory, &req, RunOptions::default(), &|_| {})
+            .expect("single-profile run succeeds when exact bytes fit");
+    }
+}
+
+#[test]
+fn f1g_separate_mode_returns_per_profile_report_and_lists_copied_saves() {
+    use agora_core::game_import::{profiles::Grouping, ImportPhase};
+
+    let f = fixture();
+    // Second profile enables a mod we delete once profile 1 reaches Finishing, so planning
+    // succeeds for all three profiles, profile 1 creates its instance, profile 2 fails, and
+    // profile 3 still completes.
+    let doomed_mod = f.setup.join("mods/DoomedMod");
+    write(&doomed_mod.join("Doomed.esp"), b"DOOMED");
+    let fails_prof = f.setup.join("profiles/FailsMidRun");
+    write(
+        &fails_prof.join("modlist.txt"),
+        b"# Mod Organizer\r\n+DoomedMod\r\n",
+    );
+    write(
+        &fails_prof.join("plugins.txt"),
+        b"# Mod Organizer\r\n*Doomed.esp\r\n",
+    );
+
+    let third = f.setup.join("profiles/Third");
+    write(
+        &third.join("modlist.txt"),
+        b"# Mod Organizer\r\n+Alpha\r\n+Beta\r\n",
+    );
+    write(
+        &third.join("plugins.txt"),
+        b"# Mod Organizer\r\n*Alpha.esp\r\n*Beta.esp\r\n",
+    );
+    write(
+        &third.join("settings.ini"),
+        b"[General]\r\nLocalSaves=true\r\nLocalSettings=false\r\n",
+    );
+    write(&third.join("saves/ThirdSave.ess"), b"THIRD SAVE");
+
+    let profiles = vec![
+        "Test Profile".to_string(),
+        "FailsMidRun".to_string(),
+        "Third".to_string(),
+    ];
+    let removed = std::cell::Cell::new(false);
+    let report = game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, Some("Sep Batch"), true),
+        &profiles,
+        Grouping::Separate,
+        Default::default(),
+        &|p| {
+            if p.phase == ImportPhase::Finishing && !removed.replace(true) {
+                std::fs::remove_file(fails_prof.join("modlist.txt")).unwrap();
+            }
+        },
+    )
+    .expect("separate mode must return a per-profile report instead of failing the whole call");
+
+    assert_eq!(
+        report.instances.len(),
+        2,
+        "profiles 1 and 3 created instances: {report:?}"
+    );
+    assert_eq!(report.profiles.len(), 3, "{:?}", report.profiles);
+
+    // Profile 1 succeeded and lists both copied save files written outside the instance.
+    let p0 = &report.profiles[0];
+    assert_eq!(p0.profile, "Test Profile");
+    assert!(p0.instance_id.is_some());
+    assert!(p0.error.is_none());
+    assert_eq!(p0.external_files_written.len(), 2, "{p0:?}");
+    assert!(
+        p0.external_files_written.iter().all(|p| p.is_file()),
+        "all reported copied save files must exist on disk: {:?}",
+        p0.external_files_written
+    );
+    assert!(p0
+        .external_files_written
+        .iter()
+        .any(|p| p.file_name().and_then(|n| n.to_str()) == Some("Save1.ess")));
+
+    // Profile 2 failed and reports its error without hiding profiles 1 and 3.
+    let p1 = &report.profiles[1];
+    assert_eq!(p1.profile, "FailsMidRun");
+    assert!(p1.instance_id.is_none());
+    assert!(
+        p1.error
+            .as_deref()
+            .is_some_and(|e| e.contains("modlist.txt")),
+        "profile 2 must carry its error: {p1:?}"
+    );
+
+    // Profile 3 succeeded and lists its copied save file.
+    let p2 = &report.profiles[2];
+    assert_eq!(p2.profile, "Third");
+    assert!(p2.instance_id.is_some());
+    assert!(p2.error.is_none());
+    assert_eq!(p2.external_files_written.len(), 1, "{p2:?}");
+    assert!(p2.external_files_written[0].is_file());
+    assert_eq!(
+        p2.external_files_written[0]
+            .file_name()
+            .and_then(|n| n.to_str()),
+        Some("ThirdSave.ess")
+    );
+}
+
+#[test]
+fn acceptance_merged_mo2_profiles_reproduce_winners_saves_and_effective_inis() {
+    use agora_core::game_import::profiles::Grouping;
+    use agora_core::game_ini::{self, IniSource};
+
+    let f = fixture();
+    // Seed the game's shared INI files in the fake Documents folder.
+    let shared_docs = f
+        ._user_data
+        .path()
+        .join("documents/My Games/Skyrim Special Edition");
+    write(
+        &shared_docs.join("Skyrim.ini"),
+        b"[General]\r\nsProfileTag=shared_base\r\n",
+    );
+    write(
+        &shared_docs.join("SkyrimCustom.ini"),
+        b"[Custom]\r\nsCustomTag=shared_custom\r\n",
+    );
+
+    // Profile 1 ("Mage"): Alpha above Gamma, private INIs, local save MageHero.ess.
+    let mage = f.setup.join("profiles/Mage");
+    write(
+        &mage.join("modlist.txt"),
+        b"# Mod Organizer\r\n+Alpha\r\n+Gamma\r\n",
+    );
+    write(
+        &mage.join("plugins.txt"),
+        b"# Mod Organizer\r\n*Alpha.esp\r\n*Gamma.esp\r\n",
+    );
+    write(
+        &mage.join("loadorder.txt"),
+        b"# Mod Organizer\r\nSkyrim.esm\r\nUpdate.esm\r\nAlpha.esp\r\nGamma.esp\r\n",
+    );
+    write(
+        &mage.join("settings.ini"),
+        b"[General]\r\nLocalSaves=true\r\nLocalSettings=true\r\n",
+    );
+    write(
+        &mage.join("Skyrim.ini"),
+        b"[General]\r\nsProfileTag=mage_private\r\n",
+    );
+    write(
+        &mage.join("SkyrimCustom.ini"),
+        b"[Custom]\r\nsCustomTag=mage_custom\r\n",
+    );
+    write(&mage.join("saves/MageHero.ess"), b"MAGE SAVE");
+
+    // Profile 2 ("Warrior"): exact same enabled mods in OPPOSITE order (Gamma above Alpha),
+    // shared INIs (LocalSettings=false), local save WarriorHero.ess.
+    let warrior = f.setup.join("profiles/Warrior");
+    write(
+        &warrior.join("modlist.txt"),
+        b"# Mod Organizer\r\n+Gamma\r\n+Alpha\r\n",
+    );
+    write(
+        &warrior.join("plugins.txt"),
+        b"# Mod Organizer\r\n*Gamma.esp\r\n*Alpha.esp\r\n",
+    );
+    write(
+        &warrior.join("loadorder.txt"),
+        b"# Mod Organizer\r\nSkyrim.esm\r\nUpdate.esm\r\nGamma.esp\r\nAlpha.esp\r\n",
+    );
+    write(
+        &warrior.join("settings.ini"),
+        b"[General]\r\nLocalSaves=true\r\nLocalSettings=false\r\n",
+    );
+    write(&warrior.join("saves/WarriorHero.ess"), b"WARRIOR SAVE");
+
+    let profiles = vec!["Mage".to_string(), "Warrior".to_string()];
+    let report = game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &Mo2Request {
+            profile: "Mage".into(),
+            ..request(&f, Some("Two Characters"), true)
+        },
+        &profiles,
+        Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("merged import succeeds");
+    assert_eq!(report.instances.len(), 1);
+    assert_eq!(report.loadouts, profiles);
+    let instance = &report.instances[0];
+    let rule = game_saves::rule_for(&f.def, &StoreId::steam()).expect("save rule");
+
+    let mage_saves = game_saves::own_folder_scoped(rule, instance, Some("Mage")).unwrap();
+    let warrior_saves = game_saves::own_folder_scoped(rule, instance, Some("Warrior")).unwrap();
+    assert_ne!(mage_saves, warrior_saves);
+
+    let check_mage = || {
+        assert_eq!(
+            planned_file_bytes(&f, instance, "Data/shared.txt"),
+            b"from alpha",
+            "Mage puts Alpha above Gamma"
+        );
+        assert_eq!(
+            planned_file_bytes(&f, instance, "Data/meshes/armor/helm.nif"),
+            b"NIF",
+            "overwrite mesh stays active under Mage"
+        );
+        assert_eq!(
+            game_saves::in_use_folder(&f.ctx, instance, &f.def).unwrap(),
+            mage_saves
+        );
+        assert_eq!(
+            std::fs::read(mage_saves.join("MageHero.ess")).unwrap(),
+            b"MAGE SAVE"
+        );
+        assert!(!mage_saves.join("WarriorHero.ess").exists());
+
+        let skyrim_ini = game_ini::read(&f.ctx, instance, &f.def, "user/Skyrim.ini").unwrap();
+        assert_eq!(
+            skyrim_ini.document.get("General", "sProfileTag").as_deref(),
+            Some("mage_private")
+        );
+        assert_eq!(
+            skyrim_ini
+                .document
+                .get("General", "SLocalSavePath")
+                .as_deref(),
+            Some(game_saves::own_value_scoped(rule, instance, Some("Mage")).as_str())
+        );
+
+        let custom_ini = game_ini::read(&f.ctx, instance, &f.def, "user/SkyrimCustom.ini").unwrap();
+        assert_eq!(custom_ini.source, IniSource::Copy);
+        assert_eq!(
+            custom_ini.document.get("Custom", "sCustomTag").as_deref(),
+            Some("mage_custom")
+        );
+    };
+
+    let check_warrior = || {
+        assert_eq!(
+            planned_file_bytes(&f, instance, "Data/shared.txt"),
+            b"from gamma",
+            "Warrior puts Gamma above Alpha"
+        );
+        assert_eq!(
+            planned_file_bytes(&f, instance, "Data/meshes/armor/helm.nif"),
+            b"NIF",
+            "overwrite mesh stays active under Warrior"
+        );
+        assert_eq!(
+            game_saves::in_use_folder(&f.ctx, instance, &f.def).unwrap(),
+            warrior_saves
+        );
+        assert_eq!(
+            std::fs::read(warrior_saves.join("WarriorHero.ess")).unwrap(),
+            b"WARRIOR SAVE"
+        );
+        assert!(!warrior_saves.join("MageHero.ess").exists());
+
+        // Warrior has shared settings (seeded from shared Skyrim.ini for SLocalSavePath), never Mage's tag.
+        let skyrim_ini = game_ini::read(&f.ctx, instance, &f.def, "user/Skyrim.ini").unwrap();
+        assert_eq!(
+            skyrim_ini.document.get("General", "sProfileTag").as_deref(),
+            Some("shared_base"),
+            "Warrior must inherit shared Skyrim.ini, never Mage's private Skyrim.ini"
+        );
+        assert_eq!(
+            skyrim_ini
+                .document
+                .get("General", "SLocalSavePath")
+                .as_deref(),
+            Some(game_saves::own_value_scoped(rule, instance, Some("Warrior")).as_str())
+        );
+
+        let custom_ini = game_ini::read(&f.ctx, instance, &f.def, "user/SkyrimCustom.ini").unwrap();
+        assert_eq!(custom_ini.source, IniSource::GameFile);
+        assert_eq!(
+            custom_ini.document.get("Custom", "sCustomTag").as_deref(),
+            Some("shared_custom"),
+            "Warrior must see the shared SkyrimCustom.ini, never Mage's private copy"
+        );
+    };
+
+    // Initial state is Mage (profile 1).
+    check_mage();
+
+    // Switch to Warrior.
+    agora_core::game_loadout::apply_game_profile_with_undo(
+        &f.ctx, instance, &f.def, "Warrior", false,
+    )
+    .expect("switch to Warrior");
+    check_warrior();
+
+    // Switch back to Mage.
+    agora_core::game_loadout::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "Mage", false)
+        .expect("switch back to Mage");
+    check_mage();
+}

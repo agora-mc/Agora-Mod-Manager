@@ -983,6 +983,10 @@ export const GUIDE_TOPICS: GuideTopic[] = [
           body: 'On the game\'s Instances page, Import instances lists the Mod Organizer 2 setups on this computer. Choose a setup and a profile, use Preview the import to see what will happen, then confirm with Import profile. It becomes a new instance, and your Mod Organizer 2 setup is only read, not changed.',
         },
         {
+          title: 'Bring a Vortex setup',
+          body: 'Close Vortex and choose Vortex in Import instances. The preview names files whose deployed winner Agora cannot reproduce. With several profiles, a merged import saves each profile’s layer order in its loadout. A separate import shows each profile’s result and lists saves copied outside the instance.',
+        },
+        {
           title: 'When something goes wrong',
           body: 'Start with the page closest to the problem.',
           bullets: [

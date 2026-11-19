@@ -794,6 +794,8 @@ pub struct MultiPlanDto {
 pub struct MultiRunDto {
     pub instances: Vec<String>,
     pub loadouts: Vec<String>,
+    pub profiles: Vec<game_import::Mo2ProfileOutcome>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -896,6 +898,8 @@ pub async fn games_import_vortex_multi(
         Ok(MultiImportReply::Run(Box::new(MultiRunDto {
             instances: report.instances,
             loadouts: report.loadouts,
+            profiles: report.profiles,
+            warnings: report.plan.warnings,
         })))
     })
     .await
@@ -1015,6 +1019,8 @@ pub async fn games_import_mo2_multi(
         Ok(MultiImportReply::Run(Box::new(MultiRunDto {
             instances: report.instances,
             loadouts: report.loadouts,
+            profiles: Vec::new(),
+            warnings: Vec::new(),
         })))
     })
     .await

@@ -443,8 +443,21 @@ fn write(path: &Path, bytes: &[u8]) {
     std::fs::write(path, bytes).unwrap();
 }
 
+fn assert_mod_roots(f: &Fixture, instance_id: &str, archive: &str, plugin: &str) {
+    let plan = game_deploy::plan(&f.ctx, instance_id, &f.def, DeployMode::Links)
+        .expect("the imported instance plans");
+    let files: Vec<_> = plan.files.iter().map(|file| file.path.as_str()).collect();
+    assert!(
+        files.contains(&format!("archive/mods/{archive}/pack.bin").as_str()),
+        "{files:?}"
+    );
+    assert!(
+        files.contains(&format!("bin/plugins/{plugin}/plug.dll").as_str()),
+        "{files:?}"
+    );
+}
+
 #[test]
-#[ignore = "second-game: importers mount every mod at content_layout.data_path and ignore content_rules, so the plugin root is lost"]
 fn an_mo2_setup_imports_mods_into_both_roots() {
     let f = Fixture::new(neon_courier::definition());
     let setup = f._tmp.path().join("mo2");
@@ -485,28 +498,7 @@ fn an_mo2_setup_imports_mods_into_both_roots() {
         .expect("the MO2 setup imports");
     let instance_id = report.instance_id.expect("an instance was made");
 
-    let plan = game_deploy::plan(&f.ctx, &instance_id, &f.def, DeployMode::Links)
-        .expect("the imported instance plans");
-    assert!(
-        plan.files
-            .iter()
-            .any(|file| file.path.as_str() == "archive/mods/pack.bin"),
-        "the archive mod is in the archive root: {:?}",
-        plan.files
-            .iter()
-            .map(|f| f.path.as_str())
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        plan.files
-            .iter()
-            .any(|file| file.path.as_str().starts_with("bin/plugins/")),
-        "the plugin mod is in the plugin root: {:?}",
-        plan.files
-            .iter()
-            .map(|f| f.path.as_str())
-            .collect::<Vec<_>>()
-    );
+    assert_mod_roots(&f, &instance_id, "ArchivePack", "PluginPack");
 }
 
 fn write_store(store: &Path, pairs: &[(&str, String)]) {
@@ -525,7 +517,6 @@ fn write_store(store: &Path, pairs: &[(&str, String)]) {
 }
 
 #[test]
-#[ignore = "second-game: importers mount every mod at content_layout.data_path and ignore content_rules, so the plugin root is lost"]
 fn a_vortex_setup_imports_mods_into_both_roots() {
     let f = Fixture::new(neon_courier::definition());
     let vortex = f._tmp.path().join("Vortex");
@@ -536,6 +527,17 @@ fn a_vortex_setup_imports_mods_into_both_roots() {
     write(&staging.join("ArchivePack/pack.bin"), b"archive");
     write(&staging.join("PluginPack/plugin.json"), b"{}");
     write(&staging.join("PluginPack/plug.dll"), b"plugin");
+    write(&staging.join("ArchivePack/shared.bin"), b"archive bytes");
+    write(&staging.join("PluginPack/shared.bin"), b"plugin bytes");
+    let game = &f.install.discovered.location;
+    write(
+        &game.join("archive/mods/vortex.deployment.json"),
+        br#"{"files":[{"relPath":"shared.bin","target":"Archive Pack","source":"ArchivePack"}]}"#,
+    );
+    write(
+        &game.join("bin/plugins/vortex.deployment.json"),
+        br#"{"files":[{"relPath":"shared.bin","target":"Plugin Pack","source":"PluginPack"}]}"#,
+    );
     std::fs::create_dir_all(vortex.join("neoncourier/profiles/p1")).unwrap();
 
     let mods = r#"{"neoncourier":{
@@ -585,26 +587,11 @@ fn a_vortex_setup_imports_mods_into_both_roots() {
             .expect("the Vortex setup imports");
     let instance_id = report.instance_id.expect("an instance was made");
 
-    let plan = game_deploy::plan(&f.ctx, &instance_id, &f.def, DeployMode::Links)
-        .expect("the imported instance plans");
     assert!(
-        plan.files
-            .iter()
-            .any(|file| file.path.as_str() == "archive/mods/pack.bin"),
-        "the archive mod is in the archive root: {:?}",
-        plan.files
-            .iter()
-            .map(|f| f.path.as_str())
-            .collect::<Vec<_>>()
+        report.plan.fidelity.is_empty(),
+        "{:?}",
+        report.plan.fidelity
     );
-    assert!(
-        plan.files
-            .iter()
-            .any(|file| file.path.as_str().starts_with("bin/plugins/")),
-        "the plugin mod is in the plugin root: {:?}",
-        plan.files
-            .iter()
-            .map(|f| f.path.as_str())
-            .collect::<Vec<_>>()
-    );
+    assert_eq!(report.plan.manifest.matched, 2);
+    assert_mod_roots(&f, &instance_id, "Archive Pack", "Plugin Pack");
 }

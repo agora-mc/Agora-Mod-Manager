@@ -396,7 +396,7 @@ test.describe('Import dialog', () => {
     await expect(page.getByRole('button', { name: 'Import as a new instance' })).toBeDisabled();
   });
 
-  test('imports a Vortex profile through the same dialog', async ({ page }) => {
+  test('reports a partial Vortex batch and imports a single profile through the same dialog', async ({ page }) => {
     const vortexScan = {
       store: 'C:/Users/me/AppData/Roaming/Vortex/state.v2',
       games: [
@@ -418,6 +418,16 @@ test.describe('Import dialog', () => {
             {
               id: 'p1',
               name: 'Main',
+              modsEnabled: 1,
+              modsTotal: 1,
+              pluginsTxt: true,
+              loadorderTxt: true,
+              localSettings: false,
+              localSaves: false,
+            },
+            {
+              id: 'p2',
+              name: 'Alt',
               modsEnabled: 1,
               modsTotal: 1,
               pluginsTxt: true,
@@ -501,11 +511,32 @@ test.describe('Import dialog', () => {
       savesFolder: null,
       nextSteps: ["Vortex's downloads were not copied; mods are stored as they are in the staging folder"],
     };
+    const fidelityWarning = 'Main can only reproduce one of the crossed winners for Data/shared.txt';
+    const externalSave = 'C:/Fixture/Saves/First.ess';
     await boot(
       page,
       [
         { command: 'games_import_vortex', match: { dryRun: true }, reply: vortexPlan },
         { command: 'games_import_vortex', match: { dryRun: false }, reply: vortexRun },
+        {
+          command: 'games_import_vortex_profiles',
+          match: { dryRun: true, mode: 'separate' },
+          reply: {
+            kind: 'plan', manager: 'vortex', grouping: 'separate', profiles: ['Main', 'Alt'],
+            bytes: 2048, freeBytes: 8192, fits: true, plans: [], warnings: [fidelityWarning],
+          },
+        },
+        {
+          command: 'games_import_vortex_profiles',
+          match: { dryRun: false, mode: 'separate' },
+          reply: {
+            kind: 'run', instances: ['inst-9'], loadouts: [], warnings: [fidelityWarning],
+            profiles: [
+              { profile: 'Main', instance_id: 'inst-9', external_files_written: [externalSave] },
+              { profile: 'Alt', instance_id: null, error: 'The staged mod disappeared', external_files_written: [] },
+            ],
+          },
+        },
       ],
       { games_import_mo2_scan: { setups: [], warnings: [] }, games_import_vortex_scan: vortexScan },
     );
@@ -513,6 +544,19 @@ test.describe('Import dialog', () => {
     await openImport(page);
     await page.getByRole('button', { name: 'Vortex', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Import from Vortex' })).toBeVisible();
+    await page.getByTestId('multi-profile-Main').check();
+    await page.getByTestId('multi-profile-Alt').check();
+    await page.getByRole('button', { name: 'One instance per profile', exact: true }).click();
+    await page.getByRole('button', { name: 'Preview the choice' }).click();
+    await expect(page.getByTestId('multi-plan')).toContainText(fidelityWarning);
+    await page.getByRole('button', { name: 'Import 2 profiles' }).click();
+    await page.getByRole('button', { name: 'Import profiles', exact: true }).click();
+    const batch = page.getByTestId('multi-run');
+    await expect(batch).toContainText('Main imported as inst-9');
+    await expect(batch.getByRole('alert')).toContainText('Alt failed. The staged mod disappeared');
+    await expect(batch).toContainText(externalSave);
+    await expect(batch).toContainText(fidelityWarning);
+
     await page.getByTestId('vortex-profile-p1').click();
 
     await expect(page.getByTestId('vortex-plan')).toBeVisible();

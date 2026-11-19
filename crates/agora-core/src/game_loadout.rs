@@ -65,6 +65,12 @@ pub struct GameLoadoutRules {
 pub struct GameLoadout {
     #[serde(default)]
     pub content: Vec<GameLoadoutContent>,
+    /// Content layer order (layer ids, lowest priority first, matching `LayerStack`).
+    /// Empty (including loadouts saved before this field existed) leaves the instance's
+    /// current layer order untouched. Layers missing from this list keep their relative
+    /// place at the end.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layer_order: Vec<String>,
     #[serde(default)]
     pub plugin_lists: Vec<GameLoadoutPluginList>,
     #[serde(default)]
@@ -127,15 +133,18 @@ pub fn capture(
     let dir = instance_dir(ctx, instance_id)?;
 
     let mut content = Vec::new();
+    let mut layer_order = Vec::new();
     for layer in manifest.layers.layers() {
         if matches!(
             layer.source,
             LayerSource::Content { .. } | LayerSource::InstanceContent { .. }
         ) {
+            let id = layer.id.as_str().to_string();
             content.push(GameLoadoutContent {
-                item: layer.id.as_str().to_string(),
+                item: id.clone(),
                 enabled: layer.enabled,
             });
+            layer_order.push(id);
         }
     }
 
@@ -178,6 +187,7 @@ pub fn capture(
 
     Ok(GameLoadout {
         content,
+        layer_order,
         plugin_lists,
         inis,
         rules,
@@ -442,6 +452,14 @@ fn diff(old: &GameLoadout, new: &GameLoadout) -> Vec<LoadoutChange> {
         }
     }
 
+    if old.layer_order != new.layer_order {
+        changes.push(item_change(
+            "order",
+            "layer_order",
+            LoadoutChangeKind::Added { enabled: true },
+        ));
+    }
+
     if old.saves != new.saves {
         changes.push(item_change(
             "saves",
@@ -565,6 +583,29 @@ fn apply_state(
             LayerSource::Content { .. } | LayerSource::InstanceContent { .. }
         ) {
             layer.enabled = wanted.get(layer.id.as_str()).copied().unwrap_or(false);
+        }
+    }
+    if !state.layer_order.is_empty() {
+        let mut rank: HashMap<&str, usize> = HashMap::with_capacity(state.layer_order.len());
+        for (index, id) in state.layer_order.iter().enumerate() {
+            rank.entry(id.as_str()).or_insert(index);
+        }
+        let positions: Vec<usize> = layers
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, layer)| {
+                matches!(
+                    layer.source,
+                    LayerSource::Content { .. } | LayerSource::InstanceContent { .. }
+                )
+                .then_some(idx)
+            })
+            .collect();
+        let mut ordered: Vec<agora_game_api::Layer> =
+            positions.iter().map(|&idx| layers[idx].clone()).collect();
+        ordered.sort_by_key(|layer| rank.get(layer.id.as_str()).copied().unwrap_or(usize::MAX));
+        for (pos, layer) in positions.into_iter().zip(ordered) {
+            layers[pos] = layer;
         }
     }
     manifest.layers = agora_game_api::LayerStack::new(layers).map_err(|e| e.to_string())?;
@@ -926,5 +967,111 @@ mod tests {
             .unwrap()
             .changes
             .is_empty());
+    }
+
+    #[test]
+    fn apply_restores_layer_order_and_undo_reverts_it() {
+        let s = setup();
+        // Starts with [content:a, content:b].
+        create_game_profile(&s.ctx, "test-instance", &s.def, "ab-order").unwrap();
+
+        // Reorder to [content:b, content:a] and add two new layers c and d.
+        let mut manifest = game_instance::get_manifest(&s.ctx, "test-instance").unwrap();
+        let mut layers = manifest.layers.layers().to_vec();
+        layers.reverse(); // [content:b, content:a]
+        for id in ["content:c", "content:d"] {
+            layers.push(Layer {
+                id: LayerId::new(id).unwrap(),
+                enabled: true,
+                mount_path: RelPath::new("Data").unwrap(),
+                source_path: RelPath::default(),
+                source: LayerSource::Content {
+                    content: id.strip_prefix("content:").unwrap().into(),
+                },
+                whiteouts: Vec::new(),
+                own_copy: false,
+            });
+        }
+        manifest.layers = agora_game_api::LayerStack::new(layers).unwrap();
+        crate::game_deploy::write_instance_manifest_atomic(&s.ctx, "test-instance", &manifest)
+            .unwrap();
+
+        // Applying "ab-order" restores [content:a, content:b], with unlisted [content:c, content:d]
+        // keeping their relative place at the end.
+        apply_game_profile_with_undo(&s.ctx, "test-instance", &s.def, "ab-order", false).unwrap();
+        let ids = |m: &GameInstanceManifest| -> Vec<String> {
+            m.layers
+                .layers()
+                .iter()
+                .map(|l| l.id.as_str().to_string())
+                .collect()
+        };
+        let restored = game_instance::get_manifest(&s.ctx, "test-instance").unwrap();
+        assert_eq!(
+            ids(&restored),
+            vec!["content:a", "content:b", "content:c", "content:d"],
+            "loadout order is restored and unlisted layers keep their relative place at the end"
+        );
+
+        // Undo brings back the previous [content:b, content:a, content:c, content:d] order.
+        undo_game_apply(&s.ctx, "test-instance", &s.def).unwrap();
+        let after_undo = game_instance::get_manifest(&s.ctx, "test-instance").unwrap();
+        assert_eq!(
+            ids(&after_undo),
+            vec!["content:b", "content:a", "content:c", "content:d"],
+            "undo restores the previous layer order"
+        );
+    }
+
+    #[test]
+    fn legacy_loadout_without_layer_order_leaves_instance_order_unchanged() {
+        let s = setup();
+        // A profile saved before `layer_order` existed has no such key in JSON.
+        let legacy_json = serde_json::json!({
+            "name": "legacy",
+            "enabled_mods": ["content:a"],
+            "created_at": "2026-01-01T00:00:00Z",
+            "game": {
+                "content": [
+                    { "item": "content:a", "enabled": true },
+                    { "item": "content:b", "enabled": false }
+                ],
+                "plugin_lists": [],
+                "inis": [],
+                "rules": [],
+                "saves": "shared"
+            }
+        });
+        let loadouts_dir = loadout::loadouts_dir(&s.dir);
+        fs::create_dir_all(&loadouts_dir).unwrap();
+        fs::write(
+            loadouts_dir.join("legacy.json"),
+            serde_json::to_vec_pretty(&legacy_json).unwrap(),
+        )
+        .unwrap();
+
+        // Reverse instance layers to [content:b, content:a].
+        let mut manifest = game_instance::get_manifest(&s.ctx, "test-instance").unwrap();
+        let mut layers = manifest.layers.layers().to_vec();
+        layers.reverse();
+        manifest.layers = agora_game_api::LayerStack::new(layers).unwrap();
+        crate::game_deploy::write_instance_manifest_atomic(&s.ctx, "test-instance", &manifest)
+            .unwrap();
+
+        apply_game_profile_with_undo(&s.ctx, "test-instance", &s.def, "legacy", false).unwrap();
+        let after = game_instance::get_manifest(&s.ctx, "test-instance").unwrap();
+        let ids: Vec<&str> = after
+            .layers
+            .layers()
+            .iter()
+            .map(|l| l.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["content:b", "content:a"],
+            "legacy loadout with no recorded order keeps the instance's current order"
+        );
+        assert!(!after.layers.layers()[0].enabled, "content:b turned off");
+        assert!(after.layers.layers()[1].enabled, "content:a kept on");
     }
 }

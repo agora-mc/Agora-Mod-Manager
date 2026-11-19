@@ -236,6 +236,13 @@ export interface MultiPlanDto {
 export interface MultiRunDto {
   instances: string[];
   loadouts: string[];
+  profiles?: {
+    profile: string;
+    instance_id: string | null;
+    error?: string;
+    external_files_written: string[];
+  }[];
+  warnings?: string[];
 }
 
 export type MultiImportReply =

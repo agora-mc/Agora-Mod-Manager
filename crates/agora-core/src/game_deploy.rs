@@ -3424,9 +3424,19 @@ pub fn decide_placement_with(
     classify: Option<agora_game_api::PlacementClassify<'_>>,
 ) -> PlacementDecision {
     let files: Vec<RelPath> = item.files.iter().map(|file| file.path.clone()).collect();
-    match agora_game_api::suggest_placement_with_rules(
-        &files, layout, rules, facts, &item.name, classify,
-    ) {
+    decide_placement_for_files(&item.name, &files, layout, rules, facts, classify)
+}
+
+pub(crate) fn decide_placement_for_files(
+    name: &str,
+    files: &[RelPath],
+    layout: &agora_game_api::ContentLayout,
+    rules: &[agora_game_api::ContentRule],
+    facts: Option<&dyn agora_game_api::ConditionFacts>,
+    classify: Option<agora_game_api::PlacementClassify<'_>>,
+) -> PlacementDecision {
+    match agora_game_api::suggest_placement_with_rules(files, layout, rules, facts, name, classify)
+    {
         agora_game_api::Suggestion::Place {
             source_path,
             mount_path,
@@ -3437,10 +3447,9 @@ pub fn decide_placement_with(
             reason,
         },
         agora_game_api::Suggestion::Installer { reason } => {
-            let mut top_level: Vec<String> = item
-                .files
+            let mut top_level: Vec<String> = files
                 .iter()
-                .filter_map(|file| file.path.as_str().split('/').next().map(str::to_string))
+                .filter_map(|file| file.as_str().split('/').next().map(str::to_string))
                 .collect();
             top_level.sort();
             top_level.dedup();
@@ -3641,26 +3650,7 @@ pub fn add_to_instance_locked(
     }
 
     let item = crate::content_store::get_item(ctx, item_id)?;
-    let facts = crate::game_conditions::InstanceFacts::for_instance(ctx, instance_id, game);
-    let classifier = ctx
-        .games
-        .package_for(&game.id)
-        .map(|_| PlacementClassifier::new(ctx, instance_id, game));
-    let decision = {
-        let classify = classifier.as_ref().map(|classifier| {
-            |item_name: &str, files: &[RelPath]| classifier.run(item_name, files)
-        });
-        let classify_ref: Option<agora_game_api::PlacementClassify<'_>> = classify
-            .as_ref()
-            .map(|classify| classify as &dyn Fn(&str, &[RelPath]) -> Option<Suggestion>);
-        decide_placement_with(
-            &item,
-            &layout,
-            &game.content_rules,
-            Some(&facts),
-            classify_ref,
-        )
-    };
+    let decision = placement_for_instance_item(ctx, instance_id, game, &layout, &item)?;
     match decision {
         PlacementDecision::Place {
             mount_path,
@@ -3683,12 +3673,50 @@ pub fn add_to_instance_locked(
             top_level,
         }),
         PlacementDecision::Unknown { top_level, note } => {
-            if let Some(error) = classifier.and_then(PlacementClassifier::take_error) {
-                return Err(AddToInstanceError::Classify(error.message));
-            }
             Err(AddToInstanceError::PlacementUnknown { top_level, note })
         }
     }
+}
+
+pub(crate) fn placement_for_instance_item(
+    ctx: &Ctx,
+    instance_id: &str,
+    game: &GameDefinition,
+    layout: &agora_game_api::ContentLayout,
+    item: &crate::content_store::ContentItem,
+) -> Result<PlacementDecision, AddToInstanceError> {
+    let facts = game
+        .content_rules
+        .iter()
+        .any(|rule| rule.when.is_some())
+        .then(|| crate::game_conditions::InstanceFacts::for_instance(ctx, instance_id, game));
+    let classifier = ctx
+        .games
+        .package_for(&game.id)
+        .map(|_| PlacementClassifier::new(ctx, instance_id, game));
+    let decision = {
+        let classify = classifier.as_ref().map(|classifier| {
+            |item_name: &str, files: &[RelPath]| classifier.run(item_name, files)
+        });
+        let classify_ref: Option<agora_game_api::PlacementClassify<'_>> = classify
+            .as_ref()
+            .map(|classify| classify as &dyn Fn(&str, &[RelPath]) -> Option<Suggestion>);
+        decide_placement_with(
+            item,
+            layout,
+            &game.content_rules,
+            facts
+                .as_ref()
+                .map(|facts| facts as &dyn agora_game_api::ConditionFacts),
+            classify_ref,
+        )
+    };
+    if matches!(decision, PlacementDecision::Unknown { .. }) {
+        if let Some(error) = classifier.and_then(PlacementClassifier::take_error) {
+            return Err(AddToInstanceError::Classify(error.message));
+        }
+    }
+    Ok(decision)
 }
 
 /// Choose (or, with `None`, stop choosing) how an instance is deployed and run. A chosen mode is

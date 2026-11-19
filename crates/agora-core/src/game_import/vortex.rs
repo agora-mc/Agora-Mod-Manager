@@ -163,6 +163,10 @@ pub fn parse_state(store: &VortexStore) -> Result<VortexState, ImportError> {
     let mut warnings = store.warnings.clone();
     let mut games = Vec::new();
     for (game_id, game_value) in mods_table {
+        check_game_id(game_id).map_err(|reason| ImportError::Unreadable {
+            path: store.source.clone(),
+            reason,
+        })?;
         let Some(game_mods) = game_value.as_object() else {
             warnings.push(format!(
                 "the mods Vortex lists for {game_id} are not an object; that game was skipped"
@@ -379,6 +383,7 @@ pub fn resolve_install_path(
     game_id: &str,
     username: Option<&str>,
 ) -> Result<PathBuf, String> {
+    check_game_id(game_id)?;
     let base = user_data.join(game_id);
     let template = pattern
         .map(str::trim)
@@ -403,6 +408,18 @@ pub fn resolve_install_path(
     } else {
         user_data.join(path)
     })
+}
+
+fn check_game_id(game_id: &str) -> Result<(), String> {
+    let invalid =
+        |reason: &str| format!("Vortex game id {game_id:?} is not a folder name: {reason}");
+    mo2::check_mod_folder_name(game_id).map_err(|reason| invalid(&reason))?;
+    if game_id.contains(['<', '>', '"', '|', '?', '*']) {
+        return Err(invalid(
+            "it contains a character forbidden in a Windows folder name",
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_template(template: &str, vars: &[(&str, &str)]) -> Result<String, String> {
@@ -502,6 +519,10 @@ pub fn scan(
     store_dir: &Path,
 ) -> Result<VortexScan, ImportError> {
     let state = read_state(store_dir)?;
+    Ok(scan_state(ctx, inventory, &state))
+}
+
+fn scan_state(ctx: &Ctx, inventory: &GameInventory, state: &VortexState) -> VortexScan {
     let mut games = Vec::new();
     let mut warnings = state.warnings.clone();
     for game in &state.games {
@@ -567,7 +588,7 @@ pub fn scan(
                 .iter()
                 .filter(|m| profile.enabled.get(&m.id).copied().unwrap_or(false))
                 .count();
-            let (plugins_txt, loadorder_txt) = plugin_files_found(&state, game, profile);
+            let (plugins_txt, loadorder_txt) = plugin_files_found(state, game, profile);
             let enabled_mod_ids: Vec<String> = game
                 .mods
                 .iter()
@@ -612,11 +633,11 @@ pub fn scan(
             manifest_searched: manifest.searched,
         });
     }
-    Ok(VortexScan {
-        store: state.source,
+    VortexScan {
+        store: state.source.clone(),
         games,
         warnings,
-    })
+    }
 }
 
 /// The Agora game whose package names this Vortex id, if any. The mapping lives in the game package
@@ -836,16 +857,28 @@ fn join_target(target: Option<&str>, rel_path: &str) -> String {
     }
 }
 
-/// The folders Vortex may have deployed into for this game: the game root, and its data mount.
+/// The game root and the mod roots the game declares.
 fn manifest_folders(def: Option<&GameDefinition>, install: &Path) -> Vec<PathBuf> {
-    let mut roots = vec![install.to_path_buf()];
+    let mut roots = BTreeSet::from([install.to_path_buf()]);
     if let Some(def) = def {
         let mount = data_mount(def);
         if !mount.is_empty() {
-            roots.push(install.join(&mount));
+            roots.insert(install.join(&mount));
+        }
+        for rule in &def.content_rules {
+            let root = rule
+                .mount
+                .as_str()
+                .split('{')
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches('/');
+            if !root.is_empty() {
+                roots.insert(install.join(root));
+            }
         }
     }
-    roots
+    roots.into_iter().collect()
 }
 
 /// The candidate manifest files in one folder: the default `vortex.deployment.json` and any
@@ -892,14 +925,14 @@ struct ManifestSearch {
 fn find_manifests(def: Option<&GameDefinition>, install: &Path) -> ManifestSearch {
     let mut search = ManifestSearch::default();
     for folder in manifest_folders(def, install) {
+        let deploy_root = folder
+            .strip_prefix(install)
+            .expect("every manifest folder is inside the game");
         let candidates = manifest_files_in(&folder);
         for path in candidates {
             search.searched.push(path.clone());
-            if !path.is_file() {
-                continue;
-            }
-            search.found = true;
-            let read = read_manifest(&path);
+            let read = read_manifest(&path, deploy_root);
+            search.found |= read.found;
             search.files += read.files;
             if let Some(damaged) = read.damaged {
                 if search.damaged.is_none() {
@@ -1021,7 +1054,9 @@ struct SaveEntry {
 /// reported, never silently counted as 0.
 fn sized_save(entry: SaveEntry, warnings: &mut Vec<String>) -> Option<u64> {
     match entry.metadata {
-        Ok(meta) if meta.is_file() => Some(meta.len()),
+        Ok(meta) if meta.is_file() && !content_store::is_reparse_point_or_symlink(&meta) => {
+            Some(meta.len())
+        }
         Ok(_) => None,
         Err(error) => {
             warnings.push(format!(
@@ -1042,6 +1077,7 @@ fn plan_saves(
     profile_id: &str,
     local: bool,
     warnings: &mut Vec<String>,
+    save_files: &mut Vec<PathBuf>,
 ) -> Result<SavesPlan, ImportError> {
     if !local {
         return Ok(SavesPlan {
@@ -1081,6 +1117,22 @@ fn plan_saves(
         reason: format!("the game's save folder cannot be resolved: {error}"),
     })?;
     let from = base.join(profile_id);
+    match std::fs::symlink_metadata(&from) {
+        Ok(meta) if meta.is_dir() && !content_store::is_reparse_point_or_symlink(&meta) => {}
+        Ok(_) => {
+            return Err(ImportError::Unreadable {
+                path: from,
+                reason: "the profile's own save folder is not a plain directory".into(),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ImportError::Unreadable {
+                path: from,
+                reason: error.to_string(),
+            })
+        }
+    }
     let mut files = 0usize;
     let mut bytes = 0u64;
     match std::fs::read_dir(&from) {
@@ -1089,7 +1141,7 @@ fn plan_saves(
                 let entry = match entry {
                     Ok(entry) => SaveEntry {
                         path: entry.path(),
-                        metadata: entry.metadata(),
+                        metadata: std::fs::symlink_metadata(entry.path()),
                     },
                     Err(error) => {
                         warnings.push(format!(
@@ -1098,9 +1150,11 @@ fn plan_saves(
                         continue;
                     }
                 };
+                let path = entry.path.clone();
                 if let Some(size) = sized_save(entry, warnings) {
                     files += 1;
-                    bytes += size;
+                    bytes = u64::saturating_add(bytes, size);
+                    save_files.push(path);
                 }
             }
         }
@@ -1112,6 +1166,7 @@ fn plan_saves(
             })
         }
     }
+    save_files.sort();
     Ok(SavesPlan {
         local: !direct,
         files,
@@ -1185,9 +1240,6 @@ pub struct PlannedMod {
     /// The files as they were collected, reused by the run so it stores exactly what was planned.
     #[serde(skip)]
     pub paths: Vec<(RelPath, PathBuf)>,
-    /// Folded relative paths, for comparing with the deployment manifest.
-    #[serde(skip)]
-    pub file_set: BTreeSet<String>,
 }
 
 /// What the deployment manifest says, as far as the import can use it.
@@ -1272,6 +1324,8 @@ pub struct VortexPlan {
     /// The mod ids, highest layer first. The manifest decides; Vortex's rules break ties.
     pub order: Vec<String>,
     pub disagreements: Vec<OrderDisagreement>,
+    /// Deployed files whose winning mod differs in the imported layer order.
+    pub fidelity: Vec<String>,
     pub plugins: PluginPlan,
     /// The profile's LOOT userlist `after` entries, and what was not imported.
     pub userlist: UserlistPlan,
@@ -1281,6 +1335,8 @@ pub struct VortexPlan {
     /// The profile keeps its own saves.
     pub local_saves: bool,
     pub saves: SavesPlan,
+    #[serde(skip)]
+    save_files: Vec<PathBuf>,
     pub problems: Vec<Problem>,
     pub warnings: Vec<String>,
 }
@@ -1292,9 +1348,34 @@ pub fn plan(
     inventory: &GameInventory,
     request: &VortexRequest,
 ) -> Result<VortexPlan, ImportError> {
+    let plan = plan_inner(ctx, inventory, request)?;
+    let space = copy_space(
+        ctx,
+        std::slice::from_ref(&plan),
+        request.copy_saves,
+        super::profiles::Grouping::Separate,
+    )?;
+    require_copy_space(&space)?;
+    content_store::ensure_room_for_declared(&ctx.paths.content_root(), space[0].bytes)?;
+    Ok(plan)
+}
+
+fn plan_inner(
+    ctx: &Ctx,
+    inventory: &GameInventory,
+    request: &VortexRequest,
+) -> Result<VortexPlan, ImportError> {
     let state = read_state(&request.store)?;
-    let (game, definition, install, would_add) =
-        match_for_request(ctx, inventory, &state, request)?;
+    plan_state(ctx, inventory, request, &state)
+}
+
+fn plan_state(
+    ctx: &Ctx,
+    inventory: &GameInventory,
+    request: &VortexRequest,
+    state: &VortexState,
+) -> Result<VortexPlan, ImportError> {
+    let (game, definition, install, would_add) = match_for_request(ctx, inventory, state, request)?;
 
     let profile = game
         .profiles
@@ -1373,19 +1454,21 @@ pub fn plan(
         ));
     }
 
-    let folded_sets: HashMap<String, BTreeSet<String>> = mods
-        .iter()
-        .map(|m| (m.mod_id.clone(), m.file_set.clone()))
-        .collect();
-    let (manifest_winners, owners, unmatched) =
-        match_manifest(&folder_ids_of(game), &manifest_search.entries, &folded_sets);
+    let mounted = mounted_files(&definition, &mods);
+    let ManifestMatches {
+        winners: manifest_winners,
+        mut owners,
+        unverified,
+    } = match_manifest(&folder_ids_of(game), &manifest_search.entries, &mounted);
     manifest.matched = manifest_winners.len();
-    if unmatched > 0 {
-        warnings.push(format!(
-            "{unmatched} file(s) in the deployment manifest are not in any imported mod (base-game files or a mod type this import does not read); they are not part of the order"
-        ));
+    let enabled_ids: BTreeSet<&str> = mods
+        .iter()
+        .filter(|item| item.enabled)
+        .map(|item| item.mod_id.as_str())
+        .collect();
+    for candidates in owners.values_mut() {
+        candidates.retain(|id| enabled_ids.contains(id.as_str()));
     }
-
     let (order, rule_rank, mut cycle) = order_mods(&mods, &manifest_winners, &owners);
     if !cycle.is_empty() {
         cycle.sort();
@@ -1395,7 +1478,21 @@ pub fn plan(
             cycle.join(", ")
         ));
     }
-    let disagreements = disagreements(&mods, &manifest_winners, &owners, &rule_rank, &folded_sets);
+    let disagreements = disagreements(&mods, &manifest_winners, &owners, &rule_rank);
+    let mut fidelity = fidelity_warnings(&mods, &order, &manifest_winners, &owners);
+    fidelity.extend(unverified);
+    if manifest.found
+        && definition
+            .content_rules
+            .iter()
+            .any(|rule| rule.when.is_some())
+    {
+        fidelity.push(format!(
+            "Agora could not verify placement that depends on {}'s live instance conditions in this preview",
+            definition.name
+        ));
+    }
+    warnings.extend(fidelity.iter().cloned());
 
     let mount = data_mount(&definition);
     let base_data = if mount.is_empty() {
@@ -1405,7 +1502,7 @@ pub fn plan(
     };
     let plugins = plan_plugins(
         &definition,
-        &state,
+        state,
         game,
         profile,
         &mods,
@@ -1421,12 +1518,14 @@ pub fn plan(
         profile.local_settings,
         &mut warnings,
     );
+    let mut save_files = Vec::new();
     let saves = plan_saves(
         &definition,
         &install.discovered.store,
         &profile.id,
         profile.local_saves,
         &mut warnings,
+        &mut save_files,
     )?;
     if profile.local_saves && !saves.local && !saves.note.is_empty() {
         warnings.push(saves.note.clone());
@@ -1440,8 +1539,6 @@ pub fn plan(
 
     let files = mods.iter().map(|m| m.files).sum();
     let bytes: u64 = mods.iter().map(|m| m.bytes).sum();
-    // Validate the space before anything (including adding a game folder) is written.
-    content_store::ensure_room_for_declared(&ctx.paths.content_root(), bytes)?;
     Ok(VortexPlan {
         store: state.source.clone(),
         vortex_game: game.id.clone(),
@@ -1467,12 +1564,14 @@ pub fn plan(
         manifest,
         order,
         disagreements,
+        fidelity,
         plugins,
         userlist,
         local_settings: profile.local_settings,
         inis,
         local_saves: profile.local_saves,
         saves,
+        save_files,
         problems,
         warnings,
     })
@@ -1651,7 +1750,6 @@ fn plan_mods(
             plugin_files: sized.plugin_files,
             rules: entry.rules.clone(),
             paths,
-            file_set: sized.file_set,
         });
     }
     out
@@ -1662,7 +1760,6 @@ fn plan_mods(
 struct SizedModFiles {
     bytes: u64,
     plugin_files: Vec<String>,
-    file_set: BTreeSet<String>,
 }
 
 /// A mod folder's total size, its plugin files at the top level, and every file it holds. A file
@@ -1670,11 +1767,16 @@ struct SizedModFiles {
 fn size_mod_files(paths: &[(RelPath, PathBuf)]) -> Result<SizedModFiles, (String, std::io::Error)> {
     let mut bytes = 0u64;
     let mut plugin_files = Vec::new();
-    let mut file_set = BTreeSet::new();
     for (rel, abs) in paths {
-        let meta = std::fs::metadata(abs).map_err(|error| (rel.as_str().to_string(), error))?;
+        let meta =
+            std::fs::symlink_metadata(abs).map_err(|error| (rel.as_str().to_string(), error))?;
+        if content_store::is_reparse_point_or_symlink(&meta) || !meta.is_file() {
+            return Err((
+                rel.as_str().to_string(),
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "not a plain file"),
+            ));
+        }
         bytes += meta.len();
-        file_set.insert(fold_path_case(rel.as_str()));
         let text = rel.as_str();
         if !text.contains('/') && mo2::is_plugin_file(text) {
             plugin_files.push(text.to_string());
@@ -1683,7 +1785,6 @@ fn size_mod_files(paths: &[(RelPath, PathBuf)]) -> Result<SizedModFiles, (String
     Ok(SizedModFiles {
         bytes,
         plugin_files,
-        file_set,
     })
 }
 
@@ -1706,6 +1807,7 @@ fn provenance(entry: &VortexMod) -> VortexProvenance {
 
 #[derive(Debug, Default)]
 struct ManifestRead {
+    found: bool,
     entries: Vec<ManifestEntry>,
     files: usize,
     damaged: Option<String>,
@@ -1713,96 +1815,114 @@ struct ManifestRead {
 
 #[derive(Debug, Clone)]
 struct ManifestEntry {
-    rel_path: String,
+    /// Path relative to the game root, including the manifest's deploy root and file target.
+    path: String,
     source: Option<String>,
-    /// The mod's subfolder under the deploy target, when mods are not merged
-    /// (`IDeploymentMethod.ts:59-64`).
-    target: Option<String>,
-}
-
-impl ManifestEntry {
-    /// The paths this entry could name inside a mod: the deployed path (`target/relPath`) and the
-    /// plain `relPath` (some mods already carry the target folder).
-    fn candidates(&self) -> Vec<String> {
-        let rel = self.rel_path.trim_matches('/').to_string();
-        let with_target = join_target(self.target.as_deref(), &rel);
-        let mut out = vec![fold_path_case(&with_target)];
-        let plain = fold_path_case(&rel);
-        if !out.contains(&plain) {
-            out.push(plain);
-        }
-        out
-    }
 }
 
 /// Read `vortex.deployment.json`. A missing file is not an error (`found: false`); one that cannot
 /// be read is recorded as damaged, so the order is never presented as checked.
-fn read_manifest(path: &Path) -> ManifestRead {
+fn read_manifest(path: &Path, deploy_root: &Path) -> ManifestRead {
+    let damaged = |reason| ManifestRead {
+        found: true,
+        damaged: Some(reason),
+        ..ManifestRead::default()
+    };
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return ManifestRead::default()
         }
-        Err(error) => {
-            return ManifestRead {
-                damaged: Some(error.to_string()),
-                ..ManifestRead::default()
-            }
-        }
+        Err(error) => return damaged(error.to_string()),
     };
     let value: Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
-        Err(error) => {
-            return ManifestRead {
-                damaged: Some(format!("it is not JSON: {error}")),
-                ..ManifestRead::default()
-            }
-        }
+        Err(error) => return damaged(format!("it is not JSON: {error}")),
     };
     let Some(files) = value.get("files").and_then(Value::as_array) else {
-        return ManifestRead {
-            damaged: Some("it has no 'files' list".into()),
-            ..ManifestRead::default()
-        };
+        return damaged("it has no 'files' list".into());
     };
+    if files.is_empty() {
+        return damaged("its 'files' list is empty, so there are no winners to check".into());
+    }
+    let root = deploy_root.to_string_lossy();
     let mut entries = Vec::new();
     for file in files {
-        let Some(file) = file.as_object() else {
-            continue;
+        let Some(rel) = file
+            .get("relPath")
+            .and_then(Value::as_str)
+            .filter(|rel| !rel.is_empty())
+        else {
+            return damaged("an entry has no file path".into());
         };
-        let Some(rel_path) = file.get("relPath").and_then(Value::as_str) else {
-            continue;
+        let target = file.get("target").and_then(Value::as_str);
+        let deployed = join_target(target, &rel.replace('\\', "/"));
+        let path = match RelPath::new(join_target(Some(&root), &deployed)) {
+            Ok(path) => path.as_str().to_string(),
+            Err(error) => {
+                return damaged(format!("'{deployed}' is not a deployment path: {error}"))
+            }
         };
         entries.push(ManifestEntry {
-            rel_path: rel_path.replace('\\', "/"),
+            path,
             source: file
                 .get("source")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            target: file
-                .get("target")
                 .and_then(Value::as_str)
                 .map(str::to_string),
         });
     }
     ManifestRead {
+        found: true,
         files: entries.len(),
         entries,
         damaged: None,
     }
 }
 
-/// A mod's installation folder and id, folded, both naming the mod. The manifest's `source` may
-/// spell either one.
-fn folder_ids(mods: &[PlannedMod]) -> HashMap<String, String> {
-    let mut by_folder = HashMap::new();
-    for entry in mods {
-        by_folder.insert(fold_path_case(&entry.folder), entry.mod_id.clone());
-        by_folder.insert(fold_path_case(&entry.mod_id), entry.mod_id.clone());
-    }
-    by_folder
+/// Predict installed paths using the same declarative placement as import execution.
+fn mounted_files(
+    definition: &GameDefinition,
+    mods: &[PlannedMod],
+) -> HashMap<String, BTreeSet<String>> {
+    let layout = definition.content_layout.clone().unwrap_or_default();
+    mods.iter()
+        .filter_map(|item| {
+            let files: Vec<_> = item.paths.iter().map(|(path, _)| path.clone()).collect();
+            let decision = game_deploy::decide_placement_for_files(
+                &item.name,
+                &files,
+                &layout,
+                &definition.content_rules,
+                None,
+                None,
+            );
+            let (mount, source) = super::imported_mod_destination(definition, decision).ok()?;
+            let prefix = if source.is_empty() {
+                source
+            } else {
+                format!("{source}/")
+            };
+            let prefix = fold_path_case(&prefix);
+            let mounted = files
+                .iter()
+                .filter_map(|path| {
+                    let path = fold_path_case(path.as_str());
+                    path.strip_prefix(&prefix)
+                        .map(|rel| fold_path_case(&join_target(Some(&mount), rel)))
+                })
+                .collect();
+            Some((item.mod_id.clone(), mounted))
+        })
+        .collect()
 }
 
+struct ManifestWinner {
+    path: String,
+    mod_id: String,
+}
+
+/// A mod's installation folder and id, folded, both naming the mod. The manifest's `source` may
+/// spell either one.
 fn folder_ids_of(game: &VortexGame) -> HashMap<String, String> {
     let mut by_folder = HashMap::new();
     for entry in &game.mods {
@@ -1814,15 +1934,17 @@ fn folder_ids_of(game: &VortexGame) -> HashMap<String, String> {
 
 /// What the manifest says supplied each file, and which imported mods hold that file. Keys are
 /// folded. A manifest entry whose `source` names no imported mod is not counted.
+struct ManifestMatches {
+    winners: BTreeMap<String, ManifestWinner>,
+    owners: BTreeMap<String, Vec<String>>,
+    unverified: Vec<String>,
+}
+
 fn match_manifest(
     by_folder: &HashMap<String, String>,
     entries: &[ManifestEntry],
     mod_sets: &HashMap<String, BTreeSet<String>>,
-) -> (
-    BTreeMap<String, String>,
-    BTreeMap<String, Vec<String>>,
-    usize,
-) {
+) -> ManifestMatches {
     let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (mod_id, files) in mod_sets {
         for file in files {
@@ -1830,28 +1952,51 @@ fn match_manifest(
         }
     }
     let mut winners = BTreeMap::new();
-    let mut unmatched = 0usize;
+    let mut unverified = Vec::new();
+    let mut ambiguous = BTreeSet::new();
     for entry in entries {
-        let Some(source) = entry.source.as_deref() else {
-            unmatched += 1;
+        let path = fold_path_case(&entry.path);
+        let winner = entry
+            .source
+            .as_ref()
+            .and_then(|source| by_folder.get(&fold_path_case(source)));
+        let Some(winner) =
+            winner.filter(|id| mod_sets.get(*id).is_some_and(|paths| paths.contains(&path)))
+        else {
+            unverified.push(format!(
+                "Agora could not verify {}: the manifest supplier {} did not match an imported file at that path",
+                entry.path, entry.source.as_deref().unwrap_or("(unknown)")
+            ));
             continue;
         };
-        let Some(winner) = by_folder.get(&fold_path_case(source)) else {
-            unmatched += 1;
+        if ambiguous.contains(&path) {
             continue;
-        };
-        let Some(set) = mod_sets.get(winner) else {
-            unmatched += 1;
+        }
+        if winners
+            .get(&path)
+            .is_some_and(|previous: &ManifestWinner| previous.mod_id != *winner)
+        {
+            unverified.push(format!(
+                "Agora could not verify {}: the deployment manifests name more than one supplier for the same path",
+                entry.path
+            ));
+            winners.remove(&path);
+            ambiguous.insert(path);
             continue;
-        };
-        let Some(rel) = entry.candidates().into_iter().find(|rel| set.contains(rel)) else {
-            unmatched += 1;
-            continue;
-        };
-        // A file has one supplier, and the manifest is the deployed state.
-        winners.insert(rel, winner.clone());
+        }
+        winners.insert(
+            path,
+            ManifestWinner {
+                path: entry.path.clone(),
+                mod_id: winner.clone(),
+            },
+        );
     }
-    (winners, owners, unmatched)
+    ManifestMatches {
+        winners,
+        owners,
+        unverified,
+    }
 }
 
 /// Order the mods, highest layer first. Manifest constraints decide; Vortex's `before` / `after`
@@ -1859,7 +2004,7 @@ fn match_manifest(
 /// rules-only order (for the disagreement report), and any mods a manifest cycle left unordered.
 fn order_mods(
     mods: &[PlannedMod],
-    manifest_winners: &BTreeMap<String, String>,
+    manifest_winners: &BTreeMap<String, ManifestWinner>,
     owners: &BTreeMap<String, Vec<String>>,
 ) -> (Vec<String>, HashMap<String, usize>, Vec<String>) {
     let ids: Vec<String> = mods.iter().map(|m| m.mod_id.clone()).collect();
@@ -1878,8 +2023,9 @@ fn order_mods(
         .collect();
 
     let mut manifest_edges: HashMap<String, BTreeSet<String>> = HashMap::new();
-    for (rel, winner) in manifest_winners {
-        let Some(list) = owners.get(rel) else {
+    for (rel, file) in manifest_winners {
+        let winner = &file.mod_id;
+        let Some(list) = owners.get(rel).filter(|list| list.contains(winner)) else {
             continue;
         };
         for other in list {
@@ -1892,7 +2038,7 @@ fn order_mods(
         }
     }
     let mut order = topo(&ids, &manifest_edges, &rule_rank);
-    let mut cycle: Vec<String> = ids
+    let cycle: Vec<String> = ids
         .iter()
         .filter(|id| !order.iter().any(|placed| placed == *id))
         .cloned()
@@ -1902,11 +2048,6 @@ fn order_mods(
         let mut rest: Vec<String> = cycle.clone();
         rest.sort_by_key(|id| rule_rank.get(id).copied().unwrap_or(usize::MAX));
         order.extend(rest);
-        cycle = ids
-            .iter()
-            .filter(|id| !order.iter().any(|placed| placed == *id))
-            .cloned()
-            .collect();
     }
     (order, rule_rank, cycle)
 }
@@ -1996,17 +2137,17 @@ fn topo(
 
 fn disagreements(
     mods: &[PlannedMod],
-    manifest_winners: &BTreeMap<String, String>,
+    manifest_winners: &BTreeMap<String, ManifestWinner>,
     owners: &BTreeMap<String, Vec<String>>,
     rule_rank: &HashMap<String, usize>,
-    mod_sets: &HashMap<String, BTreeSet<String>>,
 ) -> Vec<OrderDisagreement> {
     let names: HashMap<&str, &str> = mods
         .iter()
         .map(|m| (m.mod_id.as_str(), m.name.as_str()))
         .collect();
     let mut out = Vec::new();
-    for (rel, winner) in manifest_winners {
+    for (rel, file) in manifest_winners {
+        let winner = &file.mod_id;
         let Some(list) = owners.get(rel) else {
             continue;
         };
@@ -2024,19 +2165,8 @@ fn disagreements(
         if rules_winner == winner {
             continue;
         }
-        // Show the file as the mods spell it (one of them holds it).
-        let display = mods
-            .iter()
-            .find(|m| mod_sets.get(&m.mod_id).is_some_and(|set| set.contains(rel)))
-            .and_then(|m| {
-                m.paths
-                    .iter()
-                    .find(|(path, _)| fold_path_case(path.as_str()) == *rel)
-                    .map(|(path, _)| path.as_str().to_string())
-            })
-            .unwrap_or_else(|| rel.clone());
         out.push(OrderDisagreement {
-            file: display,
+            file: file.path.clone(),
             manifest_supplied: names
                 .get(winner.as_str())
                 .copied()
@@ -2052,6 +2182,29 @@ fn disagreements(
     out
 }
 
+fn fidelity_warnings(
+    mods: &[PlannedMod],
+    order: &[String],
+    winners: &BTreeMap<String, ManifestWinner>,
+    owners: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let by_id: HashMap<_, _> = mods.iter().map(|item| (&item.mod_id, item)).collect();
+    let rank: HashMap<_, _> = order.iter().enumerate().map(|(i, id)| (id, i)).collect();
+    winners.iter().filter_map(|(path, file)| {
+        let expected = &file.mod_id;
+        let actual = owners.get(path)?.iter().min_by_key(|id| rank.get(id))?;
+        if expected == actual {
+            return None;
+        }
+        let expected = by_id.get(expected)?;
+        let actual = by_id.get(actual)?;
+        Some(format!(
+            "Agora cannot reproduce {}: the deployment manifest names {}, but the imported layer order gives the file to {}",
+            file.path, expected.name, actual.name
+        ))
+    }).collect()
+}
+
 /// Parse a profile's `plugins.txt`. Vortex writes two shapes
 /// (`..._util_PluginPersistor.ts`):
 /// - the original shape lists **only active plugins**, with no prefix:
@@ -2059,25 +2212,20 @@ fn disagreements(
 ///   `writeFiles` writes that list (`:600-607`);
 /// - the Fallout 4 shape marks an active plugin with `*` and leaves a ghost bare (`:473-483`).
 ///
-/// The original reader treats every entry as active (`initFromKeyList`: `keyEnabled = enable &&
-/// (this.mPluginFormat === "original" || key[0] === "*")`, `:680`). A file with no `*` line is
-/// therefore the original shape, where every line is active; a file with any `*` line is read the
-/// MO2 way, where a bare line is inactive. The order always comes from `loadorder.txt`
+/// The game's declared active prefix distinguishes these shapes even when nothing is active.
+/// The order comes from `loadorder.txt`
 /// (`writeFiles` at `:589-599`, read first for the original format at `:751-762`).
-fn parse_vortex_plugins(text: &str) -> Vec<mo2::PluginLine> {
-    let lines: Vec<&str> = text
-        .lines()
+fn parse_vortex_plugins(text: &str, active_prefix: &str) -> Vec<mo2::PluginLine> {
+    text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .collect();
-    if lines.iter().any(|line| line.starts_with('*')) {
-        return mo2::parse_plugins(text);
-    }
-    lines
-        .into_iter()
-        .map(|line| mo2::PluginLine {
-            name: line.to_string(),
-            active: true,
+        .filter_map(|line| {
+            let marked = line.strip_prefix(active_prefix);
+            let name = marked.unwrap_or(line).trim();
+            (!name.is_empty()).then(|| mo2::PluginLine {
+                name: name.to_string(),
+                active: marked.is_some(),
+            })
         })
         .collect()
 }
@@ -2101,10 +2249,22 @@ fn plan_plugins(
             notes: vec!["the game keeps no plugin list".into()],
         };
     };
+    let agora_game_api::LoadOrderFormat::Lines { active_prefix, .. } = &rule.format else {
+        warnings
+            .push("could not tell how to read plugins.txt for this game's scripted list".into());
+        return PluginPlan {
+            kept: false,
+            lines: Vec::new(),
+            active: 0,
+            locked: Vec::new(),
+            implicit_skipped: Vec::new(),
+            notes: Vec::new(),
+        };
+    };
     let (plugins_path, loadorder_path) = plugin_files(&state.source, &game.id, &profile.id);
     let mut notes = Vec::new();
-    let loadorder = match std::fs::read(&loadorder_path) {
-        Ok(bytes) => mo2::parse_loadorder(&String::from_utf8_lossy(&bytes)),
+    let loadorder = match std::fs::read_to_string(&loadorder_path) {
+        Ok(text) => mo2::parse_loadorder(text.trim_start_matches('\u{feff}')),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             notes.push(format!(
                 "the profile has no loadorder.txt (looked in {}); the order comes from plugins.txt",
@@ -2120,23 +2280,41 @@ fn plan_plugins(
             Vec::new()
         }
     };
-    let listed = match std::fs::read(&plugins_path) {
-        Ok(bytes) => parse_vortex_plugins(&String::from_utf8_lossy(&bytes)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let text = match std::fs::read_to_string(&plugins_path) {
+        Ok(text) if !text.trim().is_empty() => Some(text),
+        Ok(_) => {
             warnings.push(format!(
-                "the profile has no plugins.txt (looked in {}); no plugin is active",
+                "the profile's plugins.txt is empty ({}); Agora could not tell which plugins were active",
                 plugins_path.display()
             ));
-            Vec::new()
+            None
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            warnings.push(format!(
+                "the profile has no plugins.txt (looked in {}); Agora could not tell which plugins were active",
+                plugins_path.display()
+            ));
+            None
         }
         Err(error) => {
             warnings.push(format!(
                 "the profile's plugins.txt could not be read ({}): {error}",
                 plugins_path.display()
             ));
-            Vec::new()
+            None
         }
     };
+    let Some(text) = text else {
+        return PluginPlan {
+            kept: false,
+            lines: Vec::new(),
+            active: 0,
+            locked: Vec::new(),
+            implicit_skipped: Vec::new(),
+            notes,
+        };
+    };
+    let listed = parse_vortex_plugins(text.trim_start_matches('\u{feff}'), active_prefix);
     let active_names: BTreeSet<String> = listed
         .iter()
         .filter(|p| p.active)
@@ -2498,6 +2676,7 @@ pub struct VortexRunReport {
     pub saves_copied: usize,
     pub saves_skipped_existing: usize,
     pub saves_folder: Option<PathBuf>,
+    pub external_files_written: Vec<PathBuf>,
     pub next_steps: Vec<String>,
 }
 
@@ -2510,12 +2689,34 @@ pub fn run(
     options: RunOptions,
     progress: &dyn Fn(ImportProgress),
 ) -> Result<VortexRunReport, ImportError> {
-    // Plan and validate before writing anything, including a game folder. Only then is a folder
-    // with --add-folder added, and the plan is made again against the real install.
-    let mut plan = plan(ctx, inventory, request)?;
+    let plan = plan(ctx, inventory, request)?;
+    run_planned(
+        ctx,
+        inventory,
+        request,
+        plan,
+        options,
+        progress,
+        &mut HashMap::new(),
+    )
+    .map_err(|error| with_external_files(error.error, &error.external_files_written))
+}
+
+fn run_planned(
+    ctx: &Ctx,
+    inventory: &GameInventory,
+    request: &VortexRequest,
+    mut plan: VortexPlan,
+    options: RunOptions,
+    progress: &dyn Fn(ImportProgress),
+    mod_to_item: &mut HashMap<String, String>,
+) -> Result<VortexRunReport, Box<super::RunInnerError>> {
+    // The speculative install used by the preview gets its real identity after --add-folder.
     let inventory = if plan.would_add_folder {
+        let instance_name = plan.instance_name;
         let added = add_folder_for_request(ctx, inventory, request)?;
-        plan = self::plan(ctx, &added, request)?;
+        plan = plan_inner(ctx, &added, request)?;
+        plan.instance_name = instance_name;
         added
     } else {
         inventory.clone()
@@ -2551,12 +2752,12 @@ pub fn run(
         saves_copied: 0,
         saves_skipped_existing: 0,
         saves_folder: None,
+        external_files_written: Vec::new(),
         next_steps: Vec::new(),
     };
 
     let mods_total = plan.mods.len();
     let mods_bytes: u64 = plan.mods.iter().map(|m| m.bytes).sum();
-    let mut stored: Vec<(usize, String)> = Vec::new();
     let mut bytes_done = 0u64;
     for (index, planned) in plan.mods.iter().enumerate() {
         progress(ImportProgress {
@@ -2567,22 +2768,10 @@ pub fn run(
             bytes_done,
             bytes_total: mods_bytes,
         });
-        let source = ContentSource::VortexImport {
-            store: plan.store.to_string_lossy().to_string(),
-            game: plan.vortex_game.clone(),
-            mod_id: planned.mod_id.clone(),
-            installation_folder: planned.folder.clone(),
-            provenance: planned.provenance.clone(),
-            added_at_unix_ms: content_store::now_unix_ms(),
-        };
-        let store_error = |error: crate::content_store::ContentError| ImportError::Store {
-            mod_folder: planned.name.clone(),
-            reason: error.to_string(),
-        };
-        let outcome =
-            content_store::add_collected(ctx, &planned.name, planned.paths.clone(), source)
-                .map_err(store_error)?;
-        stored.push((index, outcome.item().item_id.clone()));
+        if !mod_to_item.contains_key(&planned.mod_id) {
+            let item_id = store_mod(ctx, &plan, planned)?;
+            mod_to_item.insert(planned.mod_id.clone(), item_id);
+        }
         bytes_done += planned.bytes;
         report.stored_mods += 1;
         progress(ImportProgress {
@@ -2644,39 +2833,33 @@ pub fn run(
         game_deploy::write_instance_manifest_atomic(ctx, &instance_id, &manifest)?;
 
         progress(done_progress(ImportPhase::Layers));
-        let mount = data_mount(&def);
-        let mount_arg = if mount.is_empty() {
-            None
-        } else {
-            Some(mount.as_str())
-        };
-        // `order` is highest first, so the last one is the lowest layer.
-        for mod_id in plan.order.iter().rev() {
-            let Some(planned) = plan.mods.iter().find(|m| &m.mod_id == mod_id) else {
-                continue;
-            };
-            let Some((_, item_id)) = stored
-                .iter()
-                .find(|(index, _)| plan.mods.get(*index).is_some_and(|m| &m.mod_id == mod_id))
-            else {
-                continue;
-            };
-            let existing = game_instance::get_manifest(ctx, &instance_id)?
-                .layers
-                .layers()
-                .iter()
-                .any(|l| matches!(&l.source, agora_game_api::LayerSource::Content { content } if content == item_id));
-            if existing {
+        let mods: HashMap<_, _> = plan.mods.iter().map(|item| (&item.mod_id, item)).collect();
+        let ordered: Vec<_> = plan
+            .order
+            .iter()
+            .map(|id| (mods[id], &mod_to_item[id]))
+            .collect();
+        let mut representative = HashMap::new();
+        for &(planned, item_id) in &ordered {
+            representative
+                .entry(item_id)
+                .and_modify(|current: &mut &PlannedMod| {
+                    if planned.enabled && !current.enabled {
+                        *current = planned;
+                    }
+                })
+                .or_insert(planned);
+        }
+        // Add lowest first. With identical items, keep the highest enabled alias's priority.
+        for (planned, item_id) in ordered.into_iter().rev() {
+            if representative[item_id].mod_id != planned.mod_id {
                 report.duplicates.push(format!(
                     "{} (same bytes as a layer already here)",
                     planned.name
                 ));
-                if planned.enabled {
-                    game_deploy::set_content_enabled(ctx, &instance_id, item_id, true)?;
-                }
                 continue;
             }
-            game_deploy::add_content(ctx, &instance_id, item_id, mount_arg, None)?;
+            super::add_imported_mod(ctx, &instance_id, &def, item_id)?;
             report.content_layers += 1;
             if !planned.enabled {
                 game_deploy::set_content_enabled(ctx, &instance_id, item_id, false)?;
@@ -2762,12 +2945,13 @@ pub fn run(
                 let folder = crate::game_saves::own_folder(rule, &instance_id)?;
                 report.saves_folder = Some(folder.clone());
                 if request.copy_saves {
-                    if let Some(from) = &plan.saves.from {
-                        let (copied, skipped, notes) = copy_save_folder(from, &folder)?;
-                        report.saves_copied = copied;
-                        report.saves_skipped_existing = skipped;
-                        report.next_steps.extend(notes);
-                    }
+                    let (copied, skipped) = copy_save_files(
+                        &plan.save_files,
+                        &folder,
+                        &mut report.external_files_written,
+                    )?;
+                    report.saves_copied = copied;
+                    report.saves_skipped_existing = skipped;
                 } else if plan.saves.files > 0 {
                     report.next_steps.push(format!(
                         "Agora did not copy {} save file(s) (they are under Documents, which needs --copy-saves). To copy them by hand, copy the files in {} into {}",
@@ -2785,7 +2969,10 @@ pub fn run(
         Ok(())
     })();
     if let Err(error) = populated {
-        return Err(abandon_half_made_instance(ctx, &instance_id, error));
+        return Err(Box::new(super::RunInnerError {
+            error: abandon_half_made_instance(ctx, &instance_id, error),
+            external_files_written: report.external_files_written,
+        }));
     }
 
     report.next_steps.extend(
@@ -2797,9 +2984,10 @@ pub fn run(
         "Vortex's downloads were not copied; mods are stored as they are in the staging folder"
             .into(),
     );
+    report.next_steps.extend(plan.fidelity.iter().cloned());
     if !plan.disagreements.is_empty() {
         report.next_steps.push(format!(
-            "A different mod supplies {} file(s) than Vortex's rules alone would pick; the deployment manifest was followed, and the plan lists each one",
+            "The plan lists {} file(s) for which the deployment manifest and the rules alone pick different suppliers",
             plan.disagreements.len()
         ));
     }
@@ -2827,6 +3015,10 @@ pub fn profile_sets(
     game: &str,
 ) -> Result<ProfileSets, ImportError> {
     let scan = scan(ctx, inventory, store)?;
+    profile_sets_from_scan(&scan, game)
+}
+
+fn profile_sets_from_scan(scan: &VortexScan, game: &str) -> Result<ProfileSets, ImportError> {
     let found = scan
         .games
         .iter()
@@ -2862,14 +3054,16 @@ pub struct MultiProfilePlan {
     pub game_name: String,
     /// One plan per profile, in the order asked for.
     pub plans: Vec<VortexPlan>,
-    /// The bytes the choice brings in: the union for a merge, the sum for separate instances.
+    /// Bytes copied from the setup. Shared staging mods are copied once per batch.
     pub bytes: u64,
     /// The free bytes on the content store's drive, when they can be read.
     pub free_bytes: Option<u64>,
-    /// False only when the bytes cannot fit.
+    /// Whether the planned copies fit in the available space.
     pub fits: bool,
     pub suggestion: super::profiles::Suggestion,
     pub warnings: Vec<String>,
+    #[serde(skip)]
+    copy_space: Vec<CopySpace>,
 }
 
 /// Plan several profiles at once, and say whether the bytes fit.
@@ -2883,7 +3077,9 @@ pub fn plan_profiles(
     if profiles.is_empty() {
         return Err(ImportError::NoProfiles);
     }
-    let sets = profile_sets(ctx, inventory, &base.store, base.game.as_str())?;
+    let state = read_state(&base.store)?;
+    let scan = scan_state(ctx, inventory, &state);
+    let sets = profile_sets_from_scan(&scan, base.game.as_str())?;
     let mut plans = Vec::with_capacity(profiles.len());
     let mut names = Vec::with_capacity(profiles.len());
     for profile in profiles {
@@ -2891,32 +3087,35 @@ pub fn plan_profiles(
             profile: profile.clone(),
             ..base.clone()
         };
-        plans.push(plan(ctx, inventory, &request)?);
+        let mut planned = plan_state(ctx, inventory, &request, &state)?;
+        if grouping == super::profiles::Grouping::Separate {
+            planned.instance_name = base
+                .name
+                .as_ref()
+                .map_or_else(|| profile.clone(), |name| format!("{name} ({profile})"));
+        }
+        plans.push(planned);
         names.push(profile.clone());
     }
 
-    let mut union: BTreeMap<String, u64> = BTreeMap::new();
-    let mut separate_bytes = 0u64;
-    for plan in &plans {
-        for item in plan.mods.iter().filter(|m| m.enabled) {
-            union.insert(item.mod_id.clone(), item.bytes);
-            separate_bytes = separate_bytes.saturating_add(item.bytes);
-        }
-    }
-    let bytes = match grouping {
-        super::profiles::Grouping::Merged => union.values().sum(),
-        super::profiles::Grouping::Separate => separate_bytes,
-    };
-    let free_bytes = crate::game_tool_swap::available_bytes(&ctx.paths.content_root());
-    let fits = free_bytes.is_none_or(|free| bytes <= free);
+    let copy_space = copy_space(ctx, &plans, base.copy_saves, grouping)?;
+    let bytes = copy_space
+        .iter()
+        .map(|volume| volume.bytes)
+        .fold(0, u64::saturating_add);
+    let free_bytes = copy_space[0].free;
+    let fits = copy_space.iter().all(CopySpace::fits);
     let suggestion = super::profiles::suggest_grouping(&sets.profiles);
-    let mut warnings = Vec::new();
-    if !fits {
-        warnings.push(format!(
-            "the choice needs {} but only {} is free on the content store's drive",
-            crate::game_tool_swap::human_bytes(bytes),
-            crate::game_tool_swap::human_bytes(free_bytes.unwrap_or(0))
-        ));
+    let mut warnings: Vec<_> = plans
+        .iter()
+        .flat_map(|plan| {
+            plan.fidelity
+                .iter()
+                .map(|note| format!("{}: {note}", plan.profile))
+        })
+        .collect();
+    for volume in copy_space.iter().filter(|volume| !volume.fits()) {
+        warnings.push(volume.problem());
     }
     if suggestion.groups.len() > 1 {
         warnings.push(suggestion.note.clone());
@@ -2932,7 +3131,138 @@ pub fn plan_profiles(
         fits,
         suggestion,
         warnings,
+        copy_space,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopySpace {
+    folder: PathBuf,
+    bytes: u64,
+    free: Option<u64>,
+}
+
+impl CopySpace {
+    fn fits(&self) -> bool {
+        self.free.is_some_and(|free| self.bytes <= free)
+    }
+
+    fn problem(&self) -> String {
+        match self.free {
+            Some(free) => format!(
+                "the import needs {} on {}, with {} free",
+                crate::game_tool_swap::human_bytes(self.bytes),
+                self.folder.display(),
+                crate::game_tool_swap::human_bytes(free),
+            ),
+            None => format!(
+                "Agora could not tell how much space was free on {}",
+                self.folder.display()
+            ),
+        }
+    }
+}
+
+fn require_copy_space(space: &[CopySpace]) -> Result<(), ImportError> {
+    for (index, volume) in space.iter().enumerate() {
+        if !volume.fits() {
+            if let (0, Some(free)) = (index, volume.free) {
+                return Err(ImportError::NotEnoughSpace {
+                    needed: volume.bytes,
+                    free,
+                });
+            }
+            return Err(ImportError::Other(volume.problem()));
+        }
+    }
+    Ok(())
+}
+
+fn copy_space(
+    ctx: &Ctx,
+    plans: &[VortexPlan],
+    copy_saves: bool,
+    grouping: super::profiles::Grouping,
+) -> Result<Vec<CopySpace>, ImportError> {
+    let mut volumes = vec![CopySpace {
+        folder: ctx.paths.content_root(),
+        bytes: 0,
+        free: None,
+    }];
+    let mut mods = BTreeSet::new();
+    for (index, plan) in plans.iter().enumerate() {
+        for item in &plan.mods {
+            let copied =
+                grouping == super::profiles::Grouping::Separate || index == 0 || item.enabled;
+            if copied && mods.insert(item.mod_id.as_str()) {
+                volumes[0].bytes = volumes[0].bytes.saturating_add(item.bytes);
+            }
+        }
+        for ini in &plan.inis {
+            let path = &ini.from;
+            let meta =
+                std::fs::symlink_metadata(path).map_err(|error| ImportError::Unreadable {
+                    path: path.clone(),
+                    reason: error.to_string(),
+                })?;
+            if !meta.is_file() || content_store::is_reparse_point_or_symlink(&meta) {
+                return Err(ImportError::Unreadable {
+                    path: path.clone(),
+                    reason: "the INI is not a plain file".into(),
+                });
+            }
+            volumes[0].bytes = volumes[0].bytes.saturating_add(meta.len());
+        }
+        if copy_saves && plan.saves.local && plan.saves.bytes > 0 {
+            let rule = ctx
+                .games
+                .game(&plan.game)
+                .and_then(|definition| crate::game_saves::rule_for(definition, &plan.store_id))
+                .ok_or_else(|| {
+                    ImportError::Other(format!(
+                        "could not resolve a save destination for {}",
+                        plan.profile
+                    ))
+                })?;
+            // The instance id is allocated later. Only the destination volume is needed here.
+            let folder = crate::game_saves::own_folder(rule, "agora-import-preview")?;
+            if let Some(volume) = volumes
+                .iter_mut()
+                .find(|volume| volume.folder == folder || same_copy_volume(&volume.folder, &folder))
+            {
+                volume.bytes = volume.bytes.saturating_add(plan.saves.bytes);
+            } else {
+                volumes.push(CopySpace {
+                    folder,
+                    bytes: plan.saves.bytes,
+                    free: None,
+                });
+            }
+        }
+    }
+    for volume in &mut volumes {
+        volume.free = crate::game_tool_swap::available_bytes(&volume.folder).or_else(|| {
+            let existing = volume.folder.ancestors().find(|path| path.is_dir())?;
+            fs2::available_space(existing).ok()
+        });
+    }
+    Ok(volumes)
+}
+
+#[cfg(unix)]
+fn same_copy_volume(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let dev = |path: &Path| {
+        path.ancestors()
+            .find_map(|path| std::fs::metadata(path).ok())
+            .map(|meta| meta.dev())
+    };
+    dev(a).zip(dev(b)).is_some_and(|(a, b)| a == b)
+}
+
+#[cfg(not(unix))]
+fn same_copy_volume(a: &Path, b: &Path) -> bool {
+    crate::game_tool_swap::same_volume(a, b)
 }
 
 /// What one profile's saves did.
@@ -2955,15 +3285,10 @@ pub struct MultiProfileReport {
     pub loadouts: Vec<String>,
     /// What each profile's own saves did, in profile order.
     pub saves: Vec<ProfileSavesReport>,
+    pub profiles: Vec<super::Mo2ProfileOutcome>,
 }
 
-fn add_mod_to_merged(
-    ctx: &Ctx,
-    instance_id: &str,
-    definition: &GameDefinition,
-    plan: &VortexPlan,
-    item: &PlannedMod,
-) -> Result<String, ImportError> {
+fn store_mod(ctx: &Ctx, plan: &VortexPlan, item: &PlannedMod) -> Result<String, ImportError> {
     let source = ContentSource::VortexImport {
         store: plan.store.to_string_lossy().to_string(),
         game: plan.vortex_game.clone(),
@@ -2977,19 +3302,23 @@ fn add_mod_to_merged(
             mod_folder: item.name.clone(),
             reason: e.to_string(),
         })?;
-    let item_id = outcome.item().item_id.clone();
+    Ok(outcome.item().item_id.clone())
+}
+
+fn add_mod_to_merged(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    plan: &VortexPlan,
+    item: &PlannedMod,
+) -> Result<String, ImportError> {
+    let item_id = store_mod(ctx, plan, item)?;
     let manifest = game_instance::get_manifest(ctx, instance_id)?;
     let present = manifest.layers.layers().iter().any(|layer| {
         matches!(&layer.source, agora_game_api::LayerSource::Content { content } if content == &item_id)
     });
     if !present {
-        let mount = data_mount(definition);
-        let mount_arg = if mount.is_empty() {
-            None
-        } else {
-            Some(mount.as_str())
-        };
-        game_deploy::add_content(ctx, instance_id, &item_id, mount_arg, None).map_err(|e| {
+        super::add_imported_mod(ctx, instance_id, definition, &item_id).map_err(|e| {
             ImportError::Other(format!(
                 "'{}' could not be put on the merged instance: {e}",
                 item.name
@@ -2999,147 +3328,74 @@ fn add_mod_to_merged(
     Ok(item_id)
 }
 
-/// Copy the files directly inside `from` into `folder`, keeping a file already there. An entry
-/// or a size that cannot be read is returned as a note, never silently skipped.
-fn copy_save_folder(
-    from: &Path,
+/// Copy exactly the planned saves. Journal each newly created file even if writing it fails.
+fn copy_save_files(
+    files: &[PathBuf],
     folder: &Path,
-) -> Result<(usize, usize, Vec<String>), ImportError> {
-    std::fs::create_dir_all(folder).map_err(|e| {
-        ImportError::Other(format!(
-            "the instance's save folder {} could not be made: {e}",
-            folder.display()
-        ))
-    })?;
-    let mut copied = 0usize;
-    let mut skipped = 0usize;
-    let mut notes = Vec::new();
-    let entries = match std::fs::read_dir(from) {
-        Ok(entries) => entries,
-        // The planner already counts an absent folder as no saves.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0, notes)),
-        Err(error) => return Err(error.into()),
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                notes.push(format!(
-                    "an entry in {} could not be read, so it was not copied: {error}",
-                    from.display()
-                ));
-                continue;
+    written: &mut Vec<PathBuf>,
+) -> Result<(usize, usize), ImportError> {
+    if files.is_empty() {
+        return Ok((0, 0));
+    }
+    std::fs::create_dir_all(folder)?;
+    let mut copied = 0;
+    let mut skipped = 0;
+    for path in files {
+        let dest = folder.join(path.file_name().expect("a planned save has a filename"));
+        let mut copy = || -> std::io::Result<bool> {
+            if dest.symlink_metadata().is_ok() {
+                return Ok(false);
             }
-        };
-        let is_file = match entry.metadata() {
-            Ok(meta) => meta.is_file(),
-            Err(error) => {
-                notes.push(format!(
-                    "{} could not be read, so it was not copied: {error}",
-                    entry.path().display()
+            let meta = std::fs::symlink_metadata(path)?;
+            if !meta.is_file() || content_store::is_reparse_point_or_symlink(&meta) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "not a plain save file",
                 ));
-                continue;
             }
+            let mut source = std::fs::File::open(path)?;
+            let mut target = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&dest)
+            {
+                Ok(target) => target,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Ok(false)
+                }
+                Err(error) => return Err(error),
+            };
+            written.push(dest.clone());
+            std::io::copy(&mut source, &mut target)?;
+            Ok(true)
         };
-        if !is_file {
-            continue;
-        }
-        let dest = folder.join(entry.file_name());
-        if dest.exists() {
-            skipped += 1;
-            continue;
-        }
-        std::fs::copy(entry.path(), &dest).map_err(|e| {
+        if copy().map_err(|error| {
             ImportError::Other(format!(
-                "{} could not be copied to {}: {e}",
-                entry.path().display(),
+                "{} could not be copied to {}: {error}",
+                path.display(),
                 dest.display()
             ))
-        })?;
-        copied += 1;
+        })? {
+            copied += 1;
+        } else {
+            skipped += 1;
+        }
     }
-    Ok((copied, skipped, notes))
+    Ok((copied, skipped))
 }
 
-/// Every chosen profile's mods, in the order one import of all of them would put them: the
-/// deployment manifest decides, and Vortex's rules break ties.
-fn merged_mod_order(
-    definition: &GameDefinition,
-    plan: &MultiProfilePlan,
-) -> Result<Vec<String>, ImportError> {
-    // The first profile's mods are already on the instance, including the disabled ones an
-    // `--all-mods` run stored; every later profile adds only what it enables.
-    let mut union: BTreeMap<String, PlannedMod> = BTreeMap::new();
-    for (index, profile_plan) in plan.plans.iter().enumerate() {
-        for item in &profile_plan.mods {
-            if index > 0 && !item.enabled {
-                continue;
-            }
-            union
-                .entry(item.mod_id.clone())
-                .or_insert_with(|| item.clone());
-        }
+fn with_external_files(error: ImportError, files: &[PathBuf]) -> ImportError {
+    if files.is_empty() {
+        return error;
     }
-    let mods: Vec<PlannedMod> = union.into_values().collect();
-    let install = plan
-        .plans
-        .first()
-        .map(|plan| plan.install_location.clone())
-        .ok_or_else(|| ImportError::Other("no profile was planned".into()))?;
-    let search = find_manifests(Some(definition), &install);
-    let folded_sets: HashMap<String, BTreeSet<String>> = mods
+    let paths: Vec<_> = files
         .iter()
-        .map(|mod_| (mod_.mod_id.clone(), mod_.file_set.clone()))
+        .map(|path| path.display().to_string())
         .collect();
-    let (winners, owners, _) = match_manifest(&folder_ids(&mods), &search.entries, &folded_sets);
-    let (order, _, _) = order_mods(&mods, &winners, &owners);
-    Ok(order)
-}
-
-/// Put the instance's content layers in `order`'s order (highest first). The layers are added as
-/// the union is stored; this gives them Vortex's layer order rather than the order they arrived.
-fn order_merged_layers(
-    ctx: &Ctx,
-    instance_id: &str,
-    order: &[String],
-    mod_to_item: &HashMap<String, String>,
-) -> Result<(), ImportError> {
-    let mut item_rank: HashMap<String, usize> = HashMap::new();
-    for (index, mod_id) in order.iter().enumerate() {
-        if let Some(item) = mod_to_item.get(mod_id) {
-            item_rank
-                .entry(item.clone())
-                .and_modify(|rank| *rank = (*rank).min(index))
-                .or_insert(index);
-        }
-    }
-    let mut manifest = game_instance::get_manifest(ctx, instance_id)?;
-    let mut layers = manifest.layers.layers().to_vec();
-    let positions: Vec<usize> = layers
-        .iter()
-        .enumerate()
-        .filter(|(_, layer)| matches!(&layer.source, agora_game_api::LayerSource::Content { .. }))
-        .map(|(index, _)| index)
-        .collect();
-    let rank_of = |layer: &agora_game_api::Layer| match &layer.source {
-        agora_game_api::LayerSource::Content { content } => {
-            item_rank.get(content).copied().unwrap_or(usize::MAX)
-        }
-        _ => usize::MAX,
-    };
-    let mut content: Vec<agora_game_api::Layer> = positions
-        .iter()
-        .map(|index| layers[*index].clone())
-        .collect();
-    // An order index of 0 is the highest layer; the layer list runs lowest first.
-    content.sort_by_key(|layer| std::cmp::Reverse(rank_of(layer)));
-    for (position, layer) in positions.into_iter().zip(content) {
-        layers[position] = layer;
-    }
-    manifest.layers =
-        agora_game_api::LayerStack::new(layers).map_err(|e| ImportError::Other(e.to_string()))?;
-    game_deploy::write_instance_manifest_atomic(ctx, instance_id, &manifest)?;
-    Ok(())
+    ImportError::Other(format!(
+        "{error}. Save files written outside the instance: {}",
+        paths.join(", ")
+    ))
 }
 
 /// One profile's state on the merged instance. Its own INIs and plugin list are the profile's;
@@ -3164,6 +3420,23 @@ fn profile_state_for_merge(
             .get(item.item.as_str())
             .is_some_and(|mods| mods.iter().any(|mod_id| enabled.contains(mod_id.as_str())));
     }
+    let rank: HashMap<_, _> = plan
+        .order
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.as_str(), i))
+        .collect();
+    state.layer_order.sort_by_key(|layer| {
+        let rank_of_layer = layer_mod
+            .get(layer)
+            .into_iter()
+            .flatten()
+            .filter(|id| enabled.contains(id.as_str()))
+            .filter_map(|id| rank.get(id.as_str()).copied())
+            .min()
+            .unwrap_or(usize::MAX);
+        std::cmp::Reverse(rank_of_layer)
+    });
 
     // A profile without its own plugins.txt keeps the game's shared list. A loadout entry with no
     // contents means the instance has no copy, so the game reads the shared file.
@@ -3273,46 +3546,63 @@ pub fn run_profiles(
     progress: &dyn Fn(ImportProgress),
 ) -> Result<MultiProfileReport, ImportError> {
     let plan = plan_profiles(ctx, inventory, base, profiles, grouping)?;
-    if !plan.fits {
-        return Err(ImportError::NotEnoughSpace {
-            needed: plan.bytes,
-            free: plan.free_bytes.unwrap_or(0),
-        });
-    }
+    require_copy_space(&plan.copy_space)?;
+    let mut mod_to_item = HashMap::new();
     match grouping {
         super::profiles::Grouping::Separate => {
             let mut instances = Vec::new();
             let mut saves = Vec::new();
-            for profile in profiles {
+            let mut outcomes = Vec::with_capacity(profiles.len());
+            for (profile, planned) in profiles.iter().zip(&plan.plans) {
                 let request = VortexRequest {
                     profile: profile.clone(),
-                    name: Some(
-                        base.name
-                            .clone()
-                            .map(|name| format!("{name} ({profile})"))
-                            .unwrap_or_else(|| profile.clone()),
-                    ),
                     ..base.clone()
                 };
-                let report = run(ctx, inventory, &request, options, progress)?;
-                if let Some(instance) = report.instance_id.clone() {
-                    instances.push(instance);
+                match run_planned(
+                    ctx,
+                    inventory,
+                    &request,
+                    planned.clone(),
+                    options,
+                    progress,
+                    &mut mod_to_item,
+                ) {
+                    Ok(report) => {
+                        if let Some(instance) = &report.instance_id {
+                            instances.push(instance.clone());
+                        }
+                        saves.push(ProfileSavesReport {
+                            profile: report.plan.profile,
+                            copied: report.saves_copied,
+                            skipped_existing: report.saves_skipped_existing,
+                            note: report
+                                .saves_folder
+                                .is_none()
+                                .then(|| "the profile uses the game's shared saves".to_string()),
+                        });
+                        outcomes.push(super::Mo2ProfileOutcome {
+                            profile: profile.clone(),
+                            instance_id: report.instance_id,
+                            error: report
+                                .interrupted
+                                .then(|| "stopped before creating the instance".into()),
+                            external_files_written: report.external_files_written,
+                        });
+                    }
+                    Err(error) => outcomes.push(super::Mo2ProfileOutcome {
+                        profile: profile.clone(),
+                        instance_id: None,
+                        error: Some(error.error.to_string()),
+                        external_files_written: error.external_files_written,
+                    }),
                 }
-                saves.push(ProfileSavesReport {
-                    profile: report.plan.profile.clone(),
-                    copied: report.saves_copied,
-                    skipped_existing: report.saves_skipped_existing,
-                    note: report
-                        .saves_folder
-                        .is_none()
-                        .then(|| "the profile uses the game's shared saves".to_string()),
-                });
             }
             Ok(MultiProfileReport {
                 plan,
                 instances,
                 loadouts: Vec::new(),
                 saves,
+                profiles: outcomes,
             })
         }
         super::profiles::Grouping::Merged => {
@@ -3322,7 +3612,21 @@ pub fn run_profiles(
                 copy_saves: false,
                 ..base.clone()
             };
-            let first_report = run(ctx, inventory, &request, options, progress)?;
+            let mut first = plan.plans[0].clone();
+            first.inis.clear();
+            first.plugins.kept = false;
+            first.userlist.rules.clear();
+            first.saves.local = false;
+            let first_report = run_planned(
+                ctx,
+                inventory,
+                &request,
+                first,
+                options,
+                progress,
+                &mut mod_to_item,
+            )
+            .map_err(|error| with_external_files(error.error, &error.external_files_written))?;
             let instance_id = first_report
                 .instance_id
                 .clone()
@@ -3334,15 +3638,20 @@ pub fn run_profiles(
                 .cloned()
                 .ok_or_else(|| ImportError::Other("the game definition is missing".into()))?;
 
+            let mut outcomes: Vec<_> = profiles
+                .iter()
+                .map(|profile| super::Mo2ProfileOutcome {
+                    profile: profile.clone(),
+                    instance_id: Some(instance_id.clone()),
+                    error: None,
+                    external_files_written: Vec::new(),
+                })
+                .collect();
             let merged = (|| -> Result<(Vec<String>, Vec<ProfileSavesReport>), ImportError> {
                 // Every mod the chosen profiles bring, not just the first's. A mod two profiles
                 // enable with identical bytes is still one content item, but it belongs to both.
-                let mut mod_to_item: HashMap<String, String> = HashMap::new();
-                for (index, profile_plan) in plan.plans.iter().enumerate() {
-                    for item in &profile_plan.mods {
-                        if index > 0 && !item.enabled {
-                            continue;
-                        }
+                for profile_plan in plan.plans.iter().skip(1) {
+                    for item in profile_plan.mods.iter().filter(|item| item.enabled) {
                         if mod_to_item.contains_key(&item.mod_id) {
                             continue;
                         }
@@ -3351,10 +3660,6 @@ pub fn run_profiles(
                         mod_to_item.insert(item.mod_id.clone(), item_id);
                     }
                 }
-
-                // Lay the union out in Vortex's order, not in the order it was stored.
-                let order = merged_mod_order(&definition, &plan)?;
-                order_merged_layers(ctx, &instance_id, &order, &mod_to_item)?;
 
                 let mut item_mods: HashMap<String, Vec<String>> = HashMap::new();
                 for (mod_id, item_id) in &mod_to_item {
@@ -3403,7 +3708,8 @@ pub fn run_profiles(
                 // setups never load each other's saves. A file already there is kept and
                 // counted; an unreadable one is named.
                 let mut saves = Vec::new();
-                for (profile, profile_plan) in profiles.iter().zip(plan.plans.iter()) {
+                for (outcome, profile_plan) in outcomes.iter_mut().zip(&plan.plans) {
+                    let profile = &outcome.profile;
                     if !profile_plan.saves.local {
                         saves.push(ProfileSavesReport {
                             profile: profile.clone(),
@@ -3454,21 +3760,19 @@ pub fn run_profiles(
                         });
                         continue;
                     }
-                    let Some(from) = &profile_plan.saves.from else {
-                        saves.push(ProfileSavesReport {
-                            profile: profile.clone(),
-                            copied: 0,
-                            skipped_existing: 0,
-                            note: Some("the profile's own save folder is empty".to_string()),
-                        });
-                        continue;
-                    };
-                    let (copied, skipped, notes) = copy_save_folder(from, &folder)?;
+                    let (copied, skipped) = copy_save_files(
+                        &profile_plan.save_files,
+                        &folder,
+                        &mut outcome.external_files_written,
+                    )?;
                     saves.push(ProfileSavesReport {
                         profile: profile.clone(),
                         copied,
                         skipped_existing: skipped,
-                        note: (!notes.is_empty()).then(|| notes.join("; ")),
+                        note: profile_plan
+                            .save_files
+                            .is_empty()
+                            .then(|| "the profile's own save folder is empty".to_string()),
                     });
                 }
                 Ok((loadouts, saves))
@@ -3480,8 +3784,18 @@ pub fn run_profiles(
                     instances: vec![instance_id],
                     loadouts,
                     saves,
+                    profiles: outcomes,
                 }),
-                Err(error) => Err(abandon_half_made_instance(ctx, &instance_id, error)),
+                Err(error) => {
+                    let files: Vec<_> = outcomes
+                        .into_iter()
+                        .flat_map(|outcome| outcome.external_files_written)
+                        .collect();
+                    Err(with_external_files(
+                        abandon_half_made_instance(ctx, &instance_id, error),
+                        &files,
+                    ))
+                }
             }
         }
     }
@@ -3492,6 +3806,48 @@ mod tests {
     use super::*;
     use rusty_leveldb::{Options, DB};
 
+    #[test]
+    fn an_original_format_list_marks_its_bare_entries_active() {
+        let lines = parse_vortex_plugins("# Fixture\nExample.esp\n", "");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].name, "Example.esp");
+        assert!(lines[0].active);
+    }
+
+    #[test]
+    fn a_store_game_id_that_is_a_path_is_refused() {
+        let (_dir, store) = store_folder();
+        write_store(
+            &store,
+            &[(
+                "persistent###mods",
+                r#"{"../other":{"mod":{"installationPath":"Pack"}}}"#,
+            )],
+        );
+        let error = read_state(&store).expect_err("a game id must be a plain folder name");
+        assert!(error.to_string().contains("../other"), "{error}");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn sizing_rejects_a_file_replaced_with_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let source = dir.path().join("linked");
+        #[cfg(windows)]
+        junction::create(&target, &source).unwrap();
+        #[cfg(unix)]
+        {
+            let file = target.join("file");
+            std::fs::write(&file, b"fixture").unwrap();
+            std::os::unix::fs::symlink(file, &source).unwrap();
+        }
+        let sized = size_mod_files(&[(RelPath::new("linked").unwrap(), source)]);
+        assert!(
+            matches!(sized, Err((_, error)) if error.kind() == std::io::ErrorKind::InvalidData)
+        );
+    }
     fn store_folder() -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::Builder::new()
             .prefix("agora-vortex-state-")
