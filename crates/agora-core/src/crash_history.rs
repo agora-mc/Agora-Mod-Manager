@@ -598,22 +598,68 @@ pub fn content_hash(bytes: &[u8]) -> String {
     hex_digest(&digest)
 }
 
+/// Content identity for a log. Large files may be identified by a bounded sample (head and tail),
+/// recorded as partial so callers know it is not a whole-file hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentIdentity {
+    pub hash: String,
+    pub partial: bool,
+}
+
 /// The `content_hash` of a file on disk, read in bounded chunks. Used for the current session's
 /// artifacts, which may be far larger than the evidence copy keeps.
 pub fn content_hash_file(path: &std::path::Path) -> std::io::Result<String> {
-    use std::io::Read;
+    bounded_content_identity(
+        path,
+        &crate::crash_engine::evidence::CopyLimits::default(),
+    )
+    .map(|id| id.hash)
+}
+
+/// Compute a file identity bounded by the copy budget: whole-file hash when small enough, otherwise
+/// hash the head and tail that would be kept and mark the identity partial.
+pub fn bounded_content_identity(
+    path: &std::path::Path,
+    limits: &crate::crash_engine::evidence::CopyLimits,
+) -> std::io::Result<ContentIdentity> {
+    use std::io::{Read, Seek, SeekFrom};
 
     let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    let size = file.metadata()?.len();
+    if size <= limits.max_file_bytes {
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
         }
-        hasher.update(&buffer[..read]);
+        return Ok(ContentIdentity {
+            hash: hex_digest(&hasher.finalize()),
+            partial: false,
+        });
     }
-    Ok(hex_digest(&hasher.finalize()))
+
+    let mut hasher = Sha256::new();
+    let mut head = vec![0u8; limits.head_bytes.min(size) as usize];
+    let read = file.read(&mut head)?;
+    head.truncate(read);
+    hasher.update(&head);
+
+    let tail_len = limits.tail_bytes.min(size.saturating_sub(read as u64)) as usize;
+    if tail_len > 0 {
+        file.seek(SeekFrom::End(-(tail_len as i64)))?;
+        let mut tail = vec![0u8; tail_len];
+        let read_tail = file.read(&mut tail)?;
+        tail.truncate(read_tail);
+        hasher.update(&tail);
+    }
+    Ok(ContentIdentity {
+        hash: hex_digest(&hasher.finalize()),
+        partial: true,
+    })
 }
 
 fn hex_digest(digest: &[u8]) -> String {

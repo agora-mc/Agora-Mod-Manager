@@ -1723,9 +1723,9 @@ fn diagnose_record(
     }
 
     // The same crash's own files may sit in a source folder, so leave them out of the history
-    // comparison by their content hash. Hash the whole source file, never the stored copy: a log
-    // over the copy limit is kept as head and tail, and its copy's hash would not match the whole
-    // file the sweep reads, so the crash would count itself as history.
+    // comparison by their content identity. Identity is computed once and bounded for large logs
+    // (head+tail, like the copy the store keeps) so a huge log is not read in full.
+    let identity_limits = CopyLimits::default();
     let bound_files: Vec<&FoundArtifact> = collection
         .bound
         .iter()
@@ -1733,7 +1733,11 @@ fn diagnose_record(
         .collect();
     let exclude_hashes: Vec<String> = bound_files
         .iter()
-        .filter_map(|found| crate::crash_history::content_hash_file(&found.path).ok())
+        .filter_map(|found| {
+            crate::crash_history::bounded_content_identity(&found.path, &identity_limits)
+                .ok()
+                .map(|id| id.hash)
+        })
         .collect();
     let artifact_occurrences: Vec<ArtifactOccurrence> = bound_files
         .iter()
