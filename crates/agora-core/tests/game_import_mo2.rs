@@ -2308,3 +2308,196 @@ fn f1g_separate_mode_returns_per_profile_report_and_lists_copied_saves() {
         Some("ThirdSave.ess")
     );
 }
+
+#[test]
+fn acceptance_merged_mo2_profiles_reproduce_winners_saves_and_effective_inis() {
+    use agora_core::game_import::profiles::Grouping;
+    use agora_core::game_ini::{self, IniSource};
+
+    let f = fixture();
+    // Seed the game's shared INI files in the fake Documents folder.
+    let shared_docs = f
+        ._user_data
+        .path()
+        .join("documents/My Games/Skyrim Special Edition");
+    write(
+        &shared_docs.join("Skyrim.ini"),
+        b"[General]\r\nsProfileTag=shared_base\r\n",
+    );
+    write(
+        &shared_docs.join("SkyrimCustom.ini"),
+        b"[Custom]\r\nsCustomTag=shared_custom\r\n",
+    );
+
+    // Profile 1 ("Mage"): Alpha above Gamma, private INIs, local save MageHero.ess.
+    let mage = f.setup.join("profiles/Mage");
+    write(
+        &mage.join("modlist.txt"),
+        b"# Mod Organizer\r\n+Alpha\r\n+Gamma\r\n",
+    );
+    write(
+        &mage.join("plugins.txt"),
+        b"# Mod Organizer\r\n*Alpha.esp\r\n*Gamma.esp\r\n",
+    );
+    write(
+        &mage.join("loadorder.txt"),
+        b"# Mod Organizer\r\nSkyrim.esm\r\nUpdate.esm\r\nAlpha.esp\r\nGamma.esp\r\n",
+    );
+    write(
+        &mage.join("settings.ini"),
+        b"[General]\r\nLocalSaves=true\r\nLocalSettings=true\r\n",
+    );
+    write(
+        &mage.join("Skyrim.ini"),
+        b"[General]\r\nsProfileTag=mage_private\r\n",
+    );
+    write(
+        &mage.join("SkyrimCustom.ini"),
+        b"[Custom]\r\nsCustomTag=mage_custom\r\n",
+    );
+    write(&mage.join("saves/MageHero.ess"), b"MAGE SAVE");
+
+    // Profile 2 ("Warrior"): exact same enabled mods in OPPOSITE order (Gamma above Alpha),
+    // shared INIs (LocalSettings=false), local save WarriorHero.ess.
+    let warrior = f.setup.join("profiles/Warrior");
+    write(
+        &warrior.join("modlist.txt"),
+        b"# Mod Organizer\r\n+Gamma\r\n+Alpha\r\n",
+    );
+    write(
+        &warrior.join("plugins.txt"),
+        b"# Mod Organizer\r\n*Gamma.esp\r\n*Alpha.esp\r\n",
+    );
+    write(
+        &warrior.join("loadorder.txt"),
+        b"# Mod Organizer\r\nSkyrim.esm\r\nUpdate.esm\r\nGamma.esp\r\nAlpha.esp\r\n",
+    );
+    write(
+        &warrior.join("settings.ini"),
+        b"[General]\r\nLocalSaves=true\r\nLocalSettings=false\r\n",
+    );
+    write(&warrior.join("saves/WarriorHero.ess"), b"WARRIOR SAVE");
+
+    let profiles = vec!["Mage".to_string(), "Warrior".to_string()];
+    let report = game_import::mo2_run_profiles(
+        &f.ctx,
+        &f.inventory,
+        &Mo2Request {
+            profile: "Mage".into(),
+            ..request(&f, Some("Two Characters"), true)
+        },
+        &profiles,
+        Grouping::Merged,
+        Default::default(),
+        &|_| {},
+    )
+    .expect("merged import succeeds");
+    assert_eq!(report.instances.len(), 1);
+    assert_eq!(report.loadouts, profiles);
+    let instance = &report.instances[0];
+    let rule = game_saves::rule_for(&f.def, &StoreId::steam()).expect("save rule");
+
+    let mage_saves = game_saves::own_folder_scoped(rule, instance, Some("Mage")).unwrap();
+    let warrior_saves = game_saves::own_folder_scoped(rule, instance, Some("Warrior")).unwrap();
+    assert_ne!(mage_saves, warrior_saves);
+
+    let check_mage = || {
+        assert_eq!(
+            planned_file_bytes(&f, instance, "Data/shared.txt"),
+            b"from alpha",
+            "Mage puts Alpha above Gamma"
+        );
+        assert_eq!(
+            planned_file_bytes(&f, instance, "Data/meshes/armor/helm.nif"),
+            b"NIF",
+            "overwrite mesh stays active under Mage"
+        );
+        assert_eq!(
+            game_saves::in_use_folder(&f.ctx, instance, &f.def).unwrap(),
+            mage_saves
+        );
+        assert_eq!(
+            std::fs::read(mage_saves.join("MageHero.ess")).unwrap(),
+            b"MAGE SAVE"
+        );
+        assert!(!mage_saves.join("WarriorHero.ess").exists());
+
+        let skyrim_ini = game_ini::read(&f.ctx, instance, &f.def, "user/Skyrim.ini").unwrap();
+        assert_eq!(
+            skyrim_ini.document.get("General", "sProfileTag").as_deref(),
+            Some("mage_private")
+        );
+        assert_eq!(
+            skyrim_ini
+                .document
+                .get("General", "SLocalSavePath")
+                .as_deref(),
+            Some(game_saves::own_value_scoped(rule, instance, Some("Mage")).as_str())
+        );
+
+        let custom_ini = game_ini::read(&f.ctx, instance, &f.def, "user/SkyrimCustom.ini").unwrap();
+        assert_eq!(custom_ini.source, IniSource::Copy);
+        assert_eq!(
+            custom_ini.document.get("Custom", "sCustomTag").as_deref(),
+            Some("mage_custom")
+        );
+    };
+
+    let check_warrior = || {
+        assert_eq!(
+            planned_file_bytes(&f, instance, "Data/shared.txt"),
+            b"from gamma",
+            "Warrior puts Gamma above Alpha"
+        );
+        assert_eq!(
+            planned_file_bytes(&f, instance, "Data/meshes/armor/helm.nif"),
+            b"NIF",
+            "overwrite mesh stays active under Warrior"
+        );
+        assert_eq!(
+            game_saves::in_use_folder(&f.ctx, instance, &f.def).unwrap(),
+            warrior_saves
+        );
+        assert_eq!(
+            std::fs::read(warrior_saves.join("WarriorHero.ess")).unwrap(),
+            b"WARRIOR SAVE"
+        );
+        assert!(!warrior_saves.join("MageHero.ess").exists());
+
+        // Warrior has shared settings (seeded from shared Skyrim.ini for SLocalSavePath), never Mage's tag.
+        let skyrim_ini = game_ini::read(&f.ctx, instance, &f.def, "user/Skyrim.ini").unwrap();
+        assert_eq!(
+            skyrim_ini.document.get("General", "sProfileTag").as_deref(),
+            Some("shared_base"),
+            "Warrior must inherit shared Skyrim.ini, never Mage's private Skyrim.ini"
+        );
+        assert_eq!(
+            skyrim_ini
+                .document
+                .get("General", "SLocalSavePath")
+                .as_deref(),
+            Some(game_saves::own_value_scoped(rule, instance, Some("Warrior")).as_str())
+        );
+
+        let custom_ini = game_ini::read(&f.ctx, instance, &f.def, "user/SkyrimCustom.ini").unwrap();
+        assert_eq!(custom_ini.source, IniSource::GameFile);
+        assert_eq!(
+            custom_ini.document.get("Custom", "sCustomTag").as_deref(),
+            Some("shared_custom"),
+            "Warrior must see the shared SkyrimCustom.ini, never Mage's private copy"
+        );
+    };
+
+    // Initial state is Mage (profile 1).
+    check_mage();
+
+    // Switch to Warrior.
+    agora_core::game_loadout::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "Warrior")
+        .expect("switch to Warrior");
+    check_warrior();
+
+    // Switch back to Mage.
+    agora_core::game_loadout::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "Mage")
+        .expect("switch back to Mage");
+    check_mage();
+}
