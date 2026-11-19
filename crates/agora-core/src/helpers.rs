@@ -447,9 +447,10 @@ pub fn available_disk_space_bytes(path: &Path) -> Option<u64> {
     } else {
         info.f_bsize
     };
-    u64::try_from(info.f_bavail)
-        .ok()?
-        .checked_mul(u64::try_from(block_size).ok()?)
+    u128::from(info.f_bavail)
+        .checked_mul(u128::from(block_size))?
+        .try_into()
+        .ok()
 }
 
 pub fn check_disk_space_for(path: &Path, required_bytes: u64) -> LauncherResult<()> {
