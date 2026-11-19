@@ -692,7 +692,8 @@ impl PluginService {
     }
 
     /// Whether this plugin's code may run right now: the emergency stop is not
-    /// engaged, and either the plugin has no code or the user allowed it.
+    /// engaged, and either the plugin has no code or the user allowed the code
+    /// that is actually on disk.
     ///
     /// Data-only plugins return `true`: they run nothing, so there is nothing to
     /// allow or stop. Used for every decision about starting or calling a script.
@@ -726,10 +727,43 @@ impl PluginService {
         }
         self.inner
             .conn()
-            .and_then(|conn| store::script_consent(&conn, plugin_id))
-            .map(|consent| consent == Some(true))
+            .and_then(|conn| {
+                if store::script_consent(&conn, plugin_id)? != Some(true) {
+                    return Ok(false);
+                }
+                // Consent belongs to the code the player was shown, not to the
+                // plugin id. Re-hash what is on disk on every decision, so an
+                // edit after consent (or a failed read) is never run on the old
+                // answer. An unreadable directory or a missing entrypoint is a
+                // refusal, not a permission.
+                let consented = store::script_consent_code_hash(&conn, plugin_id)?;
+                Ok(consented == install::script_digest(&record.manifest, &record.install_dir)?)
+            })
             // Cannot read the choice: the user has not been shown to allow it.
             .unwrap_or(false)
+    }
+
+    /// Whether the stored yes was given for code other than what is on disk now.
+    fn code_consent_is_stale(&self, plugin_id: &PluginId) -> bool {
+        let Some(record) = self.inner.record(plugin_id) else {
+            return false;
+        };
+        if record.manifest.is_declarative_only() {
+            return false;
+        }
+        let Ok(conn) = self.inner.conn() else {
+            return false;
+        };
+        if store::script_consent(&conn, plugin_id).ok() != Some(Some(true)) {
+            return false;
+        }
+        let Ok(consented) = store::script_consent_code_hash(&conn, plugin_id) else {
+            return false;
+        };
+        let Ok(current) = install::script_digest(&record.manifest, &record.install_dir) else {
+            return false;
+        };
+        consented != current
     }
 
     /// Allow or disallow one plugin's scripts. Independent per plugin and
@@ -2193,7 +2227,7 @@ impl PluginService {
         // The one place a script runtime starts. A data-only plugin returned
         // above and needs neither the user's permission nor the stop to be off.
         if !self.scripts_permitted(plugin_id) {
-            return Err(self.scripts_refused());
+            return Err(self.scripts_refused(plugin_id));
         }
 
         let settings = self.settings_snapshot(plugin_id, &record);
@@ -2604,20 +2638,22 @@ impl PluginService {
     }
 
     /// Why a script was refused, in words for the person who has to fix it.
-    fn scripts_refused(&self) -> PluginError {
-        PluginError::new(
-            PluginErrorCode::NotActivated,
-            if self.emergency_stop_engaged() {
-                "All plugin code is stopped (emergency stop)"
-            } else {
-                "This plugin has not been allowed to run code"
-            },
-        )
+    fn scripts_refused(&self, plugin_id: &PluginId) -> PluginError {
+        let reason = if self.emergency_stop_engaged() {
+            "All plugin code is stopped (emergency stop)".to_string()
+        } else if self.code_consent_is_stale(plugin_id) {
+            format!(
+                "`{plugin_id}`'s code changed after you consented to it. Consent again to the new code before it can run."
+            )
+        } else {
+            format!("`{plugin_id}` has not been allowed to run code")
+        };
+        PluginError::new(PluginErrorCode::NotActivated, reason)
     }
 
     fn ensure_running(&self, plugin_id: &PluginId) -> Result<(), PluginError> {
         if !self.scripts_permitted(plugin_id) {
-            return Err(self.scripts_refused());
+            return Err(self.scripts_refused(plugin_id));
         }
         if self.inner.host.is_active(plugin_id) {
             return Ok(());
@@ -2718,7 +2754,7 @@ impl PluginService {
         if !self.scripts_permitted(plugin_id) {
             return Err(LauncherError::Generic {
                 code: "ERR_PLUGIN_DISABLED".into(),
-                message: self.scripts_refused().message,
+                message: self.scripts_refused(plugin_id).message,
             });
         }
         for action in &proposal.actions {

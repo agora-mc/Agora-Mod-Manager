@@ -488,8 +488,4 @@ fn a_failed_swap_whose_restore_fails_does_not_strand_the_starting_mark() {
         restore(&h.ctx, &def, &StoreId::steam()).is_err(),
         "recovery must still report the file it cannot read, not be blocked by the mark"
     );
-
-    let mut perms = std::fs::metadata(&real).unwrap().permissions();
-    perms.set_readonly(false);
-    std::fs::set_permissions(&real, perms).unwrap();
 }

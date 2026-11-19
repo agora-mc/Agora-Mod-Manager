@@ -2275,6 +2275,46 @@ async fn an_allowed_scripted_plugin_runs_and_turning_it_off_stops_it() {
 }
 
 #[tokio::test]
+async fn a_community_script_changed_after_consent_is_refused() {
+    let world = World::new();
+    world
+        .service
+        .install_package_bytes(&script_zip(COMMUNITY_SCRIPT, "1.0.0"), true)
+        .unwrap();
+    world.service.activate_all().unwrap();
+    assert!(world.running(COMMUNITY_SCRIPT));
+
+    // The answer was given for the previewed package. A file changed on disk since
+    // is new code, which the player has not consented to.
+    std::fs::write(
+        world.packages_root().join(COMMUNITY_SCRIPT).join("main.js"),
+        b"export function noop() { return 2; }\n",
+    )
+    .unwrap();
+
+    assert!(
+        !world
+            .service
+            .scripts_permitted(&plugin_id(COMMUNITY_SCRIPT)),
+        "changed code still passes the consent gate"
+    );
+    world.stop_everything();
+    let error = world
+        .service
+        .activate(&plugin_id(COMMUNITY_SCRIPT))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(COMMUNITY_SCRIPT),
+        "the refusal must name the plugin: {error}"
+    );
+    assert!(
+        error.contains("allowed again") || error.contains("consent"),
+        "the refusal must say consent is needed for the new code: {error}"
+    );
+}
+
+#[tokio::test]
 async fn the_emergency_stop_stops_every_script_and_data_only_plugins_still_load() {
     let world = world_with_script_plugins().await;
     world.service.activate_all().unwrap();
