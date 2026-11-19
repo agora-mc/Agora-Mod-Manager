@@ -9,6 +9,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -758,6 +759,82 @@ fn fuse_overlay_runs_when_the_kernel_refuses() {
         !target.join("new_in_upper.txt").exists(),
         "the overlay was visible outside the namespace"
     );
+}
+
+/// A `fuse-overlayfs` that daemonises leaves its real process alive after the view ends: the PID
+/// Agora holds is the short-lived wrapper, so neither `PR_SET_PDEATHSIG` nor the stop signal binds
+/// to the process that owns the mount. `-f` keeps the daemon in the foreground (fuse-overlayfs(1)).
+#[test]
+fn fuse_daemon_does_not_outlive_the_view() {
+    let _serial = serial();
+    if !fuse_overlayfs_installed() {
+        eprintln!("SKIPPED: fuse-overlayfs is not on PATH on this host");
+        return;
+    }
+    struct ClearEnv;
+    impl Drop for ClearEnv {
+        fn drop(&mut self) {
+            std::env::remove_var(REFUSE_KERNEL_OVERLAY_ENV);
+        }
+    }
+    std::env::set_var(REFUSE_KERNEL_OVERLAY_ENV, "1");
+    let _clear = ClearEnv;
+
+    let fixture = Fixture::new();
+    let instance_dir = fixture.instance_dir();
+    let target = fixture._tmp.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let request = ViewRequest {
+        instance_id: fixture.instance_id.clone(),
+        target,
+        command: fixture.command("exit 0\n"),
+        per_user_files: vec![],
+    };
+
+    let run = ran(run_view(&fixture, &request)).expect("the fixture host must run the view");
+    assert_eq!(run.mechanism, OverlayMechanism::Fuse);
+    assert!(run.status.success(), "the command failed: {:?}", run.status);
+
+    let alive = fuse_daemons_using(&instance_dir);
+    assert!(
+        alive.is_empty(),
+        "the fuse daemon outlived the view: pids {alive:?} still mount over the instance"
+    );
+}
+
+/// Process ids whose cmdline names `fuse-overlayfs` and the given instance folder. A daemon that
+/// daemonised keeps its mount in a namespace that outlives Agora; a foreground daemon dies with the
+/// command or is signalled by `stop_fuse_daemon`.
+fn fuse_daemons_using(instance_dir: &Path) -> Vec<i32> {
+    let needle = instance_dir.as_os_str().as_bytes();
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if cmdline
+            .split(|byte| *byte == 0)
+            .any(|arg| arg == b"fuse-overlayfs" || arg.ends_with(b"/fuse-overlayfs"))
+            && contains(&cmdline, needle)
+        {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 #[test]

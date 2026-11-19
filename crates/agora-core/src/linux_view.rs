@@ -307,6 +307,7 @@ mod linux_impl {
         working_directory: Option<CString>,
         per_user: Vec<(CString, CString)>,
         fuse_program: Option<CString>,
+        fuse_foreground: CString,
         fuse_dash_o: CString,
         fuse_data: CString,
         fuse_mountinfo_probe: Vec<u8>,
@@ -414,6 +415,7 @@ mod linux_impl {
                     .transpose()?,
                 per_user,
                 fuse_program: find_fuse_overlayfs(),
+                fuse_foreground: CString::new("-f").expect("a fixed value"),
                 fuse_dash_o: CString::new("-o").expect("a fixed value"),
                 fuse_data: CString::new(fuse_data)
                     .map_err(|_| ViewError::Setup("a view path contains a NUL".into()))?,
@@ -880,8 +882,13 @@ mod linux_impl {
                 unsafe { c::_exit(127) };
             }
             unsafe { c::prctl(c::PR_SET_PDEATHSIG, c::SIGKILL) };
-            let argv: [*const c::c_char; 5] = [
+            // fuse-overlayfs(1): `-f`, `--foreground` keeps the daemon in the foreground instead
+            // of detaching. Without it the pid below is the short-lived wrapper, so both
+            // PR_SET_PDEATHSIG and the later stop signal bind to the wrong process and the real
+            // mount helper outlives the view.
+            let argv: [*const c::c_char; 6] = [
                 program.as_ptr(),
+                prepared.fuse_foreground.as_ptr(),
                 prepared.fuse_dash_o.as_ptr(),
                 prepared.fuse_data.as_ptr(),
                 prepared.target.as_ptr(),
@@ -904,6 +911,10 @@ mod linux_impl {
             unsafe { c::nanosleep(&delay, std::ptr::null_mut()) };
         }
         unsafe { c::kill(daemon, c::SIGKILL) };
+        // The daemon is a child of this process until the command is exec'd, so a daemon that
+        // never mounted would otherwise be left as a zombie. Reap it before reporting the
+        // step-down.
+        let _ = waitpid(Pid::from_raw(daemon), None);
         Err(FuseFailure::Timeout)
     }
 
