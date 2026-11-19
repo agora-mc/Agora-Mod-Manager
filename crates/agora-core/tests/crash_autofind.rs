@@ -18,7 +18,9 @@ use agora_core::crash_history::{
 };
 use agora_core::crash_packs::LoadedCrashPack;
 use agora_core::ctx::Ctx;
-use agora_game_api::crash::{lint_pack_json, Level, Owner, CRASH_CONTRACT_VERSION};
+use agora_game_api::crash::{
+    lint_pack_json, Level, MatchedBy, Owner, SessionVerdict, CRASH_CONTRACT_VERSION,
+};
 use agora_plugin_host::QuickJsHost;
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -418,6 +420,9 @@ fn a_recurring_suspect_boosts_the_answer_and_gets_one_counting_finding() {
         },
         &[],
         &[],
+        SessionVerdict::Crashed {
+            how: MatchedBy::Supplied,
+        },
         Some(&CrashHistoryInput {
             prior: &prior,
             sessions_since_first: &sessions,
@@ -519,6 +524,9 @@ fn a_confirmed_fix_boosts_the_same_bucket_and_never_invents_a_suspect() {
         },
         &[],
         &[],
+        SessionVerdict::Crashed {
+            how: MatchedBy::Supplied,
+        },
         Some(&CrashHistoryInput {
             prior: &[],
             sessions_since_first: &sessions,
@@ -553,6 +561,9 @@ fn a_confirmed_fix_boosts_the_same_bucket_and_never_invents_a_suspect() {
         },
         &[],
         &[],
+        SessionVerdict::Crashed {
+            how: MatchedBy::Supplied,
+        },
         Some(&CrashHistoryInput {
             prior: &[],
             sessions_since_first: &sessions,
@@ -587,6 +598,9 @@ fn a_confirmed_fix_boosts_the_same_bucket_and_never_invents_a_suspect() {
         },
         &[],
         &[],
+        SessionVerdict::Crashed {
+            how: MatchedBy::Supplied,
+        },
         Some(&CrashHistoryInput {
             prior: &[],
             sessions_since_first: &sessions,

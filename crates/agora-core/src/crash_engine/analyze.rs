@@ -252,7 +252,15 @@ pub fn analyze_with_facts(
     extra_facts: &[Fact],
     changes: &[crate::session_ledger::ManifestChange],
 ) -> LauncherResult<AnalyzeOutput> {
-    analyze_with_history(input, extra_facts, changes, None)
+    analyze_with_history(
+        input,
+        extra_facts,
+        changes,
+        SessionVerdict::Crashed {
+            how: MatchedBy::Supplied,
+        },
+        None,
+    )
 }
 
 /// [`analyze_with_facts`] plus the pattern across earlier crashes, which becomes the engine's
@@ -262,6 +270,7 @@ pub fn analyze_with_history(
     input: &AnalyzeInput<'_>,
     extra_facts: &[Fact],
     changes: &[crate::session_ledger::ManifestChange],
+    verdict: SessionVerdict,
     history: Option<&CrashHistoryInput<'_>>,
 ) -> LauncherResult<AnalyzeOutput> {
     let mut packs: Vec<&LoadedCrashPack> = input.packs.iter().collect();
@@ -1062,6 +1071,9 @@ mod tests {
             },
             &extra_facts,
             &changes,
+            SessionVerdict::Crashed {
+                how: MatchedBy::Supplied,
+            },
             None,
         )
         .expect("analyze succeeds");
