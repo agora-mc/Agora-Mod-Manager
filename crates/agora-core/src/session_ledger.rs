@@ -853,6 +853,11 @@ pub fn build_manifest(
         }
         Err(e) => manifest.unreadable.push(format!("settings: {e}")),
     }
+
+    match crate::crash_engine::attribution::from_instance(ctx, instance_id) {
+        Ok(view) => manifest.owner_layers = view.layers().to_vec(),
+        Err(error) => manifest.unreadable.push(format!("file ownership: {error}")),
+    }
     manifest
 }
 

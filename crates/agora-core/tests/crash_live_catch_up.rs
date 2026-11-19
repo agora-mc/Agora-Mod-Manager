@@ -281,7 +281,6 @@ fn without_a_later_session_the_window_ends_now_and_still_sees_the_crash() {
     );
 }
 
-
 /// Two separate crashes can produce byte-identical logs. Each session must still read its own
 /// evidence; a content hash alone does not make them the same event.
 #[test]
@@ -538,6 +537,290 @@ fn a_facts_only_artifact_contributes_without_being_copied() {
                 count += 1;
             }
         }
-        assert_eq!(count, 0, "facts-only raw file must not be copied: {session_dir:?}");
+        assert_eq!(
+            count, 0,
+            "facts-only raw file must not be copied: {session_dir:?}"
+        );
     }
+}
+
+/// A historical session's ownership comes from its launch manifest, not the current setup.
+#[test]
+fn historical_attribution_uses_the_session_launch_manifest() {
+    use agora_core::crash_engine::attribution::{LayerOwner, LayerView};
+
+    let fixture = Fixture::new();
+    let conn = fixture.conn();
+    let now = SystemTime::now();
+    let pack = BuiltInPack {
+        file: "test/owner/pack.json".to_string(),
+        json: serde_json::json!({
+            "contract": 1,
+            "games": ["test-game"],
+            "sources": [{
+                "id": "crash_log",
+                "where": { "root": "instance", "path": "logs" },
+                "match": { "glob": "crash-*.log" },
+                "format": "probe",
+                "bind": [{ "time": { "before_s": 2, "after_s": 10 } }],
+                "role": "primary"
+            }],
+            "parsers": [{
+                "id": "probe",
+                "detect": { "all": ["(?m)^ERRORS$"] },
+                "entry": { "generic": { "name": "text_sections", "config": {
+                    "producer": { "format": "probe_log" },
+                    "sections": [{
+                        "id": "errors",
+                        "header": "^ERRORS$",
+                        "kind": "core.exception",
+                        "lines": [{
+                            "pattern": "^(?P<category>\\w+) (?P<mod>\\S+)$",
+                            "attrs": { "category": "category" },
+                            "refs": [{ "kind": "module", "value": "mod", "strength": "exec" }]
+                        }]
+                    }]
+                } } }
+            }],
+            "ref_maps": [{
+                "kind": "module",
+                "lookup": { "path": { "patterns": ["mods/{value}"] } },
+                "match": "casefold"
+            }],
+            "rules": [{
+                "id": "module_owner",
+                "version": 1,
+                "when": { "fact": { "kind": "core.exception", "ref": { "kind": "module", "bind": "m" } } },
+                "effects": [{ "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 12 } }],
+                "text": { "headline": { "en": "{owner:m} crashed." } }
+            }]
+        })
+        .to_string(),
+        parsers: Vec::new(),
+    };
+
+    struct CurrentB;
+    impl ExtraInstanceProvider for CurrentB {
+        fn resolve(
+            &self,
+            _ctx: &agora_core::ctx::Ctx,
+            _instance_id: &str,
+        ) -> agora_core::error::LauncherResult<Option<ResolvedCrashInstance>> {
+            Ok(Some(ResolvedCrashInstance {
+                game_id: "test-game".to_string(),
+                runtime_version: Some("1.0".to_string()),
+                view: InstanceView::new(vec![LayerView::new(
+                    "mod-b",
+                    true,
+                    LayerOwner::Item {
+                        key: "mod-b".to_string(),
+                        name: "Mod B".to_string(),
+                    },
+                    vec!["mods/Mod.dll".to_string()],
+                )]),
+                could_not_check: Vec::new(),
+            }))
+        }
+    }
+
+    let started = now - Duration::from_secs(2 * 3600);
+    let ended = started + Duration::from_secs(30);
+    fixture.write_log("crash-hist.log", started + Duration::from_secs(5));
+
+    let mut manifest = LaunchManifest::default();
+    manifest.owner_layers = vec![LayerView::new(
+        "mod-a",
+        true,
+        LayerOwner::Item {
+            key: "mod-a".to_string(),
+            name: "Mod A".to_string(),
+        },
+        vec!["mods/Mod.dll".to_string()],
+    )];
+    let session = session_ledger::begin(
+        &conn,
+        "inst",
+        &chrono::DateTime::<chrono::Utc>::from(started).to_rfc3339(),
+        &manifest,
+        Owner::current(),
+    )
+    .unwrap();
+    session_ledger::finish(
+        &conn,
+        &session,
+        &SessionFinish {
+            ended_at: chrono::DateTime::<chrono::Utc>::from(ended).to_rfc3339(),
+            duration_ms: 30_000,
+            exit: ExitObservation::Code {
+                pid: 7777,
+                image: "Game.exe".to_string(),
+                code: 0xC000_0005,
+            },
+            game_runtime_ms: Some(30_000),
+            normal_exit_codes: vec![0],
+            artifact: None,
+            froze: false,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let live = LivePacks {
+        packs: &[],
+        built_in: std::slice::from_ref(&pack),
+        host: &fixture.host,
+        instances: Some(&CurrentB),
+    };
+    let answer = agora_core::crash_live::diagnose_session(&fixture.ctx, &session, live)
+        .expect("historical session is diagnosable");
+    let StoredAnswer::Analyzed { answer, .. } = answer.answer else {
+        panic!("expected analyzed answer");
+    };
+    let owner = answer.candidates.first().and_then(|c| match &c.owner {
+        agora_game_api::crash::Owner::Item { key, .. } => Some(key.as_str()),
+        _ => None,
+    });
+    assert_eq!(
+        owner,
+        Some("mod-a"),
+        "historical session must name the mod that owned the file then: {answer:?}"
+    );
+    assert!(
+        !answer.could_not_check.iter().any(|n| n
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("attributed with the current setup"))),
+        "manifest ownership was known, so no current-setup caveat: {answer:?}"
+    );
+}
+
+#[test]
+fn an_older_session_without_recorded_ownership_states_the_current_setup_caveat() {
+    use agora_core::crash_engine::attribution::{LayerOwner, LayerView};
+
+    let fixture = Fixture::new();
+    let conn = fixture.conn();
+    let now = SystemTime::now();
+    let pack = BuiltInPack {
+        file: "test/owner-old/pack.json".to_string(),
+        json: serde_json::json!({
+            "contract": 1,
+            "games": ["test-game"],
+            "sources": [{
+                "id": "crash_log",
+                "where": { "root": "instance", "path": "logs" },
+                "match": { "glob": "crash-*.log" },
+                "format": "probe",
+                "bind": [{ "time": { "before_s": 2, "after_s": 10 } }],
+                "role": "primary"
+            }],
+            "parsers": [{
+                "id": "probe",
+                "detect": { "all": ["(?m)^ERRORS$"] },
+                "entry": { "generic": { "name": "text_sections", "config": {
+                    "producer": { "format": "probe_log" },
+                    "sections": [{
+                        "id": "errors",
+                        "header": "^ERRORS$",
+                        "kind": "core.exception",
+                        "lines": [{
+                            "pattern": "^(?P<category>\\w+) (?P<mod>\\S+)$",
+                            "attrs": { "category": "category" },
+                            "refs": [{ "kind": "module", "value": "mod", "strength": "exec" }]
+                        }]
+                    }]
+                } } }
+            }],
+            "ref_maps": [{
+                "kind": "module",
+                "lookup": { "path": { "patterns": ["mods/{value}"] } },
+                "match": "casefold"
+            }],
+            "rules": [{
+                "id": "module_owner",
+                "version": 1,
+                "when": { "fact": { "kind": "core.exception", "ref": { "kind": "module", "bind": "m" } } },
+                "effects": [{ "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 12 } }],
+                "text": { "headline": { "en": "{owner:m} crashed." } }
+            }]
+        })
+        .to_string(),
+        parsers: Vec::new(),
+    };
+
+    struct CurrentB;
+    impl ExtraInstanceProvider for CurrentB {
+        fn resolve(
+            &self,
+            _ctx: &agora_core::ctx::Ctx,
+            _instance_id: &str,
+        ) -> agora_core::error::LauncherResult<Option<ResolvedCrashInstance>> {
+            Ok(Some(ResolvedCrashInstance {
+                game_id: "test-game".to_string(),
+                runtime_version: Some("1.0".to_string()),
+                view: InstanceView::new(vec![LayerView::new(
+                    "mod-b",
+                    true,
+                    LayerOwner::Item {
+                        key: "mod-b".to_string(),
+                        name: "Mod B".to_string(),
+                    },
+                    vec!["mods/Mod.dll".to_string()],
+                )]),
+                could_not_check: Vec::new(),
+            }))
+        }
+    }
+
+    let started = now - Duration::from_secs(2 * 3600);
+    let ended = started + Duration::from_secs(30);
+    fixture.write_log("crash-old.log", started + Duration::from_secs(5));
+
+    let manifest = LaunchManifest::default();
+    let session = session_ledger::begin(
+        &conn,
+        "inst",
+        &chrono::DateTime::<chrono::Utc>::from(started).to_rfc3339(),
+        &manifest,
+        Owner::current(),
+    )
+    .unwrap();
+    session_ledger::finish(
+        &conn,
+        &session,
+        &SessionFinish {
+            ended_at: chrono::DateTime::<chrono::Utc>::from(ended).to_rfc3339(),
+            duration_ms: 30_000,
+            exit: ExitObservation::Code {
+                pid: 8888,
+                image: "Game.exe".to_string(),
+                code: 0xC000_0005,
+            },
+            game_runtime_ms: Some(30_000),
+            normal_exit_codes: vec![0],
+            artifact: None,
+            froze: false,
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let live = LivePacks {
+        packs: &[],
+        built_in: std::slice::from_ref(&pack),
+        host: &fixture.host,
+        instances: Some(&CurrentB),
+    };
+    let answer = agora_core::crash_live::diagnose_session(&fixture.ctx, &session, live)
+        .expect("older session is diagnosable");
+    let StoredAnswer::Analyzed { answer, .. } = answer.answer else {
+        panic!("expected analyzed answer");
+    };
+    assert!(
+        answer.could_not_check.iter().any(|n| n
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("attributed with the current setup"))),
+        "older session without ownership map must state the caveat: {answer:?}"
+    );
 }

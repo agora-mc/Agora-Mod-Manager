@@ -609,11 +609,8 @@ pub struct ContentIdentity {
 /// The `content_hash` of a file on disk, read in bounded chunks. Used for the current session's
 /// artifacts, which may be far larger than the evidence copy keeps.
 pub fn content_hash_file(path: &std::path::Path) -> std::io::Result<String> {
-    bounded_content_identity(
-        path,
-        &crate::crash_engine::evidence::CopyLimits::default(),
-    )
-    .map(|id| id.hash)
+    bounded_content_identity(path, &crate::crash_engine::evidence::CopyLimits::default())
+        .map(|id| id.hash)
 }
 
 /// Compute a file identity bounded by the copy budget: whole-file hash when small enough, otherwise

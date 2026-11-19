@@ -382,7 +382,10 @@ fn large_log_identity_is_bounded_to_head_and_tail() {
     drop(file);
 
     let id = bounded_content_identity(&path, &limits).unwrap();
-    assert!(id.partial, "a log over the copy budget must have a partial identity");
+    assert!(
+        id.partial,
+        "a log over the copy budget must have a partial identity"
+    );
 
     let mut expected = Vec::new();
     expected.extend_from_slice(&head);

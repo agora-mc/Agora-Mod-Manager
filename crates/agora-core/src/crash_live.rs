@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use agora_game_api::crash::{
-    Artifact, AttrValue, BuiltInPack, CopyPolicy, CrashAnswer, Fact, GameHandle, MatchedBy, ParserLimits,
-    Reads, RefMap, RoleRule, Scalar, SessionVerdict, SourceRole, DETECT_HEAD_BYTES,
+    Artifact, AttrValue, BuiltInPack, CopyPolicy, CrashAnswer, Fact, GameHandle, MatchedBy,
+    ParserLimits, Reads, RefMap, RoleRule, Scalar, SessionVerdict, SourceRole, DETECT_HEAD_BYTES,
 };
 use agora_game_api::GamePath;
 use agora_plugin_api::host::{ScriptHost, ScriptReads};
@@ -1597,6 +1597,30 @@ fn artifact_occurrence(found: &FoundArtifact) -> Option<ArtifactOccurrence> {
     })
 }
 
+fn manifest_owner_view(
+    record: &SessionRecord,
+) -> Option<crate::crash_engine::attribution::InstanceView> {
+    let manifest = record.manifest.as_ref()?;
+    if manifest.owner_layers.is_empty() {
+        return None;
+    }
+    Some(crate::crash_engine::attribution::InstanceView::new(
+        manifest.owner_layers.clone(),
+    ))
+}
+
+fn attribution_caveat_note() -> agora_game_api::crash::CouldNotCheck {
+    agora_game_api::crash::CouldNotCheck {
+        reason: agora_game_api::crash::CouldNotCheckReason::InstanceIncomplete,
+        subject: "file ownership at crash time".to_string(),
+        detail: Some(
+            "This older session did not record which mod owned each file, so it was attributed with the current setup."
+                .to_string(),
+        ),
+        source: None,
+    }
+}
+
 fn diagnose_record(
     ctx: &Ctx,
     conn: &Connection,
@@ -1681,7 +1705,11 @@ fn diagnose_record(
         .iter()
         .flat_map(|pack| pack.pack.roles.iter().cloned())
         .collect();
-    let resolver = Resolver::new(resolved.view, ref_maps, roles);
+    let (owner_view, attributed_with_current_setup) = match manifest_owner_view(record) {
+        Some(view) => (view, false),
+        None => (resolved.view, true),
+    };
+    let resolver = Resolver::new(owner_view, ref_maps, roles);
     let scope = std::sync::Arc::new(
         crate::game_script::instance_reads(ctx, &record.instance_id)
             .map_err(|error| format!("the instance files could not be opened: {error}"))?,
@@ -1807,6 +1835,12 @@ fn diagnose_record(
             &mut output,
             format!("the older crash logs could not be read: {why}"),
         );
+    }
+    if attributed_with_current_setup {
+        output
+            .answer
+            .could_not_check
+            .push(attribution_caveat_note());
     }
 
     let at_unix_ms = Some(crate::crash_engine::evidence::unix_ms(window.started));
