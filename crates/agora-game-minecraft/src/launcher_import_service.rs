@@ -3740,6 +3740,83 @@ name=Dup Instance
         assert!(!quarantine.exists());
     }
 
+    /// Two processes: an import job whose instance lock another Agora process holds belongs to a
+    /// live import, so recovery leaves the staging folder and the job row alone and reports it;
+    /// once the lock is free, the next pass finishes the job.
+    #[test]
+    fn test_recover_interrupted_leaves_a_live_import_alone() {
+        let ctx = test_ctx();
+        let staging = ctx.paths.staging_root().join("recover-live-staging");
+        let final_dir = ctx.paths.instances_root().join("recover-live");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("options.txt"), b"payload").unwrap();
+        let connection =
+            agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        agora_core::db::upsert_instance_import_job(
+            &connection,
+            &InstanceImportJob {
+                job_id: "recover-live-job".into(),
+                instance_id: "recover-live".into(),
+                launcher_kind: "prism".into(),
+                source_instance_key: "source".into(),
+                staging_path: staging.to_string_lossy().into_owned(),
+                final_path: final_dir.to_string_lossy().into_owned(),
+                quarantine_path: None,
+                state: "staging".into(),
+                plan_fingerprint: "plan".into(),
+                error: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .unwrap();
+        drop(connection);
+
+        // A second lock manager on the same locks root is what another Agora process sees.
+        let other_process = agora_core::lock_manager::LockManager::new(ctx.paths.locks_root());
+        let held = other_process
+            .acquire(
+                agora_core::lock_manager::LockResource::Instance("recover-live".into()),
+                "launcher-import-execute",
+            )
+            .expect("the live import takes the instance lock");
+
+        let warnings = recover_interrupted_jobs(&ctx);
+
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("recover-live") && w.contains("left alone")),
+            "the skip is reported: {warnings:?}"
+        );
+        assert!(staging.join("options.txt").exists(), "staging untouched");
+        let connection =
+            agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        assert_eq!(
+            agora_core::db::list_instance_import_jobs(&connection)
+                .unwrap()
+                .len(),
+            1,
+            "the job row is kept for the live import"
+        );
+        drop(connection);
+
+        // The live import finished; the next startup pass rolls the job back.
+        drop(held);
+        let warnings = recover_interrupted_jobs(&ctx);
+        assert!(!warnings.iter().any(|w| w.contains("left alone")), "{warnings:?}");
+        assert!(!staging.exists(), "staging rolled back");
+        let connection =
+            agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        assert!(
+            agora_core::db::list_instance_import_jobs(&connection)
+                .unwrap()
+                .is_empty(),
+            "the job row is gone"
+        );
+    }
+
     #[tokio::test]
     async fn test_execute_skips_blocked_items() {
         let ctx = test_ctx();

@@ -10,8 +10,9 @@
 //!
 //! The discipline follows `game_user_files`: a journal is written, and made durable, before anything
 //! is renamed or copied. A journal left by a crash is put back by the next check, which runs before any
-//! launch, deploy, tool run or user-files session for that game, and at CLI start. Recovery discards the
-//! run's writes rather than capturing them: the copy is deleted, or moved home and deleted. It never
+//! launch, deploy, tool run or user-files session for that game, and by the one startup recovery pass
+//! every adapter runs (`startup_recovery::run_at_startup`). Recovery discards the run's writes rather
+//! than capturing them: the copy is deleted, or moved home and deleted. It never
 //! merges folders and never overwrites. It deletes a folder only when that folder's marker matches the
 //! journal and its path is one the swap derives from trusted inputs (the instance's base and install,
 //! never the journal's own paths).
