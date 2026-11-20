@@ -779,6 +779,33 @@ async fn prepare_loader(
     allow_unverified: bool,
 ) -> LauncherResult<PreparedLoader> {
     let clients = &ctx.http_clients;
+    prepare_loader_with(
+        ctx,
+        policy,
+        loader,
+        mc_version,
+        loader_version,
+        allow_unverified,
+        |url, file_name| async move { fetch_loader_bytes(clients, policy, &url, &file_name).await },
+    )
+    .await
+}
+
+/// `prepare_loader` with the byte fetcher injected, so a test can record every
+/// requested URL and serve recorded fixtures without touching the network.
+async fn prepare_loader_with<F, Fut>(
+    ctx: &Ctx,
+    policy: &NetworkPolicy,
+    loader: &str,
+    mc_version: &str,
+    loader_version: &str,
+    allow_unverified: bool,
+    fetch: F,
+) -> LauncherResult<PreparedLoader>
+where
+    F: Fn(String, String) -> Fut,
+    Fut: std::future::Future<Output = LauncherResult<Vec<u8>>>,
+{
     let (kind, entry) = plan_loader(loader, mc_version, loader_version)?;
     let loader_key = loader.to_ascii_lowercase();
     let entry = match (kind, entry) {
@@ -812,12 +839,8 @@ async fn prepare_loader(
                 ),
             });
         }
-        let profile =
-            fetch_loader_bytes(clients, policy, &entry.source_url, &entry.file_name).await?;
-        verify_loader_artifact(&loader_key, &entry, &profile)?;
-
         let (artifact_name, bytes, installer_version, hash_verified) =
-            prepare_official_installer(clients, policy, &loader_key, allow_unverified).await?;
+            prepare_official_installer(&loader_key, allow_unverified, &fetch).await?;
         if !hash_verified {
             notes.push(format!(
                 "No published .sha512 was found beside the {loader} installer {installer_version}; it was downloaded because unverified loader downloads were allowed."
@@ -849,7 +872,7 @@ async fn prepare_loader(
         });
     }
 
-    let bytes = fetch_loader_bytes(clients, policy, &entry.source_url, &entry.file_name).await?;
+    let bytes = fetch(entry.source_url.clone(), entry.file_name.clone()).await?;
     verify_loader_artifact(&loader_key, &entry, &bytes)?;
     let artifact_name = format!("{loader_key}-installer.jar");
     notes.push(format!(
@@ -906,12 +929,15 @@ fn quilt_installer_server_args(mc_version: &str, loader_version: &str) -> Vec<St
 /// check it against the strongest hash the repository publishes beside it
 /// (`.sha512`; both repositories publish it). A missing hash file is the only
 /// case `allow_unverified` may override.
-async fn prepare_official_installer(
-    clients: &HttpClients,
-    policy: &NetworkPolicy,
+async fn prepare_official_installer<F, Fut>(
     loader: &str,
     allow_unverified: bool,
-) -> LauncherResult<(String, Vec<u8>, String, bool)> {
+    fetch: &F,
+) -> LauncherResult<(String, Vec<u8>, String, bool)>
+where
+    F: Fn(String, String) -> Fut,
+    Fut: std::future::Future<Output = LauncherResult<Vec<u8>>>,
+{
     let base = match loader {
         "fabric" => FABRIC_INSTALLER_BASE,
         "quilt" => QUILT_INSTALLER_BASE,
@@ -923,18 +949,17 @@ async fn prepare_official_installer(
         }
     };
     let metadata_url = format!("{base}/maven-metadata.xml");
-    let metadata = fetch_loader_bytes(clients, policy, &metadata_url, "maven-metadata.xml").await?;
+    let metadata = fetch(metadata_url, "maven-metadata.xml".into()).await?;
     let installer_version = parse_maven_metadata_latest(&String::from_utf8_lossy(&metadata))?;
     let jar_name = format!("{loader}-installer-{installer_version}.jar");
     let jar_url = format!("{base}/{installer_version}/{jar_name}");
-    let bytes = fetch_loader_bytes(clients, policy, &jar_url, &jar_name).await?;
+    let bytes = fetch(jar_url.clone(), jar_name.clone()).await?;
     let hash_url = format!("{jar_url}.sha512");
-    let published =
-        match fetch_loader_bytes(clients, policy, &hash_url, &format!("{jar_name}.sha512")).await {
-            Ok(text) => Some(String::from_utf8_lossy(&text).into_owned()),
-            Err(error) if is_http_not_found(&error) => None,
-            Err(error) => return Err(error),
-        };
+    let published = match fetch(hash_url, format!("{jar_name}.sha512")).await {
+        Ok(text) => Some(String::from_utf8_lossy(&text).into_owned()),
+        Err(error) if is_http_not_found(&error) => None,
+        Err(error) => return Err(error),
+    };
     let verified =
         verify_published_hash(&bytes, published.as_deref(), &jar_name, allow_unverified)?;
     Ok((
@@ -2309,5 +2334,52 @@ side = "CLIENT"
             .await
             .unwrap_err();
         assert!(!err.to_string().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fabric_and_quilt_export_never_fetch_or_verify_the_profile() {
+        for (loader, version) in [("fabric", "0.20.1"), ("quilt", "0.30.1")] {
+            let tmp = TempDir::new().unwrap();
+            let ctx = core_api::ctx::Ctx::for_testing(tmp.path().to_path_buf());
+            let urls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = urls.clone();
+            let installer = b"invented installer bytes".to_vec();
+            let installer_hash = core_api::download::sha512_hex(&installer);
+            let fetch = |url: String, _file: String| {
+                let seen = seen.clone();
+                let installer = installer.clone();
+                let installer_hash = installer_hash.clone();
+                async move {
+                    seen.lock().unwrap().push(url.clone());
+                    if url.ends_with("maven-metadata.xml") {
+                        Ok(br#"<?xml version="1.0"?><metadata><versioning><release>1.2.3</release></versioning></metadata>"#.to_vec())
+                    } else if url.ends_with(".jar") {
+                        Ok(installer)
+                    } else if url.ends_with(".sha512") {
+                        Ok(installer_hash.into_bytes())
+                    } else {
+                        Err(LauncherError::Generic {
+                            code: "ERR_UNEXPECTED_PROFILE_FETCH".into(),
+                            message: format!("export must not fetch {url}"),
+                        })
+                    }
+                }
+            };
+            let policy = NetworkPolicy::all_disabled();
+            let prepared =
+                prepare_loader_with(&ctx, &policy, loader, "1.21.1", version, false, fetch)
+                    .await
+                    .unwrap_or_else(|error| panic!("{loader} export failed: {error}"));
+            assert_eq!(prepared.loader_version, version);
+            let requested = urls.lock().unwrap();
+            assert!(
+                !requested.iter().any(|url| {
+                    url.contains("meta.fabricmc.org")
+                        || url.contains("meta.quiltmc.org")
+                        || url.contains("/profile/json")
+                }),
+                "{loader} export requested a profile it does not use: {requested:?}"
+            );
+        }
     }
 }
