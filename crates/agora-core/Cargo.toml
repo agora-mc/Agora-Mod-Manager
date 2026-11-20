@@ -140,7 +140,6 @@ nix = { version = "0.31", default-features = false, features = ["fs"] }
 libc = "0.2"
 
 [dev-dependencies]
-serde_json = { workspace = true, features = ["preserve_order"] }
 tempfile = "3"
 # The Vortex import tests build an invented store in the same format Vortex uses.
 rusty-leveldb = "4.0.2"
