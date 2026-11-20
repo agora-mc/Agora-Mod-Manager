@@ -61,9 +61,8 @@ const VERSION_MANIFEST_URL: &str =
 /// other metadata (version JSONs addressed by SHA-1, asset indexes, pinned
 /// loader profiles) are content-addressable and need no freshness window.
 const VERSION_MANIFEST_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-// Bumped to 2: the loader/base library merge now replaces same-artifact
-// libraries, so plans cached with duplicate jars (e.g. two ASM versions) are stale.
-const RESOLVED_PLAN_CACHE_SCHEMA_VERSION: u32 = 2;
+// Bumped to 3 so plans that predate Maven-verified loader receipts are rebuilt.
+const RESOLVED_PLAN_CACHE_SCHEMA_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Redirect-safe HTTP clients
@@ -827,7 +826,7 @@ fn append_plan_source_metadata(records: &mut Vec<serde_json::Value>, path: &Path
     }));
 }
 
-/// Resolve base Minecraft metadata, an optional pinned Fabric/Quilt profile,
+/// Resolve base Minecraft metadata, an optional installed loader profile,
 /// and a compatible Java executable. Cache hits are verified and used without
 /// contacting the network, enabling offline resolution after first install.
 ///
@@ -888,7 +887,7 @@ pub async fn resolve(request: ResolveRequest) -> LauncherResult<ResolvedLaunchPl
                 &minecraft_dir,
                 &receipts_root,
                 &tuple,
-                loader_manifests::strip_sha_prefix(&entry.sha256),
+                entry.receipt_source_sha(lt),
             )
             .map_err(|issue| {
                 let err: LauncherError = issue.into();
@@ -1258,7 +1257,7 @@ async fn materialize_adopted_profile(
         .map(|r| r.generated_artifact_sha256.keys().cloned().collect())
         .unwrap_or_default();
 
-    // Curated pins: downloadable with exact SHA-256 from the pinned loader manifest.
+    // Curated pins: exact SHA-256 from the catalog or a verified Maven download.
     let curated_pins: std::collections::BTreeMap<String, String> = adopted_profile
         .receipt
         .as_ref()
@@ -2668,7 +2667,7 @@ fn missing_artifact<T>(kind: &str, path: &Path) -> LauncherResult<T> {
     })
 }
 
-fn resolve_library_artifact(
+pub(crate) fn resolve_library_artifact(
     library: &launch::Library,
 ) -> LauncherResult<Option<launch::LibraryArtifact>> {
     if let Some(artifact) = library
@@ -6074,7 +6073,8 @@ mod tests {
                         "artifact": {
                             "path": "net/fabricmc/fabric-loader/0.19.0/fabric-loader-0.19.0.jar",
                             "url": "https://maven.fabricmc.net/net/fabricmc/fabric-loader/0.19.0/fabric-loader-0.19.0.jar",
-                            "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "sha256": "a".repeat(64),
                         }
                     }
                 }
@@ -6093,7 +6093,18 @@ mod tests {
             minecraft_version: mc_version.into(),
             loader_version: loader_version.into(),
         };
-        write_forge_receipt(&receipts_root, &minecraft_dir, &tuple, &entry.sha256);
+        crate::installed_profile::create_receipt_for_profile_json(
+            &minecraft_dir,
+            &receipts_root,
+            &tuple,
+            &entry.source_url,
+            BTreeMap::from([(
+                "net/fabricmc/fabric-loader/0.19.0/fabric-loader-0.19.0.jar".into(),
+                "a".repeat(64),
+            )]),
+            BTreeMap::new(),
+        )
+        .unwrap();
 
         let resolved = resolve(ResolveRequest {
             instance_id: "adopt-fabric-test".into(),
@@ -6157,7 +6168,8 @@ mod tests {
                         "artifact": {
                             "path": "org/quiltmc/quilt-loader/0.30.0-beta.8/quilt-loader-0.30.0-beta.8.jar",
                             "url": "https://maven.quiltmc.org/repository/release/org/quiltmc/quilt-loader/0.30.0-beta.8/quilt-loader-0.30.0-beta.8.jar",
-                            "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                            "sha256": "b".repeat(64),
                         }
                     }
                 }
@@ -6176,7 +6188,18 @@ mod tests {
             minecraft_version: mc_version.into(),
             loader_version: loader_version.into(),
         };
-        write_forge_receipt(&receipts_root, &minecraft_dir, &tuple, &entry.sha256);
+        crate::installed_profile::create_receipt_for_profile_json(
+            &minecraft_dir,
+            &receipts_root,
+            &tuple,
+            &entry.source_url,
+            BTreeMap::from([(
+                "org/quiltmc/quilt-loader/0.30.0-beta.8/quilt-loader-0.30.0-beta.8.jar".into(),
+                "b".repeat(64),
+            )]),
+            BTreeMap::new(),
+        )
+        .unwrap();
 
         let resolved = resolve(ResolveRequest {
             instance_id: "adopt-quilt-test".into(),

@@ -441,6 +441,8 @@ agora instance wrapper <INSTANCE_ID> "mangohud --dlsym"
 
 `instance create` can set Java up front: `--jvm-memory-mb <MB>` gives the heap a fixed size and makes the memory choice manual, `--jvm-gc` picks `auto` (the default), `low_latency`, `high_efficiency` or `manual`, `--jvm-custom-args "<ARGS>"` adds raw JVM flags, and `--jvm-always-pre-touch true|false` switches heap pre-touching. `--template <TEMPLATE_ID>` starts the instance from a saved template's files and JVM settings (see [Templates](#templates)).
 
+Fabric and Quilt instance creation checks the generated client profile and verifies every library against its Maven repository's strongest published checksum. Run `agora instance repair-loader <ID>` to update an older installation that still has a profile-byte receipt. Both commands accept `--allow-unverified-loader` when a repository publishes no checksum for a library. Agora names each such file on stderr. A mismatch or invalid profile stops the operation.
+
 Clone flags can omit saves (`--no-saves`), mods (`--no-mods`), resource packs (`--no-resource-packs`), shader packs (`--no-shader-packs`), screenshots (`--no-screenshots`), configuration (`--no-config`), `servers.dat` (`--no-servers`), or options (`--no-options`). `--hard-links` and `--sym-links` change filesystem behavior and should be used only when the destination and source relationship is understood.
 
 Locking prevents ordinary content mutation. Unlock explicitly before applying intended changes.

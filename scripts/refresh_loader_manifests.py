@@ -17,7 +17,6 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
 import os
@@ -147,7 +146,10 @@ def _verification_targets(
     rotating slice is what notices upstream changing an older pinned file;
     every entry is reached once per len(entries) / sample_size days.
     """
-    entries = sorted(_manifest_entries(manifest), key=lambda pair: _entry_key(*pair))
+    entries = sorted(
+        (pair for pair in _manifest_entries(manifest) if not fetch.is_dynamic_profile(*pair)),
+        key=lambda pair: _entry_key(*pair),
+    )
     if sample_size is None or sample_size >= len(entries):
         return entries
     targets = [pair for pair in entries if _entry_key(*pair) in changed_keys]
@@ -162,22 +164,9 @@ def _verification_targets(
     return targets
 
 
-def _cache_name(source_url: str) -> str:
-    cache_name = source_url.split("/")[-1]
-    # Profile JSON URLs all end in /profile/json; give them unique cache names
-    # so we don't reuse the same cached file for every entry.
-    if not cache_name.endswith(".jar"):
-        ext = os.path.splitext(cache_name)[1] or ".bin"
-        cache_name = hashlib.sha256(source_url.encode("utf-8")).hexdigest()[:32] + ext
-    return cache_name
-
-
 def _file_fields(entry: dict[str, Any], path: Path) -> dict[str, Any]:
     """The file-derived fields of an entry, recomputed from a downloaded file."""
     data = path.read_bytes()
-    if entry.get("file_type") == "profile_json":
-        # Profile/version JSON is hashed with volatile keys stripped.
-        return {"sha256": fetch._stable_json_sha256(data)}
     fields: dict[str, Any] = {"sha256": fetch._sha256_hex(data)}
     if entry.get("file_type") == "installer_jar":
         fields["content_sha256"] = fetch.installer_content_sha256(path)
@@ -211,7 +200,7 @@ def verify_manifest(
     for loader, entry in targets:
         key = _entry_key(loader, entry)
         try:
-            cache_path = fetch._download_to_cache(entry["source_url"], _cache_name(entry["source_url"]))
+            cache_path = fetch._download_to_cache(entry["source_url"], entry["file_name"])
             upstream = _file_fields(entry, cache_path)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not verify %s: %s", key, exc)

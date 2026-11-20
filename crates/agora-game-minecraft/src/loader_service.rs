@@ -7,14 +7,20 @@ use crate::loader_compatibility::{
     evaluate_loader_compatibility, LoaderCompatibilityReport, LoaderCompatibilityRequest,
 };
 use crate::loader_manifests::{self, LoaderEntry};
-use agora_core::ctx::Ctx;
-use agora_core::error::{LauncherError, LauncherResult};
-use agora_core::event_sink::{CoreEvent, EventStatus, ProgressEvent, ProgressPhase};
-use agora_core::models::{InstanceManifest, InstanceRow};
-use agora_core::network::{NetworkCategory, NetworkPolicy};
-use agora_core::operation_manager::OpHandle;
+use agora_core::{
+    ctx::Ctx,
+    download::{sha1_hex, sha256_hex},
+    error::{LauncherError, LauncherResult},
+    event_sink::{CoreEvent, EventStatus, ProgressEvent, ProgressPhase},
+    models::{InstanceManifest, InstanceRow},
+    network::{NetworkCategory, NetworkPolicy},
+    operation_manager::OpHandle,
+};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
+
+mod generated_profile;
 
 const BACKUP_SUFFIX: &str = ".bak-reinstall";
 const INSTALLER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -48,6 +54,14 @@ impl LoaderService {
     }
 
     pub async fn repair(&self, instance_id: &str) -> LauncherResult<InstallReceiptSummary> {
+        self.repair_with_unverified_loader(instance_id, false).await
+    }
+
+    pub async fn repair_with_unverified_loader(
+        &self,
+        instance_id: &str,
+        allow_unverified_loader: bool,
+    ) -> LauncherResult<InstallReceiptSummary> {
         let conn = agora_core::db::local_state_connection(&self.ctx.paths.local_state_db())
             .map_err(|_| LauncherError::LocalStateFailed)?;
         let row = agora_core::db::get_instance(&conn, instance_id)
@@ -56,11 +70,12 @@ impl LoaderService {
                 code: "ERR_INSTANCE_NOT_FOUND".into(),
                 message: format!("Instance '{instance_id}' not found"),
             })?;
-        self.ensure_installed(
+        self.ensure_installed_with_options(
             &row.loader,
             &row.minecraft_version,
             &row.loader_version,
             true,
+            allow_unverified_loader,
         )
         .await
     }
@@ -365,10 +380,33 @@ impl LoaderService {
         loader_version: &str,
         force_reinstall: bool,
     ) -> LauncherResult<InstallReceiptSummary> {
+        self.ensure_installed_with_options(
+            loader,
+            minecraft_version,
+            loader_version,
+            force_reinstall,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn ensure_installed_with_options(
+        &self,
+        loader: &str,
+        minecraft_version: &str,
+        loader_version: &str,
+        force_reinstall: bool,
+        allow_unverified_loader: bool,
+    ) -> LauncherResult<InstallReceiptSummary> {
         let entry = loader_manifests::find_entry(loader, minecraft_version, loader_version)
             .ok_or(LauncherError::UnsupportedLoader)?;
-        self.ensure_entry(loader.to_owned(), entry, force_reinstall)
-            .await
+        self.ensure_entry(
+            loader.to_owned(),
+            entry,
+            force_reinstall,
+            allow_unverified_loader,
+        )
+        .await
     }
 
     async fn ensure_entry(
@@ -376,12 +414,17 @@ impl LoaderService {
         loader: String,
         entry: LoaderEntry,
         force_reinstall: bool,
+        allow_unverified_loader: bool,
     ) -> LauncherResult<InstallReceiptSummary> {
         let tuple = LoaderTuple {
             loader: loader.clone(),
             minecraft_version: entry.mc_version.clone(),
             loader_version: entry.loader_version.clone(),
         };
+        tuple.validate().map_err(|message| LauncherError::Generic {
+            code: "ERR_LOADER_TUPLE".into(),
+            message,
+        })?;
         let label = format!("Install {} {}", tuple.loader, tuple.loader_version);
         let op = self
             .ctx
@@ -443,7 +486,8 @@ impl LoaderService {
             return Err(e);
         }
 
-        let expected_sha = loader_manifests::strip_sha_prefix(&entry.sha256);
+        let is_maven_profile = entry.is_maven_profile(&loader);
+        let expected_sha = entry.receipt_source_sha(&loader);
         if !force_reinstall {
             if let Ok(adopted) = installed_profile::adopt_installed_profile(
                 &minecraft_root,
@@ -451,8 +495,20 @@ impl LoaderService {
                 &tuple,
                 expected_sha,
             ) {
-                op.complete();
-                return Ok(summary_from_adoption(tuple, adopted, true));
+                let unverified = adopted
+                    .receipt
+                    .as_ref()
+                    .filter(|_| is_maven_profile)
+                    .map(|receipt| &receipt.generated_artifact_sha256);
+                if unverified.is_none_or(|paths| paths.is_empty() || allow_unverified_loader) {
+                    if let Some(paths) = unverified {
+                        for path in paths.keys() {
+                            self.warn_unverified_library(&op, path);
+                        }
+                    }
+                    op.complete();
+                    return Ok(summary_from_adoption(tuple, adopted, true));
+                }
             }
         }
 
@@ -460,45 +516,33 @@ impl LoaderService {
             op.fail(e.to_string());
             return Err(e);
         }
-        let file_path = cache_dir.join(&entry.file_name);
-        let data = match verified_cache_hit(&file_path, &loader, &entry) {
-            Some(bytes) => bytes,
-            None => {
-                self.ctx.progress_sink.report(ProgressEvent::new(
-                    operation_id.clone(),
-                    ProgressPhase::Downloading,
-                    format!("Downloading {}", entry.file_name),
-                ));
-                match crate::loader_download::download_verified_with_clients(
-                    &self.ctx.http_clients,
-                    &loader,
-                    &entry.file_name,
-                    &entry.file_type,
-                    &entry.source_url,
-                    &entry.sha256,
-                )
-                .await
-                {
-                    Ok(bytes) => {
-                        if let Err(e) = atomic_write(&file_path, &bytes) {
-                            op.fail(e.to_string());
-                            return Err(e);
-                        }
+        let result = async {
+            self.ctx.progress_sink.report(ProgressEvent::new(
+                operation_id.clone(),
+                ProgressPhase::Downloading,
+                format!("Preparing {}", entry.file_name),
+            ));
+            if is_maven_profile {
+                self.install_maven_profile(&tuple, &entry, allow_unverified_loader, &op)
+                    .await
+            } else if entry.file_type == "installer_jar" {
+                let file_path = cache_dir.join(&entry.file_name);
+                let data = match verified_cache_hit(&file_path, &loader, &entry) {
+                    Some(bytes) => bytes,
+                    None => {
+                        let bytes = crate::loader_download::download_verified_with_clients(
+                            &self.ctx.http_clients,
+                            &loader,
+                            &entry.file_name,
+                            &entry.file_type,
+                            &entry.source_url,
+                            &entry.sha256,
+                        )
+                        .await?;
+                        atomic_write(&file_path, &bytes)?;
                         bytes
                     }
-                    Err(e) => {
-                        op.fail(e.to_string());
-                        return Err(e);
-                    }
-                }
-            }
-        };
-
-        let result = match entry.file_type.as_str() {
-            "profile_json" => {
-                install_profile_json(&minecraft_root, &receipts_root, &tuple, &entry, &data)
-            }
-            "installer_jar" => {
+                };
                 self.install_forge_profile(
                     &minecraft_root,
                     &receipts_root,
@@ -510,12 +554,11 @@ impl LoaderService {
                     &op,
                 )
                 .await
+            } else {
+                Err(LauncherError::UnsupportedLoader)
             }
-            _ => {
-                op.fail("unsupported loader");
-                return Err(LauncherError::UnsupportedLoader);
-            }
-        };
+        }
+        .await;
         match result {
             Ok(summary) => {
                 op.complete();
@@ -533,6 +576,77 @@ impl LoaderService {
                 Err(e)
             }
         }
+    }
+
+    fn warn_unverified_library(&self, op: &OpHandle, path: &str) {
+        let message =
+            format!("Warning: {path} has no published hash. Using it with explicit approval.");
+        eprintln!("{message}");
+        self.ctx.progress_sink.report(ProgressEvent::new(
+            op.id().clone(),
+            ProgressPhase::Verifying,
+            message,
+        ));
+    }
+
+    async fn install_maven_profile(
+        &self,
+        tuple: &LoaderTuple,
+        entry: &LoaderEntry,
+        allow_unverified_loader: bool,
+        op: &OpHandle,
+    ) -> LauncherResult<InstallReceiptSummary> {
+        let clients = &self.ctx.http_clients;
+        let data =
+            crate::loader_download::download_bytes_with_clients(clients, &entry.source_url).await?;
+        let mut profile: serde_json::Value =
+            serde_json::from_slice(&data).map_err(|error| LauncherError::Generic {
+                code: "ERR_LOADER_PROFILE_STRUCTURE".into(),
+                message: format!("Invalid loader profile JSON: {error}"),
+            })?;
+        let jars = generated_profile::validate(&mut profile, tuple)?;
+        let minecraft_root = self.ctx.paths.minecraft_runtime_root();
+        let receipts_root = self.ctx.paths.loader_receipts();
+        let libraries_dir = minecraft_root.join("libraries");
+        let mut verified = BTreeMap::new();
+        let mut unverified = BTreeMap::new();
+        let mut installed_libraries = Vec::with_capacity(jars.len());
+        for (name, artifact) in jars {
+            let (bytes, published) = crate::loader_download::download_maven_library(
+                clients,
+                &artifact.url,
+                allow_unverified_loader,
+            )
+            .await?;
+            let hash = sha256_hex(&bytes);
+            atomic_write(&libraries_dir.join(&artifact.path), &bytes)?;
+            installed_libraries.push(serde_json::json!({
+                "name": name,
+                "downloads": { "artifact": {
+                    "path": artifact.path,
+                    "url": artifact.url,
+                    "size": bytes.len(),
+                    "sha1": sha1_hex(&bytes),
+                    "sha256": hash,
+                }}
+            }));
+            if published {
+                verified.insert(artifact.path, hash);
+            } else {
+                self.warn_unverified_library(op, &artifact.path);
+                unverified.insert(artifact.path, hash);
+            }
+        }
+        profile["libraries"] = serde_json::Value::Array(installed_libraries);
+        install_profile_json(
+            &minecraft_root,
+            &receipts_root,
+            tuple,
+            &entry.source_url,
+            &profile,
+            verified,
+            unverified,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -855,37 +969,51 @@ fn install_profile_json(
     minecraft_root: &Path,
     receipts_root: &Path,
     tuple: &LoaderTuple,
-    entry: &LoaderEntry,
-    data: &[u8],
+    source_url: &str,
+    profile: &serde_json::Value,
+    verified: BTreeMap<String, String>,
+    unverified: BTreeMap<String, String>,
 ) -> LauncherResult<InstallReceiptSummary> {
-    let version_id = entry.file_name.trim_end_matches(".json");
+    let data = serde_json::to_vec(profile).map_err(|error| LauncherError::Generic {
+        code: "ERR_PROFILE_CORRUPT".into(),
+        message: error.to_string(),
+    })?;
+    let version_id = installed_profile::derive_profile_id(tuple);
     let target = minecraft_root
         .join("versions")
-        .join(version_id)
+        .join(&version_id)
         .join(format!("{version_id}.json"));
-    atomic_write(&target, data)?;
-    installed_profile::create_receipt_for_profile_json(
-        minecraft_root,
-        receipts_root,
-        tuple,
-        loader_manifests::strip_sha_prefix(&entry.sha256),
-        &entry.source_url,
-        std::collections::BTreeMap::new(),
-    )
-    .map_err(|issue| LauncherError::Generic {
-        code: "ERR_PROFILE_CORRUPT".into(),
-        message: issue.reasons.join("; "),
-    })?;
-    let profile: serde_json::Value =
-        serde_json::from_slice(data).map_err(|error| LauncherError::Generic {
+    let backup = backup_profile(minecraft_root, receipts_root, tuple)?;
+    let result = atomic_write(&target, &data).and_then(|()| {
+        installed_profile::create_receipt_for_profile_json(
+            minecraft_root,
+            receipts_root,
+            tuple,
+            source_url,
+            verified,
+            unverified,
+        )
+        .map_err(|issue| LauncherError::Generic {
             code: "ERR_PROFILE_CORRUPT".into(),
-            message: error.to_string(),
-        })?;
+            message: issue.reasons.join("; "),
+        })
+    });
+    let receipt = match result {
+        Ok(receipt) => {
+            delete_backup(minecraft_root, &version_id);
+            receipt
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&target);
+            restore_backup(minecraft_root, receipts_root, &backup);
+            return Err(error);
+        }
+    };
     Ok(InstallReceiptSummary {
         tuple: tuple.clone(),
-        profile_id: installed_profile::derive_profile_id(tuple),
+        profile_id: version_id,
         cache_hit: false,
-        profile_stable_hash: installed_profile::stable_profile_hash(&profile),
+        profile_stable_hash: receipt.profile_stable_hash,
         receipt_schema_version: installed_profile::RECEIPT_SCHEMA_VERSION,
         installer_exit_status: 0,
     })
@@ -1119,6 +1247,8 @@ mod tests {
     use agora_core::ctx::Ctx;
     use agora_core::models::InstalledMod;
     use std::io::Write;
+
+    mod generated_profiles;
 
     fn context() -> (Ctx, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(

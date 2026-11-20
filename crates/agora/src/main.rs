@@ -1419,6 +1419,11 @@ enum InstanceCmd {
         loader: String,
         #[arg(short = 'V', long, default_value = "", help = "Loader version")]
         loader_version: String,
+        #[arg(
+            long,
+            help = "Allow Fabric or Quilt libraries with no published checksum"
+        )]
+        allow_unverified_loader: bool,
         #[arg(long, help = "Heap size in MB; makes the memory choice manual")]
         jvm_memory_mb: Option<i64>,
         #[arg(
@@ -1487,7 +1492,14 @@ enum InstanceCmd {
     /// Rename an instance.
     Rename { id: String, name: String },
     /// Reinstall the mod loader for an instance.
-    RepairLoader { id: String },
+    RepairLoader {
+        id: String,
+        #[arg(
+            long,
+            help = "Allow Fabric or Quilt libraries with no published checksum"
+        )]
+        allow_unverified_loader: bool,
+    },
     /// Explain the current automatic memory estimate without changing settings.
     RecommendMemory { id: String },
     #[command(flatten)]
@@ -4742,6 +4754,7 @@ async fn run_instance_command(
             mc_version,
             loader,
             loader_version,
+            allow_unverified_loader,
             jvm_memory_mb,
             jvm_gc,
             jvm_custom_args,
@@ -4769,7 +4782,9 @@ async fn run_instance_command(
                 pack_icon_url: None,
                 template_id,
             };
-            let row = InstanceService::new(ctx.clone()).create(request).await?;
+            let row = InstanceService::new(ctx.clone())
+                .create_with_unverified_loader(request, allow_unverified_loader)
+                .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&row)?);
             } else {
@@ -4952,8 +4967,13 @@ async fn run_instance_command(
                 println!("Renamed instance '{}' to '{}'", id, name);
             }
         }
-        InstanceCmd::RepairLoader { id } => {
-            let summary = LoaderService::new(ctx.clone()).repair(&id).await?;
+        InstanceCmd::RepairLoader {
+            id,
+            allow_unverified_loader,
+        } => {
+            let summary = LoaderService::new(ctx.clone())
+                .repair_with_unverified_loader(&id, allow_unverified_loader)
+                .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&summary)?);
             } else {
@@ -17933,6 +17953,41 @@ mod tests {
                 assert_eq!(state, "on");
             }
             _ => panic!("wrong command variant"),
+        }
+    }
+
+    #[test]
+    fn instance_allow_unverified_loader_is_explicit() {
+        for (command, required_args) in [
+            (
+                "create",
+                &["Invented Instance", "--mc-version", "1.21.1"][..],
+            ),
+            ("repair-loader", &["invented-instance"][..]),
+        ] {
+            let mut args = vec!["agora", "instance", command];
+            args.extend_from_slice(required_args);
+            for expected in [false, true] {
+                if expected {
+                    args.push("--allow-unverified-loader");
+                }
+                let cli = Cli::try_parse_from(&args).unwrap();
+                let Commands::Instance { action } = cli.command else {
+                    panic!("expected instance command");
+                };
+                let actual = match action {
+                    super::InstanceCmd::Create {
+                        allow_unverified_loader,
+                        ..
+                    }
+                    | super::InstanceCmd::RepairLoader {
+                        allow_unverified_loader,
+                        ..
+                    } => allow_unverified_loader,
+                    _ => panic!("expected instance create or repair"),
+                };
+                assert_eq!(actual, expected, "{command}");
+            }
         }
     }
 

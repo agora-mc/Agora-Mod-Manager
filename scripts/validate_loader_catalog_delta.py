@@ -14,6 +14,8 @@ from fetch_loader_manifests import (
     FILE_DERIVED_FIELDS,
     IMMUTABLE_ENTRY_FIELDS,
     QUARANTINE_PATH,
+    PROFILE_VERIFICATION,
+    is_dynamic_profile,
 )
 
 
@@ -103,6 +105,12 @@ def validate_catalog_delta(
     for key in sorted(set(before_entries) & set(after_entries)):
         old_entry = before_entries[key]
         new_entry = after_entries[key]
+        legacy_profile_migration = (
+            is_dynamic_profile(key.split("/", 1)[0], old_entry)
+            and is_dynamic_profile(key.split("/", 1)[0], new_entry)
+            and new_entry.get("verification") == PROFILE_VERIFICATION
+            and "sha256" not in new_entry
+        )
         # A re-pinned file may change what was derived from the file, and only
         # that; the rest of the entry still has to match.
         rotated = old_entry.get("sha256") != new_entry.get("sha256") and _is_recorded_rotation(
@@ -115,6 +123,7 @@ def validate_catalog_delta(
             for field in IMMUTABLE_ENTRY_FIELDS
             if old_entry.get(field) != new_entry.get(field)
             and not (rotated and field in FILE_DERIVED_FIELDS)
+            and not (legacy_profile_migration and field == "sha256")
         }
         if changed_fields:
             mutations.append({"key": key, "fields": changed_fields})

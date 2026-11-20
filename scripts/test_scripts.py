@@ -255,6 +255,34 @@ class TestLoaderCatalogRefreshSafety(unittest.TestCase):
 
         self.assertEqual(merged, [existing, added])
 
+    def test_dynamic_profile_replaces_legacy_pin_without_quarantine(self):
+        old = dict(self._entry(), file_type="profile_json", file_name="loader.json")
+        fresh = {key: value for key, value in old.items() if key != "sha256"}
+        fresh["verification"] = "profile_structure_and_maven_checksums"
+        merged = fetch_loader_manifests._merge_entries([old], [fresh], loader="fabric")
+        self.assertEqual(merged[0]["verification"], fresh["verification"])
+        self.assertNotIn("sha256", merged[0])
+
+        before = {"domain_allowlist": [], "loaders": {"fabric": [old]}}
+        after = {"domain_allowlist": [], "loaders": {"fabric": merged}}
+        report = validate_loader_catalog_delta.validate_catalog_delta(
+            before, after, append_only=True, reject_existing_mutations=True
+        )
+        self.assertEqual(report["errors"], [])
+        for manifest in [before, after]:
+            self.assertEqual(
+                refresh_loader_manifests._verification_targets(
+                    manifest, {"fabric/1.21/0.1.0"}, None
+                ),
+                [],
+            )
+
+    @mock.patch("fetch_loader_manifests._fetch_profile_json", return_value=b"{}")
+    @mock.patch("fetch_loader_manifests._fetch_json", return_value=[{"loader": {"version": "0.1.0"}}])
+    def test_empty_generated_profile_is_rejected(self, _fetch_json, _fetch_profile):
+        with self.assertRaises(fetch_loader_manifests.UpstreamMetadataError):
+            fetch_loader_manifests._fetch_fabric("1.21")
+
     def test_merge_rejects_derivation_change_for_unchanged_file(self):
         existing = self._entry()
         changed = dict(existing)
@@ -671,16 +699,30 @@ class TestLoaderManifestEnrichment(unittest.TestCase):
 
     # -- New entries from fetchers carry capabilities ------------------------
 
+    @staticmethod
+    def _profile_fixture(url, _cache_name, **_kw):
+        loader = url.split(".")[1].removesuffix("mc")
+        mc_version, loader_version = url.split("/")[-4:-2]
+        return json.dumps({
+            "id": f"{loader}-loader-{loader_version}-{mc_version}",
+            "inheritsFrom": mc_version,
+            "libraries": [{"name": "example.test:invented:1.0"}],
+        }).encode()
+
     @mock.patch("fetch_loader_manifests._fetch_profile_json")
     @mock.patch("fetch_loader_manifests._fetch_json")
     def test_fabric_new_entry_writes_capabilities(self, fetch_json, fetch_profile):
         fetch_json.return_value = [{"loader": {"version": "0.19.0"}}]
-        fetch_profile.return_value = b'{"loader": {"version": "0.19.0"}}'
+        fetch_profile.side_effect = self._profile_fixture
         entries = fetch_loader_manifests._fetch_fabric("1.21", refresh_profiles=True)
         self.assertEqual(
             entries[0]["provided_versions"], {"fabricloader": "0.19.0"}
         )
         self.assertEqual(entries[0]["release_channel"], "stable")
+        self.assertEqual(
+            entries[0]["verification"], "profile_structure_and_maven_checksums"
+        )
+        self.assertNotIn("sha256", entries[0])
 
     def _quilt_maven_jar(
         self, directory: str, loader_version: str, provided: str | None
@@ -715,7 +757,7 @@ class TestLoaderManifestEnrichment(unittest.TestCase):
         self, fetch_json, fetch_profile, download
     ):
         fetch_json.return_value = [{"loader": {"version": "0.28.0-beta.5"}}]
-        fetch_profile.return_value = b'{"loader": {"version": "0.28.0-beta.5"}}'
+        fetch_profile.side_effect = self._profile_fixture
         with tempfile.TemporaryDirectory() as directory:
             download.return_value = self._quilt_maven_jar(
                 directory, "0.28.0-beta.5", "0.16.0"
@@ -726,6 +768,10 @@ class TestLoaderManifestEnrichment(unittest.TestCase):
             {"quilt_loader": "0.28.0-beta.5", "fabricloader": "0.16.0"},
         )
         self.assertEqual(entries[0]["release_channel"], "prerelease")
+        self.assertEqual(
+            entries[0]["verification"], "profile_structure_and_maven_checksums"
+        )
+        self.assertNotIn("sha256", entries[0])
 
     @mock.patch("fetch_loader_manifests._download_to_cache")
     @mock.patch("fetch_loader_manifests._fetch_profile_json")
@@ -737,7 +783,7 @@ class TestLoaderManifestEnrichment(unittest.TestCase):
             {"loader": {"version": "0.30.1"}},
             {"loader": {"version": "0.26.3"}},
         ]
-        fetch_profile.return_value = b"{}"
+        fetch_profile.side_effect = self._profile_fixture
         with tempfile.TemporaryDirectory() as directory:
             jars = {
                 "0.30.1": self._quilt_maven_jar(directory, "0.30.1", "0.19.3"),
@@ -768,7 +814,7 @@ class TestLoaderManifestEnrichment(unittest.TestCase):
         self, fetch_json, fetch_profile, download
     ):
         fetch_json.return_value = [{"loader": {"version": "0.30.1"}}]
-        fetch_profile.return_value = b"{}"
+        fetch_profile.side_effect = self._profile_fixture
         with tempfile.TemporaryDirectory() as directory:
             download.return_value = self._quilt_maven_jar(
                 directory, "0.30.1", None
@@ -788,7 +834,7 @@ class TestLoaderManifestEnrichment(unittest.TestCase):
         self, fetch_json, fetch_profile, download
     ):
         fetch_json.return_value = [{"loader": {"version": "0.30.1"}}]
-        fetch_profile.return_value = b"{}"
+        fetch_profile.side_effect = self._profile_fixture
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "quilt-loader-0.30.1.jar"
             path.write_text("not a zip", encoding="utf-8")
@@ -808,7 +854,7 @@ class TestLoaderManifestEnrichment(unittest.TestCase):
         self, fetch_json, fetch_profile, download
     ):
         fetch_json.return_value = [{"loader": {"version": "0.30.1"}}]
-        fetch_profile.return_value = b"{}"
+        fetch_profile.side_effect = self._profile_fixture
         with tempfile.TemporaryDirectory() as directory:
             download.return_value = self._quilt_maven_jar(
                 directory, "0.30.1", "${fabric_loader_version}"
