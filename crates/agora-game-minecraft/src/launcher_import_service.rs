@@ -2438,7 +2438,7 @@ fn recover_one_job(
     let final_dir = PathBuf::from(&job.final_path);
     if !staging.starts_with(paths.staging_root()) || !final_dir.starts_with(paths.instances_root())
     {
-        let _ = agora_core::db::delete_instance_import_job(connection, &job.job_id);
+        let _ = db::delete_instance_import_job(connection, &job.job_id);
         return Some(format!(
             "Ignored unsafe interrupted import paths for {}",
             job.instance_id
@@ -2446,7 +2446,7 @@ fn recover_one_job(
     }
 
     // A failed lookup is "could not tell", never "no row": stop without touching the journal.
-    let import_committed = match agora_core::db::get_instance_import(connection, &job.instance_id) {
+    let import_committed = match db::get_instance_import(connection, &job.instance_id) {
         Ok(record) => {
             record.is_some_and(|record| record.source_fingerprint == job.plan_fingerprint)
         }
@@ -2458,7 +2458,7 @@ fn recover_one_job(
             ));
         }
     };
-    let instance_committed = match agora_core::db::get_instance(connection, &job.instance_id) {
+    let instance_committed = match db::get_instance(connection, &job.instance_id) {
         Ok(row) => row.is_some(),
         Err(error) => {
             return Some(format!(
@@ -2506,7 +2506,7 @@ fn recover_one_job(
     } else {
         // Only a positive "no such instance" permits deleting the final directory. A failed
         // lookup means we cannot tell whether a live or newly created instance now owns it.
-        let instance_exists = match agora_core::db::get_instance(connection, &job.instance_id) {
+        let instance_exists = match db::get_instance(connection, &job.instance_id) {
             Ok(row) => row.is_some(),
             Err(error) => {
                 return Some(format!(
@@ -2522,7 +2522,7 @@ fn recover_one_job(
         }
         format!("Rolled back interrupted import for {}", job.instance_id)
     };
-    let _ = agora_core::db::delete_instance_import_job(connection, &job.job_id);
+    let _ = db::delete_instance_import_job(connection, &job.job_id);
     Some(line)
 }
 
