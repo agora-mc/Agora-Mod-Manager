@@ -183,9 +183,7 @@ pub fn clone_instance(
         let destination = &clone_folders.in_use(game_instance::SavesChoice::Own)?.path;
         if game_saves::checked_metadata(
             destination,
-            destination
-                .parent()
-                .unwrap_or_else(|| destination.as_path()),
+            destination.parent().unwrap_or(destination.as_path()),
         )?
         .is_some()
         {
