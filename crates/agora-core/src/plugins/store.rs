@@ -317,6 +317,27 @@ pub fn script_consent(conn: &Connection, plugin_id: &PluginId) -> LauncherResult
     .map_err(db_error)
 }
 
+/// Every digest an answer was given for, keyed by plugin id. A row with no
+/// digest is recorded as `None`, which is not the same as no row at all.
+pub fn list_script_consent_code_hashes(
+    conn: &Connection,
+) -> LauncherResult<std::collections::BTreeMap<String, Option<String>>> {
+    let mut stmt = conn
+        .prepare("SELECT plugin_id, code_hash FROM plugin_script_consent")
+        .map_err(db_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(db_error)?;
+    let mut out = std::collections::BTreeMap::new();
+    for row in rows {
+        let (id, hash) = row.map_err(db_error)?;
+        out.insert(id, hash);
+    }
+    Ok(out)
+}
+
 /// Every recorded answer, keyed by plugin id.
 pub fn list_script_consent(
     conn: &Connection,

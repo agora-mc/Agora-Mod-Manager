@@ -166,10 +166,13 @@ pub struct PluginSummary {
     pub official: super::official::OfficialStatus,
     /// The plugin has code (an entrypoint). A data-only plugin runs nothing.
     pub runs_code: bool,
-    /// The user allowed this plugin's code to run. Always `false` for a
-    /// data-only plugin. Independent of every other plugin, and of the
-    /// emergency stop, which overrides it while engaged.
+    /// The user allowed this plugin's code to run and the code on disk is what
+    /// they allowed. Always `false` for a data-only plugin. Independent of every
+    /// other plugin, and of the emergency stop, which overrides it while engaged.
     pub scripts_allowed: bool,
+    /// The Code column's label, including why an earlier answer no longer
+    /// covers the installed code. Uses the same consent check as the runtime.
+    pub scripts_consent_text: String,
 }
 
 /// The outcome of the most recent update check, for display.
@@ -361,6 +364,16 @@ impl CodeConsentState {
 
     fn permitted(self) -> bool {
         matches!(self, Self::NoCode | Self::Allowed)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NoCode => "none",
+            Self::NotAnswered => "not allowed",
+            Self::Allowed => "allowed",
+            Self::Stale => "consent needed again (code changed)",
+            Self::Uncheckable => "could not tell (code not verified)",
+        }
     }
 }
 
@@ -1015,13 +1028,17 @@ impl PluginService {
             .read()
             .map(|statuses| statuses.clone())
             .unwrap_or_default();
-        let consent = self.script_consent_for_display();
+        let consent = self.code_consent_for_display();
         resolution
             .plugins
             .iter()
             .map(|resolved| {
                 let id = resolved.id().clone();
                 let manifest = &resolved.record.manifest;
+                let code_state = consent
+                    .get(id.as_str())
+                    .copied()
+                    .unwrap_or(CodeConsentState::Uncheckable);
                 PluginSummary {
                     id: id.to_string(),
                     name: manifest.name.clone(),
@@ -1059,30 +1076,58 @@ impl PluginService {
                         .cloned()
                         .unwrap_or(super::official::OfficialStatus::Community),
                     runs_code: !manifest.is_declarative_only(),
-                    scripts_allowed: !manifest.is_declarative_only()
-                        && consent.get(id.as_str()).copied() == Some(true),
+                    scripts_allowed: !manifest.is_declarative_only() && code_state.permitted(),
+                    scripts_consent_text: code_state.label().to_string(),
                 }
             })
             .collect()
     }
 
-    /// The recorded script choices, keyed by plugin id.
-    ///
-    /// Unreadable reads as "nobody allowed anything", which shows scripts as not
-    /// allowed: the safe direction for a display, and `scripts_permitted` does
-    /// its own read.
-    fn script_consent_for_display(&self) -> BTreeMap<String, bool> {
-        match self
-            .inner
-            .conn()
-            .and_then(|conn| store::list_script_consent(&conn))
-        {
-            Ok(consent) => consent,
+    /// Consent states for every installed plugin, keyed by id. The answers and
+    /// their digests are read in one query each rather than per row, then each
+    /// code identity goes through the same memoised digest as the runtime gate.
+    /// An unreadable answer is Uncheckable, which shows no permission.
+    #[allow(clippy::type_complexity)]
+    fn code_consent_for_display(&self) -> BTreeMap<String, CodeConsentState> {
+        let Ok(conn) = self.inner.conn() else {
+            return BTreeMap::new();
+        };
+        let answers = match store::list_script_consent(&conn) {
+            Ok(answers) => answers,
             Err(e) => {
                 eprintln!("[plugins] could not read script choices: {e}");
-                BTreeMap::new()
+                return BTreeMap::new();
             }
+        };
+        let hashes = match store::list_script_consent_code_hashes(&conn) {
+            Ok(hashes) => hashes,
+            Err(e) => {
+                eprintln!("[plugins] could not read consented code digests: {e}");
+                return BTreeMap::new();
+            }
+        };
+        let Ok(resolution) = self.inner.resolution.read() else {
+            return BTreeMap::new();
+        };
+        let mut out = BTreeMap::new();
+        for resolved in &resolution.plugins {
+            let id = resolved.id();
+            let manifest = &resolved.record.manifest;
+            let state = if manifest.is_declarative_only() {
+                CodeConsentState::NoCode
+            } else {
+                let answered = answers.get(id.as_str()).copied();
+                let consented = hashes.get(id.as_str()).and_then(|hash| hash.as_deref());
+                match self.code_digest_for(id, manifest, &resolved.record.install_dir) {
+                    Ok(current) => {
+                        CodeConsentState::classify(answered, consented, current.as_deref())
+                    }
+                    Err(_) => CodeConsentState::Uncheckable,
+                }
+            };
+            out.insert(id.as_str().to_string(), state);
         }
+        out
     }
 
     /// Pinned update sources and last check results, keyed by plugin id.

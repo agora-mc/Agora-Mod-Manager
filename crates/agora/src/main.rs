@@ -3615,14 +3615,7 @@ async fn run_plugin_command(
                             },
                             if plugin.enabled { "yes" } else { "no" }.into(),
                             if plugin.running { "yes" } else { "no" }.into(),
-                            if !plugin.runs_code {
-                                "none"
-                            } else if plugin.scripts_allowed {
-                                "allowed"
-                            } else {
-                                "not allowed"
-                            }
-                            .into(),
+                            plugin.scripts_consent_text.clone(),
                             plugin.status_text.clone(),
                         ]
                     })
