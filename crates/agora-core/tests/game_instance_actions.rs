@@ -1088,6 +1088,11 @@ fn a_restore_cut_off_after_the_move_is_finished_by_recovery() {
         br#"{"new_id":"grounded-1","new_name":"Grounded"}"#,
     )
     .expect("the marker");
+    std::fs::write(
+        entry.join("instance").join(".agora-restore-marker.json"),
+        serde_json::json!({ "entry_id": entry_id }).to_string(),
+    )
+    .expect("the marker inside the moved folder");
     std::fs::rename(
         entry.join("instance"),
         f.ctx.paths.instance_dir("grounded-1").expect("a dir"),
@@ -1125,6 +1130,107 @@ fn a_restore_cut_off_before_the_move_is_called_off() {
     assert!(entry.join("instance").is_dir(), "the files must stay put");
     let restored = trash::restore(&f.ctx, &entry_id, None).expect("the restore still works");
     assert_eq!(restored.instance_id, "grounded-1");
+}
+
+/// A crash after the row was inserted but before the entry was tidied: recovery must not rewrite
+/// the live instance again, and it must tidy the entry now that the marker proves ownership.
+#[test]
+fn a_committed_restore_cut_off_before_tidy_is_tidied_without_rewriting() {
+    let f = Fixture::new();
+    write_instance(&f.ctx, &manifest("grounded-1", "Grounded"));
+    let entry_id = game_instance::delete(&f.ctx, "grounded-1")
+        .expect("the delete")
+        .trash_entry_id
+        .expect("an entry");
+    let entry = f.ctx.paths.recently_deleted_games_root().join(&entry_id);
+    std::fs::write(
+        entry.join("restoring.json"),
+        br#"{"new_id":"grounded-1","new_name":"Renamed"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        entry.join("instance").join(".agora-restore-marker.json"),
+        serde_json::json!({ "entry_id": entry_id }).to_string(),
+    )
+    .unwrap();
+    let dest = f.ctx.paths.instance_dir("grounded-1").expect("a dir");
+    std::fs::rename(entry.join("instance"), &dest).unwrap();
+    let before = std::fs::read(dest.join("instance_manifest.json")).unwrap();
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db())
+        .expect("a connection");
+    conn.execute(
+        "INSERT INTO game_instances (instance_id, game, name, base_json, created_at, last_launched_at)
+         VALUES ('grounded-1', 'skyrim-se', 'Renamed', ?1, datetime('now'), NULL)",
+        [serde_json::to_string(&manifest("grounded-1", "Grounded").base).unwrap()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (actions, warnings) = trash::recover_interrupted_reporting(&f.ctx);
+
+    assert!(warnings.is_empty(), "no warning: {warnings:?}");
+    assert!(actions.iter().any(|a| a.contains("already")), "{actions:?}");
+    assert_eq!(
+        std::fs::read(dest.join("instance_manifest.json")).unwrap(),
+        before,
+        "the live instance was not rewritten"
+    );
+    assert!(
+        !dest.join(".agora-restore-marker.json").exists(),
+        "marker cleaned up"
+    );
+    assert!(!entry.exists(), "the entry was tidied");
+    assert!(
+        game_instance::get(&f.ctx, "grounded-1").unwrap().is_some(),
+        "the row is still there"
+    );
+}
+
+/// A stale `restoring.json` from one trash entry must not let recovery rewrite the manifest of
+/// a different folder that later came to occupy the destination id. The folder has to carry the
+/// marker the delete wrote for this entry.
+#[test]
+fn a_stale_restore_marker_does_not_claim_a_reused_destination() {
+    let f = Fixture::new();
+    // A foreign instance folder at the destination id, with no row yet (creation in flight).
+    let foreign = write_instance(&f.ctx, &manifest("target-id", "Foreign"));
+    let before = std::fs::read(foreign.join("instance_manifest.json")).unwrap();
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db())
+        .expect("a connection");
+    conn.execute(
+        "DELETE FROM game_instances WHERE instance_id = 'target-id'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    // A different instance whose restore was cut off after the files moved out of the entry.
+    write_instance(&f.ctx, &manifest("victim", "Victim"));
+    let entry_id = game_instance::delete(&f.ctx, "victim")
+        .expect("the delete")
+        .trash_entry_id
+        .expect("an entry");
+    let entry = f.ctx.paths.recently_deleted_games_root().join(&entry_id);
+    std::fs::write(
+        entry.join("restoring.json"),
+        br#"{"new_id":"target-id","new_name":"Renamed"}"#,
+    )
+    .unwrap();
+    std::fs::remove_dir_all(entry.join("instance")).unwrap();
+
+    let (_actions, warnings) = trash::recover_interrupted_reporting(&f.ctx);
+
+    assert_eq!(
+        std::fs::read(foreign.join("instance_manifest.json")).unwrap(),
+        before,
+        "a reused destination must be left alone"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("marker") && w.contains("left as it is")),
+        "the refusal is reported: {warnings:?}"
+    );
 }
 
 #[cfg(windows)]

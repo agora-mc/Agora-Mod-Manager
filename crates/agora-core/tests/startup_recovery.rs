@@ -574,6 +574,16 @@ fn write_instance(ctx: &CoreContext, manifest: &GameInstanceManifest) -> PathBuf
     dir
 }
 
+/// Mirrors the marker the real restore writes *inside* the folder it moves, so recovery can
+/// prove a destination folder came from this entry (see `trash.rs`).
+fn write_restore_marker(folder: &Path, entry_id: &str) {
+    std::fs::write(
+        folder.join(".agora-restore-marker.json"),
+        serde_json::json!({ "entry_id": entry_id }).to_string(),
+    )
+    .unwrap();
+}
+
 /// The startup pass finishes an interrupted Recently deleted restore: the instance row comes
 /// back, the entry is tidied, and the report names the action.
 #[test]
@@ -595,6 +605,7 @@ fn the_startup_pass_finishes_an_interrupted_recently_deleted_restore() {
         br#"{"new_id":"grounded-1","new_name":"Grounded"}"#,
     )
     .expect("the marker");
+    write_restore_marker(&entry.join("instance"), &entry_id);
     std::fs::rename(
         entry.join("instance"),
         ctx.paths.instance_dir("grounded-1").expect("a dir"),
@@ -637,6 +648,7 @@ fn the_startup_pass_leaves_a_busy_trash_entry_alone() {
         br#"{"new_id":"busy-1","new_name":"Busy"}"#,
     )
     .expect("the marker");
+    write_restore_marker(&entry.join("instance"), &entry_id);
     std::fs::rename(
         entry.join("instance"),
         ctx.paths.instance_dir("busy-1").expect("a dir"),
