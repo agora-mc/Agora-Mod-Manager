@@ -9,7 +9,11 @@
 //! and where it lives are in `game_tool_copy`.
 //!
 //! The discipline follows `game_user_files`: a journal is written, and made durable, before anything
-//! is renamed or copied. A journal left by a crash is put back by the next check, which runs before any
+//! is renamed or copied. The run holds the game/store user-files lock (`LockResource::GameUserFiles`)
+//! for the whole operation — from before the journal is written, through the copy, the spawned
+//! tool's run and the post-exit capture, until the journal is cleared — and every recovery takes
+//! that same lock with no wait, so a run that is still going can never be recovered underneath it.
+//! A journal left by a crash is put back by the next check, which runs before any
 //! launch, deploy, tool run or user-files session for that game, and by the one startup recovery pass
 //! every adapter runs (`startup_recovery::run_at_startup`). Recovery discards the run's writes rather
 //! than capturing them: the copy is deleted, or moved home and deleted. It never
@@ -144,6 +148,42 @@ fn seam() -> VolumeSeam {
         .ok()
         .and_then(|guard| *guard)
         .unwrap_or_default()
+}
+
+/// Where in a swap run the test hook fires.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunHookPoint {
+    /// The real `Data` is renamed aside and the copy is in place; the tool has not spawned yet.
+    BeforeSpawn,
+    /// The tool has exited; the copy is being put back and its writes captured.
+    PostExitCapture,
+}
+
+#[doc(hidden)]
+type RunHook = std::sync::Arc<
+    dyn Fn(&Ctx, &SwapJournal, RunHookPoint) + Send + Sync,
+>;
+
+static RUN_HOOK: Mutex<Option<RunHook>> = Mutex::new(None);
+
+/// Set or clear the run hook (a test seam; production never sets it). Tests that set it must run
+/// one at a time.
+#[doc(hidden)]
+pub fn set_run_hook(hook: Option<RunHook>) {
+    if let Ok(mut guard) = RUN_HOOK.lock() {
+        *guard = hook;
+    }
+}
+
+/// Fire the run hook at `point`, when a test set one. Production never sets one, so this does
+/// nothing.
+#[doc(hidden)]
+pub fn run_hook(ctx: &Ctx, journal: &SwapJournal, point: RunHookPoint) {
+    let hook = RUN_HOOK.lock().ok().and_then(|guard| guard.clone());
+    if let Some(hook) = hook {
+        hook(ctx, journal, point);
+    }
 }
 
 /// The journal file of one game and store.

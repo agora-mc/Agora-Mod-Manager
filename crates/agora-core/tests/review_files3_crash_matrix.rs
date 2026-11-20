@@ -256,6 +256,7 @@ fn build(h: &TestHarness, def: &GameDefinition, id: &str, stages: &[Stage]) {
             swapped: false,
             state: Some(FileState::BackingUp),
             restored: false,
+            real_link_target: None,
         };
         if *st != Initial {
             f.existed = true;
@@ -469,6 +470,7 @@ fn a_shortened_new_real_file_after_swap_in_is_kept_as_the_instance_copy() {
             swapped: true,
             state: Some(FileState::Swapped),
             restored: false,
+            real_link_target: None,
         }],
     };
     let jp = journal_path_of(&h, &def);

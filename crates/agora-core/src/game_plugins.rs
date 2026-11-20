@@ -459,9 +459,13 @@ fn recover_stale_session(
         return Ok(());
     }
     // A session that is running (or still starting) is not a stale one: leave it alone, or a
-    // plugin edit during a launch would put back the files the launch just swapped in.
-    if let Some(session) = crate::game_user_files::status(ctx, &definition.id, store)? {
-        if session.running {
+    // plugin edit during a launch would put back the files the launch just swapped in. A
+    // session that records no process identity at all has unknown liveness (a legacy journal,
+    // or a self-capture that failed), so it is left for the explicit restore command too.
+    if let Some(details) = crate::game_user_files::details(ctx, &definition.id, store)? {
+        if details.running
+            || crate::game_user_files::details_liveness_unknown(&details)
+        {
             return Ok(());
         }
     }

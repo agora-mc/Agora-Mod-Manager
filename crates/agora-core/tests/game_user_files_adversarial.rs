@@ -410,6 +410,7 @@ fn a_hash_mismatch_names_the_real_file_and_its_backup() {
             swapped: true,
             state: Some(agora_core::game_user_files::FileState::Swapped),
             restored: false,
+            real_link_target: None,
         }],
     };
     let journal_path = journal_path_of(&h, &def);

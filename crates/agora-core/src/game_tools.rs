@@ -2059,6 +2059,24 @@ fn release_session(
     }
 }
 
+/// [`release_session`] for a caller that already holds the game/store user-files lock — a swap run
+/// holds it for the whole operation, and the lock manager is not re-entrant.
+fn release_session_locked(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    store: &StoreId,
+    launch_id: &str,
+) -> Result<(), ToolError> {
+    if game_user_files::status(ctx, &definition.id, store)?.is_none() {
+        return Ok(());
+    }
+    game_user_files::finish_starting_launch_locked(ctx, &definition.id, store, launch_id)?;
+    match game_user_files::restore_locked(ctx, definition, store) {
+        Ok(_) | Err(UserFilesError::NoSession { .. }) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 struct TreeExit {
     code: Option<i32>,
     cancelled: bool,
@@ -3771,9 +3789,20 @@ fn run_by_swap(
     game_tool_swap::preflight(&install, &real_data, &aside, &copy.space_need())?;
     let fingerprint = input_fingerprint_scoped(ctx, instance_id, definition, tool, scope_item)?;
 
+    // The game/store user-files lock keys this whole operation: both journals the run writes (the
+    // user-files session and this swap journal) live under it, and every recovery — the startup
+    // pass in another Agora process, the explicit restore — takes the same lock with no wait.
+    // Holding it from before the first journal write until the swap journal is cleared means a
+    // recovery can never act on a live run: it cannot take the lock, so it skips and reports.
+    let _swap_lock = ctx.lock_manager.acquire(
+        crate::lock_manager::LockResource::GameUserFiles(definition.id.clone(), store.clone()),
+        "tool-swap-run",
+    )?;
+
     // The user files go in before the real Data moves, so the swap journal is the only swap in progress
-    // for this game when the recovery check runs.
-    let swapped = game_user_files::swap_in(ctx, instance_id, definition, &store, &install)?;
+    // for this game when the recovery check runs. The lock is already held, so this does not take
+    // it again.
+    let swapped = game_user_files::swap_in_locked(ctx, instance_id, definition, &store, &install)?;
 
     let mut journal = SwapJournal {
         version: game_tool_swap::JOURNAL_VERSION,
@@ -3793,7 +3822,7 @@ fn run_by_swap(
     };
     // The journal is written, and made durable, before the copy or the real Data is touched.
     if let Err(e) = game_tool_swap::write_journal(ctx, &journal) {
-        let _ = release_session(ctx, definition, &store, &swapped.launch_id);
+        let _ = release_session_locked(ctx, definition, &store, &swapped.launch_id);
         return Err(e.into());
     }
 
@@ -3820,6 +3849,9 @@ fn run_by_swap(
             e.into(),
         ));
     }
+    // The copy is in place of the real Data and the journal is durable; the tool has not spawned
+    // yet. A recovery running right now must leave the operation alone (the lock above is held).
+    game_tool_swap::run_hook(ctx, &journal, game_tool_swap::RunHookPoint::BeforeSpawn);
     if let Some(configured) = configured {
         if let Err(e) = configured.move_aside() {
             return Err(put_back_after(
@@ -3873,7 +3905,7 @@ fn run_by_swap(
             ));
         }
     };
-    let _ = game_user_files::record_process(ctx, &definition.id, &store, launched.identity.clone());
+    let _ = game_user_files::record_process_locked(ctx, &definition.id, &store, launched.identity.clone());
 
     // Record the tool's identity in the swap journal too, so recovery can tell a run is still going
     // when the tool runs from outside the install folder.
@@ -3883,10 +3915,14 @@ fn run_by_swap(
     let exit = wait_for_tree(&install, &mut launched, cancel);
     let installed = watch.finish();
 
+    // The tool has exited and the post-exit capture window is open (disengage, capture, finish,
+    // journal clear). A recovery running right now must leave the operation alone too.
+    game_tool_swap::run_hook(ctx, &journal, game_tool_swap::RunHookPoint::PostExitCapture);
+
     // Put the real Data back before capturing: the copy is moved home, then the aside comes back. If that
     // fails, the copy and the journal are kept for the next check.
     if let Err(e) = game_tool_swap::disengage(&journal) {
-        let _ = release_session(ctx, definition, &store, &swapped.launch_id);
+        let _ = release_session_locked(ctx, definition, &store, &swapped.launch_id);
         return Err(e.into());
     }
 
@@ -3905,7 +3941,7 @@ fn run_by_swap(
         output_dir,
     );
     let finished = game_tool_copy::finish_copy(ctx, definition, &journal);
-    let released = release_session(ctx, definition, &store, &swapped.launch_id);
+    let released = release_session_locked(ctx, definition, &store, &swapped.launch_id);
     let refreshed = finished?;
     game_tool_swap::remove_journal(ctx, &journal)?;
     released?;
@@ -4041,7 +4077,7 @@ fn abandon_swap(
         return e.into();
     }
     let _ = game_tool_swap::remove_journal(ctx, journal);
-    let _ = release_session(ctx, definition, store, launch_id);
+    let _ = release_session_locked(ctx, definition, store, launch_id);
     error
 }
 
@@ -4057,18 +4093,18 @@ fn put_back_after(
     error: ToolError,
 ) -> ToolError {
     if let Err(e) = game_tool_swap::disengage(journal) {
-        let _ = release_session(ctx, definition, store, launch_id);
+        let _ = release_session_locked(ctx, definition, store, launch_id);
         return e.into();
     }
     if let Err(e) = game_tool_copy::finish_copy(ctx, definition, journal) {
-        let _ = release_session(ctx, definition, store, launch_id);
+        let _ = release_session_locked(ctx, definition, store, launch_id);
         return e.into();
     }
     if let Err(e) = game_tool_swap::remove_journal(ctx, journal) {
-        let _ = release_session(ctx, definition, store, launch_id);
+        let _ = release_session_locked(ctx, definition, store, launch_id);
         return e.into();
     }
-    let _ = release_session(ctx, definition, store, launch_id);
+    let _ = release_session_locked(ctx, definition, store, launch_id);
     error
 }
 

@@ -132,6 +132,10 @@ pub struct JournaledFile {
     /// not put the user's file over the session's saved copy again.
     #[serde(default)]
     pub restored: bool,
+    /// Where `real_path` pointed when the swap read it, when it was a symbolic link; `None` when
+    /// it was not one. A restore never writes through a link that no longer points there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_link_target: Option<PathBuf>,
 }
 
 /// Status of an active or recoverable user-file session.
@@ -302,6 +306,17 @@ pub fn resolve_user_file_source(source: &GamePath) -> Result<PathBuf, UserFilesE
 
 fn hash_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Where `path` points when it is a symbolic link, `None` when it is not one (or its target
+/// cannot be read). Recorded at swap time so a restore never writes through a link that has
+/// been retargeted since the swap.
+fn symlink_target(path: &Path) -> Option<PathBuf> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_symlink() {
+        return None;
+    }
+    std::fs::read_link(path).ok()
 }
 
 /// Write a user file atomically: a temp file beside it, synced, renamed over the target, then the
@@ -500,6 +515,35 @@ fn session_running_apart_from_starting(journal: &Journal) -> bool {
     false
 }
 
+/// Whether a journal records no process identity at all: no starting launcher and no recorded
+/// process. That is a legacy journal or a self-capture that failed, and it means liveness is
+/// unknown — a launch between its swap and its spawn looks exactly like this — so automatic
+/// recovery must not act on the journal; it is reported as needing a hand.
+pub fn liveness_unknown(journal: &Journal) -> bool {
+    journal.starting_launcher.is_none() && journal.processes.is_empty()
+}
+
+/// [`liveness_unknown`] for session details read without the full journal.
+pub fn details_liveness_unknown(details: &SessionDetails) -> bool {
+    details.starting_launcher.is_none() && details.processes.is_empty()
+}
+
+/// The needs-a-hand line for a journal whose liveness is unknown: what was left alone, and the
+/// command that can decide once nothing of that game is running.
+pub fn needs_hand_message(journal_path: &Path, journal: &Journal) -> String {
+    format!(
+        "the user-files journal {} of instance {} ({}/{}) records no process identity, so Agora \
+         cannot tell whether its session is still live; it was left alone and nothing was \
+         changed. If no game or tool of {} is running, put the files back by hand with `{}`",
+        journal_path.display(),
+        journal.instance_id,
+        journal.game,
+        journal.store,
+        journal.game,
+        restore_instruction(journal.game.as_str(), journal.store.as_str())
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Core Operations: swap_in, restore, status
 // ---------------------------------------------------------------------------
@@ -516,7 +560,20 @@ pub fn swap_in(
         LockResource::GameUserFiles(definition.id.clone(), store.clone()),
         "swap-in",
     )?;
+    swap_in_locked(ctx, instance_id, definition, store, running_from)
+}
 
+/// [`swap_in`] for a caller that already holds the game/store user-files lock (the lock manager
+/// is not re-entrant). A tool swap holds that lock for the whole run — from before this journal
+/// is written until the run's own swap journal is cleared — so a recovery in another process
+/// can never act on the live run.
+pub fn swap_in_locked(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    store: &StoreId,
+    running_from: &Path,
+) -> Result<SwapOutcome, UserFilesError> {
     // This launch's own identity, recorded in the journal before any real file is touched. Only
     // the launch that made the swap may give up its start; a restore from the same process but a
     // different launch (the previous session's exit watcher, the Restore command) must not.
@@ -551,8 +608,19 @@ pub fn swap_in(
                 game_display, store_display, existing.instance_id
             )));
         }
-        // Not running: recover/restore the previous session before proceeding.
-        let _ = restore_journal_internal(ctx, definition, &existing)?;
+        // Not running: recover/restore the previous session before proceeding. A journal that
+        // records no process identity at all (a legacy journal, or a self-capture that failed)
+        // has unknown liveness: another process's launch between its swap and its spawn looks
+        // exactly like this, so this launch must not restore under it. It refuses and names the
+        // command that can decide once nothing is running.
+        if liveness_unknown(&existing) {
+            return Err(UserFilesError::Other(needs_hand_message(
+                &journal_path,
+                &existing,
+            )));
+        }
+        // A new launch's catch-up is automatic recovery, so it is strict.
+        let _ = restore_journal_internal(ctx, definition, &existing, true)?;
     }
 
     // 2. Filter mappings that apply to this store
@@ -630,6 +698,7 @@ pub fn swap_in(
             swapped: false,
             state: Some(FileState::BackingUp),
             restored: false,
+            real_link_target: None,
         })
         .collect();
 
@@ -673,6 +742,7 @@ pub fn swap_in(
                 journal.files[i].swapped = false;
                 journal.files[i].state = Some(FileState::BackingUp);
                 journal.files[i].restored = false;
+                journal.files[i].real_link_target = symlink_target(&real_path);
                 write_journal(&journal_path, &journal)?;
 
                 // Copy to a temp name, make it durable, verify it, and only then give it the final
@@ -735,13 +805,19 @@ pub fn swap_in(
                     None => String::new(),
                 };
 
+                // The file is NOT marked swapped yet. There is no backup that could prove what
+                // happened, so the mark is written only once Agora has actually created the
+                // real file: a stop in between leaves a journal that says the real file was
+                // never touched, and recovery then never treats a file the player made in the
+                // meantime as Agora's own write.
                 journal.files[i].existed = false;
                 journal.files[i].backup_path = None;
                 journal.files[i].original_sha256 = None;
                 journal.files[i].written_sha256 = written_hash;
-                journal.files[i].swapped = true;
-                journal.files[i].state = Some(FileState::Swapped);
+                journal.files[i].swapped = false;
+                journal.files[i].state = Some(FileState::BackingUp);
                 journal.files[i].restored = false;
+                journal.files[i].real_link_target = symlink_target(&real_path);
                 write_journal(&journal_path, &journal)?;
 
                 if let Some(instance_bytes) = instance_bytes {
@@ -750,6 +826,10 @@ pub fn swap_in(
                     }
                     write_user_file(&real_path, &instance_bytes)?;
                 }
+
+                journal.files[i].swapped = true;
+                journal.files[i].state = Some(FileState::Swapped);
+                write_journal(&journal_path, &journal)?;
             }
         }
         Ok(())
@@ -758,7 +838,7 @@ pub fn swap_in(
     if let Err(e) = swap_result {
         // Any error puts back what was swapped so far. A restore that also fails is reported, and
         // its journal is left for the next launch or a restore to finish.
-        return Err(match restore_journal_internal(ctx, definition, &journal) {
+        return Err(match restore_journal_internal(ctx, definition, &journal, true) {
             Ok(_) => e,
             Err(restore_error) => UserFilesError::Other(format!(
                 "{e}; putting the player's files back also failed: {restore_error}. The journal was kept so recovery can finish it."
@@ -794,6 +874,40 @@ pub fn restore_locked(
     definition: &GameDefinition,
     store: &StoreId,
 ) -> Result<RestoreReport, UserFilesError> {
+    restore_locked_mode(ctx, definition, store, false)
+}
+
+/// [`restore`] as automatic crash recovery, under the caller's game-user-files lock: the same
+/// put-back, but strict — it never acts on a file whose content changed since the swap (see
+/// [`restore_journal_internal`]). The explicit [`restore`] command is the human override that
+/// may do the full put-back after checking nothing of that game is running.
+pub fn restore_locked_recovery(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    store: &StoreId,
+) -> Result<RestoreReport, UserFilesError> {
+    restore_locked_mode(ctx, definition, store, true)
+}
+
+/// [`restore_locked_recovery`] for an automatic caller that does not hold the lock.
+pub fn restore_for_recovery(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    store: &StoreId,
+) -> Result<RestoreReport, UserFilesError> {
+    let _lock = ctx.lock_manager.acquire(
+        LockResource::GameUserFiles(definition.id.clone(), store.clone()),
+        "restore-recovery",
+    )?;
+    restore_locked_recovery(ctx, definition, store)
+}
+
+fn restore_locked_mode(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    store: &StoreId,
+    strict: bool,
+) -> Result<RestoreReport, UserFilesError> {
     let journal_path = ctx
         .paths
         .user_files_journal_path(definition.id.as_str(), store.as_str());
@@ -827,7 +941,7 @@ pub fn restore_locked(
         });
     }
 
-    restore_journal_internal(ctx, definition, &journal)
+    restore_journal_internal(ctx, definition, &journal, strict)
 }
 
 /// What a catch-up did with the per-user files of one finished session.
@@ -873,6 +987,11 @@ pub fn restore_finished_for_instance(ctx: &Ctx, instance_id: &str) -> Option<Fin
         if is_session_running(&journal) {
             return None;
         }
+        // Unknown liveness (no recorded identity): automatic recovery must not act on it; the
+        // report says it needs a hand instead.
+        if liveness_unknown(&journal) {
+            return Some(report(Some(needs_hand_message(&journal_path, &journal)), 0, 0));
+        }
         let Some(definition) = ctx.games.game(&journal.game) else {
             return Some(report(
                 Some(format!(
@@ -883,7 +1002,7 @@ pub fn restore_finished_for_instance(ctx: &Ctx, instance_id: &str) -> Option<Fin
                 0,
             ));
         };
-        return Some(match restore(ctx, definition, &journal.store) {
+        return Some(match restore_for_recovery(ctx, definition, &journal.store) {
             Ok(found) => report(
                 None,
                 found.files.len(),
@@ -966,7 +1085,34 @@ pub fn recover_finished_sessions(ctx: &Ctx) -> (Vec<String>, Vec<String>) {
                 continue;
             }
         };
-        match restore_locked(ctx, definition, &journal.store) {
+        // Under the lock, re-read the journal: another process may have finished or changed it
+        // between the directory scan and the lock. A journal that records no process identity
+        // has unknown liveness, so it is reported as needing a hand, never recovered.
+        let text = match std::fs::read_to_string(&journal_path) {
+            Ok(text) => text,
+            Err(e) => {
+                warnings.push(format!(
+                    "the user-files journal {} cannot be read ({e}), so it was left alone",
+                    journal_path.display()
+                ));
+                continue;
+            }
+        };
+        let journal: Journal = match serde_json::from_str(&text) {
+            Ok(journal) => journal,
+            Err(e) => {
+                warnings.push(format!(
+                    "the user-files journal {} is malformed ({e}), so it was left alone",
+                    journal_path.display()
+                ));
+                continue;
+            }
+        };
+        if liveness_unknown(&journal) {
+            warnings.push(needs_hand_message(&journal_path, &journal));
+            continue;
+        }
+        match restore_locked_recovery(ctx, definition, &journal.store) {
             Ok(report) => actions.push(format!(
                 "Put back the user files of {} ({}) after the interrupted session of instance {} \
                  ({} file(s) restored).",
@@ -1078,6 +1224,15 @@ pub fn finish_starting(ctx: &Ctx, game: &GameId, store: &StoreId) -> Result<(), 
         LockResource::GameUserFiles(game.clone(), store.clone()),
         "finish-starting",
     )?;
+    finish_starting_locked(ctx, game, store)
+}
+
+/// [`finish_starting`] for a caller that already holds the game/store user-files lock.
+pub fn finish_starting_locked(
+    ctx: &Ctx,
+    game: &GameId,
+    store: &StoreId,
+) -> Result<(), UserFilesError> {
     let journal_path = ctx
         .paths
         .user_files_journal_path(game.as_str(), store.as_str());
@@ -1106,6 +1261,16 @@ pub fn finish_starting_launch(
         LockResource::GameUserFiles(game.clone(), store.clone()),
         "finish-starting-launch",
     )?;
+    finish_starting_launch_locked(ctx, game, store, launch_id)
+}
+
+/// [`finish_starting_launch`] for a caller that already holds the game/store user-files lock.
+pub fn finish_starting_launch_locked(
+    ctx: &Ctx,
+    game: &GameId,
+    store: &StoreId,
+    launch_id: &str,
+) -> Result<(), UserFilesError> {
     let journal_path = ctx
         .paths
         .user_files_journal_path(game.as_str(), store.as_str());
@@ -1133,6 +1298,7 @@ fn restore_journal_internal(
     ctx: &Ctx,
     definition: &GameDefinition,
     journal: &Journal,
+    strict: bool,
 ) -> Result<RestoreReport, UserFilesError> {
     if journal.game != definition.id {
         return Err(UserFilesError::Other(format!(
@@ -1225,10 +1391,56 @@ fn restore_journal_internal(
             }
         }
 
+        // A real path that is a link now must still point where it pointed when the swap read
+        // it: writing the backup through a retargeted link would overwrite the new target. A
+        // journal that recorded no target (a legacy journal) cannot prove that, so the restore
+        // stops here, before anything is modified, and asks for a hand.
+        if let Some(current) = symlink_target(&file.real_path) {
+            let recorded_ok = file
+                .real_link_target
+                .as_ref()
+                .is_some_and(|recorded| paths_eq_case_insensitive(recorded, &current));
+            if !recorded_ok {
+                let recorded = match &file.real_link_target {
+                    Some(target) => format!("a link to '{}'", target.display()),
+                    None => "no link".to_string(),
+                };
+                return Err(UserFilesError::Other(format!(
+                    "the user file '{}' is now a link to '{}', but the journal records {}; Agora \
+                     did not write through it and changed nothing. Check the link by hand, then \
+                     put the files back with `{}`",
+                    file.real_path.display(),
+                    current.display(),
+                    recorded,
+                    restore_instruction(journal.game.as_str(), journal.store.as_str())
+                )));
+            }
+        }
+
         // A backup on disk proves the real file was there, even when a stop happened before the
         // journal said so. It is only usable when its hash matches the recorded original.
         let has_backup = derived_backup_path.exists();
         let existed = file.existed || has_backup || file.original_sha256.is_some();
+
+        // Strict mode is crash recovery, not a human at the restore command: a file Agora
+        // created during the session (no original existed) whose content no longer matches
+        // what the session wrote may have been made by the player after the crash. Recovery
+        // never overwrites the instance's copy with such bytes and never deletes the file, so
+        // the whole restore stops here, before anything is modified, and asks for a hand.
+        if strict && !existed && file_state(file) == FileState::Swapped {
+            if let Ok(bytes) = std::fs::read(&file.real_path) {
+                if hash_bytes(&bytes) != file.written_sha256 {
+                    return Err(UserFilesError::Other(format!(
+                        "the user file '{}' changed since the swap (it does not match what the \
+                         session wrote), so recovery left it and the instance's copy '{}' exactly \
+                         as they are and changed nothing. Check the file by hand, then run `{}`",
+                        file.real_path.display(),
+                        derived_instance_copy.display(),
+                        restore_instruction(journal.game.as_str(), journal.store.as_str())
+                    )));
+                }
+            }
+        }
 
         validated_entries.push(ValidatedEntry {
             index: i,
@@ -1305,6 +1517,16 @@ fn restore_journal_internal(
                     entry.derived_backup_path.display()
                 )));
             }
+            // A stop between Agora's write and the "swapped" mark leaves the file Agora wrote
+            // under a journal that says no swap happened. Only bytes exactly matching the
+            // recorded write are removed; anything else was not written by Agora and is left
+            // exactly as it is.
+            if entry.derived_real_path.exists()
+                && !entry.file.written_sha256.is_empty()
+                && real_hash.as_deref() == Some(entry.file.written_sha256.as_str())
+            {
+                let _ = std::fs::remove_file(&entry.derived_real_path);
+            }
             let _ = std::fs::remove_file(entry.derived_backup_path.with_extension("tmp"));
             journal.files[entry.index].restored = true;
             write_journal(&journal_path, &journal)?;
@@ -1358,7 +1580,8 @@ fn restore_journal_internal(
             write_user_file(&entry.derived_real_path, &backup_bytes)?;
         } else {
             // Agora created this file during the session; the session's copy goes back and the real
-            // file goes.
+            // file goes. (Crash recovery never reaches a file whose content changed since the
+            // swap: the strict check in the validation above stops the whole restore first.)
             if let Some(current) = &real_bytes {
                 if real_hash.as_deref() != Some(entry.file.written_sha256.as_str()) {
                     if let Some(parent) = entry.derived_instance_copy.parent() {
@@ -1425,7 +1648,16 @@ pub fn record_process(
         LockResource::GameUserFiles(game.clone(), store.clone()),
         "record-process",
     )?;
+    record_process_locked(ctx, game, store, identity)
+}
 
+/// [`record_process`] for a caller that already holds the game/store user-files lock.
+pub fn record_process_locked(
+    ctx: &Ctx,
+    game: &GameId,
+    store: &StoreId,
+    identity: ProcessIdentity,
+) -> Result<(), UserFilesError> {
     let journal_path = ctx
         .paths
         .user_files_journal_path(game.as_str(), store.as_str());
