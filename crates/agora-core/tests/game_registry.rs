@@ -932,7 +932,7 @@ fn a_registry_without_instance_services_says_so() {
 fn a_refused_compiled_package_attaches_no_services() {
     struct Loud;
     impl agora_core::game_hooks::CompiledServices for Loud {
-        fn recover_at_startup(&self, _: &agora_core::app_paths::AppPaths) -> Vec<String> {
+        fn recover_at_startup(&self, _: &agora_core::ctx::CoreContext) -> Vec<String> {
             vec!["ran".into()]
         }
     }
@@ -953,8 +953,8 @@ fn a_refused_compiled_package_attaches_no_services() {
         .is_err());
     let registry = builder.build();
     let tmp = tempfile::tempdir().unwrap();
-    let paths = agora_core::app_paths::AppPaths::from_root(tmp.path().to_path_buf());
-    assert_eq!(registry.recover_at_startup(&paths), ["ran"]);
+    let ctx = agora_core::ctx::CoreContext::for_testing(tmp.path().to_path_buf());
+    assert_eq!(registry.recover_at_startup(&ctx), ["ran"]);
 }
 
 fn game_with_ini_check(check: IniCheck) -> GameDefinition {

@@ -783,7 +783,17 @@ pub fn restore(
         LockResource::GameUserFiles(definition.id.clone(), store.clone()),
         "restore",
     )?;
+    restore_locked(ctx, definition, store)
+}
 
+/// The body of [`restore`] under the caller's game-user-files lock: read the journal, refuse a
+/// live session, put the files back. Callers that already hold the lock (startup recovery) use
+/// this instead of taking the lock again — the lock manager is not re-entrant.
+pub fn restore_locked(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    store: &StoreId,
+) -> Result<RestoreReport, UserFilesError> {
     let journal_path = ctx
         .paths
         .user_files_journal_path(definition.id.as_str(), store.as_str());
@@ -883,6 +893,101 @@ pub fn restore_finished_for_instance(ctx: &Ctx, instance_id: &str) -> Option<Fin
         });
     }
     None
+}
+
+/// Startup recovery over every user-files journal on disk: a session whose game is no longer
+/// running has its files put back. A session that is still running (a live game or launch, in
+/// this or another process) is left alone — that is a normal session, not interrupted work — and
+/// a store whose lock another Agora process holds is skipped and reported rather than recovered
+/// underneath the live operation. Returns `(actions, warnings)`; nothing is raised.
+pub fn recover_finished_sessions(ctx: &Ctx) -> (Vec<String>, Vec<String>) {
+    let mut actions = Vec::new();
+    let mut warnings = Vec::new();
+    let root = ctx.paths.user_files_root();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return (actions, warnings);
+    };
+    let mut dirs: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    dirs.sort();
+    for dir in dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        let journal_path = dir.join("journal.json");
+        if !journal_path.exists() {
+            continue;
+        }
+        // Fail closed on an unreadable journal: never read "cannot tell" as "nothing pending".
+        let text = match std::fs::read_to_string(&journal_path) {
+            Ok(text) => text,
+            Err(e) => {
+                warnings.push(format!(
+                    "the user-files journal {} cannot be read ({e}), so it was left alone",
+                    journal_path.display()
+                ));
+                continue;
+            }
+        };
+        let journal: Journal = match serde_json::from_str(&text) {
+            Ok(journal) => journal,
+            Err(e) => {
+                warnings.push(format!(
+                    "the user-files journal {} is malformed ({e}), so it was left alone",
+                    journal_path.display()
+                ));
+                continue;
+            }
+        };
+        if is_session_running(&journal) {
+            continue;
+        }
+        let Some(definition) = ctx.games.game(&journal.game) else {
+            warnings.push(format!(
+                "the user-files session of instance {} was left alone: its game '{}' is not registered",
+                journal.instance_id, journal.game
+            ));
+            continue;
+        };
+        // Never wait on the lock at startup: another Agora may be mid-swap on this game and store.
+        let lock = ctx.lock_manager.acquire_with_timeout(
+            LockResource::GameUserFiles(journal.game.clone(), journal.store.clone()),
+            "startup-recovery",
+            std::time::Duration::ZERO,
+            None,
+        );
+        let _lock = match lock {
+            Ok(lock) => lock,
+            Err(error) => {
+                warnings.push(format!(
+                    "the user-files session of instance {} ({}/{}) was left alone: another Agora \
+                     holds its lock right now ({error}). Nothing was changed.",
+                    journal.instance_id, journal.game, journal.store
+                ));
+                continue;
+            }
+        };
+        match restore_locked(ctx, &definition, &journal.store) {
+            Ok(report) => actions.push(format!(
+                "Put back the user files of {} ({}) after the interrupted session of instance {} \
+                 ({} file(s) restored).",
+                report.game,
+                report.store,
+                report.instance_id,
+                report.files.len()
+            )),
+            // Another process finished the session between the directory scan and the lock.
+            Err(UserFilesError::NoSession { .. }) => {}
+            Err(UserFilesError::CannotRestoreRunning { instance }) => warnings.push(format!(
+                "the user-files session of instance {instance} ({}/{}) was left alone: the game is still running",
+                journal.game, journal.store
+            )),
+            Err(e) => warnings.push(format!(
+                "the user-files session of instance {} ({}/{}) could not be put back: {e}",
+                journal.instance_id, journal.game, journal.store
+            )),
+        }
+    }
+    (actions, warnings)
 }
 
 /// Restore user files, retrying while the game is still leaving the process table. A game that

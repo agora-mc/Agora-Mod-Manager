@@ -78,8 +78,8 @@ impl CompiledServices for MinecraftServices {
         load_catalogs(ctx, registry, event)
     }
 
-    fn recover_at_startup(&self, paths: &agora_core::app_paths::AppPaths) -> Vec<String> {
-        crate::launcher_import_service::recover_interrupted_jobs(paths)
+    fn recover_at_startup(&self, ctx: &Ctx) -> Vec<String> {
+        crate::launcher_import_service::recover_interrupted_jobs(ctx)
     }
 
     fn providers(&self, ctx: &Ctx) -> Vec<Arc<dyn agora_core::providers::ContentProvider>> {

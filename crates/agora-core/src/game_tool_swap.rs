@@ -725,38 +725,92 @@ fn recorded_process_running(
     })
 }
 
-/// The per-game check: for each store of the game with a journal, take the game's user-files lock
-/// and put back an interrupted swap. One file existence test per store when nothing is pending.
-pub fn recover_game(ctx: &Ctx, definition: &GameDefinition) -> Result<Vec<SwapJournal>, SwapError> {
-    let mut restored = Vec::new();
+/// How long a recovery pass waits for the game's user-files lock before giving up on a store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockWait {
+    /// The explicit `tools-swap restore` command waits for a live operation to let go.
+    Wait,
+    /// The startup pass never waits: another Agora process may hold the lock for a live swap, and
+    /// that swap must not be recovered underneath it, so the journal is left alone and reported.
+    NoWait,
+}
+
+/// The per-store check, under the caller's rules for waiting on the lock. Each store's outcome is
+/// reported on its own line; nothing is raised.
+fn recover_game_locked(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    wait: LockWait,
+) -> Vec<Recovery> {
+    let mut out = Vec::new();
     for entry in &definition.stores {
         let store = entry.store.as_str();
         if !journal_path(ctx, definition.id.as_str(), store).exists() {
             continue;
         }
-        let _lock = ctx.lock_manager.acquire(
-            LockResource::GameUserFiles(definition.id.clone(), entry.store.clone()),
-            "tool-swap-recover",
-        )?;
-        if let Some(journal) = recover_store_unlocked(ctx, definition.id.as_str(), store)? {
-            restored.push(journal);
+        let resource = LockResource::GameUserFiles(definition.id.clone(), entry.store.clone());
+        let lock = match wait {
+            LockWait::Wait => ctx.lock_manager.acquire(resource, "tool-swap-recover"),
+            LockWait::NoWait => ctx.lock_manager.acquire_with_timeout(
+                resource,
+                "tool-swap-recover",
+                std::time::Duration::ZERO,
+                None,
+            ),
+        };
+        let _lock = match lock {
+            Ok(lock) => lock,
+            Err(error) => {
+                out.push(Recovery::Stuck(match wait {
+                    LockWait::Wait => error.to_string(),
+                    LockWait::NoWait => format!(
+                        "the swap journal for {}/{store} was left alone: another Agora \
+                         holds its lock right now ({error}). Nothing was changed.",
+                        definition.id
+                    ),
+                }));
+                continue;
+            }
+        };
+        match recover_store_unlocked(ctx, definition.id.as_str(), store) {
+            Ok(Some(journal)) => out.push(Recovery::Restored(Box::new(journal))),
+            Ok(None) => {}
+            Err(e) => out.push(Recovery::Stuck(e.to_string())),
+        }
+    }
+    out
+}
+
+/// The per-game check: for each store of the game with a journal, take the game's user-files lock
+/// and put back an interrupted swap. One file existence test per store when nothing is pending.
+pub fn recover_game(ctx: &Ctx, definition: &GameDefinition) -> Result<Vec<SwapJournal>, SwapError> {
+    let mut restored = Vec::new();
+    for recovery in recover_game_locked(ctx, definition, LockWait::Wait) {
+        match recovery {
+            Recovery::Restored(journal) => restored.push(*journal),
+            Recovery::Stuck(message) => return Err(SwapError::Stuck(message)),
         }
     }
     Ok(restored)
 }
 
-/// The startup check: recover every game the registry knows. Each result is reported, never raised.
+/// The explicit check: recover every game the registry knows, waiting for a live operation to let
+/// go of a store's lock. Each result is reported, never raised.
 pub fn recover_all(ctx: &Ctx) -> Vec<Recovery> {
     let mut out = Vec::new();
     for definition in ctx.games.games() {
-        match recover_game(ctx, definition) {
-            Ok(restored) => out.extend(
-                restored
-                    .into_iter()
-                    .map(|journal| Recovery::Restored(Box::new(journal))),
-            ),
-            Err(e) => out.push(Recovery::Stuck(e.to_string())),
-        }
+        out.extend(recover_game_locked(ctx, definition, LockWait::Wait));
+    }
+    out
+}
+
+/// The startup check: the same pass, but never waiting on a lock. A journal whose lock another
+/// Agora process holds belongs to a live operation and is left alone and reported, not recovered
+/// underneath it. Each result is reported, never raised.
+pub fn recover_all_nowait(ctx: &Ctx) -> Vec<Recovery> {
+    let mut out = Vec::new();
+    for definition in ctx.games.games() {
+        out.extend(recover_game_locked(ctx, definition, LockWait::NoWait));
     }
     out
 }

@@ -8,7 +8,6 @@
 //! Package-owned state lives in [`Extensions`] on the context rather than in
 //! fields core would have to name.
 
-use crate::app_paths::AppPaths;
 use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
 use std::any::{Any, TypeId};
@@ -44,9 +43,10 @@ pub trait CompiledServices: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Runs once while the context is built, before any command, to recover
-    /// the package's interrupted work. Returns warnings.
-    fn recover_at_startup(&self, _paths: &AppPaths) -> Vec<String> {
+    /// Runs once at startup through
+    /// [`crate::startup_recovery::run_at_startup`], before any command, to recover the package's
+    /// interrupted work. Returns human-readable lines for the startup recovery report.
+    fn recover_at_startup(&self, _ctx: &Ctx) -> Vec<String> {
         Vec::new()
     }
 

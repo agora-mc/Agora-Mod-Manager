@@ -2369,8 +2369,14 @@ fn persist_import_job_state(
 }
 
 /// Recover interrupted imports before normal app operations begin.
-pub fn recover_interrupted_jobs(paths: &agora_core::app_paths::AppPaths) -> Vec<String> {
+///
+/// Two-process rule: a job whose instance lock another Agora process holds belongs to a live
+/// import (the executing import takes `LockResource::Instance` before writing its journal), so it
+/// is left alone — staging, quarantine and the job row untouched — and reported, never recovered
+/// underneath the live operation.
+pub fn recover_interrupted_jobs(ctx: &agora_core::ctx::Ctx) -> Vec<String> {
     let mut warnings = Vec::new();
+    let paths = &ctx.paths;
     let Ok(connection) = agora_core::db::local_state_connection(&paths.local_state_db()) else {
         return warnings;
     };
@@ -2378,6 +2384,24 @@ pub fn recover_interrupted_jobs(paths: &agora_core::app_paths::AppPaths) -> Vec<
         return warnings;
     };
     for job in jobs {
+        // Never wait on the lock at startup: a live import in another process may hold it.
+        let lock = ctx.lock_manager.acquire_with_timeout(
+            agora_core::lock_manager::LockResource::Instance(job.instance_id.clone()),
+            "import-recover",
+            std::time::Duration::ZERO,
+            None,
+        );
+        let _guard = match lock {
+            Ok(guard) => guard,
+            Err(error) => {
+                warnings.push(format!(
+                    "The interrupted import for {} was left alone: another Agora holds the \
+                     instance's lock right now ({error}). Nothing was changed.",
+                    job.instance_id
+                ));
+                continue;
+            }
+        };
         let staging = PathBuf::from(&job.staging_path);
         let final_dir = PathBuf::from(&job.final_path);
         if !staging.starts_with(paths.staging_root())
@@ -3662,7 +3686,7 @@ name=Dup Instance
         .unwrap();
         drop(connection);
 
-        let warnings = recover_interrupted_jobs(&ctx.paths);
+        let warnings = recover_interrupted_jobs(&ctx);
         assert!(!warnings.is_empty());
         assert!(!staging.exists());
         assert!(!final_dir.exists());
@@ -3710,7 +3734,7 @@ name=Dup Instance
         .unwrap();
         drop(connection);
 
-        recover_interrupted_jobs(&ctx.paths);
+        recover_interrupted_jobs(&ctx);
         assert!(final_dir.join("old.txt").exists());
         assert!(!final_dir.join("new.txt").exists());
         assert!(!quarantine.exists());

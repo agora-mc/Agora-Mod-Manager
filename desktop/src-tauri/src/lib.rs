@@ -224,6 +224,34 @@ fn show_startup_notices(report: &agora_core::db::LocalStateStartupReport) {
     }
 }
 
+/// The text of the startup recovery notice: every action and warning on its own line, or `None`
+/// when the pass found nothing to do or report.
+fn recovery_notice_text(
+    report: &agora_core::startup_recovery::StartupRecoveryReport,
+) -> Option<String> {
+    if report.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<&str> = report.actions.iter().map(String::as_str).collect();
+    lines.extend(report.warnings.iter().map(String::as_str));
+    Some(lines.join("\n"))
+}
+
+/// Tell the player, once, what startup recovery did or could not do — the same way the local
+/// database notices above are shown. A recovery that needs a hand is surfaced here, not only
+/// logged.
+fn show_recovery_notice(report: &agora_core::startup_recovery::StartupRecoveryReport) {
+    let Some(text) = recovery_notice_text(report) else {
+        return;
+    };
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title("Agora recovered interrupted work at startup")
+        .set_description(text)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+}
+
 pub fn run() {
     agora_core::lock_manager::set_program_name("Agora app");
     // Minecraft is a game package; register it with core before any context
@@ -749,6 +777,16 @@ pub fn run() {
                         let ctx = ctx.with_minecraft_snapshot_entries(
                             agora_game_minecraft::snapshot_scope::tracked_entries(),
                         );
+                        // One startup recovery pass over every crash journal, the same one the
+                        // CLI and the MCP listener run (MASTER_SPEC §32.11). A journal that
+                        // belongs to a live operation in another process is left alone and
+                        // reported, never recovered underneath it.
+                        let recovery_report = agora_core::startup_recovery::run_at_startup(&ctx);
+                        for line in recovery_report.actions.iter().chain(&recovery_report.warnings)
+                        {
+                            eprintln!("[core] {line}");
+                        }
+                        show_recovery_notice(&recovery_report);
                         let maintenance_ctx = ctx.clone();
                         watch_external_changes(
                             app.handle().clone(),
@@ -914,5 +952,20 @@ mod tests {
             registry.game(&GameId::new("skyrim-se").unwrap()).is_none(),
             "Skyrim must come from the official plugin, not the compiled registry"
         );
+    }
+
+    /// The desktop surfaces startup recovery to the player exactly when the pass did something or
+    /// could not do something: an empty report shows no dialog.
+    #[test]
+    fn a_recovery_notice_is_shown_only_when_there_is_something_to_say() {
+        use agora_core::startup_recovery::StartupRecoveryReport;
+        assert_eq!(super::recovery_notice_text(&StartupRecoveryReport::default()), None);
+        let report = StartupRecoveryReport {
+            actions: vec!["Put back the real Data folder of skyrim-se.".to_string()],
+            warnings: vec!["A tool swap was not put back: needs a hand.".to_string()],
+        };
+        let text = super::recovery_notice_text(&report).expect("a notice");
+        assert!(text.contains("Put back the real Data folder of skyrim-se."));
+        assert!(text.contains("A tool swap was not put back: needs a hand."));
     }
 }
