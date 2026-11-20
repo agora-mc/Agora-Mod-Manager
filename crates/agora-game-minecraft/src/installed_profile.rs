@@ -1275,13 +1275,13 @@ fn validate_maven_receipt(
             .downloads
             .as_ref()
             .and_then(|downloads| downloads.artifact.as_ref())
-            .ok_or_else(&repair)?;
+            .ok_or_else(repair)?;
         let hash = receipt
             .curated_artifact_sha256
             .get(&artifact.path)
             .or_else(|| receipt.generated_artifact_sha256.get(&artifact.path))
             .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
-            .ok_or_else(&repair)?;
+            .ok_or_else(repair)?;
         if artifact.sha256.as_ref() != Some(hash) {
             return Err(repair());
         }

@@ -132,7 +132,7 @@ pub(crate) async fn download_maven_library(
         let expected = fields
             .next()
             .filter(|hash| hash.len() == length && hash.bytes().all(|b| b.is_ascii_hexdigit()))
-            .ok_or_else(&invalid)?;
+            .ok_or_else(invalid)?;
         let filename = url.rsplit('/').next().unwrap_or(url);
         if fields
             .next()
