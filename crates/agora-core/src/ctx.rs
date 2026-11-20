@@ -230,6 +230,7 @@ impl CoreContext {
                 newer.kept_at.display()
             ));
         }
+        warnings.extend(local_state_report.warnings.iter().cloned());
 
         // The plugin runtime is created later, but a scripted package needs a
         // stable handle to it now. The handle is empty until the plugin service
