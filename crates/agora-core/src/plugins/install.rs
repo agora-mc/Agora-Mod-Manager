@@ -773,11 +773,30 @@ pub fn restore_rollback(rollback_dir: &Path, install_dir: &Path) -> LauncherResu
 /// already names the version that is on disk, the install finished and the
 /// stashed copy is stale; otherwise the previous version is put back. Both
 /// outcomes remove the rollback folder, so running it again does nothing.
+///
+/// Two processes: an install holds the plugin-install lock for its whole swap, so a starting
+/// process never waits on it — when the lock is held, the stashed folders belong to a live
+/// install in another Agora process and are left alone, reported, not recovered underneath it.
 pub fn recover_interrupted_installs(
     conn: &rusqlite::Connection,
     paths: &crate::app_paths::AppPaths,
 ) -> LauncherResult<Vec<String>> {
     let mut warnings = Vec::new();
+    let locks = crate::lock_manager::LockManager::new(paths.locks_root());
+    let _guard = match locks.acquire_with_timeout(
+        crate::lock_manager::LockResource::PluginInstall,
+        "plugin-install-recover",
+        std::time::Duration::ZERO,
+        None,
+    ) {
+        Ok(guard) => guard,
+        Err(error) => {
+            return Ok(vec![format!(
+                "Interrupted plugin installs were left alone: another Agora holds the \
+                 plugin-install lock right now ({error}). Nothing was changed."
+            )]);
+        }
+    };
     let rollback_root = paths.plugin_rollback_root();
     let read = match std::fs::read_dir(&rollback_root) {
         Ok(read) => read,
@@ -1398,5 +1417,65 @@ mod tests {
             vec!["instance:read".to_string(), "content:read".to_string()]
         );
         assert!(preview.requires_capability_consent());
+    }
+
+    /// Two processes: while another Agora process holds the plugin-install lock (it is mid
+    /// install), startup recovery leaves the stashed previous version alone and says so; once
+    /// the lock is free, the next pass puts it back.
+    #[test]
+    fn recovery_leaves_stashed_plugins_alone_while_another_process_installs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::app_paths::AppPaths::from_root(tmp.path().join("data"));
+        paths.create_required_dirs().unwrap();
+        crate::db::init_local_state_db(&paths.local_state_db()).unwrap();
+        let conn = crate::db::local_state_connection(&paths.local_state_db()).unwrap();
+
+        // The state a crashed install leaves: previous version stashed in the rollback
+        // folder, no record naming the version on disk.
+        let rollback = paths.plugin_rollback_root().join("acme.one");
+        std::fs::create_dir_all(&rollback).unwrap();
+        std::fs::write(
+            rollback.join(MANIFEST_FILENAME),
+            manifest_json("acme.one").replace("\"1.0.0\"", "\"0.9.0\""),
+        )
+        .unwrap();
+        let destination = paths.plugin_packages_root().join("acme.one");
+        std::fs::create_dir_all(paths.plugin_packages_root()).unwrap();
+
+        // A second lock manager on the same locks root is what another process sees.
+        let other_process = crate::lock_manager::LockManager::new(paths.locks_root());
+        let held = other_process
+            .acquire(
+                crate::lock_manager::LockResource::PluginInstall,
+                "plugin-install",
+            )
+            .expect("the live install takes the lock");
+
+        let warnings = recover_interrupted_installs(&conn, &paths).unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("left alone") && w.contains("plugin-install")),
+            "the skip is reported: {warnings:?}"
+        );
+        assert!(rollback.is_dir(), "the stashed version is untouched");
+        assert!(
+            !destination.exists(),
+            "nothing was restored underneath the live install"
+        );
+
+        drop(held);
+        let warnings = recover_interrupted_installs(&conn, &paths).unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("Recovered plugin acme.one")),
+            "recovered once the lock is free: {warnings:?}"
+        );
+        assert!(!rollback.exists(), "the rollback folder is gone");
+        assert!(
+            installed_version(&destination).as_deref() == Some("0.9.0"),
+            "the previous version is back"
+        );
     }
 }
