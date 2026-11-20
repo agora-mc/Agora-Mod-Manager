@@ -4,8 +4,6 @@
 // failed reinstall (e.g. offline) reports the original reason.
 
 use super::*;
-use agora_core::ctx::Ctx;
-use agora_core::event_sink::CollectingProgressSink;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +18,7 @@ const ADOPT_REASON: &str = "mainClass is empty";
 fn test_ctx(root: &std::path::Path) -> (Ctx, Arc<CollectingProgressSink>) {
     let sink = Arc::new(CollectingProgressSink::new());
     let ctx = crate::testing_context(root.to_owned()).with_progress_sink(sink.clone());
-    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    crate::content_bridge::init_local_state(&ctx);
     (ctx, sink)
 }
 
@@ -52,18 +50,20 @@ fn write_damaged_fabric_profile(minecraft_root: &std::path::Path) {
     .unwrap();
 }
 
+/// The reason given when an install adopts but is trusted only through
+/// Maven libraries without published hashes the user has not opted into.
+const UNVERIFIED_REASON: &str =
+    "loader has libraries with no published hash and unverified loader libraries are not allowed";
+
 /// Spawns the local Maven responder that serves the intact fabric profile.
-async fn spawn_fabric_maven() -> (String, tokio::task::JoinHandle<()>) {
+async fn spawn_fabric_maven(
+    reply: super::generated_profiles::MavenReply,
+) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
-            super::generated_profiles::respond(
-                socket,
-                FABRIC_PROFILE.as_bytes(),
-                super::generated_profiles::MavenReply::Match,
-            )
-            .await;
+            super::generated_profiles::respond(socket, FABRIC_PROFILE.as_bytes(), reply).await;
         }
     });
     (origin, server)
@@ -89,6 +89,39 @@ fn adopt_warning_messages(sink: &CollectingProgressSink) -> Vec<String> {
         .collect()
 }
 
+fn unverified_reinstall_warnings(sink: &CollectingProgressSink) -> Vec<String> {
+    sink.events()
+        .into_iter()
+        .filter(|event| {
+            event
+                .message
+                .contains("unverified loader libraries are not allowed")
+        })
+        .map(|event| event.message)
+        .collect()
+}
+
+/// Runs the fabric 0.20.1 install through the loader service.
+async fn ensure(
+    service: &LoaderService,
+    origin: String,
+    allow_unverified: bool,
+) -> LauncherResult<InstallReceiptSummary> {
+    crate::loader_download::TEST_LOADER_ORIGIN
+        .scope((http_client(), origin), async {
+            service
+                .ensure_installed_with_options(
+                    "fabric",
+                    "1.21.1",
+                    "0.20.1",
+                    false,
+                    allow_unverified,
+                )
+                .await
+        })
+        .await
+}
+
 /// A damaged install that fails adoption must be healed by reinstalling,
 /// and a warning naming the adoption reason must reach the operation log.
 #[tokio::test]
@@ -99,7 +132,7 @@ async fn adopt_failure_warns_then_reinstalls() {
     write_base_version(&minecraft_root);
     write_damaged_fabric_profile(&minecraft_root);
 
-    let (origin, server) = spawn_fabric_maven().await;
+    let (origin, server) = spawn_fabric_maven(super::generated_profiles::MavenReply::Match).await;
     let service = LoaderService::new(ctx.clone());
     let summary = crate::loader_download::TEST_LOADER_ORIGIN
         .scope((http_client(), origin), async {
@@ -187,5 +220,113 @@ async fn failed_reinstall_error_carries_adopt_reason() {
     assert!(
         !adopt_warning_messages(&sink).is_empty(),
         "the adoption warning must be recorded even when the reinstall fails"
+    );
+}
+
+/// An install that adopts but is trusted only through no-hash Maven
+/// libraries must warn when the user has not opted in, then heal by
+/// reinstalling (here: against an origin that now publishes checksums).
+#[tokio::test]
+async fn unverified_libraries_without_opt_in_warn_then_reinstall_heals() {
+    let temp = tempfile::tempdir().unwrap();
+    let (ctx, sink) = test_ctx(temp.path());
+    let minecraft_root = ctx.paths.minecraft_runtime_root();
+    write_base_version(&minecraft_root);
+    let service = LoaderService::new(ctx.clone());
+
+    // Phase 1: fresh install accepting libraries without published hashes.
+    let (origin, server) = spawn_fabric_maven(super::generated_profiles::MavenReply::Missing).await;
+    ensure(&service, origin, true)
+        .await
+        .expect("install must succeed with the unverified-loader opt-in");
+    server.abort();
+    let _ = server.await;
+
+    let tuple = LoaderTuple {
+        loader: "fabric".into(),
+        minecraft_version: "1.21.1".into(),
+        loader_version: "0.20.1".into(),
+    };
+    let receipt = installed_profile::read_receipt(&ctx.paths.loader_receipts(), &tuple)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !receipt.generated_artifact_sha256.is_empty(),
+        "the recorded install must carry no-hash libraries to exercise the fallthrough"
+    );
+
+    // Phase 2: the same install re-checked without the opt-in must warn and
+    // reinstall. The origin now publishes checksums, so the heal verifies.
+    let (origin, server) = spawn_fabric_maven(super::generated_profiles::MavenReply::Match).await;
+    let summary = ensure(&service, origin, false)
+        .await
+        .expect("the reinstall must heal the install with published hashes");
+    server.abort();
+    let _ = server.await;
+
+    assert_eq!(summary.tuple.loader, "fabric");
+    // The fresh install (phase 1) had nothing to verify, so no adoption
+    // warning may have been recorded for it.
+    assert!(
+        adopt_warning_messages(&sink).is_empty(),
+        "a fresh install must not claim an existing install failed verification, got: {:?}",
+        adopt_warning_messages(&sink)
+    );
+    let warnings = unverified_reinstall_warnings(&sink);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "exactly one unverified-libraries warning must be recorded, got: {warnings:?}"
+    );
+    assert!(
+        warnings[0].contains(UNVERIFIED_REASON) && warnings[0].contains("reinstalling"),
+        "the warning must name the reason and announce the reinstall, got: {}",
+        warnings[0]
+    );
+}
+
+/// The same fallthrough with an unreachable loader Maven origin: the
+/// reinstall failure must carry the unverified-libraries reason.
+#[tokio::test]
+async fn unverified_libraries_reinstall_failure_carries_reason() {
+    let temp = tempfile::tempdir().unwrap();
+    let (ctx, sink) = test_ctx(temp.path());
+    let minecraft_root = ctx.paths.minecraft_runtime_root();
+    write_base_version(&minecraft_root);
+    let service = LoaderService::new(ctx.clone());
+
+    // Phase 1: fresh install with the unverified-loader opt-in.
+    let (origin, server) = spawn_fabric_maven(super::generated_profiles::MavenReply::Missing).await;
+    ensure(&service, origin, true)
+        .await
+        .expect("install must succeed with the unverified-loader opt-in");
+    server.abort();
+    let _ = server.await;
+
+    // Reserve then release a port so the loader origin is unreachable.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+
+    let error = ensure(&service, origin, false)
+        .await
+        .expect_err("the offline reinstall must fail");
+
+    let message = error.to_string();
+    assert!(
+        message.contains(UNVERIFIED_REASON),
+        "the reinstall error must carry the unverified-libraries reason, got: {message}"
+    );
+    assert!(
+        message.contains("; reinstall failed:"),
+        "the reinstall error must also name the reinstall failure, got: {message}"
+    );
+    assert!(
+        !unverified_reinstall_warnings(&sink).is_empty(),
+        "the unverified-libraries warning must be recorded even when the reinstall fails"
+    );
+    assert!(
+        adopt_warning_messages(&sink).is_empty(),
+        "a fresh install must not claim an existing install failed verification"
     );
 }

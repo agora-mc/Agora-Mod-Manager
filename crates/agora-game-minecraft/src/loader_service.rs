@@ -488,9 +488,9 @@ impl LoaderService {
 
         let is_maven_profile = entry.is_maven_profile(&loader);
         let expected_sha = entry.receipt_source_sha(&loader);
-        // Why the existing install (if any) failed adoption — recorded so the
-        // reinstall that heals it explains itself; a failing heal reports the
-        // reason too. See warn_existing_install_unverified.
+        // Why the existing install (if any) failed adoption or cannot be
+        // used as-is — recorded so the reinstall that heals it explains
+        // itself; a failing heal reports the reason too. See warn_loader.
         let mut adopt_failure: Option<String> = None;
         if !force_reinstall {
             match installed_profile::adopt_installed_profile(
@@ -514,12 +514,33 @@ impl LoaderService {
                         op.complete();
                         return Ok(summary_from_adoption(tuple, adopted, true));
                     }
+                    // Adopted, but the install is trusted only through
+                    // Maven libraries without published hashes and the user
+                    // has not opted in: heal by reinstalling.
+                    let reason = "loader has libraries with no published hash and unverified loader libraries are not allowed";
+                    self.warn_loader(&op, format!("Warning: {reason}; reinstalling"));
+                    adopt_failure = Some(reason.to_string());
                 }
-                Err(issue) => {
+                Err(issue)
+                    if !matches!(
+                        issue.kind,
+                        installed_profile::ProfileIssueKind::MissingProfile
+                    ) =>
+                {
                     let reason = issue.reasons.join("; ");
-                    self.warn_existing_install_unverified(&op, &reason);
+                    self.warn_loader(
+                        &op,
+                        format!(
+                            "Warning: existing install could not be verified: {reason}; reinstalling"
+                        ),
+                    );
                     adopt_failure =
                         Some(format!("existing install could not be verified: {reason}"));
+                }
+                Err(_) => {
+                    // Nothing to verify (fresh install, missing base JSON):
+                    // a new install is not a heal, so there is no reason to
+                    // attach and nothing to warn about.
                 }
             }
         }
@@ -592,9 +613,9 @@ impl LoaderService {
         }
     }
 
-    fn warn_existing_install_unverified(&self, op: &OpHandle, reason: &str) {
-        let message =
-            format!("Warning: existing install could not be verified: {reason}; reinstalling");
+    /// Report a loader-install warning for this operation: stderr plus a
+    /// progress event, following the warn_unverified_library pattern.
+    fn warn_loader(&self, op: &OpHandle, message: String) {
         eprintln!("{message}");
         self.ctx.progress_sink.report(ProgressEvent::new(
             op.id().clone(),
@@ -1289,7 +1310,7 @@ fn delete_backup(minecraft_root: &Path, profile_id: &str) {
 mod tests {
     use super::*;
     use crate::loader_compatibility::CurrentLoaderStatus;
-    use agora_core::ctx::Ctx;
+    use agora_core::event_sink::CollectingProgressSink;
     use agora_core::models::InstalledMod;
     use std::io::Write;
 
