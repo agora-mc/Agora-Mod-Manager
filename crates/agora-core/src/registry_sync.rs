@@ -1451,6 +1451,18 @@ fn cached_catalog_summary_with_trust(
     let bundle_path = paths::registry_bundle_path(app_data_dir).ok()?;
     if bundle_path.exists() {
         let header = load_header(&bundle_path, trust).ok()?;
+        // Readiness is not "a header verified": the readable database must be
+        // present and be the bytes the header signed. A crash between the
+        // bundle rename and extraction, or a swapped registry.db, must show as
+        // not ready rather than a catalog the desktop thinks it can use.
+        let db_path = paths::registry_db_path(app_data_dir).ok()?;
+        if !db_path.exists() {
+            return None;
+        }
+        let digest = database_hash_memoized(&db_path).ok()?;
+        if !digest.eq_ignore_ascii_case(&header.db_sha256) {
+            return None;
+        }
         return Some(CachedCatalogSummary {
             schema_version: Some(header.schema_version),
             stale: header.is_expired_at(Utc::now()),
@@ -3183,6 +3195,36 @@ mod tests {
         assert_eq!(
             fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
             current
+        );
+    }
+
+    /// Readiness means the readable database is present and matches the
+    /// installed bundle, not merely that a bundle header verifies.
+    #[test]
+    fn has_cached_db_requires_a_readable_matching_database() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
+        let key = test_key(98);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let header = fresh_header(&key, &payload);
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            signed_bundle(&key, &header, &payload),
+        )
+        .unwrap();
+
+        assert!(
+            !get_status_with_trust(dir.path(), &ls_path, &trust).has_cached_db,
+            "a bundle with no extracted database is not ready"
+        );
+        let db_path = paths::registry_db_path(dir.path()).unwrap();
+        fs::write(&db_path, &payload).unwrap();
+        assert!(get_status_with_trust(dir.path(), &ls_path, &trust).has_cached_db);
+        fs::write(&db_path, b"not the database the bundle signed").unwrap();
+        assert!(
+            !get_status_with_trust(dir.path(), &ls_path, &trust).has_cached_db,
+            "a database that does not match the bundle is not ready"
         );
     }
 

@@ -549,6 +549,26 @@ fn cheap_metadata_fingerprint(
         } else {
             hasher.update(b"<registry-metadata-error>");
         }
+        // The extracted database can stay byte-identical while the installed
+        // bundle changes — a same-stamp republish, or an extraction that has
+        // not caught up yet. Include the bundle's identity so findings from an
+        // older catalog are never reused for a newer one.
+        let bundle = path.with_file_name("registry.bundle");
+        hasher.update(b"registry.bundle:");
+        hasher.update(bundle.to_string_lossy().as_bytes());
+        if let Ok(metadata) = std::fs::metadata(&bundle) {
+            hasher.update(metadata.len().to_le_bytes());
+            let modified_ns = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            hasher.update(modified_ns.to_le_bytes());
+            append_file_identity(&mut hasher, &metadata);
+        } else {
+            hasher.update(b"<registry-bundle-metadata-error>");
+        }
     } else {
         hasher.update(b"<no-registry>");
     }
@@ -2315,6 +2335,28 @@ mod tests {
         std::fs::write(&path, b"bbbbbbbb").unwrap();
         let second = cached_health(&dir, &manifest, None, Some(&first.scan_token));
         assert_ne!(first.scan_token, second.scan_token);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn health_cache_keys_on_the_installed_bundle_not_only_the_extracted_db() {
+        let dir = fresh_instance("health_bundle_identity");
+        let manifest = tracked_manifest(&[]);
+        let reg = dir.join("registry.db");
+        build_alias_registry(&reg, &[("fabric-api", "fabric-api-base")]);
+        let bundle = dir.join("registry.bundle");
+        std::fs::write(&bundle, b"bundle-one").unwrap();
+        let before = scan_token(&dir, &manifest, Some(&reg));
+
+        // A replacement bundle is installed, but the extracted database is
+        // unchanged (same payload, or extraction not yet repaired). Findings
+        // from the old catalog must not be reused.
+        std::fs::write(&bundle, b"bundle-two-is-newer-and-longer").unwrap();
+        let after = scan_token(&dir, &manifest, Some(&reg));
+        assert_ne!(
+            before, after,
+            "the installed bundle's identity must be part of the health cache key"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
