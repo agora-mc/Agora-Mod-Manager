@@ -195,8 +195,8 @@ pub(crate) fn copy_save_files(
     for (rel, _) in files {
         let from = source.join(rel);
         let to = destination.join(rel);
-        game_saves::checked_metadata(&from)?;
-        game_saves::checked_metadata(&to)?;
+        game_saves::checked_metadata(&from, source)?;
+        game_saves::checked_metadata(&to, destination)?;
         if let Some(parent) = to.parent() {
             fs::create_dir_all(parent).map_err(|source| write_error(parent, source))?;
         }
@@ -365,7 +365,7 @@ pub fn backup_while_running(
     )?;
     let area = folders.in_use(manifest.saves)?;
     let folder = &area.path;
-    if game_saves::checked_metadata(folder)?.is_none() {
+    if game_saves::checked_metadata(folder, folder)?.is_none() {
         return Err(SaveBackupError::NoSaveFolder);
     }
     let files = area.files()?;
@@ -374,7 +374,7 @@ pub fn backup_while_running(
     }
     let bytes = files.iter().map(|(_, size)| *size).sum::<u64>();
     let root = backup_root(ctx, instance_id)?;
-    game_saves::checked_metadata(&root)?;
+    game_saves::checked_metadata(&root, ctx.paths.root())?;
     check_room(bytes, helpers::available_disk_space_bytes(&root))?;
 
     let id = new_id();
@@ -617,10 +617,10 @@ pub fn restore(
         .map_err(|error| SaveBackupError::Other(error.to_string()))?;
     let root = backup_root(ctx, instance_id)?;
     let dir = root.join(backup_id);
-    if game_saves::checked_metadata(&dir)?.is_none() {
+    if game_saves::checked_metadata(&dir, &root)?.is_none() {
         return Err(SaveBackupError::BackupNotFound(backup_id.to_string()));
     }
-    game_saves::checked_metadata(&dir.join(BACKUP_MANIFEST))?;
+    game_saves::checked_metadata(&dir.join(BACKUP_MANIFEST), &dir)?;
     let stored = read_manifest(&dir)?;
     if stored.id != backup_id {
         return Err(SaveBackupError::Other(format!(
@@ -661,7 +661,7 @@ pub fn restore(
             continue;
         }
         let from = files_dir.join(relative);
-        let metadata = game_saves::checked_metadata(&from)?
+        let metadata = game_saves::checked_metadata(&from, &files_dir)?
             .ok_or_else(|| read_error(&from, std::io::ErrorKind::NotFound.into()))?;
         if !metadata.is_file() || metadata.len() != file.size {
             return Err(SaveBackupError::Other(format!(
@@ -669,7 +669,7 @@ pub fn restore(
                 file.path
             )));
         }
-        if game_saves::checked_metadata(&to)?.is_some_and(|meta| !meta.is_file()) {
+        if game_saves::checked_metadata(&to, folder)?.is_some_and(|meta| !meta.is_file()) {
             return Err(SaveBackupError::Other(format!(
                 "the restore destination {} is not a file",
                 to.display()
@@ -683,8 +683,8 @@ pub fn restore(
 
     let mut kept_current = Vec::new();
     for (from, to) in &files {
-        game_saves::checked_metadata(from)?;
-        let current = game_saves::checked_metadata(to)?;
+        game_saves::checked_metadata(from, &files_dir)?;
+        let current = game_saves::checked_metadata(to, folder)?;
         if let Some(parent) = to.parent() {
             fs::create_dir_all(parent).map_err(|source| write_error(parent, source))?;
         }

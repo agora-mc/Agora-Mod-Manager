@@ -102,7 +102,7 @@ fn build_staging(
         .paths
         .instance_dir(source_id)
         .map_err(|e| InstanceError::InvalidId(source_id.to_string(), e.to_string()))?;
-    game_saves::checked_metadata(&source_dir)?;
+    game_saves::checked_metadata(&source_dir, ctx.paths.root())?;
     copy_tree(&source_dir, staging, Path::new(""))?;
 
     let mut manifest = source_manifest.clone();
@@ -140,7 +140,7 @@ pub fn clone_instance(
         .instance_dir(source_id)
         .map_err(|error| InstanceError::InvalidId(source_id.to_string(), error.to_string()))?;
     let source_manifest_path = source_dir.join("instance_manifest.json");
-    game_saves::checked_metadata(&source_manifest_path)?;
+    game_saves::checked_metadata(&source_manifest_path, &source_dir)?;
     // A running game is writing the files a clone would copy. The shared guard
     // takes the instance lock and checks the one "is this game running" answer;
     // it fails at once rather than waiting out the lock.
@@ -151,7 +151,7 @@ pub fn clone_instance(
                 _ => InstanceError::Other(error.to_string()),
             }
         })?;
-    game_saves::checked_metadata(&source_manifest_path)?;
+    game_saves::checked_metadata(&source_manifest_path, &source_dir)?;
     let source_manifest = game_instance::get_manifest(ctx, source_id)?;
     let store = store_of(ctx, source_id)?;
 
@@ -181,7 +181,14 @@ pub fn clone_instance(
         let folders = game_saves::save_folders(definition, &store, source_id, scope)?;
         let clone_folders = game_saves::save_folders(definition, &store, &new_id, None)?;
         let destination = &clone_folders.in_use(game_instance::SavesChoice::Own)?.path;
-        if game_saves::checked_metadata(destination)?.is_some() {
+        if game_saves::checked_metadata(
+            destination,
+            destination
+                .parent()
+                .unwrap_or_else(|| destination.as_path()),
+        )?
+        .is_some()
+        {
             return Err(InstanceError::Other(format!(
                 "the clone's save directory already exists at {}",
                 destination.display()
@@ -201,11 +208,12 @@ pub fn clone_instance(
             .ini
             .filter(|_| source_manifest.saves == game_instance::SavesChoice::Own)
         {
-            let state = game_saves::read_state(&source_dir.join(STATE_FILE))?.ok_or_else(|| {
-                SavesError::Other(
-                    "could not tell what the source's save setting was before isolation".into(),
-                )
-            })?;
+            let state = game_saves::read_state(&source_dir.join(STATE_FILE), &source_dir)?
+                .ok_or_else(|| {
+                    SavesError::Other(
+                        "could not tell what the source's save setting was before isolation".into(),
+                    )
+                })?;
             if state.ini != rule.ini.as_str()
                 || state.section != rule.section
                 || state.key != rule.key
@@ -260,7 +268,9 @@ pub fn clone_instance(
     let rollback = |save_folder: Option<&Path>| {
         let _ = std::fs::remove_dir_all(&destination);
         if let Some(folder) = save_folder {
-            if game_saves::checked_metadata(folder).is_ok_and(|metadata| metadata.is_some()) {
+            if game_saves::checked_metadata(folder, folder.parent().unwrap_or(folder))
+                .is_ok_and(|metadata| metadata.is_some())
+            {
                 let _ = std::fs::remove_dir_all(folder);
             }
         }
@@ -276,7 +286,7 @@ pub fn clone_instance(
                 false,
                 None,
             )?;
-            game_saves::checked_metadata(folder)?;
+            game_saves::checked_metadata(folder, folder.parent().unwrap_or(folder))?;
             std::fs::create_dir_all(folder.parent().expect("the save folder has a parent"))?;
             std::fs::create_dir(folder)?;
             Ok(())

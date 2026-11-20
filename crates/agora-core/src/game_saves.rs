@@ -208,17 +208,20 @@ fn render_own_value(template: &str, instance_id: &str, scope: Option<&str>) -> S
     template.replace("{instance}", &folder)
 }
 
-fn resolve(path: &GamePath) -> Result<PathBuf, SavesError> {
+/// Resolve a user-data `GamePath` component by component. Returns the folder and the trusted root:
+/// links at or above that root are the user's system setup; links below it are refused.
+fn resolve(path: &GamePath) -> Result<(PathBuf, PathBuf), SavesError> {
     let (location, path) = validate_folder_path(path)?;
-    let mut folder = user_data_root(location).ok_or_else(|| {
+    let root = user_data_root(location).ok_or_else(|| {
         SavesError::Other(format!("could not find the {location:?} user-data folder"))
     })?;
+    let mut folder = root.clone();
     for part in path.as_str().split('/').filter(|part| !part.is_empty()) {
-        checked_metadata(&folder)?;
+        checked_metadata(&folder, &root)?;
         folder = resolve_rel_case_insensitive(&folder, part);
     }
-    checked_metadata(&folder)?;
-    Ok(folder)
+    checked_metadata(&folder, &root)?;
+    Ok((folder, root))
 }
 
 /// The folder the game reads and writes for this instance, without surveying its contents.
@@ -240,7 +243,7 @@ pub fn in_use_folder(
 
 /// The game's shared save folder for the rule.
 pub fn shared_folder(rule: &SaveLocationRule) -> Result<PathBuf, SavesError> {
-    resolve(&rule.shared_dir)
+    resolve(&rule.shared_dir).map(|(folder, _)| folder)
 }
 
 /// The instance's own save folder: `own_value` under the rule's `relative_to` folder.
@@ -255,12 +258,13 @@ pub fn own_folder_scoped(
     scope: Option<&str>,
 ) -> Result<PathBuf, SavesError> {
     validate_own_template(&rule.own_value, &rule.relative_to, &rule.shared_dir)?;
-    let folder = resolve(&rule.relative_to)?.join(relative_save_path(&own_value_scoped(
+    let (base, base_root) = resolve(&rule.relative_to)?;
+    let folder = base.join(relative_save_path(&own_value_scoped(
         rule,
         instance_id,
         scope,
     ))?);
-    checked_metadata(&folder)?;
+    checked_metadata(&folder, &base_root)?;
     Ok(folder)
 }
 
@@ -356,14 +360,35 @@ pub(crate) fn validate_own_template(
     Ok(())
 }
 
-/// Check every ancestor without following a symbolic link or Windows reparse point.
-pub(crate) fn checked_metadata(path: &Path) -> Result<Option<Metadata>, SavesError> {
-    let ancestors = path
-        .ancestors()
-        .filter(|p| !p.as_os_str().is_empty())
-        .collect::<Vec<_>>();
-    let mut result = None;
-    for component in ancestors.into_iter().rev() {
+/// Check `path` and the components between it and `root` without following a symbolic link or
+/// Windows reparse point. `root` and everything above it is trusted: a moved Documents folder or a
+/// system temp folder can be a link there. A link below `root` could redirect a write and is refused.
+pub(crate) fn checked_metadata(path: &Path, root: &Path) -> Result<Option<Metadata>, SavesError> {
+    let at_root = paths_eq_case_insensitive(path, root);
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) if !at_root && is_reparse_point_or_symlink(&metadata) => {
+            return Err(SavesError::Other(format!(
+                "{} is a link or reparse point",
+                path.display()
+            )));
+        }
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(SavesError::Read {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+    if at_root {
+        return Ok(metadata);
+    }
+    let mut current = path.parent();
+    while let Some(component) = current {
+        if paths_eq_case_insensitive(component, root) {
+            break;
+        }
         match fs::symlink_metadata(component) {
             Ok(metadata) if is_reparse_point_or_symlink(&metadata) => {
                 return Err(SavesError::Other(format!(
@@ -371,7 +396,7 @@ pub(crate) fn checked_metadata(path: &Path) -> Result<Option<Metadata>, SavesErr
                     component.display()
                 )));
             }
-            Ok(metadata) => result = Some(metadata),
+            Ok(_) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(source) => {
                 return Err(SavesError::Read {
@@ -380,8 +405,9 @@ pub(crate) fn checked_metadata(path: &Path) -> Result<Option<Metadata>, SavesErr
                 })
             }
         }
+        current = component.parent();
     }
-    Ok(result)
+    Ok(metadata)
 }
 
 #[derive(Debug)]
@@ -402,7 +428,7 @@ impl SaveArea {
     pub(crate) fn files(&self) -> Result<Vec<(String, u64)>, SavesError> {
         let mut files = Vec::new();
         let mut dirs = vec![(self.path.clone(), String::new())];
-        checked_metadata(&self.path)?
+        checked_metadata(&self.path, &self.path)?
             .ok_or_else(|| SavesError::Other(format!("{} does not exist", self.path.display())))?;
         while let Some((dir, relative)) = dirs.pop() {
             for entry in entries(&dir)? {
@@ -414,7 +440,7 @@ impl SaveArea {
                 if self.excludes(&path) {
                     continue;
                 }
-                let metadata = checked_metadata(&path)?
+                let metadata = checked_metadata(&path, &self.path)?
                     .ok_or_else(|| SavesError::Other(format!("{} disappeared", path.display())))?;
                 let name = entry.file_name().into_string().map_err(|_| {
                     SavesError::Other(format!("{} has an unreadable file name", path.display()))
@@ -504,11 +530,11 @@ pub(crate) fn save_folders<'a>(
             ))
         }
     };
-    let shared_path = resolve(shared)?;
+    let (shared_path, shared_root) = resolve(shared)?;
     validate_recognition(recognition)?;
     let (own, private_root) = if let Some((template, base)) = own {
         validate_own_template(template, base, shared)?;
-        let base = resolve(base)?;
+        let (base, base_root) = resolve(base)?;
         let private = base.join(private_prefix(template)?);
         if path_within(&shared_path, &private) {
             return Err(SavesError::Other(
@@ -520,7 +546,7 @@ pub(crate) fn save_folders<'a>(
             instance_id,
             scope,
         ))?);
-        checked_metadata(&own)?;
+        checked_metadata(&own, &base_root)?;
         (
             Some(SaveArea {
                 path: own,
@@ -531,7 +557,7 @@ pub(crate) fn save_folders<'a>(
     } else {
         (None, None)
     };
-    checked_metadata(&shared_path)?;
+    checked_metadata(&shared_path, &shared_root)?;
     Ok(SaveFolders {
         shared: SaveArea {
             path: shared_path,
@@ -576,7 +602,7 @@ fn survey(
     let path = &area.path;
     let mut saves = 0usize;
     let mut newest: Option<SystemTime> = None;
-    let exists = checked_metadata(path)?.is_some();
+    let exists = checked_metadata(path, path)?.is_some();
     if exists {
         for entry in entries(path)? {
             let entry = entry.map_err(|source| SavesError::Read {
@@ -587,7 +613,7 @@ fn survey(
             if area.excludes(&file) {
                 continue;
             }
-            let metadata = checked_metadata(&file)?
+            let metadata = checked_metadata(&file, path)?
                 .ok_or_else(|| SavesError::Other(format!("{} disappeared", file.display())))?;
             let is_save = match recognition {
                 Some(SaveRecognition::Folders) => metadata.is_dir(),
@@ -623,16 +649,16 @@ fn manifest_of(ctx: &Ctx, instance_id: &str) -> Result<GameInstanceManifest, Sav
     })
 }
 
-fn state_path(ctx: &Ctx, instance_id: &str) -> Result<PathBuf, SavesError> {
-    Ok(ctx
+fn state_path(ctx: &Ctx, instance_id: &str) -> Result<(PathBuf, PathBuf), SavesError> {
+    let dir = ctx
         .paths
         .instance_dir(instance_id)
-        .map_err(|e| SavesError::Other(e.to_string()))?
-        .join(STATE_FILE))
+        .map_err(|e| SavesError::Other(e.to_string()))?;
+    Ok((dir.join(STATE_FILE), dir))
 }
 
-pub(crate) fn read_state(path: &Path) -> Result<Option<SavesState>, SavesError> {
-    if checked_metadata(path)?.is_none() {
+pub(crate) fn read_state(path: &Path, root: &Path) -> Result<Option<SavesState>, SavesError> {
+    if checked_metadata(path, root)?.is_none() {
         return Ok(None);
     }
     let text = std::fs::read_to_string(path).map_err(|source| SavesError::Read {
@@ -814,13 +840,14 @@ pub(crate) fn validate_previous_value(
     previous: Option<&str>,
 ) -> Result<(), SavesError> {
     if let Some(value) = previous.filter(|value| !value.is_empty()) {
-        let path = resolve(&rule.relative_to)?.join(relative_save_path(value)?);
+        let (base, base_root) = resolve(&rule.relative_to)?;
+        let path = base.join(relative_save_path(value)?);
         if shared.excludes(&path) {
             return Err(SavesError::Other(
                 "the previous save setting names private saves".into(),
             ));
         }
-        checked_metadata(&path)?;
+        checked_metadata(&path, &base_root)?;
     }
     Ok(())
 }
@@ -838,8 +865,8 @@ fn edit_save_setting(
         return Ok(SettingChange::NoSetting);
     };
     let instance_id = guard.instance_id();
-    let state_file = state_path(ctx, instance_id)?;
-    let recorded = read_state(&state_file)?;
+    let (state_file, instance_dir) = state_path(ctx, instance_id)?;
+    let recorded = read_state(&state_file, &instance_dir)?;
 
     Ok(match choice {
         SavesChoice::Own => {

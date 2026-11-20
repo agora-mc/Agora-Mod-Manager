@@ -2,7 +2,7 @@
 //! instance's own, put back exactly when the choice goes back, and no save file is ever moved.
 //! Uses the Skyrim SE definition the app ships and the test override for the user-data roots.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use agora_core::ctx::CoreContext;
@@ -121,6 +121,29 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         std::env::remove_var("AGORA_TEST_USER_DATA_ROOT");
+    }
+}
+
+/// A link to a directory, made without administrator rights on Windows (a junction).
+fn link_dir(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("cmd")
+            .arg("/c")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "mklink /J failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
@@ -420,4 +443,47 @@ fn a_game_with_no_save_location_refuses_an_own_choice() {
 
     let err = game_saves::set_choice(&h.ctx, "plain", &def, SavesChoice::Own).unwrap_err();
     assert!(matches!(err, SavesError::NoSaveLocation { .. }), "{err:?}");
+}
+
+#[test]
+fn a_save_area_reached_through_a_linked_parent_is_accepted() {
+    let h = Harness::new();
+    let def = skyrim();
+    let outer = TempDir::new().unwrap();
+    let real_root = outer.path().join("real-user");
+    std::fs::create_dir_all(real_root.join("documents")).unwrap();
+    let linked_root = outer.path().join("linked-user");
+    link_dir(&real_root, &linked_root);
+    // The user moved their documents folder with a junction (Windows) or a symlink (Unix).
+    // Everything under it is an ordinary folder; the link itself is above the save root.
+    std::env::set_var("AGORA_TEST_USER_DATA_ROOT", &linked_root);
+
+    h.make_instance("linked-parent");
+    let my_games = linked_root
+        .join("documents")
+        .join("My Games")
+        .join("Skyrim Special Edition");
+    std::fs::create_dir_all(my_games.join("Saves")).unwrap();
+    std::fs::write(my_games.join("Skyrim.ini"), REAL).unwrap();
+    std::fs::write(my_games.join("Saves").join("One.ess"), b"one").unwrap();
+
+    let status = game_saves::status(&h.ctx, "linked-parent", &def).unwrap();
+    assert_eq!(status.in_use.saves, Some(1), "{status:?}");
+}
+
+#[test]
+fn a_link_inside_the_save_area_is_still_refused() {
+    let h = Harness::new();
+    let def = skyrim();
+    h.make_instance("inside-link");
+    std::fs::create_dir_all(h.shared_saves()).unwrap();
+    let outside = h.user.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    link_dir(&outside, &h.shared_saves().join("Escape.ess"));
+
+    let err = game_saves::status(&h.ctx, "inside-link", &def).unwrap_err();
+    assert!(
+        err.to_string().contains("link"),
+        "a link below the save root must be refused: {err}"
+    );
 }
