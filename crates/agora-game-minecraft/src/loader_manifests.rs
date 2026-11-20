@@ -63,6 +63,7 @@ pub struct LoaderEntry {
     pub mc_version: String,
     pub loader_version: String,
     pub source_url: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub sha256: String,
     pub file_name: String,
     pub file_type: String,
@@ -92,7 +93,7 @@ struct LoaderEntrySerde {
     mc_version: String,
     loader_version: String,
     source_url: String,
-    sha256: String,
+    sha256: Option<String>,
     file_name: String,
     file_type: String,
     #[serde(default)]
@@ -113,6 +114,11 @@ impl<'de> Deserialize<'de> for LoaderEntry {
         D: serde::Deserializer<'de>,
     {
         let raw = LoaderEntrySerde::deserialize(deserializer)?;
+        let sha256 = match raw.sha256 {
+            Some(hash) if !hash.is_empty() => hash,
+            _ if raw.file_type == "profile_json" => String::new(),
+            _ => return Err(serde::de::Error::missing_field("sha256")),
+        };
         Ok(Self {
             release_channel: raw
                 .release_channel
@@ -120,7 +126,7 @@ impl<'de> Deserialize<'de> for LoaderEntry {
             mc_version: raw.mc_version,
             loader_version: raw.loader_version,
             source_url: raw.source_url,
-            sha256: raw.sha256,
+            sha256,
             file_name: raw.file_name,
             file_type: raw.file_type,
             version_json_sha256: raw.version_json_sha256,
@@ -209,6 +215,20 @@ fn mc_versions_list() -> &'static [String] {
 // ---------------------------------------------------------------------------
 
 impl LoaderEntry {
+    pub(crate) fn is_maven_profile(&self, loader: &str) -> bool {
+        self.file_type == "profile_json" && matches!(loader, "fabric" | "quilt")
+    }
+
+    /// Generated profiles have no source hash. The local receipt binds their
+    /// installed contents separately.
+    pub(crate) fn receipt_source_sha(&self, loader: &str) -> &str {
+        if self.is_maven_profile(loader) {
+            ""
+        } else {
+            strip_sha_prefix(&self.sha256)
+        }
+    }
+
     /// Look up the version this entry provides for a capability.
     ///
     /// Explicit `provided_versions` entries always win (and may augment the
@@ -464,7 +484,7 @@ impl LoaderCatalog {
         if existing.mc_version != entry.mc_version
             || existing.loader_version != entry.loader_version
             || existing.source_url != entry.source_url
-            || existing.sha256 != entry.sha256
+            || (!existing.is_maven_profile(loader) && existing.sha256 != entry.sha256)
             || existing.file_name != entry.file_name
             || existing.file_type != entry.file_type
             || existing.version_json_sha256 != entry.version_json_sha256
@@ -738,17 +758,36 @@ mod tests {
     fn conflicting_registry_loader_pin_fails_closed() {
         let embedded = LoaderCatalog::embedded();
         let mut conflicting = embedded
-            .find_entry("fabric", "1.21.1", "0.18.6")
+            .find_entry("forge", "1.5.2", "7.8.0.729")
             .unwrap()
             .clone();
         conflicting.sha256 = "0".repeat(64);
         let registry = LoaderCatalog {
             domain_allowlist: embedded.domain_allowlist.clone(),
-            loaders: std::collections::BTreeMap::from([("fabric".into(), vec![conflicting])]),
+            loaders: std::collections::BTreeMap::from([("forge".into(), vec![conflicting])]),
         };
 
         let error = LoaderCatalog::merge_with_embedded(Some(registry)).unwrap_err();
         assert!(error.to_string().contains("Conflicting pinned metadata"));
+    }
+
+    #[test]
+    fn legacy_registry_profile_pins_do_not_conflict_with_generated_profiles() {
+        let embedded = LoaderCatalog::embedded();
+        let entry = embedded.find_entry("fabric", "1.21.1", "0.20.1").unwrap();
+        assert!(entry.sha256.is_empty());
+        let mut legacy = serde_json::to_value(entry).unwrap();
+        legacy["sha256"] = serde_json::json!("f".repeat(64));
+        let registry = LoaderCatalog {
+            domain_allowlist: embedded.domain_allowlist.clone(),
+            loaders: BTreeMap::from([(
+                "fabric".into(),
+                vec![serde_json::from_value(legacy).unwrap()],
+            )]),
+        };
+        let effective = LoaderCatalog::merge_with_embedded(Some(registry)).unwrap();
+        let profile = effective.find_entry("fabric", "1.21.1", "0.20.1").unwrap();
+        assert!(profile.receipt_source_sha("fabric").is_empty());
     }
 
     #[test]

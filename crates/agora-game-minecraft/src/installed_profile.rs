@@ -155,7 +155,7 @@ pub fn derive_profile_id(tuple: &LoaderTuple) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LoaderSourceKind {
-    /// Installed from a pinned profile JSON (Fabric, Quilt).
+    /// Installed from a generated profile JSON (Fabric, Quilt).
     ProfileJson,
     /// Installed via the official installer JAR (Forge, NeoForge).
     InstallerJar,
@@ -185,7 +185,8 @@ pub struct InstalledProfileReceipt {
     /// compatibility with v1/v2 receipts that predate this field.
     #[serde(default = "default_source_kind")]
     pub source_kind: LoaderSourceKind,
-    /// SHA-256 of the curated source artifact (profile JSON or installer JAR).
+    /// SHA-256 of the curated installer JAR. Empty for profiles checked
+    /// against Maven checksums. Legacy receipts may carry a profile-byte pin.
     /// Reads legacy installer_sha256 field from v1/v2 receipts.
     #[serde(alias = "installer_sha256")]
     pub source_sha256: String,
@@ -207,13 +208,14 @@ pub struct InstalledProfileReceipt {
     /// Exit code of the installer process, or 0 if unknown/success.
     pub installer_exit_status: i32,
     /// Map of relative Maven paths to SHA-256 hex digests for processor-
-    /// created artifacts (Forge/NeoForge). Populated by the install service
-    /// when an installer processor completes. Empty for Fabric/Quilt.
+    /// created artifacts (Forge/NeoForge), or Maven jars from a repository
+    /// with no published checksum that the player explicitly accepted.
+    /// These paths may be adopted locally but cannot be downloaded at launch.
     #[serde(default, deserialize_with = "deserialize_nullable_hash_map")]
     pub generated_artifact_sha256: BTreeMap<String, String>,
     /// Map of relative Maven paths to SHA-256 hex digests for loader library
-    /// pins supplied by Agora's curated manifest. Pre-populated from the
-    /// loader manifest entries for `library_pins`.
+    /// pins supplied by Agora's curated manifest or recorded after checking a
+    /// Fabric/Quilt library against a published Maven checksum.
     #[serde(default)]
     pub curated_artifact_sha256: BTreeMap<String, String>,
 }
@@ -1051,6 +1053,11 @@ pub fn adopt_installed_profile(
 
     match receipt.as_ref() {
         Some(rcpt) => {
+            if expected_source_sha256.is_empty()
+                && matches!(tuple.loader.as_str(), "fabric" | "quilt")
+            {
+                validate_maven_receipt(rcpt, &loader_version, &profile_path)?;
+            }
             let expected_relative = format!("versions/{profile_id}/{profile_id}.json");
             match validate_receipt_binding(
                 rcpt,
@@ -1123,6 +1130,42 @@ pub fn adopt_installed_profile(
         trusted_unhashed_library_paths: trusted_unhashed_paths,
         minecraft_dir: minecraft_dir.to_path_buf(),
     })
+}
+
+fn validate_maven_receipt(
+    receipt: &InstalledProfileReceipt,
+    profile: &VersionInfo,
+    profile_path: &Path,
+) -> Result<(), ProfileIssue> {
+    let repair = || {
+        ProfileIssue::unsupported(
+            Some(profile_path.to_path_buf()),
+            vec!["Repair the loader to verify its libraries against Maven checksums.".into()],
+        )
+    };
+    if receipt.source_kind != LoaderSourceKind::ProfileJson
+        || !receipt.source_sha256.is_empty()
+        || profile.libraries.is_empty()
+    {
+        return Err(repair());
+    }
+    for library in &profile.libraries {
+        let artifact = library
+            .downloads
+            .as_ref()
+            .and_then(|downloads| downloads.artifact.as_ref())
+            .ok_or_else(&repair)?;
+        let hash = receipt
+            .curated_artifact_sha256
+            .get(&artifact.path)
+            .or_else(|| receipt.generated_artifact_sha256.get(&artifact.path))
+            .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(&repair)?;
+        if artifact.sha256.as_ref() != Some(hash) {
+            return Err(repair());
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1399,26 +1442,16 @@ pub fn file_sha256_hex(path: &Path, max_bytes: u64) -> Result<String, ProfileIss
 // create_receipt_for_profile_json â€” receipt for Fabric/Quilt-style installs
 // ---------------------------------------------------------------------------
 
-/// Create and write a receipt for a loader installed from a pinned profile JSON
-/// (Fabric or Quilt). Unlike the Forge installer, there is no process exit
-/// status or generated artifact enumeration â€” the profile is simply validated
-/// and its stable hash recorded.
-///
-/// Arguments:
-/// * `minecraft_dir` â€” The root minecraft directory (contains `versions/`).
-/// * `receipts_root` â€” Directory where receipts are stored.
-/// * `tuple` â€” Identifies the loader, Minecraft version, and loader version.
-/// * `source_sha256` â€” SHA-256 hex of the pinned profile JSON source.
-/// * `source_url` â€” Download URL of the pinned profile JSON.
-/// * `curated_artifact_sha256` â€” Map of relative Maven paths to SHA-256 hex
-///   for loader library pins from Agora's curated manifest.
+/// Bind a checked Fabric or Quilt profile to its installed Maven libraries.
+/// Each hash map records the exact bytes installed under its relative Maven
+/// path. Unverified jars required an explicit missing-checksum override.
 pub fn create_receipt_for_profile_json(
     minecraft_dir: &Path,
     receipts_root: &Path,
     tuple: &LoaderTuple,
-    source_sha256: &str,
     source_url: &str,
     curated_artifact_sha256: BTreeMap<String, String>,
+    unverified_artifact_sha256: BTreeMap<String, String>,
 ) -> Result<InstalledProfileReceipt, ProfileIssue> {
     // 1. Validate tuple.
     tuple
@@ -1451,7 +1484,7 @@ pub fn create_receipt_for_profile_json(
         schema_version: RECEIPT_SCHEMA_VERSION, // 3
         tuple: tuple.clone(),
         source_kind: LoaderSourceKind::ProfileJson,
-        source_sha256: source_sha256.to_string(),
+        source_sha256: String::new(),
         source_url: source_url.to_string(),
         profile_id: profile_id.clone(),
         profile_relative_path: profile_relative_path.clone(),
@@ -1459,16 +1492,16 @@ pub fn create_receipt_for_profile_json(
         base_version_id: tuple.minecraft_version.clone(),
         installed_at: chrono::Utc::now().to_rfc3339(),
         installer_exit_status: 0,
-        generated_artifact_sha256: BTreeMap::new(),
+        generated_artifact_sha256: unverified_artifact_sha256,
         curated_artifact_sha256,
     };
 
     // 5. Write receipt atomically.
     write_receipt_atomic(receipts_root, tuple, &receipt)?;
 
-    // 6. Prove binding by calling normal adoption with the same source SHA.
-    let _adopted = adopt_installed_profile(minecraft_dir, receipts_root, tuple, source_sha256)
-        .inspect_err(|_issue| {
+    // 6. Prove binding by calling normal adoption for a generated profile.
+    let _adopted =
+        adopt_installed_profile(minecraft_dir, receipts_root, tuple, "").inspect_err(|_issue| {
             let _ = remove_receipt(receipts_root, tuple);
         })?;
 

@@ -4931,12 +4931,31 @@ any slice from owning the experience across slots, so each rebuilt Minecraft's p
 
 *(Numbered 27 to leave §26 to the multi-game work.)*
 
-Every loader file a user installs (Fabric/Quilt profile JSON, Forge/NeoForge
-installer jars) is pinned by SHA-256 in `loader-manifests/loader_manifests.json`
-the first time a refresh sees it. The signed registry carries those pins, and the
-launcher refuses a download that does not match. Forge and NeoForge installers are
-run with `java -jar`, so for them the pin is the boundary between code Agora has
-seen and code it has not.
+The signed loader catalog pins the SHA-256 of the raw Forge and NeoForge
+installer jars. Agora checks the pin before running an installer with
+`java -jar`. Fabric and Quilt server export checks the official installer
+jar against the SHA-512 published beside it in Maven.
+
+Fabric and Quilt client profiles are generated. Their libraries can change
+for an existing loader version, so a hash of the profile goes stale even
+if the timestamps are stripped. The catalog records the loader tuple,
+profile URL and verification method. Agora checks the profile ID, Minecraft
+parent, known client entry point and allowed argument values. The library
+list must name the exact loader and mapping versions and use allowed Maven
+hosts. Unobfuscated Minecraft releases starting with 26.1 can omit mappings.
+[Fabric profile generator](https://github.com/FabricMC/fabric-meta/blob/master/src/main/java/net/fabricmc/meta/web/ProfileHandler.java),
+[Fabric entry point](https://github.com/FabricMC/fabric-loader/blob/master/src/main/resources/fabric-installer.json),
+[Quilt entry point](https://github.com/QuiltMC/quilt-loader/blob/develop/src/main/resources/quilt_installer.json),
+[Minecraft 26.1 release notes](https://www.minecraft.net/en-us/article/minecraft-java-edition-26-1).
+
+Agora checks each library jar against its repository's `.jar.sha512`,
+`.jar.sha256` or `.jar.sha1`, in that order. A missing sidecar permits trying
+the next one. A malformed or mismatched hash stops the install. If all three
+are missing, the player must explicitly allow the download and Agora names
+the jar. The receipt binds the installed profile to the exact library bytes
+for future launches. Agora's direct launcher reuses libraries accepted
+without a sidecar from the installed files. Old profile-byte receipts
+need a loader repair to populate the new receipt.
 
 **Threat model.** Pinning protects users from a file changing *after* Agora pinned
 it, and from tampering between upstream and the user. It cannot judge a
@@ -4954,7 +4973,7 @@ the entry it touches:
   If upstream's new jar has the same content hash, the entry is re-pinned in
   place and the old hash is kept in `sha256_history`. Same contents means the
   same code, so this needs no review.
-- *Anything else* (changed contents, a profile JSON, or an entry pinned before
+- *Anything else* (changed contents or an entry pinned before
   content hashes existed): the entry is moved to `loader-manifests/quarantine.json`,
   leaves the catalog so users neither run the new file nor hit a hash mismatch,
   and maintainers are told on Discord. The rest of the catalog publishes as
@@ -4966,10 +4985,10 @@ the entry it touches:
   upstream event.
 
 The refresh only re-reads the newest versions of each loader, so the daily
-loader-catalog workflow also re-checks a rotating slice of 200 pinned files
-(`--verify-sample`), reaching every entry in under three weeks (a manual run
-with `full_verify` checks all of them at once); files checked
-this way get their `content_sha256` filled in as they come round. The nightly
+loader-catalog workflow also checks a rotating slice of 200 pinned installers
+(`--verify-sample`). A manual run with `full_verify` checks all pinned
+installers. Files checked this way get their `content_sha256` filled in as
+they come round. The nightly
 compiler only verifies what changed. `validate_loader_catalog_delta.py` still
 rejects any hash change not recorded in `sha256_history` and any deletion not
 recorded in quarantine. Candidate-download strikes (`failed_candidates.json`)

@@ -1025,6 +1025,19 @@ impl InstanceService {
                 .ok_or(LauncherError::MojangNotFound)?;
             let minecraft_root = self.ctx.paths.minecraft_runtime_root();
             let profile_version_id = loader_version_id(&row);
+            if matches!(row.loader.as_str(), "fabric" | "quilt") {
+                let tuple = crate::installed_profile::LoaderTuple {
+                    loader: row.loader.clone(),
+                    minecraft_version: row.minecraft_version.clone(),
+                    loader_version: row.loader_version.clone(),
+                };
+                crate::installed_profile::adopt_installed_profile(
+                    &minecraft_root,
+                    &self.ctx.paths.loader_receipts(),
+                    &tuple,
+                    "",
+                )?;
+            }
             crate::launcher_profiles::materialize_version_json(
                 &minecraft_root,
                 official_root,
@@ -1741,6 +1754,16 @@ impl InstanceService {
     }
 
     pub async fn create(&self, request: CreateInstanceRequest) -> LauncherResult<InstanceRow> {
+        self.create_with_unverified_loader(request, false).await
+    }
+
+    /// Create with explicit approval to download loader libraries that publish
+    /// no checksum. Every published checksum must still match.
+    pub async fn create_with_unverified_loader(
+        &self,
+        request: CreateInstanceRequest,
+        allow_unverified_loader: bool,
+    ) -> LauncherResult<InstanceRow> {
         let instance_id = self.validate_id(&request.instance_id)?;
         if request.name.trim().is_empty() || request.minecraft_version.trim().is_empty() {
             return Err(LauncherError::InstanceCreateFailed);
@@ -1883,11 +1906,12 @@ impl InstanceService {
                 request.loader_version
             );
             if let Err(error) = LoaderService::new(self.ctx.clone())
-                .ensure_installed(
+                .ensure_installed_with_options(
                     &request.loader,
                     &request.minecraft_version,
                     &request.loader_version,
                     false,
+                    allow_unverified_loader,
                 )
                 .await
                 .map_err(|e| e.while_attempting(format!("download {loader_label}")))
@@ -2763,11 +2787,30 @@ mod tests {
         .unwrap();
 
         let runtime_root = ctx.paths.minecraft_runtime_root();
+        let loader_path = "net/fabricmc/fabric-loader/0.19.3/fabric-loader-0.19.3.jar";
+        let installed_hash = "a".repeat(64);
         for (version_id, json) in [
-            ("26.2", r#"{"id":"26.2","type":"release"}"#),
+            (
+                "26.2",
+                serde_json::json!({
+                    "id": "26.2", "mainClass": "invented.game.Main", "type": "release", "libraries": [],
+                }),
+            ),
             (
                 "fabric-loader-0.19.3-26.2",
-                r#"{"id":"fabric-loader-0.19.3-26.2","inheritsFrom":"26.2"}"#,
+                serde_json::json!({
+                    "id": "fabric-loader-0.19.3-26.2", "inheritsFrom": "26.2",
+                    "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+                    "type": "release", "arguments": {"game": [], "jvm": []},
+                    "libraries": [{
+                        "name": "net.fabricmc:fabric-loader:0.19.3",
+                        "downloads": {"artifact": {
+                            "path": loader_path,
+                            "url": format!("https://maven.fabricmc.net/{loader_path}"),
+                            "sha256": installed_hash,
+                        }},
+                    }],
+                }),
             ),
         ] {
             let path = runtime_root
@@ -2775,11 +2818,26 @@ mod tests {
                 .join(version_id)
                 .join(format!("{version_id}.json"));
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, json).unwrap();
+            std::fs::write(path, serde_json::to_vec(&json).unwrap()).unwrap();
         }
 
+        let service = InstanceService::new(ctx.clone());
+        assert!(service.prepare_delegated_launch("delegated").is_err());
+        crate::installed_profile::create_receipt_for_profile_json(
+            &runtime_root,
+            &ctx.paths.loader_receipts(),
+            &crate::installed_profile::LoaderTuple {
+                loader: row.loader.clone(),
+                minecraft_version: row.minecraft_version.clone(),
+                loader_version: row.loader_version.clone(),
+            },
+            "https://meta.fabricmc.net/v2/versions/loader/26.2/0.19.3/profile/json",
+            std::collections::BTreeMap::from([(loader_path.into(), installed_hash)]),
+            Default::default(),
+        )
+        .unwrap();
         let official_profiles = crate::context::launcher_profiles_path(&ctx).unwrap();
-        let preparation = InstanceService::new(ctx).prepare_delegated_launch("delegated");
+        let preparation = service.prepare_delegated_launch("delegated");
         assert_eq!(preparation.unwrap().profile_id, "agora-delegated");
         let official_root = official_profiles.parent().unwrap();
         assert!(official_root.join("versions/26.2/26.2.json").is_file());

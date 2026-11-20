@@ -82,6 +82,22 @@ IMMUTABLE_ENTRY_FIELDS = (
     "installer_spec",
 )
 
+PROFILE_VERIFICATION = "profile_structure_and_maven_checksums"
+
+
+def is_dynamic_profile(loader: str, entry: dict[str, Any]) -> bool:
+    return loader in ("fabric", "quilt") and entry.get("file_type") == "profile_json"
+
+
+def _with_profile_verification(loader: str, entry: dict[str, Any]) -> dict[str, Any]:
+    if not is_dynamic_profile(loader, entry):
+        return entry
+    return {
+        **{key: value for key, value in entry.items() if key not in ("sha256", "sha256_history")},
+        "verification": PROFILE_VERIFICATION,
+    }
+
+
 # Optional enrichment fields. A legacy entry missing one of these fields may
 # be enriched by the refresh; once a value exists, changing it is a mutation.
 ENRICHABLE_ENTRY_FIELDS = (
@@ -310,11 +326,7 @@ def _extract_neoforge_language_capabilities(
 
 
 def _stable_json_sha256(data: bytes, drop: set[str] | None = None) -> str:
-    """Return a deterministic SHA-256 of a JSON payload after stripping volatile keys.
-
-    Fabric dynamically rewrites `time`/`releaseTime` on every request, so pinning
-    the raw response is unstable. This normalizes the payload for verification.
-    """
+    """Hash an installer's version JSON after stripping volatile metadata."""
     drop = drop or {"time", "releaseTime"}
     obj = json.loads(data.decode("utf-8"))
     if isinstance(obj, dict):
@@ -686,6 +698,21 @@ def _fetch_profile_json(url: str, cache_name: str, *, refresh: bool = False) -> 
     return data
 
 
+def _check_profile_json(data: bytes, profile_id: str, minecraft_version: str) -> None:
+    try:
+        profile = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise UpstreamMetadataError(f"Invalid profile {profile_id}: {exc}") from exc
+    if (
+        not isinstance(profile, dict)
+        or profile.get("id") != profile_id
+        or profile.get("inheritsFrom") != minecraft_version
+        or not isinstance(profile.get("libraries"), list)
+        or not profile["libraries"]
+    ):
+        raise UpstreamMetadataError(f"Invalid profile identity or libraries for {profile_id}")
+
+
 def _extract_version_json_sha256(jar_path: Path) -> str | None:
     """Extract version.json from an installer jar and return its stable SHA-256."""
     try:
@@ -788,31 +815,25 @@ def _fetch_fabric(
             )
             continue
 
-        _failed_record_success(key)
         file_name = f"fabric-loader-{loader_version}-{mc_version}.json"
-        try:
-            sha = _stable_json_sha256(data)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise UpstreamMetadataError(
-                f"Fabric profile {mc_version}/{loader_version}: {exc}"
-            ) from exc
+        _check_profile_json(data, file_name.removesuffix(".json"), mc_version)
+        _failed_record_success(key)
 
         entries.append({
             "mc_version": mc_version,
             "loader_version": loader_version,
             "source_url": profile_url,
-            "sha256": sha,
             "file_name": file_name,
             "file_type": "profile_json",
+            "verification": PROFILE_VERIFICATION,
             "provided_versions": {"fabricloader": loader_version},
             "release_channel": _release_channel(loader_version),
         })
         logger.info(
-            "Added Fabric loader %s for MC %s (%s sha256=%s...)",
+            "Added Fabric loader %s for MC %s (%s)",
             loader_version,
             mc_version,
             _release_channel(loader_version),
-            sha[:16],
         )
 
     return entries
@@ -1006,14 +1027,9 @@ def _fetch_quilt(
         if data is None:
             continue
 
-        _failed_record_success(key)
         file_name = f"quilt-loader-{loader_version}-{mc_version}.json"
-        try:
-            sha = _stable_json_sha256(data)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise UpstreamMetadataError(
-                f"Quilt profile {mc_version}/{loader_version}: {exc}"
-            ) from exc
+        _check_profile_json(data, file_name.removesuffix(".json"), mc_version)
+        _failed_record_success(key)
 
         provided_versions = {"quilt_loader": loader_version}
         fabricloader = _quilt_provided_fabricloader(loader_version)
@@ -1024,18 +1040,17 @@ def _fetch_quilt(
             "mc_version": mc_version,
             "loader_version": loader_version,
             "source_url": profile_url,
-            "sha256": sha,
             "file_name": file_name,
             "file_type": "profile_json",
+            "verification": PROFILE_VERIFICATION,
             "provided_versions": provided_versions,
             "release_channel": _release_channel(loader_version),
         })
         logger.info(
-            "Added Quilt loader %s for MC %s (%s sha256=%s...)",
+            "Added Quilt loader %s for MC %s (%s)",
             loader_version,
             mc_version,
             _release_channel(loader_version),
-            sha[:16],
         )
 
     return entries
@@ -1305,15 +1320,17 @@ def _merge_entries(
 ) -> list[dict[str, Any]]:
     existing = _reconcile_quarantine(loader, existing)
     seen: dict[tuple[str, str], dict[str, Any]] = {
-        (e["mc_version"], e["loader_version"]): e for e in existing
+        (e["mc_version"], e["loader_version"]): _with_profile_verification(loader, e)
+        for e in existing
     }
     mutations: list[dict[str, Any]] = []
     for entry in new_entries:
+        entry = _with_profile_verification(loader, entry)
         key = (entry["mc_version"], entry["loader_version"])
         previous = seen.get(key)
 
         record = _QUARANTINE.get(entry["source_url"])
-        if record is not None:
+        if record is not None and not is_dynamic_profile(loader, entry):
             if entry["sha256"] != record["entry"]["sha256"]:
                 quarantine_entry(loader, record["entry"], entry, record["reason"])
                 continue
@@ -1384,6 +1401,7 @@ _ENTRY_KEY_ORDER = (
     "sha256",
     "file_name",
     "file_type",
+    "verification",
     "version_json_sha256",
     "content_sha256",
     "installer_spec",
@@ -1396,7 +1414,7 @@ _ENTRY_KEY_ORDER = (
 
 def _normalize_entry(loader: str, entry: dict[str, Any]) -> dict[str, Any]:
     """Enrich a legacy entry and re-emit its keys in a fixed order."""
-    entry = _enrich_entry(loader, entry)
+    entry = _with_profile_verification(loader, _enrich_entry(loader, entry))
     return {key: entry[key] for key in _ENTRY_KEY_ORDER if key in entry}
 
 
@@ -1417,14 +1435,12 @@ def _write_loader_manifests(manifest: dict[str, Any]) -> None:
 
 
 def _write_known_good_hashes(manifest: dict[str, Any]) -> None:
-    loader_hashes: dict[str, dict[str, str | None]] = {}
+    loader_hashes: dict[str, dict[str, str]] = {}
     for loader, entries in manifest["loaders"].items():
         loader_hashes[loader] = {}
         for entry in entries:
-            sha = entry.get("sha256")
-            loader_hashes[loader][entry["file_name"]] = (
-                f"sha256:{sha}" if sha else None
-            )
+            if not is_dynamic_profile(loader, entry):
+                loader_hashes[loader][entry["file_name"]] = f"sha256:{entry['sha256']}"
 
     data = {
         "domain_allowlist": manifest["domain_allowlist"],
