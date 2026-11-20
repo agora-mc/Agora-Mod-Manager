@@ -9,6 +9,7 @@ use agora_core::plugins::{
     UpdateOutcome,
 };
 use clap::Subcommand;
+use std::path::PathBuf;
 
 #[derive(Subcommand)]
 pub enum OfficialCmd {
@@ -25,6 +26,12 @@ pub enum OfficialCmd {
         yes: bool,
         #[arg(long, help = "Install without allowing the plugin's code to run")]
         no_code: bool,
+        #[arg(
+            long,
+            value_name = "ZIP",
+            help = "Install a local package file instead of downloading it; it must match the signed catalog's pin"
+        )]
+        file: Option<PathBuf>,
     },
     /// Move an installed plugin to the catalog's current official version.
     Update {
@@ -98,7 +105,12 @@ pub async fn run(service: &PluginService, action: OfficialCmd, json: bool) -> an
                 &rows,
             );
         }
-        OfficialCmd::Install { id, yes, no_code } => {
+        OfficialCmd::Install {
+            id,
+            yes,
+            no_code,
+            file,
+        } => {
             let plugin_id = crate::parse_plugin_id(&id)?;
             // `--yes` is the answer to both questions; `--no-code` withholds the
             // second. Core only applies the code answer to a first install.
@@ -107,9 +119,16 @@ pub async fn run(service: &PluginService, action: OfficialCmd, json: bool) -> an
                 scripts: yes && !no_code,
                 previewed_digest: None,
             };
-            let outcome = service
-                .install_official(plugin_id.as_str(), consent, &service.http_fetcher())
-                .await?;
+            let outcome = match file {
+                Some(path) => {
+                    service.install_official_from_file(plugin_id.as_str(), &path, consent)?
+                }
+                None => {
+                    service
+                        .install_official(plugin_id.as_str(), consent, &service.http_fetcher())
+                        .await?
+                }
+            };
             report(&id, outcome, "Installed", json, no_code)?;
         }
         OfficialCmd::Update { id, yes } => {

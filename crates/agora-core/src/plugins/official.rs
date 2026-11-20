@@ -876,7 +876,7 @@ fn verify_package_bytes(entry: &OfficialEntry, bytes: &[u8]) -> LauncherResult<(
         return Err(refused(
             "ERR_OFFICIAL_PLUGIN_SIZE",
             format!(
-                "The download for `{}` is {} bytes, but the signed catalog says {}. \
+                "The package for `{}` is {} bytes, but the signed catalog says {}. \
                  Nothing was installed.",
                 entry.plugin_id,
                 bytes.len(),
@@ -884,13 +884,57 @@ fn verify_package_bytes(entry: &OfficialEntry, bytes: &[u8]) -> LauncherResult<(
             ),
         ));
     }
-    if crate::download::sha256_hex(bytes) != entry.package_sha256 {
+    let actual = crate::download::sha256_hex(bytes);
+    if actual != entry.package_sha256 {
         return Err(refused(
             "ERR_OFFICIAL_PLUGIN_HASH",
             format!(
-                "The download for `{}` does not match the SHA-256 in the signed catalog, so it \
-                 was refused. Nothing was installed.",
-                entry.plugin_id
+                "The package for `{}` has SHA-256 {actual}, but the signed catalog pins {}. \
+                 Nothing was installed.",
+                entry.plugin_id, entry.package_sha256
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The checks on a signed entry that do not depend on the package bytes.
+fn check_entry(entry: &OfficialEntry) -> LauncherResult<()> {
+    entry.check().map_err(|problem| {
+        refused(
+            "ERR_OFFICIAL_PLUGIN_ENTRY",
+            format!(
+                "The catalog entry for `{}` {} cannot be used: {problem}",
+                entry.plugin_id, entry.version
+            ),
+        )
+    })?;
+    if let Some(reason) = entry.incompatible_reason() {
+        return Err(refused(
+            "ERR_OFFICIAL_PLUGIN_INCOMPATIBLE",
+            format!(
+                "`{}` {} cannot be installed on this version of Agora: {reason}.",
+                entry.plugin_id, entry.version
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Check obtained package bytes against their signed pin before anything is
+/// written. Downloads and local files call the same function, so a local file
+/// can never skip a check the downloaded package goes through.
+fn verify_entry_bytes(entry: &OfficialEntry, bytes: &[u8]) -> LauncherResult<()> {
+    verify_package_bytes(entry, bytes)?;
+    // The bytes are what the entry pins; the files they unpack to must be
+    // what it pins too, or the installed copy could never verify.
+    if zip_tree_digest(bytes)? != entry.package_tree_sha256 {
+        return Err(refused(
+            "ERR_OFFICIAL_PLUGIN_TREE",
+            format!(
+                "The files in the package for `{}` {} are not the ones the signed catalog \
+                 pins. Nothing was installed.",
+                entry.plugin_id, entry.version
             ),
         ));
     }
@@ -1119,6 +1163,38 @@ impl PluginService {
         self.finish_official_install(plans, consent)
     }
 
+    /// Install an official plugin from package bytes obtained without the
+    /// network, after the same pin checks a downloaded package goes through.
+    pub fn install_official_bytes(
+        &self,
+        plugin_id: &str,
+        bytes: &[u8],
+        consent: impl Into<Consent>,
+    ) -> LauncherResult<UpdateOutcome> {
+        let catalog = self.signed_catalog()?;
+        let entry = known_entry(catalog.current(plugin_id), plugin_id)?;
+        check_entry(entry)?;
+        verify_entry_bytes(entry, bytes)?;
+        self.install_verified(entry, bytes, consent)
+    }
+
+    /// Install an official plugin from a local package zip file.
+    pub fn install_official_from_file(
+        &self,
+        plugin_id: &str,
+        path: &Path,
+        consent: impl Into<Consent>,
+    ) -> LauncherResult<UpdateOutcome> {
+        let bytes = std::fs::read(path).map_err(|error| LauncherError::Generic {
+            code: "ERR_OFFICIAL_PLUGIN_FILE_READ".into(),
+            message: format!(
+                "Could not read the package file {}: {error}.",
+                path.display()
+            ),
+        })?;
+        self.install_official_bytes(plugin_id, &bytes, consent)
+    }
+
     /// Move an installed plugin to the catalog's current official version.
     ///
     /// A same-id plugin that is not verified official (a community copy, or one
@@ -1241,24 +1317,7 @@ impl PluginService {
         entry: &OfficialEntry,
         fetcher: &dyn PackageFetcher,
     ) -> LauncherResult<Vec<u8>> {
-        entry.check().map_err(|problem| {
-            refused(
-                "ERR_OFFICIAL_PLUGIN_ENTRY",
-                format!(
-                    "The catalog entry for `{}` {} cannot be used: {problem}",
-                    entry.plugin_id, entry.version
-                ),
-            )
-        })?;
-        if let Some(reason) = entry.incompatible_reason() {
-            return Err(refused(
-                "ERR_OFFICIAL_PLUGIN_INCOMPATIBLE",
-                format!(
-                    "`{}` {} cannot be installed on this version of Agora: {reason}.",
-                    entry.plugin_id, entry.version
-                ),
-            ));
-        }
+        check_entry(entry)?;
         // `check` proved the URL has a plain host; this is that host.
         let host = package_host(&entry.package_url).ok_or_else(|| {
             refused(
@@ -1269,19 +1328,7 @@ impl PluginService {
 
         let bytes = fetcher.fetch(&entry.package_url, &host).await?;
         // Before anything is written anywhere.
-        verify_package_bytes(entry, &bytes)?;
-        // The bytes are what the entry pins; the files they unpack to must be
-        // what it pins too, or the installed copy could never verify.
-        if zip_tree_digest(&bytes)? != entry.package_tree_sha256 {
-            return Err(refused(
-                "ERR_OFFICIAL_PLUGIN_TREE",
-                format!(
-                    "The files in the package for `{}` {} are not the ones the signed catalog \
-                     pins. Nothing was installed.",
-                    entry.plugin_id, entry.version
-                ),
-            ));
-        }
+        verify_entry_bytes(entry, &bytes)?;
         Ok(bytes)
     }
 

@@ -582,6 +582,80 @@ async fn a_good_install_is_official_and_records_the_signed_entry() {
     assert_eq!(list.plugins[0].game_ids, vec![GAME.to_string()]);
 }
 
+#[test]
+fn an_official_plugin_can_be_installed_from_a_local_package_file() {
+    let world = World::new();
+    let zip = fixture_zip("1.0.0");
+    world.publish(vec![(Release::of("1.0.0", "current", &zip), zip.clone())]);
+    let file = world.root().join("supplied.zip");
+    std::fs::write(&file, &zip).unwrap();
+
+    let plugin = installed(
+        world
+            .service
+            .install_official_from_file(PLUGIN, &file, true)
+            .unwrap(),
+    );
+
+    assert_eq!(plugin.version, "1.0.0");
+    assert_eq!(
+        plugin.official,
+        OfficialStatus::Official {
+            version: "1.0.0".into()
+        }
+    );
+    // The bytes came from the file, not from the catalog's URL.
+    assert_eq!(world.fetcher.calls(), 0);
+    let conn = agora_core::db::local_state_connection(&world.paths().local_state_db()).unwrap();
+    let provenance = agora_core::plugins::store::list_official(&conn).unwrap();
+    assert_eq!(provenance[PLUGIN].entry_sha256, sha(&zip));
+}
+
+#[test]
+fn a_local_package_that_does_not_match_its_pin_is_refused_naming_both_hashes() {
+    let world = World::new();
+    let good = fixture_zip("1.0.0");
+    let release = Release::of("1.0.0", "current", &good);
+    let pinned_hash = sha(&good);
+    let mut forged = good.clone();
+    let last = forged.len() - 1;
+    forged[last] ^= 0xFF;
+    let file = world.root().join("forged.zip");
+    std::fs::write(&file, &forged).unwrap();
+    world.publish(vec![(release, good)]);
+
+    let error = world
+        .service
+        .install_official_from_file(PLUGIN, &file, true)
+        .expect_err("a local package that does not match the pin is refused");
+    assert_eq!(error.code(), "ERR_OFFICIAL_PLUGIN_HASH");
+    assert!(
+        error.to_string().contains(&sha(&forged)) && error.to_string().contains(&pinned_hash),
+        "the refusal must name both hashes: {error}"
+    );
+    assert!(files_under(&world.paths().plugins_root()).is_empty());
+    assert!(world.service.list().is_empty());
+}
+
+#[test]
+fn a_local_package_for_an_unknown_plugin_id_is_refused() {
+    let world = World::new();
+    let zip = fixture_zip("1.0.0");
+    world.publish(vec![(Release::of("1.0.0", "current", &zip), zip.clone())]);
+    let file = world.root().join("unknown.zip");
+    std::fs::write(&file, &zip).unwrap();
+
+    let error = world
+        .service
+        .install_official_from_file("acme.unknown", &file, true)
+        .expect_err("an id the signed catalog does not list is refused");
+    assert_eq!(error.code(), "ERR_OFFICIAL_PLUGIN_UNKNOWN");
+    assert!(
+        error.to_string().contains("acme.unknown"),
+        "the refusal must name the unknown id: {error}"
+    );
+}
+
 #[tokio::test]
 async fn the_normal_capability_consent_still_applies() {
     let world = World::new();
