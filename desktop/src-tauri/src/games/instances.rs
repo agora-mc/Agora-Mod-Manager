@@ -1016,7 +1016,7 @@ fn launch_instance(
 
     // The CLI asks the same core function. On Linux a Steam install is handed to Steam so the
     // wrapper can mount the view; only the direct route starts a process here and needs a watcher.
-    match game_wrap::dispatch_launch(&ctx, instance_id, LaunchPlatform::Native) {
+    match game_wrap::dispatch_launch(&ctx, instance_id, LaunchPlatform::Native, false) {
         Ok(PlatformLaunch::Steam(status)) => return Ok(steam_launch_reply(&status)),
         Ok(PlatformLaunch::Ordinary) => {}
         Err(error) => return Err(core_failed(error.to_string())),

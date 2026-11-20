@@ -1176,20 +1176,20 @@ fn start_scripts(
 fn shell_body(plan: &LauncherPlan, gc_args: &str) -> String {
     match plan {
         LauncherPlan::LauncherJar { file } => {
-            format!("exec \"$JAVA_BIN\" {gc_args} -jar {file} nogui")
+            format!("exec \"$JAVA_BIN\" {gc_args} -jar ./{file} nogui")
         }
         LauncherPlan::InstallerThenRun {
             installer,
             args,
             runner,
         } => {
-            let install = format!("\"$JAVA_BIN\" -jar {installer} {}", args.join(" "));
+            let install = format!("\"$JAVA_BIN\" -jar ./{installer} {}", args.join(" "));
             match runner {
                 InstallerRunner::RunScript => format!(
-                    "if [ ! -f run.sh ]; then\n  {install} || exit 1\nfi\nexec bash ./run.sh nogui"
+                    "if [ ! -f ./run.sh ]; then\n  {install} || exit 1\nfi\ncase \"$JAVA_BIN\" in\n  */*) PATH=\"$(dirname \"$JAVA_BIN\"):$PATH\" ;;\nesac\nexec bash ./run.sh nogui"
                 ),
                 InstallerRunner::LauncherJar { file } => format!(
-                    "if [ ! -f {file} ]; then\n  {install} || exit 1\nfi\nexec \"$JAVA_BIN\" {gc_args} -jar {file} nogui"
+                    "if [ ! -f ./{file} ]; then\n  {install} || exit 1\nfi\nexec \"$JAVA_BIN\" {gc_args} -jar ./{file} nogui"
                 ),
             }
         }
@@ -1199,20 +1199,20 @@ fn shell_body(plan: &LauncherPlan, gc_args: &str) -> String {
 fn batch_body(plan: &LauncherPlan, gc_args: &str) -> String {
     match plan {
         LauncherPlan::LauncherJar { file } => {
-            format!("\"%JAVA%\" {gc_args} -jar {file} nogui")
+            format!("\"%JAVA%\" {gc_args} -jar \"%~dp0{file}\" nogui")
         }
         LauncherPlan::InstallerThenRun {
             installer,
             args,
             runner,
         } => {
-            let install = format!("\"%JAVA%\" -jar {installer} {}", args.join(" "));
+            let install = format!("\"%JAVA%\" -jar \"%~dp0{installer}\" {}", args.join(" "));
             match runner {
                 InstallerRunner::RunScript => format!(
-                    "if not exist run.bat (\r\n  {install}\r\n  if errorlevel 1 exit /b 1\r\n)\r\ncall run.bat nogui"
+                    "if not exist \"%~dp0run.bat\" (\r\n  {install}\r\n  if errorlevel 1 exit /b 1\r\n)\r\nfor %%I in (\"%JAVA%\") do if not \"%%~dpI\"==\"\" set \"PATH=%%~dpI;%PATH%\"\r\ncall \"%~dp0run.bat\" nogui"
                 ),
                 InstallerRunner::LauncherJar { file } => format!(
-                    "if not exist {file} (\r\n  {install}\r\n  if errorlevel 1 exit /b 1\r\n)\r\n\"%JAVA%\" {gc_args} -jar {file} nogui"
+                    "if not exist \"%~dp0{file}\" (\r\n  {install}\r\n  if errorlevel 1 exit /b 1\r\n)\r\n\"%JAVA%\" {gc_args} -jar \"%~dp0{file}\" nogui"
                 ),
             }
         }
@@ -1776,6 +1776,93 @@ side = "CLIENT"
     }
 
     #[test]
+    fn start_scripts_reference_local_scripts_and_jars_by_explicit_path() {
+        let (sh, bat) = start_scripts(
+            &LauncherPlan::InstallerThenRun {
+                installer: "forge-installer.jar".into(),
+                args: vec!["--installServer".into()],
+                runner: InstallerRunner::RunScript,
+            },
+            2048,
+            GcProfile::HighEfficiency,
+            17,
+            "forge",
+        );
+        assert!(
+            bat.contains("call \"%~dp0run.bat\" nogui"),
+            "run.bat must be called by explicit path: {bat}"
+        );
+        assert!(
+            bat.contains("if not exist \"%~dp0run.bat\""),
+            "the run.bat existence check must use an explicit path: {bat}"
+        );
+        assert!(
+            bat.contains("-jar \"%~dp0forge-installer.jar\""),
+            "the installer jar must be run by explicit path: {bat}"
+        );
+        assert!(
+            sh.contains("cd \"$(dirname \"$0\")\""),
+            "start.sh must cd to its own folder: {sh}"
+        );
+        assert!(
+            sh.contains("exec bash ./run.sh nogui"),
+            "run.sh must be called by explicit path: {sh}"
+        );
+        assert!(
+            sh.contains("if [ ! -f ./run.sh ]"),
+            "the run.sh existence check must use an explicit path: {sh}"
+        );
+
+        let (sh, bat) = start_scripts(
+            &LauncherPlan::LauncherJar {
+                file: "fabric-server-launch.jar".into(),
+            },
+            4096,
+            GcProfile::HighEfficiency,
+            21,
+            "fabric",
+        );
+        assert!(
+            bat.contains("-jar \"%~dp0fabric-server-launch.jar\""),
+            "the launcher jar must be run by explicit path: {bat}"
+        );
+        assert!(
+            sh.contains("-jar ./fabric-server-launch.jar"),
+            "the launcher jar must be run by explicit path: {sh}"
+        );
+    }
+
+    #[test]
+    fn forge_start_scripts_put_the_chosen_java_folder_first_on_path() {
+        let (sh, bat) = start_scripts(
+            &LauncherPlan::InstallerThenRun {
+                installer: "forge-installer.jar".into(),
+                args: vec!["--installServer".into()],
+                runner: InstallerRunner::RunScript,
+            },
+            2048,
+            GcProfile::HighEfficiency,
+            21,
+            "neoforge",
+        );
+        let bat_path_line =
+            "for %%I in (\"%JAVA%\") do if not \"%%~dpI\"==\"\" set \"PATH=%%~dpI;%PATH%\"";
+        assert!(bat.contains(bat_path_line), "{bat}");
+        assert!(
+            bat.find(bat_path_line).unwrap() < bat.find("call \"%~dp0run.bat\"").unwrap(),
+            "PATH must be set before handing over to run.bat: {bat}"
+        );
+
+        let sh_path_line = "PATH=\"$(dirname \"$JAVA_BIN\"):$PATH\"";
+        assert!(sh.contains("case \"$JAVA_BIN\" in"), "{sh}");
+        assert!(sh.contains(sh_path_line), "{sh}");
+        assert!(
+            sh.find(sh_path_line).unwrap() < sh.find("exec bash ./run.sh").unwrap(),
+            "PATH must be set before handing over to run.sh: {sh}"
+        );
+    }
+
+    #[test]
     fn the_eula_is_written_unaccepted_and_never_overwritten() {
         let tmp = TempDir::new().unwrap();
         write_eula(tmp.path()).unwrap();
@@ -1840,7 +1927,10 @@ side = "CLIENT"
         );
         assert!(sh.contains("fabric-server-launch.jar"), "{sh}");
         assert!(sh.contains("-Xmx4096M"), "{sh}");
-        assert!(sh.contains("if [ ! -f fabric-server-launch.jar ]"), "{sh}");
+        assert!(
+            sh.contains("if [ ! -f ./fabric-server-launch.jar ]"),
+            "{sh}"
+        );
         assert!(bat.contains("-mcversion 1.21"), "{bat}");
         assert!(bat.contains("fabric-server-launch.jar"), "{bat}");
         assert!(!sh.contains("user_jvm_args.txt"), "{sh}");

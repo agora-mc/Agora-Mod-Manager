@@ -15,12 +15,16 @@
 //! Nothing here names a game. The Steam app id, the install and the Proton prefix come from the
 //! install record; the per-user files come from the game definition.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::{Duration, UNIX_EPOCH};
 
-use agora_game_api::{BaseReference, GameDefinition, GameId, StoreId, UserFileStrategy};
+use agora_game_api::{
+    BaseReference, ConditionFacts, GameDefinition, GameId, GamePath, StoreId, UserFileStrategy,
+    VersionSource,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::crash_live::LivePacks;
@@ -28,6 +32,7 @@ use crate::ctx::Ctx;
 use crate::game_deploy::DeployMode;
 use crate::game_discovery::steam;
 use crate::game_instance;
+use crate::game_launch::{AppliedAlternative, LaunchRoots, ResolvedLaunch};
 use crate::linux_view::{self, CommandSpec, PerUserMount, ViewOutcome, ViewRequest};
 
 /// How long a `games instance launch` record is trusted. Steam starts the wrapper within seconds;
@@ -49,6 +54,9 @@ pub struct PendingLaunch {
     pub instance_id: String,
     pub game: String,
     pub created_unix_ms: i64,
+    /// The launch asked to skip framework loaders, so the wrapper must not substitute one either.
+    #[serde(default)]
+    pub plain: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,6 +128,189 @@ impl WrapOutcome {
     }
 }
 
+/// What the Steam wrapper decided about starting the game through a framework loader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoaderSubstitution {
+    /// Steam's arguments, with the game executable replaced by the loader when one applies.
+    pub args: Vec<String>,
+    /// The alternative that was applied, for the one-line announcement the Windows launch prints.
+    pub applied: Option<AppliedAlternative>,
+    /// Why the command was left unchanged when the loader was wanted, for stderr.
+    pub reason: Option<String>,
+}
+
+/// Rewrite Steam's command so the game starts through the launch alternative the game definition
+/// declares, using the same [`apply_launch_alternative_with_facts`](crate::game_launch::apply_launch_alternative_with_facts)
+/// decision the Windows launch uses.
+///
+/// Steam starts a Proton game as `<proton> waitforexitandrun <game exe>` (Valve's Proton README,
+/// <https://github.com/ValveSoftware/Proton>): its command names the game's own executable, so a
+/// framework loader installed beside it is never used. When an alternative applies, the game
+/// executable argument is replaced by the loader's executable from the same folder; Proton's
+/// wrapper, its arguments and everything else Steam passed stay untouched. An argument matches the
+/// game's executable when its file name, case-insensitively, is one the definition declares (the
+/// launch recipe or a version source), or is a launcher variant sharing that name's stem (Steam
+/// names Skyrim SE's game `SkyrimSELauncher.exe`, the definition declares `SkyrimSE.exe`).
+///
+/// `plain` skips the alternative, as `games instance launch --plain` does. A wanted loader with no
+/// matching argument, or one that cannot be started, leaves the command unchanged and says why.
+pub fn loader_substitution(
+    definition: &GameDefinition,
+    roots: &LaunchRoots,
+    facts: &dyn ConditionFacts,
+    plain: bool,
+    args: &[String],
+) -> LoaderSubstitution {
+    if plain {
+        return LoaderSubstitution {
+            args: args.to_vec(),
+            applied: None,
+            reason: None,
+        };
+    }
+
+    let mut resolved = ResolvedLaunch {
+        program: PathBuf::new(),
+        args: Vec::new(),
+        env: BTreeMap::new(),
+        cwd: PathBuf::new(),
+    };
+    let mut notes = Vec::new();
+    let alternative = match crate::game_launch::apply_launch_alternative_with_facts(
+        definition,
+        roots,
+        &mut resolved,
+        facts,
+        &mut notes,
+    ) {
+        Ok(alternative) => alternative,
+        Err(error) => {
+            return LoaderSubstitution {
+                args: args.to_vec(),
+                applied: None,
+                reason: Some(format!("the game's loader could not be used ({error})")),
+            }
+        }
+    };
+    let Some(alternative) = alternative else {
+        return LoaderSubstitution {
+            args: args.to_vec(),
+            applied: None,
+            reason: None,
+        };
+    };
+
+    let Some(index) = args
+        .iter()
+        .position(|arg| is_game_executable_arg(arg, definition))
+    else {
+        return LoaderSubstitution {
+            args: args.to_vec(),
+            applied: None,
+            reason: Some(
+                "no argument in Steam's command named the game's executable, so the loader was not used"
+                    .to_string(),
+            ),
+        };
+    };
+
+    let Some(loader_name) = resolved
+        .program
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+    else {
+        return LoaderSubstitution {
+            args: args.to_vec(),
+            applied: None,
+            reason: Some("the game's loader has no executable name".to_string()),
+        };
+    };
+
+    let mut rewritten = args.to_vec();
+    rewritten[index] = replace_file_name(&rewritten[index], &loader_name);
+    LoaderSubstitution {
+        args: rewritten,
+        applied: Some(alternative),
+        reason: None,
+    }
+}
+
+/// Replace just the last path component of `value`, keeping the folder and the separator style
+/// Steam used (Proton names the game's executable as a path, Unix- or Windows-style).
+fn replace_file_name(value: &str, name: &str) -> String {
+    match value.rfind(['/', '\\']) {
+        Some(index) => format!("{}{}", &value[..=index], name),
+        None => name.to_string(),
+    }
+}
+
+/// The last path component of a command argument, with either separator style.
+fn argument_file_name(value: &str) -> &str {
+    value.rsplit(['/', '\\']).next().unwrap_or(value)
+}
+
+/// Whether a Steam command argument names the game's own executable, which is what a framework's
+/// loader replaces. The names come from the game definition; a launcher variant (Steam names Skyrim
+/// SE's game `SkyrimSELauncher.exe` where the definition declares `SkyrimSE.exe`) shares the
+/// declared name's stem. Comparison ignores case, and the argument may be a full path.
+fn is_game_executable_arg(argument: &str, definition: &GameDefinition) -> bool {
+    let name = argument_file_name(argument);
+    if name.is_empty() {
+        return false;
+    }
+    declared_executable_names(definition)
+        .iter()
+        .any(|declared| {
+            if name.eq_ignore_ascii_case(declared) {
+                return true;
+            }
+            let declared_stem = declared
+                .rsplit_once('.')
+                .map(|(stem, _)| stem)
+                .unwrap_or(declared);
+            let name_stem = name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(name);
+            !declared_stem.is_empty()
+                && name_stem.len() > declared_stem.len()
+                && name_stem
+                    .get(..declared_stem.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(declared_stem))
+        })
+}
+
+/// The game executable names the definition declares: its launch recipe's executable and any
+/// executable version sources.
+fn declared_executable_names(definition: &GameDefinition) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(recipe) = &definition.launch {
+        let path = match &recipe.executable {
+            GamePath::Runtime { path }
+            | GamePath::Install { path, .. }
+            | GamePath::Base { path, .. }
+            | GamePath::Instance { path }
+            | GamePath::Layer { path, .. }
+            | GamePath::RuntimeComponent { path, .. }
+            | GamePath::UserData { path, .. } => Some(path.as_str()),
+            GamePath::Artifact { .. } => None,
+        };
+        if let Some(name) = path.and_then(|path| path.rsplit('/').next()) {
+            if !name.is_empty() {
+                names.push(name.to_string());
+            }
+        }
+    }
+    for source in &definition.version_sources {
+        if let VersionSource::Executable { path } = source {
+            if let Some(name) = path.as_str().rsplit('/').next() {
+                if !name.is_empty() {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
 /// What Steam's launch options look like for one instance.
 pub fn launch_status(ctx: &Ctx, instance_id: &str) -> Result<steam::SteamLaunchStatus, WrapError> {
     let (_, app_id) = instance_install(ctx, instance_id)?;
@@ -158,17 +349,20 @@ pub trait SteamLauncher: Send + Sync {
 pub fn start_via_steam(
     ctx: &Ctx,
     instance_id: &str,
+    plain: bool,
 ) -> Result<steam::SteamLaunchStatus, WrapError> {
     let launcher = native_steam_launcher().ok_or(WrapError::SteamMissing)?;
-    start_via_steam_with(ctx, instance_id, &launcher)
+    start_via_steam_with(ctx, instance_id, &launcher, plain)
 }
 
 /// [`start_via_steam`] with an injected launcher, so a launch hand-off can be tested without a
-/// Steam install or a real process.
+/// Steam install or a real process. `plain` travels in the pending launch so the wrapper skips the
+/// game's framework loader too.
 pub fn start_via_steam_with(
     ctx: &Ctx,
     instance_id: &str,
     launcher: &dyn SteamLauncher,
+    plain: bool,
 ) -> Result<steam::SteamLaunchStatus, WrapError> {
     let (_, app_id) = instance_install(ctx, instance_id)?;
     let record = game_instance::get(ctx, instance_id)?
@@ -179,6 +373,7 @@ pub fn start_via_steam_with(
             instance_id: instance_id.to_string(),
             game: record.game.as_str().to_string(),
             created_unix_ms: now_ms(ctx),
+            plain,
         },
     )?;
     let started = launcher.start(&format!("steam://rungameid/{app_id}"));
@@ -202,12 +397,13 @@ pub fn dispatch_launch(
     ctx: &Ctx,
     instance_id: &str,
     platform: LaunchPlatform,
+    plain: bool,
 ) -> Result<PlatformLaunch, WrapError> {
     if platform == LaunchPlatform::Native && !cfg!(target_os = "linux") {
         return Ok(PlatformLaunch::Ordinary);
     }
     let launcher = native_steam_launcher().ok_or(WrapError::SteamMissing)?;
-    dispatch_launch_with(ctx, instance_id, platform, &launcher)
+    dispatch_launch_with(ctx, instance_id, platform, &launcher, plain)
 }
 
 /// [`dispatch_launch`] with an injected Steam launcher, for testing the hand-off both surfaces
@@ -217,6 +413,7 @@ pub fn dispatch_launch_with(
     instance_id: &str,
     platform: LaunchPlatform,
     launcher: &dyn SteamLauncher,
+    plain: bool,
 ) -> Result<PlatformLaunch, WrapError> {
     let linux = match platform {
         LaunchPlatform::Linux => true,
@@ -225,7 +422,7 @@ pub fn dispatch_launch_with(
     if !linux {
         return Ok(PlatformLaunch::Ordinary);
     }
-    match start_via_steam_with(ctx, instance_id, launcher) {
+    match start_via_steam_with(ctx, instance_id, launcher, plain) {
         Ok(status) => Ok(PlatformLaunch::Steam(status)),
         Err(WrapError::NotSteam(_)) => Ok(PlatformLaunch::Ordinary),
         Err(error) => Err(error),
@@ -343,7 +540,7 @@ pub fn wrap(ctx: &Ctx, live: &LivePacks<'_>, command: &[String]) -> Result<WrapO
     };
     let args: Vec<String> = command.iter().skip(1).cloned().collect();
 
-    let Some(instance_id) = choose_instance(ctx, &program)? else {
+    let Some((instance_id, plain)) = choose_instance(ctx, &program)? else {
         return Ok(run_passthrough(
             &program,
             &args,
@@ -388,12 +585,37 @@ pub fn wrap(ctx: &Ctx, live: &LivePacks<'_>, command: &[String]) -> Result<WrapO
     // the Windows game's per-user files in the Linux home and bind the wrong files.
     let prefix = steam::proton_prefix_checked(&install, &app_id).map_err(WrapError::Prefix)?;
     let mounts = per_user_mounts(ctx, &instance_id, &definition, &prefix)?;
+
+    // Steam's command names the game's own executable, so SKSE would never load under Proton.
+    // Decide on the loader with the same rule the Windows launch uses, against the instance's
+    // deployed view, and swap only that one argument; the rest of Steam's command stays as it came.
+    let facts = crate::game_conditions::InstanceFacts::for_instance(ctx, &instance_id, &definition);
+    let roots = LaunchRoots {
+        runtime: crate::game_deploy::deployment_dir(ctx, &instance_id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| install.clone()),
+        install: Some(install.clone()),
+        base: Some(install.clone()),
+    };
+    let substitution = loader_substitution(&definition, &roots, &facts, plain, &args);
+    if let Some(alternative) = &substitution.applied {
+        eprintln!(
+            "agora games wrap: Starting through '{}': {}.",
+            alternative.id, alternative.reason
+        );
+    }
+    if let Some(reason) = &substitution.reason {
+        eprintln!("agora games wrap: {reason}. Starting the game's own executable instead.");
+    }
+    let command_args = substitution.args;
+
     let request = ViewRequest {
         instance_id: instance_id.clone(),
         target: install.clone(),
         command: CommandSpec {
             program: program.clone(),
-            args: args.clone(),
+            args: command_args.clone(),
             environment: None,
             // Steam starts the command with the game folder as its working directory. Re-enter
             // that path inside the namespace after the overlay is mounted, so a relative read or
@@ -441,7 +663,7 @@ pub fn wrap(ctx: &Ctx, live: &LivePacks<'_>, command: &[String]) -> Result<WrapO
                 &store,
                 &install,
                 &program,
-                &args,
+                &command_args,
                 step.next,
                 &step.reason,
                 session_id.as_deref(),
@@ -553,8 +775,9 @@ fn now_ms(ctx: &Ctx) -> i64 {
         .unwrap_or(0)
 }
 
-/// The instance to play: the pending launch, else the default for the game the command belongs to.
-fn choose_instance(ctx: &Ctx, program: &Path) -> Result<Option<String>, WrapError> {
+/// The instance to play and whether its launch asked for a plain start: the pending launch, else
+/// the default for the game the command belongs to.
+fn choose_instance(ctx: &Ctx, program: &Path) -> Result<Option<(String, bool)>, WrapError> {
     let app_id = std::env::var("SteamAppId").ok();
     let identified = identify_game(ctx, program, app_id.as_deref());
 
@@ -567,17 +790,17 @@ fn choose_instance(ctx: &Ctx, program: &Path) -> Result<Option<String>, WrapErro
                     game.as_str()
                 );
             } else {
-                return Ok(Some(pending.instance_id));
+                return Ok(Some((pending.instance_id, pending.plain)));
             }
         } else {
-            return Ok(Some(pending.instance_id));
+            return Ok(Some((pending.instance_id, pending.plain)));
         }
     }
 
     let Some(game) = identified else {
         return Ok(None);
     };
-    Ok(default_instance(ctx, &game))
+    Ok(default_instance(ctx, &game).map(|id| (id, false)))
 }
 
 /// Which game a Steam command belongs to: its app id names one in the registry, else the install
@@ -1071,6 +1294,215 @@ fn finish_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agora_game_api::{
+        DeploymentStrategy, FrameworkId, LaunchAlternative, LaunchRecipe, LaunchValue, RelPath,
+        StoreIdentifier,
+    };
+
+    fn loader_definition() -> GameDefinition {
+        GameDefinition {
+            mo2_game_name: None,
+            session: Default::default(),
+            id: GameId::new("loader-test-game").unwrap(),
+            extends: None,
+            name: "Loader Test Game".into(),
+            import_ids: Default::default(),
+            stores: vec![StoreIdentifier {
+                store: StoreId::steam(),
+                product: "4242".into(),
+            }],
+            version_sources: vec![VersionSource::Executable {
+                path: RelPath::new("SkyrimSE.exe").unwrap(),
+            }],
+            deployment: DeploymentStrategy::VirtualFileSystem,
+            content_rules: vec![],
+            framework_ids: vec![],
+            tool_ids: vec![],
+            launch: Some(LaunchRecipe {
+                executable: GamePath::Runtime {
+                    path: RelPath::new("SkyrimSE.exe").unwrap(),
+                },
+                arguments: vec![LaunchValue::Literal {
+                    value: "-test".into(),
+                }],
+                environment: Default::default(),
+                working_directory: GamePath::Runtime {
+                    path: RelPath::default(),
+                },
+            }),
+            user_files: vec![],
+            save_paths: vec![],
+            linked_archive_patterns: vec![],
+            declared_writes: vec![],
+            excluded_paths: vec![],
+            load_orders: Vec::new(),
+            runtime_files: Vec::new(),
+            save_location: Vec::new(),
+            ini_checks: Vec::new(),
+            launch_alternatives: vec![LaunchAlternative {
+                id: "skse".into(),
+                when: agora_game_api::Condition::Present(
+                    RelPath::new("skse64_loader.exe").unwrap(),
+                ),
+                executable: GamePath::Runtime {
+                    path: RelPath::new("skse64_loader.exe").unwrap(),
+                },
+                reason: "SKSE is installed, so the game starts through its loader".into(),
+            }],
+            content_layout: None,
+            copy_patterns: Vec::new(),
+        }
+    }
+
+    struct FakeFacts {
+        present: bool,
+    }
+
+    impl ConditionFacts for FakeFacts {
+        fn present(&self, _path: &RelPath) -> Option<bool> {
+            Some(self.present)
+        }
+        fn framework(&self, _framework: &FrameworkId) -> Option<Option<String>> {
+            None
+        }
+        fn game_version(&self) -> Option<String> {
+            None
+        }
+    }
+
+    fn test_roots(root: &Path) -> LaunchRoots {
+        LaunchRoots {
+            runtime: root.to_path_buf(),
+            install: Some(root.to_path_buf()),
+            base: Some(root.to_path_buf()),
+        }
+    }
+
+    #[test]
+    fn a_proton_command_is_pointed_at_the_loader_from_the_game_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("skse64_loader.exe"), b"loader").unwrap();
+        let args = vec![
+            "/home/player/.steam/steamapps/common/Proton/proton".into(),
+            "waitforexitandrun".into(),
+            "/home/player/.steam/steamapps/common/Skyrim/SkyrimSELauncher.exe".into(),
+            "-windowed".into(),
+        ];
+        let result = loader_substitution(
+            &loader_definition(),
+            &test_roots(tmp.path()),
+            &FakeFacts { present: true },
+            false,
+            &args,
+        );
+        assert_eq!(result.args[0], args[0]);
+        assert_eq!(result.args[1], args[1]);
+        assert_eq!(
+            result.args[2],
+            "/home/player/.steam/steamapps/common/Skyrim/skse64_loader.exe"
+        );
+        assert_eq!(result.args[3], "-windowed");
+        assert_eq!(result.applied.as_ref().unwrap().id, "skse");
+        assert_eq!(result.reason, None);
+    }
+
+    #[test]
+    fn both_the_launcher_and_the_game_exe_map_to_the_loader() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("skse64_loader.exe"), b"loader").unwrap();
+        for game_exe in [
+            "SkyrimSELauncher.exe",
+            "SkyrimSE.exe",
+            "SKYRIMSE.EXE",
+            "skyrimseLauncher.exe",
+        ] {
+            let args = vec![
+                "proton".into(),
+                "waitforexitandrun".into(),
+                format!("/games/Skyrim/{game_exe}"),
+            ];
+            let result = loader_substitution(
+                &loader_definition(),
+                &test_roots(tmp.path()),
+                &FakeFacts { present: true },
+                false,
+                &args,
+            );
+            assert_eq!(
+                result.args[2], "/games/Skyrim/skse64_loader.exe",
+                "{game_exe} was not mapped to the loader"
+            );
+        }
+    }
+
+    #[test]
+    fn without_the_loader_the_command_is_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = vec![
+            "proton".into(),
+            "waitforexitandrun".into(),
+            "/games/Skyrim/SkyrimSELauncher.exe".into(),
+        ];
+        let result = loader_substitution(
+            &loader_definition(),
+            &test_roots(tmp.path()),
+            &FakeFacts { present: false },
+            false,
+            &args,
+        );
+        assert_eq!(result.args, args);
+        assert_eq!(result.applied, None);
+        assert_eq!(result.reason, None);
+    }
+
+    #[test]
+    fn no_matching_argument_leaves_the_command_unchanged_with_a_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("skse64_loader.exe"), b"loader").unwrap();
+        let args = vec![
+            "proton".into(),
+            "waitforexitandrun".into(),
+            "/games/Some Other Game/OtherGame.exe".into(),
+        ];
+        let result = loader_substitution(
+            &loader_definition(),
+            &test_roots(tmp.path()),
+            &FakeFacts { present: true },
+            false,
+            &args,
+        );
+        assert_eq!(result.args, args);
+        assert_eq!(result.applied, None);
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no argument")),
+            "the reason must say why nothing was substituted: {:?}",
+            result.reason
+        );
+    }
+
+    #[test]
+    fn a_plain_launch_leaves_the_command_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("skse64_loader.exe"), b"loader").unwrap();
+        let args = vec![
+            "proton".into(),
+            "waitforexitandrun".into(),
+            "/games/Skyrim/SkyrimSELauncher.exe".into(),
+        ];
+        let result = loader_substitution(
+            &loader_definition(),
+            &test_roots(tmp.path()),
+            &FakeFacts { present: true },
+            true,
+            &args,
+        );
+        assert_eq!(result.args, args);
+        assert_eq!(result.applied, None);
+        assert_eq!(result.reason, None);
+    }
 
     #[test]
     fn a_stale_pending_launch_is_not_taken() {
@@ -1087,6 +1519,7 @@ mod tests {
                 instance_id: "old".into(),
                 game: "a-game".into(),
                 created_unix_ms: 0,
+                plain: false,
             },
         )
         .unwrap();
@@ -1107,6 +1540,7 @@ mod tests {
                 instance_id: "fresh".into(),
                 game: "a-game".into(),
                 created_unix_ms: now_ms(&ctx),
+                plain: false,
             },
         )
         .unwrap();

@@ -234,13 +234,29 @@ pub async fn download_mod_bytes_standalone(url: &str) -> LauncherResult<Vec<u8>>
 /// Fabric rewrites `time`/`releaseTime` on every request, so the raw response hash
 /// is unstable. This mirrors `_stable_json_sha256` in `scripts/fetch_loader_manifests.py`.
 pub fn stable_json_sha256(data: &[u8]) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(data).ok()?;
-    let mut obj = value;
+    fn sort_keys(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut entries: Vec<_> = map
+                    .iter()
+                    .map(|(key, value)| (key.clone(), sort_keys(value)))
+                    .collect();
+                entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+                serde_json::Value::Object(entries.into_iter().collect())
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(sort_keys).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    let mut obj: serde_json::Value = serde_json::from_slice(data).ok()?;
     if let serde_json::Value::Object(map) = &mut obj {
         map.remove("time");
         map.remove("releaseTime");
     }
-    let serialized = serde_json::to_string(&obj).ok()?;
+    let serialized = serde_json::to_string(&sort_keys(&obj)).ok()?;
     let mut hasher = Sha256::new();
     hasher.update(serialized.as_bytes());
     Some(hex::encode(hasher.finalize()))
@@ -259,6 +275,13 @@ mod tests {
         let hash1 = stable_json_sha256(input1).unwrap();
         let hash2 = stable_json_sha256(input2).unwrap();
         assert_eq!(hash1, hash2, "reordering keys must produce the same hash");
+    }
+
+    #[test]
+    fn stable_json_sha256_sorts_nested_keys_and_keeps_unicode() {
+        let input = "{\"z\":9,\"time\":\"2024-01-01T00:00:00Z\",\"nested\":{\"beta\":2,\"alpha\":1,\"time\":\"keep-me\"},\"a\":[{\"y\":\"café\",\"x\":true}],\"releaseTime\":\"2024-01-01T00:00:00Z\"}";
+        let expected = "33b6f37c928bc4c64fcd08ca37c641fc92bd1d35b28508fb688dd474d72d7679";
+        assert_eq!(stable_json_sha256(input.as_bytes()).unwrap(), expected);
     }
 
     #[test]

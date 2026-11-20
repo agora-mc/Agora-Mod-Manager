@@ -8481,7 +8481,7 @@ async fn run_command(
                     skip_before_launch,
                 } => {
                     #[cfg(target_os = "linux")]
-                    if let Some(code) = cli_linux_launch(ctx, &instance_id, json)? {
+                    if let Some(code) = cli_linux_launch(ctx, &instance_id, json, plain)? {
                         std::process::exit(code);
                     }
                     let on_vfs_failure = if fall_back {
@@ -11978,26 +11978,31 @@ fn cli_linux_launch(
     ctx: &agora_core::ctx::Ctx,
     instance_id: &str,
     json: bool,
+    plain: bool,
 ) -> anyhow::Result<Option<i32>> {
     use agora_core::game_wrap::{dispatch_launch, LaunchPlatform};
-    let status =
-        match cli_dispatch_outcome(dispatch_launch(ctx, instance_id, LaunchPlatform::Native)) {
-            Ok(Some(status)) => status,
-            Ok(None) => return Ok(None),
-            Err(error) => {
-                if json {
-                    let out = serde_json::json!({
-                        "status": "error",
-                        "error": error.to_string(),
-                        "exitCode": 1,
-                    });
-                    eprintln!("{}", serde_json::to_string_pretty(&out)?);
-                } else {
-                    eprintln!("Error: {error}");
-                }
-                return Ok(Some(1));
+    let status = match cli_dispatch_outcome(dispatch_launch(
+        ctx,
+        instance_id,
+        LaunchPlatform::Native,
+        plain,
+    )) {
+        Ok(Some(status)) => status,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            if json {
+                let out = serde_json::json!({
+                    "status": "error",
+                    "error": error.to_string(),
+                    "exitCode": 1,
+                });
+                eprintln!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                eprintln!("Error: {error}");
             }
-        };
+            return Ok(Some(1));
+        }
+    };
 
     if json {
         let out = serde_json::json!({

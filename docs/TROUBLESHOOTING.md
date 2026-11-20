@@ -223,6 +223,17 @@ Steam starts the game, so Agora runs through the game's launch options:
    Steam uses the launch Agora recorded for two minutes, else that default, else Steam's command
    runs untouched.
 
+Steam starts a Proton game as `<proton> waitforexitandrun <game exe>` (Valve's Proton README,
+<https://github.com/ValveSoftware/Proton>), so its command names the game's own executable and a
+framework loader installed beside it would never load. When the instance's deployed view has a
+launch alternative whose condition holds — SKSE's `skse64_loader.exe` for Skyrim SE — the wrapper
+swaps that one argument for the loader from the same folder and prints `Starting through 'skse'`;
+Proton, its arguments and the rest of Steam's command are unchanged. Both the launcher name Steam
+uses (`SkyrimSELauncher.exe`) and the game executable the definition declares (`SkyrimSE.exe`) map
+to the loader. If the game's executable is not in Steam's command, the wrapper says so on standard
+error and runs the command untouched. `agora games instance launch <ID> --plain` records a plain
+start, which the wrapper honours; use it to check the game without SKSE or another framework loader.
+
 Launching through Proton on Linux has not been tested on real hardware yet.
 
 A **step-down** means the overlay could not be mounted over the game folder (for example because

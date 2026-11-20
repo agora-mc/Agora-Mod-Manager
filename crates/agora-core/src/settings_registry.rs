@@ -216,12 +216,12 @@ const REGISTRY: &[SettingDef] = &[
     number_setting("games_recently_deleted_days", "30"),
     number_setting("ambience.music-volume", "0.35"),
     number_setting("ambience.sound-volume", "0.5"),
-    number_setting("onboarding_step", "0"),
     // ------------------------------------------------------------------
     // Strings and opaque state written by the UI, the CLI and core.
     // ------------------------------------------------------------------
     string_setting("active_game"),
     string_setting("advanced_mode"),
+    string_setting("onboarding_step"),
     string_setting("default_instance_template"),
     string_setting("java_path"),
     string_setting("last_home_visit"),
@@ -647,6 +647,34 @@ mod tests {
             read_bool(&conn, "network_lockdown_enabled").unwrap(),
             Some(true)
         );
+    }
+
+    #[test]
+    fn onboarding_step_round_trips_every_wizard_step_word() {
+        for step in [
+            "welcome",
+            "appearance",
+            "services",
+            "launch",
+            "java",
+            "github",
+            "registry",
+            "import",
+        ] {
+            let value = Value::String(step.into());
+            assert_eq!(
+                validate("onboarding_step", &value).unwrap(),
+                value,
+                "{step} must be accepted by the registry"
+            );
+            let conn = conn();
+            crate::db::set_setting(&conn, "onboarding_step", &value).unwrap();
+            assert_eq!(
+                read(&conn, "onboarding_step").unwrap(),
+                Some(value),
+                "{step} must round-trip through storage"
+            );
+        }
     }
 
     #[test]

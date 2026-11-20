@@ -281,6 +281,7 @@ impl Fixture {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as i64,
+                plain: false,
             },
         )
         .unwrap();
@@ -328,6 +329,7 @@ fn the_shared_dispatch_hands_a_steam_instance_to_steam() {
         &fixture.instance_id,
         game_wrap::LaunchPlatform::Linux,
         &fake,
+        false,
     )
     .expect("the fake Steam launcher succeeded");
     match dispatch {
@@ -368,6 +370,7 @@ fn the_shared_dispatch_fails_closed_when_steam_cannot_start() {
         &fixture.instance_id,
         game_wrap::LaunchPlatform::Linux,
         &BrokenSteam,
+        false,
     )
     .expect_err("a failed Steam start is an error");
     assert!(matches!(error, WrapError::SteamStart(_)), "{error}");

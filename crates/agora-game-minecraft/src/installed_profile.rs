@@ -398,6 +398,7 @@ fn validate_loader_profile(
     profile_path: &Path,
     expected_profile_id: &str,
     expected_base_version: &str,
+    produced_libraries: &BTreeSet<String>,
 ) -> Result<(), ProfileIssue> {
     // 1. Profile ID must match expected.
     if info.id != expected_profile_id {
@@ -443,7 +444,7 @@ fn validate_loader_profile(
     validate_arguments(info, profile_path)?;
 
     // 5. Library validation.
-    validate_libraries(&info.libraries, profile_path)?;
+    validate_libraries(&info.libraries, profile_path, produced_libraries)?;
 
     Ok(())
 }
@@ -518,6 +519,7 @@ fn validate_arguments(info: &VersionInfo, profile_path: &Path) -> Result<(), Pro
 fn validate_libraries(
     libraries: &[crate::launch::Library],
     profile_path: &Path,
+    produced_libraries: &BTreeSet<String>,
 ) -> Result<(), ProfileIssue> {
     for lib in libraries {
         // Name must be non-empty.
@@ -559,17 +561,28 @@ fn validate_libraries(
 
         // Validate URLs
         if let Some(ref downloads) = lib.downloads {
+            let produced = produced_libraries.contains(&lib.name);
             if let Some(ref artifact) = downloads.artifact {
-                validate_library_url(&artifact.url, profile_path, &lib.name)?;
+                validate_library_url(&artifact.url, profile_path, &lib.name, produced)?;
             }
             if let Some(ref classifiers) = downloads.classifiers {
                 for (key, art) in classifiers {
-                    validate_library_url(&art.url, profile_path, &format!("{}/{}", lib.name, key))?;
+                    validate_library_url(
+                        &art.url,
+                        profile_path,
+                        &format!("{}/{}", lib.name, key),
+                        produced,
+                    )?;
                 }
             }
         }
         if let Some(ref url) = lib.url {
-            validate_library_url(url, profile_path, &lib.name)?;
+            validate_library_url(
+                url,
+                profile_path,
+                &lib.name,
+                produced_libraries.contains(&lib.name),
+            )?;
         }
 
         // Validate rules
@@ -614,7 +627,19 @@ fn validate_library_url(
     url: &str,
     profile_path: &Path,
     lib_name: &str,
+    produced: bool,
 ) -> Result<(), ProfileIssue> {
+    if url.trim().is_empty() {
+        if produced {
+            return Ok(());
+        }
+        return Err(ProfileIssue::corrupt(
+            Some(profile_path.to_path_buf()),
+            format!(
+                "Library '{lib_name}' has a blank URL but is not an installer processor output"
+            ),
+        ));
+    }
     if !url.starts_with("https://") {
         return Err(ProfileIssue::corrupt(
             Some(profile_path.to_path_buf()),
@@ -744,6 +769,97 @@ fn collect_unhashed_library_paths(libraries: &[crate::launch::Library]) -> Vec<S
         }
     }
     paths
+}
+
+pub fn processor_output_coordinates(install_profile: &serde_json::Value) -> BTreeSet<String> {
+    fn collect(reference: &serde_json::Value, out: &mut BTreeSet<String>) {
+        let Some(text) = reference.as_str() else {
+            return;
+        };
+        let Some(inner) = text
+            .split_once('[')
+            .and_then(|(_, rest)| rest.rsplit_once(']').map(|(value, _)| value))
+        else {
+            return;
+        };
+        let coordinate = inner.split('@').next().unwrap_or(inner).trim();
+        if coordinate.matches(':').count() >= 2 {
+            out.insert(coordinate.to_string());
+        }
+    }
+
+    let mut out = BTreeSet::new();
+    if let Some(processors) = install_profile.get("processors").and_then(|v| v.as_array()) {
+        for processor in processors {
+            if let Some(outputs) = processor.get("outputs").and_then(|v| v.as_object()) {
+                for value in outputs.values() {
+                    collect(value, &mut out);
+                }
+            }
+        }
+    }
+    if let Some(data) = install_profile.get("data").and_then(|v| v.as_object()) {
+        for entry in data.values() {
+            for side in ["client", "server"] {
+                if let Some(value) = entry.get(side) {
+                    collect(value, &mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
+pub fn processor_outputs_from_installer_jar(jar: &[u8]) -> Result<BTreeSet<String>, ProfileIssue> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(jar)).map_err(|error| {
+        ProfileIssue::corrupt(None, format!("Installer is not a readable JAR: {error}"))
+    })?;
+    let mut entry = archive.by_name("install_profile.json").map_err(|error| {
+        ProfileIssue::corrupt(
+            None,
+            format!("Installer has no install_profile.json: {error}"),
+        )
+    })?;
+    const MAX_INSTALL_PROFILE_SIZE: u64 = 4 * 1024 * 1024;
+    if entry.size() > MAX_INSTALL_PROFILE_SIZE {
+        return Err(ProfileIssue::corrupt(
+            None,
+            format!(
+                "Installer's install_profile.json is too large: {} bytes",
+                entry.size()
+            ),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(entry.size() as usize);
+    entry.read_to_end(&mut bytes).map_err(|error| {
+        ProfileIssue::corrupt(None, format!("Cannot read install_profile.json: {error}"))
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        ProfileIssue::corrupt(
+            None,
+            format!("Installer's install_profile.json is invalid: {error}"),
+        )
+    })?;
+    Ok(processor_output_coordinates(&value))
+}
+
+fn receipt_produced_libraries(
+    libraries: &[crate::launch::Library],
+    receipt: &InstalledProfileReceipt,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for lib in libraries {
+        let Ok(descriptor) = parse_maven_descriptor(&lib.name) else {
+            continue;
+        };
+        let relative = descriptor.to_relative_path();
+        if receipt.generated_artifact_sha256.contains_key(&relative)
+            || receipt.curated_artifact_sha256.contains_key(&relative)
+        {
+            out.insert(lib.name.clone());
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,16 +1153,21 @@ pub fn adopt_installed_profile(
 
     let base_version = bounded_parse_version_info(&base_path)?;
 
-    // 5. Structural validation.
+    // 5. Try to read receipt.
+    let receipt = read_receipt(receipts_root, tuple)?;
+    let produced_libraries = receipt
+        .as_ref()
+        .map(|rcpt| receipt_produced_libraries(&loader_version.libraries, rcpt))
+        .unwrap_or_default();
+
+    // 6. Structural validation.
     validate_loader_profile(
         &loader_version,
         &profile_path,
         &profile_id,
         &tuple.minecraft_version,
+        &produced_libraries,
     )?;
-
-    // 6. Try to read and validate receipt.
-    let receipt = read_receipt(receipts_root, tuple)?;
 
     let validated_receipt: Option<InstalledProfileReceipt>;
     let trusted_unhashed_paths: BTreeSet<String>;
@@ -1219,6 +1340,7 @@ pub fn create_receipt_for_installed_profile(
     source_sha256: &str,
     source_url: &str,
     exit_status: i32,
+    produced_libraries: &BTreeSet<String>,
 ) -> Result<InstalledProfileReceipt, ProfileIssue> {
     // 0. Reject non-zero exit status before any hashing or I/O.
     if exit_status != 0 {
@@ -1278,6 +1400,7 @@ pub fn create_receipt_for_installed_profile(
         &profile_path,
         &profile_id,
         &tuple.minecraft_version,
+        produced_libraries,
     )?;
 
     // 6. Enumerate library paths without upstream SHA1/SHA256.
@@ -1532,6 +1655,138 @@ mod tests {
     use agora_core::error::LauncherError;
     use serde_json::json;
     use std::fs;
+
+    #[test]
+    fn processor_outputs_are_collected_from_outputs_and_data_entries() {
+        let install_profile = json!({
+            "processors": [
+                {
+                    "jar": "net.minecraftforge:binarypatcher:1.0.14",
+                    "outputs": {
+                        "client": "[net.minecraftforge:forge:1.21.1-52.1.21:client]",
+                        "server": "[net.minecraftforge:forge:1.21.1-52.1.21:server]"
+                    }
+                },
+                {
+                    "outputs": { "client": "[org.example:tool:2.0:client@jar]" }
+                }
+            ],
+            "data": {
+                "BINPATCH": {
+                    "client": "[net.minecraftforge:forge:1.21.1-52.1.21:client@lzma]",
+                    "server": "[net.minecraftforge:forge:1.21.1-52.1.21:server@lzma]"
+                },
+                "MAPPINGS": {
+                    "client": "data/mappings.txt"
+                }
+            }
+        });
+        let produced = processor_output_coordinates(&install_profile);
+        assert!(produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:client"));
+        assert!(produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:server"));
+        assert!(produced.contains("org.example:tool:2.0:client"));
+        assert_eq!(produced.len(), 3, "{produced:?}");
+    }
+
+    #[test]
+    fn processor_outputs_are_read_from_the_installer_jar() {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+            let options = zip::write::SimpleFileOptions::default();
+            writer.start_file("install_profile.json", options).unwrap();
+            std::io::Write::write_all(
+                &mut writer,
+                br#"{"processors":[{"outputs":{"client":"[net.minecraftforge:forge:1.21.1-52.1.21:client]"}}],"data":{}}"#,
+            )
+            .unwrap();
+            writer.finish().unwrap();
+        }
+        let produced = processor_outputs_from_installer_jar(&bytes).unwrap();
+        assert!(produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:client"));
+
+        let err = processor_outputs_from_installer_jar(b"not a zip").unwrap_err();
+        assert!(
+            err.reasons
+                .iter()
+                .any(|reason| reason.contains("not a readable JAR")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_blank_library_url_is_allowed_only_for_processor_outputs() {
+        let value = json!({
+            "id": "forge-1.21.1-52.1.21",
+            "inheritsFrom": "1.21.1",
+            "mainClass": "net.minecraftforge.Main",
+            "type": "release",
+            "libraries": [
+                {
+                    "name": "net.minecraftforge:forge:1.21.1-52.1.21:client",
+                    "downloads": {
+                        "artifact": {
+                            "path": "net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-client.jar",
+                            "url": ""
+                        }
+                    }
+                }
+            ],
+            "arguments": { "jvm": [], "game": [] }
+        });
+        let info: VersionInfo = serde_json::from_value(value).unwrap();
+        let path = Path::new("versions/forge-1.21.1-52.1.21/forge-1.21.1-52.1.21.json");
+        let install_profile = json!({
+            "processors": [
+                {
+                    "outputs": {
+                        "client": "[net.minecraftforge:forge:1.21.1-52.1.21:client@lzma]"
+                    }
+                }
+            ]
+        });
+        let produced = processor_output_coordinates(&install_profile);
+        assert!(produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:client"));
+        assert!(
+            validate_loader_profile(&info, path, "forge-1.21.1-52.1.21", "1.21.1", &produced)
+                .is_ok(),
+            "the installer produced this artifact, so its blank URL is not a download"
+        );
+
+        let err = validate_loader_profile(
+            &info,
+            path,
+            "forge-1.21.1-52.1.21",
+            "1.21.1",
+            &BTreeSet::new(),
+        )
+        .unwrap_err();
+        assert!(
+            err.reasons.iter().any(|reason| {
+                reason.contains("blank URL")
+                    && reason.contains("net.minecraftforge:forge:1.21.1-52.1.21:client")
+            }),
+            "a blank URL outside the processor outputs must be refused by name: {err:?}"
+        );
+
+        let mut http = info.clone();
+        http.libraries[0]
+            .downloads
+            .as_mut()
+            .unwrap()
+            .artifact
+            .as_mut()
+            .unwrap()
+            .url = "http://maven.minecraftforge.net/forge-client.jar".into();
+        let err = validate_loader_profile(&http, path, "forge-1.21.1-52.1.21", "1.21.1", &produced)
+            .unwrap_err();
+        assert!(
+            err.reasons
+                .iter()
+                .any(|reason| reason.contains("non-HTTPS URL")),
+            "a non-empty non-HTTPS URL must still be refused: {err:?}"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Temp fixture helpers
@@ -2700,6 +2955,7 @@ mod tests {
             installer_sha,
             "https://maven.minecraftforge.net/forge.jar",
             0,
+            &BTreeSet::new(),
         )
         .expect("create_receipt should succeed");
 
@@ -2739,6 +2995,7 @@ mod tests {
             installer_sha,
             "https://maven.neoforged.net/neoforge.jar",
             0,
+            &BTreeSet::new(),
         )
         .expect("create_receipt for neoforge should succeed");
 
@@ -2762,6 +3019,7 @@ mod tests {
             "sha",
             "https://example.com/forge.jar",
             0,
+            &BTreeSet::new(),
         )
         .expect_err("should fail when generated library is missing");
 
@@ -2804,6 +3062,7 @@ mod tests {
             "sha",
             "https://example.com/forge.jar",
             0,
+            &BTreeSet::new(),
         )
         .expect_err("should reject traversal path");
 
@@ -2838,6 +3097,7 @@ mod tests {
             installer_sha,
             "https://maven.minecraftforge.net/forge.jar",
             0,
+            &BTreeSet::new(),
         )
         .expect("create_receipt should succeed");
 
@@ -2883,6 +3143,7 @@ mod tests {
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "https://maven.minecraftforge.net/forge.jar",
             0,
+            &BTreeSet::new(),
         )
         .expect("create_receipt should succeed");
 
@@ -2921,6 +3182,7 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "https://maven.minecraftforge.net/forge.jar",
             1, // non-zero exit
+            &BTreeSet::new(),
         )
         .expect_err("should reject non-zero exit");
 
@@ -2962,6 +3224,7 @@ mod tests {
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "https://maven.minecraftforge.net/forge.jar",
             -1,
+            &BTreeSet::new(),
         )
         .expect_err("should reject negative exit");
 
