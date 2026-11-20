@@ -41,8 +41,16 @@
 //!   user-files lock) is taken with a zero timeout, and a journal whose lock is held is **left
 //!   alone and reported**, never recovered underneath the live holder — the OS releases the lock
 //!   when the holder dies, so a crashed holder never blocks recovery;
+//! * the writer holds that same lock for the whole operation: a tool swap holds the game/store
+//!   user-files lock from before its journal is written, through the copy, the spawned tool's
+//!   run and the post-exit capture, until the journal is cleared, so the windows in between
+//!   (after engage before spawn, during post-exit capture) are covered by the lock, not only by
+//!   the recorded process identities;
 //! * where the journal also records process identities (tool swaps, user-files sessions), a live
-//!   recorded process additionally refuses the recovery.
+//!   recorded process additionally refuses the recovery;
+//! * where liveness is unknown — a journal with no recorded identity at all (a legacy journal,
+//!   or a self-capture that failed) — recovery does not act on it automatically: it is reported
+//!   as needing a hand, and the explicit restore command is the human override.
 //!
 //! Everything is reported, never raised: a journal that needs a hand comes back as a warning line,
 //! and startup continues.

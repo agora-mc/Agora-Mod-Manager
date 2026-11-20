@@ -3905,7 +3905,12 @@ fn run_by_swap(
             ));
         }
     };
-    let _ = game_user_files::record_process_locked(ctx, &definition.id, &store, launched.identity.clone());
+    let _ = game_user_files::record_process_locked(
+        ctx,
+        &definition.id,
+        &store,
+        launched.identity.clone(),
+    );
 
     // Record the tool's identity in the swap journal too, so recovery can tell a run is still going
     // when the tool runs from outside the install folder.

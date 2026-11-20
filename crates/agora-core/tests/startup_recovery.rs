@@ -854,7 +854,10 @@ fn the_startup_pass_leaves_a_live_user_files_session_alone() {
         "Instance copy\n",
         "the live session was restored underneath"
     );
-    assert!(journal_path.exists(), "the journal of a live session is kept");
+    assert!(
+        journal_path.exists(),
+        "the journal of a live session is kept"
+    );
     assert!(
         report.actions.is_empty(),
         "nothing was recovered: {report:?}"
@@ -919,8 +922,13 @@ fn a_file_the_player_made_after_a_crash_is_not_overwritten_by_recovery() {
         &f.running_from,
     )
     .unwrap();
-    agora_core::game_user_files::record_process(&f.ctx, &f.def.id, &StoreId::steam(), dead_identity())
-        .unwrap();
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
     let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
     assert!(journal_path.exists());
     assert_eq!(std::fs::read_to_string(&f.real).unwrap(), "Instance copy\n");
@@ -966,8 +974,13 @@ fn a_crash_before_agora_created_the_file_leaves_the_players_file_alone() {
         &f.running_from,
     )
     .unwrap();
-    agora_core::game_user_files::record_process(&f.ctx, &f.def.id, &StoreId::steam(), dead_identity())
-        .unwrap();
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
     let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
     // The write-ahead state of the window before Agora creates the real file.
     let mut value: serde_json::Value =
@@ -1019,9 +1032,17 @@ fn a_symlink_retarged_since_the_swap_is_refused_by_recovery() {
     )
     .unwrap();
     // The swap wrote through the link, and the journal recorded where it pointed.
-    assert_eq!(std::fs::read_to_string(&target_a).unwrap(), "Instance copy\n");
-    agora_core::game_user_files::record_process(&f.ctx, &f.def.id, &StoreId::steam(), dead_identity())
-        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&target_a).unwrap(),
+        "Instance copy\n"
+    );
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
     let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
     assert!(journal_path.exists());
     // After the crash the player retargets the link to another file of theirs.

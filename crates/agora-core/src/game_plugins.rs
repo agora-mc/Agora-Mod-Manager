@@ -463,9 +463,7 @@ fn recover_stale_session(
     // session that records no process identity at all has unknown liveness (a legacy journal,
     // or a self-capture that failed), so it is left for the explicit restore command too.
     if let Some(details) = crate::game_user_files::details(ctx, &definition.id, store)? {
-        if details.running
-            || crate::game_user_files::details_liveness_unknown(&details)
-        {
+        if details.running || crate::game_user_files::details_liveness_unknown(&details) {
             return Ok(());
         }
     }

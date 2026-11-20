@@ -990,7 +990,11 @@ pub fn restore_finished_for_instance(ctx: &Ctx, instance_id: &str) -> Option<Fin
         // Unknown liveness (no recorded identity): automatic recovery must not act on it; the
         // report says it needs a hand instead.
         if liveness_unknown(&journal) {
-            return Some(report(Some(needs_hand_message(&journal_path, &journal)), 0, 0));
+            return Some(report(
+                Some(needs_hand_message(&journal_path, &journal)),
+                0,
+                0,
+            ));
         }
         let Some(definition) = ctx.games.game(&journal.game) else {
             return Some(report(
@@ -1002,14 +1006,16 @@ pub fn restore_finished_for_instance(ctx: &Ctx, instance_id: &str) -> Option<Fin
                 0,
             ));
         };
-        return Some(match restore_for_recovery(ctx, definition, &journal.store) {
-            Ok(found) => report(
-                None,
-                found.files.len(),
-                found.files.iter().filter(|file| file.changed).count(),
-            ),
-            Err(error) => report(Some(error.to_string()), 0, 0),
-        });
+        return Some(
+            match restore_for_recovery(ctx, definition, &journal.store) {
+                Ok(found) => report(
+                    None,
+                    found.files.len(),
+                    found.files.iter().filter(|file| file.changed).count(),
+                ),
+                Err(error) => report(Some(error.to_string()), 0, 0),
+            },
+        );
     }
     None
 }

@@ -3656,7 +3656,10 @@ fn a_startup_recovery_during_a_live_swap_run_leaves_the_operation_alone() {
         before,
         "the real Data is byte for byte unchanged after the live run"
     );
-    assert!(!journal_file(&f).exists(), "the journal is cleared by the run");
+    assert!(
+        !journal_file(&f).exists(),
+        "the journal is cleared by the run"
+    );
     assert!(
         names(&install)
             .iter()

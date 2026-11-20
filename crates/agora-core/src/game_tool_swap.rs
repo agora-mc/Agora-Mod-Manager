@@ -161,9 +161,7 @@ pub enum RunHookPoint {
 }
 
 #[doc(hidden)]
-type RunHook = std::sync::Arc<
-    dyn Fn(&Ctx, &SwapJournal, RunHookPoint) + Send + Sync,
->;
+type RunHook = std::sync::Arc<dyn Fn(&Ctx, &SwapJournal, RunHookPoint) + Send + Sync>;
 
 static RUN_HOOK: Mutex<Option<RunHook>> = Mutex::new(None);
 
