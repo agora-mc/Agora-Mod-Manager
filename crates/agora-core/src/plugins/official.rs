@@ -1311,6 +1311,13 @@ impl PluginService {
             .map(|record| record.manifest.version.to_string()))
     }
 
+    /// The installed version of a plugin id, read from local state. Adapters
+    /// use it to say "updated" rather than "installed" when a local package
+    /// replaces an existing copy.
+    pub fn installed_version(&self, plugin_id: &str) -> LauncherResult<Option<String>> {
+        self.live_version(plugin_id)
+    }
+
     /// Download one signed entry and verify it, writing nothing.
     async fn fetch_verified_entry(
         &self,

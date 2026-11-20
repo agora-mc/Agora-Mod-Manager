@@ -146,6 +146,7 @@ pub async fn check_and_download_update(
 /// install and remembering the trust the bundle taught us.
 #[derive(Debug, Clone)]
 pub struct InstalledBundle {
+    pub tag: String,
     pub schema_version: i64,
     pub expires_at: String,
 }
@@ -153,21 +154,24 @@ pub struct InstalledBundle {
 /// Install a signed `registry.bundle` from a local file.
 ///
 /// Uses the same verification and install path as a downloaded bundle, with
-/// the compiled-in keys plus the remembered `registry.trust` state. No GitHub
-/// tag or asset id is recorded, so the next online sync can still replace the
-/// catalog this installs.
+/// the compiled-in keys plus the remembered `registry.trust` state. The tag
+/// named by the signed bundle header is recorded as the cached registry tag,
+/// exactly as a downloaded bundle's release tag is, so `registry status` shows
+/// it and the next sync compares against it. No release asset id is recorded.
 pub fn install_bundle_from_file(
     app_data_dir: &Path,
+    local_state_path: &Path,
     bundle_path: &Path,
 ) -> LauncherResult<InstalledBundle> {
     let trust = effective_trust(app_data_dir, &RegistryTrust::production());
-    install_bundle_from_file_with_trust(app_data_dir, bundle_path, &trust)
+    install_bundle_from_file_with_trust(app_data_dir, local_state_path, bundle_path, &trust)
 }
 
 /// As [`install_bundle_from_file`], with an explicit trust list. This is the
 /// entry point tests use to install a locally built signed bundle.
 pub fn install_bundle_from_file_with_trust(
     app_data_dir: &Path,
+    local_state_path: &Path,
     bundle_path: &Path,
     trust: &RegistryTrust,
 ) -> LauncherResult<InstalledBundle> {
@@ -178,12 +182,14 @@ pub fn install_bundle_from_file_with_trust(
             bundle_path.display()
         ),
     })?;
-    install_bundle_bytes_checked(
+    let installed = install_bundle_bytes_checked(
         app_data_dir,
         &bytes,
         trust,
         &bundle_path.display().to_string(),
-    )
+    )?;
+    set_cached_tag(local_state_path, &installed.tag)?;
+    Ok(installed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1045,6 +1051,7 @@ fn install_bundle_bytes_checked(
     install_bundle_bytes(app_data_dir, &verified.header, bundle_bytes, trust)?;
 
     Ok(InstalledBundle {
+        tag: verified.header.tag,
         schema_version,
         expires_at: verified.header.expires_at,
     })
@@ -2254,6 +2261,12 @@ mod tests {
         bytes
     }
 
+    fn local_state_in(dir: &Path) -> PathBuf {
+        let path = dir.join("local_state.db");
+        db::init_local_state_db(&path).unwrap();
+        path
+    }
+
     #[test]
     fn test_registry_status_default() {
         let tmp_dir =
@@ -2465,6 +2478,7 @@ mod tests {
     #[test]
     fn a_local_bundle_file_installs_and_opens() {
         let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
         let key = test_key(60);
         let trust = RegistryTrust::with_key(test_public(&key));
         let payload = sample_db();
@@ -2472,11 +2486,24 @@ mod tests {
         let source_name = "supplied-registry.bundle";
         write_bundle(dir.path(), source_name, &key, &header, &payload);
 
-        let installed =
-            install_bundle_from_file_with_trust(dir.path(), &dir.path().join(source_name), &trust)
-                .unwrap();
+        let installed = install_bundle_from_file_with_trust(
+            dir.path(),
+            &ls_path,
+            &dir.path().join(source_name),
+            &trust,
+        )
+        .unwrap();
+        assert_eq!(installed.tag, header.tag);
         assert_eq!(installed.schema_version, 10);
         assert_eq!(installed.expires_at, header.expires_at);
+        // The signed header's tag is remembered exactly like a release tag, so
+        // status shows it and a later sync compares against it.
+        assert_eq!(
+            get_cached_tag(&ls_path).unwrap().as_deref(),
+            Some("registry-2026-11-16")
+        );
+        let status = get_status(dir.path(), &ls_path);
+        assert_eq!(status.cached_tag.as_deref(), Some("registry-2026-11-16"));
         assert_eq!(
             fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
             signed_bundle(&key, &header, &payload)
@@ -2502,6 +2529,7 @@ mod tests {
     #[test]
     fn a_tampered_local_bundle_is_refused_with_the_download_message() {
         let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
         let key = test_key(61);
         let trust = RegistryTrust::with_key(test_public(&key));
         let payload = sample_db();
@@ -2512,7 +2540,8 @@ mod tests {
         let source = dir.path().join("tampered.bundle");
         fs::write(&source, &bytes).unwrap();
 
-        let error = install_bundle_from_file_with_trust(dir.path(), &source, &trust).unwrap_err();
+        let error =
+            install_bundle_from_file_with_trust(dir.path(), &ls_path, &source, &trust).unwrap_err();
         assert_eq!(error.code(), "ERR_REGISTRY_BUNDLE_HASH");
         assert_eq!(
             error.to_string(),
@@ -2526,6 +2555,7 @@ mod tests {
     #[test]
     fn an_unknown_key_local_bundle_is_refused_with_the_download_message() {
         let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
         let signer = test_key(62);
         let trust = RegistryTrust::with_key(test_public(&test_key(63)));
         let payload = sample_db();
@@ -2538,9 +2568,13 @@ mod tests {
         let source_name = "unknown-key.bundle";
         write_bundle(dir.path(), source_name, &signer, &header, &payload);
 
-        let error =
-            install_bundle_from_file_with_trust(dir.path(), &dir.path().join(source_name), &trust)
-                .unwrap_err();
+        let error = install_bundle_from_file_with_trust(
+            dir.path(),
+            &ls_path,
+            &dir.path().join(source_name),
+            &trust,
+        )
+        .unwrap_err();
         assert_eq!(error.code(), "ERR_REGISTRY_SIGNATURE_INVALID");
         assert_eq!(
             error.to_string(),
@@ -2556,6 +2590,7 @@ mod tests {
     #[test]
     fn an_expired_local_bundle_is_refused_with_the_download_message() {
         let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
         let key = test_key(64);
         let trust = RegistryTrust::with_key(test_public(&key));
         let payload = sample_db();
@@ -2568,7 +2603,8 @@ mod tests {
         let source = dir.path().join("expired.bundle");
         write_bundle(dir.path(), "expired.bundle", &key, &header, &payload);
 
-        let error = install_bundle_from_file_with_trust(dir.path(), &source, &trust).unwrap_err();
+        let error =
+            install_bundle_from_file_with_trust(dir.path(), &ls_path, &source, &trust).unwrap_err();
         assert_eq!(error.code(), "ERR_REGISTRY_EXPIRED");
         assert_eq!(
             error.to_string(),
@@ -2585,13 +2621,14 @@ mod tests {
     #[test]
     fn an_older_local_bundle_is_refused_with_the_download_message() {
         let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
         let key = test_key(65);
         let trust = RegistryTrust::with_key(test_public(&key));
         let new_payload = sample_db();
         let new_header = fresh_header(&key, &new_payload);
         let new_source = dir.path().join("new.bundle");
         write_bundle(dir.path(), "new.bundle", &key, &new_header, &new_payload);
-        install_bundle_from_file_with_trust(dir.path(), &new_source, &trust).unwrap();
+        install_bundle_from_file_with_trust(dir.path(), &ls_path, &new_source, &trust).unwrap();
 
         let old_payload = sample_db_with_built_at("2026-08-26T03:19:02+00:00");
         let old_built_at = "2026-08-26T03:19:02+00:00";
@@ -2604,8 +2641,8 @@ mod tests {
         let old_source = dir.path().join("old.bundle");
         write_bundle(dir.path(), "old.bundle", &key, &old_header, &old_payload);
 
-        let error =
-            install_bundle_from_file_with_trust(dir.path(), &old_source, &trust).unwrap_err();
+        let error = install_bundle_from_file_with_trust(dir.path(), &ls_path, &old_source, &trust)
+            .unwrap_err();
         assert_eq!(error.code(), "ERR_REGISTRY_ROLLBACK");
         assert_eq!(
             error.to_string(),

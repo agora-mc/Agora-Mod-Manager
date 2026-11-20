@@ -6229,13 +6229,19 @@ async fn run_registry_command(
             }
         }
         RegistryCmd::InstallBundle { file } => {
-            let installed = agora_core::registry_sync::install_bundle_from_file(data_dir, &file)?;
+            let local_state = data_dir.join("local_state.db");
+            if !local_state.exists() {
+                agora_core::db::init_local_state_db(&local_state)?;
+            }
+            let installed =
+                agora_core::registry_sync::install_bundle_from_file(data_dir, &local_state, &file)?;
             let catalog_warnings = ctx.reload_game_catalogs()?;
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "file": file,
+                        "tag": installed.tag,
                         "schema_version": installed.schema_version,
                         "expires_at": installed.expires_at,
                         "catalog_warnings": catalog_warnings,
@@ -6243,6 +6249,7 @@ async fn run_registry_command(
                 );
             } else {
                 println!("Installed catalog bundle from {}.", file.display());
+                println!("Tag:           {}", installed.tag);
                 println!("Schema:        {}", installed.schema_version);
                 println!("Expires:       {}", installed.expires_at);
                 for warning in catalog_warnings {

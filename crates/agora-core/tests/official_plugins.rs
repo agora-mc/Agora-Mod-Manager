@@ -589,6 +589,7 @@ fn an_official_plugin_can_be_installed_from_a_local_package_file() {
     world.publish(vec![(Release::of("1.0.0", "current", &zip), zip.clone())]);
     let file = world.root().join("supplied.zip");
     std::fs::write(&file, &zip).unwrap();
+    assert_eq!(world.service.installed_version(PLUGIN).unwrap(), None);
 
     let plugin = installed(
         world
@@ -597,6 +598,10 @@ fn an_official_plugin_can_be_installed_from_a_local_package_file() {
             .unwrap(),
     );
 
+    assert_eq!(
+        world.service.installed_version(PLUGIN).unwrap().as_deref(),
+        Some("1.0.0")
+    );
     assert_eq!(plugin.version, "1.0.0");
     assert_eq!(
         plugin.official,
@@ -609,6 +614,37 @@ fn an_official_plugin_can_be_installed_from_a_local_package_file() {
     let conn = agora_core::db::local_state_connection(&world.paths().local_state_db()).unwrap();
     let provenance = agora_core::plugins::store::list_official(&conn).unwrap();
     assert_eq!(provenance[PLUGIN].entry_sha256, sha(&zip));
+}
+
+#[test]
+fn a_local_package_can_replace_an_already_installed_official_plugin() {
+    let world = World::new();
+    let zip = fixture_zip("1.0.0");
+    world.publish(vec![(Release::of("1.0.0", "current", &zip), zip.clone())]);
+    let file = world.root().join("supplied.zip");
+    std::fs::write(&file, &zip).unwrap();
+
+    let first = installed(
+        world
+            .service
+            .install_official_from_file(PLUGIN, &file, true)
+            .unwrap(),
+    );
+    assert_eq!(first.version, "1.0.0");
+    // No "already installed" guard: the pin is checked again and the same
+    // package is installed over the existing copy. The CLI says "Updated".
+    let second = installed(
+        world
+            .service
+            .install_official_from_file(PLUGIN, &file, true)
+            .unwrap(),
+    );
+    assert_eq!(second.version, "1.0.0");
+    assert_eq!(
+        world.service.installed_version(PLUGIN).unwrap().as_deref(),
+        Some("1.0.0")
+    );
+    assert_eq!(world.fetcher.calls(), 0);
 }
 
 #[test]

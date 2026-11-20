@@ -119,6 +119,12 @@ pub async fn run(service: &PluginService, action: OfficialCmd, json: bool) -> an
                 scripts: yes && !no_code,
                 previewed_digest: None,
             };
+            // A local package may replace an installed copy (the pin still has
+            // to match); say so rather than calling it a first install.
+            let was_installed = match &file {
+                Some(_) => service.installed_version(plugin_id.as_str())?.is_some(),
+                None => false,
+            };
             let outcome = match file {
                 Some(path) => {
                     service.install_official_from_file(plugin_id.as_str(), &path, consent)?
@@ -129,7 +135,7 @@ pub async fn run(service: &PluginService, action: OfficialCmd, json: bool) -> an
                         .await?
                 }
             };
-            report(&id, outcome, "Installed", json, no_code)?;
+            report(&id, outcome, install_verb(was_installed), json, no_code)?;
         }
         OfficialCmd::Update { id, yes } => {
             let plugin_id = crate::parse_plugin_id(&id)?;
@@ -147,6 +153,14 @@ pub async fn run(service: &PluginService, action: OfficialCmd, json: bool) -> an
         }
     }
     Ok(())
+}
+
+fn install_verb(was_installed: bool) -> &'static str {
+    if was_installed {
+        "Updated"
+    } else {
+        "Installed"
+    }
 }
 
 fn report(
@@ -241,4 +255,15 @@ fn print_code_question(preview: &InstallPreview) {
         "  You can allow it later with `agora plugin scripts {} allow`.",
         manifest.id
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::install_verb;
+
+    #[test]
+    fn a_local_package_replacing_an_installed_plugin_says_updated() {
+        assert_eq!(install_verb(false), "Installed");
+        assert_eq!(install_verb(true), "Updated");
+    }
 }
