@@ -141,6 +141,51 @@ pub async fn check_and_download_update(
     .await
 }
 
+/// The parts of a bundle install that do not depend on where the bytes came
+/// from: verification, expiry, rollback and schema checks, the single-rename
+/// install and remembering the trust the bundle taught us.
+#[derive(Debug, Clone)]
+pub struct InstalledBundle {
+    pub schema_version: i64,
+    pub expires_at: String,
+}
+
+/// Install a signed `registry.bundle` from a local file.
+///
+/// Uses the same verification and install path as a downloaded bundle, with
+/// the compiled-in keys plus the remembered `registry.trust` state. No GitHub
+/// tag or asset id is recorded, so the next online sync can still replace the
+/// catalog this installs.
+pub fn install_bundle_from_file(
+    app_data_dir: &Path,
+    bundle_path: &Path,
+) -> LauncherResult<InstalledBundle> {
+    let trust = effective_trust(app_data_dir, &RegistryTrust::production());
+    install_bundle_from_file_with_trust(app_data_dir, bundle_path, &trust)
+}
+
+/// As [`install_bundle_from_file`], with an explicit trust list. This is the
+/// entry point tests use to install a locally built signed bundle.
+pub fn install_bundle_from_file_with_trust(
+    app_data_dir: &Path,
+    bundle_path: &Path,
+    trust: &RegistryTrust,
+) -> LauncherResult<InstalledBundle> {
+    let bytes = std::fs::read(bundle_path).map_err(|error| LauncherError::Generic {
+        code: "ERR_REGISTRY_BUNDLE_READ".into(),
+        message: format!(
+            "Could not read the catalog bundle file {}: {error}.",
+            bundle_path.display()
+        ),
+    })?;
+    install_bundle_bytes_checked(
+        app_data_dir,
+        &bytes,
+        trust,
+        &bundle_path.display().to_string(),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn check_and_download_update_inner(
     app_data_dir: &Path,
@@ -320,55 +365,11 @@ async fn check_and_download_update_inner(
             }
         };
 
-        let verified =
-            registry_bundle::verify_bundle(&bundle_bytes, trust).map_err(bundle_error)?;
-
-        // Anti-rollback, checked only after the signature so the compared stamp is
-        // one the signing key vouched for. The tag pre-check above works on
-        // unsigned API metadata and can be forged; this cannot.
-        let candidate_built_at = Some(verified.header.built_at.clone());
-        let cached_built_at = read_cached_built_at_checked(app_data_dir, trust)?;
-        if is_rollback(cached_built_at.as_deref(), candidate_built_at.as_deref()) {
-            return Err(LauncherError::Generic {
-                code: "ERR_REGISTRY_ROLLBACK".into(),
-                message: format!(
-                    "Refusing registry {}: it was built at {}, older than the registry already \
-                     installed ({}). The cached registry has been kept.",
-                    latest.tag_name,
-                    candidate_built_at.as_deref().unwrap_or("unknown"),
-                    cached_built_at.as_deref().unwrap_or("unknown"),
-                ),
-            });
-        }
-
-        // An expired bundle is readable but never installed as current: doing so
-        // would replace a good cache with one that already cannot be used for an
-        // install or update.
-        if verified.header.is_expired_at(Utc::now()) {
-            return Err(LauncherError::Generic {
-                code: "ERR_REGISTRY_EXPIRED".into(),
-                message: format!(
-                    "Refusing registry {}: it expired at {}. The cached registry has been kept.",
-                    latest.tag_name, verified.header.expires_at
-                ),
-            });
-        }
-
-        let schema_version = verified.header.schema_version;
-        if schema_version > APP_REGISTRY_SCHEMA_VERSION {
-            return Err(LauncherError::Generic {
-                code: "ERR_REGISTRY_NEWER_SCHEMA".to_string(),
-                message: format!(
-                    "Catalog schema version {} is newer than supported {}. Please update the app.",
-                    schema_version, APP_REGISTRY_SCHEMA_VERSION
-                ),
-            });
-        }
-
-        install_bundle_bytes(app_data_dir, &verified.header, &bundle_bytes, trust)?;
+        let installed =
+            install_bundle_bytes_checked(app_data_dir, &bundle_bytes, trust, &latest.tag_name)?;
         set_cached_tag(local_state_path, &latest.tag_name)?;
         set_cached_asset_id(local_state_path, Some(bundle_id))?;
-        Ok((schema_version, verified.header.expires_at))
+        Ok((installed.schema_version, installed.expires_at))
     }
     .await;
 
@@ -982,6 +983,71 @@ fn ensure_database(
     })?;
     remember_database_hash(&db_path, &header.db_sha256);
     Ok(())
+}
+
+/// Verify candidate bundle bytes and install them only when they are current,
+/// newer than the installed catalog and supported by this app.
+///
+/// Both the GitHub release sync and the local-file install call this after the
+/// bytes are obtained, so expiry, rollback and schema rules cannot drift
+/// between the two sources. `label` names the source in refusal messages: a
+/// release tag for sync, a file path for a local install.
+fn install_bundle_bytes_checked(
+    app_data_dir: &Path,
+    bundle_bytes: &[u8],
+    trust: &RegistryTrust,
+    label: &str,
+) -> LauncherResult<InstalledBundle> {
+    let verified = registry_bundle::verify_bundle(bundle_bytes, trust).map_err(bundle_error)?;
+
+    // Anti-rollback is checked only after the signature, so the stamp being
+    // compared is one the signing key vouched for. The tag check in the sync
+    // path uses unsigned API metadata and can be forged; this cannot.
+    let candidate_built_at = Some(verified.header.built_at.clone());
+    let cached_built_at = read_cached_built_at_checked(app_data_dir, trust)?;
+    if is_rollback(cached_built_at.as_deref(), candidate_built_at.as_deref()) {
+        return Err(LauncherError::Generic {
+            code: "ERR_REGISTRY_ROLLBACK".into(),
+            message: format!(
+                "Refusing registry {}: it was built at {}, older than the registry already \
+                 installed ({}). The cached registry has been kept.",
+                label,
+                candidate_built_at.as_deref().unwrap_or("unknown"),
+                cached_built_at.as_deref().unwrap_or("unknown"),
+            ),
+        });
+    }
+
+    // An expired bundle stays readable but is never installed as current: doing
+    // so would replace a good cache with one that cannot be used for an install
+    // or update.
+    if verified.header.is_expired_at(Utc::now()) {
+        return Err(LauncherError::Generic {
+            code: "ERR_REGISTRY_EXPIRED".into(),
+            message: format!(
+                "Refusing registry {}: it expired at {}. The cached registry has been kept.",
+                label, verified.header.expires_at
+            ),
+        });
+    }
+
+    let schema_version = verified.header.schema_version;
+    if schema_version > APP_REGISTRY_SCHEMA_VERSION {
+        return Err(LauncherError::Generic {
+            code: "ERR_REGISTRY_NEWER_SCHEMA".to_string(),
+            message: format!(
+                "Catalog schema version {} is newer than supported {}. Please update the app.",
+                schema_version, APP_REGISTRY_SCHEMA_VERSION
+            ),
+        });
+    }
+
+    install_bundle_bytes(app_data_dir, &verified.header, bundle_bytes, trust)?;
+
+    Ok(InstalledBundle {
+        schema_version,
+        expires_at: verified.header.expires_at,
+    })
 }
 
 /// Install the exact signed bytes of a bundle that has already been verified.
@@ -2392,6 +2458,166 @@ mod tests {
         assert_eq!(version, 10);
         assert!(!registry.freshness().is_stale());
         registry.require_fresh().unwrap();
+    }
+
+    /// A bundle supplied as a local file goes through the same verification
+    /// and install as a downloaded one, and the installed catalog opens.
+    #[test]
+    fn a_local_bundle_file_installs_and_opens() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(60);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let header = fresh_header(&key, &payload);
+        let source_name = "supplied-registry.bundle";
+        write_bundle(dir.path(), source_name, &key, &header, &payload);
+
+        let installed =
+            install_bundle_from_file_with_trust(dir.path(), &dir.path().join(source_name), &trust)
+                .unwrap();
+        assert_eq!(installed.schema_version, 10);
+        assert_eq!(installed.expires_at, header.expires_at);
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            signed_bundle(&key, &header, &payload)
+        );
+        assert_eq!(
+            fs::read(paths::registry_db_path(dir.path()).unwrap()).unwrap(),
+            payload
+        );
+
+        let registry = open_verified_registry_with_key(dir.path(), &test_public(&key)).unwrap();
+        let version: i64 = registry
+            .connection()
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 10);
+        registry.require_fresh().unwrap();
+    }
+
+    /// A tampered local bundle is refused with the exact message the download
+    /// path gives for a payload whose hash does not match its signed header.
+    #[test]
+    fn a_tampered_local_bundle_is_refused_with_the_download_message() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(61);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let header = fresh_header(&key, &payload);
+        let mut bytes = signed_bundle(&key, &header, &payload);
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        let source = dir.path().join("tampered.bundle");
+        fs::write(&source, &bytes).unwrap();
+
+        let error = install_bundle_from_file_with_trust(dir.path(), &source, &trust).unwrap_err();
+        assert_eq!(error.code(), "ERR_REGISTRY_BUNDLE_HASH");
+        assert_eq!(
+            error.to_string(),
+            "The catalog bundle could not be used: the catalog payload does not match the signed SHA-256."
+        );
+        assert!(!paths::registry_bundle_path(dir.path()).unwrap().exists());
+    }
+
+    /// A bundle signed by an unknown key is refused with the download path's
+    /// unknown-key message.
+    #[test]
+    fn an_unknown_key_local_bundle_is_refused_with_the_download_message() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let signer = test_key(62);
+        let trust = RegistryTrust::with_key(test_public(&test_key(63)));
+        let payload = sample_db();
+        let header = header_for(
+            &signer,
+            &payload,
+            "2026-11-16T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let source_name = "unknown-key.bundle";
+        write_bundle(dir.path(), source_name, &signer, &header, &payload);
+
+        let error =
+            install_bundle_from_file_with_trust(dir.path(), &dir.path().join(source_name), &trust)
+                .unwrap_err();
+        assert_eq!(error.code(), "ERR_REGISTRY_SIGNATURE_INVALID");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "The catalog bundle could not be used: the catalog was signed by unknown key {}.",
+                header.key_id
+            )
+        );
+    }
+
+    /// An expired local bundle is refused even though its signature verifies,
+    /// with the same expiry message the download path gives.
+    #[test]
+    fn an_expired_local_bundle_is_refused_with_the_download_message() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(64);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let header = header_for(
+            &key,
+            &payload,
+            "2026-11-16T12:00:00+00:00",
+            "2025-02-01T00:00:00+00:00",
+        );
+        let source = dir.path().join("expired.bundle");
+        write_bundle(dir.path(), "expired.bundle", &key, &header, &payload);
+
+        let error = install_bundle_from_file_with_trust(dir.path(), &source, &trust).unwrap_err();
+        assert_eq!(error.code(), "ERR_REGISTRY_EXPIRED");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Refusing registry {}: it expired at 2025-02-01T00:00:00+00:00. The cached registry has been kept.",
+                source.display()
+            )
+        );
+        assert!(!paths::registry_bundle_path(dir.path()).unwrap().exists());
+    }
+
+    /// A bundle built before the installed one is refused; there is deliberately
+    /// no override, because the installed stamp is signed.
+    #[test]
+    fn an_older_local_bundle_is_refused_with_the_download_message() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(65);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let new_payload = sample_db();
+        let new_header = fresh_header(&key, &new_payload);
+        let new_source = dir.path().join("new.bundle");
+        write_bundle(dir.path(), "new.bundle", &key, &new_header, &new_payload);
+        install_bundle_from_file_with_trust(dir.path(), &new_source, &trust).unwrap();
+
+        let old_payload = sample_db_with_built_at("2026-08-26T03:19:02+00:00");
+        let old_built_at = "2026-08-26T03:19:02+00:00";
+        let old_header = header_for(
+            &key,
+            &old_payload,
+            old_built_at,
+            "2099-01-01T00:00:00+00:00",
+        );
+        let old_source = dir.path().join("old.bundle");
+        write_bundle(dir.path(), "old.bundle", &key, &old_header, &old_payload);
+
+        let error =
+            install_bundle_from_file_with_trust(dir.path(), &old_source, &trust).unwrap_err();
+        assert_eq!(error.code(), "ERR_REGISTRY_ROLLBACK");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Refusing registry {}: it was built at {old_built_at}, older than the registry already installed (2026-11-16T12:00:00+00:00). The cached registry has been kept.",
+                old_source.display()
+            )
+        );
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            signed_bundle(&key, &new_header, &new_payload)
+        );
     }
 
     /// A crash after the bundle is in place but before the readable database is

@@ -375,10 +375,13 @@ in the desktop app's Library. Nothing is imported, and no file is moved, changed
 | --- | --- |
 | `agora registry status` | Inspect the cached catalog and its active state |
 | `agora registry sync` | Download and verify the latest signed catalog |
+| `agora registry install-bundle <FILE>` | Install a signed catalog bundle from a local file |
 | `agora registry item <ITEM>` | Show one catalog item |
 | `agora sync` | Convenience alias for catalog synchronization |
 
 Use `--registry-repo` only for an intentional development or sandbox catalog. A different repository changes the trust and governance boundary.
+
+`agora registry install-bundle <FILE>` installs a local `registry.bundle` through the same path a downloaded one takes: the compiled-in keys plus the remembered `registry.trust` state verify the signature and key roles, the signed `built_at` refuses an older bundle, and an expired or unsupported-schema bundle is refused. There is no override for an older bundle, because the installed stamp is signed. The install replaces the bundle with one rename, keeps the previous one as `registry.bundle.prev`, extracts the readable database from the verified bytes and records any keys or revocations the bundle taught the client. No GitHub tag or asset id is recorded, so the next `agora registry sync` can still replace this catalog. With `--json` it prints the installed schema version, expiry and any catalog warnings. This is meant for offline machines and test setups; only install a bundle whose signature you have a reason to trust.
 
 ### Registry review and governance
 
