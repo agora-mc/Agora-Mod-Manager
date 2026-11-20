@@ -1351,6 +1351,7 @@ mod tests {
             copy_dir: PathBuf::from(r"D:\Agora\swap\Data"),
             swap_dir: PathBuf::from(r"D:\Agora\swap"),
             processes: Vec::new(),
+            spawning: false,
         }
     }
 
