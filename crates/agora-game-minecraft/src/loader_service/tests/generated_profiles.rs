@@ -5,6 +5,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 const FABRIC_PROFILE: &str = include_str!("../../../tests/fixtures/fabric-1.21.1-0.20.1.json");
+const QUILT_PROFILE: &[u8] = include_bytes!("../../../tests/fixtures/quilt-1.21.1-0.30.1.json");
 const JAR: &[u8] = b"invented library bytes";
 
 #[derive(Clone, Copy)]
@@ -91,6 +92,9 @@ async fn create_for(
     .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
+    let library_count = serde_json::from_slice::<Value>(&profile)
+        .ok()
+        .and_then(|value| value["libraries"].as_array().map(Vec::len));
     let server = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             respond(socket, &profile, reply).await;
@@ -135,6 +139,7 @@ async fn create_for(
             &receipt.curated_artifact_sha256
         };
         assert!(!pins.is_empty());
+        assert_eq!(Some(pins.len()), library_count);
         for (path, sha256) in pins {
             assert_eq!(
                 std::fs::read(root.join("libraries").join(path)).unwrap(),
@@ -255,29 +260,67 @@ async fn uses_weaker_published_checksums_only_on_not_found() {
 }
 
 #[tokio::test]
-async fn creates_quilt_instance_with_hashed_mappings() {
-    let mut profile: Value = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/quilt-1.21.1-0.30.1.json"
-    ))
-    .unwrap();
+async fn creates_quilt_instance_from_captured_profile() {
     create_for(
         "quilt",
         "0.30.1",
-        serde_json::to_vec(&profile).unwrap(),
-        MavenReply::Sha1,
-        false,
-    )
-    .await
-    .unwrap();
-    profile["libraries"][0]["name"] = json!("org.quiltmc:hashed:1.21");
-    let err = create_for(
-        "quilt",
-        "0.30.1",
-        serde_json::to_vec(&profile).unwrap(),
+        QUILT_PROFILE.to_vec(),
         MavenReply::Match,
         false,
     )
     .await
-    .unwrap_err();
-    assert!(err.to_string().contains("mappings artifact"), "{err}");
+    .unwrap();
+}
+
+#[tokio::test]
+async fn refuses_invalid_quilt_libraries() {
+    for (coordinate, edit, rule) in [
+        (
+            "org.quiltmc:hashed:1.21.1",
+            Some(("name", "org.quiltmc:hashed:1.21")),
+            "mappings artifact",
+        ),
+        (
+            "net.fabricmc:intermediary:1.21.1",
+            Some(("name", "net.fabricmc:intermediary:1.21")),
+            "mappings artifact",
+        ),
+        (
+            "org.quiltmc:hashed:1.21.1",
+            None,
+            "Missing mappings artifact",
+        ),
+        (
+            "org.quiltmc:quilt-loader:0.30.1",
+            Some(("name", "org.quiltmc:quilt-loader:0.30.0")),
+            "loader artifact",
+        ),
+        (
+            "org.quiltmc:quilt-config:1.3.3",
+            Some(("url", "https://invented.invalid/")),
+            "host allowlist",
+        ),
+    ] {
+        let mut profile: Value = serde_json::from_slice(QUILT_PROFILE).unwrap();
+        let libraries = profile["libraries"].as_array_mut().unwrap();
+        let index = libraries
+            .iter()
+            .position(|library| library["name"] == coordinate)
+            .unwrap();
+        if let Some((field, value)) = edit {
+            libraries[index][field] = json!(value);
+        } else {
+            libraries.remove(index);
+        }
+        let err = create_for(
+            "quilt",
+            "0.30.1",
+            serde_json::to_vec(&profile).unwrap(),
+            MavenReply::Match,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains(rule), "{coordinate}: {err}");
+    }
 }

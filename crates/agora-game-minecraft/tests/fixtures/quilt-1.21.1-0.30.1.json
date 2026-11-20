@@ -3,10 +3,55 @@
   "inheritsFrom": "1.21.1",
   "type": "release",
   "mainClass": "org.quiltmc.loader.impl.launch.knot.KnotClient",
-  "arguments": { "game": [], "jvm": [] },
+  "arguments": {
+    "game": []
+  },
   "libraries": [
-    { "name": "org.quiltmc:hashed:1.21.1", "url": "https://maven.quiltmc.org/repository/release/" },
-    { "name": "net.fabricmc:intermediary:1.21.1", "url": "https://maven.fabricmc.net/" },
-    { "name": "org.quiltmc:quilt-loader:0.30.1", "url": "https://maven.quiltmc.org/repository/release/" }
-  ]
+    {
+      "name": "net.fabricmc:sponge-mixin:0.17.3+mixin.0.8.7",
+      "url": "https://maven.fabricmc.net/"
+    },
+    {
+      "name": "org.quiltmc:quilt-json5:1.0.4+final",
+      "url": "https://maven.quiltmc.org/repository/release/"
+    },
+    {
+      "name": "org.ow2.asm:asm:9.10.1",
+      "url": "https://maven.fabricmc.net/"
+    },
+    {
+      "name": "org.ow2.asm:asm-analysis:9.10.1",
+      "url": "https://maven.fabricmc.net/"
+    },
+    {
+      "name": "org.ow2.asm:asm-commons:9.10.1",
+      "url": "https://maven.fabricmc.net/"
+    },
+    {
+      "name": "org.ow2.asm:asm-tree:9.10.1",
+      "url": "https://maven.fabricmc.net/"
+    },
+    {
+      "name": "org.ow2.asm:asm-util:9.10.1",
+      "url": "https://maven.fabricmc.net/"
+    },
+    {
+      "name": "org.quiltmc:quilt-config:1.3.3",
+      "url": "https://maven.quiltmc.org/repository/release/"
+    },
+    {
+      "name": "org.quiltmc:quilt-loader:0.30.1",
+      "url": "https://maven.quiltmc.org/repository/release/"
+    },
+    {
+      "name": "org.quiltmc:hashed:1.21.1",
+      "url": "https://maven.quiltmc.org/repository/release/"
+    },
+    {
+      "name": "net.fabricmc:intermediary:1.21.1",
+      "url": "https://maven.fabricmc.net/"
+    }
+  ],
+  "releaseTime": "2024-08-08T12:24:45+00:00",
+  "time": "2026-11-03T06:42:36+00:00"
 }
