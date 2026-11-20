@@ -13,7 +13,7 @@ use crate::registry_bundle::{
     self, BundleError, CatalogHeader, KeyCertificate, KeyRevocation, RegistryKey, RegistryKeyRole,
     RegistryTrust, VerifiedBundle,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use ed25519_dalek::{Signature, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -347,8 +347,15 @@ async fn check_and_download_update_inner(
     // reinstating entries that curation has since quarantined.
     let latest_asset = latest.find_asset("registry.bundle");
     let cached_asset = get_cached_asset_id(local_state_path)?;
+    // Decide whether to fetch a candidate from the signed build stamp, not the
+    // signed display tag. An unverifiable cached bundle yields no date, which
+    // makes the pre-filter fetch so the signed checks can have the last word.
+    let cached_release_date = read_cached_stamp_checked(app_data_dir, trust)
+        .ok()
+        .flatten()
+        .and_then(|stamp| cached_release_date_from_stamp(Some(&stamp)));
     let update_available = update_is_available(
-        cached_tag.as_deref(),
+        cached_release_date.as_deref(),
         has_cached_db,
         cached_asset,
         &latest.tag_name,
@@ -1053,21 +1060,41 @@ fn install_bundle_bytes_checked(
     let verified = registry_bundle::verify_bundle(bundle_bytes, trust).map_err(bundle_error)?;
 
     // Anti-rollback is checked only after the signature, so the stamp being
-    // compared is one the signing key vouched for. The tag check in the sync
-    // path uses unsigned API metadata and can be forged; this cannot.
-    let candidate_built_at = Some(verified.header.built_at.clone());
-    let cached_built_at = read_cached_built_at_checked(app_data_dir, trust)?;
-    if is_rollback(cached_built_at.as_deref(), candidate_built_at.as_deref()) {
-        return Err(LauncherError::Generic {
-            code: "ERR_REGISTRY_ROLLBACK".into(),
-            message: format!(
-                "Refusing registry {}: it was built at {}, older than the registry already \
-                 installed ({}). The cached registry has been kept.",
-                label,
-                candidate_built_at.as_deref().unwrap_or("unknown"),
-                cached_built_at.as_deref().unwrap_or("unknown"),
-            ),
-        });
+    // compared is one the signing key vouched for. The release tag is display
+    // metadata and never takes part in this decision.
+    let cached_stamp = read_cached_stamp_checked(app_data_dir, trust)?;
+    match compare_stamps(
+        cached_stamp.as_ref(),
+        &verified.header.built_at,
+        &verified.header.db_sha256,
+    )? {
+        StampOrder::Older => {
+            return Err(LauncherError::Generic {
+                code: "ERR_REGISTRY_ROLLBACK".into(),
+                message: format!(
+                    "Refusing registry {}: it was built at {}, older than the registry already \
+                     installed ({}). The cached registry has been kept.",
+                    label,
+                    verified.header.built_at,
+                    cached_stamp
+                        .as_ref()
+                        .map(|stamp| stamp.built_at.as_str())
+                        .unwrap_or("unknown"),
+                ),
+            })
+        }
+        StampOrder::EqualDifferentBytes => {
+            return Err(LauncherError::Generic {
+                code: "ERR_REGISTRY_ROLLBACK".into(),
+                message: format!(
+                    "Refusing registry {}: it carries a different signed payload with the same \
+                     build stamp ({}) as the registry already installed. The cached registry has \
+                     been kept.",
+                    label, verified.header.built_at
+                ),
+            })
+        }
+        StampOrder::Newer | StampOrder::EqualSameBytes => {}
     }
 
     // An expired bundle stays readable but is never installed as current: doing
@@ -1284,20 +1311,30 @@ fn stale_message(header: &CatalogHeader) -> String {
     )
 }
 
-/// The signed build stamp of the cached catalog, for the rollback check.
-///
+/// The signed build stamp and payload hash of the cached catalog, for the
+/// rollback check. The hash lets an equal stamp over different bytes be
+/// refused instead of silently replacing the current catalog.
+#[derive(Debug, Clone)]
+struct CachedStamp {
+    built_at: String,
+    db_sha256: String,
+}
+
 /// An absent catalog is `None` (nothing to roll back from). A catalog that is
 /// present but cannot be read or verified is an error: treating "unknown" as
 /// "older" is what lets a replayed old signed catalog replace a newer one.
-fn read_cached_built_at_checked(
+fn read_cached_stamp_checked(
     app_data_dir: &Path,
     trust: &RegistryTrust,
-) -> LauncherResult<Option<String>> {
+) -> LauncherResult<Option<CachedStamp>> {
     let bundle_path =
         paths::registry_bundle_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
     if bundle_path.exists() {
         return match load_header(&bundle_path, trust) {
-            Ok(header) => Ok(Some(header.built_at)),
+            Ok(header) => Ok(Some(CachedStamp {
+                built_at: header.built_at,
+                db_sha256: header.db_sha256,
+            })),
             Err(error) => Err(LauncherError::Generic {
                 code: "ERR_REGISTRY_CACHED_STAMP_UNREADABLE".into(),
                 message: format!(
@@ -1935,24 +1972,69 @@ fn parse_registry_tag(tag: &str) -> Option<(u16, u8, u8)> {
     Some((year, month, day))
 }
 
-/// Whether installing `candidate` over `cached` would move the registry
-/// backwards in time.
+/// How a candidate's signed build stamp compares with the cached one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StampOrder {
+    /// The candidate is older; installing it would roll the catalog back.
+    Older,
+    /// Same instant and same signed payload: a harmless no-op.
+    EqualSameBytes,
+    /// Same instant but different signed bytes: refuse rather than pick a winner.
+    EqualDifferentBytes,
+    Newer,
+}
+
+/// Compare signed build stamps as parsed UTC instants, not as text: RFC 3339
+/// offsets can sort differently from the moments they represent. An unparseable
+/// stamp is an error, never permission to replace the current catalog.
 ///
-/// Both stamps come from inside signature-verified database bytes, so unlike
-/// the release tag they cannot be forged without the signing key. ISO-8601 UTC
-/// timestamps from the compiler compare correctly as strings.
-///
-/// An unstamped candidate over a stamped cache is a rollback: it predates the stamp, so it is
-/// older than anything stamped. Refusing it keeps the stamped registry. A *cached* database
-/// predating the stamp has no value to compare, and refusing every update in that state would
-/// strand clients on exactly the registry we want them to move off, so that direction still
-/// allows the update.
-fn is_rollback(cached_built_at: Option<&str>, candidate_built_at: Option<&str>) -> bool {
-    match (cached_built_at, candidate_built_at) {
-        (Some(cached), Some(candidate)) => candidate < cached,
-        (Some(_), None) => true,
-        _ => false,
+/// Both stamps come from signature-verified bytes, so unlike the release tag
+/// they cannot be forged without the signing key. A cached database predating
+/// the stamp has no value to compare, and refusing every update in that state
+/// would strand clients, so that direction allows the update.
+fn compare_stamps(
+    cached: Option<&CachedStamp>,
+    candidate_built_at: &str,
+    candidate_db_sha256: &str,
+) -> LauncherResult<StampOrder> {
+    let candidate_time = parse_utc(candidate_built_at).ok_or_else(|| LauncherError::Generic {
+        code: "ERR_REGISTRY_STAMP_INVALID".into(),
+        message: format!(
+            "The candidate catalog's signed build stamp `{candidate_built_at}` cannot be read."
+        ),
+    })?;
+    let Some(cached) = cached else {
+        return Ok(StampOrder::Newer);
+    };
+    let cached_time = parse_utc(&cached.built_at).ok_or_else(|| LauncherError::Generic {
+        code: "ERR_REGISTRY_CACHED_STAMP_UNREADABLE".into(),
+        message: "The installed catalog's signed build stamp cannot be read.".into(),
+    })?;
+    match candidate_time.cmp(&cached_time) {
+        std::cmp::Ordering::Less => Ok(StampOrder::Older),
+        std::cmp::Ordering::Greater => Ok(StampOrder::Newer),
+        std::cmp::Ordering::Equal => {
+            if candidate_db_sha256.eq_ignore_ascii_case(&cached.db_sha256) {
+                Ok(StampOrder::EqualSameBytes)
+            } else {
+                Ok(StampOrder::EqualDifferentBytes)
+            }
+        }
     }
+}
+
+/// The UTC release date carried by the cached catalog's signed stamp, in the
+/// `registry-YYYY-MM-DD` form `update_is_available` compares. This is the
+/// authority for "is the remote candidate newer"; the signed display tag can
+/// be future-dated or unparseable and must not decide that question.
+fn cached_release_date_from_stamp(stamp: Option<&CachedStamp>) -> Option<String> {
+    let time = parse_utc(&stamp?.built_at)?;
+    Some(format!(
+        "registry-{:04}-{:02}-{:02}",
+        time.year(),
+        time.month(),
+        time.day()
+    ))
 }
 
 /// Read the schema version from the cached registry database at `path`.
@@ -2430,15 +2512,45 @@ mod tests {
     }
 
     #[test]
-    fn is_rollback_compares_signed_build_stamps() {
+    fn compare_stamps_orders_signed_build_stamps() {
         let older = "2026-08-26T03:19:02+00:00";
         let newer = "2026-08-27T12:20:15+00:00";
-        assert!(is_rollback(Some(newer), Some(older)));
-        assert!(!is_rollback(Some(older), Some(newer)));
-        assert!(!is_rollback(Some(newer), Some(newer)));
-        assert!(!is_rollback(None, Some(newer)));
-        assert!(is_rollback(Some(newer), None));
-        assert!(!is_rollback(None, None));
+        let hash = "0".repeat(64);
+        let cached = |built_at: &str, sha: &str| CachedStamp {
+            built_at: built_at.into(),
+            db_sha256: sha.into(),
+        };
+        assert_eq!(
+            compare_stamps(Some(&cached(newer, &hash)), older, &hash).unwrap(),
+            StampOrder::Older
+        );
+        assert_eq!(
+            compare_stamps(Some(&cached(older, &hash)), newer, &hash).unwrap(),
+            StampOrder::Newer
+        );
+        assert_eq!(
+            compare_stamps(Some(&cached(newer, &hash)), newer, &hash).unwrap(),
+            StampOrder::EqualSameBytes
+        );
+        assert_eq!(
+            compare_stamps(
+                Some(&cached(newer, &hash)),
+                newer,
+                &"1".repeat(64)
+            )
+            .unwrap(),
+            StampOrder::EqualDifferentBytes
+        );
+        assert_eq!(
+            compare_stamps(None, newer, &hash).unwrap(),
+            StampOrder::Newer
+        );
+        assert_eq!(
+            compare_stamps(Some(&cached(newer, &hash)), "not a time", &hash)
+                .unwrap_err()
+                .code(),
+            "ERR_REGISTRY_STAMP_INVALID"
+        );
     }
 
     #[test]
@@ -2543,6 +2655,9 @@ mod tests {
         let source_name = "supplied-registry.bundle";
         write_bundle(dir.path(), source_name, &key, &header, &payload);
         let locks = LockManager::new(dir.path().join("locks"));
+        // A previous online asset id must not survive a local install: it would
+        // make the next same-day sync look up to date.
+        set_cached_asset_id(&ls_path, Some(4242)).unwrap();
 
         let installed = install_bundle_from_file_with_trust(
             dir.path(),
@@ -2561,6 +2676,7 @@ mod tests {
             get_cached_tag(&ls_path).unwrap().as_deref(),
             Some("registry-2026-11-16")
         );
+        assert_eq!(get_cached_asset_id(&ls_path).unwrap(), None);
         let status = get_status(dir.path(), &ls_path);
         assert_eq!(status.cached_tag.as_deref(), Some("registry-2026-11-16"));
         assert_eq!(
@@ -2820,6 +2936,120 @@ mod tests {
             .contains("v1 revoke"));
     }
 
+    /// Offsets are compared as UTC instants, not as text. 11:00-02:00 is 13:00
+    /// UTC, so it is newer than a cached 12:00+00:00 even though it sorts lower.
+    #[test]
+    fn a_built_at_offset_is_compared_as_an_instant() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(76);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let current_payload = sample_db_with_built_at("2026-11-16T12:00:00+00:00");
+        let current_header = fresh_header(&key, &current_payload);
+        let current = signed_bundle(&key, &current_header, &current_payload);
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &current).unwrap();
+
+        let newer_payload = sample_db_with_built_at("2026-11-16T11:00:00-02:00");
+        let mut newer_header = header_for(
+            &key,
+            &newer_payload,
+            "2026-11-16T11:00:00-02:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        newer_header.tag = "registry-2026-11-16".into();
+        let newer = signed_bundle(&key, &newer_header, &newer_payload);
+
+        install_bundle_bytes_checked(dir.path(), &newer, &trust, "newer")
+            .expect("a later UTC instant must be accepted even if its text sorts earlier");
+    }
+
+    /// An equal signed build stamp with different signed bytes must not replace
+    /// the installed catalog.
+    #[test]
+    fn an_equal_stamp_with_different_bytes_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(77);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let stamp = "2026-11-16T12:00:00+00:00";
+        let current_payload = sample_db_with_built_at(stamp);
+        let current_header = fresh_header(&key, &current_payload);
+        let current = signed_bundle(&key, &current_header, &current_payload);
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &current).unwrap();
+
+        let other_payload = sample_db_with_built_at("2026-11-17T12:00:00+00:00");
+        let mut other_header = header_for(
+            &key,
+            &other_payload,
+            stamp,
+            "2099-01-01T00:00:00+00:00",
+        );
+        other_header.tag = "registry-2026-11-16".into();
+        let other = signed_bundle(&key, &other_header, &other_payload);
+
+        let error = install_bundle_bytes_checked(dir.path(), &other, &trust, "other")
+            .expect_err("an equal stamp over different bytes must be refused");
+        assert_eq!(error.code(), "ERR_REGISTRY_ROLLBACK");
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            current
+        );
+    }
+
+    /// A signed display tag must not make an explicit sync report "up to date".
+    #[tokio::test]
+    async fn a_future_signed_tag_cannot_suppress_an_explicit_sync() {
+        let (dir, ls_path, locks) = setup_sync_env();
+        let key = test_key(78);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let local_payload = sample_db_with_built_at("2026-11-16T12:00:00+00:00");
+        let mut local_header = fresh_header(&key, &local_payload);
+        local_header.tag = "registry-2099-01-01".into();
+        let local_bundle = signed_bundle(&key, &local_header, &local_payload);
+        let source = dir.path().join("local.bundle");
+        fs::write(&source, &local_bundle).unwrap();
+        install_bundle_from_file_with_trust(dir.path(), &ls_path, &source, &trust, &locks).unwrap();
+        assert_eq!(
+            get_cached_tag(&ls_path).unwrap().as_deref(),
+            Some("registry-2099-01-01")
+        );
+
+        let remote_payload = sample_db_with_built_at("2026-11-20T02:00:00+00:00");
+        let mut remote_header = header_for(
+            &key,
+            &remote_payload,
+            "2026-11-20T02:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        remote_header.tag = "registry-2026-11-20".into();
+        let remote_bundle = signed_bundle(&key, &remote_header, &remote_payload);
+        let recorded = r#"[
+            {"tag_name": "registry-2026-11-20", "draft": false, "prerelease": false, "assets": [{"id": 5001, "name": "registry.bundle"}]}
+        ]"#;
+        let transport = FakeRegistryTransport::from_pages(vec![(1, release_json_to_list(recorded))]);
+        transport.push_asset_ok(5001, remote_bundle.clone());
+
+        let status = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            true,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_000,
+        )
+        .await
+        .expect("explicit sync must check the remote, not trust the signed tag");
+
+        assert!(status.update_available || status.message.contains("updated"));
+        assert!(!status.message.contains("up to date"), "{}", status.message);
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            remote_bundle
+        );
+    }
+
     /// Once the bundle is committed, a failure to remember its trust state must
     /// not be reported as a failed install: the bundle is already in place and
     /// verifies itself from the revocations it carries.
@@ -2971,7 +3201,9 @@ mod tests {
         let header = fresh_header(&key, &payload);
         write_bundle(dir.path(), "registry.bundle", &key, &header, &payload);
         assert_eq!(
-            read_cached_built_at_checked(dir.path(), &trust).unwrap(),
+            read_cached_stamp_checked(dir.path(), &trust)
+                .unwrap()
+                .map(|stamp| stamp.built_at),
             Some(header.built_at)
         );
 
@@ -2980,7 +3212,7 @@ mod tests {
             b"corrupt current bundle",
         )
         .unwrap();
-        let error = read_cached_built_at_checked(dir.path(), &trust).unwrap_err();
+        let error = read_cached_stamp_checked(dir.path(), &trust).unwrap_err();
         assert_eq!(error.code(), "ERR_REGISTRY_CACHED_STAMP_UNREADABLE");
     }
 
