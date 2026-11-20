@@ -579,6 +579,13 @@ impl LoaderService {
                 });
             }
             normalize_forge_profile(minecraft_root, tuple)?;
+            let produced =
+                installed_profile::processor_outputs_from_installer_jar(data).map_err(|issue| {
+                    LauncherError::Generic {
+                        code: "ERR_PROFILE_CORRUPT".into(),
+                        message: issue.reasons.join("; "),
+                    }
+                })?;
             let receipt = installed_profile::create_receipt_for_installed_profile(
                 minecraft_root,
                 receipts_root,
@@ -586,6 +593,7 @@ impl LoaderService {
                 loader_manifests::strip_sha_prefix(&entry.sha256),
                 &entry.source_url,
                 installer_result.exit_code,
+                &produced,
             )
             .map_err(|issue| LauncherError::Generic {
                 code: "ERR_PROFILE_CORRUPT".into(),
