@@ -60,13 +60,20 @@ async fn respond(mut socket: TcpStream, profile: &[u8], reply: MavenReply) {
 }
 
 async fn create(profile: Value, reply: MavenReply, allow_unverified: bool) -> LauncherResult<()> {
-    create_for("fabric", "0.20.1", profile, reply, allow_unverified).await
+    create_for(
+        "fabric",
+        "0.20.1",
+        serde_json::to_vec(&profile).unwrap(),
+        reply,
+        allow_unverified,
+    )
+    .await
 }
 
 async fn create_for(
     loader: &str,
     loader_version: &str,
-    profile: Value,
+    profile: Vec<u8>,
     reply: MavenReply,
     allow_unverified: bool,
 ) -> LauncherResult<()> {
@@ -84,7 +91,6 @@ async fn create_for(
     .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
-    let profile = serde_json::to_vec(&profile).unwrap();
     let server = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             respond(socket, &profile, reply).await;
@@ -147,10 +153,16 @@ fn fabric_profile() -> Value {
 }
 
 #[tokio::test]
-async fn creates_fabric_instance_from_dynamic_profile() {
-    create(fabric_profile(), MavenReply::Match, false)
-        .await
-        .unwrap();
+async fn creates_fabric_instance_from_captured_profile() {
+    create_for(
+        "fabric",
+        "0.20.1",
+        FABRIC_PROFILE.as_bytes().to_vec(),
+        MavenReply::Match,
+        false,
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -165,7 +177,12 @@ async fn refuses_invalid_fabric_structure() {
     let mut host = fabric_profile();
     host["libraries"][0]["url"] = json!("https://invented.invalid/");
     let mut jvm = fabric_profile();
-    jvm["arguments"]["jvm"] = json!(["-Dunexpected=true"]);
+    jvm["arguments"]["jvm"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("-Dunexpected=true"));
+    let mut diagnostic = fabric_profile();
+    diagnostic["arguments"]["jvm"][1] = json!("-XX:+UseBASE64Intrinsics");
     let mut class = fabric_profile();
     class["mainClass"] = json!("invented.loader.Main");
     let mut loader = fabric_profile();
@@ -181,6 +198,7 @@ async fn refuses_invalid_fabric_structure() {
     for (profile, rule) in [
         (host, "host"),
         (jvm, "arguments.jvm"),
+        (diagnostic, "arguments.jvm"),
         (class, "mainClass"),
         (loader, "loader artifact"),
         (mappings, "mappings artifact"),
@@ -242,12 +260,24 @@ async fn creates_quilt_instance_with_hashed_mappings() {
         "../../../tests/fixtures/quilt-1.21.1-0.30.1.json"
     ))
     .unwrap();
-    create_for("quilt", "0.30.1", profile.clone(), MavenReply::Sha1, false)
-        .await
-        .unwrap();
+    create_for(
+        "quilt",
+        "0.30.1",
+        serde_json::to_vec(&profile).unwrap(),
+        MavenReply::Sha1,
+        false,
+    )
+    .await
+    .unwrap();
     profile["libraries"][0]["name"] = json!("org.quiltmc:hashed:1.21");
-    let err = create_for("quilt", "0.30.1", profile, MavenReply::Match, false)
-        .await
-        .unwrap_err();
+    let err = create_for(
+        "quilt",
+        "0.30.1",
+        serde_json::to_vec(&profile).unwrap(),
+        MavenReply::Match,
+        false,
+    )
+    .await
+    .unwrap_err();
     assert!(err.to_string().contains("mappings artifact"), "{err}");
 }

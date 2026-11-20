@@ -20,7 +20,12 @@ const QUILT_MAIN_CLASSES: &[&str] = &[
     "org.quiltmc.loader.launch.knot.KnotClient",
 ];
 // https://github.com/FabricMC/fabric-meta/blob/master/src/main/java/net/fabricmc/meta/web/ProfileHandler.java
-const FABRIC_JVM_ARGUMENTS: &[&str] = &["-DFabricMcEmu= net.minecraft.client.main.Main "];
+// The captured 0.20.1 / 1.21.1 profile also disables the HotSpot Base64 intrinsic.
+const FABRIC_JVM_ARGUMENTS: &[&str] = &[
+    "-XX:+UnlockDiagnosticVMOptions",
+    "-XX:-UseBASE64Intrinsics",
+    "-DFabricMcEmu= net.minecraft.client.main.Main ",
+];
 const QUILT_JVM_ARGUMENTS: &[&str] = &[];
 const GAME_ARGUMENTS: &[&str] = &[];
 
