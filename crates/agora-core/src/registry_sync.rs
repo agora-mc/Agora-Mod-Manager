@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use std::sync::{Mutex, OnceLock};
 
 /// Resolve the registry repository with priority:
@@ -154,17 +155,19 @@ pub struct InstalledBundle {
 /// Install a signed `registry.bundle` from a local file.
 ///
 /// Uses the same verification and install path as a downloaded bundle, with
-/// the compiled-in keys plus the remembered `registry.trust` state. The tag
-/// named by the signed bundle header is recorded as the cached registry tag,
-/// exactly as a downloaded bundle's release tag is, so `registry status` shows
-/// it and the next sync compares against it. No release asset id is recorded.
+/// the compiled-in keys plus the remembered `registry.trust` state. A local
+/// file is just another source of bytes: it takes the same cross-process
+/// `RegistryUpdate` lock sync does, so the rollback check and the single-rename
+/// commit cannot race a concurrent sync. The tag named by the signed bundle
+/// header is kept for display, and no release asset id is recorded.
 pub fn install_bundle_from_file(
     app_data_dir: &Path,
     local_state_path: &Path,
     bundle_path: &Path,
+    lock_manager: &LockManager,
 ) -> LauncherResult<InstalledBundle> {
     let trust = effective_trust(app_data_dir, &RegistryTrust::production());
-    install_bundle_from_file_with_trust(app_data_dir, local_state_path, bundle_path, &trust)
+    install_bundle_from_file_with_trust(app_data_dir, local_state_path, bundle_path, &trust, lock_manager)
 }
 
 /// As [`install_bundle_from_file`], with an explicit trust list. This is the
@@ -174,7 +177,44 @@ pub fn install_bundle_from_file_with_trust(
     local_state_path: &Path,
     bundle_path: &Path,
     trust: &RegistryTrust,
+    lock_manager: &LockManager,
 ) -> LauncherResult<InstalledBundle> {
+    install_local_inner(
+        app_data_dir,
+        local_state_path,
+        bundle_path,
+        trust,
+        lock_manager,
+        None,
+    )
+}
+
+/// The local install body. `timeout` lets a test prove the lock is taken
+/// without waiting the production timeout; production always waits.
+fn install_local_inner(
+    app_data_dir: &Path,
+    local_state_path: &Path,
+    bundle_path: &Path,
+    trust: &RegistryTrust,
+    lock_manager: &LockManager,
+    timeout: Option<Duration>,
+) -> LauncherResult<InstalledBundle> {
+    // The rollback comparison in `install_bundle_bytes_checked` and the commit
+    // it guards must see the same catalog. Sync holds this lock across its
+    // check-and-commit, so a local install must hold it too.
+    let _registry_lock = match timeout {
+        Some(duration) => lock_manager.acquire_with_timeout(
+            crate::lock_manager::LockResource::RegistryUpdate,
+            "registry-local-install",
+            duration,
+            None,
+        )?,
+        None => lock_manager.acquire(
+            crate::lock_manager::LockResource::RegistryUpdate,
+            "registry-local-install",
+        )?,
+    };
+
     let bytes = std::fs::read(bundle_path).map_err(|error| LauncherError::Generic {
         code: "ERR_REGISTRY_BUNDLE_READ".into(),
         message: format!(
@@ -188,7 +228,10 @@ pub fn install_bundle_from_file_with_trust(
         trust,
         &bundle_path.display().to_string(),
     )?;
-    set_cached_tag(local_state_path, &installed.tag)?;
+    // Display metadata is written after the commit; a failure here must not
+    // report failure for a bundle that is already installed.
+    let _ = set_cached_tag(local_state_path, &installed.tag);
+    let _ = set_cached_asset_id(local_state_path, None);
     Ok(installed)
 }
 
@@ -373,8 +416,11 @@ async fn check_and_download_update_inner(
 
         let installed =
             install_bundle_bytes_checked(app_data_dir, &bundle_bytes, trust, &latest.tag_name)?;
-        set_cached_tag(local_state_path, &latest.tag_name)?;
-        set_cached_asset_id(local_state_path, Some(bundle_id))?;
+        // Display/asset metadata is written after the commit. The bundle is
+        // already current, so a write failure here must not be reported as a
+        // failed install; the next sync can set it again.
+        let _ = set_cached_tag(local_state_path, &latest.tag_name);
+        let _ = set_cached_asset_id(local_state_path, Some(bundle_id));
         Ok((installed.schema_version, installed.expires_at))
     }
     .await;
@@ -1059,9 +1105,17 @@ fn install_bundle_bytes_checked(
 
 /// Install the exact signed bytes of a bundle that has already been verified.
 ///
-/// The bundle is one file, so it is replaced by one rename. Before that, the
-/// previous good bundle is copied to `registry.bundle.prev`; a crash at any
-/// point leaves either the old current or the old previous usable.
+/// The bundle is one file, so it is replaced by one rename. Everything that can
+/// fail before that rename stops the install without changing trust; the
+/// previous good bundle is copied to `registry.bundle.prev` first, so a crash
+/// at any point leaves either the old current or the old previous usable.
+///
+/// The bundle rename is the single commit point. Revocations and key trust are
+/// persisted only *after* it: writing a revocation first could untrust the
+/// current bundle while it is still current, and an abort would strand the
+/// cache on an unreadable stamp. Anything that fails after the rename is
+/// best-effort — the bundle is installed and carries its own certificates and
+/// revocations, so it still verifies — and is not reported as a failed install.
 fn install_bundle_bytes(
     app_data_dir: &Path,
     header: &CatalogHeader,
@@ -1074,10 +1128,6 @@ fn install_bundle_bytes(
         .map_err(|_| LauncherError::RegistryMissing)?;
     let trust = effective_trust(app_data_dir, trust);
     let payload = registry_bundle::verify_bundle(bundle_bytes, &trust).map_err(bundle_error)?;
-    // Remember what this verified bundle teaches before it is installed. A
-    // failure to persist a revocation must not leave a catalog whose future
-    // keys the client has not learned about.
-    remember_bundle_trust(app_data_dir, &payload)?;
 
     // Keep the previous copy only when the current file looks like a bundle.
     // A corrupt current must not overwrite a good previous one.
@@ -1092,24 +1142,31 @@ fn install_bundle_bytes(
         }
     }
 
+    // COMMIT: one rename replaces the current bundle.
     write_atomic(&bundle_path, bundle_bytes).map_err(|error| LauncherError::Generic {
         code: "ERR_REGISTRY_WRITE".into(),
         message: format!("Could not install the catalog bundle: {error}."),
     })?;
 
-    // The signature lives inside the bundle now. An old sidecar beside the new
-    // database would describe bytes that are no longer there.
+    // Post-commit, best-effort. The signature lives inside the bundle now, so
+    // an old sidecar would describe bytes that are no longer there.
     if let Ok(sig_path) = paths::registry_sig_path(app_data_dir) {
         let _ = std::fs::remove_file(sig_path);
     }
-
-    ensure_database(
+    // The readable database is a derived copy: if this fails, the next open
+    // extracts it again from the bundle that is now current.
+    let _ = ensure_database(
         app_data_dir,
         &bundle_path,
         header,
         Some(&payload.payload),
         &trust,
-    )
+    );
+    // A revocation may revoke the key of the bundle we just replaced. Persist
+    // it only now that the replacement is in place. If this write fails the
+    // revocation can be learned from the installed bundle on the next sync.
+    let _ = remember_bundle_trust(app_data_dir, &payload);
+    Ok(())
 }
 
 /// Verify the cached catalog, recovering from the previous bundle when the
@@ -2485,12 +2542,14 @@ mod tests {
         let header = fresh_header(&key, &payload);
         let source_name = "supplied-registry.bundle";
         write_bundle(dir.path(), source_name, &key, &header, &payload);
+        let locks = LockManager::new(dir.path().join("locks"));
 
         let installed = install_bundle_from_file_with_trust(
             dir.path(),
             &ls_path,
             &dir.path().join(source_name),
             &trust,
+            &locks,
         )
         .unwrap();
         assert_eq!(installed.tag, header.tag);
@@ -2539,9 +2598,10 @@ mod tests {
         bytes[last] ^= 0x01;
         let source = dir.path().join("tampered.bundle");
         fs::write(&source, &bytes).unwrap();
+        let locks = LockManager::new(dir.path().join("locks"));
 
-        let error =
-            install_bundle_from_file_with_trust(dir.path(), &ls_path, &source, &trust).unwrap_err();
+        let error = install_bundle_from_file_with_trust(dir.path(), &ls_path, &source, &trust, &locks)
+            .unwrap_err();
         assert_eq!(error.code(), "ERR_REGISTRY_BUNDLE_HASH");
         assert_eq!(
             error.to_string(),
@@ -2567,12 +2627,14 @@ mod tests {
         );
         let source_name = "unknown-key.bundle";
         write_bundle(dir.path(), source_name, &signer, &header, &payload);
+        let locks = LockManager::new(dir.path().join("locks"));
 
         let error = install_bundle_from_file_with_trust(
             dir.path(),
             &ls_path,
             &dir.path().join(source_name),
             &trust,
+            &locks,
         )
         .unwrap_err();
         assert_eq!(error.code(), "ERR_REGISTRY_SIGNATURE_INVALID");
@@ -2602,9 +2664,10 @@ mod tests {
         );
         let source = dir.path().join("expired.bundle");
         write_bundle(dir.path(), "expired.bundle", &key, &header, &payload);
+        let locks = LockManager::new(dir.path().join("locks"));
 
-        let error =
-            install_bundle_from_file_with_trust(dir.path(), &ls_path, &source, &trust).unwrap_err();
+        let error = install_bundle_from_file_with_trust(dir.path(), &ls_path, &source, &trust, &locks)
+            .unwrap_err();
         assert_eq!(error.code(), "ERR_REGISTRY_EXPIRED");
         assert_eq!(
             error.to_string(),
@@ -2628,7 +2691,9 @@ mod tests {
         let new_header = fresh_header(&key, &new_payload);
         let new_source = dir.path().join("new.bundle");
         write_bundle(dir.path(), "new.bundle", &key, &new_header, &new_payload);
-        install_bundle_from_file_with_trust(dir.path(), &ls_path, &new_source, &trust).unwrap();
+        let locks = LockManager::new(dir.path().join("locks"));
+        install_bundle_from_file_with_trust(dir.path(), &ls_path, &new_source, &trust, &locks)
+            .unwrap();
 
         let old_payload = sample_db_with_built_at("2026-08-26T03:19:02+00:00");
         let old_built_at = "2026-08-26T03:19:02+00:00";
@@ -2641,8 +2706,9 @@ mod tests {
         let old_source = dir.path().join("old.bundle");
         write_bundle(dir.path(), "old.bundle", &key, &old_header, &old_payload);
 
-        let error = install_bundle_from_file_with_trust(dir.path(), &ls_path, &old_source, &trust)
-            .unwrap_err();
+        let error =
+            install_bundle_from_file_with_trust(dir.path(), &ls_path, &old_source, &trust, &locks)
+                .unwrap_err();
         assert_eq!(error.code(), "ERR_REGISTRY_ROLLBACK");
         assert_eq!(
             error.to_string(),
@@ -2654,6 +2720,143 @@ mod tests {
         assert_eq!(
             fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
             signed_bundle(&key, &new_header, &new_payload)
+        );
+    }
+
+    /// A local install contends on the same cross-process `RegistryUpdate` lock
+    /// sync holds. While that lock is held, the local install must not commit.
+    #[test]
+    fn a_local_install_takes_the_registry_update_lock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
+        let key = test_key(66);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let locks = LockManager::new(dir.path().join("locks"));
+        let _holder = locks
+            .acquire(crate::lock_manager::LockResource::RegistryUpdate, "sync")
+            .unwrap();
+        let payload = sample_db();
+        let header = fresh_header(&key, &payload);
+        let source = dir.path().join("source.bundle");
+        write_bundle(dir.path(), "source.bundle", &key, &header, &payload);
+
+        let result = install_local_inner(
+            dir.path(),
+            &ls_path,
+            &source,
+            &trust,
+            &locks,
+            Some(Duration::from_millis(200)),
+        );
+        let error = result.expect_err("a local install must not commit while sync holds RegistryUpdate");
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("registry-update"),
+            "the refusal must name the contended lock: {error}"
+        );
+        assert!(!paths::registry_bundle_path(dir.path()).unwrap().exists());
+    }
+
+    /// A revocation learned from a candidate is not persisted until the bundle
+    /// is committed. A failure before the commit leaves the old bundle current
+    /// and trusted, and a retry works.
+    #[test]
+    fn a_failed_commit_does_not_persist_the_new_revocation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stolen = test_key(70);
+        let recovery = test_key(71);
+        let replacement = test_key(72);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&stolen)),
+            (RegistryKeyRole::Primary, test_public(&replacement)),
+        ]);
+        let payload = sample_db();
+        let current_header = fresh_header(&stolen, &payload);
+        let current = signed_bundle(&stolen, &current_header, &payload);
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &current).unwrap();
+
+        let mut candidate_header = header_for(
+            &replacement,
+            &payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        candidate_header
+            .revocations
+            .push(revocation(&recovery, &stolen));
+        let candidate = signed_bundle(&replacement, &candidate_header, &payload);
+
+        // Break the pre-commit backup so the bundle cannot be replaced.
+        let prev = paths::registry_bundle_previous_path(dir.path()).unwrap();
+        fs::create_dir_all(&prev).unwrap();
+        let error = install_bundle_bytes_checked(dir.path(), &candidate, &trust, "candidate")
+            .expect_err("the commit must fail while the backup path is obstructed");
+        assert_eq!(error.code(), "ERR_REGISTRY_WRITE");
+
+        let trust_path = paths::registry_trust_state_path(dir.path()).unwrap();
+        let remembered = fs::read_to_string(&trust_path).unwrap_or_default();
+        assert!(
+            !remembered.contains("v1 revoke"),
+            "a failed commit must not leave the old bundle revoked: {remembered}"
+        );
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            current
+        );
+        assert!(
+            open_verified_registry_with_trust(dir.path(), &trust).is_ok(),
+            "the previous bundle stays trusted"
+        );
+
+        // Retry once the obstruction is gone.
+        fs::remove_dir(&prev).unwrap();
+        install_bundle_bytes_checked(dir.path(), &candidate, &trust, "candidate").unwrap();
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            candidate
+        );
+        assert!(fs::read_to_string(&trust_path)
+            .unwrap()
+            .contains("v1 revoke"));
+    }
+
+    /// Once the bundle is committed, a failure to remember its trust state must
+    /// not be reported as a failed install: the bundle is already in place and
+    /// verifies itself from the revocations it carries.
+    #[test]
+    fn a_post_commit_trust_failure_does_not_report_the_install_as_failed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stolen = test_key(73);
+        let recovery = test_key(74);
+        let replacement = test_key(75);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&stolen)),
+            (RegistryKeyRole::Primary, test_public(&replacement)),
+        ]);
+        let payload = sample_db();
+        let current_header = fresh_header(&stolen, &payload);
+        let current = signed_bundle(&stolen, &current_header, &payload);
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &current).unwrap();
+
+        let mut candidate_header = header_for(
+            &replacement,
+            &payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        candidate_header
+            .revocations
+            .push(revocation(&recovery, &stolen));
+        let candidate = signed_bundle(&replacement, &candidate_header, &payload);
+
+        // A directory at the trust-state path makes the append fail after swap.
+        fs::create_dir_all(paths::registry_trust_state_path(dir.path()).unwrap()).unwrap();
+        install_bundle_bytes_checked(dir.path(), &candidate, &trust, "candidate")
+            .expect("the bundle is installed, so the install must not be reported as failed");
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            candidate
         );
     }
 

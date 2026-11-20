@@ -6233,8 +6233,12 @@ async fn run_registry_command(
             if !local_state.exists() {
                 agora_core::db::init_local_state_db(&local_state)?;
             }
-            let installed =
-                agora_core::registry_sync::install_bundle_from_file(data_dir, &local_state, &file)?;
+            let installed = agora_core::registry_sync::install_bundle_from_file(
+                data_dir,
+                &local_state,
+                &file,
+                ctx.lock_manager(),
+            )?;
             let catalog_warnings = ctx.reload_game_catalogs()?;
             if json {
                 println!(
