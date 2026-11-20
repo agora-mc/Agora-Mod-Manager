@@ -856,6 +856,18 @@ pub trait PackageFetcher: Send + Sync {
     async fn fetch(&self, url: &str, pinned_host: &str) -> LauncherResult<Vec<u8>>;
 }
 
+/// Where a planned package's bytes come from. Online packages are fetched from
+/// their signed URL; offline, the target's bytes are already in hand and any
+/// dependency that needs fetching is a refusal.
+#[derive(Clone, Copy)]
+enum PlanFetch<'a> {
+    Online(&'a dyn PackageFetcher),
+    Offline {
+        root_bytes: &'a [u8],
+        root_id: &'a str,
+    },
+}
+
 /// Fetches through the core HTTP client: HTTPS only, pinned to the signed
 /// entry's host, same-host redirects, Lockdown Mode and the private-address
 /// floor all still applying.
@@ -1164,22 +1176,29 @@ impl PluginService {
     }
 
     /// Install an official plugin from package bytes obtained without the
-    /// network, after the same pin checks a downloaded package goes through.
-    pub fn install_official_bytes(
+    /// network. The same dependency planning as a downloaded install runs, but
+    /// no dependency can be fetched: one that is missing or incompatible is
+    /// refused, naming it, unless it is already installed at a satisfying
+    /// version.
+    pub async fn install_official_bytes(
         &self,
         plugin_id: &str,
         bytes: &[u8],
         consent: impl Into<Consent>,
     ) -> LauncherResult<UpdateOutcome> {
+        let consent: Consent = consent.into();
         let catalog = self.signed_catalog()?;
         let entry = known_entry(catalog.current(plugin_id), plugin_id)?;
         check_entry(entry)?;
         verify_entry_bytes(entry, bytes)?;
-        self.install_verified(entry, bytes, consent)
+        let plans = self
+            .plan_official_install_offline(entry, &catalog, bytes)
+            .await?;
+        self.finish_official_install(plans, consent)
     }
 
     /// Install an official plugin from a local package zip file.
-    pub fn install_official_from_file(
+    pub async fn install_official_from_file(
         &self,
         plugin_id: &str,
         path: &Path,
@@ -1193,6 +1212,7 @@ impl PluginService {
             ),
         })?;
         self.install_official_bytes(plugin_id, &bytes, consent)
+            .await
     }
 
     /// Move an installed plugin to the catalog's current official version.
@@ -1367,8 +1387,37 @@ impl PluginService {
         fetcher: &dyn PackageFetcher,
     ) -> LauncherResult<Vec<PlannedInstall>> {
         let mut state = PlanState::default();
-        self.plan_install(entry, catalog, fetcher, false, &mut state)
-            .await?;
+        self.plan_install(
+            entry,
+            catalog,
+            PlanFetch::Online(fetcher),
+            false,
+            &mut state,
+        )
+        .await?;
+        Ok(state.plans)
+    }
+
+    /// The offline variant: the target's bytes came from a local file, and a
+    /// dependency that would need a download is refused instead of planned.
+    async fn plan_official_install_offline(
+        &self,
+        entry: &OfficialEntry,
+        catalog: &OfficialCatalog,
+        root_bytes: &[u8],
+    ) -> LauncherResult<Vec<PlannedInstall>> {
+        let mut state = PlanState::default();
+        self.plan_install(
+            entry,
+            catalog,
+            PlanFetch::Offline {
+                root_bytes,
+                root_id: &entry.plugin_id,
+            },
+            false,
+            &mut state,
+        )
+        .await?;
         Ok(state.plans)
     }
 
@@ -1376,7 +1425,7 @@ impl PluginService {
         &'a self,
         entry: &'a OfficialEntry,
         catalog: &'a OfficialCatalog,
-        fetcher: &'a dyn PackageFetcher,
+        fetch: PlanFetch<'a>,
         is_dependency: bool,
         state: &'a mut PlanState,
     ) -> Pin<Box<dyn Future<Output = LauncherResult<()>> + Send + 'a>> {
@@ -1386,7 +1435,25 @@ impl PluginService {
                 return Ok(());
             }
             state.visiting.insert(id.clone());
-            let bytes = self.fetch_verified_entry(entry, fetcher).await?;
+            let bytes = match fetch {
+                PlanFetch::Online(fetcher) => self.fetch_verified_entry(entry, fetcher).await?,
+                // The caller already checked these bytes against the signed pin.
+                PlanFetch::Offline { root_bytes, .. } if !is_dependency => root_bytes.to_vec(),
+                // A dependency reaching the planner is one that is not already
+                // installed at a satisfying version. Offline there is no other
+                // way to get it, so refuse and name what is missing.
+                PlanFetch::Offline { root_id, .. } => {
+                    return Err(refused(
+                        "ERR_OFFICIAL_PLUGIN_OFFLINE_DEPENDENCY",
+                        format!(
+                            "`{root_id}` needs `{}`, which is not installed at a compatible \
+                             version. It would need a download, so it cannot be installed from \
+                             a local file. Install the dependency first.",
+                            entry.plugin_id
+                        ),
+                    ));
+                }
+            };
             let mut preview = self.preview_package_bytes(&bytes)?;
             // Every package in an official plan came from the signed catalog.
             // The prompt uses this to recommend allowing the code.
@@ -1452,7 +1519,7 @@ impl PluginService {
                     ));
                 }
                 let dependency_entry = dependency_entry.clone();
-                self.plan_install(&dependency_entry, catalog, fetcher, true, state)
+                self.plan_install(&dependency_entry, catalog, fetch, true, state)
                     .await?;
             }
             state.visiting.remove(&id);

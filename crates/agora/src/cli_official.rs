@@ -127,7 +127,9 @@ pub async fn run(service: &PluginService, action: OfficialCmd, json: bool) -> an
             };
             let outcome = match file {
                 Some(path) => {
-                    service.install_official_from_file(plugin_id.as_str(), &path, consent)?
+                    service
+                        .install_official_from_file(plugin_id.as_str(), &path, consent)
+                        .await?
                 }
                 None => {
                     service
@@ -171,7 +173,15 @@ fn report(
     no_code_available: bool,
 ) -> anyhow::Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(&outcome)?);
+        let mut value = serde_json::to_value(&outcome)?;
+        if matches!(outcome, UpdateOutcome::Installed { .. }) {
+            if let serde_json::Value::Object(map) = &mut value {
+                // The human report distinguishes a first install from a local
+                // package replacing an existing copy; --json must say too.
+                map.insert("action".into(), serde_json::Value::String(verb.to_string()));
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
     match outcome {

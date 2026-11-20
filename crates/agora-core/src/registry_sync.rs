@@ -20,8 +20,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 /// Resolve the registry repository with priority:
 /// 1. CLI override (passed as parameter)
@@ -167,7 +167,13 @@ pub fn install_bundle_from_file(
     lock_manager: &LockManager,
 ) -> LauncherResult<InstalledBundle> {
     let trust = effective_trust(app_data_dir, &RegistryTrust::production());
-    install_bundle_from_file_with_trust(app_data_dir, local_state_path, bundle_path, &trust, lock_manager)
+    install_bundle_from_file_with_trust(
+        app_data_dir,
+        local_state_path,
+        bundle_path,
+        &trust,
+        lock_manager,
+    )
 }
 
 /// As [`install_bundle_from_file`], with an explicit trust list. This is the
@@ -2533,12 +2539,7 @@ mod tests {
             StampOrder::EqualSameBytes
         );
         assert_eq!(
-            compare_stamps(
-                Some(&cached(newer, &hash)),
-                newer,
-                &"1".repeat(64)
-            )
-            .unwrap(),
+            compare_stamps(Some(&cached(newer, &hash)), newer, &"1".repeat(64)).unwrap(),
             StampOrder::EqualDifferentBytes
         );
         assert_eq!(
@@ -2716,8 +2717,9 @@ mod tests {
         fs::write(&source, &bytes).unwrap();
         let locks = LockManager::new(dir.path().join("locks"));
 
-        let error = install_bundle_from_file_with_trust(dir.path(), &ls_path, &source, &trust, &locks)
-            .unwrap_err();
+        let error =
+            install_bundle_from_file_with_trust(dir.path(), &ls_path, &source, &trust, &locks)
+                .unwrap_err();
         assert_eq!(error.code(), "ERR_REGISTRY_BUNDLE_HASH");
         assert_eq!(
             error.to_string(),
@@ -2782,8 +2784,9 @@ mod tests {
         write_bundle(dir.path(), "expired.bundle", &key, &header, &payload);
         let locks = LockManager::new(dir.path().join("locks"));
 
-        let error = install_bundle_from_file_with_trust(dir.path(), &ls_path, &source, &trust, &locks)
-            .unwrap_err();
+        let error =
+            install_bundle_from_file_with_trust(dir.path(), &ls_path, &source, &trust, &locks)
+                .unwrap_err();
         assert_eq!(error.code(), "ERR_REGISTRY_EXPIRED");
         assert_eq!(
             error.to_string(),
@@ -2839,6 +2842,93 @@ mod tests {
         );
     }
 
+    /// A locally supplied bundle with a schema newer than this app supports is
+    /// refused before anything is installed.
+    #[test]
+    fn a_local_bundle_with_an_unsupported_schema_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
+        let key = test_key(80);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let mut header = fresh_header(&key, &payload);
+        header.schema_version = APP_REGISTRY_SCHEMA_VERSION + 1;
+        let source = dir.path().join("future.bundle");
+        write_bundle(dir.path(), "future.bundle", &key, &header, &payload);
+        let locks = LockManager::new(dir.path().join("locks"));
+
+        let error =
+            install_bundle_from_file_with_trust(dir.path(), &ls_path, &source, &trust, &locks)
+                .unwrap_err();
+        assert_eq!(error.code(), "ERR_REGISTRY_NEWER_SCHEMA");
+        assert!(!paths::registry_bundle_path(dir.path()).unwrap().exists());
+        assert!(!paths::registry_db_path(dir.path()).unwrap().exists());
+    }
+
+    /// A revocation remembered from an earlier local install keeps blocking a
+    /// later local bundle signed by the retired key, even when that bundle does
+    /// not carry the revocation itself.
+    #[test]
+    fn a_remembered_revocation_blocks_a_later_local_bundle() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
+        let stolen = test_key(81);
+        let recovery = test_key(82);
+        let replacement = test_key(83);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&stolen)),
+            (RegistryKeyRole::Primary, test_public(&replacement)),
+        ]);
+        let locks = LockManager::new(dir.path().join("locks"));
+        let payload = sample_db();
+
+        let mut revoking = header_for(
+            &replacement,
+            &payload,
+            "2026-11-16T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        revoking.revocations.push(revocation(&recovery, &stolen));
+        let revoking_source = dir.path().join("revoking.bundle");
+        write_bundle(
+            dir.path(),
+            "revoking.bundle",
+            &replacement,
+            &revoking,
+            &payload,
+        );
+        install_bundle_from_file_with_trust(dir.path(), &ls_path, &revoking_source, &trust, &locks)
+            .unwrap();
+        assert!(
+            fs::read_to_string(paths::registry_trust_state_path(dir.path()).unwrap())
+                .unwrap()
+                .contains("v1 revoke")
+        );
+
+        let stale_header = header_for(
+            &stolen,
+            &payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let stale_source = dir.path().join("stale.bundle");
+        write_bundle(dir.path(), "stale.bundle", &stolen, &stale_header, &payload);
+        let error = install_bundle_from_file_with_trust(
+            dir.path(),
+            &ls_path,
+            &stale_source,
+            &trust,
+            &locks,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "ERR_REGISTRY_SIGNATURE_INVALID");
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            signed_bundle(&replacement, &revoking, &payload)
+        );
+    }
+
     /// A local install contends on the same cross-process `RegistryUpdate` lock
     /// sync holds. While that lock is held, the local install must not commit.
     #[test]
@@ -2864,9 +2954,13 @@ mod tests {
             &locks,
             Some(Duration::from_millis(200)),
         );
-        let error = result.expect_err("a local install must not commit while sync holds RegistryUpdate");
+        let error =
+            result.expect_err("a local install must not commit while sync holds RegistryUpdate");
         assert!(
-            error.to_string().to_ascii_lowercase().contains("registry-update"),
+            error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("registry-update"),
             "the refusal must name the contended lock: {error}"
         );
         assert!(!paths::registry_bundle_path(dir.path()).unwrap().exists());
@@ -2976,12 +3070,7 @@ mod tests {
         fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &current).unwrap();
 
         let other_payload = sample_db_with_built_at("2026-11-17T12:00:00+00:00");
-        let mut other_header = header_for(
-            &key,
-            &other_payload,
-            stamp,
-            "2099-01-01T00:00:00+00:00",
-        );
+        let mut other_header = header_for(&key, &other_payload, stamp, "2099-01-01T00:00:00+00:00");
         other_header.tag = "registry-2026-11-16".into();
         let other = signed_bundle(&key, &other_header, &other_payload);
 
@@ -3024,7 +3113,8 @@ mod tests {
         let recorded = r#"[
             {"tag_name": "registry-2026-11-20", "draft": false, "prerelease": false, "assets": [{"id": 5001, "name": "registry.bundle"}]}
         ]"#;
-        let transport = FakeRegistryTransport::from_pages(vec![(1, release_json_to_list(recorded))]);
+        let transport =
+            FakeRegistryTransport::from_pages(vec![(1, release_json_to_list(recorded))]);
         transport.push_asset_ok(5001, remote_bundle.clone());
 
         let status = check_and_download_update_inner(
