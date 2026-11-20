@@ -875,11 +875,57 @@ fn raise_floor(app_data_dir: &Path, built_at: &str, db_sha256: &str) -> Launcher
         }
     }
     let path = registry_floor_path(app_data_dir)?;
+    // Test-only failure injection, keyed by data root so parallel tests with
+    // their own TempDirs cannot affect each other. Unlike a read-only file,
+    // this fails identically on Windows, Linux and macOS: `write_atomic`
+    // renames a fresh temp file and would otherwise ignore the old file's
+    // attributes on Unix.
+    #[cfg(test)]
+    if injected_floor_write_failure(app_data_dir) {
+        return Err(floor_error(
+            "Injected catalog rollback floor write failure.",
+        ));
+    }
     write_atomic(&path, format!("{built_at} {db_sha256}\n").as_bytes()).map_err(|error| {
         floor_error(format!(
             "Could not save the catalog rollback floor: {error}."
         ))
     })
+}
+
+#[cfg(test)]
+fn floor_write_failures() -> &'static Mutex<Vec<PathBuf>> {
+    static FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn injected_floor_write_failure(app_data_dir: &Path) -> bool {
+    floor_write_failures()
+        .lock()
+        .map(|dirs| dirs.iter().any(|dir| dir == app_data_dir))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+struct FloorWriteFailureGuard(PathBuf);
+
+#[cfg(test)]
+impl Drop for FloorWriteFailureGuard {
+    fn drop(&mut self) {
+        if let Ok(mut dirs) = floor_write_failures().lock() {
+            dirs.retain(|dir| dir != &self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+fn fail_floor_writes(app_data_dir: &Path) -> FloorWriteFailureGuard {
+    floor_write_failures()
+        .lock()
+        .unwrap()
+        .push(app_data_dir.to_path_buf());
+    FloorWriteFailureGuard(app_data_dir.to_path_buf())
 }
 
 /// The strongest baseline a replacement is compared against: the higher of the
@@ -1683,6 +1729,14 @@ pub fn verified_registry_digest(
             code: "ERR_REGISTRY_SIGNATURE_INVALID".into(),
             message: format!("The catalog bundle could not be used: {error}."),
         })?;
+        // The digest is used as a cache key for the readable database, so it
+        // must not materialize one for a bundle a plain open would refuse.
+        if below_floor(&header, app_data_dir, trust)? {
+            return Err(LauncherError::Generic {
+                code: "ERR_REGISTRY_ROLLBACK".into(),
+                message: floor_stale_message(),
+            });
+        }
         ensure_database(app_data_dir, &bundle_path, &header, None, trust)?;
         return Ok(Some(header.db_sha256.to_ascii_lowercase()));
     }
@@ -3741,13 +3795,6 @@ mod tests {
         assert_eq!(error.code(), "ERR_REGISTRY_FLOOR");
     }
 
-    fn set_floor_readonly(dir: &Path, readonly: bool) {
-        let path = registry_floor_path(dir).unwrap();
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        permissions.set_readonly(readonly);
-        fs::set_permissions(&path, permissions).unwrap();
-    }
-
     /// The floor must be checkpointed to the verified maximum, not only when it
     /// is unset: a lagging floor plus a revoking append must not expose an older
     /// bundle again.
@@ -3781,7 +3828,7 @@ mod tests {
 
         // Install a newer bundle but make its post-swap floor write fail, so the
         // stored floor lags behind the installed bundle.
-        set_floor_readonly(dir.path(), true);
+        let floor_failure = fail_floor_writes(dir.path());
         let second_payload = sample_db_with_built_at("2026-11-17T12:00:00+00:00");
         let second_header = header_for(
             &old,
@@ -3793,7 +3840,7 @@ mod tests {
         let error = install_bundle_bytes_checked(dir.path(), &second, &trust, "newer")
             .expect_err("the lagging floor write must fail");
         assert_eq!(error.code(), "ERR_REGISTRY_FLOOR");
-        set_floor_readonly(dir.path(), false);
+        drop(floor_failure);
         assert_eq!(
             fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
             second
@@ -3867,7 +3914,7 @@ mod tests {
             &trust,
         )
         .unwrap();
-        set_floor_readonly(dir.path(), true);
+        let _floor_failure = fail_floor_writes(dir.path());
 
         let second_payload = sample_db_with_built_at("2026-11-17T12:00:00+00:00");
         let second_header = header_for(
@@ -4726,6 +4773,39 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         assert_eq!(
             verified_registry_digest(tempfile::TempDir::new().unwrap().path(), &trust,).unwrap(),
             None
+        );
+    }
+
+    /// The digest helper must not materialize the database of a below-floor
+    /// bundle, any more than a plain open may use one.
+    #[test]
+    fn the_verified_digest_refuses_a_below_floor_bundle() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(127);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db_with_built_at("2026-11-15T12:00:00+00:00");
+        let header = header_for(
+            &key,
+            &payload,
+            "2026-11-15T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        write_bundle(dir.path(), "registry.bundle", &key, &header, &payload);
+        fs::write(
+            registry_floor_path(dir.path()).unwrap(),
+            format!("2026-11-17T12:00:00+00:00 {}\n", "0".repeat(64)),
+        )
+        .unwrap();
+        assert!(!paths::registry_db_path(dir.path()).unwrap().exists());
+
+        let error = match verified_registry_digest(dir.path(), &trust) {
+            Ok(_) => panic!("a below-floor bundle has no usable digest"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "ERR_REGISTRY_ROLLBACK");
+        assert!(
+            !paths::registry_db_path(dir.path()).unwrap().exists(),
+            "the digest helper must not extract a below-floor database"
         );
     }
 
