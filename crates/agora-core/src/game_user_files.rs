@@ -85,6 +85,12 @@ pub struct Journal {
     /// may give up its own start (for example when its spawn fails).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_id: Option<String>,
+    /// Written before a tool is spawned for this session. While this is set and no recorded
+    /// process is provably dead, automatic recovery cannot tell whether a tool is running — the
+    /// writer may have died between the spawn and recording it — so the session needs a hand,
+    /// never an automatic restore. Cleared when the spawned process is recorded.
+    #[serde(default)]
+    pub spawning: bool,
     pub files: Vec<JournaledFile>,
 }
 
@@ -466,6 +472,7 @@ impl Drop for StartingMarkGuard<'_> {
         };
         if journal.starting_launcher.is_some() {
             journal.starting_launcher = None;
+            journal.spawning = false;
             let _ = write_journal(self.journal_path, &journal);
         }
     }
@@ -526,6 +533,43 @@ pub fn liveness_unknown(journal: &Journal) -> bool {
 /// [`liveness_unknown`] for session details read without the full journal.
 pub fn details_liveness_unknown(details: &SessionDetails) -> bool {
     details.starting_launcher.is_none() && details.processes.is_empty()
+}
+
+/// Whether a journal is in its "spawning" window with no provably dead recorded process: the
+/// writer recorded that it was about to spawn a tool, and no recorded process can be proven dead,
+/// so a tool may be running that no record can see. Automatic recovery treats that as needing a
+/// hand, never as a dead session.
+pub fn spawning_without_dead_process(journal: &Journal) -> bool {
+    journal.spawning
+        && !journal
+            .processes
+            .iter()
+            .any(|process| process_identity::verify(process).is_err())
+}
+
+/// [`spawning_without_dead_process`] for session details read without the full journal.
+pub fn details_spawning_without_dead_process(details: &SessionDetails) -> bool {
+    details.spawning
+        && !details
+            .processes
+            .iter()
+            .any(|process| process_identity::verify(process).is_err())
+}
+
+/// The needs-a-hand line for a session in its spawning window.
+pub fn spawning_needs_hand_message(journal_path: &Path, journal: &Journal) -> String {
+    format!(
+        "the user-files journal {} of instance {} ({}/{}) is marked as spawning a tool and \
+         records no provably dead process, so Agora cannot tell whether a tool is still running; \
+         it was left alone and nothing was changed. If no tool of {} is running, put the files \
+         back by hand with `{}`",
+        journal_path.display(),
+        journal.instance_id,
+        journal.game,
+        journal.store,
+        journal.game,
+        restore_instruction(journal.game.as_str(), journal.store.as_str())
+    )
 }
 
 /// The needs-a-hand line for a journal whose liveness is unknown: what was left alone, and the
@@ -615,6 +659,14 @@ pub fn swap_in_locked(
         // command that can decide once nothing is running.
         if liveness_unknown(&existing) {
             return Err(UserFilesError::Other(needs_hand_message(
+                &journal_path,
+                &existing,
+            )));
+        }
+        // In its spawning window with no provably dead process, a tool may be running that no
+        // record can see: this launch must not restore under it.
+        if spawning_without_dead_process(&existing) {
+            return Err(UserFilesError::Other(spawning_needs_hand_message(
                 &journal_path,
                 &existing,
             )));
@@ -711,6 +763,7 @@ pub fn swap_in_locked(
         processes: Vec::new(),
         starting_launcher: process_identity::capture_self(),
         launch_id: Some(launch_id.clone()),
+        spawning: false,
         files: journal_files,
     };
 
@@ -996,6 +1049,13 @@ pub fn restore_finished_for_instance(ctx: &Ctx, instance_id: &str) -> Option<Fin
                 0,
             ));
         }
+        if spawning_without_dead_process(&journal) {
+            return Some(report(
+                Some(spawning_needs_hand_message(&journal_path, &journal)),
+                0,
+                0,
+            ));
+        }
         let Some(definition) = ctx.games.game(&journal.game) else {
             return Some(report(
                 Some(format!(
@@ -1116,6 +1176,10 @@ pub fn recover_finished_sessions(ctx: &Ctx) -> (Vec<String>, Vec<String>) {
         };
         if liveness_unknown(&journal) {
             warnings.push(needs_hand_message(&journal_path, &journal));
+            continue;
+        }
+        if spawning_without_dead_process(&journal) {
+            warnings.push(spawning_needs_hand_message(&journal_path, &journal));
             continue;
         }
         match restore_locked_recovery(ctx, definition, &journal.store) {
@@ -1249,6 +1313,7 @@ pub fn finish_starting_locked(
     let mut journal: Journal = serde_json::from_str(&text)?;
     if journal.starting_launcher.is_some() {
         journal.starting_launcher = None;
+        journal.spawning = false;
         write_journal(&journal_path, &journal)?;
     }
     Ok(())
@@ -1296,6 +1361,7 @@ pub fn finish_starting_launch_locked(
         ));
     }
     journal.starting_launcher = None;
+    journal.spawning = false;
     write_journal(&journal_path, &journal)?;
     Ok(())
 }
@@ -1680,9 +1746,35 @@ pub fn record_process_locked(
     let text = std::fs::read_to_string(&journal_path)?;
     let mut journal: Journal = serde_json::from_str(&text)?;
     journal.processes.push(identity);
-    // The game now has an identity that says whether it is alive; the launcher mark is done.
+    // The game now has an identity that says whether it is alive; the launcher mark is done, and
+    // the spawn is recorded, so the spawning window is over.
     journal.starting_launcher = None;
+    journal.spawning = false;
     write_journal(&journal_path, &journal)?;
+    Ok(())
+}
+
+/// Mark the session as spawning a tool, written (durably) before the spawn. For a caller that
+/// already holds the game/store user-files lock. While the mark is set and no recorded process
+/// is provably dead, automatic recovery treats the session as needing a hand (see
+/// [`spawning_without_dead_process`]); [`record_process_locked`] clears it.
+pub fn mark_spawning_locked(
+    ctx: &Ctx,
+    game: &GameId,
+    store: &StoreId,
+) -> Result<(), UserFilesError> {
+    let journal_path = ctx
+        .paths
+        .user_files_journal_path(game.as_str(), store.as_str());
+    if !journal_path.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&journal_path)?;
+    let mut journal: Journal = serde_json::from_str(&text)?;
+    if !journal.spawning {
+        journal.spawning = true;
+        write_journal(&journal_path, &journal)?;
+    }
     Ok(())
 }
 
@@ -1729,6 +1821,7 @@ pub struct SessionDetails {
     pub running_from: PathBuf,
     pub processes: Vec<ProcessIdentity>,
     pub starting_launcher: Option<ProcessIdentity>,
+    pub spawning: bool,
 }
 
 /// Read a session's details. An unreadable journal is an error, never "no session".
@@ -1763,6 +1856,7 @@ pub fn details(
         running_from: journal.running_from,
         processes: journal.processes,
         starting_launcher: journal.starting_launcher,
+        spawning: journal.spawning,
     }))
 }
 

@@ -397,6 +397,7 @@ fn a_hash_mismatch_names_the_real_file_and_its_backup() {
         processes: Vec::new(),
         starting_launcher: None,
         launch_id: None,
+        spawning: false,
         files: vec![JournaledFile {
             real_path: real.clone(),
             instance_path: RelPath::new("user/Plugins.txt").unwrap(),

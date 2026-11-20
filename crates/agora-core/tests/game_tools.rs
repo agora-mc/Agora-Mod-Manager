@@ -3038,6 +3038,7 @@ fn journal_of(f: &Fixture, run: &str, kind: CopyKind) -> SwapJournal {
         copy_dir: game_tool_copy::copy_dir_for(kind, &loc, run),
         swap_dir: loc.swap_dir.clone(),
         processes: Vec::new(),
+        spawning: false,
     }
 }
 
@@ -3572,12 +3573,13 @@ fn a_recovery_with_nothing_pending_changes_nothing() {
     assert_eq!(snapshot(&real_data(&f)), before);
 }
 
-/// Clears the run hook when dropped, so a panicking test cannot leak it into the next one.
+/// Clears the run hook when dropped, so a panicking test cannot leak it into the next one on
+/// this thread. (The hook only fires on the thread that set it, so parallel tests are safe.)
 struct RunHookGuard;
 
 impl Drop for RunHookGuard {
     fn drop(&mut self) {
-        swap::set_run_hook(None);
+        swap::clear_run_hook();
     }
 }
 
@@ -3599,6 +3601,7 @@ fn a_startup_recovery_during_a_live_swap_run_leaves_the_operation_alone() {
     let seen_hook = Arc::clone(&seen);
     let journal_path_hook = journal_path.clone();
     swap::set_run_hook(Some(Arc::new(move |ctx, journal, point| {
+        let Some(journal) = journal else { return };
         // The one startup pass, run from inside the live operation the way another Agora
         // process runs it. It must not touch the run's journal, aside or copy.
         let report = agora_core::startup_recovery::run_at_startup(ctx);
@@ -3665,6 +3668,194 @@ fn a_startup_recovery_during_a_live_swap_run_leaves_the_operation_alone() {
             .iter()
             .all(|n| !n.starts_with(swap::ASIDE_PREFIX) && !n.starts_with(swap::COPY_PREFIX)),
         "no aside or copy folder is left"
+    );
+}
+
+/// The window between the spawn and recording the spawned tool: the writer records a
+/// "spawning" state in the journal before the spawn (production path, verified here through the
+/// run hook), and a journal from that window with no provably dead process is a needs-a-hand
+/// case for recovery — never an automatic restore, even when the tool runs from outside the
+/// install folder, where the install scan cannot see it.
+#[test]
+fn a_swap_journal_from_the_spawn_window_needs_a_hand_not_an_automatic_restore() {
+    let _swap = SwapTest::same_volume();
+    let _hook_guard = RunHookGuard;
+    let f = swap_fixture(Vec::new());
+    // An external tool: its exe lives outside the install, so the install-folder scan misses it.
+    let outside = TempDir::new().unwrap();
+    let external_exe = outside.path().join("ExternalTool.exe");
+    std::fs::copy(r"C:\Windows\System32\cmd.exe", &external_exe).unwrap();
+    let user = add_user_tool_full(
+        &f,
+        "External",
+        external_exe.to_str().unwrap(),
+        &["/c", "ping", "-n", "6", "127.0.0.1"],
+        false,
+        None,
+    );
+
+    let saved = Arc::new(Mutex::new(None::<String>));
+    let saved_hook = Arc::clone(&saved);
+    let journal_hook = journal_file(&f);
+    swap::set_run_hook(Some(Arc::new(move |_ctx, _journal, point| {
+        if point != swap::RunHookPoint::AfterSpawnBeforeRecord {
+            return;
+        }
+        // The journal exactly as the production writer left it in the spawn window.
+        let text = std::fs::read_to_string(&journal_hook).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["spawning"],
+            serde_json::json!(true),
+            "the writer must durably record the spawning state before the spawn: {text}"
+        );
+        assert_eq!(
+            value["processes"],
+            serde_json::json!([]),
+            "the process is not recorded yet in this window: {text}"
+        );
+        *saved_hook.lock().unwrap() = Some(text);
+    })));
+
+    let outcome = game_tools::run_user_tool(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &user.id,
+        CaptureMode::Swap,
+        true,
+        false,
+        &StagingLauncher::new(),
+        &CancellationToken::new(),
+    );
+    assert!(outcome.is_ok(), "{outcome:?}");
+    let saved_text = saved
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the hook fired in the spawn window");
+    assert!(
+        !journal_file(&f).exists(),
+        "the finished run cleared its journal"
+    );
+
+    // Rebuild the crash that window leaves when Agora dies right there: the production-written
+    // journal (spawning, no recorded process), the swap engaged, and a live external tool that
+    // no record mentions.
+    let journal_path = journal_file(&f);
+    std::fs::write(&journal_path, &saved_text).unwrap();
+    let journal: SwapJournal = serde_json::from_str(&saved_text).unwrap();
+    std::fs::rename(&journal.real_data, &journal.aside).unwrap();
+    std::fs::rename(&journal.copy_dir, &journal.real_data).unwrap();
+    let mut busy = Command::new(r"C:\Windows\System32\cmd.exe")
+        .args(["/c", "ping", "-n", "60", "127.0.0.1"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let report = agora_core::startup_recovery::run_at_startup(&f.ctx);
+
+    let _ = busy.kill();
+    let _ = busy.wait();
+
+    assert!(
+        report.actions.is_empty(),
+        "recovery restored the swap under a possibly-live tool: {report:?}"
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("spawning") && w.contains("no provably dead process")),
+        "the needs-a-hand case is reported: {report:?}"
+    );
+    assert!(journal_path.exists(), "the journal is kept for a hand");
+    assert!(journal.aside.is_dir(), "the real Data is still aside");
+    assert!(
+        game_tool_copy::marker_matches(
+            &journal.real_data,
+            &journal.instance_id,
+            journal.copy_kind,
+            &journal.run
+        ),
+        "the copy is still in place of Data"
+    );
+}
+
+/// A recovery started during a links-captured run's post-exit capture leaves the operation
+/// alone: the links path holds the game/store user-files lock for the whole operation, through
+/// the tool's run and the post-exit capture, exactly as the swap path does, and the startup pass
+/// takes that lock with no wait.
+#[test]
+fn a_startup_recovery_during_a_links_run_post_exit_capture_leaves_the_session_alone() {
+    let _user_data = UserData::new();
+    let _hook_guard = RunHookGuard;
+    let f = fixture_with(vec![writes_or_fails("nemesis")], true, false);
+    let user_root = std::env::var("AGORA_TEST_USER_DATA_ROOT").unwrap();
+    let real = Path::new(&user_root)
+        .join("local")
+        .join("Test Game")
+        .join("Plugins.txt");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(&real, "Player original\n").unwrap();
+    let copy = f.instance_dir().join("user/Plugins.txt");
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::write(&copy, "Instance copy\n").unwrap();
+    let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
+
+    let fired = Arc::new(Mutex::new(false));
+    let fired_hook = Arc::clone(&fired);
+    let journal_hook = journal_path.clone();
+    let real_hook = real.clone();
+    swap::set_run_hook(Some(Arc::new(move |ctx, _journal, point| {
+        if point != swap::RunHookPoint::LinksPostExitCapture {
+            return;
+        }
+        // The one startup pass, run from inside the live links run the way another Agora
+        // process runs it: it must leave the session completely alone and report the skip.
+        let report = agora_core::startup_recovery::run_at_startup(ctx);
+        assert!(
+            report.actions.is_empty(),
+            "recovery acted during the links run's post-exit capture: {report:?}"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("left alone") && w.contains("lock")),
+            "the skip is reported: {report:?}"
+        );
+        assert!(
+            journal_hook.exists(),
+            "the session journal was removed under the live run"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real_hook).unwrap(),
+            "Instance copy\n",
+            "the user files were restored under the live run"
+        );
+        *fired_hook.lock().unwrap() = true;
+    })));
+
+    let outcome = f
+        .run_as("nemesis", &StagingLauncher::new(), CaptureMode::Links)
+        .unwrap();
+
+    assert!(outcome.promoted, "{outcome:?}");
+    assert!(
+        *fired.lock().unwrap(),
+        "the links post-exit capture window was exercised"
+    );
+    assert!(
+        !journal_path.exists(),
+        "the finished run released the session"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&real).unwrap(),
+        "Player original\n",
+        "the player's file is back after the run"
     );
 }
 

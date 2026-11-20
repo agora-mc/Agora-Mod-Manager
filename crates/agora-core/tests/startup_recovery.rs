@@ -272,6 +272,7 @@ fn journal_of(f: &SwapFixture, run: &str, kind: CopyKind) -> SwapJournal {
         copy_dir: agora_core::game_tool_copy::copy_dir_for(kind, &loc, run),
         swap_dir: loc.swap_dir.clone(),
         processes: Vec::new(),
+        spawning: false,
     }
 }
 

@@ -323,6 +323,7 @@ fn build(h: &TestHarness, def: &GameDefinition, id: &str, stages: &[Stage]) {
         processes: vec![],
         starting_launcher: None,
         launch_id: None,
+        spawning: false,
         files,
     };
     let jp = journal_path_of(h, def);
@@ -459,6 +460,7 @@ fn a_shortened_new_real_file_after_swap_in_is_kept_as_the_instance_copy() {
         processes: vec![],
         starting_launcher: None,
         launch_id: None,
+        spawning: false,
         files: vec![JournaledFile {
             real_path: real.clone(),
             instance_path: def.user_files[0].instance_path.clone(),

@@ -92,6 +92,12 @@ pub struct SwapJournal {
     /// even when the tool runs from outside the install folder.
     #[serde(default)]
     pub processes: Vec<crate::process_identity::ProcessIdentity>,
+    /// Written (durably) before the tool is spawned. While this is set and no recorded process is
+    /// provably dead, recovery cannot tell whether a tool is running — the writer may have died
+    /// between the spawn and recording it — so the journal needs a hand, never an automatic
+    /// restore. Cleared when the spawned process is recorded.
+    #[serde(default)]
+    pub spawning: bool,
 }
 
 /// A journal found on disk, for `games tools-swap status`.
@@ -158,27 +164,55 @@ pub enum RunHookPoint {
     BeforeSpawn,
     /// The tool has exited; the copy is being put back and its writes captured.
     PostExitCapture,
+    /// The tool was spawned but its identity is not yet recorded in the journal (the window in
+    /// which a dead Agora leaves a live tool unrecorded).
+    AfterSpawnBeforeRecord,
+    /// The links-captured tool has exited; its writes are being captured from the farm.
+    LinksPostExitCapture,
 }
 
 #[doc(hidden)]
-type RunHook = std::sync::Arc<dyn Fn(&Ctx, &SwapJournal, RunHookPoint) + Send + Sync>;
+type RunHook = std::sync::Arc<dyn Fn(&Ctx, Option<&SwapJournal>, RunHookPoint) + Send + Sync>;
 
-static RUN_HOOK: Mutex<Option<RunHook>> = Mutex::new(None);
+/// The hook with the thread that installed it: the hook fires only on that thread, so parallel
+/// tests that run tools never fire each other's hooks.
+static RUN_HOOK: Mutex<Option<(std::thread::ThreadId, RunHook)>> = Mutex::new(None);
 
-/// Set or clear the run hook (a test seam; production never sets it). Tests that set it must run
-/// one at a time.
+/// Set or clear the run hook (a test seam; production never sets it). The hook fires only on the
+/// thread that sets it. Tests that set it must still run their tool runs on this thread.
 #[doc(hidden)]
 pub fn set_run_hook(hook: Option<RunHook>) {
     if let Ok(mut guard) = RUN_HOOK.lock() {
-        *guard = hook;
+        *guard = hook.map(|hook| (std::thread::current().id(), hook));
     }
 }
 
-/// Fire the run hook at `point`, when a test set one. Production never sets one, so this does
-/// nothing.
+/// Clear the run hook, but only the one this thread installed, so a finishing test cannot clear
+/// another parallel test's hook.
 #[doc(hidden)]
-pub fn run_hook(ctx: &Ctx, journal: &SwapJournal, point: RunHookPoint) {
-    let hook = RUN_HOOK.lock().ok().and_then(|guard| guard.clone());
+pub fn clear_run_hook() {
+    if let Ok(mut guard) = RUN_HOOK.lock() {
+        let this_thread = std::thread::current().id();
+        if guard
+            .as_ref()
+            .is_some_and(|(thread, _)| *thread == this_thread)
+        {
+            *guard = None;
+        }
+    }
+}
+
+/// Fire the run hook at `point`, when a test on this thread set one. `journal` is the swap
+/// journal of the run, when the run has one (the links and VFS paths have only the user-files
+/// session journal). Production never sets a hook, so this does nothing.
+#[doc(hidden)]
+pub fn run_hook(ctx: &Ctx, journal: Option<&SwapJournal>, point: RunHookPoint) {
+    let hook = RUN_HOOK.lock().ok().and_then(|guard| {
+        guard
+            .as_ref()
+            .filter(|(thread, _)| *thread == std::thread::current().id())
+            .map(|(_, hook)| hook.clone())
+    });
     if let Some(hook) = hook {
         hook(ctx, journal, point);
     }
@@ -743,6 +777,26 @@ pub fn recover_store_unlocked(
                 .as_ref()
                 .map(|exe| format!(" ({exe})"))
                 .unwrap_or_default()
+        )));
+    }
+    // The journal says a tool was spawning and no recorded process is provably dead: the writer
+    // may have died between the spawn and recording the process, so a tool may be running that
+    // no record can prove dead. That is a needs-a-hand case, never an automatic restore.
+    if journal.spawning
+        && !journal
+            .processes
+            .iter()
+            .any(|process| crate::process_identity::verify(process).is_err())
+    {
+        return Err(SwapError::Stuck(format!(
+            "the swap journal {} says a tool was spawning for instance {} and records no provably \
+             dead process, so Agora cannot tell whether a tool is still running. Nothing was \
+             changed. If no tool of that instance is running, check {} and {} by hand, put the \
+             real Data folder back, then delete the journal.",
+            path.display(),
+            journal.instance_id,
+            journal.real_data.display(),
+            journal.aside.display()
         )));
     }
     restore_and_discard(&journal)?;

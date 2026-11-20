@@ -215,6 +215,7 @@ fn bug_crash_between_overwrite_and_journal_loses_the_original_file() {
         processes: vec![],
         starting_launcher: None,
         launch_id: None,
+        spawning: false,
         files: vec![
             JournaledFile {
                 real_path: h.plugins(),

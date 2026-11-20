@@ -829,6 +829,7 @@ fn interrupted_swap_restores_correctly() {
         processes: vec![],
         starting_launcher: None,
         launch_id: None,
+        spawning: false,
         files: vec![
             JournaledFile {
                 real_path: real_plugin_file.clone(),
