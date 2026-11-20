@@ -144,6 +144,26 @@ pub fn init_local_state_db_with(
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+
+    // One cross-process lock for the whole open: integrity check, any quarantine/restore, and
+    // migrations. The CLI and the desktop can start together; without this, the later process
+    // could restore the same backup over the first one's live database and remove its WAL/SHM
+    // sidecars. The second starter waits here and then reads the result. The lock file lives on
+    // the same data root as the database, so both adapters use the same key.
+    let locks_root = db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("locks");
+    let locks = crate::lock_manager::LockManager::new(locks_root);
+    let _db_guard = locks
+        .acquire(
+            crate::lock_manager::LockResource::LocalStateDatabase,
+            "init-local-state-db",
+        )
+        .map_err(|error| {
+            anyhow::anyhow!("Could not lock the local database for startup: {error}")
+        })?;
+
     let mut report = LocalStateStartupReport::default();
 
     // 1. Integrity check, and recovery before anything writes to the file.

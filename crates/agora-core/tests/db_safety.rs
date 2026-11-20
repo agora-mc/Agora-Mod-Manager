@@ -4,12 +4,16 @@
 //! release wrote it, then opens it through the real startup path.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use agora_core::db::{
     init_local_state_db, init_local_state_db_with, local_state_connection, run_migrations,
     run_migrations_to, CorruptRecovery, LocalStateOpenOptions, ERR_LOCAL_STATE_BACKUP_FAILED,
     ERR_LOCAL_STATE_NEWER, LOCAL_STATE_BACKUP_RETENTION, LOCAL_STATE_SCHEMA_VERSION,
 };
+use agora_core::lock_manager::{LockManager, LockResource};
 use rusqlite::Connection;
 
 fn database_at(dir: &Path, name: &str, version: i64) -> PathBuf {
@@ -213,6 +217,55 @@ fn a_corrupt_file_is_restored_from_the_newest_good_backup_and_is_kept() {
     assert_eq!(
         recovery.restored_from.as_deref(),
         Some(backup_path.as_path())
+    );
+    assert_eq!(
+        get_setting(&path, "safety_probe").as_deref(),
+        Some("\"kept\"")
+    );
+    assert_eq!(schema_version(&path), LOCAL_STATE_SCHEMA_VERSION);
+}
+
+/// Two startups racing the `.recovery` restore. A second process must wait for the first
+/// instead of running its own backup restore, which would delete the first process's WAL/SHM
+/// and rename a fresh database over its now-live one.
+#[test]
+fn two_startups_cannot_race_the_database_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = database_at(dir.path(), "local_state.db", LOCAL_STATE_SCHEMA_VERSION);
+    set_setting(&path, "safety_probe", "\"kept\"");
+    let backup_dir = dir.path().join("backups");
+    std::fs::create_dir_all(&backup_dir).unwrap();
+    let backup = backup_dir.join("local_state-20000101-000000-000-0000-v28.db");
+    std::fs::copy(&path, &backup).unwrap();
+    std::fs::write(&path, b"this is not a sqlite database").unwrap();
+
+    // Another process holds the database recovery lock while it restores.
+    let other_process = LockManager::new(dir.path().join("locks"));
+    let held = other_process
+        .acquire(LockResource::LocalStateDatabase, "other-startup")
+        .expect("the first startup holds the lock");
+
+    let (tx, rx) = mpsc::channel();
+    let other_path = path.clone();
+    let handle = thread::spawn(move || {
+        let result = init_local_state_db_with(&other_path, &LocalStateOpenOptions::default());
+        tx.send(result).unwrap();
+    });
+
+    assert!(
+        rx.recv_timeout(Duration::from_secs(3)).is_err(),
+        "the second startup ran while another held the database recovery lock"
+    );
+
+    drop(held);
+    let report = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the second startup finished once the lock was free")
+        .expect("startup succeeded");
+    handle.join().unwrap();
+    assert!(
+        report.recovered_corrupt.is_some(),
+        "one recovery was reported"
     );
     assert_eq!(
         get_setting(&path, "safety_probe").as_deref(),
