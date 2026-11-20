@@ -74,6 +74,7 @@
 
 @layer base {
   :root {
+    color-scheme: light;
     --font-scale: 1.5;
     --border-scale: 1;
     /* Emoji need their own font: none of the UI faces below carry colour emoji,
@@ -124,6 +125,7 @@
   }
 
   .dark {
+    color-scheme: dark;
     --background: 213 67% 8%;
     --background-foreground: 210 40% 98%;
     --foreground: 210 40% 98%;
@@ -470,6 +472,61 @@ html[data-input-modality="gamepad"] :is(
   html[data-input-modality="gamepad"] :is(a[href], button, [tabindex]:not([tabindex="-1"])):focus {
     transition: outline-offset 120ms ease-out, box-shadow 120ms ease-out;
   }
+}
+
+@layer base {
+  input[type="text"],
+  input[type="number"],
+  input[type="date"],
+  input[type="search"],
+  input[type="password"],
+  textarea {
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+    border-color: hsl(var(--input));
+  }
+
+  input[type="checkbox"],
+  input[type="radio"],
+  input[type="range"] {
+    accent-color: hsl(var(--primary));
+  }
+}
+
+select {
+  -webkit-appearance: none;
+  appearance: none;
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  border: 1px solid hsl(var(--input));
+  background-image:
+    linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position:
+    calc(100% - 16px) calc(50% - 2px),
+    calc(100% - 11px) calc(50% - 2px);
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 2.25rem;
+  cursor: pointer;
+}
+
+select option {
+  background-color: hsl(var(--popover));
+  color: hsl(var(--popover-foreground));
+}
+
+select:hover:not(:disabled):not(:focus-visible) {
+  border-color: hsl(var(--primary));
+}
+
+select:focus-visible {
+  border-color: hsl(var(--ring));
+}
+
+select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 /* --- Couch presentation -------------------------------------------------
