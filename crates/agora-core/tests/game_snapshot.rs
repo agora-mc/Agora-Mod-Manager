@@ -955,12 +955,25 @@ fn zip_archive_bytes_named(name: &str, bytes: &[u8]) -> Vec<u8> {
     {
         let mut writer = zip::ZipWriter::new(&mut cursor);
         let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+            .compression_method(zip::CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::default());
         writer.start_file(name, options).unwrap();
         writer.write_all(bytes).unwrap();
         writer.finish().unwrap();
     }
     cursor.into_inner()
+}
+
+#[test]
+fn fixture_archives_do_not_carry_the_wall_clock() {
+    let bytes = zip_archive_bytes();
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+    let entry = archive.by_index(0).unwrap();
+    assert_eq!(
+        entry.last_modified(),
+        Some(zip::DateTime::default()),
+        "a fixture whose bytes change with the clock makes a backup's recorded SHA-256 disagree with a later fetch of the same archive"
+    );
 }
 
 fn fake_catalog_item(archive_sha256: &str) -> GameCatalogItem {
