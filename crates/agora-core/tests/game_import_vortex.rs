@@ -1881,3 +1881,108 @@ fn a_failure_after_the_merge_started_abandons_the_half_made_instance() {
         "the half-made instance was left behind"
     );
 }
+
+// -- Vortex mod types (V3) --------------------------------------------------------------------
+
+/// Add one extra mod to the store and its staging folder. `mod_type` is Vortex's raw `IMod.type`
+/// id, or `None` when the field is absent.
+fn add_typed_mod(f: &Fixture, id: &str, folder: &str, name: &str, mod_type: Option<&str>) {
+    write(&f.staging.join(folder).join("Tool.ini"), b"[tool]\n");
+    let mut db = DB::open(
+        &f.store,
+        Options {
+            create_if_missing: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let raw = db.get(b"persistent###mods").unwrap();
+    let mut mods: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let mut entry = serde_json::json!({
+        "id": id,
+        "state": "installed",
+        "installationPath": folder,
+        "attributes": { "name": name }
+    });
+    if let Some(kind) = mod_type {
+        entry["type"] = serde_json::Value::String(kind.to_string());
+    }
+    mods[VORTEX_GAME][id] = entry;
+    db.put(b"persistent###mods", &serde_json::to_vec(&mods).unwrap())
+        .unwrap();
+
+    let raw = db.get(b"persistent###profiles").unwrap();
+    let mut profiles: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    profiles["p1"]["modState"][id] = serde_json::json!({ "enabled": true });
+    db.put(
+        b"persistent###profiles",
+        &serde_json::to_vec(&profiles).unwrap(),
+    )
+    .unwrap();
+    db.flush().unwrap();
+}
+
+fn mount_of_named_layer(f: &Fixture, instance: &str, name: &str) -> String {
+    let manifest = agora_core::game_instance::get_manifest(&f.ctx, instance).unwrap();
+    manifest
+        .layers
+        .layers()
+        .iter()
+        .find_map(|layer| match &layer.source {
+            agora_game_api::LayerSource::Content { content } => {
+                let item = agora_core::content_store::get_item(&f.ctx, content).ok()?;
+                (item.name == name).then(|| layer.mount_path.as_str().to_string())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no content layer named '{name}'"))
+}
+
+#[test]
+fn a_root_type_mod_is_placed_at_the_game_root() {
+    let f = fixture();
+    add_typed_mod(&f, "mod-root", "Root Folder", "Root Tool", Some("root"));
+    let report = vortex::run(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, None),
+        Default::default(),
+        &|_| {},
+    )
+    .expect("the import runs");
+    let instance = report.instance_id.expect("an instance was made");
+    assert_eq!(
+        mount_of_named_layer(&f, &instance, "Root Tool"),
+        "",
+        "a mod of Vortex's root type deploys to the game root, not the data folder"
+    );
+    assert_eq!(
+        mount_of_named_layer(&f, &instance, "Alpha Mod"),
+        "Data",
+        "the ordinary mod keeps the data-folder placement"
+    );
+}
+
+#[test]
+fn an_unknown_mod_type_is_imported_with_a_warning_that_names_it() {
+    let f = fixture();
+    add_typed_mod(
+        &f,
+        "mod-odd",
+        "Odd Folder",
+        "Odd Tool",
+        Some("community-tool"),
+    );
+    let plan = vortex::plan(&f.ctx, &f.inventory, &request(&f, None)).expect("the plan is made");
+    assert!(
+        plan.mods.iter().any(|item| item.name == "Odd Tool"),
+        "the mod is still imported, not silently dropped"
+    );
+    let warning = plan
+        .warnings
+        .iter()
+        .find(|warning| warning.contains("community-tool"))
+        .expect("a warning names the unknown type");
+    assert!(warning.contains("Odd Tool"), "{warning}");
+    assert!(warning.contains("guess"), "{warning}");
+}

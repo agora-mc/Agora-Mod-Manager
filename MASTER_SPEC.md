@@ -4253,7 +4253,10 @@ Most people who will try this already have a setup. Import has to be good.
   file wins it) with Vortex's rules as the tie-breaker, and any file the manifest and the rules
   disagree on is reported. The preview and import report also name any deployed file whose winner
   the chosen layer order cannot reproduce. Both importers use the game's placement rules for mod
-  files. Downloads are referenced when their hashes match.
+  files. Vortex's per-mod `type` is read too: the Creation Engine `root` type places the mod at the
+  game root instead of the data folder; a type Agora does not know is still imported with the
+   ordinary placement and a warning that says that placement is a guess. Downloads are referenced
+   when their hashes match.
 
 - **Loadouts for game instances (designed 2026-11-15).** Minecraft instances already have loadouts
   (`agora loadout`, the desktop's loadout picker): named sets of which content is on, applied with
