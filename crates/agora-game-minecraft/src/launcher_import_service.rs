@@ -39,6 +39,7 @@ use crate::launcher_import::{
     LoaderTuple,
 };
 use crate::loader_service::LoaderService;
+use agora_core::lock_manager::LockResource;
 use agora_core::models::{InstalledMod, InstanceManifest, InstanceRow};
 use agora_core::network::NetworkPolicy;
 use serde::{Deserialize, Serialize};
@@ -1506,7 +1507,7 @@ impl LauncherImportService {
             .ctx
             .lock_manager
             .acquire_async(
-                agora_core::lock_manager::LockResource::Instance(dest_id.clone()),
+                LockResource::Instance(dest_id.clone()),
                 "launcher-import-execute",
             )
             .await
@@ -2374,7 +2375,7 @@ fn persist_import_job_state(
 /// import (the executing import takes `LockResource::Instance` before writing its journal), so it
 /// is left alone — staging, quarantine and the job row untouched — and reported, never recovered
 /// underneath the live operation.
-pub fn recover_interrupted_jobs(ctx: &agora_core::ctx::Ctx) -> Vec<String> {
+pub fn recover_interrupted_jobs(ctx: &Ctx) -> Vec<String> {
     let mut warnings = Vec::new();
     let paths = &ctx.paths;
     let Ok(connection) = agora_core::db::local_state_connection(&paths.local_state_db()) else {
@@ -2386,7 +2387,7 @@ pub fn recover_interrupted_jobs(ctx: &agora_core::ctx::Ctx) -> Vec<String> {
     for job in jobs {
         // Never wait on the lock at startup: a live import in another process may hold it.
         let lock = ctx.lock_manager.acquire_with_timeout(
-            agora_core::lock_manager::LockResource::Instance(job.instance_id.clone()),
+            LockResource::Instance(job.instance_id.clone()),
             "import-recover",
             std::time::Duration::ZERO,
             None,
@@ -2618,6 +2619,7 @@ mod tests {
 
     use super::*;
     use crate::launcher_import::{ContentInventory, LaunchStrategy};
+    use agora_core::lock_manager::LockManager;
 
     /// A fresh temp directory for one test. The random component matters:
     /// `%TEMP%` is shared, and a name built from the process id and a
@@ -3750,10 +3752,9 @@ name=Dup Instance
         let final_dir = ctx.paths.instances_root().join("recover-live");
         std::fs::create_dir_all(&staging).unwrap();
         std::fs::write(staging.join("options.txt"), b"payload").unwrap();
-        let connection =
-            agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let connection = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let now = chrono::Utc::now().to_rfc3339();
-        agora_core::db::upsert_instance_import_job(
+        db::upsert_instance_import_job(
             &connection,
             &InstanceImportJob {
                 job_id: "recover-live-job".into(),
@@ -3774,10 +3775,10 @@ name=Dup Instance
         drop(connection);
 
         // A second lock manager on the same locks root is what another Agora process sees.
-        let other_process = agora_core::lock_manager::LockManager::new(ctx.paths.locks_root());
+        let other_process = LockManager::new(ctx.paths.locks_root());
         let held = other_process
             .acquire(
-                agora_core::lock_manager::LockResource::Instance("recover-live".into()),
+                LockResource::Instance("recover-live".into()),
                 "launcher-import-execute",
             )
             .expect("the live import takes the instance lock");
@@ -3791,12 +3792,9 @@ name=Dup Instance
             "the skip is reported: {warnings:?}"
         );
         assert!(staging.join("options.txt").exists(), "staging untouched");
-        let connection =
-            agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let connection = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
         assert_eq!(
-            agora_core::db::list_instance_import_jobs(&connection)
-                .unwrap()
-                .len(),
+            db::list_instance_import_jobs(&connection).unwrap().len(),
             1,
             "the job row is kept for the live import"
         );
@@ -3805,12 +3803,14 @@ name=Dup Instance
         // The live import finished; the next startup pass rolls the job back.
         drop(held);
         let warnings = recover_interrupted_jobs(&ctx);
-        assert!(!warnings.iter().any(|w| w.contains("left alone")), "{warnings:?}");
-        assert!(!staging.exists(), "staging rolled back");
-        let connection =
-            agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
         assert!(
-            agora_core::db::list_instance_import_jobs(&connection)
+            !warnings.iter().any(|w| w.contains("left alone")),
+            "{warnings:?}"
+        );
+        assert!(!staging.exists(), "staging rolled back");
+        let connection = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        assert!(
+            db::list_instance_import_jobs(&connection)
                 .unwrap()
                 .is_empty(),
             "the job row is gone"

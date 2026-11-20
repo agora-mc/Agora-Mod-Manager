@@ -52,11 +52,7 @@ fn registry(def: &GameDefinition, hook: Arc<RecordingServices>) -> Arc<GameRegis
         tools: vec![],
     };
     builder
-        .add_compiled(
-            "test-pkg",
-            Arc::new(TestPackage(pkg)),
-            hook,
-        )
+        .add_compiled("test-pkg", Arc::new(TestPackage(pkg)), hook)
         .expect("register test package");
     Arc::new(builder.build())
 }
@@ -75,15 +71,17 @@ impl agora_core::game_hooks::CompiledServices for RecordingServices {
 fn definition(user_files: bool) -> GameDefinition {
     let mut mappings = Vec::new();
     if user_files {
-        mappings.push(UserFileMapping::new(
-            GamePath::UserData {
-                location: UserDataLocation::LocalAppData,
-                path: RelPath::new("Test Game/Plugins.txt").unwrap(),
-            },
-            RelPath::new("user/Plugins.txt").unwrap(),
-            UserFileStrategy::JournaledSwap,
-        )
-        .with_stores(vec![StoreId::steam()]));
+        mappings.push(
+            UserFileMapping::new(
+                GamePath::UserData {
+                    location: UserDataLocation::LocalAppData,
+                    path: RelPath::new("Test Game/Plugins.txt").unwrap(),
+                },
+                RelPath::new("user/Plugins.txt").unwrap(),
+                UserFileStrategy::JournaledSwap,
+            )
+            .with_stores(vec![StoreId::steam()]),
+        );
     }
     GameDefinition {
         mo2_game_name: None,
@@ -105,9 +103,7 @@ fn definition(user_files: bool) -> GameDefinition {
             executable: GamePath::Runtime {
                 path: RelPath::new("Game.exe").unwrap(),
             },
-            arguments: vec![LaunchValue::Literal {
-                value: "/c".into(),
-            }],
+            arguments: vec![LaunchValue::Literal { value: "/c".into() }],
             environment: Default::default(),
             working_directory: GamePath::Runtime {
                 path: RelPath::default(),
@@ -217,7 +213,11 @@ fn swap_fixture() -> SwapFixture {
     let ctx = ctx.with_games(registry(&def, Arc::new(RecordingServices::default())));
     let install_dir = tmp.path().join("install");
     std::fs::create_dir_all(install_dir.join("Data")).unwrap();
-    std::fs::copy(std::env::current_exe().unwrap(), install_dir.join("Game.exe")).unwrap();
+    std::fs::copy(
+        std::env::current_exe().unwrap(),
+        install_dir.join("Game.exe"),
+    )
+    .unwrap();
     std::fs::write(install_dir.join("Data").join("Skyrim.bsa"), b"BSA DATA").unwrap();
     std::fs::write(install_dir.join("Data").join("tweak.ini"), b"ini original").unwrap();
     std::fs::write(install_dir.join("Data").join("delete_me.txt"), b"delete me").unwrap();
@@ -385,7 +385,10 @@ fn the_startup_pass_puts_back_an_interrupted_tool_swap() {
             .any(|a| a.contains("Put back the real Data folder")),
         "the report names the action: {report:?}"
     );
-    assert!(report.warnings.is_empty(), "nothing needs a hand: {report:?}");
+    assert!(
+        report.warnings.is_empty(),
+        "nothing needs a hand: {report:?}"
+    );
 }
 
 /// Two processes: a swap journal whose game/store lock another Agora process holds belongs to a
@@ -412,7 +415,10 @@ fn the_startup_pass_leaves_a_swap_alone_while_another_process_holds_its_lock() {
     // Nothing was recovered: the journal, the aside and the swapped-in copy are all untouched.
     assert!(journal_file(&f).exists(), "the journal is still there");
     assert!(journal.aside.is_dir(), "the real Data is still aside");
-    assert!(real_data(&f).join("new.txt").exists(), "the copy is still in place");
+    assert!(
+        real_data(&f).join("new.txt").exists(),
+        "the copy is still in place"
+    );
     assert_ne!(snapshot(&real_data(&f)), before);
     assert!(
         report
@@ -421,14 +427,24 @@ fn the_startup_pass_leaves_a_swap_alone_while_another_process_holds_its_lock() {
             .any(|w| w.contains("left alone") && w.contains("lock")),
         "the skip is reported: {report:?}"
     );
-    assert!(report.actions.is_empty(), "nothing was recovered: {report:?}");
+    assert!(
+        report.actions.is_empty(),
+        "nothing was recovered: {report:?}"
+    );
 
     // Once the live operation lets go, the next startup recovers the swap.
     drop(_held);
     let report = run_at_startup(&f.ctx);
-    assert_eq!(snapshot(&real_data(&f)), before, "recovered after the lock was released");
+    assert_eq!(
+        snapshot(&real_data(&f)),
+        before,
+        "recovered after the lock was released"
+    );
     assert!(!journal_file(&f).exists());
-    assert!(report.actions.iter().any(|a| a.contains("Put back the real Data folder")));
+    assert!(report
+        .actions
+        .iter()
+        .any(|a| a.contains("Put back the real Data folder")));
 }
 
 /// A journal that does not describe a swap Agora makes needs a hand: the startup pass reports it
@@ -448,7 +464,10 @@ fn a_swap_journal_that_needs_a_hand_is_reported_not_raised() {
     let report = run_at_startup(&f.ctx);
 
     assert_eq!(std::fs::read(victim.join("keep.txt")).unwrap(), b"keep");
-    assert!(journal.aside.is_dir(), "the real Data is still aside, untouched");
+    assert!(
+        journal.aside.is_dir(),
+        "the real Data is still aside, untouched"
+    );
     assert!(!real_data(&f).exists());
     assert!(journal_file(&f).exists(), "the journal is kept for a human");
     assert!(
@@ -470,7 +489,10 @@ fn a_swap_journal_that_needs_a_hand_is_reported_not_raised() {
 fn the_startup_pass_runs_the_game_registry_hook() {
     let def = definition(false);
     let hook = Arc::new(RecordingServices::default());
-    hook.lines.lock().unwrap().push("recovered one import job".into());
+    hook.lines
+        .lock()
+        .unwrap()
+        .push("recovered one import job".into());
     let tmp = TempDir::new().unwrap();
     let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
     agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
@@ -479,7 +501,10 @@ fn the_startup_pass_runs_the_game_registry_hook() {
     let report = run_at_startup(&ctx);
 
     assert!(
-        report.warnings.iter().any(|w| w == "recovered one import job"),
+        report
+            .warnings
+            .iter()
+            .any(|w| w == "recovered one import job"),
         "the hook's line is in the report: {report:?}"
     );
 }
@@ -620,16 +645,19 @@ fn the_startup_pass_leaves_a_busy_trash_entry_alone() {
 
     let other_process = LockManager::new(ctx.paths.locks_root());
     let _held = other_process
-        .acquire(
-            LockResource::Instance("busy-1".to_string()),
-            "live-delete",
-        )
+        .acquire(LockResource::Instance("busy-1".to_string()), "live-delete")
         .expect("the live operation takes the instance lock");
 
     let report = run_at_startup(&ctx);
 
-    assert!(game_instance::get(&ctx, "busy-1").unwrap().is_none(), "not recovered");
-    assert!(entry.join("restoring.json").exists(), "the entry is untouched");
+    assert!(
+        game_instance::get(&ctx, "busy-1").unwrap().is_none(),
+        "not recovered"
+    );
+    assert!(
+        entry.join("restoring.json").exists(),
+        "the entry is untouched"
+    );
     assert!(
         report
             .warnings

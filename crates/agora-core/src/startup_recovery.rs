@@ -75,9 +75,7 @@ pub fn run_at_startup(ctx: &Ctx) -> StartupRecoveryReport {
     let mut report = StartupRecoveryReport::default();
 
     // 1. Game packages (game-specific recovery stays behind the registry hook).
-    report
-        .warnings
-        .extend(ctx.games.recover_at_startup(ctx));
+    report.warnings.extend(ctx.games.recover_at_startup(ctx));
 
     // 2. Interrupted tool swaps. Nowait: a journal whose lock another Agora process holds belongs
     //    to a live run and is left alone and reported.
@@ -87,9 +85,9 @@ pub fn run_at_startup(ctx: &Ctx) -> StartupRecoveryReport {
                 "Put back the real Data folder of {} after an interrupted run of {}.",
                 journal.game, journal.tool
             )),
-            Recovery::Stuck(message) => {
-                report.warnings.push(format!("A tool swap was not put back: {message}"))
-            }
+            Recovery::Stuck(message) => report
+                .warnings
+                .push(format!("A tool swap was not put back: {message}")),
         }
     }
 

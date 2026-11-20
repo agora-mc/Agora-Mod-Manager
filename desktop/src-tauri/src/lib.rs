@@ -959,7 +959,10 @@ mod tests {
     #[test]
     fn a_recovery_notice_is_shown_only_when_there_is_something_to_say() {
         use agora_core::startup_recovery::StartupRecoveryReport;
-        assert_eq!(super::recovery_notice_text(&StartupRecoveryReport::default()), None);
+        assert_eq!(
+            super::recovery_notice_text(&StartupRecoveryReport::default()),
+            None
+        );
         let report = StartupRecoveryReport {
             actions: vec!["Put back the real Data folder of skyrim-se.".to_string()],
             warnings: vec!["A tool swap was not put back: needs a hand.".to_string()],

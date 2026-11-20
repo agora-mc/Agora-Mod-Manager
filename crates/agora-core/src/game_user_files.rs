@@ -966,7 +966,7 @@ pub fn recover_finished_sessions(ctx: &Ctx) -> (Vec<String>, Vec<String>) {
                 continue;
             }
         };
-        match restore_locked(ctx, &definition, &journal.store) {
+        match restore_locked(ctx, definition, &journal.store) {
             Ok(report) => actions.push(format!(
                 "Put back the user files of {} ({}) after the interrupted session of instance {} \
                  ({} file(s) restored).",

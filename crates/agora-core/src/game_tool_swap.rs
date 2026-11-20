@@ -736,13 +736,24 @@ enum LockWait {
     NoWait,
 }
 
+/// One store's outcome in a recovery pass.
+enum StoreOutcome {
+    /// The interrupted swap was put back.
+    Restored(Box<SwapJournal>),
+    /// The journal was left alone because another Agora process holds its lock.
+    LeftAlone(String),
+    /// The journal could not be recovered; the original error keeps its variant (`Refused` for a
+    /// live run, `Stuck` for a needs-a-hand case).
+    Failed(SwapError),
+}
+
 /// The per-store check, under the caller's rules for waiting on the lock. Each store's outcome is
 /// reported on its own line; nothing is raised.
 fn recover_game_locked(
     ctx: &Ctx,
     definition: &GameDefinition,
     wait: LockWait,
-) -> Vec<Recovery> {
+) -> Vec<StoreOutcome> {
     let mut out = Vec::new();
     for entry in &definition.stores {
         let store = entry.store.as_str();
@@ -762,21 +773,21 @@ fn recover_game_locked(
         let _lock = match lock {
             Ok(lock) => lock,
             Err(error) => {
-                out.push(Recovery::Stuck(match wait {
-                    LockWait::Wait => error.to_string(),
-                    LockWait::NoWait => format!(
+                out.push(match wait {
+                    LockWait::Wait => StoreOutcome::Failed(SwapError::Lock(error)),
+                    LockWait::NoWait => StoreOutcome::LeftAlone(format!(
                         "the swap journal for {}/{store} was left alone: another Agora \
                          holds its lock right now ({error}). Nothing was changed.",
                         definition.id
-                    ),
-                }));
+                    )),
+                });
                 continue;
             }
         };
         match recover_store_unlocked(ctx, definition.id.as_str(), store) {
-            Ok(Some(journal)) => out.push(Recovery::Restored(Box::new(journal))),
+            Ok(Some(journal)) => out.push(StoreOutcome::Restored(Box::new(journal))),
             Ok(None) => {}
-            Err(e) => out.push(Recovery::Stuck(e.to_string())),
+            Err(e) => out.push(StoreOutcome::Failed(e)),
         }
     }
     out
@@ -786,10 +797,11 @@ fn recover_game_locked(
 /// and put back an interrupted swap. One file existence test per store when nothing is pending.
 pub fn recover_game(ctx: &Ctx, definition: &GameDefinition) -> Result<Vec<SwapJournal>, SwapError> {
     let mut restored = Vec::new();
-    for recovery in recover_game_locked(ctx, definition, LockWait::Wait) {
-        match recovery {
-            Recovery::Restored(journal) => restored.push(*journal),
-            Recovery::Stuck(message) => return Err(SwapError::Stuck(message)),
+    for outcome in recover_game_locked(ctx, definition, LockWait::Wait) {
+        match outcome {
+            StoreOutcome::Restored(journal) => restored.push(*journal),
+            StoreOutcome::LeftAlone(message) => return Err(SwapError::Stuck(message)),
+            StoreOutcome::Failed(e) => return Err(e),
         }
     }
     Ok(restored)
@@ -798,20 +810,26 @@ pub fn recover_game(ctx: &Ctx, definition: &GameDefinition) -> Result<Vec<SwapJo
 /// The explicit check: recover every game the registry knows, waiting for a live operation to let
 /// go of a store's lock. Each result is reported, never raised.
 pub fn recover_all(ctx: &Ctx) -> Vec<Recovery> {
-    let mut out = Vec::new();
-    for definition in ctx.games.games() {
-        out.extend(recover_game_locked(ctx, definition, LockWait::Wait));
-    }
-    out
+    recover_all_with(ctx, LockWait::Wait)
 }
 
 /// The startup check: the same pass, but never waiting on a lock. A journal whose lock another
 /// Agora process holds belongs to a live operation and is left alone and reported, not recovered
 /// underneath it. Each result is reported, never raised.
 pub fn recover_all_nowait(ctx: &Ctx) -> Vec<Recovery> {
+    recover_all_with(ctx, LockWait::NoWait)
+}
+
+fn recover_all_with(ctx: &Ctx, wait: LockWait) -> Vec<Recovery> {
     let mut out = Vec::new();
     for definition in ctx.games.games() {
-        out.extend(recover_game_locked(ctx, definition, LockWait::NoWait));
+        for outcome in recover_game_locked(ctx, definition, wait) {
+            out.push(match outcome {
+                StoreOutcome::Restored(journal) => Recovery::Restored(journal),
+                StoreOutcome::LeftAlone(message) => Recovery::Stuck(message),
+                StoreOutcome::Failed(e) => Recovery::Stuck(e.to_string()),
+            });
+        }
     }
     out
 }
