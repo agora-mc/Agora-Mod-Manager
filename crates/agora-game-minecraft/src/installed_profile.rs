@@ -1426,14 +1426,45 @@ pub fn create_receipt_for_installed_profile(
         produced_libraries,
     )?;
 
-    // 6. Enumerate library paths without upstream SHA1/SHA256.
-    let unhashed_paths = collect_unhashed_library_paths(&loader_version.libraries);
+    // 6. Enumerate library paths the receipt must pin from disk:
+    //    every library without an upstream hash, and every installer
+    //    processor output with a blank download URL — a processor output
+    //    is only ever created locally (the installer verified its bytes
+    //    against the hashes it declared in install_profile.json), so it
+    //    can never be downloaded at launch even when the generated
+    //    version.json publishes a SHA-1 for it. Pinning it here gives
+    //    adoption and the launch planner the SHA-256 they need to trust
+    //    the artifact, and fails fast if the installer did not actually
+    //    produce it.
+    let mut pinned_paths: BTreeSet<String> =
+        collect_unhashed_library_paths(&loader_version.libraries)
+            .into_iter()
+            .collect();
+    for lib in &loader_version.libraries {
+        if !produced_libraries.contains(&lib.name) {
+            continue;
+        }
+        // A non-blank URL means the artifact is downloadable, so it needs
+        // no receipt pin. Blank (or absent) means local-only: pin it.
+        let downloadable = lib
+            .downloads
+            .as_ref()
+            .and_then(|downloads| downloads.artifact.as_ref())
+            .map(|artifact| !artifact.url.trim().is_empty())
+            .unwrap_or(false);
+        if downloadable {
+            continue;
+        }
+        if let Ok(descriptor) = parse_maven_descriptor(&lib.name) {
+            pinned_paths.insert(descriptor.to_relative_path());
+        }
+    }
 
-    // 7. For each unhashed library, verify the file under .minecraft/libraries.
+    // 7. For each pinned library, verify the file under .minecraft/libraries.
     //    TOCTOU protection (item 7): capture metadata before reading, hash
     //    bounded stream, verify metadata again; fail if changed.
     let mut generated_artifact_sha256: BTreeMap<String, String> = BTreeMap::new();
-    for rel_path in &unhashed_paths {
+    for rel_path in &pinned_paths {
         // Reject unsafe paths.
         if is_unsafe_relative_path(rel_path) {
             return Err(ProfileIssue::corrupt(
