@@ -374,9 +374,11 @@ fn a_hash_mismatch_names_the_real_file_and_its_backup() {
 ",
     )
     .unwrap();
+    // The instance's copy still holds exactly what the session wrote, so only the real file
+    // changed: the restore reaches the backup and reports its hash mismatch by name.
     std::fs::write(
         &copy,
-        "the saved session
+        "the instance's bytes
 ",
     )
     .unwrap();
@@ -411,7 +413,7 @@ fn a_hash_mismatch_names_the_real_file_and_its_backup() {
             swapped: true,
             state: Some(agora_core::game_user_files::FileState::Swapped),
             restored: false,
-            real_link_target: None,
+            real_resolved_path: None,
         }],
     };
     let journal_path = journal_path_of(&h, &def);

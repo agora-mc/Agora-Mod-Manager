@@ -228,7 +228,7 @@ fn bug_crash_between_overwrite_and_journal_loses_the_original_file() {
                 swapped: false,
                 state: None,
                 restored: false,
-                real_link_target: None,
+                real_resolved_path: None,
             },
             JournaledFile {
                 real_path: h.ini(),
@@ -241,7 +241,7 @@ fn bug_crash_between_overwrite_and_journal_loses_the_original_file() {
                 swapped: false,
                 state: None,
                 restored: false,
-                real_link_target: None,
+                real_resolved_path: None,
             },
         ],
     };

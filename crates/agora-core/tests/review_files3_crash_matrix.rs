@@ -256,7 +256,7 @@ fn build(h: &TestHarness, def: &GameDefinition, id: &str, stages: &[Stage]) {
             swapped: false,
             state: Some(FileState::BackingUp),
             restored: false,
-            real_link_target: None,
+            real_resolved_path: None,
         };
         if *st != Initial {
             f.existed = true;
@@ -343,6 +343,14 @@ fn expected_inst(st: Stage, i: usize) -> String {
     }
 }
 
+/// Stages where the real file and the instance's copy both changed since the swap to
+/// DIFFERENT bytes: recovery must refuse, keep both exactly as they are, keep the journal,
+/// and keep the real file's current bytes as a clearly named conflict copy next to the
+/// instance's copy.
+fn refuses_both_changed(st: Stage) -> bool {
+    matches!(st, RInstTorn | RRealTorn)
+}
+
 /// Recover from the hand-built state and report every violated invariant.
 fn recover_and_check(stages: &[Stage]) -> Vec<String> {
     let h = TestHarness::new();
@@ -350,6 +358,64 @@ fn recover_and_check(stages: &[Stage]) -> Vec<String> {
     let id = "m";
     build(&h, &def, id, stages);
     let mut bad = Vec::new();
+    // What the scenario put on disk, before recovery runs.
+    let before: Vec<(Vec<u8>, Vec<u8>)> = stages
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            (
+                std::fs::read(real_of(&h, i)).unwrap_or_default(),
+                std::fs::read(inst_of(&h, id, i)).unwrap_or_default(),
+            )
+        })
+        .collect();
+    if stages.iter().any(|st| refuses_both_changed(*st)) {
+        match restore(&h.ctx, &def, &StoreId::steam()) {
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains("both changed since the swap") {
+                    bad.push(format!("the refusal does not say both sides changed: {msg}"));
+                }
+            }
+            Ok(_) => bad.push(
+                "the restore succeeded although both sides changed since the swap".into(),
+            ),
+        }
+        for (i, st) in stages.iter().enumerate() {
+            let real = std::fs::read(real_of(&h, i)).unwrap_or_default();
+            let ic = std::fs::read(inst_of(&h, id, i)).unwrap_or_default();
+            if real != before[i].0 || ic != before[i].1 {
+                bad.push(format!(
+                    "entry {i} ({st:?}): recovery changed a file it refused to touch"
+                ));
+            }
+            if refuses_both_changed(*st) {
+                let conflicts: Vec<PathBuf> = std::fs::read_dir(
+                    inst_of(&h, id, i).parent().unwrap(),
+                )
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.contains(".agora-conflict-"))
+                })
+                .collect();
+                if conflicts.len() != 1
+                    || std::fs::read(&conflicts[0]).unwrap_or_default() != before[i].0
+                {
+                    bad.push(format!(
+                        "entry {i} ({st:?}): the conflict copy next to the instance's copy is missing or wrong: {conflicts:?}"
+                    ));
+                }
+            }
+        }
+        if !journal_path_of(&h, &def).exists() {
+            bad.push("the journal was removed although the restore refused".into());
+        }
+        return bad;
+    }
     match restore(&h.ctx, &def, &StoreId::steam()) {
         Ok(_) => {}
         Err(e) => bad.push(format!("restore failed: {e}")),
@@ -436,7 +502,7 @@ fn a_shortened_real_file_after_swap_in_is_kept_as_the_instance_copy() {
 }
 
 #[test]
-fn a_real_file_that_is_a_prefix_during_restore_is_kept_as_the_instance_copy() {
+fn a_real_file_that_is_a_prefix_during_restore_is_kept_as_a_conflict_copy_and_reported() {
     let bad = recover_and_check(&[RRealTorn]);
     assert!(bad.is_empty(), "{bad:#?}");
 }
@@ -472,7 +538,7 @@ fn a_shortened_new_real_file_after_swap_in_is_kept_as_the_instance_copy() {
             swapped: true,
             state: Some(FileState::Swapped),
             restored: false,
-            real_link_target: None,
+            real_resolved_path: None,
         }],
     };
     let jp = journal_path_of(&h, &def);

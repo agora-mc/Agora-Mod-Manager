@@ -842,7 +842,7 @@ fn interrupted_swap_restores_correctly() {
                 swapped: true,
                 state: None,
                 restored: false,
-                real_link_target: None,
+                real_resolved_path: None,
             },
             JournaledFile {
                 real_path: real_ini_file.clone(),
@@ -855,7 +855,7 @@ fn interrupted_swap_restores_correctly() {
                 swapped: false,
                 state: None,
                 restored: false,
-                real_link_target: None,
+                real_resolved_path: None,
             },
         ],
     };
