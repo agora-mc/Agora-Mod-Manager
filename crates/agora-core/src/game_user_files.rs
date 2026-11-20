@@ -1815,7 +1815,46 @@ pub fn list_statuses(
 
 #[cfg(test)]
 mod tests {
-    use super::write_user_file;
+    use super::{write_user_file, JournaledFile};
+    use std::path::PathBuf;
+
+    use agora_game_api::RelPath;
+
+    #[test]
+    fn the_recorded_link_target_round_trips_and_old_journals_have_none() {
+        let file = JournaledFile {
+            real_path: PathBuf::from("/home/player/.local/share/Test/Plugins.txt"),
+            instance_path: RelPath::new("user/Plugins.txt").unwrap(),
+            instance_copy_path: PathBuf::from("/data/inst/user/Plugins.txt"),
+            existed: true,
+            backup_path: None,
+            original_sha256: Some("ab".into()),
+            written_sha256: "cd".into(),
+            swapped: true,
+            state: None,
+            restored: false,
+            real_link_target: Some(PathBuf::from("/home/player/elsewhere/Plugins.txt")),
+        };
+        let text = serde_json::to_string(&file).unwrap();
+        assert!(text.contains("real_link_target"), "{text}");
+        let back: JournaledFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            back.real_link_target,
+            Some(PathBuf::from("/home/player/elsewhere/Plugins.txt"))
+        );
+        // A journal written before the field existed parses with no target: unknown, which
+        // recovery treats as "cannot prove the link was not retargeted".
+        let old = r#"{
+            "real_path": "/home/player/.local/share/Test/Plugins.txt",
+            "instance_path": "user/Plugins.txt",
+            "instance_copy_path": "/data/inst/user/Plugins.txt",
+            "existed": true,
+            "written_sha256": "cd",
+            "swapped": true
+        }"#;
+        let parsed: JournaledFile = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.real_link_target, None);
+    }
 
     fn make_read_writable(path: &std::path::Path) {
         let mut perms = std::fs::metadata(path).unwrap().permissions();

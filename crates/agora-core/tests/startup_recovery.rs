@@ -746,3 +746,309 @@ fn the_startup_pass_restores_the_user_files_of_a_dead_session() {
 
     std::env::remove_var("AGORA_TEST_USER_DATA_ROOT");
 }
+
+// ---------------------------------------------------------------------------
+// Live and unknown sessions, and files changed after a crash
+// ---------------------------------------------------------------------------
+
+/// The user-files setup of the tests below: a registry with the one mapping, the player's real
+/// file, the instance's copy, and a `running_from` folder.
+struct UserFilesFixture {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    _data_dir: TempDir,
+    _user_data_dir: TempDir,
+    ctx: CoreContext,
+    def: GameDefinition,
+    running_from: PathBuf,
+    real: PathBuf,
+    copy: PathBuf,
+}
+
+fn user_files_fixture(player_file: Option<&str>) -> UserFilesFixture {
+    let guard = USER_FILES_LOCK.lock().unwrap();
+    let data_dir = TempDir::new().unwrap();
+    let user_data_dir = TempDir::new().unwrap();
+    std::env::set_var("AGORA_TEST_USER_DATA_ROOT", user_data_dir.path());
+
+    let def = definition(true);
+    let ctx = CoreContext::for_testing(data_dir.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let ctx = ctx.with_games(registry(&def, Arc::new(RecordingServices::default())));
+    let running_from = data_dir.path().join("running_from");
+    std::fs::create_dir_all(&running_from).unwrap();
+
+    let real = user_data_dir
+        .path()
+        .join("local")
+        .join("Test Game")
+        .join("Plugins.txt");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    if let Some(bytes) = player_file {
+        std::fs::write(&real, bytes).unwrap();
+    }
+    let copy = ctx
+        .paths
+        .instance_dir("instance-a")
+        .unwrap()
+        .join("user/Plugins.txt");
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::write(&copy, "Instance copy\n").unwrap();
+
+    UserFilesFixture {
+        _guard: guard,
+        _data_dir: data_dir,
+        _user_data_dir: user_data_dir,
+        ctx,
+        def,
+        running_from,
+        real,
+        copy,
+    }
+}
+
+impl Drop for UserFilesFixture {
+    fn drop(&mut self) {
+        std::env::remove_var("AGORA_TEST_USER_DATA_ROOT");
+    }
+}
+
+/// A dead process identity: a pid no process can have, verified stale by the OS.
+fn dead_identity() -> agora_core::process_identity::ProcessIdentity {
+    agora_core::process_identity::ProcessIdentity {
+        pid: u32::MAX - 2,
+        start_time: 5,
+        expected_exe: None,
+        job: None,
+    }
+}
+
+/// The startup pass leaves a session whose recorded process is LIVE alone: liveness detection
+/// (pid + start time + exe verified against the OS) is what tells a live session from a dead
+/// one, so this test fails if that verification stops working.
+#[test]
+fn the_startup_pass_leaves_a_live_user_files_session_alone() {
+    let f = user_files_fixture(Some("Player original\n"));
+    agora_core::game_user_files::swap_in(
+        &f.ctx,
+        "instance-a",
+        &f.def,
+        &StoreId::steam(),
+        &f.running_from,
+    )
+    .unwrap();
+    // A live pid: this test process, recorded as the session's game.
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        agora_core::process_identity::capture_self().expect("capture this process"),
+    )
+    .unwrap();
+    let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
+    assert_eq!(std::fs::read_to_string(&f.real).unwrap(), "Instance copy\n");
+
+    let report = run_at_startup(&f.ctx);
+
+    assert_eq!(
+        std::fs::read_to_string(&f.real).unwrap(),
+        "Instance copy\n",
+        "the live session was restored underneath"
+    );
+    assert!(journal_path.exists(), "the journal of a live session is kept");
+    assert!(
+        report.actions.is_empty(),
+        "nothing was recovered: {report:?}"
+    );
+}
+
+/// A journal that records no process identity at all (a legacy journal, or a self-capture that
+/// failed) has unknown liveness: the startup pass does not recover it automatically, it reports
+/// it as needing a hand and changes nothing.
+#[test]
+fn a_user_files_journal_with_no_recorded_identity_needs_a_hand_not_automatic_recovery() {
+    let f = user_files_fixture(Some("Player original\n"));
+    agora_core::game_user_files::swap_in(
+        &f.ctx,
+        "instance-a",
+        &f.def,
+        &StoreId::steam(),
+        &f.running_from,
+    )
+    .unwrap();
+    let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
+    // Strip the identities, the way a legacy journal or a failed self-capture leaves them.
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&journal_path).unwrap()).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("starting_launcher");
+    object.insert("processes".into(), serde_json::json!([]));
+    std::fs::write(&journal_path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    assert_eq!(std::fs::read_to_string(&f.real).unwrap(), "Instance copy\n");
+
+    let report = run_at_startup(&f.ctx);
+
+    assert_eq!(
+        std::fs::read_to_string(&f.real).unwrap(),
+        "Instance copy\n",
+        "an unknown-liveness session was restored automatically"
+    );
+    assert!(journal_path.exists(), "the journal is kept for a hand");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("no process identity") && w.contains("left alone")),
+        "the needs-a-hand case is reported: {report:?}"
+    );
+    assert!(report.actions.is_empty(), "{report:?}");
+}
+
+/// A file the player created after a crash — the swap journal says the file was swapped in,
+/// but its content is not what the session wrote — is never overwritten by recovery: neither
+/// the real file nor the instance's copy is touched; the journal is reported as needing a hand.
+#[test]
+fn a_file_the_player_made_after_a_crash_is_not_overwritten_by_recovery() {
+    // The real file was absent when the session swapped in, so Agora created it from the
+    // instance's copy.
+    let f = user_files_fixture(None);
+    agora_core::game_user_files::swap_in(
+        &f.ctx,
+        "instance-a",
+        &f.def,
+        &StoreId::steam(),
+        &f.running_from,
+    )
+    .unwrap();
+    agora_core::game_user_files::record_process(&f.ctx, &f.def.id, &StoreId::steam(), dead_identity())
+        .unwrap();
+    let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
+    assert!(journal_path.exists());
+    assert_eq!(std::fs::read_to_string(&f.real).unwrap(), "Instance copy\n");
+    // The crash left the journal saying "swapped" before Agora's write landed (the state an
+    // older Agora wrote in that window), and the player then created the file themselves.
+    std::fs::remove_file(&f.real).unwrap();
+    std::fs::write(&f.real, "Player wrote this after the crash\n").unwrap();
+
+    let report = run_at_startup(&f.ctx);
+
+    assert_eq!(
+        std::fs::read_to_string(&f.real).unwrap(),
+        "Player wrote this after the crash\n",
+        "the player's file was deleted or overwritten by recovery"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&f.copy).unwrap(),
+        "Instance copy\n",
+        "the instance's copy was overwritten with the player's bytes"
+    );
+    assert!(journal_path.exists(), "the journal is kept for a hand");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("changed since the swap")),
+        "the refusal is reported: {report:?}"
+    );
+    assert!(report.actions.is_empty(), "{report:?}");
+}
+
+/// The state the current writer leaves when it is cut off between journaling and creating the
+/// real file: the entry is NOT marked swapped. Recovery then leaves a file the player made in
+/// the meantime exactly as it is (only bytes exactly matching the recorded write are removed).
+#[test]
+fn a_crash_before_agora_created_the_file_leaves_the_players_file_alone() {
+    let f = user_files_fixture(None);
+    agora_core::game_user_files::swap_in(
+        &f.ctx,
+        "instance-a",
+        &f.def,
+        &StoreId::steam(),
+        &f.running_from,
+    )
+    .unwrap();
+    agora_core::game_user_files::record_process(&f.ctx, &f.def.id, &StoreId::steam(), dead_identity())
+        .unwrap();
+    let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
+    // The write-ahead state of the window before Agora creates the real file.
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&journal_path).unwrap()).unwrap();
+    let file0 = &mut value["files"][0];
+    file0["swapped"] = serde_json::json!(false);
+    file0["state"] = serde_json::json!("backing_up");
+    std::fs::write(&journal_path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    // The player created the file after the crash.
+    std::fs::write(&f.real, "Player created this\n").unwrap();
+
+    let report = run_at_startup(&f.ctx);
+
+    assert_eq!(
+        std::fs::read_to_string(&f.real).unwrap(),
+        "Player created this\n",
+        "a file the player made in the not-yet-swapped window was removed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&f.copy).unwrap(),
+        "Instance copy\n",
+        "the instance's copy was touched"
+    );
+    assert!(
+        report.warnings.is_empty(),
+        "nothing needs a hand: the session never swapped this file: {report:?}"
+    );
+}
+
+/// A backup is never written through a symlink retargeted since the swap: the link's target is
+/// recorded in the journal at swap time, and recovery refuses when it no longer matches.
+#[cfg(unix)]
+#[test]
+fn a_symlink_retarged_since_the_swap_is_refused_by_recovery() {
+    let f = user_files_fixture(None);
+    let user_root = f._user_data_dir.path().to_path_buf();
+    // The player's real file is a link to target A.
+    let target_a = user_root.join("target-a.txt");
+    std::fs::write(&target_a, "Player original\n").unwrap();
+    let _ = std::fs::remove_file(&f.real);
+    std::os::unix::fs::symlink(&target_a, &f.real).unwrap();
+
+    agora_core::game_user_files::swap_in(
+        &f.ctx,
+        "instance-a",
+        &f.def,
+        &StoreId::steam(),
+        &f.running_from,
+    )
+    .unwrap();
+    // The swap wrote through the link, and the journal recorded where it pointed.
+    assert_eq!(std::fs::read_to_string(&target_a).unwrap(), "Instance copy\n");
+    agora_core::game_user_files::record_process(&f.ctx, &f.def.id, &StoreId::steam(), dead_identity())
+        .unwrap();
+    let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
+    assert!(journal_path.exists());
+    // After the crash the player retargets the link to another file of theirs.
+    let target_b = user_root.join("target-b.txt");
+    std::fs::write(&target_b, "B's own bytes\n").unwrap();
+    std::fs::remove_file(&f.real).unwrap();
+    std::os::unix::fs::symlink(&target_b, &f.real).unwrap();
+
+    let report = run_at_startup(&f.ctx);
+
+    assert_eq!(
+        std::fs::read_to_string(&target_b).unwrap(),
+        "B's own bytes\n",
+        "recovery wrote the backup through the retargeted link"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target_a).unwrap(),
+        "Instance copy\n",
+        "recovery changed the old target too"
+    );
+    assert!(journal_path.exists(), "the journal is kept for a hand");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("is now a link to")),
+        "the refusal names the retargeted link: {report:?}"
+    );
+    assert!(report.actions.is_empty(), "{report:?}");
+}

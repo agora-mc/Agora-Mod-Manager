@@ -3572,6 +3572,99 @@ fn a_recovery_with_nothing_pending_changes_nothing() {
     assert_eq!(snapshot(&real_data(&f)), before);
 }
 
+/// Clears the run hook when dropped, so a panicking test cannot leak it into the next one.
+struct RunHookGuard;
+
+impl Drop for RunHookGuard {
+    fn drop(&mut self) {
+        swap::set_run_hook(None);
+    }
+}
+
+/// A recovery started while a swap run is live — after the engage and before the spawn, and
+/// again during the post-exit capture — cannot act on the run: the run holds the game/store
+/// user-files lock for the whole operation, and the startup pass takes that same lock with no
+/// wait, so it leaves the journal completely alone and reports the skip. The run then finishes
+/// normally, with the real Data byte for byte unchanged.
+#[test]
+fn a_startup_recovery_during_a_live_swap_run_leaves_the_operation_alone() {
+    let _swap = SwapTest::same_volume();
+    let _hook_guard = RunHookGuard;
+    let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let install = install_dir(&f);
+    let before = snapshot(&real_data(&f));
+    let journal_path = journal_file(&f);
+
+    let seen: Arc<Mutex<Vec<swap::RunHookPoint>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_hook = Arc::clone(&seen);
+    let journal_path_hook = journal_path.clone();
+    swap::set_run_hook(Some(Arc::new(move |ctx, journal, point| {
+        // The one startup pass, run from inside the live operation the way another Agora
+        // process runs it. It must not touch the run's journal, aside or copy.
+        let report = agora_core::startup_recovery::run_at_startup(ctx);
+        assert!(
+            report.actions.is_empty(),
+            "recovery acted on a live run at {point:?}: {report:?}"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("left alone") && w.contains("lock")),
+            "the skip is reported at {point:?}: {report:?}"
+        );
+        assert!(
+            journal_path_hook.exists(),
+            "the journal was removed under the live run at {point:?}"
+        );
+        assert!(
+            journal.aside.is_dir(),
+            "the real Data was put back under the live run at {point:?}"
+        );
+        assert!(
+            game_tool_copy::marker_matches(
+                &journal.real_data,
+                &journal.instance_id,
+                journal.copy_kind,
+                &journal.run
+            ),
+            "the copy was moved or discarded under the live run at {point:?}"
+        );
+        seen_hook.lock().unwrap().push(point);
+    })));
+
+    let outcome = f
+        .run_as("nemesis", &swap_launcher(&f), CaptureMode::Swap)
+        .unwrap();
+
+    assert!(outcome.promoted, "{outcome:?}");
+    assert!(
+        outcome.written.contains(&"Data/meshes/x.nif".to_string()),
+        "the run's own capture survived: {outcome:?}"
+    );
+    let fired = seen.lock().unwrap().clone();
+    assert!(
+        fired.contains(&swap::RunHookPoint::BeforeSpawn),
+        "the before-spawn window was exercised: {fired:?}"
+    );
+    assert!(
+        fired.contains(&swap::RunHookPoint::PostExitCapture),
+        "the post-exit capture window was exercised: {fired:?}"
+    );
+    assert_eq!(
+        snapshot(&real_data(&f)),
+        before,
+        "the real Data is byte for byte unchanged after the live run"
+    );
+    assert!(!journal_file(&f).exists(), "the journal is cleared by the run");
+    assert!(
+        names(&install)
+            .iter()
+            .all(|n| !n.starts_with(swap::ASIDE_PREFIX) && !n.starts_with(swap::COPY_PREFIX)),
+        "no aside or copy folder is left"
+    );
+}
+
 #[test]
 fn a_link_run_reports_what_the_tool_wrote_into_the_real_data_folder() {
     // Under link capture the tool writes into the real install, which the farm comparison cannot see.

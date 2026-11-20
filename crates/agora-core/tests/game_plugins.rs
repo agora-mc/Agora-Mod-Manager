@@ -887,14 +887,21 @@ fn a_session_left_behind_is_recovered_before_the_real_file_is_read() {
         std::fs::read_to_string(&real).unwrap(),
         "*OtherInstance.esp\r\n"
     );
-    // The process that swapped it in is gone too (the test process is not it).
+    // The process that swapped it in is gone too: the recorded starting identity is a dead
+    // pid (a real crash leaves the dead identity recorded; a journal with no identity at all
+    // has unknown liveness and is left for the explicit restore, not recovered automatically).
     let journal_path = h
         .ctx
         .paths
         .user_files_journal_path(h.def.id.as_str(), StoreId::steam().as_str());
     let mut journal: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&journal_path).unwrap()).unwrap();
-    journal["starting_launcher"] = serde_json::Value::Null;
+    journal["starting_launcher"] = serde_json::json!({
+        "pid": u32::MAX - 2,
+        "start_time": 5,
+        "expected_exe": null,
+        "job": null
+    });
     std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
 
     let inst = h.instance("recovering");
