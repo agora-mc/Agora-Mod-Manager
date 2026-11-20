@@ -374,12 +374,14 @@ fn recover_and_check(stages: &[Stage]) -> Vec<String> {
             Err(e) => {
                 let msg = e.to_string();
                 if !msg.contains("both changed since the swap") {
-                    bad.push(format!("the refusal does not say both sides changed: {msg}"));
+                    bad.push(format!(
+                        "the refusal does not say both sides changed: {msg}"
+                    ));
                 }
             }
-            Ok(_) => bad.push(
-                "the restore succeeded although both sides changed since the swap".into(),
-            ),
+            Ok(_) => {
+                bad.push("the restore succeeded although both sides changed since the swap".into())
+            }
         }
         for (i, st) in stages.iter().enumerate() {
             let real = std::fs::read(real_of(&h, i)).unwrap_or_default();
@@ -390,18 +392,17 @@ fn recover_and_check(stages: &[Stage]) -> Vec<String> {
                 ));
             }
             if refuses_both_changed(*st) {
-                let conflicts: Vec<PathBuf> = std::fs::read_dir(
-                    inst_of(&h, id, i).parent().unwrap(),
-                )
-                .unwrap()
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.contains(".agora-conflict-"))
-                })
-                .collect();
+                let conflicts: Vec<PathBuf> =
+                    std::fs::read_dir(inst_of(&h, id, i).parent().unwrap())
+                        .unwrap()
+                        .flatten()
+                        .map(|entry| entry.path())
+                        .filter(|path| {
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(|name| name.contains(".agora-conflict-"))
+                        })
+                        .collect();
                 if conflicts.len() != 1
                     || std::fs::read(&conflicts[0]).unwrap_or_default() != before[i].0
                 {

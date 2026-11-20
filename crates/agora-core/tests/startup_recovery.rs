@@ -1128,8 +1128,13 @@ fn both_sides_changed_since_the_swap_are_kept_as_a_conflict_copy_and_reported() 
         &f.running_from,
     )
     .unwrap();
-    agora_core::game_user_files::record_process(&f.ctx, &f.def.id, &StoreId::steam(), dead_identity())
-        .unwrap();
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
     let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
     assert!(journal_path.exists());
     assert_eq!(std::fs::read_to_string(&f.real).unwrap(), "Instance copy\n");
@@ -1196,8 +1201,13 @@ fn an_ancestor_directory_replaced_by_a_link_since_the_swap_is_refused_by_recover
         &f.running_from,
     )
     .unwrap();
-    agora_core::game_user_files::record_process(&f.ctx, &f.def.id, &StoreId::steam(), dead_identity())
-        .unwrap();
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
     let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
     assert!(journal_path.exists());
     assert_eq!(std::fs::read_to_string(&f.real).unwrap(), "Instance copy\n");
@@ -1216,8 +1226,13 @@ fn an_ancestor_directory_replaced_by_a_link_since_the_swap_is_refused_by_recover
         "recovery wrote the backup through the ancestor link"
     );
     assert_eq!(
-        std::fs::read_to_string(user_root.join("local-orig").join("Test Game").join("Plugins.txt"))
-            .unwrap(),
+        std::fs::read_to_string(
+            user_root
+                .join("local-orig")
+                .join("Test Game")
+                .join("Plugins.txt")
+        )
+        .unwrap(),
         "Instance copy\n",
         "the original location was changed"
     );
@@ -1251,13 +1266,23 @@ fn a_directory_link_deeper_in_the_chain_retarged_since_the_swap_is_refused_by_re
         &f.running_from,
     )
     .unwrap();
-    agora_core::game_user_files::record_process(&f.ctx, &f.def.id, &StoreId::steam(), dead_identity())
-        .unwrap();
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
     let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
     assert!(journal_path.exists());
     assert_eq!(
-        std::fs::read_to_string(user_root.join("realdir").join("Test Game").join("Plugins.txt"))
-            .unwrap(),
+        std::fs::read_to_string(
+            user_root
+                .join("realdir")
+                .join("Test Game")
+                .join("Plugins.txt")
+        )
+        .unwrap(),
         "Instance copy\n",
         "the swap wrote through the link chain"
     );
@@ -1280,8 +1305,13 @@ fn a_directory_link_deeper_in_the_chain_retarged_since_the_swap_is_refused_by_re
         "recovery wrote the backup through the retargeted inner link"
     );
     assert_eq!(
-        std::fs::read_to_string(user_root.join("realdir").join("Test Game").join("Plugins.txt"))
-            .unwrap(),
+        std::fs::read_to_string(
+            user_root
+                .join("realdir")
+                .join("Test Game")
+                .join("Plugins.txt")
+        )
+        .unwrap(),
         "Instance copy\n",
         "the old target was changed"
     );
@@ -1328,8 +1358,13 @@ fn a_file_link_deeper_in_the_chain_retarged_since_the_swap_is_refused_by_recover
         std::fs::read_to_string(&target1).unwrap(),
         "Instance copy\n"
     );
-    agora_core::game_user_files::record_process(&f.ctx, &f.def.id, &StoreId::steam(), dead_identity())
-        .unwrap();
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
     let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
     assert!(journal_path.exists());
     // After the crash the player retargets the inner link.

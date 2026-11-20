@@ -1553,8 +1553,7 @@ fn restore_journal_internal(
             // original or the backup's bytes: the entry is then only marked restored.
             let real_is_original = file.original_sha256.as_deref().is_some()
                 && real_hash.as_deref() == file.original_sha256.as_deref();
-            let real_matches_backup =
-                real_hash.is_some() && real_hash == backup_hash;
+            let real_matches_backup = real_hash.is_some() && real_hash == backup_hash;
             if !real_is_original && !real_matches_backup {
                 let real_changed = real_hash
                     .as_deref()
