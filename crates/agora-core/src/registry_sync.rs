@@ -775,26 +775,64 @@ fn registry_floor_path(app_data_dir: &Path) -> LauncherResult<PathBuf> {
     Ok(app_data_dir.join("registry.floor"))
 }
 
-fn read_floor_file(app_data_dir: &Path) -> Option<CachedStamp> {
-    let path = registry_floor_path(app_data_dir).ok()?;
-    let text = std::fs::read_to_string(&path).ok()?;
-    let mut fields = text.split_whitespace();
-    let built_at = fields.next()?.to_string();
-    let db_sha256 = fields.next()?.to_string();
-    if parse_utc(&built_at).is_none() || db_sha256.len() != 64 {
-        return None;
+fn floor_error(message: impl Into<String>) -> LauncherError {
+    LauncherError::Generic {
+        code: "ERR_REGISTRY_FLOOR".into(),
+        message: message.into(),
     }
-    Some(CachedStamp {
+}
+
+/// Read the durable floor. A missing file is an unset floor; an unreadable or
+/// malformed one is an error and must never be mistaken for "no floor", because
+/// that would drop rollback protection.
+fn read_floor_file(app_data_dir: &Path) -> LauncherResult<Option<CachedStamp>> {
+    let path = registry_floor_path(app_data_dir)?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(floor_error(format!(
+                "Could not read the catalog rollback floor: {error}."
+            )))
+        }
+    };
+    let mut fields = text.split_whitespace();
+    let built_at = fields
+        .next()
+        .ok_or_else(|| floor_error("The catalog rollback floor is empty."))?
+        .to_string();
+    let db_sha256 = fields
+        .next()
+        .ok_or_else(|| floor_error("The catalog rollback floor has no payload hash."))?
+        .to_string();
+    if parse_utc(&built_at).is_none() || db_sha256.len() != 64 {
+        return Err(floor_error("The catalog rollback floor is malformed."));
+    }
+    Ok(Some(CachedStamp {
         built_at,
         db_sha256,
-    })
+    }))
+}
+
+/// Before any trust statement is appended, capture the verified baseline of a
+/// pre-floor cache. Otherwise the append can revoke the installed bundle's
+/// signer, a failed swap leaves that bundle unverifiable, and the effective
+/// floor is lost with it. The floor is durable before the trust change.
+fn ensure_floor_baseline(app_data_dir: &Path, trust: &RegistryTrust) -> LauncherResult<()> {
+    if read_floor_file(app_data_dir)?.is_some() {
+        return Ok(());
+    }
+    if let Some(stamp) = read_cached_stamp(app_data_dir, trust) {
+        raise_floor(app_data_dir, &stamp.built_at, &stamp.db_sha256)?;
+    }
+    Ok(())
 }
 
 /// The effective rollback floor. A client with a pre-floor trust state takes it
 /// from the installed bundle when that bundle still verifies; otherwise the
 /// floor is unset and candidates are judged on their own signed stamps.
 fn durable_floor(app_data_dir: &Path, trust: &RegistryTrust) -> Option<CachedStamp> {
-    if let Some(floor) = read_floor_file(app_data_dir) {
+    if let Some(floor) = read_floor_file(app_data_dir).ok().flatten() {
         return Some(floor);
     }
     let bundle_path = paths::registry_bundle_path(app_data_dir).ok()?;
@@ -815,17 +853,16 @@ fn raise_floor(app_data_dir: &Path, built_at: &str, db_sha256: &str) -> Launcher
         code: "ERR_REGISTRY_STAMP_INVALID".into(),
         message: format!("The committed catalog's build stamp `{built_at}` cannot be read."),
     })?;
-    if let Some(current) = read_floor_file(app_data_dir) {
+    if let Some(current) = read_floor_file(app_data_dir)? {
         if parse_utc(&current.built_at).is_some_and(|time| time >= candidate) {
             return Ok(());
         }
     }
     let path = registry_floor_path(app_data_dir)?;
     write_atomic(&path, format!("{built_at} {db_sha256}\n").as_bytes()).map_err(|error| {
-        LauncherError::Generic {
-            code: "ERR_REGISTRY_FLOOR".into(),
-            message: format!("Could not save the catalog rollback floor: {error}."),
-        }
+        floor_error(format!(
+            "Could not save the catalog rollback floor: {error}."
+        ))
     })
 }
 
@@ -851,7 +888,10 @@ fn rollback_baseline(app_data_dir: &Path, trust: &RegistryTrust) -> Option<Cache
 /// Persist the keys a verified bundle introduced and the revocations a recovery
 /// key signed. Only complete lines are appended, and the file is never
 /// rewritten, so a crash cannot lose an earlier revocation. Duplicate lines are
-/// harmless.
+/// harmless. A write or flush error can leave some complete, verified entries
+/// behind and lose only the later ones: that is acceptable because every line
+/// is independently signed and verified, so a partial append never invents a
+/// trust fact and a later install can append the missing lines again.
 fn remember_bundle_trust(app_data_dir: &Path, verified: &VerifiedBundle) -> LauncherResult<()> {
     // Expiry is not a reason to skip a revocation: a retired key stays retired
     // even if the bundle that carried the statement has since expired.
@@ -1308,6 +1348,22 @@ fn unchanged_candidate(
 /// bundle is copied to `registry.bundle.prev` first. The rollback floor is
 /// raised after the rename. The readable database is a derived copy that the
 /// next open can repair.
+///
+/// If a swap fails after the trust append, the catalog can be left offline: the
+/// verified revocation is kept while the bundle it revoked is still current.
+/// That is deliberate — a genuine revocation must not be discarded to keep a
+/// retired signer usable — and the error says the trust update was kept and a
+/// reinstall or sync is needed.
+fn trust_kept_error(error: LauncherError) -> LauncherError {
+    let code = error.code();
+    LauncherError::Generic {
+        code,
+        message: format!(
+            "{error}. The catalog trust update was kept; reinstall or sync the catalog to restore it."
+        ),
+    }
+}
+
 fn install_bundle_bytes(
     app_data_dir: &Path,
     header: &CatalogHeader,
@@ -1321,6 +1377,10 @@ fn install_bundle_bytes(
     let trust = effective_trust(app_data_dir, trust);
     let payload = registry_bundle::verify_bundle(bundle_bytes, &trust).map_err(bundle_error)?;
 
+    // Capture the pre-existing verified baseline before changing trust: the
+    // append below may revoke the installed bundle's signer, so its stamp must
+    // already be durable. A malformed or unreadable floor refuses the install.
+    ensure_floor_baseline(app_data_dir, &trust)?;
     // Signed and verified trust facts only ever add, so writing them ahead of
     // the swap is always safe and no revocation can be lost by a later failure.
     remember_bundle_trust(app_data_dir, &payload)?;
@@ -1330,18 +1390,22 @@ fn install_bundle_bytes(
     if bundle_path.exists() {
         if let Ok(current) = std::fs::read(&bundle_path) {
             if registry_bundle::parse_bundle(&current).is_ok() {
-                write_atomic(&previous_path, &current).map_err(|error| LauncherError::Generic {
-                    code: "ERR_REGISTRY_WRITE".into(),
-                    message: format!("Could not keep the previous catalog: {error}."),
+                write_atomic(&previous_path, &current).map_err(|error| {
+                    trust_kept_error(LauncherError::Generic {
+                        code: "ERR_REGISTRY_WRITE".into(),
+                        message: format!("Could not keep the previous catalog: {error}."),
+                    })
                 })?;
             }
         }
     }
 
     // COMMIT: one rename replaces the current bundle.
-    write_atomic(&bundle_path, bundle_bytes).map_err(|error| LauncherError::Generic {
-        code: "ERR_REGISTRY_WRITE".into(),
-        message: format!("Could not install the catalog bundle: {error}."),
+    write_atomic(&bundle_path, bundle_bytes).map_err(|error| {
+        trust_kept_error(LauncherError::Generic {
+            code: "ERR_REGISTRY_WRITE".into(),
+            message: format!("Could not install the catalog bundle: {error}."),
+        })
     })?;
 
     // Post-commit, best-effort. The signature lives inside the bundle now, so
@@ -1358,7 +1422,7 @@ fn install_bundle_bytes(
         Some(&payload.payload),
         &trust,
     );
-    raise_floor(app_data_dir, &header.built_at, &header.db_sha256)?;
+    raise_floor(app_data_dir, &header.built_at, &header.db_sha256).map_err(trust_kept_error)?;
     Ok(())
 }
 
@@ -1403,7 +1467,9 @@ fn verify_bundle_file(
     match load_header(bundle_path, trust) {
         Ok(header) => match ensure_database(app_data_dir, bundle_path, &header, None, trust) {
             Ok(()) => {
-                if header.is_expired_at(Utc::now()) {
+                if below_floor(&header, app_data_dir, trust) {
+                    CachedRegistryIntegrity::Stale(floor_stale_message())
+                } else if header.is_expired_at(Utc::now()) {
                     CachedRegistryIntegrity::Stale(stale_message(&header))
                 } else {
                     CachedRegistryIntegrity::Verified
@@ -1484,6 +1550,22 @@ fn stale_message(header: &CatalogHeader) -> String {
     )
 }
 
+/// Whether a verified bundle's signed stamp is below the durable floor. The
+/// comparison is between parsed UTC instants, never between the stamp strings.
+fn below_floor(header: &CatalogHeader, app_data_dir: &Path, trust: &RegistryTrust) -> bool {
+    durable_floor(app_data_dir, trust).is_some_and(|floor| {
+        parse_utc(&header.built_at)
+            .zip(parse_utc(&floor.built_at))
+            .is_some_and(|(candidate, floor)| candidate < floor)
+    })
+}
+
+fn floor_stale_message() -> String {
+    "The cached catalog is older than a previously committed catalog. It is shown for browsing \
+     only; sync for a fresh catalog before installing or updating."
+        .to_string()
+}
+
 /// The signed build stamp and payload hash of the cached catalog, for the
 /// rollback check. The hash lets an equal stamp over different bytes be
 /// refused instead of silently replacing the current catalog.
@@ -1529,7 +1611,9 @@ fn cached_catalog_summary_with_trust(
         }
         return Some(CachedCatalogSummary {
             schema_version: Some(header.schema_version),
-            stale: header.is_expired_at(Utc::now()),
+            // A below-floor catalog is stale in the same user-facing sense as
+            // an expired one: it can be browsed but not used for installations.
+            stale: header.is_expired_at(Utc::now()) || below_floor(&header, app_data_dir, trust),
             expires_at: Some(header.expires_at),
         });
     }
@@ -1983,6 +2067,12 @@ fn open_bundle_once(
         code: "ERR_REGISTRY_SIGNATURE_INVALID".into(),
         message: format!("The catalog bundle could not be used: {error}."),
     })?;
+    if below_floor(&header, app_data_dir, trust) {
+        return Err(LauncherError::Generic {
+            code: "ERR_REGISTRY_ROLLBACK".into(),
+            message: floor_stale_message(),
+        });
+    }
     ensure_database(app_data_dir, bundle_path, &header, None, trust)?;
     let db_path =
         paths::registry_db_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
@@ -3314,6 +3404,80 @@ mod tests {
         assert_eq!(error.code(), "ERR_REGISTRY_ROLLBACK");
     }
 
+    /// A healthy open must not use a cached bundle below the durable floor, and
+    /// status shows the same stale state an expired catalog gets.
+    #[test]
+    fn a_bundle_below_the_floor_is_not_opened_and_looks_stale() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
+        let key = test_key(117);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db_with_built_at("2026-11-17T12:00:00+00:00");
+        let header = header_for(
+            &key,
+            &payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let bundle = signed_bundle(&key, &header, &payload);
+        install_bundle_bytes(dir.path(), &header, &bundle, &trust).unwrap();
+        set_cached_tag(&ls_path, &header.tag).unwrap();
+
+        // A signed older bundle is swapped in below the persisted floor.
+        let older_payload = sample_db_with_built_at("2026-11-15T12:00:00+00:00");
+        let older_header = header_for(
+            &key,
+            &older_payload,
+            "2026-11-15T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let older = signed_bundle(&key, &older_header, &older_payload);
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &older).unwrap();
+        fs::write(paths::registry_db_path(dir.path()).unwrap(), &older_payload).unwrap();
+
+        assert!(
+            open_verified_registry_with_trust(dir.path(), &trust).is_err(),
+            "a below-floor bundle must not be opened"
+        );
+        assert!(
+            get_status_with_trust(dir.path(), &ls_path, &trust).stale,
+            "a below-floor bundle must show the expired catalog's stale state"
+        );
+    }
+
+    /// Recovery compares the backup's stamp with the floor as an instant. This
+    /// stamp is textually later but an earlier moment, so it must not be restored.
+    #[test]
+    fn recovery_refuses_a_prev_below_the_floor_by_instant_not_text() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(118);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let header = header_for(
+            &key,
+            &payload,
+            "2026-11-16T13:00:00+02:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        fs::write(
+            paths::registry_bundle_previous_path(dir.path()).unwrap(),
+            signed_bundle(&key, &header, &payload),
+        )
+        .unwrap();
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), b"damaged").unwrap();
+        fs::write(
+            registry_floor_path(dir.path()).unwrap(),
+            format!("2026-11-16T12:00:00+00:00 {}\n", "0".repeat(64)),
+        )
+        .unwrap();
+
+        let result = verify_cached_registry_with_trust(dir.path(), &trust);
+        assert!(
+            !matches!(result, CachedRegistryIntegrity::Recovered(_)),
+            "13:00+02:00 is 11:00 UTC, below the floor: {result:?}"
+        );
+    }
+
     /// A local install contends on the same cross-process `RegistryUpdate` lock
     /// sync holds. While that lock is held, the local install must not commit.
     #[test]
@@ -3382,6 +3546,11 @@ mod tests {
         let error = install_bundle_bytes_checked(dir.path(), &candidate, &trust, "candidate")
             .expect_err("the commit must fail while the backup path is obstructed");
         assert_eq!(error.code(), "ERR_REGISTRY_WRITE");
+        assert!(
+            error.to_string().contains("trust update was kept")
+                && error.to_string().contains("reinstall or sync"),
+            "the failure must say the trust fact survived and how to repair: {error}"
+        );
 
         let trust_path = paths::registry_trust_state_path(dir.path()).unwrap();
         assert!(
@@ -3405,6 +3574,112 @@ mod tests {
         assert!(fs::read_to_string(&trust_path)
             .unwrap()
             .contains("v1 revoke"));
+    }
+
+    /// A pre-floor cache must persist its baseline before the append revokes its
+    /// signer. If the swap then fails, an older bundle from a still-trusted key
+    /// must still be refused by the floor.
+    #[test]
+    fn a_pre_floor_baseline_survives_a_failed_revoking_swap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stolen = test_key(112);
+        let recovery = test_key(113);
+        let replacement = test_key(114);
+        let trusted = test_key(115);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&stolen)),
+            (RegistryKeyRole::Primary, test_public(&replacement)),
+            (RegistryKeyRole::Primary, test_public(&trusted)),
+        ]);
+        assert!(!registry_floor_path(dir.path()).unwrap().exists());
+
+        let payload = sample_db_with_built_at("2026-11-16T12:00:00+00:00");
+        let current_header = header_for(
+            &stolen,
+            &payload,
+            "2026-11-16T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let current = signed_bundle(&stolen, &current_header, &payload);
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &current).unwrap();
+
+        let mut revoking = header_for(
+            &replacement,
+            &payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        revoking.revocations.push(revocation(&recovery, &stolen));
+        let revoking_bytes = signed_bundle(&replacement, &revoking, &payload);
+        let prev = paths::registry_bundle_previous_path(dir.path()).unwrap();
+        fs::create_dir_all(&prev).unwrap();
+        install_bundle_bytes_checked(dir.path(), &revoking_bytes, &trust, "revoking")
+            .expect_err("the obstructed swap must fail");
+
+        // The floor was captured from the installed bundle before its signer was
+        // revoked, so it outlives the failed swap.
+        let floor = read_floor_file(dir.path()).unwrap().unwrap();
+        assert_eq!(floor.built_at, "2026-11-16T12:00:00+00:00");
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            current
+        );
+
+        let older_payload = sample_db_with_built_at("2026-11-15T12:00:00+00:00");
+        let older = header_for(
+            &trusted,
+            &older_payload,
+            "2026-11-15T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let error = install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&trusted, &older, &older_payload),
+            &trust,
+            "older",
+        )
+        .expect_err("the persisted floor must refuse an older signed bundle");
+        assert_eq!(error.code(), "ERR_REGISTRY_ROLLBACK");
+    }
+
+    /// A floor read error (as opposed to an absent floor) must refuse an install.
+    #[test]
+    fn an_unreadable_floor_refuses_an_install() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(116);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let header = fresh_header(&key, &payload);
+        let current = signed_bundle(&key, &header, &payload);
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &current).unwrap();
+        fs::create_dir_all(registry_floor_path(dir.path()).unwrap()).unwrap();
+
+        let error = install_bundle_bytes_checked(dir.path(), &current, &trust, "candidate")
+            .expect_err("a floor read error is not an absent floor");
+        assert_eq!(error.code(), "ERR_REGISTRY_FLOOR");
+    }
+
+    /// A malformed but readable floor is an error, not an unset floor: treating
+    /// it as unset would silently drop rollback protection.
+    #[test]
+    fn a_malformed_floor_refuses_an_install() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(119);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let header = fresh_header(&key, &payload);
+        let bundle = signed_bundle(&key, &header, &payload);
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &bundle).unwrap();
+        fs::write(
+            registry_floor_path(dir.path()).unwrap(),
+            "not a stamp not a hash\n",
+        )
+        .unwrap();
+
+        let error = install_bundle_bytes_checked(dir.path(), &bundle, &trust, "candidate")
+            .expect_err("a malformed floor must refuse the install");
+        assert_eq!(error.code(), "ERR_REGISTRY_FLOOR");
     }
 
     /// Offsets are compared as UTC instants, not as text. 11:00-02:00 is 13:00
