@@ -202,6 +202,7 @@ fn a_second_view_is_refused_by_the_first_ones_open_session() {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as i64,
+            plain: false,
         },
     )
     .unwrap();
