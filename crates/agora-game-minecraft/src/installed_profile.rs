@@ -613,6 +613,9 @@ fn validate_library_url(
     profile_path: &Path,
     lib_name: &str,
 ) -> Result<(), ProfileIssue> {
+    if url.trim().is_empty() {
+        return Ok(());
+    }
     if !url.starts_with("https://") {
         return Err(ProfileIssue::corrupt(
             Some(profile_path.to_path_buf()),
@@ -1499,6 +1502,44 @@ mod tests {
     use agora_core::error::LauncherError;
     use serde_json::json;
     use std::fs;
+
+    #[test]
+    fn an_installer_produced_library_with_an_empty_url_is_not_a_download() {
+        let value = json!({
+            "id": "forge-1.21.1-52.1.21",
+            "inheritsFrom": "1.21.1",
+            "mainClass": "net.minecraftforge.Main",
+            "type": "release",
+            "libraries": [
+                {
+                    "name": "net.minecraftforge:forge:1.21.1-52.1.21:client",
+                    "downloads": {
+                        "artifact": {
+                            "path": "net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-client.jar",
+                            "url": "",
+                            "sha1": "0123456789abcdef0123456789abcdef01234567"
+                        }
+                    }
+                }
+            ],
+            "arguments": { "jvm": [], "game": [] }
+        });
+        let info: VersionInfo = serde_json::from_value(value).unwrap();
+        let path = Path::new("versions/forge-1.21.1-52.1.21/forge-1.21.1-52.1.21.json");
+        assert!(
+            validate_loader_profile(&info, path, "forge-1.21.1-52.1.21", "1.21.1").is_ok(),
+            "an empty URL means the installer produced the artifact; it is not a download"
+        );
+
+        let mut http = info.clone();
+        http.libraries[0].downloads.as_mut().unwrap().artifact.as_mut().unwrap().url =
+            "http://maven.minecraftforge.net/forge-client.jar".into();
+        let err = validate_loader_profile(&http, path, "forge-1.21.1-52.1.21", "1.21.1").unwrap_err();
+        assert!(
+            err.reasons.iter().any(|reason| reason.contains("non-HTTPS URL")),
+            "a non-empty non-HTTPS URL must still be refused: {err:?}"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Temp fixture helpers
