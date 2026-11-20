@@ -2645,7 +2645,7 @@ fn find_import_quarantine(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("the staging folder could not be read ({error})")),
     };
-    let mut owned: Vec<PathBuf> = read
+    let named: Vec<PathBuf> = read
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
@@ -2653,14 +2653,32 @@ fn find_import_quarantine(
                 .and_then(|name| name.to_str())
                 .and_then(|name| name.strip_prefix(&prefix))
                 .is_some_and(|suffix| Uuid::parse_str(suffix).is_ok())
-                && import_owns(path, job_id)
         })
         .collect();
+    let format_paths = |paths: &[PathBuf]| {
+        paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let owned: Vec<PathBuf> = named
+        .iter()
+        .filter(|path| import_owns(path, job_id))
+        .cloned()
+        .collect();
     match owned.len() {
-        0 => Ok(None),
-        1 => Ok(Some(owned.remove(0))),
+        0 if named.is_empty() => Ok(None),
+        0 => Err(format!(
+            "quarantine folders exist for instance {instance_id} but none is marked as this \
+             job's ({}); none was touched",
+            format_paths(&named)
+        )),
+        1 => Ok(Some(owned[0].clone())),
         _ => Err(format!(
-            "more than one quarantine folder matches instance {instance_id}; none was touched"
+            "more than one quarantine folder is marked as this job's for instance {instance_id} \
+             ({}); none was touched",
+            format_paths(&owned)
         )),
     }
 }
@@ -4252,6 +4270,49 @@ name=Dup Instance
         assert!(
             warnings.iter().any(|w| w.contains("left alone")),
             "the refusal is reported: {warnings:?}"
+        );
+    }
+
+    /// The ambiguous branch must name the candidate folders, so a person can see what to keep or
+    /// remove instead of being told only that there was more than one.
+    #[test]
+    fn test_find_import_quarantine_lists_candidates_when_ambiguous() {
+        let ctx = test_ctx();
+        let first = ctx
+            .paths
+            .staging_root()
+            .join(format!(".agora-quarantine-multi-{}", Uuid::new_v4()));
+        let second = ctx
+            .paths
+            .staging_root()
+            .join(format!(".agora-quarantine-multi-{}", Uuid::new_v4()));
+        for dir in [&first, &second] {
+            std::fs::create_dir_all(dir).unwrap();
+            mark_owner(dir, "multi-job");
+        }
+
+        let error = find_import_quarantine(&ctx.paths, "multi", "multi-job").unwrap_err();
+
+        assert!(error.contains(first.to_string_lossy().as_ref()), "{error}");
+        assert!(error.contains(second.to_string_lossy().as_ref()), "{error}");
+    }
+
+    /// Candidate folders that carry no marker for this job are ambiguous too, and are reported
+    /// with their paths rather than being silently ignored.
+    #[test]
+    fn test_find_import_quarantine_lists_unowned_candidates() {
+        let ctx = test_ctx();
+        let candidate = ctx
+            .paths
+            .staging_root()
+            .join(format!(".agora-quarantine-unowned-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&candidate).unwrap();
+
+        let error = find_import_quarantine(&ctx.paths, "unowned", "unowned-job").unwrap_err();
+
+        assert!(
+            error.contains(candidate.to_string_lossy().as_ref()),
+            "{error}"
         );
     }
 
