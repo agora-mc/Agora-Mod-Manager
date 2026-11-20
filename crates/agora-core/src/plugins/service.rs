@@ -25,17 +25,17 @@ use agora_plugin_api::contributions::{
     LaunchCheckFailure, ReplaceableSurface, SettingDefinition, ViewSource, MAX_LAUNCH_CHECK_MS,
 };
 use agora_plugin_api::diagnostics::{DiagnosticReport, RepairAction, RepairProposal, Severity};
-use agora_plugin_api::distribution::{Release, UpdateDocument};
+use agora_plugin_api::distribution::{Release, UpdateDocument, UPDATE_SOURCE_FILENAME};
 use agora_plugin_api::dto::ViewModel;
 use agora_plugin_api::error::{PluginError, PluginErrorCode};
 use agora_plugin_api::host::{ActivationRequest, GameReads, HostBridge, ScriptHost, StoredBlobs};
-use agora_plugin_api::manifest::{ActivationEvent, PluginId, PluginManifest};
+use agora_plugin_api::manifest::{ActivationEvent, PluginId, PluginManifest, MANIFEST_FILENAME};
 use agora_plugin_api::protocol::{HostRequest, HostResponse, LogLevel};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// The emergency stop: while it is engaged, no plugin script runs, official or
 /// community. Default **not engaged**; a plugin's scripts then run if the user
@@ -166,10 +166,13 @@ pub struct PluginSummary {
     pub official: super::official::OfficialStatus,
     /// The plugin has code (an entrypoint). A data-only plugin runs nothing.
     pub runs_code: bool,
-    /// The user allowed this plugin's code to run. Always `false` for a
-    /// data-only plugin. Independent of every other plugin, and of the
-    /// emergency stop, which overrides it while engaged.
+    /// The user allowed this plugin's code to run and the code on disk is what
+    /// they allowed. Always `false` for a data-only plugin. Independent of every
+    /// other plugin, and of the emergency stop, which overrides it while engaged.
     pub scripts_allowed: bool,
+    /// The Code column's label, including why an earlier answer no longer
+    /// covers the installed code. Uses the same consent check as the runtime.
+    pub scripts_consent_text: String,
 }
 
 /// The outcome of the most recent update check, for display.
@@ -320,6 +323,131 @@ impl LaunchCheckOutcome {
 // Shared state
 // ---------------------------------------------------------------------------
 
+/// One code file's identity, as seen without reading its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodeFileId {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+/// A digest memo, valid only while the installed code still has these identities.
+#[derive(Debug, Clone)]
+struct CodeIdentityMemo {
+    files: BTreeMap<String, CodeFileId>,
+    digest: Option<String>,
+}
+
+/// The answer to "may the code on disk run?", before the emergency stop and
+/// official standing are taken into account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeConsentState {
+    NoCode,
+    NotAnswered,
+    Allowed,
+    Stale,
+    Uncheckable,
+}
+
+impl CodeConsentState {
+    /// One classifier for the gate, the refusal message and the manager's list:
+    /// a stale answer is a different answer from one that was never given.
+    fn classify(answered: Option<bool>, consented: Option<&str>, current: Option<&str>) -> Self {
+        if answered != Some(true) {
+            return Self::NotAnswered;
+        }
+        if consented == current {
+            Self::Allowed
+        } else {
+            Self::Stale
+        }
+    }
+
+    fn permitted(self) -> bool {
+        matches!(self, Self::NoCode | Self::Allowed)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NoCode => "none",
+            Self::NotAnswered => "not allowed",
+            Self::Allowed => "allowed",
+            Self::Stale => "consent needed again (code changed)",
+            Self::Uncheckable => "could not tell (code not verified)",
+        }
+    }
+}
+
+/// Snapshot the identity of every file that `install::script_digest` hashes,
+/// excluding the same two host metadata files. Reading metadata is cheap; the
+/// bytes are only read on a cache miss. An unreadable file is an error, so a
+/// memo is never trusted on a guess.
+fn code_identity(plugin_dir: &Path) -> LauncherResult<BTreeMap<String, CodeFileId>> {
+    fn collect(
+        root: &Path,
+        dir: &Path,
+        out: &mut BTreeMap<String, CodeFileId>,
+    ) -> LauncherResult<()> {
+        let read = std::fs::read_dir(dir).map_err(|e| LauncherError::Generic {
+            code: "ERR_PLUGIN_IO".into(),
+            message: format!("could not read {}: {e}", dir.display()),
+        })?;
+        for item in read {
+            let item = item.map_err(|e| LauncherError::Generic {
+                code: "ERR_PLUGIN_IO".into(),
+                message: format!("could not read {}: {e}", dir.display()),
+            })?;
+            let path = item.path();
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|_| LauncherError::Generic {
+                    code: "ERR_PLUGIN_IO".into(),
+                    message: "a plugin file is outside its folder".into(),
+                })?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let meta = std::fs::symlink_metadata(&path).map_err(|e| LauncherError::Generic {
+                code: "ERR_PLUGIN_IO".into(),
+                message: format!("could not inspect {}: {e}", path.display()),
+            })?;
+            if meta.is_dir() {
+                collect(root, &path, out)?;
+                continue;
+            }
+            if rel == MANIFEST_FILENAME || rel == UPDATE_SOURCE_FILENAME {
+                continue;
+            }
+            // A link inside the package resolves to a file the digest hashes,
+            // so follow it for identity too: changing its target must show up.
+            let identity = if meta.file_type().is_symlink() {
+                std::fs::metadata(&path).ok()
+            } else {
+                Some(meta)
+            };
+            let Some(identity) = identity else {
+                out.insert(
+                    rel,
+                    CodeFileId {
+                        len: 0,
+                        modified: None,
+                    },
+                );
+                continue;
+            };
+            out.insert(
+                rel,
+                CodeFileId {
+                    len: identity.len(),
+                    modified: identity.modified().ok(),
+                },
+            );
+        }
+        Ok(())
+    }
+    let mut out = BTreeMap::new();
+    collect(plugin_dir, plugin_dir, &mut out)?;
+    Ok(out)
+}
+
 pub(super) struct Inner {
     pub(super) ctx: Ctx,
     host: Arc<dyn ScriptHost>,
@@ -334,6 +462,10 @@ pub(super) struct Inner {
     /// the last `reload`. Read by `list`, so showing the manager does not
     /// re-verify the registry on every render.
     official: RwLock<BTreeMap<String, super::official::OfficialStatus>>,
+    /// Last verified code digest per plugin, with the file identities it was
+    /// computed from. Bounded by the number of installed plugins; re-hashed
+    /// whenever any identity differs and on activation.
+    code_identities: RwLock<BTreeMap<String, CodeIdentityMemo>>,
 }
 
 impl Inner {
@@ -581,6 +713,7 @@ impl PluginService {
             logs_root,
             registry_trust,
             official: RwLock::new(BTreeMap::new()),
+            code_identities: RwLock::new(BTreeMap::new()),
         });
         let service = Self {
             bus: PluginEventBus::new(subscriptions, host),
@@ -692,7 +825,8 @@ impl PluginService {
     }
 
     /// Whether this plugin's code may run right now: the emergency stop is not
-    /// engaged, and either the plugin has no code or the user allowed it.
+    /// engaged, and either the plugin has no code or the user allowed the code
+    /// that is actually on disk.
     ///
     /// Data-only plugins return `true`: they run nothing, so there is nothing to
     /// allow or stop. Used for every decision about starting or calling a script.
@@ -724,12 +858,71 @@ impl PluginService {
         if status_forbids_scripts {
             return false;
         }
-        self.inner
-            .conn()
-            .and_then(|conn| store::script_consent(&conn, plugin_id))
-            .map(|consent| consent == Some(true))
-            // Cannot read the choice: the user has not been shown to allow it.
-            .unwrap_or(false)
+        self.code_consent_state(plugin_id).permitted()
+    }
+
+    /// The digest of the code now installed, memoised by file identity. Identity
+    /// is captured before hashing so a change during the hash is caught on the
+    /// next call rather than hidden by a memo recorded from the older snapshot.
+    fn code_digest_for(
+        &self,
+        plugin_id: &PluginId,
+        manifest: &PluginManifest,
+        install_dir: &Path,
+    ) -> LauncherResult<Option<String>> {
+        let identity = code_identity(install_dir)?;
+        if let Ok(cache) = self.inner.code_identities.read() {
+            if cache
+                .get(plugin_id.as_str())
+                .is_some_and(|memo| memo.files == identity)
+            {
+                return Ok(cache[plugin_id.as_str()].digest.clone());
+            }
+        }
+        let digest = install::script_digest(manifest, install_dir)?;
+        if let Ok(mut cache) = self.inner.code_identities.write() {
+            cache.insert(
+                plugin_id.as_str().to_string(),
+                CodeIdentityMemo {
+                    files: identity,
+                    digest: digest.clone(),
+                },
+            );
+        }
+        Ok(digest)
+    }
+
+    /// The consent decision shared by the runtime gate, the refusal text and
+    /// the manager's list. One classifier, one digest (memoised), one answer.
+    fn code_consent_state(&self, plugin_id: &PluginId) -> CodeConsentState {
+        let Some(record) = self.inner.record(plugin_id) else {
+            return CodeConsentState::Uncheckable;
+        };
+        if record.manifest.is_declarative_only() {
+            return CodeConsentState::NoCode;
+        }
+        let Ok(conn) = self.inner.conn() else {
+            return CodeConsentState::Uncheckable;
+        };
+        let Ok(answered) = store::script_consent(&conn, plugin_id) else {
+            return CodeConsentState::Uncheckable;
+        };
+        if answered != Some(true) {
+            return CodeConsentState::NotAnswered;
+        }
+        let Ok(consented) = store::script_consent_code_hash(&conn, plugin_id) else {
+            return CodeConsentState::Uncheckable;
+        };
+        let Ok(current) = self.code_digest_for(plugin_id, &record.manifest, &record.install_dir)
+        else {
+            return CodeConsentState::Uncheckable;
+        };
+        CodeConsentState::classify(answered, consented.as_deref(), current.as_deref())
+    }
+
+    /// Whether the stored yes was given for code other than what is on disk now.
+    fn code_consent_is_stale(&self, plugin_id: &PluginId) -> bool {
+        self.code_consent_state(plugin_id) == CodeConsentState::Stale
     }
 
     /// Allow or disallow one plugin's scripts. Independent per plugin and
@@ -835,13 +1028,17 @@ impl PluginService {
             .read()
             .map(|statuses| statuses.clone())
             .unwrap_or_default();
-        let consent = self.script_consent_for_display();
+        let consent = self.code_consent_for_display();
         resolution
             .plugins
             .iter()
             .map(|resolved| {
                 let id = resolved.id().clone();
                 let manifest = &resolved.record.manifest;
+                let code_state = consent
+                    .get(id.as_str())
+                    .copied()
+                    .unwrap_or(CodeConsentState::Uncheckable);
                 PluginSummary {
                     id: id.to_string(),
                     name: manifest.name.clone(),
@@ -879,30 +1076,58 @@ impl PluginService {
                         .cloned()
                         .unwrap_or(super::official::OfficialStatus::Community),
                     runs_code: !manifest.is_declarative_only(),
-                    scripts_allowed: !manifest.is_declarative_only()
-                        && consent.get(id.as_str()).copied() == Some(true),
+                    scripts_allowed: !manifest.is_declarative_only() && code_state.permitted(),
+                    scripts_consent_text: code_state.label().to_string(),
                 }
             })
             .collect()
     }
 
-    /// The recorded script choices, keyed by plugin id.
-    ///
-    /// Unreadable reads as "nobody allowed anything", which shows scripts as not
-    /// allowed: the safe direction for a display, and `scripts_permitted` does
-    /// its own read.
-    fn script_consent_for_display(&self) -> BTreeMap<String, bool> {
-        match self
-            .inner
-            .conn()
-            .and_then(|conn| store::list_script_consent(&conn))
-        {
-            Ok(consent) => consent,
+    /// Consent states for every installed plugin, keyed by id. The answers and
+    /// their digests are read in one query each rather than per row, then each
+    /// code identity goes through the same memoised digest as the runtime gate.
+    /// An unreadable answer is Uncheckable, which shows no permission.
+    #[allow(clippy::type_complexity)]
+    fn code_consent_for_display(&self) -> BTreeMap<String, CodeConsentState> {
+        let Ok(conn) = self.inner.conn() else {
+            return BTreeMap::new();
+        };
+        let answers = match store::list_script_consent(&conn) {
+            Ok(answers) => answers,
             Err(e) => {
                 eprintln!("[plugins] could not read script choices: {e}");
-                BTreeMap::new()
+                return BTreeMap::new();
             }
+        };
+        let hashes = match store::list_script_consent_code_hashes(&conn) {
+            Ok(hashes) => hashes,
+            Err(e) => {
+                eprintln!("[plugins] could not read consented code digests: {e}");
+                return BTreeMap::new();
+            }
+        };
+        let Ok(resolution) = self.inner.resolution.read() else {
+            return BTreeMap::new();
+        };
+        let mut out = BTreeMap::new();
+        for resolved in &resolution.plugins {
+            let id = resolved.id();
+            let manifest = &resolved.record.manifest;
+            let state = if manifest.is_declarative_only() {
+                CodeConsentState::NoCode
+            } else {
+                let answered = answers.get(id.as_str()).copied();
+                let consented = hashes.get(id.as_str()).and_then(|hash| hash.as_deref());
+                match self.code_digest_for(id, manifest, &resolved.record.install_dir) {
+                    Ok(current) => {
+                        CodeConsentState::classify(answered, consented, current.as_deref())
+                    }
+                    Err(_) => CodeConsentState::Uncheckable,
+                }
+            };
+            out.insert(id.as_str().to_string(), state);
         }
+        out
     }
 
     /// Pinned update sources and last check results, keyed by plugin id.
@@ -2190,10 +2415,16 @@ impl PluginService {
         if self.inner.host.is_active(plugin_id) {
             return Ok(());
         }
+        // The first check after an activation always hashes the code that is
+        // being loaded, rather than trusting a memo from an earlier session of
+        // this process.
+        if let Ok(mut cache) = self.inner.code_identities.write() {
+            cache.remove(plugin_id.as_str());
+        }
         // The one place a script runtime starts. A data-only plugin returned
         // above and needs neither the user's permission nor the stop to be off.
         if !self.scripts_permitted(plugin_id) {
-            return Err(self.scripts_refused());
+            return Err(self.scripts_refused(plugin_id));
         }
 
         let settings = self.settings_snapshot(plugin_id, &record);
@@ -2604,20 +2835,22 @@ impl PluginService {
     }
 
     /// Why a script was refused, in words for the person who has to fix it.
-    fn scripts_refused(&self) -> PluginError {
-        PluginError::new(
-            PluginErrorCode::NotActivated,
-            if self.emergency_stop_engaged() {
-                "All plugin code is stopped (emergency stop)"
-            } else {
-                "This plugin has not been allowed to run code"
-            },
-        )
+    fn scripts_refused(&self, plugin_id: &PluginId) -> PluginError {
+        let reason = if self.emergency_stop_engaged() {
+            "All plugin code is stopped (emergency stop)".to_string()
+        } else if self.code_consent_is_stale(plugin_id) {
+            format!(
+                "`{plugin_id}`'s code changed after you consented to it. Consent again to the new code before it can run."
+            )
+        } else {
+            format!("`{plugin_id}` has not been allowed to run code")
+        };
+        PluginError::new(PluginErrorCode::NotActivated, reason)
     }
 
     fn ensure_running(&self, plugin_id: &PluginId) -> Result<(), PluginError> {
         if !self.scripts_permitted(plugin_id) {
-            return Err(self.scripts_refused());
+            return Err(self.scripts_refused(plugin_id));
         }
         if self.inner.host.is_active(plugin_id) {
             return Ok(());
@@ -2718,7 +2951,7 @@ impl PluginService {
         if !self.scripts_permitted(plugin_id) {
             return Err(LauncherError::Generic {
                 code: "ERR_PLUGIN_DISABLED".into(),
-                message: self.scripts_refused().message,
+                message: self.scripts_refused(plugin_id).message,
             });
         }
         for action in &proposal.actions {

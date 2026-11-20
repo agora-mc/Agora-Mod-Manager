@@ -783,6 +783,7 @@ agora plugin set <PLUGIN_ID> <KEY> <VALUE>
 agora plugin check-update [PLUGIN_ID]
 agora plugin update <PLUGIN_ID>
 agora plugin update <PLUGIN_ID> --yes
+agora plugin update <PLUGIN_ID> --allow-scripts
 agora plugin keygen --out <PATH> --key-id <ID>
 agora plugin sign <DOCUMENT> --key <PATH> --key-id <ID>
 ```
@@ -879,6 +880,8 @@ agora pack update <INSTANCE> <MRPACK> --yes
 `plugin check-update` fetches a plugin's signed update document and reports what it means. It downloads only the metadata, never a package. With no plugin id it checks everything installed, and reports plugins with no update source rather than skipping them silently. The result distinguishes cases that a single "up to date" would blur together: a newer release that needs a newer Agora is reported as exactly that, and an installed version ahead of what the publisher lists is reported rather than downgraded.
 
 `plugin update` applies what the publisher is offering. It re-checks rather than trusting an earlier result, downloads the package, verifies it against the size and SHA-256 in the signed document, and then goes through the same install path a manual install uses. A release asking for capabilities or network hosts the installed version was not granted stops and prints what is new; `--yes` accepts that. Development folders are never updated.
+
+`--yes` confirms capabilities and the release, but never allows code. If the new version brings new or changed scripts, its code is installed but does not run until you allow it separately: re-run with `--allow-scripts`, or use `plugin scripts <PLUGIN_ID> allow`. An update that is only about code can be applied with `--yes` alone; the command tells you which flag allows the scripts. Consent is bound to the code you were shown, so an edit to a script on disk also stops it until you allow the new code.
 
 Both require the plugin system to be on. Nothing contacts a publisher until you ask it to, or until you turn on automatic checking, which is off by default.
 

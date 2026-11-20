@@ -2275,6 +2275,128 @@ async fn an_allowed_scripted_plugin_runs_and_turning_it_off_stops_it() {
 }
 
 #[tokio::test]
+async fn a_community_script_changed_after_consent_is_refused() {
+    let world = World::new();
+    world
+        .service
+        .install_package_bytes(&script_zip(COMMUNITY_SCRIPT, "1.0.0"), true)
+        .unwrap();
+    world.service.activate_all().unwrap();
+    assert!(world.running(COMMUNITY_SCRIPT));
+
+    // The answer was given for the previewed package. A file changed on disk since
+    // is new code, which the player has not consented to.
+    std::fs::write(
+        world.packages_root().join(COMMUNITY_SCRIPT).join("main.js"),
+        b"export function noop() { return 2; }\n",
+    )
+    .unwrap();
+
+    assert!(
+        !world
+            .service
+            .scripts_permitted(&plugin_id(COMMUNITY_SCRIPT)),
+        "changed code still passes the consent gate"
+    );
+    world.stop_everything();
+    let error = world
+        .service
+        .activate(&plugin_id(COMMUNITY_SCRIPT))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(COMMUNITY_SCRIPT),
+        "the refusal must name the plugin: {error}"
+    );
+    assert!(
+        error.contains("allowed again") || error.contains("consent"),
+        "the refusal must say consent is needed for the new code: {error}"
+    );
+}
+
+/// A few megabytes of modules, the shape a large plugin such as LOOT actually
+/// installs. Prints the cost of two successive consent checks so the effect of
+/// the per-process code-identity memo can be measured; no timing assertion,
+/// since machines differ.
+#[test]
+fn measure_consent_check_cost_on_a_large_plugin() {
+    let world = World::new();
+    // Varied text, so the package does not trip the zip-bomb expansion limit.
+    let megabyte: String = (0..131_072).map(|i| format!("{i:08x}")).collect();
+    let files: Vec<(&str, &str)> = vec![
+        ("mod-a.js", megabyte.as_str()),
+        ("mod-b.js", megabyte.as_str()),
+        ("mod-c.js", megabyte.as_str()),
+    ];
+    let zip = script_zip_with_files(COMMUNITY_SCRIPT, "1.0.0", &files);
+    world.service.install_package_bytes(&zip, true).unwrap();
+    let id = plugin_id(COMMUNITY_SCRIPT);
+
+    let first = std::time::Instant::now();
+    let allowed_first = world.service.scripts_permitted(&id);
+    let warm = first.elapsed();
+
+    // Change a modification time only: the next check must re-hash every file
+    // even though no content changed, which measures the unmemoised cost.
+    let module = world
+        .packages_root()
+        .join(COMMUNITY_SCRIPT)
+        .join("mod-a.js");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&module)
+        .unwrap();
+    file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))
+        .unwrap();
+    let second = std::time::Instant::now();
+    let allowed_second = world.service.scripts_permitted(&id);
+    let rehashed = second.elapsed();
+
+    let third = std::time::Instant::now();
+    let allowed_third = world.service.scripts_permitted(&id);
+    let warm_again = third.elapsed();
+
+    eprintln!(
+        "consent check on {} bytes of code: memo hit {warm:?}, after identity change (re-hash) {rehashed:?}, memo hit again {warm_again:?}; allowed {allowed_first}/{allowed_second}/{allowed_third}",
+        zip.len()
+    );
+    assert!(allowed_first && allowed_second && allowed_third);
+}
+
+#[test]
+fn a_same_length_script_edit_is_caught_on_the_very_next_call() {
+    let world = World::new();
+    world
+        .service
+        .install_package_bytes(&script_zip(COMMUNITY_SCRIPT, "1.0.0"), true)
+        .unwrap();
+    let id = plugin_id(COMMUNITY_SCRIPT);
+    assert!(world.service.scripts_permitted(&id));
+
+    let main = world.packages_root().join(COMMUNITY_SCRIPT).join("main.js");
+    assert_eq!(
+        std::fs::read(&main).unwrap(),
+        b"export function noop() { return 1; }\n"
+    );
+    // Same length, so only the identity (mtime) can reveal the change to a
+    // memo backed by length and modification time.
+    std::fs::write(&main, b"export function noop() { return 2; }\n").unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&main).unwrap();
+    file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))
+        .unwrap();
+
+    assert!(
+        !world.service.scripts_permitted(&id),
+        "the memo hid a same-length edit on disk"
+    );
+    let error = world.service.activate(&id).unwrap_err().to_string();
+    assert!(
+        error.contains(COMMUNITY_SCRIPT),
+        "the refusal names the plugin: {error}"
+    );
+}
+
+#[tokio::test]
 async fn the_emergency_stop_stops_every_script_and_data_only_plugins_still_load() {
     let world = world_with_script_plugins().await;
     world.service.activate_all().unwrap();

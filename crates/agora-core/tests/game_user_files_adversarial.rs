@@ -436,3 +436,56 @@ fn probe_restore_without_a_session_is_harmless() {
     // Either Ok with nothing restored or a clear "nothing to restore"; never a panic.
     let _ = r;
 }
+
+#[test]
+fn a_failed_swap_whose_restore_fails_does_not_strand_the_starting_mark() {
+    let h = TestHarness::new();
+    let def = test_skyrim_definition();
+
+    // A directory where the player's file should be fails the swap on read. It fails the
+    // restore's read too, so `swap_in` returns an error and deliberately keeps the journal.
+    let real = h
+        .local_dir()
+        .join("Skyrim Special Edition")
+        .join("Plugins.txt");
+    std::fs::create_dir_all(&real).unwrap();
+    let copy = h
+        .instance_dir("stranded-mark")
+        .join("user")
+        .join("Plugins.txt");
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::write(&copy, "instance\n").unwrap();
+
+    let error = swap_in(
+        &h.ctx,
+        "stranded-mark",
+        &def,
+        &StoreId::steam(),
+        &h.running_from,
+    )
+    .expect_err("a directory where a file is expected fails the swap and its restore");
+    assert!(
+        error.to_string().contains("kept"),
+        "the journal should be kept for recovery: {error}"
+    );
+
+    let journal_path = journal_path_of(&h, &def);
+    assert!(journal_path.exists(), "the journal was not kept");
+    let journal: Journal =
+        serde_json::from_str(&std::fs::read_to_string(&journal_path).unwrap()).unwrap();
+    assert!(
+        journal.starting_launcher.is_none(),
+        "a failed swap stranded the starting mark, so the session looks running forever: {error}"
+    );
+    assert!(
+        !status(&h.ctx, &def.id, &StoreId::steam())
+            .unwrap()
+            .unwrap()
+            .running,
+        "a launch that never spawned still looks running"
+    );
+    assert!(
+        restore(&h.ctx, &def, &StoreId::steam()).is_err(),
+        "recovery must still report the file it cannot read, not be blocked by the mark"
+    );
+}

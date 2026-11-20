@@ -8385,6 +8385,59 @@ fn plugin_validate_notes_a_package_that_needs_an_absent_parent() {
 }
 
 #[test]
+fn plugin_list_reports_code_that_changed_after_consent() {
+    let (tmp, data_dir) = temp_data_dir();
+    let folder = tmp.path().join("consent-dev-plugin");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(
+        folder.join("agora-plugin.json"),
+        r#"{
+  "manifest": 1,
+  "id": "acme.changed",
+  "name": "Changed",
+  "version": "1.0.0",
+  "license": "MIT",
+  "apiRange": ">=0.1, <0.2",
+  "entrypoint": "main.js",
+  "capabilities": { "required": ["instance:read"] }
+}"#,
+    )
+    .unwrap();
+    let main = folder.join("main.js");
+    std::fs::write(&main, b"export function noop() { return 1; }\n").unwrap();
+
+    let installed = run_agora(
+        &data_dir,
+        &[
+            "plugin",
+            "install",
+            "development",
+            folder.to_str().unwrap(),
+            "--yes",
+        ],
+    );
+    assert!(
+        installed.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let before_output = run_agora(&data_dir, &["plugin", "list"]);
+    let before = String::from_utf8_lossy(&before_output.stdout);
+    assert!(
+        before.contains("allowed"),
+        "expected an allowed plugin: {before}"
+    );
+
+    std::fs::write(&main, b"export function noop() { return 2; }\n").unwrap();
+    let after_output = run_agora(&data_dir, &["plugin", "list"]);
+    let after = String::from_utf8_lossy(&after_output.stdout);
+    assert!(
+        after.contains("consent needed again (code changed)"),
+        "the list did not explain the stale consent: {after}"
+    );
+}
+
+#[test]
 fn crash_list_reads_stored_answers_and_inspect_reads_a_report() {
     let (_tmp, data_dir) = temp_data_dir();
     run_agora(&data_dir, &["paths"]);
