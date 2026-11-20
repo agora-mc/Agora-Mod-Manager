@@ -51,6 +51,8 @@ pub struct LocalStateStartupReport {
     pub migrated_from: i64,
     /// The schema version recorded after migration.
     pub migrated_to: i64,
+    /// Problems that were left alone rather than guessed at, for the adapters to report.
+    pub warnings: Vec<String>,
 }
 
 /// A corrupt database kept on disk and how startup recovered from it.
@@ -171,16 +173,32 @@ pub fn init_local_state_db_with(
     //    launch that fails to restore a backup leaves evidence that recovery
     //    is unfinished. Without it, the absent database would look like a first
     //    run on the next start and recovery would be skipped.
+    let identity = ensure_identity(db_path)?;
     let recovery_marker = recovery_marker_path(db_path);
     if recovery_marker.is_file() {
-        if let Some(recovery) = recover_pending_database(db_path, &recovery_marker)? {
-            report.recovered_corrupt = Some(recovery);
+        match read_recovery_marker(&recovery_marker)
+            .filter(|marker| marker_belongs_to(marker, &identity, db_path))
+        {
+            Some(_) => {
+                if let Some(recovery) = recover_pending_database(db_path, &recovery_marker)? {
+                    report.recovered_corrupt = Some(recovery);
+                }
+            }
+            None => {
+                // A foreign or unreadable marker is "could not tell", never permission to
+                // restore a backup here or to clear the marker. Keep both and report.
+                report.warnings.push(format!(
+                    "A database recovery marker beside {} is not from this database and was left \
+                     alone; no backup was restored.",
+                    db_path.display()
+                ));
+            }
         }
     } else if db_path.exists() {
         match check_integrity(db_path)? {
             Integrity::Ok => {}
             Integrity::Corrupt(reason) => {
-                write_recovery_marker(&recovery_marker)?;
+                write_recovery_marker(db_path, &recovery_marker, &identity)?;
                 let kept_at = quarantine_database(db_path, "corrupt")?;
                 let restored_from = restore_newest_backup(db_path)?;
                 clear_recovery_marker(&recovery_marker);
@@ -446,8 +464,50 @@ fn recovery_marker_path(db_path: &Path) -> PathBuf {
     sidecar_path(db_path, ".recovery")
 }
 
-fn write_recovery_marker(marker: &Path) -> anyhow::Result<()> {
-    std::fs::write(marker, b"")?;
+/// A random id kept beside the database. The recovery marker carries this id and the database's
+/// path, so a marker copied from another data root (or from another database) is recognised as
+/// foreign and left alone instead of driving a backup restore here.
+fn identity_path(db_path: &Path) -> PathBuf {
+    sidecar_path(db_path, ".identity")
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RecoveryMarker {
+    identity: String,
+    db_path: PathBuf,
+}
+
+/// Read the database's identity, creating it on a first run. Called under the startup lock, so
+/// two starting processes cannot write different ids.
+fn ensure_identity(db_path: &Path) -> anyhow::Result<String> {
+    let path = identity_path(db_path);
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let identity = text.trim();
+        if !identity.is_empty() {
+            return Ok(identity.to_string());
+        }
+    }
+    let identity = uuid::Uuid::new_v4().to_string();
+    std::fs::write(&path, identity.as_bytes())?;
+    Ok(identity)
+}
+
+fn read_recovery_marker(marker: &Path) -> Option<RecoveryMarker> {
+    std::fs::read_to_string(marker)
+        .ok()
+        .and_then(|text| serde_json::from_str::<RecoveryMarker>(&text).ok())
+}
+
+fn marker_belongs_to(marker: &RecoveryMarker, identity: &str, db_path: &Path) -> bool {
+    marker.identity == identity && marker.db_path == db_path
+}
+
+fn write_recovery_marker(db_path: &Path, marker: &Path, identity: &str) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec(&RecoveryMarker {
+        identity: identity.to_string(),
+        db_path: db_path.to_path_buf(),
+    })?;
+    std::fs::write(marker, bytes)?;
     Ok(())
 }
 

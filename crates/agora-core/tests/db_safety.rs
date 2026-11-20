@@ -4,7 +4,7 @@
 //! release wrote it, then opens it through the real startup path.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
@@ -89,6 +89,29 @@ fn recovery_marker(path: &Path) -> PathBuf {
             .and_then(|name| name.to_str())
             .unwrap_or("local_state.db")
     ))
+}
+
+fn identity_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        "{}.identity",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("local_state.db")
+    ))
+}
+
+/// Mirrors the identity sidecar and marker the writer leaves for a genuinely interrupted restore.
+fn write_valid_recovery_marker(path: &Path) {
+    std::fs::write(identity_path(path), b"test-identity").unwrap();
+    std::fs::write(
+        recovery_marker(path),
+        serde_json::json!({
+            "identity": "test-identity",
+            "db_path": path.to_string_lossy(),
+        })
+        .to_string(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -274,6 +297,139 @@ fn two_startups_cannot_race_the_database_restore() {
     assert_eq!(schema_version(&path), LOCAL_STATE_SCHEMA_VERSION);
 }
 
+/// A marker copied from another data root is foreign. Even beside a healthy database it must be
+/// reported and kept, not silently cleared.
+#[test]
+fn a_foreign_recovery_marker_is_reported_and_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = database_at(dir.path(), "local_state.db", LOCAL_STATE_SCHEMA_VERSION);
+    set_setting(&path, "safety_probe", "\"kept\"");
+    std::fs::write(identity_path(&path), b"local-identity").unwrap();
+    std::fs::write(
+        recovery_marker(&path),
+        serde_json::json!({
+            "identity": "copied-from-elsewhere",
+            "db_path": path.to_string_lossy(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let report = init_local_state_db_with(&path, &LocalStateOpenOptions::default()).unwrap();
+
+    assert!(report.recovered_corrupt.is_none());
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("not from this database")),
+        "the foreign marker is reported: {:?}",
+        report.warnings
+    );
+    assert!(
+        recovery_marker(&path).exists(),
+        "the foreign marker was kept"
+    );
+    assert_eq!(
+        get_setting(&path, "safety_probe").as_deref(),
+        Some("\"kept\"")
+    );
+}
+
+/// With the database missing, a marker that does not match this database's identity must not
+/// trigger a local backup restore.
+#[test]
+fn a_recovery_marker_without_a_matching_identity_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("local_state.db");
+    let backup_dir = dir.path().join("backups");
+    std::fs::create_dir_all(&backup_dir).unwrap();
+    let good = database_at(dir.path(), "backup-source.db", LOCAL_STATE_SCHEMA_VERSION);
+    set_setting(&good, "safety_probe", "\"kept\"");
+    std::fs::copy(
+        &good,
+        backup_dir.join("local_state-20000101-000000-000-0000-v28.db"),
+    )
+    .unwrap();
+    std::fs::write(
+        recovery_marker(&path),
+        serde_json::json!({
+            "identity": "foreign",
+            "db_path": "/somewhere/else/local_state.db",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let report = init_local_state_db_with(&path, &LocalStateOpenOptions::default()).unwrap();
+
+    assert!(
+        report.recovered_corrupt.is_none(),
+        "no restore was driven by a foreign marker"
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("not from this database")),
+        "the foreign marker is reported: {:?}",
+        report.warnings
+    );
+    assert!(recovery_marker(&path).exists(), "the marker was kept");
+    assert_eq!(
+        get_setting(&path, "safety_probe"),
+        None,
+        "no backed-up setting was restored"
+    );
+}
+
+/// Two real recoveries starting together: the cross-process lock serialises them, so exactly one
+/// restores and the other opens the finished database.
+#[test]
+fn two_concurrent_recoveries_restore_exactly_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = database_at(dir.path(), "local_state.db", LOCAL_STATE_SCHEMA_VERSION);
+    set_setting(&path, "safety_probe", "\"kept\"");
+    let backup_dir = dir.path().join("backups");
+    std::fs::create_dir_all(&backup_dir).unwrap();
+    std::fs::copy(
+        &path,
+        backup_dir.join("local_state-20000101-000000-000-0000-v28.db"),
+    )
+    .unwrap();
+    std::fs::write(&path, b"this is not a sqlite database").unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let first_path = path.clone();
+    let first_barrier = barrier.clone();
+    let first = thread::spawn(move || {
+        first_barrier.wait();
+        init_local_state_db_with(&first_path, &LocalStateOpenOptions::default()).unwrap()
+    });
+    let second_path = path.clone();
+    let second = thread::spawn(move || {
+        barrier.wait();
+        init_local_state_db_with(&second_path, &LocalStateOpenOptions::default()).unwrap()
+    });
+    let first_report = first.join().unwrap();
+    let second_report = second.join().unwrap();
+
+    assert_eq!(
+        usize::from(first_report.recovered_corrupt.is_some())
+            + usize::from(second_report.recovered_corrupt.is_some()),
+        1,
+        "exactly one of the two starts restored the database"
+    );
+    assert!(
+        first_report.warnings.is_empty() && second_report.warnings.is_empty(),
+        "no ambiguous state was left behind"
+    );
+    assert_eq!(
+        get_setting(&path, "safety_probe").as_deref(),
+        Some("\"kept\"")
+    );
+}
+
 #[test]
 fn corrupt_with_no_backup_gives_a_fresh_start() {
     let dir = tempfile::tempdir().unwrap();
@@ -359,7 +515,7 @@ fn a_recovery_marker_with_no_backup_starts_fresh_and_keeps_the_old_file() {
         .path()
         .join("local_state.db.corrupt-20000101-000000-000-p1-0000");
     std::fs::rename(&path, &kept_at).unwrap();
-    std::fs::write(recovery_marker(&path), b"").unwrap();
+    write_valid_recovery_marker(&path);
 
     let report = init_local_state_db_with(&path, &LocalStateOpenOptions::default()).unwrap();
     let CorruptRecovery {

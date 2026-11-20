@@ -691,8 +691,10 @@ fn recover_entry(
         validate_path_component(&restoring.new_id)
             .map_err(|error| err("ERR_INSTANCE_RESTORE", error.to_string()))?;
         if is_plain_dir(&source) {
-            // The files never left: the restore did not get far enough to matter.
+            // The files never left: the restore did not get far enough to matter. Clear both
+            // markers — the entry's and the one inside the folder — so a later retry starts clean.
             let _ = std::fs::remove_file(&restoring_path);
+            remove_restore_marker(&source);
             return Ok(Some(format!(
                 "Called off the interrupted restore of instance {} from Recently deleted: its \
                  files never moved.",

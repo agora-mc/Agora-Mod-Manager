@@ -1124,10 +1124,24 @@ fn a_restore_cut_off_before_the_move_is_called_off() {
         br#"{"new_id":"grounded-9","new_name":"Elsewhere"}"#,
     )
     .expect("the marker");
+    // Both markers were written but the rename never happened. Cancelling the restore must clear
+    // both, not leave the inner marker behind in the trashed folder.
+    std::fs::write(
+        entry.join("instance").join(".agora-restore-marker.json"),
+        serde_json::json!({ "entry_id": entry_id }).to_string(),
+    )
+    .expect("the inner marker");
 
     trash::recover_interrupted(&f.ctx);
     assert!(!entry.join("restoring.json").exists());
     assert!(entry.join("instance").is_dir(), "the files must stay put");
+    assert!(
+        !entry
+            .join("instance")
+            .join(".agora-restore-marker.json")
+            .exists(),
+        "calling off the restore left its inner marker behind"
+    );
     let restored = trash::restore(&f.ctx, &entry_id, None).expect("the restore still works");
     assert_eq!(restored.instance_id, "grounded-1");
 }
