@@ -369,8 +369,8 @@ async fn check_and_download_update_inner(
     );
 
     if !update_available && has_cached_db {
-        clear_update_failure(local_state_path)?;
-        set_last_success_time(local_state_path, now)?;
+        let _ = clear_update_failure(local_state_path);
+        let _ = set_last_success_time(local_state_path, now);
         let cached = cached_catalog_summary_with_trust(app_data_dir, trust);
         return Ok(RegistryStatus {
             has_cached_db,
@@ -388,7 +388,7 @@ async fn check_and_download_update_inner(
     // Register operation only when we are about to start network I/O.
     let _op = operation_manager.map(|m| m.register("Update registry"));
 
-    let install_result: LauncherResult<(i64, String)> = async {
+    let install_result: LauncherResult<(i64, String, bool)> = async {
         let bundle_id =
             latest
                 .find_asset("registry.bundle")
@@ -427,6 +427,14 @@ async fn check_and_download_update_inner(
             }
         };
 
+        // A same-day republish, or a tag published across UTC midnight, can
+        // hand us the bytes we already have. Do not reinstall or claim an
+        // update: just learn the asset id so the next check stops fetching it.
+        if let Some(current) = unchanged_candidate(app_data_dir, &bundle_bytes, trust)? {
+            let _ = set_cached_asset_id(local_state_path, Some(bundle_id));
+            return Ok((current.schema_version, current.expires_at, false));
+        }
+
         let installed =
             install_bundle_bytes_checked(app_data_dir, &bundle_bytes, trust, &latest.tag_name)?;
         // Display/asset metadata is written after the commit. The bundle is
@@ -434,20 +442,22 @@ async fn check_and_download_update_inner(
         // failed install; the next sync can set it again.
         let _ = set_cached_tag(local_state_path, &latest.tag_name);
         let _ = set_cached_asset_id(local_state_path, Some(bundle_id));
-        Ok((installed.schema_version, installed.expires_at))
+        Ok((installed.schema_version, installed.expires_at, true))
     }
     .await;
 
-    let (schema_version, expires_at) = match install_result {
+    let (schema_version, expires_at, changed) = match install_result {
         Ok(ok) => ok,
         Err(error) => {
-            set_update_failure(local_state_path, now, &latest.tag_name)?;
+            // Bookkeeping must never mask the real failure or make a committed
+            // bundle look like a failed update.
+            let _ = set_update_failure(local_state_path, now, &latest.tag_name);
             return Err(error);
         }
     };
 
-    clear_update_failure(local_state_path)?;
-    set_last_success_time(local_state_path, now)?;
+    let _ = clear_update_failure(local_state_path);
+    let _ = set_last_success_time(local_state_path, now);
 
     if let Some(op) = _op {
         op.complete();
@@ -455,14 +465,22 @@ async fn check_and_download_update_inner(
 
     Ok(RegistryStatus {
         has_cached_db: true,
-        cached_tag: Some(latest.tag_name.clone()),
+        cached_tag: if changed {
+            Some(latest.tag_name.clone())
+        } else {
+            cached_tag
+        },
         cached_schema_version: Some(schema_version),
         latest_tag: Some(latest.tag_name.clone()),
         update_available: false,
         checked: true,
         stale: false,
         expires_at: Some(expires_at),
-        message: format!("Catalog updated to {}.", latest.tag_name),
+        message: if changed {
+            format!("Catalog updated to {}.", latest.tag_name)
+        } else {
+            "Catalog is up to date.".to_string()
+        },
     })
 }
 
@@ -1170,6 +1188,43 @@ fn install_bundle_bytes_checked(
         schema_version,
         expires_at: verified.header.expires_at,
     })
+}
+
+/// If `bundle_bytes` are exactly the installed bundle, return its install
+/// metadata without writing anything. The installed bundle's trust statements
+/// are reconciled first, so reporting "up to date" can never skip a reconciliation
+/// that is still owed. Anything else — including equal stamps over different
+/// bytes — is not unchanged and goes through the normal checks.
+fn unchanged_candidate(
+    app_data_dir: &Path,
+    bundle_bytes: &[u8],
+    trust: &RegistryTrust,
+) -> LauncherResult<Option<InstalledBundle>> {
+    reconcile_current_trust(app_data_dir, trust)?;
+    let trust = effective_trust(app_data_dir, trust);
+    let verified = registry_bundle::verify_bundle(bundle_bytes, &trust).map_err(bundle_error)?;
+    let cached = read_cached_stamp_checked(app_data_dir, &trust)?;
+    if compare_stamps(
+        cached.as_ref(),
+        &verified.header.built_at,
+        &verified.header.db_sha256,
+    )? != StampOrder::EqualSameBytes
+    {
+        return Ok(None);
+    }
+    let current =
+        paths::registry_bundle_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
+    if !std::fs::read(current)
+        .map(|bytes| bytes == bundle_bytes)
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    Ok(Some(InstalledBundle {
+        tag: verified.header.tag,
+        schema_version: verified.header.schema_version,
+        expires_at: verified.header.expires_at,
+    }))
 }
 
 /// Install the exact signed bytes of a bundle that has already been verified.
@@ -1986,6 +2041,15 @@ fn update_is_available(
         // roll back from.
         return true;
     };
+    // A release published just after UTC midnight can carry a tag a day ahead
+    // of its signed build stamp. If this is the exact asset we already have,
+    // the tag/date mismatch is not a reason to fetch it again; otherwise sync
+    // redownloads the same bytes on every check.
+    if let (Some(cached), Some(latest)) = (cached_asset, latest_asset) {
+        if cached == latest {
+            return false;
+        }
+    }
     if tag_is_newer(cached_tag, latest_tag) {
         return true;
     }
@@ -2535,12 +2599,22 @@ mod tests {
             "v0.9.0",
             Some(9)
         ));
-        assert!(update_is_available(
+        // A tag published after UTC midnight can be a day ahead of the signed
+        // stamp. The same asset id is still the same bytes, so do not fetch it.
+        assert!(!update_is_available(
             Some(today),
             true,
             Some(7),
             "registry-2026-11-01",
             Some(7)
+        ));
+        // A different asset id in that newer release is a real republish.
+        assert!(update_is_available(
+            Some(today),
+            true,
+            Some(7),
+            "registry-2026-11-01",
+            Some(8)
         ));
         assert!(update_is_available(None, false, None, today, Some(9)));
         assert!(update_is_available(
@@ -4445,5 +4519,115 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         assert!(!after_success.checked);
         assert!(!after_success.update_available);
         assert_eq!(after_success.message, "Catalog is up to date.");
+    }
+
+    /// A release tag published just after UTC midnight is a day ahead of the
+    /// signed build stamp. Once that asset id is recorded, sync must not fetch
+    /// the same bytes again just because the tag date looks newer.
+    #[tokio::test]
+    async fn a_tag_ahead_of_the_signed_stamp_does_not_redownload_the_same_asset() {
+        let (dir, ls_path, locks) = setup_sync_env();
+        let key = test_key(96);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db_with_built_at("2026-11-17T23:30:00+00:00");
+        let mut header = header_for(
+            &key,
+            &payload,
+            "2026-11-17T23:30:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        header.tag = "registry-2026-11-17".into();
+        let bundle = signed_bundle(&key, &header, &payload);
+        install_bundle_bytes(dir.path(), &header, &bundle, &trust).unwrap();
+        set_cached_tag(&ls_path, "registry-2026-11-17").unwrap();
+        set_cached_asset_id(&ls_path, Some(6001)).unwrap();
+
+        let recorded = r#"[
+            {"tag_name": "registry-2026-11-18", "draft": false, "prerelease": false, "assets": [{"id": 6001, "name": "registry.bundle"}]}
+        ]"#;
+        let transport =
+            FakeRegistryTransport::from_pages(vec![(1, release_json_to_list(recorded))]);
+        transport.push_asset_ok(6001, bundle.clone());
+
+        let status = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            true,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_000,
+        )
+        .await
+        .expect("sync should not redownload the asset it already has");
+        assert!(!status.update_available);
+        assert!(status.message.contains("up to date"), "{}", status.message);
+        assert_eq!(
+            transport.assets.lock().unwrap()[&6001].len(),
+            1,
+            "the identical asset must not be fetched again"
+        );
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            bundle
+        );
+    }
+
+    /// A candidate with the same signed stamp and the same bytes is "up to
+    /// date": record its asset id rather than reinstalling and claiming an
+    /// update (or refusing it as an equal-stamp conflict).
+    #[tokio::test]
+    async fn an_identical_candidate_records_its_asset_id_and_reports_up_to_date() {
+        let (dir, ls_path, locks) = setup_sync_env();
+        let key = test_key(97);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db_with_built_at("2026-11-17T23:30:00+00:00");
+        let mut header = header_for(
+            &key,
+            &payload,
+            "2026-11-17T23:30:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        header.tag = "registry-2099-01-01".into();
+        let bundle = signed_bundle(&key, &header, &payload);
+        install_bundle_bytes(dir.path(), &header, &bundle, &trust).unwrap();
+        set_cached_tag(&ls_path, "registry-2099-01-01").unwrap();
+        // A local install clears the online asset id; the next sync learns it.
+        set_cached_asset_id(&ls_path, None).unwrap();
+
+        let recorded = r#"[
+            {"tag_name": "registry-2026-11-18", "draft": false, "prerelease": false, "assets": [{"id": 6002, "name": "registry.bundle"}]}
+        ]"#;
+        let transport =
+            FakeRegistryTransport::from_pages(vec![(1, release_json_to_list(recorded))]);
+        transport.push_asset_ok(6002, bundle.clone());
+
+        let status = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            true,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_000,
+        )
+        .await
+        .expect("an identical candidate must not be a failure");
+        assert_eq!(get_cached_asset_id(&ls_path).unwrap(), Some(6002));
+        assert!(status.message.contains("up to date"), "{}", status.message);
+        assert_eq!(
+            get_cached_tag(&ls_path).unwrap().as_deref(),
+            Some("registry-2099-01-01")
+        );
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            bundle
+        );
     }
 }
