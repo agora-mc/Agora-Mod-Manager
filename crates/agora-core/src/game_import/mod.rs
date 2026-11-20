@@ -519,6 +519,19 @@ fn add_imported_mod(
     definition: &GameDefinition,
     item: &str,
 ) -> Result<(), ImportError> {
+    add_imported_mod_at(ctx, instance, definition, item, None)
+}
+
+/// [`add_imported_mod`] with a mount the import source already knows (Vortex's `root` mod type,
+/// for example). The game's content rules still decide the source path and reject a mod they
+/// cannot place at all; only the destination mount is overridden.
+pub(super) fn add_imported_mod_at(
+    ctx: &Ctx,
+    instance: &str,
+    definition: &GameDefinition,
+    item: &str,
+    mount_override: Option<&str>,
+) -> Result<(), ImportError> {
     let layout = definition.content_layout.clone().unwrap_or_default();
     let content = content_store::get_item(ctx, item)?;
     let placement_error = |reason| {
@@ -530,8 +543,11 @@ fn add_imported_mod(
     let decision =
         game_deploy::placement_for_instance_item(ctx, instance, definition, &layout, &content)
             .map_err(|error| placement_error(error.to_string()))?;
-    let (mount, source) =
+    let (mut mount, source) =
         imported_mod_destination(definition, decision).map_err(placement_error)?;
+    if let Some(override_mount) = mount_override {
+        mount = override_mount.to_string();
+    }
     game_deploy::add_content(
         ctx,
         instance,

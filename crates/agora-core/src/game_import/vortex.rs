@@ -11,7 +11,11 @@
 //! - An `IMod` has `id`, `state`, `installationPath` (its folder in the staging folder) and
 //!   `attributes` (`src_renderer_src_extensions_mod_management_types_IMod.ts:135-172`); the Nexus
 //!   ids are `attributes.modId` / `attributes.fileId` and the version is `attributes.version`
-//!   (`:51-98`).
+//!   (`:51-98`). Its `type` is the id of the mod type that chooses the deploy target (same IMod
+//!   schema): the Creation Engine game extension's `registerModType` calls define `root`, whose
+//!   target is the game root, and the default type (empty id), whose target is the data folder.
+//!   Vortex writes one `vortex.deployment.<type>.json` per type into that target
+//!   (`..._util_activationStore.ts:37-46`).
 //! - An `IProfile` has `id`, `gameId`, `name` and `modState: {[modId]: {enabled}}`
 //!   (`src_renderer_src_extensions_profile_management_types_IProfile.ts:1-18`).
 //! - The staging folder is `settings.mods.installPath[gameId]`, a template whose default is
@@ -104,7 +108,38 @@ pub struct VortexMod {
     pub installation_folder: String,
     /// `state` as Vortex stores it (`installed`, `downloading`, ...). Absent is unknown.
     pub state: Option<String>,
+    /// The raw `IMod.type` id, when Vortex records one. See [`ModType`] for what Agora does with it.
+    pub mod_type: Option<String>,
     pub rules: Vec<VortexRule>,
+}
+
+/// Vortex mod types Agora can place with confidence. `root` is the Creation Engine game
+/// extension's type whose deploy target is the game root; the default (absent or empty) type
+/// deploys to the game's data folder. Any other id is a type Agora does not know: it is still
+/// imported, but with the ordinary placement decision and a warning that says the placement is a
+/// guess. Dropping such a mod would lose part of the player's setup for a choice they never made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ModType {
+    Data,
+    Root,
+    Unknown(String),
+}
+
+impl ModType {
+    fn from_vortex(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).filter(|kind| !kind.is_empty()) {
+            None => Self::Data,
+            Some(kind) if kind.eq_ignore_ascii_case("root") => Self::Root,
+            Some(kind) if kind.eq_ignore_ascii_case("default") => Self::Data,
+            Some(kind) => Self::Unknown(kind.to_string()),
+        }
+    }
+
+    /// The mount Agora uses instead of its normal placement, when the Vortex type is known to
+    /// deploy outside the data folder. `""` is the game root.
+    fn mount_override(&self) -> Option<&'static str> {
+        matches!(self, Self::Root).then_some("")
+    }
 }
 
 /// One ordering rule of a mod. Only `before` and `after` order mods; the rest are kept so the plan
@@ -309,6 +344,7 @@ fn parse_mod(mod_id: &str, object: &Map<String, Value>) -> Option<VortexMod> {
     let nexus_mod_id = attributes.and_then(|a| get_u64(a, "modId"));
     let nexus_file_id = attributes.and_then(|a| get_u64(a, "fileId"));
     let state = get_str(object, "state");
+    let mod_type = get_str(object, "type");
     let mut rules = Vec::new();
     if let Some(list) = object.get("rules").and_then(Value::as_array) {
         for rule in list {
@@ -337,6 +373,7 @@ fn parse_mod(mod_id: &str, object: &Map<String, Value>) -> Option<VortexMod> {
         nexus_file_id,
         installation_folder,
         state,
+        mod_type,
         rules,
     })
 }
@@ -1234,6 +1271,8 @@ pub struct PlannedMod {
     pub provenance: VortexProvenance,
     /// Plugins at the mod's root, which the game loads from `Data`.
     pub plugin_files: Vec<String>,
+    /// Vortex's raw mod type id, when it records one.
+    pub mod_type: Option<String>,
     /// The ordering rules this mod states. Only `before` and `after` are used.
     #[serde(skip)]
     pub rules: Vec<VortexRule>,
@@ -1411,6 +1450,14 @@ fn plan_state(
     }
     let mut problems = Vec::new();
     let mods = plan_mods(game, profile, &staging, request.all_mods, &mut problems);
+    for item in &mods {
+        if let ModType::Unknown(kind) = ModType::from_vortex(item.mod_type.as_deref()) {
+            warnings.push(format!(
+                "mod '{}' has Vortex type '{}', which Agora does not know; it is still imported using {}'s normal placement rule, which is a guess for this type",
+                item.name, kind, definition.name
+            ));
+        }
+    }
     let enabled = mods.iter().filter(|m| m.enabled).count();
     // A game's staging folder is shared by every profile. Unless asked, only this profile's
     // enabled mods are imported; the disabled ones are named for --verbose and counted.
@@ -1748,6 +1795,7 @@ fn plan_mods(
             bytes: sized.bytes,
             provenance: provenance(entry),
             plugin_files: sized.plugin_files,
+            mod_type: entry.mod_type.clone(),
             rules: entry.rules.clone(),
             paths,
         });
@@ -2859,7 +2907,13 @@ fn run_planned(
                 ));
                 continue;
             }
-            super::add_imported_mod(ctx, &instance_id, &def, item_id)?;
+            super::add_imported_mod_at(
+                ctx,
+                &instance_id,
+                &def,
+                item_id,
+                ModType::from_vortex(planned.mod_type.as_deref()).mount_override(),
+            )?;
             report.content_layers += 1;
             if !planned.enabled {
                 game_deploy::set_content_enabled(ctx, &instance_id, item_id, false)?;
@@ -3318,7 +3372,14 @@ fn add_mod_to_merged(
         matches!(&layer.source, agora_game_api::LayerSource::Content { content } if content == &item_id)
     });
     if !present {
-        super::add_imported_mod(ctx, instance_id, definition, &item_id).map_err(|e| {
+        super::add_imported_mod_at(
+            ctx,
+            instance_id,
+            definition,
+            &item_id,
+            ModType::from_vortex(item.mod_type.as_deref()).mount_override(),
+        )
+        .map_err(|e| {
             ImportError::Other(format!(
                 "'{}' could not be put on the merged instance: {e}",
                 item.name
