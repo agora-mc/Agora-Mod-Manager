@@ -652,7 +652,14 @@ mod tests {
     #[test]
     fn onboarding_step_round_trips_every_wizard_step_word() {
         for step in [
-            "welcome", "appearance", "services", "launch", "java", "github", "registry", "import",
+            "welcome",
+            "appearance",
+            "services",
+            "launch",
+            "java",
+            "github",
+            "registry",
+            "import",
         ] {
             let value = Value::String(step.into());
             assert_eq!(

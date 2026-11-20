@@ -1845,7 +1845,8 @@ side = "CLIENT"
             21,
             "neoforge",
         );
-        let bat_path_line = "for %%I in (\"%JAVA%\") do if not \"%%~dpI\"==\"\" set \"PATH=%%~dpI;%PATH%\"";
+        let bat_path_line =
+            "for %%I in (\"%JAVA%\") do if not \"%%~dpI\"==\"\" set \"PATH=%%~dpI;%PATH%\"";
         assert!(bat.contains(bat_path_line), "{bat}");
         assert!(
             bat.find(bat_path_line).unwrap() < bat.find("call \"%~dp0run.bat\"").unwrap(),
@@ -1926,7 +1927,10 @@ side = "CLIENT"
         );
         assert!(sh.contains("fabric-server-launch.jar"), "{sh}");
         assert!(sh.contains("-Xmx4096M"), "{sh}");
-        assert!(sh.contains("if [ ! -f ./fabric-server-launch.jar ]"), "{sh}");
+        assert!(
+            sh.contains("if [ ! -f ./fabric-server-launch.jar ]"),
+            "{sh}"
+        );
         assert!(bat.contains("-mcversion 1.21"), "{bat}");
         assert!(bat.contains("fabric-server-launch.jar"), "{bat}");
         assert!(!sh.contains("user_jvm_args.txt"), "{sh}");

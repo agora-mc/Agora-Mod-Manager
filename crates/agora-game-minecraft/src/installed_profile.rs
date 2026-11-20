@@ -1532,11 +1532,20 @@ mod tests {
         );
 
         let mut http = info.clone();
-        http.libraries[0].downloads.as_mut().unwrap().artifact.as_mut().unwrap().url =
-            "http://maven.minecraftforge.net/forge-client.jar".into();
-        let err = validate_loader_profile(&http, path, "forge-1.21.1-52.1.21", "1.21.1").unwrap_err();
+        http.libraries[0]
+            .downloads
+            .as_mut()
+            .unwrap()
+            .artifact
+            .as_mut()
+            .unwrap()
+            .url = "http://maven.minecraftforge.net/forge-client.jar".into();
+        let err =
+            validate_loader_profile(&http, path, "forge-1.21.1-52.1.21", "1.21.1").unwrap_err();
         assert!(
-            err.reasons.iter().any(|reason| reason.contains("non-HTTPS URL")),
+            err.reasons
+                .iter()
+                .any(|reason| reason.contains("non-HTTPS URL")),
             "a non-empty non-HTTPS URL must still be refused: {err:?}"
         );
     }
