@@ -2421,7 +2421,7 @@ fn recover_one_job(
     // final. Re-read it under the lock: a second recovery process may have finished this row
     // while we waited, or the writer may have updated it just before it crashed. Acting on the
     // row we listed before the lock would touch folders that no longer belong to this job.
-    let fresh = match agora_core::db::list_instance_import_jobs(connection) {
+    let fresh = match db::list_instance_import_jobs(connection) {
         Ok(list) => list,
         Err(error) => {
             return Some(format!(
