@@ -324,6 +324,42 @@ fn resolved_path(path: &Path) -> Option<PathBuf> {
     std::fs::canonicalize(path).ok()
 }
 
+/// Where `path` resolves, or will resolve once it exists: the path itself when it resolves now,
+/// otherwise the deepest ancestor that exists and resolves, plus the remaining components (the
+/// file — or a folder on its way — does not exist yet at swap time; a redirected ancestor changes
+/// this answer either way).
+fn resolved_path_for(path: &Path) -> Option<PathBuf> {
+    if let Some(resolved) = std::fs::canonicalize(path).ok() {
+        return Some(resolved);
+    }
+    let mut suffix: Vec<std::ffi::OsString> = vec![path.file_name()?.to_os_string()];
+    let mut dir = path.parent()?;
+    loop {
+        if let Some(resolved) = std::fs::canonicalize(dir).ok() {
+            let mut out = resolved;
+            for component in suffix.iter().rev() {
+                out.push(component);
+            }
+            return Some(out);
+        }
+        suffix.push(dir.file_name()?.to_os_string());
+        dir = dir.parent()?;
+    }
+}
+
+/// Whether two paths are provably different files: neither is a link, and their file identities
+/// (device + inode on Unix, volume serial + file index on Windows) differ. Anything else — the
+/// same file under two names (a hard link), either path a link, or an identity that cannot be
+/// read — is NOT provably distinct.
+fn provably_distinct_files(a: &Path, b: &Path) -> bool {
+    if symlink_target(a).is_some() || symlink_target(b).is_some() {
+        return false;
+    }
+    crate::game_base::get_file_identity(a)
+        .zip(crate::game_base::get_file_identity(b))
+        .is_some_and(|(left, right)| left != right)
+}
+
 /// Where `path` points when it is a symbolic link, `None` when it is not one (or its target
 /// cannot be read).
 fn symlink_target(path: &Path) -> Option<PathBuf> {
@@ -812,7 +848,7 @@ pub fn swap_in_locked(
                 journal.files[i].swapped = false;
                 journal.files[i].state = Some(FileState::BackingUp);
                 journal.files[i].restored = false;
-                journal.files[i].real_resolved_path = resolved_path(&real_path);
+                journal.files[i].real_resolved_path = resolved_path_for(&real_path);
                 write_journal(&journal_path, &journal)?;
 
                 // Copy to a temp name, make it durable, verify it, and only then give it the final
@@ -887,7 +923,7 @@ pub fn swap_in_locked(
                 journal.files[i].swapped = false;
                 journal.files[i].state = Some(FileState::BackingUp);
                 journal.files[i].restored = false;
-                journal.files[i].real_resolved_path = resolved_path(&real_path);
+                journal.files[i].real_resolved_path = resolved_path_for(&real_path);
                 write_journal(&journal_path, &journal)?;
 
                 if let Some(instance_bytes) = instance_bytes {
@@ -1480,42 +1516,71 @@ fn restore_journal_internal(
             }
         }
 
+        // A backup on disk proves the real file was there, even when a stop happened before the
+        // journal said so. It is only usable when its hash matches the recorded original.
+        let has_backup = derived_backup_path.exists();
+        let existed = file.existed || has_backup || file.original_sha256.is_some();
+
+        let real_bytes = std::fs::read(&file.real_path).ok();
+        let real_hash = real_bytes.as_ref().map(|bytes| hash_bytes(bytes));
+        let backup_hash = if has_backup {
+            std::fs::read(&derived_backup_path)
+                .ok()
+                .map(|bytes| hash_bytes(&bytes))
+        } else {
+            None
+        };
+        // The restore moves no bytes for this entry when the real file already holds the
+        // original or the backup's bytes: the entry is then only marked restored.
+        let real_is_original = file.original_sha256.as_deref().is_some()
+            && real_hash.as_deref() == file.original_sha256.as_deref();
+        let real_matches_backup = real_hash.is_some() && real_hash == backup_hash;
+
         // The real path is compared fully resolved — the whole link chain and every ancestor
         // directory — against where it resolved when the swap read it. Writing the backup
         // through a path whose resolution changed since the swap (the final link retargeted, a
         // link deeper in a chain retargeted, an ancestor directory replaced by a link) would
         // overwrite whatever it resolves to now, so any difference stops the restore here,
-        // before anything is modified, and asks for a hand. A journal that recorded no
-        // resolved path (a legacy journal, or a dangling link at swap time) cannot prove that,
-        // so a real path that is a link now also stops the restore.
+        // before anything is modified, and asks for a hand.
         let resolved_now = resolved_path(&file.real_path);
+        let would_be_now = resolved_path_for(&file.real_path);
         let resolution_ok = match &file.real_resolved_path {
-            Some(recorded) => match &resolved_now {
-                Some(now) => paths_eq_case_insensitive(recorded, now),
-                // The path no longer resolves (the file is gone, or a link in the chain now
-                // dangles). The restore may still recreate the file under its parent folder,
-                // so that folder must resolve to the same place it did at the swap; a final
-                // component that is a link but does not resolve is a changed link, not a
-                // deleted file.
-                None => {
-                    if symlink_target(&file.real_path).is_some() {
-                        false
-                    } else {
-                        let parent_now = file
-                            .real_path
-                            .parent()
-                            .and_then(|parent| std::fs::canonicalize(parent).ok());
-                        let recorded_parent = recorded.parent().map(Path::to_path_buf);
-                        match (parent_now, recorded_parent) {
-                            (Some(parent_now), Some(recorded_parent)) => {
-                                paths_eq_case_insensitive(&parent_now, &recorded_parent)
-                            }
-                            _ => false,
-                        }
+            Some(recorded) => {
+                // A final component that is a link but no longer resolves is a changed (or
+                // broken) link, not a deleted file.
+                if symlink_target(&file.real_path).is_some() && resolved_now.is_none() {
+                    false
+                } else {
+                    match &resolved_now {
+                        Some(now) => paths_eq_case_insensitive(recorded, now),
+                        // The path no longer fully resolves (the file is gone, or an ancestor
+                        // link now dangles): compare the anchored resolution instead, so a
+                        // redirected ancestor still refuses.
+                        None => would_be_now
+                            .as_ref()
+                            .is_some_and(|now| paths_eq_case_insensitive(recorded, now)),
                     }
                 }
-            },
-            None => symlink_target(&file.real_path).is_none(),
+            }
+            None => {
+                // A legacy journal recorded no resolved path, so nothing proves the real path
+                // still resolves where the swap read it — an ancestor could have been replaced
+                // by a link while the final component stays an ordinary file. Fail closed on
+                // any entry whose restore would write; only entries that move no bytes (already
+                // restored, the real file already holding the original or the backup's bytes,
+                // or a not-swapped entry with nothing to remove) may proceed.
+                if symlink_target(&file.real_path).is_some() {
+                    false
+                } else {
+                    file.restored
+                        || real_is_original
+                        || real_matches_backup
+                        || (file_state(file) != FileState::Swapped
+                            && !has_backup
+                            && !(real_hash.as_deref() == Some(file.written_sha256.as_str())
+                                && !file.written_sha256.is_empty()))
+                }
+            }
         };
         if !resolution_ok {
             let recorded = match (&file.real_resolved_path, &resolved_now) {
@@ -1528,40 +1593,42 @@ fn restore_journal_internal(
                     "resolved to '{}' at the swap and no longer resolves now",
                     recorded.display()
                 ),
-                (None, _) => "no resolved path in the journal".to_string(),
+                (None, _) => "the journal records no resolved path for it (a journal from before \
+                              resolved paths were recorded)"
+                    .to_string(),
+            };
+            // A legacy journal that cannot prove the resolution refuses any write; name the
+            // backup too, so the report says where every copy is.
+            let backup_note = if file.real_resolved_path.is_none() && has_backup {
+                format!(
+                    "; its backup '{}' was left in place",
+                    derived_backup_path.display()
+                )
+            } else {
+                String::new()
             };
             return Err(UserFilesError::Other(format!(
-                "the user file '{}' no longer resolves where the journal records ({}); Agora \
-                 did not write through it and changed nothing. Check the links by hand, then \
-                 put the files back with `{}`",
+                "the user file '{}' cannot be verified to still resolve where the journal records \
+                 ({}{}); Agora did not write through it and changed nothing. Check the links by \
+                 hand, then put the files back with `{}`",
                 file.real_path.display(),
                 recorded,
+                backup_note,
                 restore_instruction(journal.game.as_str(), journal.store.as_str())
             )));
         }
 
         // Three-way check, before anything is modified: when the journal records the swap as
         // done, both the real file and the instance's copy are compared against what the
-        // session wrote. When BOTH changed since the swap to DIFFERENT bytes, recovery cannot
-        // tell whose bytes are the ones to keep, so it overwrites neither: the real file's
-        // current bytes are kept as a clearly named conflict copy next to the instance's copy,
-        // and the restore stops and asks for a hand. Only when at most one side changed (or
-        // both sides hold the same bytes, which loses nothing) may bytes move.
+        // session wrote. When BOTH changed since the swap, recovery cannot tell whose bytes are
+        // the ones to keep, so it overwrites neither: the real file's current bytes are kept as
+        // a clearly named conflict copy next to the instance's copy, and the restore stops and
+        // asks for a hand. Only when at most one side changed may bytes move — and equal bytes
+        // on both sides count as unambiguous only when the two paths are provably DIFFERENT
+        // files: if the instance copy is a link to the real file (or a hard link to it), both
+        // sides read the same changed bytes, and putting the backup over the shared target
+        // would lose the edit, so that is a needs-a-hand case too.
         if !file.restored && file_state(file) == FileState::Swapped {
-            let real_bytes = std::fs::read(&file.real_path).ok();
-            let real_hash = real_bytes.as_ref().map(|bytes| hash_bytes(bytes));
-            let backup_hash = if derived_backup_path.exists() {
-                std::fs::read(&derived_backup_path)
-                    .ok()
-                    .map(|bytes| hash_bytes(&bytes))
-            } else {
-                None
-            };
-            // The restore moves no bytes for this entry when the real file already holds the
-            // original or the backup's bytes: the entry is then only marked restored.
-            let real_is_original = file.original_sha256.as_deref().is_some()
-                && real_hash.as_deref() == file.original_sha256.as_deref();
-            let real_matches_backup = real_hash.is_some() && real_hash == backup_hash;
             if !real_is_original && !real_matches_backup {
                 let real_changed = real_hash
                     .as_deref()
@@ -1572,7 +1639,11 @@ fn restore_journal_internal(
                 let instance_changed = instance_hash
                     .as_deref()
                     .is_some_and(|hash| hash != file.written_sha256.as_str());
-                if real_changed && instance_changed && real_hash != instance_hash {
+                if real_changed
+                    && instance_changed
+                    && (real_hash != instance_hash
+                        || !provably_distinct_files(&file.real_path, &derived_instance_copy))
+                {
                     let real_bytes = real_bytes.expect("read changed bytes above");
                     let real_hash = real_hash.expect("hashed above");
                     let conflict_path = derived_instance_copy.with_file_name(format!(
@@ -1600,10 +1671,6 @@ fn restore_journal_internal(
             }
         }
 
-        // A backup on disk proves the real file was there, even when a stop happened before the
-        // journal said so. It is only usable when its hash matches the recorded original.
-        let has_backup = derived_backup_path.exists();
-        let existed = file.existed || has_backup || file.original_sha256.is_some();
 
         // Strict mode is crash recovery, not a human at the restore command: a file Agora
         // created during the session (no original existed) whose content no longer matches

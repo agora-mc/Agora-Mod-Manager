@@ -256,7 +256,9 @@ fn build(h: &TestHarness, def: &GameDefinition, id: &str, stages: &[Stage]) {
             swapped: false,
             state: Some(FileState::BackingUp),
             restored: false,
-            real_resolved_path: None,
+            // The production writer records where the real path resolves (the file exists in
+            // this fixture, so its canonical path).
+            real_resolved_path: std::fs::canonicalize(&real).ok(),
         };
         if *st != Initial {
             f.existed = true;
@@ -516,6 +518,8 @@ fn a_shortened_new_real_file_after_swap_in_is_kept_as_the_instance_copy() {
     let ic = inst_of(&h, "n", 0);
     let x = inst(0);
     put(&ic, &x);
+    // The real file's folder exists (as it does once the swap has written anything under it).
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
     // journal: existed=false, swapped, written = hash(x). The game left a shorter file, which is a
     // real change: an Agora write is atomic, so a prefix is not a torn write.
     let journal = Journal {
@@ -539,7 +543,11 @@ fn a_shortened_new_real_file_after_swap_in_is_kept_as_the_instance_copy() {
             swapped: true,
             state: Some(FileState::Swapped),
             restored: false,
-            real_resolved_path: None,
+            // The file was absent at swap time; the production writer records where it will
+            // resolve (the resolved parent plus the file name).
+            real_resolved_path: std::fs::canonicalize(real.parent().unwrap())
+                .ok()
+                .map(|p| p.join(real.file_name().unwrap())),
         }],
     };
     let jp = journal_path_of(&h, &def);

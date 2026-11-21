@@ -842,7 +842,8 @@ fn interrupted_swap_restores_correctly() {
                 swapped: true,
                 state: None,
                 restored: false,
-                real_resolved_path: None,
+                // The production writer records where the real path resolves.
+                real_resolved_path: std::fs::canonicalize(&real_plugin_file).ok(),
             },
             JournaledFile {
                 real_path: real_ini_file.clone(),
@@ -855,7 +856,7 @@ fn interrupted_swap_restores_correctly() {
                 swapped: false,
                 state: None,
                 restored: false,
-                real_resolved_path: None,
+                real_resolved_path: std::fs::canonicalize(&real_ini_file).ok(),
             },
         ],
     };

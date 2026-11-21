@@ -1081,7 +1081,7 @@ fn a_symlink_retarged_since_the_swap_is_refused_by_recovery() {
         report
             .warnings
             .iter()
-            .any(|w| w.contains("no longer resolves where the journal records")),
+            .any(|w| w.contains("cannot be verified to still resolve")),
         "the refusal names the retargeted link: {report:?}"
     );
     assert!(report.actions.is_empty(), "{report:?}");
@@ -1092,19 +1092,7 @@ fn a_symlink_retarged_since_the_swap_is_refused_by_recovery() {
 /// way a player could between a crash and recovery.
 #[cfg(windows)]
 fn link_dir(link: &Path, target: &Path) {
-    let output = std::process::Command::new("cmd")
-        .args(["/c", "mklink", "/J"])
-        .arg(link)
-        .arg(target)
-        .output()
-        .expect("run cmd mklink");
-    assert!(
-        output.status.success(),
-        "mklink /J {} {} failed: {}",
-        link.display(),
-        target.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    junction::create(target, link).unwrap();
 }
 
 /// Make `link` point at `target` as a directory link (see the Windows [`link_dir`]).
@@ -1241,7 +1229,7 @@ fn an_ancestor_directory_replaced_by_a_link_since_the_swap_is_refused_by_recover
         report
             .warnings
             .iter()
-            .any(|w| w.contains("no longer resolves where the journal records")),
+            .any(|w| w.contains("cannot be verified to still resolve")),
         "the refusal names the changed resolution: {report:?}"
     );
     assert!(report.actions.is_empty(), "{report:?}");
@@ -1320,7 +1308,7 @@ fn a_directory_link_deeper_in_the_chain_retarged_since_the_swap_is_refused_by_re
         report
             .warnings
             .iter()
-            .any(|w| w.contains("no longer resolves where the journal records")),
+            .any(|w| w.contains("cannot be verified to still resolve")),
         "the refusal names the changed resolution: {report:?}"
     );
     assert!(report.actions.is_empty(), "{report:?}");
@@ -1390,8 +1378,216 @@ fn a_file_link_deeper_in_the_chain_retarged_since_the_swap_is_refused_by_recover
         report
             .warnings
             .iter()
-            .any(|w| w.contains("no longer resolves where the journal records")),
+            .any(|w| w.contains("cannot be verified to still resolve")),
         "the refusal names the changed resolution: {report:?}"
     );
     assert!(report.actions.is_empty(), "{report:?}");
+}
+
+/// Make `link` name the same file as `target`: a hard link on Windows (which needs no
+/// privilege), a symbolic link elsewhere.
+#[cfg(windows)]
+fn link_file(link: &Path, target: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::CreateHardLinkW;
+    let wide = |p: &Path| -> Vec<u16> {
+        p.as_os_str().encode_wide().chain(Some(0)).collect()
+    };
+    let ok = unsafe {
+        CreateHardLinkW(
+            wide(link).as_ptr(),
+            wide(target).as_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert!(
+        ok != 0,
+        "CreateHardLinkW {} -> {} failed (os error {})",
+        link.display(),
+        target.display(),
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Make `link` name the same file as `target` (see the Windows [`link_file`]).
+#[cfg(unix)]
+fn link_file(link: &Path, target: &Path) {
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+/// Equal bytes on both sides are unambiguous ONLY when the instance's copy and the real file
+/// are provably different files. When the instance copy is a link to (or a hard link of) the
+/// real file, both sides read the same changed bytes, and putting the backup over the shared
+/// target would lose the edit — so recovery refuses, keeps the real file's bytes as a conflict
+/// copy, and reports. (Before the identity check, recovery proceeded and destroyed the edit.)
+#[test]
+fn an_instance_copy_that_is_the_real_file_needs_a_hand_not_a_same_bytes_restore() {
+    let f = user_files_fixture(Some("Player original\n"));
+    agora_core::game_user_files::swap_in(
+        &f.ctx,
+        "instance-a",
+        &f.def,
+        &StoreId::steam(),
+        &f.running_from,
+    )
+    .unwrap();
+    agora_core::game_user_files::record_process(&f.ctx, &f.def.id, &StoreId::steam(), dead_identity())
+        .unwrap();
+    let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
+    assert_eq!(std::fs::read_to_string(&f.real).unwrap(), "Instance copy\n");
+    // After the crash, the instance's copy is a link to the real file, and the game changed the
+    // real file: both sides now read the same changed bytes.
+    std::fs::remove_file(&f.copy).unwrap();
+    link_file(&f.copy, &f.real);
+    std::fs::write(&f.real, "Game changed this after the crash\n").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&f.copy).unwrap(),
+        "Game changed this after the crash\n",
+        "the copy and the real file are the same file now"
+    );
+
+    let report = run_at_startup(&f.ctx);
+
+    assert_eq!(
+        std::fs::read_to_string(&f.real).unwrap(),
+        "Game changed this after the crash\n",
+        "the backup was written over the shared file and the game's edit was lost"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&f.copy).unwrap(),
+        "Game changed this after the crash\n",
+        "the instance's side changed"
+    );
+    assert!(journal_path.exists(), "the journal is kept for a hand");
+    let conflicts: Vec<PathBuf> = std::fs::read_dir(f.copy.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("Plugins.txt.agora-conflict-"))
+        })
+        .collect();
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "the real file's bytes are kept as a conflict copy: {conflicts:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&conflicts[0]).unwrap(),
+        "Game changed this after the crash\n"
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("both changed since the swap")),
+        "the refusal is reported: {report:?}"
+    );
+    assert!(report.actions.is_empty(), "{report:?}");
+}
+
+/// A legacy journal (no recorded resolved path) fails closed on ANY recovery that would write,
+/// not only when the final component is a link: here an ancestor directory was replaced by a
+/// link after the crash, and the final component is an ordinary file, so the old link-text guard
+/// could not see it. Recovery must refuse and write nothing through the redirected ancestor.
+#[test]
+fn a_legacy_journal_with_a_redirected_ancestor_is_refused_by_recovery() {
+    let f = user_files_fixture(Some("Player original\n"));
+    let user_root = f._user_data_dir.path().to_path_buf();
+    agora_core::game_user_files::swap_in(
+        &f.ctx,
+        "instance-a",
+        &f.def,
+        &StoreId::steam(),
+        &f.running_from,
+    )
+    .unwrap();
+    agora_core::game_user_files::record_process(&f.ctx, &f.def.id, &StoreId::steam(), dead_identity())
+        .unwrap();
+    let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
+    assert!(journal_path.exists());
+    assert_eq!(std::fs::read_to_string(&f.real).unwrap(), "Instance copy\n");
+    // Make the journal legacy: no recorded resolved path.
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&journal_path).unwrap()).unwrap();
+    value["files"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("real_resolved_path");
+    std::fs::write(&journal_path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    // After the crash the player replaces the 'local' folder with a link to another folder.
+    let evil = user_root.join("evil-local");
+    std::fs::create_dir_all(evil.join("Test Game")).unwrap();
+    std::fs::write(evil.join("Test Game").join("Plugins.txt"), "Evil bytes\n").unwrap();
+    std::fs::rename(user_root.join("local"), user_root.join("local-orig")).unwrap();
+    link_dir(&user_root.join("local"), &evil);
+
+    let report = run_at_startup(&f.ctx);
+
+    assert_eq!(
+        std::fs::read_to_string(evil.join("Test Game").join("Plugins.txt")).unwrap(),
+        "Evil bytes\n",
+        "recovery wrote the backup through the redirected ancestor of a legacy journal"
+    );
+    assert_eq!(
+        std::fs::read_to_string(user_root.join("local-orig").join("Test Game").join("Plugins.txt"))
+            .unwrap(),
+        "Instance copy\n",
+        "the original location was changed"
+    );
+    assert!(journal_path.exists(), "the journal is kept for a hand");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("cannot be verified to still resolve")),
+        "the refusal is reported: {report:?}"
+    );
+    assert!(report.actions.is_empty(), "{report:?}");
+}
+
+/// The swap records where the real path will resolve even when the file does not exist yet
+/// (Agora is about to create it): the journal of an absent-at-swap file carries a resolved path,
+/// so its normal recovery (remove Agora's own write) is not mistaken for a legacy journal. The
+/// recovery itself must still succeed.
+#[test]
+fn a_file_absent_at_swap_records_its_would_be_resolved_path_and_recovers_normally() {
+    let f = user_files_fixture(None);
+    agora_core::game_user_files::swap_in(
+        &f.ctx,
+        "instance-a",
+        &f.def,
+        &StoreId::steam(),
+        &f.running_from,
+    )
+    .unwrap();
+    let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&journal_path).unwrap()).unwrap();
+    let recorded = value["files"][0]["real_resolved_path"].as_str().unwrap_or("");
+    assert!(
+        recorded.to_lowercase().ends_with("plugins.txt"),
+        "the journal records where the absent file will resolve: {recorded}"
+    );
+    agora_core::game_user_files::record_process(&f.ctx, &f.def.id, &StoreId::steam(), dead_identity())
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&f.real).unwrap(), "Instance copy\n");
+
+    let report = run_at_startup(&f.ctx);
+
+    assert!(
+        !f.real.exists(),
+        "Agora's own write (byte-identical to the recorded one) was removed: {}",
+        std::fs::read_to_string(&f.real).unwrap_or_default()
+    );
+    assert!(!journal_path.exists(), "the journal is gone after recovery");
+    assert!(
+        report
+            .actions
+            .iter()
+            .any(|a| a.contains("Put back the user files")),
+        "the recovery ran: {report:?}"
+    );
 }
