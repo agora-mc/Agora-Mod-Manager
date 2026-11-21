@@ -10,7 +10,7 @@ use crate::lock_manager::LockManager;
 use crate::operation_manager::OperationManager;
 use crate::paths;
 use crate::registry_bundle::{
-    self, BundleError, CatalogHeader, KeyCertificate, KeyRevocation, RegistryKey, RegistryKeyRole,
+    self, BundleError, CatalogHeader, KeyCertificate, KeyRevocation, RegistryKeyRole,
     RegistryTrust, VerifiedBundle,
 };
 use chrono::{DateTime, Datelike, Utc};
@@ -126,8 +126,6 @@ pub async fn check_and_download_update(
 ) -> LauncherResult<RegistryStatus> {
     let transport = GitHubTransport;
     let trust = RegistryTrust::production();
-    // Refuse early, with the trust-state error, rather than deep in an install.
-    effective_trust(app_data_dir, &trust)?;
     check_and_download_update_inner(
         app_data_dir,
         local_state_path,
@@ -168,7 +166,6 @@ pub fn install_bundle_from_file(
     lock_manager: &LockManager,
 ) -> LauncherResult<InstalledBundle> {
     let trust = RegistryTrust::production();
-    effective_trust(app_data_dir, &trust)?;
     install_bundle_from_file_with_trust(
         app_data_dir,
         local_state_path,
@@ -253,7 +250,7 @@ async fn check_and_download_update_inner(
     registry_repo: &str,
     lock_manager: &LockManager,
     transport: &dyn RegistryTransport,
-    trust: &RegistryTrust,
+    compiled: &RegistryTrust,
     now: i64,
 ) -> LauncherResult<RegistryStatus> {
     let conn =
@@ -268,6 +265,9 @@ async fn check_and_download_update_inner(
         });
     }
     drop(conn);
+    // One snapshot of the trust for the whole check, taken again only after an
+    // install has changed the log.
+    let trust = &TrustSnapshot::load(app_data_dir, compiled)?;
     let cached_tag = get_cached_tag(local_state_path)?;
     let cached = cached_catalog_summary_with_trust(app_data_dir, trust);
     let has_cached_db = cached.is_some();
@@ -438,8 +438,12 @@ async fn check_and_download_update_inner(
             return Ok((current.schema_version, current.expires_at, false));
         }
 
-        let installed =
-            install_bundle_bytes_checked(app_data_dir, &bundle_bytes, trust, &latest.tag_name)?;
+        let installed = install_bundle_bytes_checked_with(
+            app_data_dir,
+            &bundle_bytes,
+            trust,
+            &latest.tag_name,
+        )?;
         // Display/asset metadata is written after the commit. The bundle is
         // already current, so a write failure here must not be reported as a
         // failed install; the next sync can set it again.
@@ -468,6 +472,7 @@ async fn check_and_download_update_inner(
 
     // An identical candidate skips extraction, and extraction can fail even
     // after a real install. Report the actual readable-database state.
+    let trust = &TrustSnapshot::load(app_data_dir, compiled)?;
     let ready = cached_catalog_summary_with_trust(app_data_dir, trust).is_some();
     Ok(RegistryStatus {
         has_cached_db: ready,
@@ -502,7 +507,7 @@ async fn bundle_from_delta(
     latest: &GitHubRelease,
     registry_repo: &str,
     token: Option<&str>,
-    trust: &RegistryTrust,
+    trust: &TrustSnapshot,
     transport: &dyn RegistryTransport,
 ) -> Option<Vec<u8>> {
     let bundle_path = paths::registry_bundle_path(app_data_dir).ok()?;
@@ -530,7 +535,7 @@ async fn bundle_from_delta(
         .ok()?;
     let payload = registry_bundle::apply_payload_delta(&current.payload, &delta, db_len).ok()?;
     bundle.extend_from_slice(&payload);
-    registry_bundle::verify_bundle(&bundle, trust).ok()?;
+    registry_bundle::verify_bundle(&bundle, trust.trust()).ok()?;
     Some(bundle)
 }
 
@@ -612,7 +617,7 @@ fn quarantine_aside(path: &Path, kind: &str) -> std::io::Result<()> {
 /// statement that does not authenticate makes the log an error.
 #[derive(Debug, Default)]
 struct RememberedTrust {
-    keys: Vec<RegistryKey>,
+    certificates: Vec<KeyCertificate>,
     revocations: Vec<KeyRevocation>,
     /// The log exactly as it was read, so a writer can refuse to build on a
     /// log that changed underneath it.
@@ -823,8 +828,6 @@ fn load_remembered_trust(
 
     let mut all_certificates: Vec<KeyCertificate> = Vec::new();
     let mut revocations: Vec<KeyRevocation> = Vec::new();
-    let mut revoked: BTreeSet<String> = base.revoked_ids().into_iter().collect();
-    let mut keys: Vec<RegistryKey> = Vec::new();
     let mut standing = base.clone();
     for record in &records {
         let authenticated = registry_bundle::authenticate_statements(
@@ -837,6 +840,7 @@ fn load_remembered_trust(
         for certificate in &record.certificates {
             let explained = authenticated.certificates.contains(certificate)
                 || standing_revoked.contains(&certificate.key_id)
+                || standing.certificates().contains(certificate)
                 || standing
                     .keys()
                     .iter()
@@ -867,37 +871,52 @@ fn load_remembered_trust(
 
         all_certificates.extend(authenticated.certificates);
         for revocation in authenticated.revocations {
-            revoked.insert(revocation.revoked_key_id.clone());
             if !revocations.contains(&revocation) {
                 revocations.push(revocation);
             }
         }
-        keys = registry_bundle::surviving_certificates(base, &all_certificates, &revoked)
-            .into_iter()
-            .map(|certificate| {
-                RegistryKey::from_hex(certificate.public_key).with_role(certificate.role)
-            })
-            .collect();
+        // The next record is judged against everything learned so far. Chains
+        // through revoked keys fall away inside the trust itself.
         standing = base.clone();
-        standing.merge_remembered(keys.clone(), revocations.clone());
+        standing.merge_remembered(all_certificates.clone(), revocations.clone());
     }
 
     Ok(RememberedTrust {
-        keys,
+        certificates: all_certificates,
         revocations,
         log_text: text,
     })
 }
 
-/// Compiled keys plus what this client remembered, minus what it remembered as
-/// revoked. `base` must be the compiled (or test) keys, never a set that already
-/// has the log merged in. An unreadable or unauthenticatable trust log is an
-/// error, never a quiet fall back to the compiled keys.
-fn effective_trust(app_data_dir: &Path, base: &RegistryTrust) -> LauncherResult<RegistryTrust> {
-    let remembered = load_remembered_trust(app_data_dir, base)?;
-    let mut trust = base.clone();
-    trust.merge_remembered(remembered.keys, remembered.revocations);
-    Ok(trust)
+/// The trust in force for one operation: the compiled (or test) keys plus the
+/// remembered log, computed once by [`TrustSnapshot::load`] and used for every
+/// decision in that operation. Internal helpers take a snapshot, never a bare
+/// [`RegistryTrust`], so none of them can re-read the log, replay a merged set,
+/// or turn a log error into "nothing remembered".
+struct TrustSnapshot {
+    trust: RegistryTrust,
+    /// The log as it was read, so the writer refuses to build on a changed one.
+    log_text: String,
+}
+
+impl TrustSnapshot {
+    /// `compiled` is the compiled (or test) key set: roots only, never the
+    /// result of an earlier snapshot. An unreadable, damaged or
+    /// unauthenticatable log is an error, never a quiet fall back to the
+    /// compiled keys.
+    fn load(app_data_dir: &Path, compiled: &RegistryTrust) -> LauncherResult<Self> {
+        let remembered = load_remembered_trust(app_data_dir, compiled)?;
+        let mut trust = compiled.clone();
+        trust.merge_remembered(remembered.certificates, remembered.revocations);
+        Ok(Self {
+            trust,
+            log_text: remembered.log_text,
+        })
+    }
+
+    fn trust(&self) -> &RegistryTrust {
+        &self.trust
+    }
 }
 
 /// The durable rollback floor: the highest signed build stamp ever committed,
@@ -952,7 +971,7 @@ fn read_floor_file(app_data_dir: &Path) -> LauncherResult<Option<CachedStamp>> {
 /// pre-floor cache. Otherwise the append can revoke the installed bundle's
 /// signer, a failed swap leaves that bundle unverifiable, and the effective
 /// floor is lost with it. The floor is durable before the trust change.
-fn ensure_floor_baseline(app_data_dir: &Path, trust: &RegistryTrust) -> LauncherResult<()> {
+fn ensure_floor_baseline(app_data_dir: &Path, trust: &TrustSnapshot) -> LauncherResult<()> {
     // Reading first also fails closed on a malformed or unreadable floor.
     let _ = read_floor_file(app_data_dir)?;
     // Checkpoint the maximum, not just an unset floor: a previous post-swap
@@ -969,7 +988,7 @@ fn ensure_floor_baseline(app_data_dir: &Path, trust: &RegistryTrust) -> Launcher
 /// floor is unset and candidates are judged on their own signed stamps.
 fn durable_floor(
     app_data_dir: &Path,
-    trust: &RegistryTrust,
+    trust: &TrustSnapshot,
 ) -> LauncherResult<Option<CachedStamp>> {
     // An unreadable or malformed floor is an error everywhere: treating it as
     // unset would drop rollback protection on installs, opens and recovery.
@@ -1065,7 +1084,7 @@ fn fail_floor_writes(app_data_dir: &Path) -> FloorWriteFailureGuard {
 /// be verified contributes nothing here, but the floor still applies.
 fn rollback_baseline(
     app_data_dir: &Path,
-    trust: &RegistryTrust,
+    trust: &TrustSnapshot,
 ) -> LauncherResult<Option<CachedStamp>> {
     let installed = read_cached_stamp(app_data_dir, trust);
     let floor = durable_floor(app_data_dir, trust)?;
@@ -1219,9 +1238,6 @@ fn trust_fingerprint(trust: &RegistryTrust) -> String {
 enum BundleLoadError {
     Io(std::io::Error),
     Bundle(BundleError),
-    /// The remembered trust log could not be read or authenticated. Not a fault
-    /// of the bundle, so it never causes a quarantine.
-    Trust(LauncherError),
 }
 
 impl std::fmt::Display for BundleLoadError {
@@ -1229,16 +1245,14 @@ impl std::fmt::Display for BundleLoadError {
         match self {
             Self::Io(error) => write!(f, "it could not be read ({error})"),
             Self::Bundle(error) => write!(f, "{error}"),
-            Self::Trust(error) => write!(f, "{error}"),
         }
     }
 }
 
-fn load_header(path: &Path, trust: &RegistryTrust) -> Result<CatalogHeader, BundleLoadError> {
-    let app_data_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let trust = effective_trust(app_data_dir, trust).map_err(BundleLoadError::Trust)?;
+fn load_header(path: &Path, trust: &TrustSnapshot) -> Result<CatalogHeader, BundleLoadError> {
+    let trust = trust.trust();
     let metadata = std::fs::metadata(path).map_err(BundleLoadError::Io)?;
-    let fingerprint = trust_fingerprint(&trust);
+    let fingerprint = trust_fingerprint(trust);
     if let Ok(cache) = header_cache().lock() {
         if let Some(entry) = cache.get(path) {
             if entry.len == metadata.len()
@@ -1251,7 +1265,7 @@ fn load_header(path: &Path, trust: &RegistryTrust) -> Result<CatalogHeader, Bund
     }
     let bytes = std::fs::read(path).map_err(BundleLoadError::Io)?;
     let verified =
-        registry_bundle::verify_bundle(&bytes, &trust).map_err(BundleLoadError::Bundle)?;
+        registry_bundle::verify_bundle(&bytes, trust).map_err(BundleLoadError::Bundle)?;
     if let Ok(mut cache) = header_cache().lock() {
         cache.insert(
             path.to_path_buf(),
@@ -1266,11 +1280,9 @@ fn load_header(path: &Path, trust: &RegistryTrust) -> Result<CatalogHeader, Bund
     Ok(verified.header)
 }
 
-fn load_payload(path: &Path, trust: &RegistryTrust) -> Result<VerifiedBundle, BundleLoadError> {
-    let app_data_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let trust = effective_trust(app_data_dir, trust).map_err(BundleLoadError::Trust)?;
+fn load_payload(path: &Path, trust: &TrustSnapshot) -> Result<VerifiedBundle, BundleLoadError> {
     let bytes = std::fs::read(path).map_err(BundleLoadError::Io)?;
-    registry_bundle::verify_bundle(&bytes, &trust).map_err(BundleLoadError::Bundle)
+    registry_bundle::verify_bundle(&bytes, trust.trust()).map_err(BundleLoadError::Bundle)
 }
 
 fn bundle_error(error: BundleError) -> LauncherError {
@@ -1403,7 +1415,7 @@ fn ensure_database(
     bundle_path: &Path,
     header: &CatalogHeader,
     payload: Option<&[u8]>,
-    trust: &RegistryTrust,
+    trust: &TrustSnapshot,
 ) -> LauncherResult<()> {
     let db_path =
         paths::registry_db_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
@@ -1418,13 +1430,11 @@ fn ensure_database(
     let payload = match payload {
         Some(payload) => payload,
         None => {
-            let verified = load_payload(bundle_path, trust).map_err(|error| match error {
-                BundleLoadError::Trust(error) => error,
-                error => LauncherError::Generic {
+            let verified =
+                load_payload(bundle_path, trust).map_err(|error| LauncherError::Generic {
                     code: "ERR_REGISTRY_BUNDLE_INVALID".into(),
                     message: format!("The catalog bundle could not be read: {error}."),
-                },
-            })?;
+                })?;
             owned_payload = verified.payload;
             &owned_payload
         }
@@ -1453,14 +1463,22 @@ fn ensure_database(
 fn install_bundle_bytes_checked(
     app_data_dir: &Path,
     bundle_bytes: &[u8],
-    trust: &RegistryTrust,
+    compiled: &RegistryTrust,
     label: &str,
 ) -> LauncherResult<InstalledBundle> {
-    // `trust` stays the base: every helper below re-reads the log itself, and a
-    // replay must never start from an already merged set.
-    let effective = effective_trust(app_data_dir, trust)?;
+    let trust = TrustSnapshot::load(app_data_dir, compiled)?;
+    install_bundle_bytes_checked_with(app_data_dir, bundle_bytes, &trust, label)
+}
+
+/// The install body: every decision uses the one `trust` snapshot.
+fn install_bundle_bytes_checked_with(
+    app_data_dir: &Path,
+    bundle_bytes: &[u8],
+    trust: &TrustSnapshot,
+    label: &str,
+) -> LauncherResult<InstalledBundle> {
     let verified =
-        registry_bundle::verify_bundle(bundle_bytes, &effective).map_err(bundle_error)?;
+        registry_bundle::verify_bundle(bundle_bytes, trust.trust()).map_err(bundle_error)?;
 
     // Anti-rollback is checked only after the signature, so the stamp being
     // compared is one the signing key vouched for. The release tag is display
@@ -1525,7 +1543,7 @@ fn install_bundle_bytes_checked(
         });
     }
 
-    install_bundle_bytes(app_data_dir, &verified.header, bundle_bytes, trust)?;
+    install_bundle_bytes_with(app_data_dir, &verified.header, bundle_bytes, trust)?;
 
     Ok(InstalledBundle {
         tag: verified.header.tag,
@@ -1542,13 +1560,10 @@ fn install_bundle_bytes_checked(
 fn unchanged_candidate(
     app_data_dir: &Path,
     bundle_bytes: &[u8],
-    trust: &RegistryTrust,
+    trust: &TrustSnapshot,
 ) -> LauncherResult<Option<InstalledBundle>> {
-    // `trust` stays the base: every helper below re-reads the log itself, and a
-    // replay must never start from an already merged set.
-    let effective = effective_trust(app_data_dir, trust)?;
     let verified =
-        registry_bundle::verify_bundle(bundle_bytes, &effective).map_err(bundle_error)?;
+        registry_bundle::verify_bundle(bundle_bytes, trust.trust()).map_err(bundle_error)?;
     let cached = rollback_baseline(app_data_dir, trust)?;
     if compare_stamps(
         cached.as_ref(),
@@ -1617,18 +1632,30 @@ fn floor_after_swap_error(error: LauncherError) -> LauncherError {
     }
 }
 
+/// [`install_bundle_bytes_with`] for a caller that has no snapshot yet.
+#[cfg(test)]
 fn install_bundle_bytes(
     app_data_dir: &Path,
     header: &CatalogHeader,
     bundle_bytes: &[u8],
-    trust: &RegistryTrust,
+    compiled: &RegistryTrust,
+) -> LauncherResult<()> {
+    let trust = TrustSnapshot::load(app_data_dir, compiled)?;
+    install_bundle_bytes_with(app_data_dir, header, bundle_bytes, &trust)
+}
+
+fn install_bundle_bytes_with(
+    app_data_dir: &Path,
+    header: &CatalogHeader,
+    bundle_bytes: &[u8],
+    trust: &TrustSnapshot,
 ) -> LauncherResult<()> {
     let bundle_path =
         paths::registry_bundle_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
     let previous_path = paths::registry_bundle_previous_path(app_data_dir)
         .map_err(|_| LauncherError::RegistryMissing)?;
-    let effective = effective_trust(app_data_dir, trust)?;
-    let payload = registry_bundle::verify_bundle(bundle_bytes, &effective).map_err(bundle_error)?;
+    let payload =
+        registry_bundle::verify_bundle(bundle_bytes, trust.trust()).map_err(bundle_error)?;
 
     // Capture the pre-existing verified baseline before changing trust: the
     // append below may revoke the installed bundle's signer, so its stamp must
@@ -1636,8 +1663,7 @@ fn install_bundle_bytes(
     ensure_floor_baseline(app_data_dir, trust)?;
     // Signed and verified trust facts only ever add, so writing them ahead of
     // the swap is always safe and no revocation can be lost by a later failure.
-    let log_text = load_remembered_trust(app_data_dir, trust)?.log_text;
-    let trust_written = remember_bundle_trust(app_data_dir, &log_text, &payload)?;
+    let trust_written = remember_bundle_trust(app_data_dir, &trust.log_text, &payload)?;
 
     // Keep the previous copy only when the current file looks like a bundle.
     // A corrupt current must not overwrite a good previous one.
@@ -1704,14 +1730,21 @@ pub fn verify_cached_registry(app_data_dir: &Path) -> CachedRegistryIntegrity {
 /// [`verify_cached_registry`] against an explicit trust set (test support).
 pub fn verify_cached_registry_with_trust(
     app_data_dir: &Path,
-    trust: &RegistryTrust,
+    compiled: &RegistryTrust,
 ) -> CachedRegistryIntegrity {
     let bundle_path = match paths::registry_bundle_path(app_data_dir) {
         Ok(path) => path,
         Err(_) => return CachedRegistryIntegrity::Absent,
     };
     if bundle_path.exists() {
-        return verify_bundle_file(app_data_dir, &bundle_path, trust);
+        // A log that cannot be trusted is not the bundle's fault: report it, and
+        // neither recover from the previous copy nor move the bundle aside.
+        return match TrustSnapshot::load(app_data_dir, compiled) {
+            Ok(trust) => verify_bundle_file(app_data_dir, &bundle_path, &trust),
+            Err(error) => CachedRegistryIntegrity::Error(format!(
+                "{error} The catalog will not be used this run."
+            )),
+        };
     }
 
     // A pre-bundle cache is not a catalog. It has no signed expiry, no key id
@@ -1723,7 +1756,7 @@ pub fn verify_cached_registry_with_trust(
 fn verify_bundle_file(
     app_data_dir: &Path,
     bundle_path: &Path,
-    trust: &RegistryTrust,
+    trust: &TrustSnapshot,
 ) -> CachedRegistryIntegrity {
     match load_header(bundle_path, trust) {
         Ok(header) => match ensure_database(app_data_dir, bundle_path, &header, None, trust) {
@@ -1748,10 +1781,6 @@ fn verify_bundle_file(
         Err(BundleLoadError::Io(error)) => CachedRegistryIntegrity::Error(format!(
             "Cached catalog bundle could not be read ({error}); it will not be used."
         )),
-        // The bundle is not at fault, so it is neither recovered nor moved aside.
-        Err(BundleLoadError::Trust(error)) => CachedRegistryIntegrity::Error(format!(
-            "{error} The catalog will not be used this run."
-        )),
         Err(BundleLoadError::Bundle(error)) => {
             let reason = format!("Cached catalog bundle could not be used: {error}.");
             recover_previous(app_data_dir, bundle_path, trust, reason)
@@ -1762,21 +1791,13 @@ fn verify_bundle_file(
 fn recover_previous(
     app_data_dir: &Path,
     bundle_path: &Path,
-    trust: &RegistryTrust,
+    trust: &TrustSnapshot,
     reason: String,
 ) -> CachedRegistryIntegrity {
     let previous_path = match paths::registry_bundle_previous_path(app_data_dir) {
         Ok(path) => path,
         Err(_) => return quarantine_bundle(bundle_path, reason),
     };
-    // Recovery uses the remembered trust as its authority. A trust file that
-    // exists but cannot be read is never treated as "no revocations".
-    if effective_trust(app_data_dir, trust).is_err() {
-        return quarantine_bundle(
-            bundle_path,
-            format!("{reason} The remembered catalog trust state could not be read."),
-        );
-    }
     if previous_path.exists() {
         if let Ok(header) = load_header(&previous_path, trust) {
             // A backup below the durable floor is a superseded catalog. Keep it
@@ -1821,7 +1842,7 @@ fn stale_message(header: &CatalogHeader) -> String {
 fn below_floor(
     header: &CatalogHeader,
     app_data_dir: &Path,
-    trust: &RegistryTrust,
+    trust: &TrustSnapshot,
 ) -> LauncherResult<bool> {
     Ok(durable_floor(app_data_dir, trust)?.is_some_and(|floor| {
         parse_utc(&header.built_at)
@@ -1848,7 +1869,7 @@ struct CachedStamp {
 /// An installed bundle that cannot be verified contributes no stamp: neither
 /// trust statements nor a signed build time can be taken from it. The durable
 /// floor is the authority that still prevents replay in that state.
-fn read_cached_stamp(app_data_dir: &Path, trust: &RegistryTrust) -> Option<CachedStamp> {
+fn read_cached_stamp(app_data_dir: &Path, trust: &TrustSnapshot) -> Option<CachedStamp> {
     let bundle_path = paths::registry_bundle_path(app_data_dir).ok()?;
     if !bundle_path.exists() {
         return None;
@@ -1862,7 +1883,7 @@ fn read_cached_stamp(app_data_dir: &Path, trust: &RegistryTrust) -> Option<Cache
 
 fn cached_catalog_summary_with_trust(
     app_data_dir: &Path,
-    trust: &RegistryTrust,
+    trust: &TrustSnapshot,
 ) -> Option<CachedCatalogSummary> {
     let bundle_path = paths::registry_bundle_path(app_data_dir).ok()?;
     if bundle_path.exists() {
@@ -1898,17 +1919,15 @@ fn cached_catalog_summary_with_trust(
 /// signature verifies. `None` means there is no catalog to digest.
 pub fn verified_registry_digest(
     app_data_dir: &Path,
-    trust: &RegistryTrust,
+    compiled: &RegistryTrust,
 ) -> LauncherResult<Option<String>> {
     let bundle_path =
         paths::registry_bundle_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
     if bundle_path.exists() {
-        let header = load_header(&bundle_path, trust).map_err(|error| match error {
-            BundleLoadError::Trust(error) => error,
-            error => LauncherError::Generic {
-                code: "ERR_REGISTRY_SIGNATURE_INVALID".into(),
-                message: format!("The catalog bundle could not be used: {error}."),
-            },
+        let trust = &TrustSnapshot::load(app_data_dir, compiled)?;
+        let header = load_header(&bundle_path, trust).map_err(|error| LauncherError::Generic {
+            code: "ERR_REGISTRY_SIGNATURE_INVALID".into(),
+            message: format!("The catalog bundle could not be used: {error}."),
         })?;
         // The digest is used as a cache key for the readable database, so it
         // must not materialize one for a bundle a plain open would refuse.
@@ -1934,9 +1953,27 @@ pub fn get_status(app_data_dir: &Path, local_state_path: &Path) -> RegistryStatu
 fn get_status_with_trust(
     app_data_dir: &Path,
     local_state_path: &Path,
-    trust: &RegistryTrust,
+    compiled: &RegistryTrust,
 ) -> RegistryStatus {
-    let cached = cached_catalog_summary_with_trust(app_data_dir, trust);
+    // A log that cannot be trusted is shown as such, never as an empty catalog
+    // that silently trusts only the compiled keys.
+    let trust = match TrustSnapshot::load(app_data_dir, compiled) {
+        Ok(trust) => trust,
+        Err(error) => {
+            return RegistryStatus {
+                has_cached_db: false,
+                cached_tag: get_cached_tag(local_state_path).ok().flatten(),
+                cached_schema_version: None,
+                latest_tag: None,
+                update_available: false,
+                checked: false,
+                stale: false,
+                expires_at: None,
+                message: error.to_string(),
+            }
+        }
+    };
+    let cached = cached_catalog_summary_with_trust(app_data_dir, &trust);
     let has_cached_db = cached.is_some();
     let cached_tag = get_cached_tag(local_state_path).ok().flatten();
     let failed_tag = if has_cached_db {
@@ -2003,7 +2040,7 @@ pub fn seed_from_local_build(app_data_dir: &Path) -> LauncherResult<bool> {
                         &dest_bundle,
                         &parsed.header,
                         Some(parsed.payload),
-                        &RegistryTrust::production(),
+                        &TrustSnapshot::load(app_data_dir, &RegistryTrust::production())?,
                     )?;
                     if let Ok(sig_path) = paths::registry_sig_path(app_data_dir) {
                         let _ = std::fs::remove_file(sig_path);
@@ -2298,22 +2335,26 @@ pub fn open_verified_registry(app_data_dir: &Path) -> LauncherResult<VerifiedReg
 /// [`open_verified_registry`] against an explicit trust set.
 pub fn open_verified_registry_with_trust(
     app_data_dir: &Path,
-    trust: &RegistryTrust,
+    compiled: &RegistryTrust,
 ) -> LauncherResult<VerifiedRegistry> {
+    let trust = compiled;
     let bundle_path =
         paths::registry_bundle_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
     if bundle_path.exists() {
-        let first = open_bundle_once(app_data_dir, &bundle_path, trust);
+        // One snapshot for the open and for any recovery it triggers. A log that
+        // cannot be trusted refuses the open, whatever the bundle looks like.
+        let snapshot = TrustSnapshot::load(app_data_dir, compiled)?;
+        let first = open_bundle_once(app_data_dir, &bundle_path, &snapshot);
         if first.is_ok() {
             return first;
         }
         // A crash between installing the bundle and extracting the database
         // (or a damaged current bundle) is recoverable from the previous copy.
-        match verify_cached_registry_with_trust(app_data_dir, trust) {
+        match verify_bundle_file(app_data_dir, &bundle_path, &snapshot) {
             CachedRegistryIntegrity::Verified
             | CachedRegistryIntegrity::Stale(_)
             | CachedRegistryIntegrity::Recovered(_) => {
-                return open_bundle_once(app_data_dir, &bundle_path, trust)
+                return open_bundle_once(app_data_dir, &bundle_path, &snapshot)
             }
             _ => return first,
         }
@@ -2343,14 +2384,11 @@ pub fn open_verified_registry_with_trust(
 fn open_bundle_once(
     app_data_dir: &Path,
     bundle_path: &Path,
-    trust: &RegistryTrust,
+    trust: &TrustSnapshot,
 ) -> LauncherResult<VerifiedRegistry> {
-    let header = load_header(bundle_path, trust).map_err(|error| match error {
-        BundleLoadError::Trust(error) => error,
-        error => LauncherError::Generic {
-            code: "ERR_REGISTRY_SIGNATURE_INVALID".into(),
-            message: format!("The catalog bundle could not be used: {error}."),
-        },
+    let header = load_header(bundle_path, trust).map_err(|error| LauncherError::Generic {
+        code: "ERR_REGISTRY_SIGNATURE_INVALID".into(),
+        message: format!("The catalog bundle could not be used: {error}."),
     })?;
     if below_floor(&header, app_data_dir, trust)? {
         return Err(LauncherError::Generic {
@@ -4585,7 +4623,11 @@ mod tests {
         let header = fresh_header(&key, &payload);
         write_bundle(dir.path(), "registry.bundle", &key, &header, &payload);
         assert_eq!(
-            read_cached_stamp(dir.path(), &trust).map(|stamp| stamp.built_at),
+            read_cached_stamp(
+                dir.path(),
+                &TrustSnapshot::load(dir.path(), &trust).unwrap()
+            )
+            .map(|stamp| stamp.built_at),
             Some(header.built_at)
         );
 
@@ -4594,7 +4636,13 @@ mod tests {
             b"corrupt current bundle",
         )
         .unwrap();
-        assert_eq!(read_cached_stamp(dir.path(), &trust), None);
+        assert_eq!(
+            read_cached_stamp(
+                dir.path(),
+                &TrustSnapshot::load(dir.path(), &trust).unwrap()
+            ),
+            None
+        );
     }
 
     /// A new key introduced by a certificate signed by an old trusted key is
@@ -4624,6 +4672,14 @@ mod tests {
         )
         .unwrap();
         assert!(open_verified_registry_with_trust(dir.path(), &trust_old).is_err());
+    }
+
+    /// The trust one operation would use: compiled keys plus the log.
+    fn effective_trust(
+        app_data_dir: &Path,
+        compiled: &RegistryTrust,
+    ) -> LauncherResult<RegistryTrust> {
+        TrustSnapshot::load(app_data_dir, compiled).map(|snapshot| snapshot.trust)
     }
 
     fn certificate(recovery: &ed25519_dalek::SigningKey, new_public: &str) -> KeyCertificate {
@@ -5408,6 +5464,205 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         let error = verified_registry_digest(dir.path(), &trust)
             .expect_err("an unreadable trust log must refuse the digest");
         assert_eq!(error.code(), "ERR_REGISTRY_TRUST_STATE");
+    }
+
+    /// A remembered descendant must not be able to sign the very bundle that
+    /// revokes its ancestor: install and a later reopen have to agree.
+    #[test]
+    fn a_remembered_descendant_cannot_sign_the_bundle_that_revokes_its_ancestor() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = test_key(181);
+        let stolen = test_key(182);
+        let recovery = test_key(183);
+        let second_recovery = test_key(184);
+        let descendant = test_key(185);
+        let trust = rotation_trust(&primary, &stolen, &recovery);
+        let payload = sample_db();
+
+        let mut first = fresh_header(&primary, &payload);
+        first.certificates.push(recovery_certificate(
+            &recovery,
+            &test_public(&second_recovery),
+        ));
+        first
+            .certificates
+            .push(certificate(&second_recovery, &test_public(&descendant)));
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&primary, &first, &payload),
+            &trust,
+            "first",
+        )
+        .unwrap();
+        let installed = fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap();
+
+        let newer = sample_db_with_built_at("2026-11-18T12:00:00+00:00");
+        let mut revoking = header_for(
+            &descendant,
+            &newer,
+            "2026-11-18T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        revoking
+            .revocations
+            .push(revocation(&recovery, &second_recovery));
+        let error = install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&descendant, &revoking, &newer),
+            &trust,
+            "revoking",
+        )
+        .expect_err("a key certified through the revoked key cannot sign its revocation");
+        assert_eq!(error.code(), "ERR_REGISTRY_SIGNATURE_INVALID");
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            installed,
+            "nothing was installed"
+        );
+        assert!(open_verified_registry_with_trust(dir.path(), &trust).is_ok());
+    }
+
+    /// A broken log during an install is an error, even when the rollback floor
+    /// is absent and the installed stamp is all that would have protected us.
+    #[test]
+    fn a_broken_log_refuses_an_install_rather_than_hiding_the_installed_stamp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = test_key(186);
+        let stolen = test_key(187);
+        let recovery = test_key(188);
+        let new_key = test_key(189);
+        let trust = rotation_trust(&primary, &stolen, &recovery);
+        let newer = sample_db_with_built_at("2026-11-18T12:00:00+00:00");
+        let mut current = header_for(
+            &primary,
+            &newer,
+            "2026-11-18T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        current
+            .certificates
+            .push(certificate(&recovery, &test_public(&new_key)));
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&primary, &current, &newer),
+            &trust,
+            "current",
+        )
+        .unwrap();
+        fs::remove_file(dir.path().join("registry.floor")).unwrap();
+        let trust_path = paths::registry_trust_state_path(dir.path()).unwrap();
+        let intact = fs::read_to_string(&trust_path).unwrap();
+        fs::write(&trust_path, &intact[..intact.len() - 5]).unwrap();
+
+        let older = sample_db_with_built_at("2026-11-10T12:00:00+00:00");
+        let older_header = header_for(
+            &primary,
+            &older,
+            "2026-11-10T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let error = install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&primary, &older_header, &older),
+            &trust,
+            "older",
+        )
+        .expect_err("an older bundle must not install over a log we cannot trust");
+        assert_eq!(error.code(), "ERR_REGISTRY_TRUST_STATE");
+    }
+
+    /// A signer remembered from the log can sign a catalog that arrives as a
+    /// delta: the delta check uses the same snapshot as everything else, so a
+    /// remembered key does not force a full download.
+    #[tokio::test]
+    async fn a_remembered_signer_can_sign_a_delta_catalog() {
+        let (dir, ls_path, locks) = setup_sync_env();
+        let primary = test_key(190);
+        let stolen = test_key(191);
+        let recovery = test_key(192);
+        let remembered = test_key(193);
+        let trust = rotation_trust(&primary, &stolen, &recovery);
+
+        let first_payload = sample_db_with_built_at("2026-11-17T02:00:00+00:00");
+        let mut first = header_for(
+            &primary,
+            &first_payload,
+            "2026-11-17T02:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        first
+            .certificates
+            .push(certificate(&recovery, &test_public(&remembered)));
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&primary, &first, &first_payload),
+            &trust,
+            "first",
+        )
+        .unwrap();
+        let old_payload = sample_db_with_built_at("2026-11-18T02:00:00+00:00");
+        let old_header = header_for(
+            &remembered,
+            &old_payload,
+            "2026-11-18T02:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&remembered, &old_header, &old_payload),
+            &trust,
+            "second",
+        )
+        .unwrap();
+        set_cached_tag(&ls_path, "registry-2026-11-18").unwrap();
+        set_cached_asset_id(&ls_path, Some(2999)).unwrap();
+
+        let new_payload = sample_db_with_built_at("2026-11-19T02:00:00+00:00");
+        let new_header = header_for(
+            &remembered,
+            &new_payload,
+            "2026-11-19T02:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let new_bundle = signed_bundle(&remembered, &new_header, &new_payload);
+        let prefix = new_bundle[..new_bundle.len() - new_payload.len()].to_vec();
+        let mut encoder =
+            zstd::stream::write::Encoder::with_dictionary(Vec::new(), 19, &old_payload).unwrap();
+        encoder.include_contentsize(true).unwrap();
+        encoder
+            .set_pledged_src_size(Some(new_payload.len() as u64))
+            .unwrap();
+        std::io::Write::write_all(&mut encoder, &new_payload).unwrap();
+        let delta = encoder.finish().unwrap();
+        let delta_name = registry_bundle::delta_asset_name(&old_header.db_sha256).unwrap();
+
+        let recorded = format!(
+            r#"[{{"tag_name": "registry-2026-11-19", "draft": false, "prerelease": false,
+                "assets": [{{"id": 3001, "name": "registry.bundle"}},
+                           {{"id": 3002, "name": "registry.header"}},
+                           {{"id": 3003, "name": "{delta_name}"}}]}}]"#
+        );
+        let transport =
+            FakeRegistryTransport::from_pages(vec![(1, release_json_to_list(&recorded))]);
+        // The full bundle is never queued: asking for it would panic.
+        transport.push_asset_ok(3002, prefix);
+        transport.push_asset_ok(3003, delta);
+
+        let status = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            true,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_000,
+        )
+        .await
+        .expect("a remembered signer's delta must install without a full download");
+        assert_eq!(status.cached_tag.as_deref(), Some("registry-2026-11-19"));
     }
 
     /// The app and the CLI share one data folder. Their staging files must never

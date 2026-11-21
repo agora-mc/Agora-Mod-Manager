@@ -359,26 +359,35 @@ Next to the cached bundle the client keeps `registry.trust`, a line log of
 recovery-signed statements: certificates that introduced keys, and revocation
 statements with their signatures. A new entry is written before a verified
 bundle is installed, and the log only grows: a revocation is never removed.
-Every remembered line is re-verified on load by one rule. The log is a series of
-records, one per verified bundle (a `v1 record` line starts each). A statement
-counts when its signature chain authenticates against the trust standing before
-its record, whatever the order of its lines and whether or not the same record
-revokes its signer, so a key retired by an earlier record cannot sign anything in
-a later one (a
-recovery key introduced, used to revoke, and itself revoked in one bundle keeps
-its revocations). Authenticated revocations are all enforced, and a key survives
-only if nothing in its certificate chain is revoked, so revoking a recovery key
-also retires every key it certified. Every later verification starts from the
-compiled keys plus surviving remembered keys minus remembered revocations. A
-compiled-in key that was revoked stays revoked.
+The log is a series of records, one per verified bundle: a `v1 record <n>` line
+followed by exactly `n` statement lines. Every update replaces the whole file
+atomically (temp file, fsync, rename), so a record is entirely present or
+entirely absent and no prefix of a record can change trust. Lines before the
+first record header (a log from before records) form one implicit record.
 
-A missing or empty state file means nothing is remembered yet. A state file that cannot
-be read, or holds a statement that does not authenticate, is an error
-(`ERR_REGISTRY_TRUST_STATE`): the catalog is not opened and a good bundle is not
-quarantined, rather than falling back to a weaker set of keys. The only
-exception is a torn final line (no trailing newline) that does not parse or
-authenticate; the next install removes it before appending its own record. To start over, remove `registry.trust` yourself; Agora then trusts
-only its compiled keys.
+On load each record is re-verified by one rule: a statement counts when its
+signature chain authenticates against the trust standing before its record,
+whatever the order of its lines and whether or not the same record revokes its
+signer (a recovery key introduced, used to revoke, and itself revoked in one
+bundle keeps its revocations). A key retired by an earlier record cannot sign
+anything in a later one. Remembered certificates are evidence, not keys: a
+remembered key is trusted only while every key in its certificate chain is
+unrevoked, so revoking a recovery key also retires every key it certified, and
+a remembered descendant cannot sign the bundle that revokes its ancestor.
+
+Each operation (install, sync, open, status, digest, recovery) computes its
+trust once, from the compiled keys plus the log, and uses that one snapshot for
+every decision in it, including the cached stamp, the rollback floor and delta
+verification.
+
+A missing or empty state file means nothing is remembered yet. A state file that
+cannot be read, is damaged (a record cut short, a line cut in the middle), or
+holds a statement that does not authenticate is an error
+(`ERR_REGISTRY_TRUST_STATE`): the catalog is not opened, an install is refused,
+and a good bundle is not quarantined, rather than falling back to a weaker set
+of keys. A torn final line cannot come from Agora's own writes, so it is damage
+too. To start over, remove `registry.trust` yourself; Agora then trusts only its
+compiled keys.
 
 ### Rotating a key
 

@@ -98,7 +98,12 @@ impl RegistryKey {
 /// catalog (a test convenience; never true in a release build).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryTrust {
+    /// The compiled (or test) keys: the roots every chain starts from.
     keys: Vec<RegistryKey>,
+    /// Certificates remembered from earlier catalogs, each authenticated when
+    /// it was learned. They are evidence, not keys: a remembered key is trusted
+    /// only while its whole chain back to a root is unrevoked.
+    certificates: Vec<KeyCertificate>,
     /// Verified revocation statements remembered from earlier catalogs. This
     /// list only grows.
     revocations: Vec<KeyRevocation>,
@@ -120,6 +125,7 @@ impl RegistryTrust {
             .collect();
         Self {
             keys,
+            certificates: Vec::new(),
             revocations: Vec::new(),
             permit_unsigned_debug: false,
         }
@@ -129,6 +135,7 @@ impl RegistryTrust {
     pub fn with_key(public_key_hex: impl Into<String>) -> Self {
         Self {
             keys: vec![RegistryKey::from_hex(public_key_hex)],
+            certificates: Vec::new(),
             revocations: Vec::new(),
             permit_unsigned_debug: false,
         }
@@ -145,6 +152,7 @@ impl RegistryTrust {
                 .into_iter()
                 .map(|key| RegistryKey::from_hex(key.into()))
                 .collect(),
+            certificates: Vec::new(),
             revocations: Vec::new(),
             permit_unsigned_debug: false,
         }
@@ -161,6 +169,7 @@ impl RegistryTrust {
                 .into_iter()
                 .map(|(role, key)| RegistryKey::from_hex(key.into()).with_role(role))
                 .collect(),
+            certificates: Vec::new(),
             revocations: Vec::new(),
             permit_unsigned_debug: false,
         }
@@ -173,21 +182,23 @@ impl RegistryTrust {
     pub fn unverified_debug() -> Self {
         Self {
             keys: Vec::new(),
+            certificates: Vec::new(),
             revocations: Vec::new(),
             permit_unsigned_debug: cfg!(debug_assertions),
         }
     }
 
-    /// Add keys a verified catalog remembered, and the revocations it taught
-    /// us. Revocations always win over keys.
+    /// Add the certificates and revocations verified catalogs taught us.
+    /// Revocations always win, and a certificate's key is trusted only while
+    /// its chain is unrevoked.
     pub fn merge_remembered(
         &mut self,
-        keys: impl IntoIterator<Item = RegistryKey>,
+        certificates: impl IntoIterator<Item = KeyCertificate>,
         revocations: impl IntoIterator<Item = KeyRevocation>,
     ) {
-        for key in keys {
-            if !self.keys.iter().any(|known| known.id == key.id) {
-                self.keys.push(key);
+        for certificate in certificates {
+            if !self.certificates.contains(&certificate) {
+                self.certificates.push(certificate);
             }
         }
         for revocation in revocations {
@@ -195,6 +206,10 @@ impl RegistryTrust {
                 self.revocations.push(revocation);
             }
         }
+    }
+
+    pub fn certificates(&self) -> &[KeyCertificate] {
+        &self.certificates
     }
 
     pub fn keys(&self) -> &[RegistryKey] {
@@ -224,6 +239,13 @@ impl RegistryTrust {
             .map(|key| format!("{}:{}", key.id, key.role.as_str()))
             .collect();
         ids.sort_unstable();
+        let mut certified: Vec<String> = self
+            .certificates
+            .iter()
+            .map(|certificate| format!("{}:{}", certificate.key_id, certificate.signature))
+            .collect();
+        certified.sort_unstable();
+        ids.extend(certified);
         let mut revoked: Vec<String> = self
             .revocations
             .iter()
@@ -645,8 +667,9 @@ pub struct AuthenticatedStatements {
 
 /// Authenticate statements against `trust`. Authenticity is the signature
 /// chain from the compiled keys, ignoring revocations made by these same
-/// statements; keys already revoked in `trust` cannot sign anything. Enforcing
-/// the revocations is the caller's job (see [`surviving_certificates`]).
+/// statements; keys already revoked in `trust` (or certified through a revoked
+/// key) cannot sign anything. Enforcing the revocations is the caller's job:
+/// merge them into the trust, and chains through revoked keys fall away.
 pub fn authenticate_statements(
     trust: &RegistryTrust,
     certificates: &[KeyCertificate],
@@ -664,16 +687,6 @@ pub fn authenticate_statements(
         certificates: chain.newly_trusted,
         revocations: accepted,
     }
-}
-
-/// The certificates whose key is still trusted once `revoked` is enforced: a
-/// key is dropped when it, or any key in its certificate chain, is revoked.
-pub fn surviving_certificates(
-    trust: &RegistryTrust,
-    certificates: &[KeyCertificate],
-    revoked: &std::collections::BTreeSet<String>,
-) -> Vec<KeyCertificate> {
-    build_trusted(trust, certificates, revoked).newly_trusted
 }
 
 struct TrustedKeys {
@@ -705,9 +718,15 @@ fn build_trusted(
     }
 
     let mut newly_trusted = Vec::new();
-    for _ in 0..=certificates.len() {
+    let remembered = trust.certificates.len();
+    let chain: Vec<&KeyCertificate> = trust
+        .certificates
+        .iter()
+        .chain(certificates.iter())
+        .collect();
+    for _ in 0..=chain.len() {
         let mut added = false;
-        for certificate in certificates {
+        for (index, certificate) in chain.iter().copied().enumerate() {
             if keys.contains_key(&certificate.key_id) || revoked.contains(&certificate.key_id) {
                 continue;
             }
@@ -741,7 +760,9 @@ fn build_trusted(
             };
             keys.insert(certificate.key_id.clone(), verifying);
             roles.insert(certificate.key_id.clone(), certificate.role);
-            newly_trusted.push(certificate.clone());
+            if index >= remembered {
+                newly_trusted.push(certificate.clone());
+            }
             added = true;
         }
         if !added {
