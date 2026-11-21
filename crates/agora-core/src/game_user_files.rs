@@ -1711,7 +1711,6 @@ fn restore_journal_internal(
             }
         }
 
-
         // Strict mode is crash recovery, not a human at the restore command: a file Agora
         // created during the session (no original existed) whose content no longer matches
         // what the session wrote may have been made by the player after the crash. Recovery

@@ -3548,11 +3548,7 @@ fn run_under_vfs(
     // Before the spawn, the journal says a tool is spawning: if Agora dies in the window between
     // the spawn and recording the process, recovery can see that and needs a hand instead of
     // restoring under a tool no record can see.
-    game_tool_swap::run_hook(
-        ctx,
-        None,
-        game_tool_swap::RunHookPoint::BeforeSpawningMark,
-    );
+    game_tool_swap::run_hook(ctx, None, game_tool_swap::RunHookPoint::BeforeSpawningMark);
     // Fail closed: without the durable spawning mark, a crash in the spawn window would leave a
     // live tool that no record can see, and recovery could restore under it. Undo what this run
     // set up and do not launch.
@@ -3728,11 +3724,7 @@ fn run_from_links(
     // Before the spawn, the journal says a tool is spawning: if Agora dies in the window between
     // the spawn and recording the process, recovery can see that and needs a hand instead of
     // restoring under a tool no record can see.
-    game_tool_swap::run_hook(
-        ctx,
-        None,
-        game_tool_swap::RunHookPoint::BeforeSpawningMark,
-    );
+    game_tool_swap::run_hook(ctx, None, game_tool_swap::RunHookPoint::BeforeSpawningMark);
     // Fail closed: without the durable spawning mark, a crash in the spawn window would leave a
     // live tool that no record can see, and recovery could restore under it. Undo what this run
     // set up (the links deployment and the user-files session) and do not launch.

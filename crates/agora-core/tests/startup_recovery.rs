@@ -1390,9 +1390,7 @@ fn a_file_link_deeper_in_the_chain_retarged_since_the_swap_is_refused_by_recover
 fn link_file(link: &Path, target: &Path) {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::CreateHardLinkW;
-    let wide = |p: &Path| -> Vec<u16> {
-        p.as_os_str().encode_wide().chain(Some(0)).collect()
-    };
+    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(Some(0)).collect() };
     let ok = unsafe {
         CreateHardLinkW(
             wide(link).as_ptr(),
@@ -1431,8 +1429,13 @@ fn an_instance_copy_that_is_the_real_file_needs_a_hand_not_a_same_bytes_restore(
         &f.running_from,
     )
     .unwrap();
-    agora_core::game_user_files::record_process(&f.ctx, &f.def.id, &StoreId::steam(), dead_identity())
-        .unwrap();
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
     let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
     assert_eq!(std::fs::read_to_string(&f.real).unwrap(), "Instance copy\n");
     // After the crash, the instance's copy is a link to the real file, and the game changed the
@@ -1504,8 +1507,13 @@ fn a_legacy_journal_with_a_redirected_ancestor_is_refused_by_recovery() {
         &f.running_from,
     )
     .unwrap();
-    agora_core::game_user_files::record_process(&f.ctx, &f.def.id, &StoreId::steam(), dead_identity())
-        .unwrap();
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
     let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
     assert!(journal_path.exists());
     assert_eq!(std::fs::read_to_string(&f.real).unwrap(), "Instance copy\n");
@@ -1532,8 +1540,13 @@ fn a_legacy_journal_with_a_redirected_ancestor_is_refused_by_recovery() {
         "recovery wrote the backup through the redirected ancestor of a legacy journal"
     );
     assert_eq!(
-        std::fs::read_to_string(user_root.join("local-orig").join("Test Game").join("Plugins.txt"))
-            .unwrap(),
+        std::fs::read_to_string(
+            user_root
+                .join("local-orig")
+                .join("Test Game")
+                .join("Plugins.txt")
+        )
+        .unwrap(),
         "Instance copy\n",
         "the original location was changed"
     );
@@ -1566,13 +1579,20 @@ fn a_file_absent_at_swap_records_its_would_be_resolved_path_and_recovers_normall
     let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
     let value: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&journal_path).unwrap()).unwrap();
-    let recorded = value["files"][0]["real_resolved_path"].as_str().unwrap_or("");
+    let recorded = value["files"][0]["real_resolved_path"]
+        .as_str()
+        .unwrap_or("");
     assert!(
         recorded.to_lowercase().ends_with("plugins.txt"),
         "the journal records where the absent file will resolve: {recorded}"
     );
-    agora_core::game_user_files::record_process(&f.ctx, &f.def.id, &StoreId::steam(), dead_identity())
-        .unwrap();
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
     assert_eq!(std::fs::read_to_string(&f.real).unwrap(), "Instance copy\n");
 
     let report = run_at_startup(&f.ctx);
@@ -1608,8 +1628,13 @@ fn a_both_changed_conflict_is_forced_only_by_the_explicit_restore_command() {
         &f.running_from,
     )
     .unwrap();
-    agora_core::game_user_files::record_process(&f.ctx, &f.def.id, &StoreId::steam(), dead_identity())
-        .unwrap();
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
     let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
     assert_eq!(std::fs::read_to_string(&f.real).unwrap(), "Instance copy\n");
     // After the crash, both sides changed to different bytes.
@@ -1625,7 +1650,10 @@ fn a_both_changed_conflict_is_forced_only_by_the_explicit_restore_command() {
             .any(|w| w.contains("both changed since the swap")),
         "startup recovery must report the conflict: {report:?}"
     );
-    assert!(report.actions.is_empty(), "startup recovery forced nothing: {report:?}");
+    assert!(
+        report.actions.is_empty(),
+        "startup recovery forced nothing: {report:?}"
+    );
     assert_eq!(
         std::fs::read_to_string(&f.real).unwrap(),
         "Game changed this after the crash\n"
@@ -1682,5 +1710,8 @@ fn a_both_changed_conflict_is_forced_only_by_the_explicit_restore_command() {
         std::fs::read_to_string(&conflicts[0]).unwrap(),
         "Game changed this after the crash\n"
     );
-    assert!(!journal_path.exists(), "the journal is cleared by the forced restore");
+    assert!(
+        !journal_path.exists(),
+        "the journal is cleared by the forced restore"
+    );
 }
