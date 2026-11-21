@@ -1819,6 +1819,62 @@ fn conflicting_user_files(f: &UserFilesFixture) {
     std::fs::write(&f.copy, "Instance copy changed too\n").unwrap();
 }
 
+/// A case-only retarget must be refused by recovery itself, not just by the guard helper: the
+/// resolved path recorded at swap time is compared exactly with where the file resolves now.
+/// Case-insensitive filesystems cannot distinguish the two names, so they skip with a clear reason.
+#[cfg(unix)]
+#[test]
+fn a_case_only_retarget_is_refused_by_recovery() {
+    fn case_sensitive(dir: &Path) -> bool {
+        let probe = dir.join("CaseProbe");
+        std::fs::write(&probe, b"a").unwrap();
+        let sensitive = std::fs::metadata(dir.join("caseprobe")).is_err();
+        let _ = std::fs::remove_file(&probe);
+        sensitive
+    }
+
+    let f = user_files_fixture(Some("Player original\n"));
+    if !case_sensitive(f._user_data_dir.path()) {
+        eprintln!("skipping: this filesystem does not distinguish case in file names");
+        return;
+    }
+    agora_core::game_user_files::swap_in(
+        &f.ctx,
+        "instance-a",
+        &f.def,
+        &StoreId::steam(),
+        &f.running_from,
+    )
+    .unwrap();
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
+
+    // After the crash the exact path is a link to a different file whose name differs only by the
+    // case of its final component.
+    let retarget = f._user_data_dir.path().join("local/Test Game/plugins.txt");
+    std::fs::write(&retarget, "Game changed this after the crash\n").unwrap();
+    std::fs::remove_file(&f.real).unwrap();
+    std::os::unix::fs::symlink(&retarget, &f.real).unwrap();
+
+    let error = agora_core::game_user_files::restore(&f.ctx, &f.def, &StoreId::steam())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("cannot be verified to still resolve"),
+        "recovery must refuse the case-only retarget: {error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&retarget).unwrap(),
+        "Game changed this after the crash\n",
+        "the retargeted file was overwritten"
+    );
+}
+
 /// An instance copy whose bytes cannot be read is "can't tell", not "unchanged": neither the plain
 /// nor the forced restore may overwrite it. A directory at the path is unreadable as bytes on every
 /// platform; a Unix-only write-only-file fixture would exercise the same guard with a renameable
