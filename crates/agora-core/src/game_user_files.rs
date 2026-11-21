@@ -432,9 +432,21 @@ fn write_conflict_file(path: &Path, bytes: &[u8]) -> Result<PathBuf, UserFilesEr
         };
         // `symlink_metadata` does not follow the link, so a symlink at the name counts as taken
         // too. Windows reports a directory at the name as a permission error rather than
-        // AlreadyExists; checking first keeps the "pick a new name" rule portable.
-        if std::fs::symlink_metadata(&candidate).is_ok() {
-            continue;
+        // AlreadyExists; checking first keeps the "pick a new name" rule portable. A plain file
+        // that already holds exactly these bytes is the archive an earlier startup wrote: reuse it
+        // instead of adding a numbered duplicate on every start.
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || meta.is_dir() {
+                    continue;
+                }
+                if std::fs::read(&candidate).is_ok_and(|existing| existing.as_slice() == bytes) {
+                    return Ok(candidate);
+                }
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => continue,
         }
         let mut file = match std::fs::OpenOptions::new()
             .write(true)

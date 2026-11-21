@@ -1926,6 +1926,30 @@ fn an_unreadable_instance_copy_is_kept_by_both_restores() {
     }
 }
 
+/// Repeated startups with the same conflict must reuse the archive they already wrote, not pile up
+/// numbered copies of identical bytes.
+#[test]
+fn repeated_conflicts_reuse_the_identical_archive() {
+    let f = user_files_fixture(Some("Player original\n"));
+    conflicting_user_files(&f);
+
+    agora_core::game_user_files::restore(&f.ctx, &f.def, &StoreId::steam()).unwrap_err();
+    let first = conflict_archives(&f);
+    assert_eq!(first.len(), 1, "the first refusal wrote one archive");
+
+    agora_core::game_user_files::restore(&f.ctx, &f.def, &StoreId::steam()).unwrap_err();
+    let second = conflict_archives(&f);
+    assert_eq!(
+        second.len(),
+        1,
+        "a second refusal wrote a duplicate archive: {second:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&second[0]).unwrap(),
+        "Game changed this after the crash\n"
+    );
+}
+
 /// A conflict archive uses create-new: a file already at that name is left exactly as it was and
 /// the archive is written under a new number.
 #[test]
