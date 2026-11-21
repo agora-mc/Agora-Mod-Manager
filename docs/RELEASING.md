@@ -359,9 +359,12 @@ Next to the cached bundle the client keeps `registry.trust`, a line log of
 recovery-signed statements: certificates that introduced keys, and revocation
 statements with their signatures. A new entry is written before a verified
 bundle is installed, and the log only grows: a revocation is never removed.
-Every remembered line is re-verified on load by one rule: a statement counts
-when its signature chain authenticates from the compiled keys, whatever the
-order of the lines and whether or not a later statement revokes its signer (a
+Every remembered line is re-verified on load by one rule. The log is a series of
+records, one per verified bundle (a `v1 record` line starts each). A statement
+counts when its signature chain authenticates against the trust standing before
+its record, whatever the order of its lines and whether or not the same record
+revokes its signer, so a key retired by an earlier record cannot sign anything in
+a later one (a
 recovery key introduced, used to revoke, and itself revoked in one bundle keeps
 its revocations). Authenticated revocations are all enforced, and a key survives
 only if nothing in its certificate chain is revoked, so revoking a recovery key
@@ -369,12 +372,12 @@ also retires every key it certified. Every later verification starts from the
 compiled keys plus surviving remembered keys minus remembered revocations. A
 compiled-in key that was revoked stays revoked.
 
-A missing state file means nothing is remembered yet. A state file that cannot
+A missing or empty state file means nothing is remembered yet. A state file that cannot
 be read, or holds a statement that does not authenticate, is an error
 (`ERR_REGISTRY_TRUST_STATE`): the catalog is not opened and a good bundle is not
 quarantined, rather than falling back to a weaker set of keys. The only
 exception is a torn final line (no trailing newline) that does not parse or
-authenticate. To start over, remove `registry.trust` yourself; Agora then trusts
+authenticate; the next install removes it before appending its own record. To start over, remove `registry.trust` yourself; Agora then trusts
 only its compiled keys.
 
 ### Rotating a key
