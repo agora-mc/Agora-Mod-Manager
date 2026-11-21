@@ -2563,17 +2563,81 @@ fn recover_one_job(
                     job.instance_id
                 ));
             }
+            // The promoted tree may have been launched after the writer crashed and the OS
+            // released its lock, so the player may have made saves in it. Never delete it: move it
+            // aside next to the instance, mark it as this job's, and say where it went.
+            let mut promoted_aside: Option<PathBuf> = None;
             if final_dir.exists() {
-                let _ = std::fs::remove_dir_all(&final_dir);
+                let parent = match final_dir.parent() {
+                    Some(parent) => parent.to_path_buf(),
+                    None => paths.instances_root(),
+                };
+                let aside = parent.join(format!(
+                    ".agora-quarantine-{}-{}",
+                    job.instance_id,
+                    Uuid::new_v4()
+                ));
+                match std::fs::symlink_metadata(&aside) {
+                    Ok(_) => {
+                        return Some(format!(
+                            "The interrupted import for {} was left alone: could not find a free \
+                             quarantine name next to {}. Nothing was changed.",
+                            job.instance_id,
+                            final_dir.display()
+                        ))
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Some(format!(
+                            "The interrupted import for {} was left alone: the quarantine name \
+                             next to {} could not be checked ({error}). Nothing was changed.",
+                            job.instance_id,
+                            final_dir.display()
+                        ))
+                    }
+                }
+                if let Err(error) = std::fs::rename(&final_dir, &aside) {
+                    return Some(format!(
+                        "The interrupted import for {} was left alone: the promoted folder could \
+                         not be moved aside ({error}). Nothing was changed.",
+                        job.instance_id
+                    ));
+                }
+                if let Err(error) = write_import_owner_marker(&aside, &job.job_id) {
+                    let _ = std::fs::rename(&aside, &final_dir);
+                    return Some(format!(
+                        "The interrupted import for {} was left alone: the promoted folder could \
+                         not be marked as this job's ({error}). It was put back.",
+                        job.instance_id
+                    ));
+                }
+                promoted_aside = Some(aside);
             }
             if std::fs::rename(&quarantine, &final_dir).is_err() {
+                if let Some(aside) = &promoted_aside {
+                    let _ = std::fs::rename(aside, &final_dir);
+                }
                 return Some(format!(
-                    "Could not restore interrupted update for {} from {}",
+                    "Could not restore interrupted update for {} from {}; the promoted folder was \
+                     put back. Nothing was deleted.",
                     job.instance_id,
                     quarantine.display()
                 ));
             }
             remove_import_owner_marker(&final_dir);
+            let aside_note = match &promoted_aside {
+                Some(aside) => format!(
+                    " The promoted folder, including anything saved since the crash, was kept at \
+                     {}.",
+                    aside.display()
+                ),
+                None => String::new(),
+            };
+            let _ = std::fs::remove_dir_all(&staging);
+            return Some(format!(
+                "Rolled back interrupted update for {}.{}",
+                job.instance_id, aside_note
+            ));
         }
         let _ = std::fs::remove_dir_all(&staging);
         format!("Rolled back interrupted update for {}", job.instance_id)
@@ -3945,6 +4009,79 @@ name=Dup Instance
         assert!(final_dir.join("old.txt").exists());
         assert!(!final_dir.join("new.txt").exists());
         assert!(!quarantine.exists());
+    }
+
+    /// Crash after promotion but before provenance commit. An already-open desktop could have
+    /// launched the promoted folder and the player made a save. Recovery must keep that save —
+    /// either in place or in a quarantine next to the instance — and say where it went.
+    #[test]
+    fn test_recover_promoted_update_keeps_a_save_made_since_the_crash() {
+        let ctx = test_ctx();
+        let staging = ctx.paths.staging_root().join("promoted-save-staging");
+        let final_dir = ctx.paths.instances_root().join("promoted-save");
+        let quarantine = ctx.paths.staging_root().join(format!(
+            ".agora-quarantine-promoted-save-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&final_dir).unwrap();
+        std::fs::create_dir_all(&quarantine).unwrap();
+        std::fs::write(final_dir.join("new.txt"), b"new").unwrap();
+        std::fs::write(quarantine.join("old.txt"), b"old").unwrap();
+        mark_owner(&staging, "promoted-save-job");
+        mark_owner(&final_dir, "promoted-save-job");
+        mark_owner(&quarantine, "promoted-save-job");
+        let connection = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db::upsert_instance_import_job(
+            &connection,
+            &InstanceImportJob {
+                job_id: "promoted-save-job".into(),
+                instance_id: "promoted-save".into(),
+                launcher_kind: "prism".into(),
+                source_instance_key: "source".into(),
+                staging_path: staging.to_string_lossy().into_owned(),
+                final_path: final_dir.to_string_lossy().into_owned(),
+                quarantine_path: Some(quarantine.to_string_lossy().into_owned()),
+                state: "promoted_update".into(),
+                plan_fingerprint: "plan".into(),
+                error: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .unwrap();
+        drop(connection);
+
+        // A save made after the crash, in the promoted folder.
+        std::fs::create_dir_all(final_dir.join("saves")).unwrap();
+        std::fs::write(final_dir.join("saves/new-save.dat"), b"precious save").unwrap();
+
+        let warnings = recover_interrupted_jobs(&ctx);
+
+        let kept_in_place = final_dir.join("saves/new-save.dat").exists();
+        let aside = std::fs::read_dir(ctx.paths.instances_root())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".agora-quarantine-promoted-save-"))
+            })
+            .find(|path| path.join("saves/new-save.dat").exists());
+        assert!(
+            kept_in_place || aside.is_some(),
+            "the save made after the crash was deleted: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("promoted-save")),
+            "the report must name where the promoted folder went: {warnings:?}"
+        );
+        assert!(
+            final_dir.join("old.txt").exists(),
+            "the previous instance was not restored"
+        );
     }
 
     /// Two processes: an import job whose instance lock another Agora process holds belongs to a
