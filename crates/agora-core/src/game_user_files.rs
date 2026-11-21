@@ -277,7 +277,23 @@ pub fn paths_eq_case_insensitive(a: &Path, b: &Path) -> bool {
 /// equivalent spelling. This is for the restore's resolution guard; user-data folder matching
 /// elsewhere still uses the case-insensitive comparison.
 pub fn paths_eq_exact(a: &Path, b: &Path) -> bool {
-    a.components().eq(b.components())
+    // Windows canonicalize returns a verbatim `\\?\` prefix; a path carried forward from a journal
+    // that could not resolve its parent does not. That is one spelling of the same path, so strip
+    // it before comparing. Casing is still compared exactly.
+    fn normalize(path: &Path) -> String {
+        let text = path.as_os_str().to_string_lossy();
+        #[cfg(windows)]
+        {
+            text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
+        }
+        #[cfg(not(windows))]
+        {
+            text.to_string()
+        }
+    }
+    let a = normalize(a);
+    let b = normalize(b);
+    Path::new(&a).components().eq(Path::new(&b).components())
 }
 
 /// The Windows user folder a `UserDataLocation` names, inside a Proton prefix. Proton's default
@@ -338,16 +354,142 @@ pub fn resolve_user_file_source(source: &GamePath) -> Result<PathBuf, UserFilesE
     resolve_user_file_source_in(None, source)
 }
 
-fn hash_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+/// A definition's path with its own casing, with no case-insensitive lookup. This is only a
+/// consistency check against the journal at restore time — recovery never writes to a path found
+/// by searching for a case-folded sibling.
+fn exact_source_path(prefix: Option<&Path>, source: &GamePath) -> Result<PathBuf, UserFilesError> {
+    match source {
+        GamePath::UserData { location, path } => {
+            let base = match prefix {
+                Some(prefix) => user_data_root_in_prefix(prefix, location),
+                None => user_data_root(location)
+                    .ok_or_else(|| UserFilesError::UserDataNotFound(location.clone()))?,
+            };
+            Ok(if path.as_str().is_empty() {
+                base
+            } else {
+                base.join(path.as_str())
+            })
+        }
+        other => Err(UserFilesError::Other(format!(
+            "unsupported user file source root: {other:?}"
+        ))),
+    }
 }
 
-/// Where `path` resolves to right now — the whole link chain and every ancestor directory
-/// resolved (the canonical path), so a retargeted link anywhere in the chain, or an ancestor
-/// directory replaced by a link, changes the answer. Recorded at swap time so a restore never
-/// writes through a path that no longer resolves where the swap read it.
-fn resolved_path(path: &Path) -> Option<PathBuf> {
-    std::fs::canonicalize(path).ok()
+/// A file's presence: only `NotFound` means absent, every other metadata error is "can't tell".
+fn file_presence(path: &Path, what: &str) -> Result<bool, UserFilesError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(UserFilesError::Read {
+            what: format!("metadata for {what}"),
+            path: path.to_path_buf(),
+            source: error,
+        }),
+    }
+}
+
+/// Resolve ONE destination exactly: the canonical path when it exists, otherwise its exact final
+/// name appended to a parent that resolves now. A parent that does not resolve is "can't tell" —
+/// never rebuild the path by appending ancestor names, which could reconstruct a stale journal
+/// path while the real parent has moved or become a dangling link.
+fn resolved_destination(path: &Path, what: &str) -> Result<PathBuf, UserFilesError> {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => Ok(canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path.parent().ok_or_else(|| {
+                UserFilesError::Other(format!("{what} '{}' has no parent folder", path.display()))
+            })?;
+            let cant_tell = |error: std::io::Error| {
+                UserFilesError::Other(format!(
+                    "the parent of {what} '{}' could not be resolved ({error}); Agora cannot tell \
+                     where to write and changed nothing. Check the folder by hand, then put the \
+                     files back.",
+                    path.display()
+                ))
+            };
+            match std::fs::canonicalize(parent) {
+                Ok(resolved_parent) => {
+                    let name = path.file_name().ok_or_else(|| {
+                        UserFilesError::Other(format!(
+                            "{what} '{}' has no file name",
+                            path.display()
+                        ))
+                    })?;
+                    Ok(resolved_parent.join(name))
+                }
+                Err(_) => match std::fs::symlink_metadata(parent) {
+                    // A link (even a dangling one) or a non-directory at the parent means the
+                    // parent changed identity: keep everything and report.
+                    Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                        Err(cant_tell(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "it is a link or not a folder",
+                        )))
+                    }
+                    Ok(_) => Err(cant_tell(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "it could not be resolved",
+                    ))),
+                    // A genuinely missing parent is normal for a file that never existed: no bytes
+                    // will be written there, so the unmodified path is safe to carry forward.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(path.to_path_buf())
+                    }
+                    Err(error) => Err(cant_tell(error)),
+                },
+            }
+        }
+        Err(error) => Err(UserFilesError::Read {
+            what: what.to_string(),
+            path: path.to_path_buf(),
+            source: error,
+        }),
+    }
+}
+
+/// The single destination set recovery validates and writes. Every field is derived once here;
+/// neither preflight nor writeback re-derives a path or looks one up case-insensitively.
+struct RestoreDestination {
+    /// The journal's exact real path — the one file that is checked and written.
+    real: PathBuf,
+    /// Where that exact path resolves now (or will resolve once it exists).
+    real_resolved: PathBuf,
+    instance_copy: PathBuf,
+    backup: PathBuf,
+}
+
+fn restore_destination(
+    file: &JournaledFile,
+    mapping: &UserFileMapping,
+    prefix: Option<&Path>,
+    instance_dir: &Path,
+    backup_dir: &Path,
+    index: usize,
+) -> Result<RestoreDestination, UserFilesError> {
+    let expected = exact_source_path(prefix, &mapping.source)?;
+    if !paths_eq_case_insensitive(&file.real_path, &expected) {
+        return Err(UserFilesError::Other(format!(
+            "journal entry real_path '{:?}' differs from derived real_path '{:?}'",
+            file.real_path, expected
+        )));
+    }
+    let instance_copy = instance_dir.join(mapping.instance_path.as_str());
+    let backup = backup_dir.join(index.to_string());
+    // These two only need their parent to resolve when they are actually present; the caller
+    // checks presence with file_presence first so an absent backup directory stays harmless.
+    let real_resolved = resolved_destination(&file.real_path, "the user file")?;
+    Ok(RestoreDestination {
+        real: file.real_path.clone(),
+        real_resolved,
+        instance_copy,
+        backup,
+    })
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Where `path` resolves, or will resolve once it exists: the path itself when it resolves now,
@@ -1617,9 +1759,7 @@ fn restore_journal_internal(
         file: JournaledFile,
         instance_path: RelPath,
         original_sha256: Option<String>,
-        derived_real_path: PathBuf,
-        derived_instance_copy: PathBuf,
-        derived_backup_path: PathBuf,
+        destination: RestoreDestination,
         state: FileState,
         existed: bool,
     }
@@ -1639,35 +1779,41 @@ fn restore_journal_internal(
             )));
         };
 
-        let derived_real_path = resolve_user_file_source_in(prefix.as_deref(), &mapping.source)?;
-        if !paths_eq_case_insensitive(&file.real_path, &derived_real_path) {
-            return Err(UserFilesError::Other(format!(
-                "journal entry real_path '{:?}' differs from derived real_path '{:?}'",
-                file.real_path, derived_real_path
-            )));
-        }
-
-        let derived_instance_copy = instance_dir.join(mapping.instance_path.as_str());
-        let derived_backup_path = backup_dir.join(format!("{i}"));
+        let destination = restore_destination(
+            file,
+            mapping,
+            prefix.as_deref(),
+            &instance_dir,
+            &backup_dir,
+            i,
+        )?;
 
         if let Some(ref bp) = file.backup_path {
-            if !paths_eq_case_insensitive(bp, &derived_backup_path) {
+            if !paths_eq_case_insensitive(bp, &destination.backup) {
                 return Err(UserFilesError::Other(format!(
                     "journal backup path '{:?}' does not match expected backup index path '{:?}'",
-                    bp, derived_backup_path
+                    bp, destination.backup
                 )));
             }
         }
 
         // A backup on disk proves the real file was there, even when a stop happened before the
         // journal said so. It is only usable when its hash matches the recorded original.
-        let has_backup = derived_backup_path.exists();
+        let has_backup = file_presence(&destination.backup, "the backup")?;
         let existed = file.existed || has_backup || file.original_sha256.is_some();
+        // Resolving the present destinations also proves their parents resolve. An absent backup
+        // has nothing to resolve and is harmless.
+        if has_backup {
+            resolved_destination(&destination.backup, "the backup")?;
+        }
+        if file_presence(&destination.instance_copy, "the instance copy")? {
+            resolved_destination(&destination.instance_copy, "the instance copy")?;
+        }
 
-        let real_bytes = read_recovery_file(&file.real_path, "user file")?;
+        let real_bytes = read_recovery_file(&destination.real, "user file")?;
         let real_hash = real_bytes.as_ref().map(|bytes| hash_bytes(bytes));
         let backup_hash = if has_backup {
-            read_recovery_file(&derived_backup_path, "backup")?.map(|bytes| hash_bytes(&bytes))
+            read_recovery_file(&destination.backup, "backup")?.map(|bytes| hash_bytes(&bytes))
         } else {
             None
         };
@@ -1677,30 +1823,17 @@ fn restore_journal_internal(
             && real_hash.as_deref() == file.original_sha256.as_deref();
         let real_matches_backup = real_hash.is_some() && real_hash == backup_hash;
 
-        // The real path is compared fully resolved — the whole link chain and every ancestor
-        // directory — against where it resolved when the swap read it. Writing the backup
-        // through a path whose resolution changed since the swap (the final link retargeted, a
-        // link deeper in a chain retargeted, an ancestor directory replaced by a link) would
-        // overwrite whatever it resolves to now, so any difference stops the restore here,
-        // before anything is modified, and asks for a hand.
-        let resolved_now = resolved_path(&file.real_path);
-        let would_be_now = resolved_path_for(&file.real_path);
+        // The one destination is compared fully resolved against where it resolved at swap time.
+        // `destination.real_resolved` never appends names onto an unresolved parent: a missing
+        // parent was can't-tell and already stopped above. A final link that no longer resolves is
+        // a changed (or broken) link, not a deleted file.
         let resolution_ok = match &file.real_resolved_path {
             Some(recorded) => {
-                // A final component that is a link but no longer resolves is a changed (or
-                // broken) link, not a deleted file.
-                if symlink_target(&file.real_path).is_some() && resolved_now.is_none() {
+                let full_resolves = std::fs::canonicalize(&destination.real).is_ok();
+                if symlink_target(&destination.real).is_some() && !full_resolves {
                     false
                 } else {
-                    match &resolved_now {
-                        Some(now) => paths_eq_exact(recorded, now),
-                        // The path no longer fully resolves (the file is gone, or an ancestor
-                        // link now dangles): compare the anchored resolution instead, so a
-                        // redirected ancestor still refuses.
-                        None => would_be_now
-                            .as_ref()
-                            .is_some_and(|now| paths_eq_exact(recorded, now)),
-                    }
+                    paths_eq_exact(recorded, &destination.real_resolved)
                 }
             }
             None => {
@@ -1724,18 +1857,14 @@ fn restore_journal_internal(
             }
         };
         if !resolution_ok {
-            let recorded = match (&file.real_resolved_path, &resolved_now) {
-                (Some(recorded), Some(now)) => format!(
+            let recorded = match &file.real_resolved_path {
+                Some(recorded) => format!(
                     "resolved to '{}' at the swap and to '{}' now",
                     recorded.display(),
-                    now.display()
+                    destination.real_resolved.display()
                 ),
-                (Some(recorded), None) => format!(
-                    "resolved to '{}' at the swap and no longer resolves now",
-                    recorded.display()
-                ),
-                (None, _) => "the journal records no resolved path for it (a journal from before \
-                              resolved paths were recorded)"
+                None => "the journal records no resolved path for it (a journal from before \
+                         resolved paths were recorded)"
                     .to_string(),
             };
             // A legacy journal that cannot prove the resolution refuses any write; name the
@@ -1743,7 +1872,7 @@ fn restore_journal_internal(
             let backup_note = if file.real_resolved_path.is_none() && has_backup {
                 format!(
                     "; its backup '{}' was left in place",
-                    derived_backup_path.display()
+                    destination.backup.display()
                 )
             } else {
                 String::new()
@@ -1777,7 +1906,7 @@ fn restore_journal_internal(
             let real_changed = real_hash
                 .as_deref()
                 .is_some_and(|hash| hash != file.written_sha256.as_str());
-            let instance_bytes = read_recovery_file(&derived_instance_copy, "instance copy")?;
+            let instance_bytes = read_recovery_file(&destination.instance_copy, "instance copy")?;
             let instance_hash = instance_bytes.as_ref().map(|bytes| hash_bytes(bytes));
             let instance_changed = instance_hash
                 .as_deref()
@@ -1785,7 +1914,7 @@ fn restore_journal_internal(
             if real_changed
                 && instance_changed
                 && (real_hash != instance_hash
-                    || !provably_distinct_files(&file.real_path, &derived_instance_copy))
+                    || !provably_distinct_files(&destination.real, &destination.instance_copy))
             {
                 let real_bytes = real_bytes.clone().expect("read changed bytes above");
                 let real_hash = real_hash.expect("hashed above");
@@ -1801,9 +1930,10 @@ fn restore_journal_internal(
                 } else {
                     (real_bytes.to_vec(), real_hash.clone())
                 };
-                let conflict_path = derived_instance_copy.with_file_name(format!(
+                let conflict_path = destination.instance_copy.with_file_name(format!(
                     "{}.agora-conflict-{}",
-                    derived_instance_copy
+                    destination
+                        .instance_copy
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or("file"),
@@ -1818,8 +1948,8 @@ fn restore_journal_internal(
                          the swap, so neither was overwritten: the real file's current bytes \
                          were kept as '{}'. Check both by hand, then put the files back \
                          with `{}`",
-                        file.real_path.display(),
-                        derived_instance_copy.display(),
+                        destination.real.display(),
+                        destination.instance_copy.display(),
                         conflict_path.display(),
                         restore_instruction_forced(journal.game.as_str(), journal.store.as_str())
                     )));
@@ -1839,8 +1969,8 @@ fn restore_journal_internal(
                         "the user file '{}' changed since the swap (it does not match what the \
                          session wrote), so recovery left it and the instance's copy '{}' exactly \
                          as they are and changed nothing. Check the file by hand, then run `{}`",
-                        file.real_path.display(),
-                        derived_instance_copy.display(),
+                        destination.real.display(),
+                        destination.instance_copy.display(),
                         restore_instruction(journal.game.as_str(), journal.store.as_str())
                     )));
                 }
@@ -1852,9 +1982,7 @@ fn restore_journal_internal(
             file: file.clone(),
             instance_path: mapping.instance_path.clone(),
             original_sha256: file.original_sha256.clone(),
-            derived_real_path,
-            derived_instance_copy,
-            derived_backup_path,
+            destination,
             state: file_state(file),
             existed,
         });
@@ -1871,17 +1999,9 @@ fn restore_journal_internal(
             continue;
         }
 
-        let real_bytes = if entry.derived_real_path.exists() {
-            Some(std::fs::read(&entry.derived_real_path)?)
-        } else {
-            None
-        };
+        let real_bytes = read_recovery_file(&entry.destination.real, "user file")?;
         let real_hash = real_bytes.as_ref().map(|bytes| hash_bytes(bytes));
-        let backup_bytes = if entry.derived_backup_path.exists() {
-            Some(std::fs::read(&entry.derived_backup_path)?)
-        } else {
-            None
-        };
+        let backup_bytes = read_recovery_file(&entry.destination.backup, "backup")?;
         let backup_hash = backup_bytes.as_ref().map(|bytes| hash_bytes(bytes));
 
         // The real file still holding the recorded original means the swap never changed it (or an
@@ -1895,14 +2015,14 @@ fn restore_journal_internal(
         // By design: a session that ends on exactly the player's original bytes has no changed
         // bytes to save, so the instance copy is left as it was.
         if real_is_original || real_matches_backup {
-            if entry.derived_backup_path.exists() {
-                let _ = std::fs::remove_file(&entry.derived_backup_path);
+            if file_presence(&entry.destination.backup, "the backup")? {
+                let _ = std::fs::remove_file(&entry.destination.backup);
             }
-            let _ = std::fs::remove_file(entry.derived_backup_path.with_extension("tmp"));
+            let _ = std::fs::remove_file(entry.destination.backup.with_extension("tmp"));
             journal.files[entry.index].restored = true;
             write_journal(&journal_path, &journal)?;
             restored_files.push(RestoredFile {
-                real_path: entry.derived_real_path.clone(),
+                real_path: entry.destination.real.clone(),
                 instance_path: entry.instance_path.clone(),
                 changed: false,
                 original_sha256: entry.original_sha256.clone(),
@@ -1915,24 +2035,24 @@ fn restore_journal_internal(
             // The journal records that no write reached the real file. A backup that matches it was
             // already handled; one that does not may be the only copy of the player's file, so it
             // is kept and reported instead of removed.
-            if entry.derived_backup_path.exists() {
+            if file_presence(&entry.destination.backup, "the backup")? {
                 return Err(UserFilesError::Other(format!(
                     "the user file '{}' does not match its backup '{}', and the journal records no swap; both were left in place",
-                    entry.derived_real_path.display(),
-                    entry.derived_backup_path.display()
+                    entry.destination.real.display(),
+                    entry.destination.backup.display()
                 )));
             }
             // A stop between Agora's write and the "swapped" mark leaves the file Agora wrote
             // under a journal that says no swap happened. Only bytes exactly matching the
             // recorded write are removed; anything else was not written by Agora and is left
             // exactly as it is.
-            if entry.derived_real_path.exists()
+            if file_presence(&entry.destination.real, "the user file")?
                 && !entry.file.written_sha256.is_empty()
                 && real_hash.as_deref() == Some(entry.file.written_sha256.as_str())
             {
-                let _ = std::fs::remove_file(&entry.derived_real_path);
+                let _ = std::fs::remove_file(&entry.destination.real);
             }
-            let _ = std::fs::remove_file(entry.derived_backup_path.with_extension("tmp"));
+            let _ = std::fs::remove_file(entry.destination.backup.with_extension("tmp"));
             journal.files[entry.index].restored = true;
             write_journal(&journal_path, &journal)?;
             continue;
@@ -1947,21 +2067,21 @@ fn restore_journal_internal(
             let Some(original) = entry.original_sha256.as_deref() else {
                 return Err(UserFilesError::Other(format!(
                     "the backup '{}' of the user file '{}' cannot be verified: the journal has no original hash; both were left in place",
-                    entry.derived_backup_path.display(),
-                    entry.derived_real_path.display()
+                    entry.destination.backup.display(),
+                    entry.destination.real.display()
                 )));
             };
             let Some(backup_hash) = backup_hash.as_deref() else {
                 return Err(UserFilesError::Other(format!(
                     "the backup '{}' of the user file '{}' is missing; the file and the journal were left in place",
-                    entry.derived_backup_path.display(),
-                    entry.derived_real_path.display()
+                    entry.destination.backup.display(),
+                    entry.destination.real.display()
                 )));
             };
             if backup_hash != original {
                 return Err(UserFilesError::HashMismatch {
-                    path: entry.derived_backup_path.clone(),
-                    real_path: entry.derived_real_path.clone(),
+                    path: entry.destination.backup.clone(),
+                    real_path: entry.destination.real.clone(),
                     expected: original.to_string(),
                     actual: backup_hash.to_string(),
                 });
@@ -1971,51 +2091,47 @@ fn restore_journal_internal(
             // it from what Agora wrote.
             if let Some(current) = &real_bytes {
                 if real_hash.as_deref() != Some(entry.file.written_sha256.as_str()) {
-                    if let Some(parent) = entry.derived_instance_copy.parent() {
+                    if let Some(parent) = entry.destination.instance_copy.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    write_user_file(&entry.derived_instance_copy, current)?;
+                    write_user_file(&entry.destination.instance_copy, current)?;
                 }
             }
 
             let backup_bytes = backup_bytes.expect("checked above");
-            if let Some(parent) = entry.derived_real_path.parent() {
+            if let Some(parent) = entry.destination.real.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            write_user_file(&entry.derived_real_path, &backup_bytes)?;
+            write_user_file(&entry.destination.real, &backup_bytes)?;
         } else {
             // Agora created this file during the session; the session's copy goes back and the real
             // file goes. (Crash recovery never reaches a file whose content changed since the
             // swap: the strict check in the validation above stops the whole restore first.)
             if let Some(current) = &real_bytes {
                 if real_hash.as_deref() != Some(entry.file.written_sha256.as_str()) {
-                    if let Some(parent) = entry.derived_instance_copy.parent() {
+                    if let Some(parent) = entry.destination.instance_copy.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    write_user_file(&entry.derived_instance_copy, current)?;
+                    write_user_file(&entry.destination.instance_copy, current)?;
                 }
             }
-            if entry.derived_real_path.exists() {
-                std::fs::remove_file(&entry.derived_real_path)?;
+            if file_presence(&entry.destination.real, "the user file")? {
+                std::fs::remove_file(&entry.destination.real)?;
             }
         }
 
-        let final_sha256 = if entry.derived_real_path.exists() {
-            let bytes = std::fs::read(&entry.derived_real_path)?;
-            Some(hash_bytes(&bytes))
-        } else {
-            None
-        };
+        let final_sha256 = read_recovery_file(&entry.destination.real, "user file")?
+            .map(|bytes| hash_bytes(&bytes));
 
         // Record the entry before its backup can go, so a stop from here on does not restore it a
         // second time.
         journal.files[entry.index].restored = true;
         write_journal(&journal_path, &journal)?;
-        let _ = std::fs::remove_file(&entry.derived_backup_path);
-        let _ = std::fs::remove_file(entry.derived_backup_path.with_extension("tmp"));
+        let _ = std::fs::remove_file(&entry.destination.backup);
+        let _ = std::fs::remove_file(entry.destination.backup.with_extension("tmp"));
 
         restored_files.push(RestoredFile {
-            real_path: entry.derived_real_path.clone(),
+            real_path: entry.destination.real.clone(),
             instance_path: entry.instance_path.clone(),
             changed: real_hash != entry.original_sha256,
             original_sha256: entry.original_sha256.clone(),
@@ -2252,6 +2368,74 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use agora_game_api::RelPath;
+
+    /// The one destination comes from the journal, never from a case-insensitive filesystem lookup.
+    /// A mapping whose spelling differs in case must not change which path recovery writes.
+    #[test]
+    fn the_restore_destination_is_the_journal_path() {
+        use agora_game_api::{GamePath, UserDataLocation, UserFileMapping, UserFileStrategy};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = tmp.path();
+        let mapping = UserFileMapping::new(
+            GamePath::UserData {
+                location: UserDataLocation::LocalAppData,
+                path: RelPath::new("My Games/Plugins.txt").unwrap(),
+            },
+            RelPath::new("user/Plugins.txt").unwrap(),
+            UserFileStrategy::JournaledSwap,
+        );
+        let recorded = super::user_data_root_in_prefix(prefix, &UserDataLocation::LocalAppData)
+            .join("My Games/plugins.txt");
+        let file = JournaledFile {
+            real_path: recorded.clone(),
+            instance_path: RelPath::new("user/Plugins.txt").unwrap(),
+            instance_copy_path: tmp.path().join("instance/Plugins.txt"),
+            existed: true,
+            backup_path: None,
+            original_sha256: None,
+            written_sha256: String::new(),
+            swapped: true,
+            state: None,
+            restored: false,
+            real_resolved_path: Some(recorded.clone()),
+        };
+        let destination = super::restore_destination(
+            &file,
+            &mapping,
+            Some(prefix),
+            &tmp.path().join("instances"),
+            &tmp.path().join("backup"),
+            0,
+        )
+        .expect("the destination resolves");
+        assert_eq!(
+            destination.real, recorded,
+            "recovery must write the exact journal path"
+        );
+    }
+
+    /// A metadata error on the backup path is can't-tell, never "no backup". An invalid path gives
+    /// a metadata error on every platform, so this mechanism test runs everywhere.
+    #[test]
+    fn metadata_errors_are_never_absence() {
+        let error = super::file_presence(Path::new("invalid\0path"), "the backup").unwrap_err();
+        assert!(
+            error.to_string().contains("could not be read"),
+            "a metadata error must be reported, not swallowed: {error}"
+        );
+    }
+
+    /// An unresolvable destination is can't-tell; recovery must not substitute a rebuilt path.
+    #[test]
+    fn an_unresolvable_destination_is_cant_tell() {
+        let error =
+            super::resolved_destination(Path::new("invalid\0path"), "the user file").unwrap_err();
+        assert!(
+            error.to_string().contains("could not be read"),
+            "an unresolvable path must be reported: {error}"
+        );
+    }
 
     /// Canonical paths are compared exactly: a case-only retarget is a different resolved file.
     /// The case-insensitive comparator stays for user-data folder matching, not for this guard.

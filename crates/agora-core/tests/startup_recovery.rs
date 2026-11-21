@@ -1875,6 +1875,134 @@ fn a_case_only_retarget_is_refused_by_recovery() {
     );
 }
 
+/// Recovery must write the one destination it validated, never a case-insensitively discovered
+/// sibling. On a case-sensitive volume `plugins.txt` is a different file from the journal's
+/// `Plugins.txt`, so the sibling must be left alone and the recorded path restored.
+#[cfg(unix)]
+#[test]
+fn a_case_only_sibling_is_not_the_write_destination() {
+    let f = user_files_fixture(Some("Player original\n"));
+    let probe = f._user_data_dir.path().join("CaseProbe");
+    std::fs::write(&probe, b"a").unwrap();
+    if std::fs::metadata(f._user_data_dir.path().join("caseprobe")).is_ok() {
+        eprintln!("skipping: this filesystem does not distinguish case in file names");
+        let _ = std::fs::remove_file(&probe);
+        return;
+    }
+    let _ = std::fs::remove_file(&probe);
+
+    agora_core::game_user_files::swap_in(
+        &f.ctx,
+        "instance-a",
+        &f.def,
+        &StoreId::steam(),
+        &f.running_from,
+    )
+    .unwrap();
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
+    let sibling = f.real.with_file_name("plugins.txt");
+    std::fs::remove_file(&f.real).unwrap();
+    std::fs::write(&sibling, "Game changed this after the crash\n").unwrap();
+
+    agora_core::game_user_files::restore(&f.ctx, &f.def, &StoreId::steam())
+        .expect("the recorded path can be restored");
+
+    assert_eq!(
+        std::fs::read_to_string(&sibling).unwrap(),
+        "Game changed this after the crash\n",
+        "the case-only sibling was overwritten"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&f.real).unwrap(),
+        "Player original\n",
+        "the recorded destination was not restored"
+    );
+}
+
+/// A parent replaced by a dangling link is can't-tell, even when appending the final name would
+/// reconstruct the recorded path. Recovery keeps the journal and the instance's swapped copy.
+/// Creating dangling links needs a privilege on some Windows hosts, so this fixture is Unix-only.
+#[cfg(unix)]
+#[test]
+fn a_dangling_parent_keeps_the_journal_and_the_swapped_copy() {
+    let f = user_files_fixture(None);
+    agora_core::game_user_files::swap_in(
+        &f.ctx,
+        "instance-a",
+        &f.def,
+        &StoreId::steam(),
+        &f.running_from,
+    )
+    .unwrap();
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
+    let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
+    let parent = f.real.parent().unwrap().to_path_buf();
+    std::fs::remove_dir_all(&parent).unwrap();
+    let nowhere = f._user_data_dir.path().join("nowhere");
+    std::os::unix::fs::symlink(&nowhere, &parent).unwrap();
+
+    let error = agora_core::game_user_files::restore(&f.ctx, &f.def, &StoreId::steam())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("could not be resolved") || error.contains("cannot be verified"),
+        "an unresolved parent must be can't-tell: {error}"
+    );
+    assert!(journal_path.exists(), "the journal was cleared");
+    assert!(f.copy.exists(), "the swapped copy was removed");
+}
+
+/// A metadata error while checking the backup is can't-tell, never "no backup".
+#[cfg(unix)]
+#[test]
+fn a_backup_metadata_error_refuses_recovery() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = user_files_fixture(Some("Player original\n"));
+    agora_core::game_user_files::swap_in(
+        &f.ctx,
+        "instance-a",
+        &f.def,
+        &StoreId::steam(),
+        &f.running_from,
+    )
+    .unwrap();
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
+    let backup_dir = f.ctx.paths.user_files_backup_dir(GAME, "steam");
+    std::fs::set_permissions(&backup_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let error = agora_core::game_user_files::restore(&f.ctx, &f.def, &StoreId::steam())
+        .unwrap_err()
+        .to_string();
+    std::fs::set_permissions(&backup_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        error.contains("could not be read") || error.contains("could not be checked"),
+        "a metadata error must be can't-tell: {error}"
+    );
+    assert!(
+        f.ctx.paths.user_files_journal_path(GAME, "steam").exists(),
+        "the journal was cleared"
+    );
+}
+
 /// An instance copy whose bytes cannot be read is "can't tell", not "unchanged": neither the plain
 /// nor the forced restore may overwrite it. A directory at the path is unreadable as bytes on every
 /// platform; a Unix-only write-only-file fixture would exercise the same guard with a renameable
