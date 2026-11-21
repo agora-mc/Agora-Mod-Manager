@@ -3,6 +3,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// Expected schema version for the mutable local SQLite database.
 /// Migrations are applied sequentially on startup.
@@ -72,6 +73,44 @@ pub struct NewerSchemaKept {
     pub supported: i64,
     /// Where the newer database was moved. It is never deleted.
     pub kept_at: PathBuf,
+}
+
+/// Test-only hook, run once immediately after the startup lock is acquired for `db_path`.
+/// Integration tests cannot use `cfg(test)` in a library, so this is a runtime hook; it is a no-op
+/// for every other database, and removes itself after the first matching call so only one of
+/// that database's initializers pauses. Path scoping keeps parallel tests from firing each
+/// other's hook.
+#[doc(hidden)]
+pub fn set_startup_lock_hook(db_path: &std::path::Path, hook: Box<dyn Fn() + Send>) {
+    let slot = STARTUP_LOCK_HOOK.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some((db_path.to_path_buf(), hook));
+}
+
+#[doc(hidden)]
+pub fn clear_startup_lock_hook() {
+    let slot = STARTUP_LOCK_HOOK.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = None;
+}
+
+type StartupLockHook = (std::path::PathBuf, Box<dyn Fn() + Send>);
+
+static STARTUP_LOCK_HOOK: OnceLock<Mutex<Option<StartupLockHook>>> = OnceLock::new();
+
+fn notify_startup_locked(db_path: &std::path::Path) {
+    let Some(hook) = STARTUP_LOCK_HOOK.get().and_then(|slot| {
+        let mut guard = slot.lock().ok()?;
+        let matches = guard.as_ref().is_some_and(|(path, _)| path == db_path);
+        if matches {
+            guard.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    }) else {
+        return;
+    };
+    hook();
 }
 
 /// Open a read-write connection to the local state database.
@@ -165,6 +204,7 @@ pub fn init_local_state_db_with(
         .map_err(|error| {
             anyhow::anyhow!("Could not lock the local database for startup: {error}")
         })?;
+    notify_startup_locked(db_path);
 
     let mut report = LocalStateStartupReport::default();
 

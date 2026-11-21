@@ -4,7 +4,7 @@
 //! release wrote it, then opens it through the real startup path.
 
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Barrier};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -399,20 +399,56 @@ fn two_concurrent_recoveries_restore_exactly_once() {
     .unwrap();
     std::fs::write(&path, b"this is not a sqlite database").unwrap();
 
-    let barrier = Arc::new(Barrier::new(2));
+    // A test hook holds the first initializer inside the critical section. The second cannot
+    // finish until it is released, whatever the scheduler does — no shared start barrier.
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    agora_core::db::set_startup_lock_hook(
+        &path,
+        Box::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the test releases the first initializer");
+        }),
+    );
+    struct ClearHookOnDrop;
+    impl Drop for ClearHookOnDrop {
+        fn drop(&mut self) {
+            agora_core::db::clear_startup_lock_hook();
+        }
+    }
+    let _clear_hook = ClearHookOnDrop;
+
     let first_path = path.clone();
-    let first_barrier = barrier.clone();
     let first = thread::spawn(move || {
-        first_barrier.wait();
         init_local_state_db_with(&first_path, &LocalStateOpenOptions::default()).unwrap()
     });
+    entered_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the first initializer entered the critical section");
+
+    let (done_tx, done_rx) = mpsc::channel();
     let second_path = path.clone();
     let second = thread::spawn(move || {
-        barrier.wait();
-        init_local_state_db_with(&second_path, &LocalStateOpenOptions::default()).unwrap()
+        let report = init_local_state_db_with(&second_path, &LocalStateOpenOptions::default())
+            .expect("the second initializer succeeds");
+        done_tx.send(report).unwrap();
     });
+    let second_finished_early = done_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+
+    // Release before asserting so a failing control does not leave the first thread waiting on a
+    // receiver the test has already dropped.
+    release_tx.send(()).unwrap();
+    assert!(
+        !second_finished_early,
+        "the second initializer finished while the first held the startup lock"
+    );
     let first_report = first.join().unwrap();
-    let second_report = second.join().unwrap();
+    let second_report = done_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the second initializer finished once the lock was free");
+    second.join().unwrap();
 
     assert_eq!(
         usize::from(first_report.recovered_corrupt.is_some())

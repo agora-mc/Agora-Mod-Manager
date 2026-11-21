@@ -2590,9 +2590,11 @@ fn recover_one_job(
                 ));
             }
         };
-        let _ = std::fs::remove_dir_all(&staging);
         if final_dir.exists() && !instance_exists {
             if !import_owns(&final_dir, &job.job_id) {
+                // Keep the whole job — staging and row included — when any part of it is
+                // ambiguous. Deleting staging here would strand the row with no staged payload
+                // and make the "Nothing was changed" report a lie.
                 return Some(format!(
                     "The interrupted import for {} was left alone: its final directory is not \
                      marked as this job's. Nothing was changed.",
@@ -2601,6 +2603,7 @@ fn recover_one_job(
             }
             let _ = std::fs::remove_dir_all(&final_dir);
         }
+        let _ = std::fs::remove_dir_all(&staging);
         format!("Rolled back interrupted import for {}", job.instance_id)
     };
     let _ = db::delete_instance_import_job(connection, &job.job_id);
@@ -4082,6 +4085,11 @@ name=Dup Instance
         let final_dir = ctx.paths.instances_root().join("recover-db-error");
         std::fs::create_dir_all(&staging).unwrap();
         std::fs::create_dir_all(&final_dir).unwrap();
+        // Mark both folders so recovery gets past the ownership guards and actually reaches the
+        // SQL failure this test is about. Without the final-dir marker the ownership guard would
+        // protect the directory and mask a broken SQL guard.
+        mark_owner(&staging, "recover-db-error-job");
+        mark_owner(&final_dir, "recover-db-error-job");
         std::fs::write(final_dir.join("sentinel.txt"), b"keep me").unwrap();
         let connection = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let now = chrono::Utc::now().to_rfc3339();
@@ -4136,6 +4144,7 @@ name=Dup Instance
         }
         mark_owner(&stale_staging, "reload-job");
         mark_owner(&fresh_staging, "reload-job");
+        mark_owner(&final_dir, "reload-job");
         let connection = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         let stale = InstanceImportJob {
@@ -4212,6 +4221,10 @@ name=Dup Instance
         assert!(
             final_dir.join("instance_manifest.json").exists(),
             "a real instance at the final path was deleted"
+        );
+        assert!(
+            staging.exists(),
+            "a refused job keeps its staging folder, so 'Nothing was changed' is true"
         );
         assert!(
             warnings
