@@ -169,6 +169,8 @@ pub enum RunHookPoint {
     AfterSpawnBeforeRecord,
     /// The links-captured tool has exited; its writes are being captured from the farm.
     LinksPostExitCapture,
+    /// Immediately before the durable "spawning" mark is persisted, on any capture path.
+    BeforeSpawningMark,
 }
 
 #[doc(hidden)]
@@ -218,6 +220,53 @@ pub fn run_hook(ctx: &Ctx, journal: Option<&SwapJournal>, point: RunHookPoint) {
     }
 }
 
+/// A test seam that makes journal writes fail: the hook returns `true` for a journal path
+/// whose write should fail. Gated to the installing thread, like the run hook.
+#[doc(hidden)]
+type WriteFaultHook = std::sync::Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+
+#[doc(hidden)]
+static WRITE_FAULT_HOOK: Mutex<Option<(std::thread::ThreadId, WriteFaultHook)>> = Mutex::new(None);
+
+/// Set or clear the journal write-fault hook (a test seam; production never sets it). The hook
+/// fires only on the thread that sets it.
+#[doc(hidden)]
+pub fn set_write_fault_hook(hook: Option<WriteFaultHook>) {
+    if let Ok(mut guard) = WRITE_FAULT_HOOK.lock() {
+        *guard = hook.map(|hook| (std::thread::current().id(), hook));
+    }
+}
+
+/// Clear the write-fault hook, but only the one this thread installed.
+#[doc(hidden)]
+pub fn clear_write_fault_hook() {
+    if let Ok(mut guard) = WRITE_FAULT_HOOK.lock() {
+        let this_thread = std::thread::current().id();
+        if guard
+            .as_ref()
+            .is_some_and(|(thread, _)| *thread == this_thread)
+        {
+            *guard = None;
+        }
+    }
+}
+
+/// Whether a journal write to `path` fails right now (a test on this thread set a fault hook
+/// that names the path). Production never sets a hook, so this is always `false`.
+#[doc(hidden)]
+pub fn write_fault_fires(path: &Path) -> bool {
+    WRITE_FAULT_HOOK
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            guard
+                .as_ref()
+                .filter(|(thread, _)| *thread == std::thread::current().id())
+                .map(|(_, hook)| hook.clone())
+        })
+        .is_some_and(|hook| hook(path))
+}
+
 /// The journal file of one game and store.
 pub fn journal_path(ctx: &Ctx, game: &str, store: &str) -> PathBuf {
     ctx.paths.tool_swap_journal_path(game, store)
@@ -227,6 +276,14 @@ pub fn journal_path(ctx: &Ctx, game: &str, store: &str) -> PathBuf {
 /// appears under its final name only once they are.
 pub fn write_journal(ctx: &Ctx, journal: &SwapJournal) -> Result<(), SwapError> {
     let path = journal_path(ctx, &journal.game, &journal.store);
+    // Test seam only: `write_fault_fires` is false unless a test on this thread installed a
+    // fault hook, so production writes never fail here.
+    if write_fault_fires(&path) {
+        return Err(SwapError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "journal write fault injected by the test hook",
+        )));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

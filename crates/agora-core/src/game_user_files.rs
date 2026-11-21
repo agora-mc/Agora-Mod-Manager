@@ -443,6 +443,14 @@ fn sync_directory(dir: &Path) {
 fn sync_directory(_dir: &Path) {}
 
 fn write_journal(journal_path: &Path, journal: &Journal) -> Result<(), UserFilesError> {
+    // Test seam only: `write_fault_fires` is false unless a test on this thread installed a
+    // fault hook, so production writes never fail here.
+    if crate::game_tool_swap::write_fault_fires(journal_path) {
+        return Err(UserFilesError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "journal write fault injected by the test hook",
+        )));
+    }
     if let Some(parent) = journal_path.parent() {
         std::fs::create_dir_all(parent)?;
     }

@@ -3548,7 +3548,23 @@ fn run_under_vfs(
     // Before the spawn, the journal says a tool is spawning: if Agora dies in the window between
     // the spawn and recording the process, recovery can see that and needs a hand instead of
     // restoring under a tool no record can see.
-    let _ = game_user_files::mark_spawning_locked(ctx, &definition.id, &store);
+    game_tool_swap::run_hook(
+        ctx,
+        None,
+        game_tool_swap::RunHookPoint::BeforeSpawningMark,
+    );
+    // Fail closed: without the durable spawning mark, a crash in the spawn window would leave a
+    // live tool that no record can see, and recovery could restore under it. Undo what this run
+    // set up and do not launch.
+    if let Err(e) = game_user_files::mark_spawning_locked(ctx, &definition.id, &store) {
+        let _ = watch.finish();
+        let _ = release_session_locked(ctx, definition, &store, &swapped.launch_id);
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(ToolError::Other(format!(
+            "the spawning state could not be recorded ({e}), so the tool was not launched and \
+             this run was undone"
+        )));
+    }
     let mut launched = match launcher.launch_capturing(&prepared) {
         Ok(launched) => launched,
         Err(e) => {
@@ -3712,7 +3728,23 @@ fn run_from_links(
     // Before the spawn, the journal says a tool is spawning: if Agora dies in the window between
     // the spawn and recording the process, recovery can see that and needs a hand instead of
     // restoring under a tool no record can see.
-    let _ = game_user_files::mark_spawning_locked(ctx, &definition.id, &store);
+    game_tool_swap::run_hook(
+        ctx,
+        None,
+        game_tool_swap::RunHookPoint::BeforeSpawningMark,
+    );
+    // Fail closed: without the durable spawning mark, a crash in the spawn window would leave a
+    // live tool that no record can see, and recovery could restore under it. Undo what this run
+    // set up (the links deployment and the user-files session) and do not launch.
+    if let Err(e) = game_user_files::mark_spawning_locked(ctx, &definition.id, &store) {
+        let _ = watch.finish();
+        let _ = discard_deployment(&deployment_dir, instance_id);
+        let _ = release_session_locked(ctx, definition, &store, &swapped.launch_id);
+        return Err(ToolError::Other(format!(
+            "the spawning state could not be recorded ({e}), so the tool was not launched and \
+             this run was undone"
+        )));
+    }
     let mut launched = match launcher.launch_capturing(&prepared) {
         Ok(launched) => launched,
         Err(e) => {
@@ -3925,9 +3957,41 @@ fn run_by_swap(
     // Before the spawn, the journal durably says a tool is spawning: if Agora dies in the window
     // between the spawn and recording the process, a recovery can see that and needs a hand
     // instead of restoring real Data under a tool no record can see.
+    game_tool_swap::run_hook(
+        ctx,
+        Some(&journal),
+        game_tool_swap::RunHookPoint::BeforeSpawningMark,
+    );
+    // Fail closed: without the durable spawning mark, a crash in the spawn window would leave a
+    // live tool that no record can see, and recovery could restore real Data under it. Put the
+    // swap back and do not launch.
     journal.spawning = true;
-    let _ = game_tool_swap::write_journal(ctx, &journal);
-    let _ = game_user_files::mark_spawning_locked(ctx, &definition.id, &store);
+    if let Err(e) = game_tool_swap::write_journal(ctx, &journal) {
+        return Err(put_back_after(
+            ctx,
+            definition,
+            &store,
+            &swapped.launch_id,
+            &journal,
+            ToolError::Other(format!(
+                "the spawning state could not be recorded in the swap journal ({e}), so the \
+                 tool was not launched"
+            )),
+        ));
+    }
+    if let Err(e) = game_user_files::mark_spawning_locked(ctx, &definition.id, &store) {
+        return Err(put_back_after(
+            ctx,
+            definition,
+            &store,
+            &swapped.launch_id,
+            &journal,
+            ToolError::Other(format!(
+                "the spawning state could not be recorded in the user-files journal ({e}), so \
+                 the tool was not launched"
+            )),
+        ));
+    }
     let mut launched = match launcher.launch_capturing(&prepared_launch) {
         Ok(launched) => launched,
         Err(e) => {

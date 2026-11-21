@@ -7523,3 +7523,236 @@ fn recovery_waits_for_an_external_tool_the_swap_recorded() {
     );
     assert!(journal_file(&f).exists());
 }
+
+/// Clears the write-fault hook on drop, but only the one this thread installed.
+struct WriteFaultGuard;
+
+impl Drop for WriteFaultGuard {
+    fn drop(&mut self) {
+        swap::clear_write_fault_hook();
+    }
+}
+
+/// A launcher that counts how many times a process was actually started, so a test can prove a
+/// tool was never spawned.
+struct CountingLauncher {
+    inner: StagingLauncher,
+    spawns: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Launcher for CountingLauncher {
+    fn locate_vfs_dll(&self) -> Result<PathBuf, String> {
+        self.inner.locate_vfs_dll()
+    }
+
+    fn launch(&self, prepared: &PreparedLaunch) -> Result<LaunchedGame, LaunchError> {
+        self.spawns
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.launch(prepared)
+    }
+
+    fn launch_capturing(&self, prepared: &PreparedLaunch) -> Result<LaunchedGame, LaunchError> {
+        self.spawns
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.launch_capturing(prepared)
+    }
+}
+
+/// Arm a one-shot write fault on one journal path from the run hook, at the moment the
+/// production writer is about to persist the "spawning" mark: the fault hook fires only on this
+/// thread, and only for the first write to that path (the spawning mark), so the undo that
+/// follows can persist its own journal updates.
+fn arm_fault_at_spawning_mark(fault_path: PathBuf, fired: Arc<Mutex<Vec<swap::RunHookPoint>>>) {
+    swap::set_run_hook(Some(Arc::new(move |_ctx, _journal, point| {
+        fired.lock().unwrap().push(point);
+        if point == swap::RunHookPoint::BeforeSpawningMark {
+            let fault_path = fault_path.clone();
+            let once = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            swap::set_write_fault_hook(Some(Arc::new(move |p| {
+                p == &fault_path && once.swap(false, std::sync::atomic::Ordering::SeqCst)
+            })));
+        }
+    })));
+}
+
+/// The spawning mark is persisted durably before every spawn. When that persist FAILS on the
+/// swap path, the run must fail closed: the tool is never spawned, the swap is undone (real
+/// Data back byte for byte, no aside or copy, no journal) and the error is reported.
+#[test]
+fn a_failed_spawning_mark_on_the_swap_path_does_not_launch_the_tool() {
+    let _swap = SwapTest::same_volume();
+    let _hook_guard = RunHookGuard;
+    let _fault_guard = WriteFaultGuard;
+    let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let install = install_dir(&f);
+    let before = snapshot(&real_data(&f));
+    let journal_path = journal_file(&f);
+
+    let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let launcher = CountingLauncher {
+        inner: swap_launcher(&f),
+        spawns: Arc::clone(&spawns),
+    };
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    arm_fault_at_spawning_mark(journal_path.clone(), Arc::clone(&fired));
+
+    let outcome = f.run_as("nemesis", &launcher, CaptureMode::Swap);
+
+    let err = outcome.expect_err("the run must refuse when the spawning mark cannot be persisted");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("spawning") && msg.contains("not launched"),
+        "the error must say the spawning mark failed and the tool was not launched: {msg}"
+    );
+    assert_eq!(
+        spawns.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the tool was spawned although the spawning mark could not be persisted"
+    );
+    let fired = fired.lock().unwrap().clone();
+    assert!(
+        fired.contains(&swap::RunHookPoint::BeforeSpawningMark),
+        "the pre-spawning-mark window was reached: {fired:?}"
+    );
+    assert!(
+        !fired.contains(&swap::RunHookPoint::AfterSpawnBeforeRecord),
+        "the spawn window was reached: {fired:?}"
+    );
+    assert_eq!(
+        snapshot(&real_data(&f)),
+        before,
+        "the swap was not undone: the real Data changed"
+    );
+    assert!(!journal_path.exists(), "the journal is gone after the undo");
+    assert!(
+        names(&install)
+            .iter()
+            .all(|n| !n.starts_with(swap::ASIDE_PREFIX) && !n.starts_with(swap::COPY_PREFIX)),
+        "an aside or copy folder is left behind"
+    );
+}
+
+/// The same fail-closed rule on the links path: when persisting the spawning mark fails, the
+/// tool is never spawned and the run is undone (deployment discarded, user-files session
+/// released, player's file back).
+#[test]
+fn a_failed_spawning_mark_on_the_links_path_does_not_launch_the_tool() {
+    let _user_data = UserData::new();
+    let _hook_guard = RunHookGuard;
+    let _fault_guard = WriteFaultGuard;
+    let f = fixture_with(vec![writes_or_fails("nemesis")], true, false);
+    let user_root = std::env::var("AGORA_TEST_USER_DATA_ROOT").unwrap();
+    let real = Path::new(&user_root)
+        .join("local")
+        .join("Test Game")
+        .join("Plugins.txt");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(&real, "Player original\n").unwrap();
+    let copy = f.instance_dir().join("user/Plugins.txt");
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::write(&copy, "Instance copy\n").unwrap();
+    let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
+
+    let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let launcher = CountingLauncher {
+        inner: StagingLauncher::new(),
+        spawns: Arc::clone(&spawns),
+    };
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    arm_fault_at_spawning_mark(journal_path.clone(), Arc::clone(&fired));
+
+    let outcome = f.run_as("nemesis", &launcher, CaptureMode::Links);
+
+    let err = outcome.expect_err("the run must refuse when the spawning mark cannot be persisted");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("spawning") && msg.contains("not launched"),
+        "the error must say the spawning mark failed and the tool was not launched: {msg}"
+    );
+    assert_eq!(
+        spawns.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the tool was spawned although the spawning mark could not be persisted"
+    );
+    let fired = fired.lock().unwrap().clone();
+    assert!(
+        !fired.contains(&swap::RunHookPoint::LinksPostExitCapture),
+        "the tool ran and was captured: {fired:?}"
+    );
+    assert!(
+        !journal_path.exists(),
+        "the user-files session journal is gone after the undo"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&real).unwrap(),
+        "Player original\n",
+        "the player's file was not put back by the undo"
+    );
+}
+
+/// The same fail-closed rule on the VFS path: when persisting the spawning mark fails, the tool
+/// is never spawned and the run is undone (staging removed, real install untouched, session
+/// released).
+#[test]
+fn a_failed_spawning_mark_on_the_vfs_path_does_not_launch_the_tool() {
+    let _user_data = UserData::new();
+    let _hook_guard = RunHookGuard;
+    let _fault_guard = WriteFaultGuard;
+    let f = fixture_with(vec![writes_or_fails("nemesis")], true, false);
+    let user_root = std::env::var("AGORA_TEST_USER_DATA_ROOT").unwrap();
+    let real = Path::new(&user_root)
+        .join("local")
+        .join("Test Game")
+        .join("Plugins.txt");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(&real, "Player original\n").unwrap();
+    let copy = f.instance_dir().join("user/Plugins.txt");
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::write(&copy, "Instance copy\n").unwrap();
+    let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
+    let before = snapshot(&real_data(&f));
+
+    let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let launcher = CountingLauncher {
+        inner: StagingLauncher::new(),
+        spawns: Arc::clone(&spawns),
+    };
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    arm_fault_at_spawning_mark(journal_path.clone(), Arc::clone(&fired));
+
+    let outcome = f.run_as("nemesis", &launcher, CaptureMode::Vfs);
+
+    let err = outcome.expect_err("the run must refuse when the spawning mark cannot be persisted");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("spawning") && msg.contains("not launched"),
+        "the error must say the spawning mark failed and the tool was not launched: {msg}"
+    );
+    assert_eq!(
+        spawns.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the tool was spawned although the spawning mark could not be persisted"
+    );
+    assert_eq!(
+        snapshot(&real_data(&f)),
+        before,
+        "the real install changed although the tool never ran"
+    );
+    assert!(
+        !journal_path.exists(),
+        "the user-files session journal is gone after the undo"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&real).unwrap(),
+        "Player original\n",
+        "the player's file was not put back by the undo"
+    );
+    let staging_left: Vec<String> = names(&f.tool_dir("nemesis"))
+        .into_iter()
+        .filter(|n| n.starts_with("staging-"))
+        .collect();
+    assert!(
+        staging_left.is_empty(),
+        "a staging folder is left behind: {staging_left:?}"
+    );
+}
