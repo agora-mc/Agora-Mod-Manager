@@ -713,6 +713,10 @@ enum UserFilesCmd {
         game: String,
         /// Store ID of the session to restore (e.g. steam, gog).
         store: String,
+        /// Override the both-changed conflict: the conflict copy is still written first, then
+        /// the files are put back. Automatic startup recovery never forces.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -10769,7 +10773,7 @@ async fn run_command(
                         }
                     }
                 }
-                UserFilesCmd::Restore { game, store } => {
+                UserFilesCmd::Restore { game, store, force } => {
                     let game_id =
                         agora_game_api::GameId::new(&game).map_err(|e| anyhow::anyhow!("{e}"))?;
                     let store_id =
@@ -10777,7 +10781,12 @@ async fn run_command(
                     let game_def = ctx.games.game(&game_id).ok_or_else(|| {
                         anyhow::anyhow!("Game definition not found for {}", game_id)
                     })?;
-                    match agora_core::game_user_files::restore(ctx, game_def, &store_id) {
+                    let restored = if force {
+                        agora_core::game_user_files::restore_forced(ctx, game_def, &store_id)
+                    } else {
+                        agora_core::game_user_files::restore(ctx, game_def, &store_id)
+                    };
+                    match restored {
                         Ok(report) => {
                             if json {
                                 println!(

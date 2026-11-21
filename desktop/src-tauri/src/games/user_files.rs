@@ -95,11 +95,14 @@ pub async fn games_user_files_status(
 }
 
 /// Put one session's files back from Agora's backup. Refused while the game runs on them.
+/// `force` is the explicit override for a both-changed conflict: the conflict copy is still
+/// written first, then the files are put back. Automatic startup recovery never forces.
 #[tauri::command]
 pub async fn games_user_files_restore(
     app: tauri::AppHandle,
     game_id: String,
     store: String,
+    force: Option<bool>,
 ) -> Result<RestoreDto, GamesError> {
     tokio::task::spawn_blocking(move || -> Result<RestoreDto, GamesError> {
         let ctx = crate::core_context(&app)?;
@@ -125,7 +128,12 @@ pub async fn games_user_files_restore(
                     ),
                 )
             })?;
-        let report = game_user_files::restore(&ctx, game, &store_id).map_err(core_failed)?;
+        let report = if force.unwrap_or(false) {
+            game_user_files::restore_forced(&ctx, game, &store_id)
+        } else {
+            game_user_files::restore(&ctx, game, &store_id)
+        }
+        .map_err(core_failed)?;
         Ok(restore_dto(report))
     })
     .await

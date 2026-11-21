@@ -1591,3 +1591,96 @@ fn a_file_absent_at_swap_records_its_would_be_resolved_path_and_recovers_normall
         "the recovery ran: {report:?}"
     );
 }
+
+/// The explicit restore command's override: on a both-changed conflict the plain restore (and
+/// automatic startup recovery, which never forces) refuses and writes the conflict copy; the
+/// forced restore writes the same conflict copy first and then puts the files back — the
+/// original goes back to the real file, the game's changed bytes are saved into the instance's
+/// copy.
+#[test]
+fn a_both_changed_conflict_is_forced_only_by_the_explicit_restore_command() {
+    let f = user_files_fixture(Some("Player original\n"));
+    agora_core::game_user_files::swap_in(
+        &f.ctx,
+        "instance-a",
+        &f.def,
+        &StoreId::steam(),
+        &f.running_from,
+    )
+    .unwrap();
+    agora_core::game_user_files::record_process(&f.ctx, &f.def.id, &StoreId::steam(), dead_identity())
+        .unwrap();
+    let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
+    assert_eq!(std::fs::read_to_string(&f.real).unwrap(), "Instance copy\n");
+    // After the crash, both sides changed to different bytes.
+    std::fs::write(&f.real, "Game changed this after the crash\n").unwrap();
+    std::fs::write(&f.copy, "Instance copy changed too\n").unwrap();
+
+    // Automatic startup recovery refuses and never forces.
+    let report = run_at_startup(&f.ctx);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("both changed since the swap")),
+        "startup recovery must report the conflict: {report:?}"
+    );
+    assert!(report.actions.is_empty(), "startup recovery forced nothing: {report:?}");
+    assert_eq!(
+        std::fs::read_to_string(&f.real).unwrap(),
+        "Game changed this after the crash\n"
+    );
+
+    // The explicit restore without --force refuses the same way and names the override.
+    let err = agora_core::game_user_files::restore(&f.ctx, &f.def, &StoreId::steam())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("both changed since the swap") && err.contains("--force"),
+        "the refusal must name the forced command: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&f.real).unwrap(),
+        "Game changed this after the crash\n",
+        "the unforced restore changed the real file"
+    );
+    assert!(journal_path.exists(), "the journal is kept");
+
+    // The forced restore: conflict copy first, then the put-back.
+    let forced = agora_core::game_user_files::restore_forced(&f.ctx, &f.def, &StoreId::steam())
+        .expect("the forced restore completes");
+    assert!(
+        forced.files.iter().any(|file| file.changed),
+        "the game's change is reported: {forced:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&f.real).unwrap(),
+        "Player original\n",
+        "the original is back on the real file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&f.copy).unwrap(),
+        "Game changed this after the crash\n",
+        "the game's changed bytes were saved into the instance's copy"
+    );
+    let conflicts: Vec<PathBuf> = std::fs::read_dir(f.copy.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("Plugins.txt.agora-conflict-"))
+        })
+        .collect();
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "the forced restore still wrote the conflict copy first: {conflicts:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&conflicts[0]).unwrap(),
+        "Game changed this after the crash\n"
+    );
+    assert!(!journal_path.exists(), "the journal is cleared by the forced restore");
+}

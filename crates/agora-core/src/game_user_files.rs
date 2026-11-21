@@ -725,7 +725,7 @@ pub fn swap_in_locked(
             )));
         }
         // A new launch's catch-up is automatic recovery, so it is strict.
-        let _ = restore_journal_internal(ctx, definition, &existing, true)?;
+        let _ = restore_journal_internal(ctx, definition, &existing, true, false)?;
     }
 
     // 2. Filter mappings that apply to this store
@@ -944,7 +944,7 @@ pub fn swap_in_locked(
     if let Err(e) = swap_result {
         // Any error puts back what was swapped so far. A restore that also fails is reported, and
         // its journal is left for the next launch or a restore to finish.
-        return Err(match restore_journal_internal(ctx, definition, &journal, true) {
+        return Err(match restore_journal_internal(ctx, definition, &journal, true, false) {
             Ok(_) => e,
             Err(restore_error) => UserFilesError::Other(format!(
                 "{e}; putting the player's files back also failed: {restore_error}. The journal was kept so recovery can finish it."
@@ -972,6 +972,21 @@ pub fn restore(
     restore_locked(ctx, definition, store)
 }
 
+/// [`restore`] with the explicit override: on a both-changed conflict it still writes the
+/// conflict copy first, then restores. This is the human override for that one protection;
+/// automatic startup recovery never forces.
+pub fn restore_forced(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    store: &StoreId,
+) -> Result<RestoreReport, UserFilesError> {
+    let _lock = ctx.lock_manager.acquire(
+        LockResource::GameUserFiles(definition.id.clone(), store.clone()),
+        "restore-forced",
+    )?;
+    restore_locked_forced(ctx, definition, store)
+}
+
 /// The body of [`restore`] under the caller's game-user-files lock: read the journal, refuse a
 /// live session, put the files back. Callers that already hold the lock (startup recovery) use
 /// this instead of taking the lock again — the lock manager is not re-entrant.
@@ -980,7 +995,16 @@ pub fn restore_locked(
     definition: &GameDefinition,
     store: &StoreId,
 ) -> Result<RestoreReport, UserFilesError> {
-    restore_locked_mode(ctx, definition, store, false)
+    restore_locked_mode(ctx, definition, store, false, false)
+}
+
+/// [`restore_forced`] for a caller that already holds the game/store user-files lock.
+pub fn restore_locked_forced(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    store: &StoreId,
+) -> Result<RestoreReport, UserFilesError> {
+    restore_locked_mode(ctx, definition, store, false, true)
 }
 
 /// [`restore`] as automatic crash recovery, under the caller's game-user-files lock: the same
@@ -992,7 +1016,7 @@ pub fn restore_locked_recovery(
     definition: &GameDefinition,
     store: &StoreId,
 ) -> Result<RestoreReport, UserFilesError> {
-    restore_locked_mode(ctx, definition, store, true)
+    restore_locked_mode(ctx, definition, store, true, false)
 }
 
 /// [`restore_locked_recovery`] for an automatic caller that does not hold the lock.
@@ -1013,6 +1037,7 @@ fn restore_locked_mode(
     definition: &GameDefinition,
     store: &StoreId,
     strict: bool,
+    force: bool,
 ) -> Result<RestoreReport, UserFilesError> {
     let journal_path = ctx
         .paths
@@ -1047,7 +1072,7 @@ fn restore_locked_mode(
         });
     }
 
-    restore_journal_internal(ctx, definition, &journal, strict)
+    restore_journal_internal(ctx, definition, &journal, strict, force)
 }
 
 /// What a catch-up did with the per-user files of one finished session.
@@ -1277,6 +1302,12 @@ pub fn restore_instruction(game: &str, store: &str) -> String {
     format!("agora games user-files restore {game} {store}")
 }
 
+/// The explicit restore command with its override flag, for a conflict that refuses without it
+/// (both sides changed since the swap). Automatic startup recovery never forces.
+pub fn restore_instruction_forced(game: &str, store: &str) -> String {
+    format!("agora games user-files restore {game} {store} --force")
+}
+
 /// What a person is told when a restore did not finish. It names the error, says the files are
 /// still the instance's, and gives the exact command. Never success.
 pub fn restore_failure_message(reason: &str, game: &str, store: &str) -> String {
@@ -1424,6 +1455,7 @@ fn restore_journal_internal(
     definition: &GameDefinition,
     journal: &Journal,
     strict: bool,
+    force: bool,
 ) -> Result<RestoreReport, UserFilesError> {
     if journal.game != definition.id {
         return Err(UserFilesError::Other(format!(
@@ -1658,15 +1690,23 @@ fn restore_journal_internal(
                         std::fs::create_dir_all(parent)?;
                     }
                     write_user_file(&conflict_path, &real_bytes)?;
-                    return Err(UserFilesError::Other(format!(
-                        "the user file '{}' and the instance's copy '{}' both changed since the \
-                         swap, so neither was overwritten: the real file's current bytes were \
-                         kept as '{}'. Check both by hand, then put the files back with `{}`",
-                        file.real_path.display(),
-                        derived_instance_copy.display(),
-                        conflict_path.display(),
-                        restore_instruction(journal.game.as_str(), journal.store.as_str())
-                    )));
+                    // The explicit restore command's override (`--force`) writes the conflict
+                    // copy first (done above) and then restores; automatic recovery never does.
+                    if !force {
+                        return Err(UserFilesError::Other(format!(
+                            "the user file '{}' and the instance's copy '{}' both changed since \
+                             the swap, so neither was overwritten: the real file's current bytes \
+                             were kept as '{}'. Check both by hand, then put the files back \
+                             with `{}`",
+                            file.real_path.display(),
+                            derived_instance_copy.display(),
+                            conflict_path.display(),
+                            restore_instruction_forced(
+                                journal.game.as_str(),
+                                journal.store.as_str()
+                            )
+                        )));
+                    }
                 }
             }
         }

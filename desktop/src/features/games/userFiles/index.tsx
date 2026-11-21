@@ -51,13 +51,28 @@ export function RecoverySection({ gameId, frame }: { gameId: string; frame: Sect
       tone: 'danger',
     });
     if (!ok) return;
-    setRestores((current) => ({ ...current, [key]: { status: 'busy' } }));
-    try {
-      const result = await restoreUserFiles(session.gameId, session.store);
-      setRestores((current) => ({ ...current, [key]: { status: 'done', result } }));
-      load();
-    } catch (error) {
-      setRestores((current) => ({ ...current, [key]: { status: 'error', message: formatError(error) } }));
+    const run = async (force: boolean) => {
+      setRestores((current) => ({ ...current, [key]: { status: 'busy' } }));
+      try {
+        const result = await restoreUserFiles(session.gameId, session.store, force);
+        setRestores((current) => ({ ...current, [key]: { status: 'done', result } }));
+        load();
+      } catch (error) {
+        setRestores((current) => ({ ...current, [key]: { status: 'error', message: formatError(error) } }));
+        return error;
+      }
+    };
+    const error = await run(false);
+    // A both-changed conflict is the one protection the explicit restore can override: offer
+    // the forced retry, which still writes the conflict copy first.
+    if (error instanceof Error && formatError(error).includes('both changed since the swap')) {
+      const retry = await confirm({
+        title: 'Both copies changed — restore anyway?',
+        body: 'Both the game’s own file and the instance’s copy changed since the swap. Restoring anyway keeps the game’s file’s current bytes as a clearly named conflict copy next to the instance’s copy, then puts the original back.',
+        confirmLabel: 'Restore anyway',
+        tone: 'danger',
+      });
+      if (retry) await run(true);
     }
   };
 
