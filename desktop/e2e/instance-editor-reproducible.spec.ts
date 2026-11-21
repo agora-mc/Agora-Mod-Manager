@@ -367,6 +367,7 @@ async function navigateToInstanceEditor(page: Page) {
 }
 
 async function openReproducibleTab(page: Page) {
+  await page.getByRole('button', { name: 'Import & Export' }).click();
   await page.getByRole('button', { name: 'Export', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Export Instance' })).toBeVisible();
 }

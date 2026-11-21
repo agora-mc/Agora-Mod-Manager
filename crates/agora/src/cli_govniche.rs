@@ -7,11 +7,11 @@
 
 use agora_core::ctx::Ctx;
 use agora_core::governance::{self, DiagnosticStatus, GovernanceService};
-use agora_core::import::{ImportResult, TechnicZipPack};
 use agora_core::plugins::PluginService;
 use agora_core::providers::{self, ProviderRegistry};
 use agora_core::registry::RegistryService;
-use agora_core::technic::{self, TechnicTier};
+use agora_game_minecraft::import::{ImportResult, TechnicZipPack};
+use agora_game_minecraft::technic::{self, TechnicTier};
 use anyhow::{bail, Context};
 use clap::Subcommand;
 
@@ -81,6 +81,10 @@ pub enum TechnicCmd {
         loader: Option<String>,
         #[arg(long, help = "Mod loader version (zip packs only)")]
         loader_version: Option<String>,
+        /// Install a zip pack with no integrity information, for this command only. Not needed
+        /// with --sha256, or when the allow_unverified_packs setting is on.
+        #[arg(long)]
+        allow_unverified: bool,
     },
 }
 
@@ -317,6 +321,7 @@ pub async fn run_technic_command(
             loader,
             loader_version,
             sha256,
+            allow_unverified,
         } => {
             let detail = technic::pack_detail(ctx, &slug).await?;
             let result = match detail.tier {
@@ -352,6 +357,7 @@ pub async fn run_technic_command(
                         .with_context(|| format!("Technic pack '{slug}' has no download URL"))?;
                     // Said before the install starts, so it is shown even if
                     // the install then fails.
+                    let pinned = sha256.is_some();
                     if sha256.is_none() {
                         eprintln!(
                             "Warning: no --sha256 given, so the zip for '{slug}' is installed \
@@ -373,7 +379,9 @@ pub async fn run_technic_command(
                             format!("zip pack '{slug}' needs --loader-version <VERSION>")
                         })?,
                     };
-                    technic::install_zip_pack(ctx, pack, name).await?
+                    technic::install_zip_pack(ctx, pack, name, allow_unverified || pinned)
+                        .await
+                        .map_err(low_security_hint)?
                 }
             };
             print_import_result(&result, json, &format!("Technic pack '{slug}'"))?;
@@ -391,18 +399,32 @@ pub async fn install_provider_pack(
     project: &str,
     version: Option<&str>,
     name: Option<&str>,
+    allow_unverified: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let service = crate::plugin_service(ctx);
     service.reload()?;
-    let plugins = service.is_enabled().then_some(&service);
+    let plugins = service.plugin_code_allowed().then_some(&service);
     let registry = ProviderRegistry::new(ctx, plugins);
     let item = providers::item_id(provider, project);
-    let result = providers::install::install_pack(ctx, &registry, &item, version, name).await?;
+    let result = agora_game_minecraft::providers::install::install_pack(
+        ctx,
+        &registry,
+        &item,
+        version,
+        name,
+        allow_unverified,
+    )
+    .await
+    .map_err(low_security_hint)?;
     print_import_result(&result, json, &format!("'{item}'"))
 }
 
-fn print_import_result(result: &ImportResult, json: bool, what: &str) -> anyhow::Result<()> {
+pub(crate) fn print_import_result(
+    result: &ImportResult,
+    json: bool,
+    what: &str,
+) -> anyhow::Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(result)?);
     } else {
@@ -486,6 +508,18 @@ fn parse_sha256_arg(raw: &str) -> Result<String, String> {
         Ok(hash.to_ascii_lowercase())
     } else {
         Err("expected exactly 64 hexadecimal characters (a SHA-256 digest)".to_string())
+    }
+}
+
+/// Name the CLI's answer to the per-install low security prompt in the error.
+pub(crate) fn low_security_hint(error: agora_core::error::LauncherError) -> anyhow::Error {
+    if error.code() == agora_core::providers::LOW_SECURITY_CONFIRMATION_CODE {
+        anyhow::anyhow!(
+            "{error} Re-run with --allow-unverified to install it this once, or turn on \
+             allow_unverified_packs to allow it for every install."
+        )
+    } else {
+        error.into()
     }
 }
 

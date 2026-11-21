@@ -1,0 +1,109 @@
+{
+  "contract": 1,
+  "games": ["cyberpunk-2077"],
+  "sources": [
+    {
+      "id": "report_queue",
+      "where": { "root": "user_data", "location": "local_app_data", "path": "REDEngine/ReportQueue" },
+      "match": { "glob": "Cyberpunk2077-*", "marker": ".ready" },
+      "unit": "folder",
+      "format": "red_report",
+      "bind": [
+        { "pid_in_name": { "regex": "^Cyberpunk2077-\\d+-\\d+-(\\d+)-\\d+$" } },
+        { "time": { "before_s": 2, "after_s": 30 } }
+      ],
+      "role": "primary",
+      "privacy": "personal",
+      "children": [
+        { "glob": "*.dmp", "copy": "facts_only", "privacy": "personal" },
+        { "glob": "attch/*", "copy": "never", "privacy": "personal" },
+        { "glob": "screenshot.png", "copy": "never", "privacy": "personal" }
+      ]
+    },
+    {
+      "id": "script_compile_log",
+      "where": { "root": "runtime", "path": "r6/logs" },
+      "match": { "glob": "redscript_*.log" },
+      "format": "script_compile_log"
+    }
+  ],
+  "parsers": [
+    {
+      "id": "red_report",
+      "entry": { "generic": { "name": "minidump" } }
+    },
+    {
+      "id": "script_compile_log",
+      "entry": { "wasm": { "module": "crash/script_log.wasm", "export": "parse" } }
+    }
+  ],
+  "ref_maps": [
+    { "kind": "module", "lookup": { "path": { "patterns": ["red4ext/plugins/*/{value}", "bin/x64/plugins/{value}", "{value}"] } }, "match": "casefold" },
+    { "kind": "file", "lookup": { "path": { "patterns": ["{value}"] } }, "match": "casefold" }
+  ],
+  "roles": [
+    { "kind": "module", "value": "Cyberpunk2077.exe", "match": "casefold", "role": "platform" }
+  ],
+  "rules": [
+    {
+      "id": "known_empty_pointer_site_in_one_build",
+      "version": 1,
+      "scope": { "runtime": { "exact": ["9.9.1.12345"] } },
+      "when": {
+        "all": [
+          { "fact": { "kind": "core.exception", "where": { "near_null": true, "access": "read" } } },
+          { "fact": { "kind": "core.frame", "where": { "index": 0, "rva": "0x00A0B0C0" }, "ref": { "kind": "module", "role": "platform" } } }
+        ]
+      },
+      "effects": [
+        { "finding": { "scope": "mechanism", "level": "possible" } }
+      ],
+      "text": {
+        "headline": { "en": "The game read an empty pointer in its own code. This log can't name a mod." },
+        "why_not_sure": { "en": "No function names are available for this game, so this rests on an address in one exact build." }
+      },
+      "next_step": "bisect"
+    },
+    {
+      "id": "plugin_dll_found_in_stack_memory",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.frame",
+          "where": { "kind": "scan" },
+          "ref": { "kind": "module", "bind": "dll" }
+        }
+      },
+      "effects": [
+        { "signal": { "family": "execution", "candidate": { "owner_of": "dll" }, "weight": 2 } }
+      ],
+      "text": { "headline": { "en": "{owner:dll} was found in stack memory, which is weak evidence." } }
+    },
+    {
+      "id": "script_failed_to_compile",
+      "version": 1,
+      "scope": { "producer": { "format": "script_compile_log" } },
+      "when": {
+        "fact": {
+          "kind": "core.load_verdict",
+          "where": { "outcome": "failed" },
+          "ref": { "kind": "file", "bind": "script" }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "root_cause",
+            "level": "very_likely",
+            "candidate": { "owner_of": "script" },
+            "family": "decisive_verdict",
+            "weight": 16
+          }
+        }
+      ],
+      "text": { "headline": { "en": "{script} from {owner:script} failed to compile, so the game stopped before it started." } },
+      "repairs": [{ "disable_content": { "key": { "owner_of": "script" } } }],
+      "next_step": "apply_repair"
+    }
+  ]
+}

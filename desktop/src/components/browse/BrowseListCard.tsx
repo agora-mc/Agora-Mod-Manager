@@ -1,4 +1,6 @@
+import { useEffect } from 'react';
 import { Check, ExternalLink } from 'lucide-react';
+import { cacheCatalogIcon } from '../../features/library/api';
 import { BrowseIcon } from './BrowseIcon';
 import { BrowseContextLabels, BrowseStats, BrowseVersions, CuratedBadge } from './BrowseContextLabels';
 import type { BrowseCardProps } from './types';
@@ -22,6 +24,14 @@ function sourceSummary(item: BrowseCardProps['item']): string {
 }
 
 export function BrowseListCard({ item, context, onSelectMod, selected = false, onToggleSelect }: BrowseCardProps) {
+  // While this icon is shown online, keep a copy so the Library can show it offline. A failed
+  // save is never an error for the page.
+  useEffect(() => {
+    if (item.source === 'curated') {
+      void cacheCatalogIcon(item.id, item.iconUrl);
+    }
+  }, [item.id, item.source, item.iconUrl]);
+
   return (
     <li
       className={[

@@ -13,6 +13,7 @@ export function InstanceIcon({
   name,
   seed,
   loader,
+  familyHue,
   iconSrc,
   size = 56,
   className = '',
@@ -21,6 +22,8 @@ export function InstanceIcon({
   /** Stable per-instance value (the instance id). Falls back to the name. */
   seed?: string | null;
   loader?: string | null;
+  /** The hue family when there is no loader to take it from (another game's instances). */
+  familyHue?: number | null;
   iconSrc?: string | null;
   /** Edge length in px. Drives the initials' size too. */
   size?: number;
@@ -40,7 +43,7 @@ export function InstanceIcon({
     );
   }
 
-  const tint = instanceTint(seed || name, loader);
+  const tint = instanceTint(seed || name, loader, familyHue);
   const style = {
     ...box,
     fontSize: Math.round(size * 0.36),

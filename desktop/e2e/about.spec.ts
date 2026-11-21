@@ -64,6 +64,7 @@ test('describes Agora as a bespoke boutique and covers its pillars', async ({ pa
   await expect(page.getByText(/tailored, and made accessible for you/)).toBeVisible();
   await expect(page.getByRole('heading', { name: 'What makes Agora unique' })).toBeVisible();
   for (const pillar of [
+    'Built for more than one game',
     'Customizable to you',
     'Democratic community voting',
     'Open source',

@@ -103,7 +103,7 @@ after the fact.
 |---|---|
 | over HTTPS, from a host the provider declared, with SHA-256 or SHA-512 | installs; nothing to warn about |
 | from another host, over plain HTTP, or with only MD5/SHA-1 | **reduced security**: the user is warned and may continue |
-| with no digest at all | **low security**: hidden and not installable unless the user turned on **Allow low security downloads** |
+| with no digest at all | **low security**: listed, and installing asks the user first, naming each such file (**Allow low security downloads** answers yes for every install) |
 
 **Reduced security mode** is the one switch for limits that are reasonable to lift for a source
 the user trusts: plugins reaching any host (`"network": {"hosts": ["*"]}`) or more than 10, and
@@ -135,7 +135,7 @@ These paths still name a source. Each is listed so it gets retired rather than f
 |---|---|---|
 | Modrinth single-file install (`resolver.rs`, `SourceType::Modrinth`) | Browse installs of Modrinth mods use the older Modrinth resolver, which reads dependency data from the downloaded jar | See *Modrinth's single-file install on the provider path* below: a follow-up, deliberately not part of the provider change. `ModrinthProvider::resolve` exists and is tested |
 | Modrinth modpacks (`.mrpack`) | Installed by the mrpack importer | A `.mrpack`'s file list is inside the archive, so a plan cannot be written without downloading it, which a provider must not do |
-| Technic pack install (`crate::technic`) | Still installs through its own importer | The rules now match (Solder warns, zip needs low security downloads); what remains is routing the button through `TechnicProvider::resolve` |
+| Technic pack install (`crate::technic`) | Still installs through its own importer | The rules now match (Solder warns, a zip asks before installing); what remains is routing the button through `TechnicProvider::resolve` |
 | `ModDetail.tsx` | The Modrinth and Technic project pages are their own components | Plugin providers use the generic `ProviderDetail` page; the official ones keep their richer pages for now |
 | Browse category picker | Offers Modrinth's category tags when Modrinth is on | Presentation only; providers can already declare their own filters |
 | Ranking (`browse_cache::ranking_input`) | Technic's likes use a different ceiling than follows | Calibration data, not behaviour |

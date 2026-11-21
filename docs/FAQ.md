@@ -6,7 +6,7 @@ Quick answers about the Agora desktop app, with links to more detail. If somethi
 
 ### What is Agora?
 
-Agora is a Minecraft launcher with a catalog of mods, packs, and more that the community curates. It keeps each modded setup separate, checks for problems before you launch, and helps you recover when something breaks.
+Agora is a mod manager for games, with a catalog of mods, packs, and more that the community curates. Minecraft is built in, and other games come as plugins; Skyrim Special Edition is the first. It keeps each modded setup separate, checks for problems before you launch, and helps you recover when something breaks.
 
 ### Is it free?
 
@@ -18,9 +18,9 @@ Windows is tested and signed. macOS and Linux builds are available, but they are
 
 ### I play Minecraft on my console/phone/through the Microsoft store, how do I get Agora to work with it?
 
-Agora is designed for Minecraft Java Edition, which is available on PC only. The console, phone, and Microsoft Store versions of Minecraft are freqently known as Minecraft Bedrock and do not support the same mods as Java Edition, hence why Agora only supports Java Edition.
+Agora is designed for Minecraft Java Edition, which is available on PC only. The console, phone, and Microsoft Store versions of Minecraft are frequently known as Minecraft Bedrock and do not support the same mods as Java Edition, hence why Agora's Minecraft support is Java Edition only.
 
-### Do I still need to own Minecraft?
+### Do I still need to own the game?
 
 Yes. Agora starts the game, but it doesn't give you a copy of it.
 
@@ -35,7 +35,7 @@ You can download mods and play without a GitHub account.
 
 ### What's an instance?
 
-An instance is a self-contained Minecraft setup with its own version, mod loader, and mods. You can have as many as you like, and a problem in one doesn't affect the others. See [Creating and managing instances](https://agoramc.com/docs/guides/instances).
+An instance is a self-contained setup of a game with its own mods, and for Minecraft its own version and mod loader. You can have as many as you like, and a problem in one doesn't affect the others. See [Creating and managing instances](https://agoramc.com/docs/guides/instances).
 
 ### What's the difference between delegated and direct launch?
 
@@ -67,6 +67,36 @@ Enough for the pack, while leaving a few gigabytes for everything else on your c
 
 No, not with Java set to Automatic in Settings. Agora uses a suitable Java on your computer or downloads one just for itself.
 
+## Other games
+
+### Which games can Agora manage?
+
+Minecraft is built in. Other games come as plugins, and Skyrim Special Edition is the first official one. Skyrim is built on a shared Creation Engine base plugin (`agora.creation-engine`): installing Skyrim installs that base too, and the install prompt lists it. Community plugins can add other games too, though that plugin format is still experimental.
+
+### How do I add a game?
+
+On Home, find the **More games** card and select **Install** next to the game. If you dismissed the card, the same card is in Settings > Game support. Read what the plugin asks for, approve it, then choose **Restart now** when Agora asks. Agora looks for the game in Steam, GOG, the Epic Games Store and the Microsoft Store. If it doesn't find your copy, use **Add game folder** in Settings > Game support. A game plugin can build on another, shared plugin: Skyrim's builds on the Creation Engine base plugin, and installing Skyrim installs that base too. The install prompt lists everything it will add. You can install Skyrim without letting the Creation Engine plugin run code, but Sort, masterlist updates and the plugin list's checks won't work until you allow its code in Settings > Plugins.
+
+### Can I bring my Mod Organizer 2 setup?
+
+Yes. On the game's Instances page, choose **Import instances**, pick a setup and a profile, use **Preview the import** to see what will happen, then choose **Import profile**. Agora only reads your Mod Organizer 2 setup: every mod is stored as it is on disk, and the profile's load order and locks are kept on the new instance.
+
+### Why does a mod say "Get from nexusmods.com"?
+
+Some catalog entries cannot be downloaded by Agora itself. **Get from nexusmods.com** opens a dialog; choose **Open page** to open the mod's page in your browser. Download the file there with the page's own download button, then choose it back in Agora with **Choose file…**. Agora copies the file into your library and never moves or changes the original. These mods show **Updates unknown** because Agora cannot check their page for a newer version.
+
+### Does Agora sort my load order?
+
+Yes, for games that keep a plugin list such as Skyrim. On the instance's **Plugins** tab, choose **Sort…**; Agora shows the moves first and writes nothing until you choose **Apply**. Sorting uses LOOT's masterlist when one has been saved, so choose **Update masterlist** first. Locked and always-loaded plugins stay where they are.
+
+### Does the Crash Doctor work for other games?
+
+Yes. A game's plugin can bring crash rules, and Agora runs the same local analysis it uses for Minecraft. It never says a mod is certainly the cause: it says how sure it is ("possible", "likely" or "very likely") and names the plugin behind each finding. If you have a crash file from somewhere else, the CLI can read it too: `agora crash analyze <FILE> --instance <ID>`. See [When the game crashes](https://agoramc.com/docs/guides/crash-recovery).
+
+### Can the community add games?
+
+Yes. A game is a plugin, and anyone can write one with Agora's game package format. See [Adding a game to Agora](./plugins/game-packages.md). Official plugins are the ones Agora's signed catalog vouches for; community plugins get no special access, and you approve what each one may do when you install it.
+
 ## Your data
 
 ### Does Agora track me?
@@ -97,7 +127,7 @@ Yes. Press a button on a connected controller and Agora adapts to it. Minecraft 
 
 ### Can I play offline?
 
-Yes, once an instance has everything it needs. Get ready while you are online, because each instance needs its own files. See [Privacy and offline use](https://agoramc.com/docs/guides/privacy-offline).
+Yes, once an instance has everything it needs and you have signed in to a Microsoft account at least once. Get ready while you are online, because each instance needs its own files. If Agora cannot reach Microsoft, it starts the game with your saved profile and says you are playing offline: single-player works, but online servers and Realms will not accept the session. See [Privacy and offline use](https://agoramc.com/docs/guides/privacy-offline).
 
 ### Can an AI assistant help me fix my game?
 

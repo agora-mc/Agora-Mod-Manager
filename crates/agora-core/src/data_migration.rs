@@ -31,6 +31,8 @@ pub struct MigrationInventory {
     pub has_local_state_db: bool,
     /// Whether a `registry.db` exists at the source.
     pub has_registry_db: bool,
+    /// Whether a signed `registry.bundle` exists at the source.
+    pub has_registry_bundle: bool,
     /// Instance IDs found at the source.
     pub instance_ids: Vec<String>,
 }
@@ -101,6 +103,7 @@ impl DataMigrationService {
         let mut total_size_bytes: u64 = 0;
         let mut has_local_state_db = false;
         let mut has_registry_db = false;
+        let mut has_registry_bundle = false;
         let mut instance_ids = Vec::new();
 
         Self::walk_dir(
@@ -127,6 +130,9 @@ impl DataMigrationService {
                 if rp == "registry.db" {
                     has_registry_db = true;
                 }
+                if rp == "registry.bundle" {
+                    has_registry_bundle = true;
+                }
                 // Detect instances: files under instances/<id>/...
                 if let Some(rest) = rp.strip_prefix("instances/") {
                     if let Some(instance_id) = rest.split('/').next() {
@@ -148,6 +154,7 @@ impl DataMigrationService {
             total_size_bytes,
             has_local_state_db,
             has_registry_db,
+            has_registry_bundle,
             instance_ids,
         })
     }
@@ -194,7 +201,7 @@ impl DataMigrationService {
         let resolved_source = Self::resolve_path(source_root)?;
 
         // Phase 1: Create a timestamped backup of the current destination state.
-        let backup_dir = self.create_backup()?;
+        let backup_dir = self.create_backup(&plan.source_inventory)?;
 
         // Phase 2: Stage copies on the same volume, then promote.
         let result = self.stage_and_promote(&resolved_source, &plan.source_inventory);
@@ -233,6 +240,7 @@ impl DataMigrationService {
         // SQLite databases: no silent merge.
         let dest_local_state_db = self.dest.local_state_db();
         let dest_registry_db = self.dest.registry_db();
+        let dest_registry_bundle = self.dest.registry_bundle();
 
         if inventory.has_local_state_db && dest_local_state_db.exists() {
             conflicts.push(MigrationConflict {
@@ -248,6 +256,12 @@ impl DataMigrationService {
                 reason:
                     "Destination already has a registry.db. No silent merge of SQLite databases."
                         .into(),
+            });
+        }
+        if inventory.has_registry_bundle && dest_registry_bundle.exists() {
+            conflicts.push(MigrationConflict {
+                rel_path: "registry.bundle".into(),
+                reason: "Destination already has a signed registry bundle. No silent merge.".into(),
             });
         }
 
@@ -270,10 +284,11 @@ impl DataMigrationService {
 
     /// Create a timestamped backup of existing destination state.
     ///
-    /// Copies `local_state.db`, `registry.db`, `registry.db.sig`, and the
-    /// `instances/` directory to a `migration-backups/<timestamp>/` dir
-    /// under the staging root.
-    fn create_backup(&self) -> LauncherResult<PathBuf> {
+    /// Copies `local_state.db`, the signed catalog bundle, the readable
+    /// `registry.db`, and the `instances/` directory to a
+    /// `migration-backups/<timestamp>/` dir under the staging root. Any other destination file the
+    /// migration will overwrite is copied too, so a failed promotion can put every file back.
+    fn create_backup(&self, inventory: &MigrationInventory) -> LauncherResult<PathBuf> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -293,7 +308,8 @@ impl DataMigrationService {
         let files_to_backup = [
             self.dest.local_state_db(),
             self.dest.registry_db(),
-            self.dest.registry_signature(),
+            self.dest.registry_bundle(),
+            self.dest.registry_bundle_previous(),
         ];
         for path in &files_to_backup {
             if path.exists() {
@@ -321,6 +337,35 @@ impl DataMigrationService {
                     message: format!(
                         "Failed to back up instances directory {}: {e}",
                         instances_root.display()
+                    ),
+                });
+            }
+        }
+
+        // Every other destination file the promotion will overwrite, kept with its relative path
+        // so restore can put it back exactly.
+        for entry in &inventory.files {
+            if entry.rel_path.starts_with("instances/")
+                || matches!(
+                    entry.rel_path.as_str(),
+                    "local_state.db" | "registry.db" | "registry.bundle" | "registry.bundle.prev"
+                )
+            {
+                continue;
+            }
+            let destination = self.dest.root().join(Path::new(&entry.rel_path));
+            if !destination.is_file() {
+                continue;
+            }
+            let target = backup_root
+                .join("overwritten")
+                .join(Path::new(&entry.rel_path));
+            if let Err(e) = copy_file_same_volume(&destination, &target) {
+                let _ = std::fs::remove_dir_all(&backup_root);
+                return Err(LauncherError::MigrationFailed {
+                    message: format!(
+                        "Failed to back up {} before overwriting it: {e}",
+                        destination.display()
                     ),
                 });
             }
@@ -428,7 +473,12 @@ impl DataMigrationService {
     /// Restore destination state from a backup directory.
     fn restore_backup(&self, backup_dir: &Path) -> LauncherResult<()> {
         // Restore top-level files.
-        let files_to_restore = ["local_state.db", "registry.db", "registry.db.sig"];
+        let files_to_restore = [
+            "local_state.db",
+            "registry.db",
+            "registry.bundle",
+            "registry.bundle.prev",
+        ];
         for filename in &files_to_restore {
             let backup_file = backup_dir.join(filename);
             let dest_file = self.dest.root().join(filename);
@@ -454,6 +504,37 @@ impl DataMigrationService {
                 })?;
             }
             copy_dir_same_volume(&backup_instances, &dest_instances)?;
+        }
+
+        // Restore the other files the promotion overwrote, by their relative paths.
+        let overwritten = backup_dir.join("overwritten");
+        if overwritten.exists() {
+            let mut folders = vec![overwritten.clone()];
+            while let Some(folder) = folders.pop() {
+                for entry in
+                    std::fs::read_dir(&folder).map_err(|e| LauncherError::MigrationFailed {
+                        message: format!(
+                            "Failed to read backup folder {} during restore: {e}",
+                            folder.display()
+                        ),
+                    })?
+                {
+                    let entry = entry.map_err(|e| LauncherError::MigrationFailed {
+                        message: format!(
+                            "Failed to read a backup entry in {} during restore: {e}",
+                            folder.display()
+                        ),
+                    })?;
+                    let path = entry.path();
+                    if path.is_dir() {
+                        folders.push(path);
+                    } else if path.is_file() {
+                        let rel = path.strip_prefix(&overwritten).unwrap_or(&path);
+                        let destination = self.dest.root().join(rel);
+                        copy_file_same_volume(&path, &destination)?;
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -665,12 +746,13 @@ pub fn inventory_legacy_root(source_root: &Path) -> LauncherResult<MigrationInve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_root::RemoveOnDrop;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn unique_dir() -> PathBuf {
+    fn unique_dir() -> RemoveOnDrop {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let seq = NEXT.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
@@ -679,7 +761,7 @@ mod tests {
             seq
         ));
         let _ = fs::remove_dir_all(&dir);
-        dir
+        RemoveOnDrop::new(dir)
     }
 
     fn make_service(dest_root: &Path) -> DataMigrationService {
@@ -1097,5 +1179,37 @@ mod tests {
         // Second execution should also succeed (no-op).
         let result = svc.execute(&src).unwrap();
         assert_eq!(result.files_migrated, 0);
+    }
+
+    #[test]
+    fn a_colliding_file_that_is_not_a_database_is_backed_up_before_it_is_overwritten() {
+        let src = unique_dir();
+        fs::create_dir_all(src.join("cache")).unwrap();
+        fs::write(src.join("settings.json"), b"new settings").unwrap();
+        fs::write(src.join("cache/data.bin"), b"new cache").unwrap();
+        let dst = unique_dir();
+        let svc = make_service(&dst);
+        fs::write(dst.join("settings.json"), b"old settings").unwrap();
+        fs::create_dir_all(dst.join("cache")).unwrap();
+        fs::write(dst.join("cache/data.bin"), b"old cache").unwrap();
+
+        let result = svc.execute(&src).unwrap();
+        assert_eq!(
+            std::fs::read(dst.join("settings.json")).unwrap(),
+            b"new settings"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("cache/data.bin")).unwrap(),
+            b"new cache"
+        );
+        let backup = std::path::Path::new(&result.backup_path);
+        assert_eq!(
+            std::fs::read(backup.join("overwritten/settings.json")).unwrap(),
+            b"old settings"
+        );
+        assert_eq!(
+            std::fs::read(backup.join("overwritten/cache/data.bin")).unwrap(),
+            b"old cache"
+        );
     }
 }

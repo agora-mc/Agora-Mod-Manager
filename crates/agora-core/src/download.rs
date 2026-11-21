@@ -1,6 +1,5 @@
 use crate::error::{LauncherError, LauncherResult};
 use crate::http_client::{self, ClientCategory, HttpClients};
-use crate::loader_manifests;
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::{Sha256, Sha512};
 
@@ -235,96 +234,32 @@ pub async fn download_mod_bytes_standalone(url: &str) -> LauncherResult<Vec<u8>>
 /// Fabric rewrites `time`/`releaseTime` on every request, so the raw response hash
 /// is unstable. This mirrors `_stable_json_sha256` in `scripts/fetch_loader_manifests.py`.
 pub fn stable_json_sha256(data: &[u8]) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(data).ok()?;
-    let mut obj = value;
+    fn sort_keys(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut entries: Vec<_> = map
+                    .iter()
+                    .map(|(key, value)| (key.clone(), sort_keys(value)))
+                    .collect();
+                entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+                serde_json::Value::Object(entries.into_iter().collect())
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(sort_keys).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    let mut obj: serde_json::Value = serde_json::from_slice(data).ok()?;
     if let serde_json::Value::Object(map) = &mut obj {
         map.remove("time");
         map.remove("releaseTime");
     }
-    let serialized = serde_json::to_string(&obj).ok()?;
+    let serialized = serde_json::to_string(&sort_keys(&obj)).ok()?;
     let mut hasher = Sha256::new();
     hasher.update(serialized.as_bytes());
     Some(hex::encode(hasher.finalize()))
-}
-
-/// Compute the expected hash for a loader file. Profile JSONs (Fabric/Quilt)
-/// use the stable normalized hash; installer jars use the raw hash.
-pub fn compute_loader_hash(loader: &str, _file_name: &str, file_type: &str, data: &[u8]) -> String {
-    if file_type == "profile_json" && (loader == "fabric" || loader == "quilt") {
-        if let Some(stable) = stable_json_sha256(data) {
-            return stable;
-        }
-    }
-    sha256_hex(data)
-}
-
-/// Download bytes from a URL using a redirect-safe client.
-///
-/// Redirects are only followed when the target host is on the embedded loader
-/// domain allowlist, preventing SSRF via compromised/malicious pinned hosts.
-pub async fn download_bytes(url: &str) -> LauncherResult<Vec<u8>> {
-    loader_manifests::ensure_allowed_domain(url).inspect_err(|_error| {
-        eprintln!(
-            "[loader-download] rejected stage=initial-allowlist url={}",
-            crate::network::sanitized_url_for_log(url)
-        );
-    })?;
-    let clients = HttpClients::new()?;
-    http_client::checked_get_bytes(&clients, ClientCategory::Loader, url).await
-}
-
-/// Download bytes through an already initialized category-aware client set.
-pub async fn download_bytes_with_clients(
-    clients: &HttpClients,
-    url: &str,
-) -> LauncherResult<Vec<u8>> {
-    loader_manifests::ensure_allowed_domain(url).inspect_err(|_error| {
-        eprintln!(
-            "[loader-download] rejected stage=initial-allowlist url={}",
-            crate::network::sanitized_url_for_log(url)
-        );
-    })?;
-    http_client::checked_get_bytes(clients, ClientCategory::Loader, url).await
-}
-
-/// Download a loader file and verify its hash against the pinned value.
-pub async fn download_verified(
-    loader: &str,
-    file_name: &str,
-    file_type: &str,
-    url: &str,
-    expected_sha: &str,
-) -> LauncherResult<Vec<u8>> {
-    loader_manifests::ensure_allowed_domain(url).inspect_err(|_error| {
-        eprintln!(
-            "[loader-download] rejected stage=verified-initial loader={loader} file={file_name} url={}",
-            crate::network::sanitized_url_for_log(url)
-        );
-    })?;
-    let data = download_bytes(url).await?;
-    let actual = compute_loader_hash(loader, file_name, file_type, &data);
-
-    if actual != loader_manifests::strip_sha_prefix(expected_sha) {
-        return Err(LauncherError::HashMismatch);
-    }
-    Ok(data)
-}
-
-/// Download and verify a pinned loader file with shared core clients.
-pub async fn download_verified_with_clients(
-    clients: &HttpClients,
-    loader: &str,
-    file_name: &str,
-    file_type: &str,
-    url: &str,
-    expected_sha: &str,
-) -> LauncherResult<Vec<u8>> {
-    let data = download_bytes_with_clients(clients, url).await?;
-    let actual = compute_loader_hash(loader, file_name, file_type, &data);
-    if actual != loader_manifests::strip_sha_prefix(expected_sha) {
-        return Err(LauncherError::HashMismatch);
-    }
-    Ok(data)
 }
 
 #[cfg(test)]
@@ -340,6 +275,13 @@ mod tests {
         let hash1 = stable_json_sha256(input1).unwrap();
         let hash2 = stable_json_sha256(input2).unwrap();
         assert_eq!(hash1, hash2, "reordering keys must produce the same hash");
+    }
+
+    #[test]
+    fn stable_json_sha256_sorts_nested_keys_and_keeps_unicode() {
+        let input = "{\"z\":9,\"time\":\"2024-01-01T00:00:00Z\",\"nested\":{\"beta\":2,\"alpha\":1,\"time\":\"keep-me\"},\"a\":[{\"y\":\"café\",\"x\":true}],\"releaseTime\":\"2024-01-01T00:00:00Z\"}";
+        let expected = "33b6f37c928bc4c64fcd08ca37c641fc92bd1d35b28508fb688dd474d72d7679";
+        assert_eq!(stable_json_sha256(input.as_bytes()).unwrap(), expected);
     }
 
     #[test]

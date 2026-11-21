@@ -1,0 +1,235 @@
+import { test, expect, type Page } from '@playwright/test';
+import { setSwitch } from './support/switches';
+import { expectNoUnmockedCommands, installGamesMock, storedSetting } from './support/games-mock';
+
+/**
+ * The multi-game shell (MASTER_SPEC §26.14): the header switcher, the per-game tabs, and the
+ * choice that is remembered. Every command these tests reach is answered from the table in
+ * `support/games-mock.ts`; anything else fails the test.
+ */
+
+// Living Background is on by default (ambience is enabled until the user turns it off).
+const MINECRAFT_NAV = [
+  'Home',
+  'Browse',
+  'Library',
+  'My Instances',
+  'Community Governance',
+  'Help & Guide',
+  'Field Guide',
+  'Living Background',
+  'The Agora Difference',
+  'Settings',
+];
+// One sidebar for every game: the same entries, and none of the game's own.
+const GAME_NAV = [
+  'Home',
+  'Browse',
+  'Library',
+  'My Instances',
+  'Community Governance',
+  'Help & Guide',
+  'Field Guide',
+  'Living Background',
+  'The Agora Difference',
+  'Settings',
+];
+
+const skyrimInstall = {
+  installId: 'steam-489830',
+  store: 'steam',
+  name: 'Skyrim Special Edition',
+  location: 'D:/Games/Skyrim Special Edition',
+  storeVersion: '1.6.1170',
+  storeBuild: null,
+  addOnCount: 0,
+  installBytes: null,
+  runtime: {
+    status: 'identified',
+    runtime: { game: 'skyrim-se', store: 'steam', version: '1.6.1170', build: null },
+    source: 'executable',
+  },
+};
+
+const skyrim = {
+  gameId: 'skyrim-se',
+  name: 'Skyrim Special Edition',
+  installs: [skyrimInstall],
+};
+
+/** The boot commands the shell answers with empty data. Shared by every test here. */
+const BOOT_REPLIES = {
+  get_windows_accent_color: null,
+  get_registry_status: { has_cached_db: false, checked: true, message: 'Missing' },
+  check_registry_update: { has_cached_db: false, checked: true, message: 'Missing' },
+  list_instances: [],
+  list_snapshots: [],
+  for_you_items: [],
+  query_launch_state: [],
+  check_all_instance_health: [],
+  take_pending_cli_launch: null,
+  get_governance_config: null,
+  plugins_emergency_stop: true,
+  list_plugins: [],
+  list_plugin_contributions: [],
+  get_connectivity_status: { state: 'unknown', last_outcome_at: null },
+  list_recent_play: [],
+  games_instance_list: { instances: [] },
+};
+
+async function boot(page: Page, games: unknown, settings: Record<string, unknown> = {}) {
+  await installGamesMock(page, {
+    replies: { ...BOOT_REPLIES, games_list: games },
+    settings,
+  });
+}
+
+function sidebarNav(page: Page) {
+  return page.getByRole('navigation', { name: 'Main navigation' });
+}
+
+async function navLabels(page: Page): Promise<string[]> {
+  return (await sidebarNav(page).getByRole('button').allTextContents()).map((text) => text.trim());
+}
+
+test.afterEach(async ({ page }) => {
+  await expectNoUnmockedCommands(page);
+});
+
+test('the switcher stays hidden and the Minecraft sidebar is unchanged with no other game', async ({ page }) => {
+  await boot(page, { games: [] });
+  await page.goto('/');
+
+  await expect(page.getByTestId('game-switcher')).toHaveCount(0);
+  await expect.poll(() => navLabels(page)).toEqual(MINECRAFT_NAV);
+});
+
+test('a discovery that fails to answer also keeps the switcher hidden', async ({ page }) => {
+  // `null` is a reply that is not a list of games; the shell must not read it as "none found" and
+  // must not offer anything either.
+  await boot(page, null);
+  await page.goto('/');
+
+  await expect(sidebarNav(page).getByRole('button', { name: 'Browse' })).toBeVisible();
+  await expect(page.getByTestId('game-switcher')).toHaveCount(0);
+});
+
+test('the switcher is shown once Skyrim is found, and lists Minecraft first', async ({ page }) => {
+  await boot(page, { games: [skyrim] });
+  await page.goto('/');
+
+  const switcher = page.getByTestId('game-switcher');
+  await expect(switcher).toBeVisible();
+  await switcher.getByRole('button', { name: 'Game: Minecraft. Choose a game' }).click();
+  const options = switcher.getByRole('group', { name: 'Games' }).getByRole('button');
+  await expect(options).toHaveText(['Minecraft', 'Skyrim SE']);
+});
+
+test('switching to Skyrim swaps the sidebar to its tabs and back again', async ({ page }) => {
+  await boot(page, { games: [skyrim] });
+  await page.goto('/');
+
+  await page.getByTestId('game-switcher').getByRole('button', { name: 'Game: Minecraft. Choose a game' }).click();
+  await page.getByRole('button', { name: 'Skyrim Special Edition', exact: true }).click();
+
+  await expect(page.getByTestId('game-switcher').getByRole('button', { name: /Game: Skyrim Special Edition/ })).toBeVisible();
+  await expect.poll(() => navLabels(page))
+    .toEqual(GAME_NAV);
+  // A game opens on its own Home, as Minecraft does.
+  await expect(page.getByTestId('game-home-welcome')).toContainText('No instances yet');
+
+  await page.getByTestId('game-switcher').getByRole('button', { name: /Game: Skyrim Special Edition/ }).click();
+  await page.getByTestId('game-switcher').getByRole('button', { name: 'Minecraft', exact: true }).click();
+
+  await expect.poll(() => navLabels(page))
+    .toEqual(MINECRAFT_NAV);
+  await expect(page.getByTestId('game-switcher').getByRole('button', { name: 'Game: Minecraft. Choose a game' })).toBeVisible();
+});
+
+test('the chosen game is still chosen after a reload, and after the app starts again', async ({ page }) => {
+  await boot(page, { games: [skyrim] });
+  await page.goto('/');
+
+  await page.getByTestId('game-switcher').getByRole('button', { name: 'Game: Minecraft. Choose a game' }).click();
+  await page.getByRole('button', { name: 'Skyrim Special Edition', exact: true }).click();
+  await expect.poll(() => navLabels(page))
+    .toEqual(GAME_NAV);
+
+  await page.reload();
+  await expect.poll(() => navLabels(page))
+    .toEqual(GAME_NAV);
+
+  // A fresh start is a navigation to the bare app address, which carries no history state. The app
+  // must open the game the user last chose, not Minecraft's Home.
+  await page.goto('/');
+  await expect.poll(() => navLabels(page))
+    .toEqual(GAME_NAV);
+});
+
+test('a remembered game that is no longer found opens Minecraft', async ({ page }) => {
+  await boot(page, { games: [] }, { active_game: 'skyrim-se' });
+  await page.goto('/');
+
+  await expect(sidebarNav(page).getByRole('button', { name: 'Browse' })).toBeVisible();
+  await expect(page.getByTestId('game-switcher')).toHaveCount(0);
+});
+
+test('a failed discovery shows Minecraft and keeps the chosen game for next time', async ({ page }) => {
+  await boot(page, null, { active_game: 'skyrim-se' });
+  await page.goto('/');
+
+  await expect.poll(() => navLabels(page)).toEqual(MINECRAFT_NAV);
+  await sidebarNav(page).getByRole('button', { name: 'Field Guide' }).click();
+  await expect(page.getByTestId('game-switcher')).toHaveCount(0);
+  expect(await storedSetting(page, 'active_game')).toBe('skyrim-se');
+});
+
+test('landing on the remembered game at startup does not add a history entry behind it', async ({ page }) => {
+  // A fresh start opens the game the user last chose. That landing replaces the start page: if it
+  // pushed an entry instead, Back from the game would step to Minecraft's Home and switch games.
+  await boot(page, { games: [skyrim] }, { active_game: 'skyrim-se' });
+  await page.goto('/');
+  await expect.poll(() => navLabels(page)).toEqual(GAME_NAV);
+
+  const entry = await page.evaluate(() => {
+    const state = window.history.state as { __agora?: { type?: string; gameId?: string }; __agoraDepth?: number } | null;
+    return { destination: state?.__agora, depth: state?.__agoraDepth };
+  });
+  expect(entry.destination).toMatchObject({ type: 'game-tab', gameId: 'skyrim-se' });
+  expect(entry.depth, 'the game page is the first entry the app owns').toBe(0);
+});
+
+test('turning off the game being viewed remembers Minecraft and says so once', async ({ page }) => {
+  const supportRows = [
+    { gameId: 'minecraft', name: 'Minecraft: Java Edition', source: { kind: 'builtIn' }, enabled: true, canDisable: false },
+    { gameId: 'skyrim-se', name: 'Skyrim Special Edition', source: { kind: 'builtIn' }, enabled: true, canDisable: true },
+  ];
+  await installGamesMock(page, {
+    replies: {
+      ...BOOT_REPLIES,
+      games_list: { games: [skyrim] },
+      games_support_list: supportRows,
+      // Settings reads these on the way to the Game support list.
+      games_base_list: { bases: [], damaged: [] },
+      is_portable_mode: false,
+      msa_get_status: null,
+      msa_list_accounts: [],
+      credential_storage_status: null,
+      get_auth_status: false,
+    },
+  });
+  await page.goto('/');
+
+  await page.getByTestId('game-switcher').getByRole('button', { name: 'Game: Minecraft. Choose a game' }).click();
+  await page.getByRole('button', { name: 'Skyrim Special Edition', exact: true }).click();
+  await sidebarNav(page).getByRole('button', { name: 'Settings' }).click();
+
+  await page.getByRole('tablist', { name: / pages$/ }).getByRole('tab', { name: 'Game support' }).click();
+  await setSwitch(page.getByRole('switch', { name: 'Offer Skyrim Special Edition' }), false);
+  await expect(page.getByRole('switch', { name: 'Offer Skyrim Special Edition' })).not.toBeChecked();
+
+  await expect.poll(() => navLabels(page)).toEqual(MINECRAFT_NAV);
+  await expect(page.getByRole('alert').filter({ hasText: 'Skyrim Special Edition is turned off, so Agora switched to Minecraft.' }))
+    .toBeVisible();
+  expect(await storedSetting(page, 'active_game')).toBe('minecraft');
+});

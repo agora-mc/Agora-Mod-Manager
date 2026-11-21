@@ -1,6 +1,6 @@
 # Nightly Compiler
 
-The nightly compiler reads the flat JSON manifests under `registry/` and `crash-signatures/` and compiles them into a signed SQLite database (`registry.db`) plus its Ed25519 signature (`registry.db.sig`).
+The nightly compiler reads the flat JSON manifests under `registry/` and `crash-signatures/` and compiles them into a signed SQLite database (`registry.db`). It wraps that database in `registry.bundle`, the one signed file the launcher installs, and still writes `registry.db.sig` for the web export.
 
 ## Local development
 

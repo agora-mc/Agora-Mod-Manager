@@ -39,11 +39,7 @@
 //! single-file install, Technic's consent tiers, mrpack import) they are
 //! listed in `docs/plugins/providers.md` as migration debt, not hidden.
 
-pub mod browse;
-pub mod install;
-pub mod modrinth;
 pub mod plugin;
-pub mod technic;
 
 use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
@@ -125,10 +121,24 @@ pub struct ProviderHit {
     pub native: Option<NativeHit>,
 }
 
-#[derive(Debug, Clone)]
-pub enum NativeHit {
-    Modrinth(crate::modrinth::ModrinthSearchResult),
-    Technic(crate::technic::TechnicSearchResult),
+#[derive(Clone)]
+pub struct NativeHit(pub std::sync::Arc<dyn std::any::Any + Send + Sync>);
+
+impl NativeHit {
+    pub fn new<T: std::any::Any + Send + Sync>(value: T) -> Self {
+        Self(std::sync::Arc::new(value))
+    }
+
+    /// The provider's own result, if it is a `T`.
+    pub fn downcast_ref<T: std::any::Any>(&self) -> Option<&T> {
+        self.0.downcast_ref::<T>()
+    }
+}
+
+impl std::fmt::Debug for NativeHit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NativeHit(..)")
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -168,10 +178,7 @@ impl ProviderRegistry {
     /// Agora's official providers plus every provider an enabled, granted
     /// plugin contributes.
     pub fn new(ctx: &Ctx, plugins: Option<&crate::plugins::PluginService>) -> Self {
-        let mut providers: Vec<Arc<dyn ContentProvider>> = vec![
-            Arc::new(modrinth::ModrinthProvider::new(ctx.clone())),
-            Arc::new(technic::TechnicProvider::new(ctx.clone())),
-        ];
+        let mut providers: Vec<Arc<dyn ContentProvider>> = ctx.games.builtin_providers(ctx);
         if let Some(service) = plugins {
             providers.extend(plugin::PluginProvider::discover(ctx, service));
         }
@@ -399,28 +406,27 @@ pub fn url_in_scope(url: &str, hosts: &[String]) -> bool {
 /// Validate a plan and decide whether the user's settings permit it.
 ///
 /// Refuses a malformed plan. Refuses a plan containing files with no
-/// integrity information unless the user has allowed low security downloads.
-/// Everything else is permitted, with any warnings returned for the review
-/// screen: reduced assurance is the user's call, not Agora's.
+/// integrity information unless the user confirmed this install
+/// (`allow_unverified`, from the per-install prompt or the CLI's
+/// `--allow-unverified`) or turned on low security downloads, which answers
+/// that prompt for every install. Everything else is permitted, with any
+/// warnings returned for the review screen: reduced assurance is the user's
+/// call, not Agora's.
 pub fn authorize_plan(
     ctx: &Ctx,
     plan: &InstallPlan,
     declared_hosts: &[String],
+    allow_unverified: bool,
 ) -> LauncherResult<PlanAuthorization> {
     plan.validate().map_err(|e| LauncherError::Generic {
         code: "ERR_PROVIDER_PLAN_INVALID".into(),
         message: e.message,
     })?;
     let authorization = judge_plan(plan, declared_hosts);
-    if authorization.is_low_security() && !low_security_allowed(ctx) {
-        let first = &authorization.low_security[0];
+    if authorization.is_low_security() && !allow_unverified && !low_security_allowed(ctx) {
         return Err(LauncherError::Generic {
-            code: "ERR_LOW_SECURITY_DISABLED".into(),
-            message: format!(
-                "This install includes a file with no integrity information ({}: {}). Turn on \
-                 Allow low security downloads in Settings to install it anyway.",
-                first.url_host, first.reason
-            ),
+            code: LOW_SECURITY_CONFIRMATION_CODE.into(),
+            message: low_security_message(&authorization.low_security),
         });
     }
     if let Some(first) = authorization.outside_content_folders.first() {
@@ -481,6 +487,36 @@ pub fn judge_plan(plan: &InstallPlan, declared_hosts: &[String]) -> PlanAuthoriz
     verdict
 }
 
+/// The error an install returns when it holds files with no integrity
+/// information and the user has not confirmed them. The desktop answers it
+/// with a prompt and retries with `allowUnverified`; the CLI names its flag.
+pub const LOW_SECURITY_CONFIRMATION_CODE: &str = "ERR_LOW_SECURITY_DISABLED";
+
+/// What the confirmation prompt says: how many files, and each one's host and
+/// reason, so the user knows what they are accepting.
+pub fn low_security_message(notes: &[SecurityNote]) -> String {
+    const SHOWN: usize = 5;
+    let mut hosts: Vec<String> = notes
+        .iter()
+        .take(SHOWN)
+        .map(|note| format!("{} ({})", note.url_host, note.reason))
+        .collect();
+    if notes.len() > SHOWN {
+        hosts.push(format!("and {} more", notes.len() - SHOWN));
+    }
+    let count = if notes.len() == 1 {
+        "a file".to_string()
+    } else {
+        format!("{} files", notes.len())
+    };
+    format!(
+        "This install includes {count} with no integrity information, so Agora cannot tell \
+         whether they were changed on the way: {}. Install anyway only if you trust the \
+         source.",
+        hosts.join(", ")
+    )
+}
+
 /// Whether the user allows content with no integrity information.
 pub fn low_security_allowed(ctx: &Ctx) -> bool {
     crate::settings::SettingsService::new(ctx.clone())
@@ -538,7 +574,7 @@ pub fn verify_planned(
 }
 
 /// Lockdown and plugin-network state, as a reason a provider cannot be used.
-pub(crate) fn network_unavailable_reason(ctx: &Ctx, setting: Option<&str>) -> Option<String> {
+pub fn network_unavailable_reason(ctx: &Ctx, setting: Option<&str>) -> Option<String> {
     let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).ok()?;
     if crate::db::is_lockdown_enabled(&conn) {
         return Some("Privacy Lockdown Mode is on.".into());

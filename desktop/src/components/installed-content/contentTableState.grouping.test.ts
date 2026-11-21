@@ -20,6 +20,7 @@ function row(overrides: Partial<InstalledContentRow> & { filename: string }): In
     loader_mod_id: null,
     size_bytes: 0,
     file_present: true,
+    file_state: 'ok',
     resolved_path: null,
     author: null,
     categories: [],

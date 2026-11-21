@@ -7,7 +7,7 @@ box. Nobody reviews it, nobody can take it down, and nothing here phones home.
 That freedom is the point, and it is also why the trust model below is narrower than it might
 first appear. Read that section before you decide to rely on it.
 
-> **Status:** API 0.1 is experimental and both plugin switches ship off. See
+> **Status:** API 0.1 is experimental. A plugin's code runs only if the user allowed it at install, and network access ships off. See
 > [implementation-status.md](implementation-status.md) for what is actually built and what is not.
 
 ## The short version

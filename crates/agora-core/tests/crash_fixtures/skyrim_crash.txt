@@ -1,0 +1,9 @@
+Unhandled exception 0xC0000005 (Crash Logger 1.2)
+Process ID: 4242
+Exception: EXAMPLE_ACCESS_VIOLATION (access_violation, read, non_canonical) at 0xFFFFFFFFFFFFFFFF
+Image: SkyrimSE.exe 1.6.9999
+Frame 0: 0x0123450 SkyrimSE.exe addrlib-ae 10001 +8 exec_top
+Frame 1: 0x0456780 SkyrimSE.exe addrlib-ae 10002 +16 exec
+Frame 2: 0x00ABCD0 ExamplePhysics.dll exec
+Module: ExamplePhysics.dll version 2.0.0 base 0x7FF600000000
+Object: ExampleTriShape* ExampleHairStrand at R13 -> meshes/example/hair.nif

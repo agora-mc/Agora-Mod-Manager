@@ -1,4 +1,5 @@
 import { useId, type ComponentType, type ReactNode } from 'react';
+import type { SettingsCardId } from './gameScope';
 
 /**
  * One settings card. Every card in the redesigned settings page uses this so
@@ -11,6 +12,7 @@ import { useId, type ComponentType, type ReactNode } from 'react';
  * section rather than to a header fragment.
  */
 export function SettingsSection({
+  card,
   id,
   icon: Icon,
   title,
@@ -21,6 +23,8 @@ export function SettingsSection({
   children,
   ...rest
 }: {
+  /** Which games this card belongs to; see `SETTINGS_CARD_AUDIENCE`. */
+  card: SettingsCardId;
   id?: string;
   icon?: ComponentType<{ className?: string }>;
   title: string;
@@ -38,6 +42,7 @@ export function SettingsSection({
   return (
     <section
       id={id}
+      data-settings-card={card}
       aria-labelledby={headingId}
       className={`settings-card scroll-mt-24 rounded-xl border border-border bg-card p-4 ${className}`}
       {...rest}

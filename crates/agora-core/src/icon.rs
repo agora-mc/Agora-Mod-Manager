@@ -103,11 +103,72 @@ fn copy_icon(
 ) -> LauncherResult<String> {
     let (bytes, extension, _) = read_icon_source(source_path)?;
     let destination = destination.with_extension(extension);
-    if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| icon_error(error.to_string()))?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| icon_error("The icon has no folder to be kept in."))?;
+    refuse_link_chain(instance_dir, parent)?;
+    if is_link_or_reparse(&destination) {
+        return Err(icon_error(
+            "An existing icon in this instance is a link; Agora will not write through it.",
+        ));
     }
+    // An icon of another type left in place would still be a way to write outside the instance.
+    if destination.file_stem().and_then(|stem| stem.to_str()) == Some("instance-icon") {
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with("instance-icon.")
+                    && is_link_or_reparse(&entry.path())
+                {
+                    return Err(icon_error(
+                        "An existing icon in this instance is a link; Agora will not write next to it.",
+                    ));
+                }
+            }
+        }
+    }
+    std::fs::create_dir_all(parent).map_err(|error| icon_error(error.to_string()))?;
     std::fs::write(&destination, bytes).map_err(|error| icon_error(error.to_string()))?;
     relative_icon_path(&destination, instance_dir)
+}
+
+/// Whether `path` is a symlink, junction, or any other Windows reparse point. Checked with
+/// `symlink_metadata`, so a link is seen as itself rather than followed.
+fn is_link_or_reparse(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // FILE_ATTRIBUTE_REPARSE_POINT covers junctions and mount points too.
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Refuse when any folder between `instance_dir` and `parent` is a link, since creating or writing
+/// in it would put the file outside the instance.
+fn refuse_link_chain(instance_dir: &Path, parent: &Path) -> LauncherResult<()> {
+    let mut current = parent;
+    while current != instance_dir && current.starts_with(instance_dir) {
+        if is_link_or_reparse(current) {
+            return Err(icon_error(
+                "This instance's icon folder is a link; Agora will not write through it.",
+            ));
+        }
+        match current.parent() {
+            Some(next) => current = next,
+            None => break,
+        }
+    }
+    Ok(())
 }
 
 fn remove_stored_icon(instance_dir: &Path, relative: Option<&str>) {
@@ -258,4 +319,192 @@ pub fn get_custom_icon(
         return Ok(None);
     };
     Ok(Some(data_url(&path)?))
+}
+
+/// Where a game instance's own image is kept, inside the instance's Agora-owned folder. The same
+/// place a Minecraft instance keeps its image; the file's extension says its type.
+const GAME_INSTANCE_ICON_STEM: &str = ".agora/instance-icon";
+/// The extensions `extension_and_mime` stores, in the order a lookup tries them.
+const STORED_ICON_EXTENSIONS: &[&str] = &["png", "jpg", "webp", "gif"];
+
+/// The folder of a game instance (not a Minecraft one), checked to exist.
+fn game_instance_dir(ctx: &Ctx, instance_id: &str) -> LauncherResult<PathBuf> {
+    validate_path_component(instance_id)?;
+    crate::game_instance::get_manifest(ctx, instance_id)
+        .map_err(|_| icon_error("Instance not found."))?;
+    ctx.paths.instance_dir(instance_id)
+}
+
+/// Copy a user-selected image in as a game instance's image, with the same type and size limits
+/// as a Minecraft instance's. Returns it as a data URL. Any earlier image of another type goes.
+pub fn set_game_instance_icon(
+    ctx: &Ctx,
+    instance_id: &str,
+    source_path: &Path,
+) -> LauncherResult<String> {
+    let instance_dir = game_instance_dir(ctx, instance_id)?;
+    let stem = instance_dir.join(GAME_INSTANCE_ICON_STEM);
+    let relative = copy_icon(source_path, &instance_dir, &stem)?;
+    let stored = instance_dir.join(&relative);
+    for extension in STORED_ICON_EXTENSIONS {
+        let other = stem.with_extension(extension);
+        if other != stored {
+            let _ = std::fs::remove_file(other);
+        }
+    }
+    data_url(&stored)
+}
+
+/// A game instance's image as a data URL, or `None` when the player has not set one.
+pub fn get_game_instance_icon(ctx: &Ctx, instance_id: &str) -> LauncherResult<Option<String>> {
+    let instance_dir = game_instance_dir(ctx, instance_id)?;
+    let stem = instance_dir.join(GAME_INSTANCE_ICON_STEM);
+    for extension in STORED_ICON_EXTENSIONS {
+        let candidate = stem.with_extension(extension);
+        if candidate.is_file() {
+            return Ok(Some(data_url(&candidate)?));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod game_instance_icon_tests {
+    use super::*;
+    use crate::game_instance::GameInstanceManifest;
+    use agora_game_api::{BaseReference, GameId, InstallId};
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nrest";
+    const GIF: &[u8] = b"GIF89a-rest";
+
+    fn context(tmp: &tempfile::TempDir) -> Ctx {
+        Ctx::for_testing(tmp.path().join("app_data"))
+    }
+
+    fn make_instance(ctx: &Ctx, instance_id: &str) {
+        let dir = ctx.paths.instance_dir(instance_id).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = GameInstanceManifest::new(
+            GameId::new("test-game").unwrap(),
+            instance_id,
+            instance_id,
+            None,
+            BaseReference::Unpinned {
+                install: InstallId::new("steam:1").unwrap(),
+                reason: "test".into(),
+            },
+        );
+        std::fs::write(
+            dir.join("instance_manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn source(tmp: &tempfile::TempDir, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn an_instance_without_an_image_has_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = context(&tmp);
+        make_instance(&ctx, "grounded");
+        assert_eq!(get_game_instance_icon(&ctx, "grounded").unwrap(), None);
+    }
+
+    #[test]
+    fn a_set_image_is_kept_in_the_instance_folder_and_read_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = context(&tmp);
+        make_instance(&ctx, "grounded");
+        let url = set_game_instance_icon(&ctx, "grounded", &source(&tmp, "a.png", PNG)).unwrap();
+        assert!(url.starts_with("data:image/png;base64,"));
+        let dir = ctx.paths.instance_dir("grounded").unwrap();
+        assert!(dir.join(".agora/instance-icon.png").is_file());
+        assert_eq!(get_game_instance_icon(&ctx, "grounded").unwrap(), Some(url));
+    }
+
+    #[test]
+    fn a_new_image_of_another_type_replaces_the_old_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = context(&tmp);
+        make_instance(&ctx, "grounded");
+        set_game_instance_icon(&ctx, "grounded", &source(&tmp, "a.png", PNG)).unwrap();
+        let url = set_game_instance_icon(&ctx, "grounded", &source(&tmp, "b.gif", GIF)).unwrap();
+        let dir = ctx.paths.instance_dir("grounded").unwrap();
+        assert!(!dir.join(".agora/instance-icon.png").exists());
+        assert!(url.starts_with("data:image/gif;base64,"));
+        assert_eq!(get_game_instance_icon(&ctx, "grounded").unwrap(), Some(url));
+    }
+
+    #[test]
+    fn the_minecraft_rules_refuse_a_file_that_is_not_its_stated_image_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = context(&tmp);
+        make_instance(&ctx, "grounded");
+        let error =
+            set_game_instance_icon(&ctx, "grounded", &source(&tmp, "fake.png", b"not a png"))
+                .unwrap_err();
+        assert!(error.to_string().contains("not a valid image"));
+        let error =
+            set_game_instance_icon(&ctx, "grounded", &source(&tmp, "a.bmp", PNG)).unwrap_err();
+        assert!(error.to_string().contains("PNG, JPEG, WebP, or GIF"));
+        assert_eq!(get_game_instance_icon(&ctx, "grounded").unwrap(), None);
+    }
+
+    #[test]
+    fn an_unknown_or_unsafe_instance_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = context(&tmp);
+        assert!(get_game_instance_icon(&ctx, "missing").is_err());
+        assert!(get_game_instance_icon(&ctx, "../escape").is_err());
+        assert!(set_game_instance_icon(&ctx, "missing", &source(&tmp, "a.png", PNG)).is_err());
+    }
+
+    // A junction needs no administrator rights on Windows, so it is the realistic way the icon
+    // folder can already be a link.
+    #[cfg(windows)]
+    #[test]
+    fn an_icon_folder_that_is_a_junction_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = context(&tmp);
+        make_instance(&ctx, "grounded");
+        let dir = ctx.paths.instance_dir("grounded").unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        junction::create(&outside, dir.join(".agora")).unwrap();
+
+        let error =
+            set_game_instance_icon(&ctx, "grounded", &source(&tmp, "a.png", PNG)).unwrap_err();
+        assert!(error.to_string().contains("link"), "{error}");
+        assert!(
+            !outside.join("instance-icon.png").exists(),
+            "nothing is written outside the instance"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_existing_icon_that_is_a_junction_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = context(&tmp);
+        make_instance(&ctx, "grounded");
+        let dir = ctx.paths.instance_dir("grounded").unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(dir.join(".agora")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // An icon of another type, so the new PNG's own path is not the link.
+        junction::create(&outside, dir.join(".agora/instance-icon.jpg")).unwrap();
+
+        let error =
+            set_game_instance_icon(&ctx, "grounded", &source(&tmp, "a.png", PNG)).unwrap_err();
+        assert!(error.to_string().contains("link"), "{error}");
+        assert!(
+            !dir.join(".agora/instance-icon.png").exists(),
+            "nothing is written beside the link"
+        );
+    }
 }

@@ -138,6 +138,17 @@ pub struct CollectedEvidence {
     pub failure_category: FailureCategory,
 }
 
+/// One automatic evidence file a caller already found, in the order it should be considered.
+/// Another search (a crash pack's `sources`) supplies these; [`CrashEvidenceService`] applies the
+/// same reading, truncation, staleness and categorization rules to them as to its own candidates.
+#[derive(Debug, Clone)]
+pub struct EvidenceCandidate {
+    pub path: PathBuf,
+    pub kind: EvidenceSourceKind,
+    pub supplementary: bool,
+    pub modified_at: SystemTime,
+}
+
 // ---------------------------------------------------------------------------
 // CrashEvidenceService
 // ---------------------------------------------------------------------------
@@ -202,16 +213,9 @@ impl CrashEvidenceService {
         // 1. Discover automatic sources and select the newest useful source as
         // the primary. Older automatic files are included only when they are
         // plausibly from the same launch window.
-        struct Candidate {
-            path: PathBuf,
-            kind: EvidenceSourceKind,
-            supplementary: bool,
-            modified_at: SystemTime,
-        }
-
-        let mut automatic: Vec<Candidate> = Vec::new();
+        let mut automatic: Vec<EvidenceCandidate> = Vec::new();
         if let Some((path, modified_at)) = find_newest_file(&crash_reports_dir, "txt") {
-            automatic.push(Candidate {
+            automatic.push(EvidenceCandidate {
                 path,
                 kind: EvidenceSourceKind::CrashReport,
                 supplementary: false,
@@ -221,7 +225,7 @@ impl CrashEvidenceService {
 
         let latest_log = logs_dir.join("latest.log");
         if let Some(modified_at) = file_modified_at(&latest_log) {
-            automatic.push(Candidate {
+            automatic.push(EvidenceCandidate {
                 path: latest_log,
                 kind: EvidenceSourceKind::LatestLog,
                 supplementary: false,
@@ -231,7 +235,7 @@ impl CrashEvidenceService {
 
         let debug_log = logs_dir.join("debug.log");
         if let Some(modified_at) = file_modified_at(&debug_log) {
-            automatic.push(Candidate {
+            automatic.push(EvidenceCandidate {
                 path: debug_log,
                 kind: EvidenceSourceKind::DebugLog,
                 supplementary: false,
@@ -240,7 +244,7 @@ impl CrashEvidenceService {
         }
 
         if let Some((hs_path, modified_at)) = find_hs_err_file(instance_dir) {
-            automatic.push(Candidate {
+            automatic.push(EvidenceCandidate {
                 path: hs_path,
                 kind: EvidenceSourceKind::JvmFatalErrorLog,
                 supplementary: false,
@@ -249,7 +253,7 @@ impl CrashEvidenceService {
         }
 
         if let Some((path, modified_at)) = failed_launch_output(&logs_dir) {
-            automatic.push(Candidate {
+            automatic.push(EvidenceCandidate {
                 path,
                 kind: EvidenceSourceKind::LaunchOutput,
                 supplementary: false,
@@ -294,7 +298,7 @@ impl CrashEvidenceService {
                 })
                 .then_with(|| right.modified_at.cmp(&left.modified_at))
         });
-        let mut candidates: Vec<Candidate> = automatic
+        let candidates: Vec<EvidenceCandidate> = automatic
             .into_iter()
             .enumerate()
             .map(|(index, mut candidate)| {
@@ -302,6 +306,26 @@ impl CrashEvidenceService {
                 candidate
             })
             .collect();
+        self.assemble(&candidates, explicit_files)
+    }
+
+    /// Assemble a collected set from candidates another search found (a crash pack's `sources`),
+    /// plus explicit files. The caller has already ordered and marked the candidates; this applies
+    /// the same size, truncation, staleness and categorization rules as [`Self::collect_since`].
+    pub fn collect_candidates(
+        &self,
+        candidates: &[EvidenceCandidate],
+        explicit_files: &[PathBuf],
+    ) -> CollectedEvidence {
+        self.assemble(candidates, explicit_files)
+    }
+
+    fn assemble(
+        &self,
+        candidates: &[EvidenceCandidate],
+        explicit_files: &[PathBuf],
+    ) -> CollectedEvidence {
+        let mut candidates = candidates.to_vec();
 
         // Explicit user-added files
         for ef in explicit_files {
@@ -318,7 +342,7 @@ impl CrashEvidenceService {
             if candidates.iter().any(|c| c.path == resolved) {
                 continue;
             }
-            candidates.push(Candidate {
+            candidates.push(EvidenceCandidate {
                 path: resolved,
                 kind: EvidenceSourceKind::UserAdded,
                 supplementary: !candidates.is_empty(),
@@ -326,7 +350,7 @@ impl CrashEvidenceService {
             });
         }
 
-        // 3. Read each candidate with bounds
+        // Read each candidate with bounds
         let mut sources: Vec<EvidenceSource> = Vec::new();
         let mut primary_index: usize = 0;
         let mut aggregate: u64 = 0;
@@ -630,12 +654,26 @@ fn find_newest_file(dir: &Path, extension: &str) -> Option<(PathBuf, SystemTime)
         .max_by_key(|(_, mtime)| *mtime)
 }
 
-/// Find the newest `hs_err_pid*.log` file in a directory.
+/// File (under `<game_dir>/logs/`) holding the last launch's captured game
+/// output, written by the game package's launcher. Read back here when the game
+/// died before writing its own logs.
+pub const CAPTURED_LAUNCH_OUTPUT_FILE: &str = "agora-launch-output.log";
+
+/// Flag the captured launch output as the result of a user-requested stop so
+/// Crash Doctor does not treat the resulting non-zero exit as a crash.
+pub fn mark_captured_launch_output_user_stopped(game_dir: &Path) {
+    use std::io::Write;
+    let path = game_dir.join("logs").join(CAPTURED_LAUNCH_OUTPUT_FILE);
+    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+        let _ = writeln!(file, "# user_stopped=true");
+    }
+}
+
 /// The captured launch output, but only when that launch ended abnormally
 /// (non-zero or unknown exit code) and was not a user-requested stop. A clean
 /// exit's output is not crash evidence.
 fn failed_launch_output(logs_dir: &Path) -> Option<(PathBuf, SystemTime)> {
-    let path = logs_dir.join(crate::launch_planner::CAPTURED_LAUNCH_OUTPUT_FILE);
+    let path = logs_dir.join(CAPTURED_LAUNCH_OUTPUT_FILE);
     let modified_at = file_modified_at(&path)?;
     let text = String::from_utf8_lossy(&read_bounded(&path, 64 * 1024, 0)).into_owned();
     let header: Vec<&str> = text.lines().filter(|l| l.starts_with("# ")).collect();
@@ -649,6 +687,7 @@ fn failed_launch_output(logs_dir: &Path) -> Option<(PathBuf, SystemTime)> {
     (exit_code != "0").then_some((path, modified_at))
 }
 
+/// Find the newest `hs_err_pid*.log` file in a directory.
 fn find_hs_err_file(dir: &Path) -> Option<(PathBuf, SystemTime)> {
     let entries = std::fs::read_dir(dir).ok()?;
     entries
@@ -707,7 +746,7 @@ mod tests {
     fn failed_launch_output_is_collected_but_clean_or_stopped_is_not() {
         let fx = TestFixture::new();
         let logs = fx.logs_dir();
-        let file = logs.join(crate::launch_planner::CAPTURED_LAUNCH_OUTPUT_FILE);
+        let file = logs.join(CAPTURED_LAUNCH_OUTPUT_FILE);
         let svc = CrashEvidenceService::new();
 
         std::fs::write(
@@ -725,39 +764,8 @@ mod tests {
         assert!(svc.collect(&fx.path, &[]).sources.is_empty());
 
         std::fs::write(&file, "# exit_code=1\n[stderr] killed\n").unwrap();
-        crate::launch_planner::mark_captured_launch_output_user_stopped(&fx.path);
+        mark_captured_launch_output_user_stopped(&fx.path);
         assert!(svc.collect(&fx.path, &[]).sources.is_empty());
-    }
-
-    #[test]
-    fn failed_launch_output_with_a_fabric_resolution_error_gets_a_specific_diagnosis() {
-        let fx = TestFixture::new();
-        let file = fx
-            .logs_dir()
-            .join(crate::launch_planner::CAPTURED_LAUNCH_OUTPUT_FILE);
-        std::fs::write(
-            &file,
-            "# Agora captured Java output (sanitized, last 200 lines)\n# exit_code=1\n# runtime_ms=40111\n\
-[stderr] net.fabricmc.loader.impl.FormattedException: net.fabricmc.loader.impl.discovery.ModResolutionException: Mod resolution encountered an incompatible mod set!\n\
-[stderr] A potential solution has been determined, this may resolve your problem:\n\
-[stderr] \t - Install fabric-api, any version.\n\
-[stderr] Unmet dependency listing:\n\
-[stderr] \t - Mod 'Entity Culling' (entityculling) 1.11.2 requires any version of fabric-api, which is missing!\n",
-        )
-        .unwrap();
-        let evidence = CrashEvidenceService::new().collect(&fx.path, &[]);
-        let text: String = evidence
-            .sources
-            .iter()
-            .map(|source| format!("\n===== {} =====\n{}", source.meta.basename, source.text))
-            .collect();
-        let triage = crate::crash_diagnostics::triage(&text);
-        assert_eq!(
-            triage.signature_name.as_deref(),
-            Some("Missing Required Mod")
-        );
-        let markdown = triage.solution_markdown.unwrap();
-        assert!(markdown.contains("`fabric-api`") && markdown.contains("`entityculling`"));
     }
 
     struct TestFixture {

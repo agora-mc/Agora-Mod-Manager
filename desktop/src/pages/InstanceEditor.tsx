@@ -5,6 +5,7 @@ import { useAdvancedMode } from '../components/AdvancedModeContext';
 import { PluginInstancePanels } from '../features/plugins/PluginSurfaces';
 import { PluginSurface } from '../features/plugins/PluginSurface';
 import { ConsoleView } from '../components/ConsoleView';
+import { BackButton } from '@/components/ui/back-button';
 import { WorldsPanel } from '../components/WorldsPanel';
 import { WindowSizeEditor } from '../components/WindowSizeEditor';
 import { LaunchHooksEditor } from '../components/LaunchHooksEditor';
@@ -43,7 +44,10 @@ import {
   getCachedInstanceUpdates,
   exportInstancePack,
   exportSourcelessMods,
+  exportServerEnvironment,
+  listWorlds,
   formatError,
+  errorCode,
   inspectJavaExecutable,
   pickOpenFile,
   getCustomIcon,
@@ -86,13 +90,6 @@ import {
   deleteSnapshot,
   detectDrift,
   checkInstanceHealth,
-  listLoadoutProfiles,
-  createLoadoutProfile,
-  listLoadoutUnlistedMods,
-  applyLoadoutProfile,
-  deleteLoadoutProfile,
-  previewLoadoutUpdate,
-  updateLoadoutProfile,
   openInstanceFolder,
   revealPath,
   clearCachedInstanceUpdates,
@@ -125,16 +122,17 @@ import {
   type UpdateInfo,
   type Snapshot,
   type SnapshotDiff,
-  type LoadoutProfile,
-  type LoadoutChange,
-  type UnlistedModsChoice,
   type LockfileDriftReport,
   type MemoryRecommendation,
   type HealthReport,
   type LoaderChangePlan,
+  type ExportResult,
+  type WorldInfo,
 } from '../lib/tauri';
 import { InstanceTemplatePanel } from '../components/InstanceTemplatePanel';
+import { LoadoutProfilesPanel } from '../components/LoadoutProfilesPanel';
 import { useConfirm } from '@/components/ui/confirm';
+import { Switch } from '@/components/ui/switch';
 import { formatDateTime, formatPlayTime } from '@/lib/utils';
 import { copiedMemoryNote, formatMemoryMb, readCopiedMemory } from '@/lib/importDisplay';
 import { OrphanCleanupDialog } from '../components/OrphanCleanupDialog';
@@ -158,7 +156,15 @@ import {
 } from '@/components/ui/dialog';
 import { formatInstalledDate } from '../components/installed-content/contentTableState';
 import { InstanceIcon, LoaderChip, MetaChip } from '../components/InstanceIcon';
-import { ImagePlus, Play } from 'lucide-react';
+import { ChevronDown, FolderOpen, Lock, Pencil, Play, Unlock } from 'lucide-react';
+import { InstanceTileButton } from '@/components/instance-kit';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { showToast } from '../components/Toast';
 import { describeExternalChange, useExternalInstanceChanges } from '../lib/externalChanges';
 
@@ -229,6 +235,7 @@ function fallbackContentRows(manifest: InstanceManifest | null): InstalledConten
       loader_mod_id: entry.mod_jar_id ?? null,
       size_bytes: null,
       file_present: false,
+      file_state: 'missing',
       resolved_path: null,
       author: null,
       categories: ['Uncategorized'],
@@ -301,34 +308,59 @@ function wrapperCommandOf(detail: InstanceDetail): string {
 /** What the Lock control does, shown as a tooltip on Lock, Unlock and the status. */
 const LOCK_HELP = 'Locking stops mod changes (installing, updating, removing, or turning mods on and off) until you unlock. Launching still works. Locking also takes a lock snapshot, which Revert returns to.';
 
-function countOf(count: number, one: string, many: string): string {
-  return `${count} ${count === 1 ? one : many}`;
-}
+type EditorTabId =
+  | 'mods'
+  | 'resourcepacks'
+  | 'shaders'
+  | 'datapacks'
+  | 'worlds'
+  | 'screenshots'
+  | 'notes'
+  | 'snapshots'
+  | 'loadout-profiles'
+  | 'templates'
+  | 'migrate'
+  | 'import'
+  | 'export'
+  | 'console'
+  | 'java-args';
 
-/** Plain-words summary of what a loadout profile switches on, from the counts saved with it. */
-function describeLoadoutCoverage(prof: LoadoutProfile): string {
-  const covers = prof.covers;
-  if (!covers) {
-    return `Saved before counts were recorded: ${countOf(prof.enabled_mods.length, 'item', 'items')} switched on. Mods it does not list are asked about when you apply; other items it does not list are left alone.`;
-  }
-  const parts = [
-    countOf(covers.mods, 'mod', 'mods'),
-    countOf(covers.resourcepacks, 'resource pack', 'resource packs'),
-    countOf(covers.shaders, 'shader pack', 'shader packs'),
-    countOf(covers.datapacks, 'data pack', 'data packs'),
-    countOf(covers.worlds, 'world', 'worlds'),
-  ];
-  return `Switches on: ${parts.join(', ')}. Mods it does not list are asked about when you apply; other items it does not list are left alone.`;
-}
+type TopTabId =
+  | 'content'
+  | 'worlds'
+  | 'screenshots-notes'
+  | 'backups-versions'
+  | 'import-export'
+  | 'java-logs';
 
-/** One line for the Update review: what saving the profile again does to one item. */
-function describeLoadoutChange(change: LoadoutChange): string {
-  const kind = change.kind;
-  if (kind === 'turned_on') return `Turn on ${change.filename}`;
-  if (kind === 'turned_off') return `Turn off ${change.filename}`;
-  if ('added' in kind) return `Add ${change.filename} (${kind.added.enabled ? 'on' : 'off'})`;
-  return `Drop ${change.filename}, which is no longer on this instance`;
-}
+/** The six top tabs, in order, and the panel each one contains. */
+const TAB_LAYOUT: readonly { id: TopTabId; label: string; tabs: readonly EditorTabId[] }[] = [
+  { id: 'content', label: 'Content', tabs: ['mods', 'resourcepacks', 'shaders', 'datapacks'] },
+  { id: 'worlds', label: 'Worlds', tabs: ['worlds'] },
+  { id: 'screenshots-notes', label: 'Screenshots & Notes', tabs: ['screenshots', 'notes'] },
+  { id: 'backups-versions', label: 'Backups & Versions', tabs: ['snapshots', 'loadout-profiles', 'templates', 'migrate'] },
+  { id: 'import-export', label: 'Import & Export', tabs: ['import', 'export'] },
+  { id: 'java-logs', label: 'Java & Logs', tabs: ['java-args', 'console'] },
+];
+
+/** Every panel keeps its own id; this only says which top tab owns it. */
+const TOP_TAB_OF: Record<EditorTabId, TopTabId> = {
+  mods: 'content',
+  resourcepacks: 'content',
+  shaders: 'content',
+  datapacks: 'content',
+  worlds: 'worlds',
+  screenshots: 'screenshots-notes',
+  notes: 'screenshots-notes',
+  snapshots: 'backups-versions',
+  'loadout-profiles': 'backups-versions',
+  templates: 'backups-versions',
+  migrate: 'backups-versions',
+  import: 'import-export',
+  export: 'import-export',
+  'java-args': 'java-logs',
+  console: 'java-logs',
+};
 
 function previewJavaMajor(version: string | undefined): number {
   const parts = (version ?? '').split('.');
@@ -360,6 +392,11 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
   const modsRegionRef = useRef<HTMLDivElement>(null);
   const statusBannerRef = useRef<HTMLDivElement>(null);
   const [exportBusy, setExportBusy] = useState(false);
+  const [serverExportBusy, setServerExportBusy] = useState(false);
+  const [serverWorlds, setServerWorlds] = useState<WorldInfo[]>([]);
+  const [serverWorld, setServerWorld] = useState('');
+  const [serverAllowUnverified, setServerAllowUnverified] = useState(false);
+  const [serverExportResult, setServerExportResult] = useState<ExportResult | null>(null);
   // The file the last pack or lockfile was saved to, for "Show in folder".
   const [savedExportPath, setSavedExportPath] = useState<string | null>(null);
   const [instanceCustomIcon, setInstanceCustomIcon] = useState<string | null>(null);
@@ -375,8 +412,17 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
   const { getTaskForInstance, revision: packInstallRevision, startPackFile, startPlan } = usePackInstall();
   const { confirm, prompt } = useConfirm();
 
-  // Sub-sidebar active tab
-  const [activeTab, setActiveTab] = useState<'mods' | 'resourcepacks' | 'shaders' | 'datapacks' | 'worlds' | 'screenshots' | 'notes' | 'snapshots' | 'loadout-profiles' | 'templates' | 'migrate' | 'import' | 'export' | 'console' | 'java-args'>(() => (takeRequestedEditorTab() === 'console' ? 'console' : 'mods'));
+  // Sub-sidebar active tab. The top tabs only group these; the panels below
+  // still switch on this id, so every existing way of opening one keeps working.
+  const [activeTab, setActiveTab] = useState<EditorTabId>(() => (takeRequestedEditorTab() === 'console' ? 'console' : 'mods'));
+  // The sub-tab last chosen inside each top tab, so returning to that top tab
+  // lands where the user left it instead of always at the first panel.
+  const [lastSubTab, setLastSubTab] = useState<Partial<Record<TopTabId, EditorTabId>>>({});
+
+  useEffect(() => {
+    const top = TOP_TAB_OF[activeTab];
+    setLastSubTab((current) => (current[top] === activeTab ? current : { ...current, [top]: activeTab }));
+  }, [activeTab]);
 
   // Snapshots state (Phase 6)
   const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
@@ -387,48 +433,6 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
   const [confirmDeleteSnapshot, setConfirmDeleteSnapshot] = useState<string | null>(null);
   const [snapshotDiff, setSnapshotDiff] = useState<{ snapshotId: string; diff: SnapshotDiff } | null>(null);
 
-  // Loadout profiles state (Phase 6)
-  const [profiles, setProfiles] = useState<LoadoutProfile[]>([]);
-  const [profileNameInput, setProfileNameInput] = useState('');
-  const [profileBusy, setProfileBusy] = useState<string | null>(null);
-  const [confirmDeleteProfile, setConfirmDeleteProfile] = useState<string | null>(null);
-  // Set while the user is asked what to do with enabled mods a profile does not list.
-  const [unlistedChoice, setUnlistedChoice] = useState<{ profile: string; mods: string[] } | null>(null);
-  // Set while the user reviews what saving a profile again from the setup would change.
-  const [updateReview, setUpdateReview] = useState<{ profile: string; changes: LoadoutChange[] } | null>(null);
-
-  const runProfileApply = async (name: string, unlistedMods: UnlistedModsChoice) => {
-    setProfileBusy(name);
-    setError(null);
-    try {
-      await applyLoadoutProfile(instanceId, name, unlistedMods);
-      await reloadInstance();
-      setStatus(`Profile "${name}" applied. Before switching, Agora saved an undo point under Snapshots, labelled before-loadout (only the newest is kept).`);
-    } catch (e) {
-      setError(formatError(e));
-    } finally {
-      setProfileBusy(null);
-    }
-  };
-
-  // Apply asks first when the instance has enabled mods the profile does not
-  // list. Keep is only the value passed when there is nothing to switch off.
-  const requestProfileApply = async (name: string) => {
-    setError(null);
-    setProfileBusy(name);
-    const unlisted = await listLoadoutUnlistedMods(instanceId, name).catch((e: unknown) => {
-      setError(formatError(e));
-      return null;
-    });
-    setProfileBusy(null);
-    if (unlisted === null) return;
-    if (unlisted.length === 0) {
-      await runProfileApply(name, 'keep');
-      return;
-    }
-    setUnlistedChoice({ profile: name, mods: unlisted });
-  };
-
   // The launch health check, run on demand. The Health Check dialog opens with its
   // result even when there is nothing to review.
   const requestReadinessCheck = async () => {
@@ -438,38 +442,6 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
       onReviewHealth?.(instanceId, row?.name ?? 'Instance', report);
     } catch (cause) {
       setError(formatError(cause));
-    }
-  };
-
-  // Update shows every change to the profile first, and saves only when the user confirms.
-  const requestProfileUpdate = async (name: string) => {
-    setError(null);
-    setProfileBusy(name);
-    try {
-      const preview = await previewLoadoutUpdate(instanceId, name);
-      if (preview.changes.length === 0) {
-        setStatus(`Profile "${name}" already matches the current setup. Nothing to save.`);
-      } else {
-        setUpdateReview({ profile: name, changes: preview.changes });
-      }
-    } catch (e) {
-      setError(formatError(e));
-    } finally {
-      setProfileBusy(null);
-    }
-  };
-
-  const saveProfileUpdate = async (name: string) => {
-    setProfileBusy(name);
-    setError(null);
-    try {
-      await updateLoadoutProfile(instanceId, name);
-      setProfiles(await listLoadoutProfiles(instanceId));
-      setStatus(`Profile "${name}" now records the current setup of this instance.`);
-    } catch (e) {
-      setError(formatError(e));
-    } finally {
-      setProfileBusy(null);
     }
   };
 
@@ -592,6 +564,21 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
     if (error) banner.scrollIntoView?.({ block: 'nearest' });
     else showToast(message, 'success');
   }, [error, status]);
+
+  useEffect(() => {
+    if (activeTab !== 'export') return;
+    let cancelled = false;
+    void listWorlds(instanceId)
+      .then((worlds) => {
+        if (!cancelled) setServerWorlds(Array.isArray(worlds) ? worlds : []);
+      })
+      .catch(() => {
+        // A world list failure only means the picker stays on the default.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, instanceId]);
 
   useEffect(() => {
     setContentRowsLoaded(false);
@@ -813,21 +800,6 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
       try {
         const result = await listSnapshots(instanceId);
         if (!cancelled) setSnapshots(result);
-      } catch (e) {
-        if (!cancelled) setError(formatError(e));
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [instanceId, activeTab]);
-
-  // Load loadout profiles when tab becomes active
-  useEffect(() => {
-    if (activeTab !== 'loadout-profiles') return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const result = await listLoadoutProfiles(instanceId);
-        if (!cancelled) setProfiles(result);
       } catch (e) {
         if (!cancelled) setError(formatError(e));
       }
@@ -1311,7 +1283,6 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
     await Promise.all([
       refreshContent(),
       listSnapshots(instanceId).then(setSnapshots).catch(() => undefined),
-      listLoadoutProfiles(instanceId).then(setProfiles).catch(() => undefined),
     ]);
   };
 
@@ -1531,6 +1502,30 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
       setError(formatError(e));
     } finally {
       setExportBusy(false);
+    }
+  };
+
+  const handleExportServer = async () => {
+    setServerExportBusy(true);
+    setError(null);
+    setStatus(null);
+    setServerExportResult(null);
+    try {
+      const dir = await pickDirectory('Choose a folder for the server export');
+      if (!dir) return;
+      const result = await exportServerEnvironment(
+        instanceId,
+        dir,
+        serverWorld || null,
+        serverAllowUnverified,
+      );
+      setServerExportResult(result);
+      setSavedExportPath(dir);
+      setStatus(`Server exported to: ${dir}`);
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setServerExportBusy(false);
     }
   };
 
@@ -1783,6 +1778,30 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
     packGaps: detail ? detail.pack_gaps.length : null,
     busy: operationHeld,
   }) : null;
+  const tabLabel = (tab: EditorTabId): string => {
+    switch (tab) {
+      case 'mods': return `Mods (${mods.length})`;
+      case 'resourcepacks': return `Resource Packs (${manifest?.resourcepacks?.length ?? 0})`;
+      case 'shaders': return `Shaders (${manifest?.shaders?.length ?? 0})`;
+      case 'datapacks': return `Data Packs (${manifest?.datapacks?.length ?? 0})`;
+      case 'worlds': return 'Worlds & Servers';
+      case 'screenshots': return 'Screenshots';
+      case 'notes': return 'Notes';
+      case 'snapshots': return 'Snapshots';
+      case 'loadout-profiles': return 'Loadout Profiles';
+      case 'templates': return 'Templates';
+      case 'migrate': return 'Version Move';
+      case 'import': return 'Other launchers & files';
+      case 'export': return 'Export';
+      case 'java-args': return 'Java & Args';
+      case 'console': return 'Console';
+    }
+  };
+  const activeTopTab = TAB_LAYOUT.find((top) => top.id === TOP_TAB_OF[activeTab]) ?? TAB_LAYOUT[0];
+  const openTopTab = (top: (typeof TAB_LAYOUT)[number]) => {
+    const remembered = lastSubTab[top.id];
+    setActiveTab(remembered && top.tabs.includes(remembered) ? remembered : top.tabs[0]);
+  };
 
   useEffect(() => {
     if (packInstall?.status === 'failed' && packInstall.error) {
@@ -1867,7 +1886,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
         <LiveInteractiveHost
           instanceId={instanceId}
           presentation={presentation}
-          leading={<BackButton onBack={onBack} />}
+          leading={<BackButton onBack={onBack} label="Instances" />}
           onUseStandardView={() => setPresentationPref('standard')}
           onNavigateStandard={(destination: StandardDestination) => {
             // Full details are the same Standard ModDetail surface used by
@@ -1997,7 +2016,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
   if (loading) {
     return (
       <div className="space-y-6">
-        <BackButton onBack={onBack} />
+        <BackButton onBack={onBack} label="Instances" />
         <div className="rounded-xl border border-dashed border-border bg-card p-6 text-center text-muted-foreground">
           Loading instance…
         </div>
@@ -2008,7 +2027,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
   if (error && !row) {
     return (
       <div className="space-y-6">
-        <BackButton onBack={onBack} />
+        <BackButton onBack={onBack} label="Instances" />
         <div className="rounded-lg bg-destructive p-3 text-sm text-destructive-foreground">
           {error}
         </div>
@@ -2047,7 +2066,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
         </button>
       )}
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <BackButton onBack={onBack} />
+        <BackButton onBack={onBack} label="Instances" />
         <button
           type="button"
           onClick={() => setPresentationPref('high-interaction')}
@@ -2074,216 +2093,196 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
           <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
             <div className="flex items-start gap-4">
               {row?.is_locked ? headerIcon : (
-                <button
-                  type="button"
-                  onClick={handleSetInstanceIcon}
-                  disabled={recoveryBlocked}
-                  className="instance-icon-button shrink-0"
-                  title={headerIconSrc ? 'Change instance image' : 'Set a custom instance image'}
-                  aria-label={headerIconSrc ? 'Change instance image' : 'Set instance image'}
-                >
+                <InstanceTileButton hasImage={Boolean(headerIconSrc)} onSelect={handleSetInstanceIcon} disabled={recoveryBlocked}>
                   {headerIcon}
-                  <span className="instance-icon-button__overlay">
-                    <ImagePlus className="h-5 w-5" aria-hidden="true" />
-                  </span>
-                </button>
+                </InstanceTileButton>
               )}
               <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-3">
-                <h2 className="text-2xl font-bold">
-                  {row?.name}
-                  {' '}
+                <div>
+                  <h2 className="inline text-2xl font-bold">{row?.name}</h2>
                   <button
+                    type="button"
                     onClick={handleRename}
                     disabled={recoveryBlocked}
-                    className="text-xs text-muted-foreground hover:text-foreground underline"
+                    aria-label="Rename"
+                    title="Rename"
+                    className="ml-1.5 inline-flex rounded-md p-1 align-middle text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    Rename
-                  </button>
-                </h2>
-
-              </div>
-              <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-                {manifest?.loader && (
-                  <LoaderChip loader={manifest.loader} loaderVersion={manifest.loader_version} />
-                )}
-                <MetaChip>MC {row?.minecraft_version}</MetaChip>
-              </div>
-              {manifest?.loader && manifest.loader !== 'vanilla' && (
-                <p className="text-xs text-muted-foreground mt-1.5">
-                  <button
-                    type="button"
-                    onClick={openLoaderChooser}
-                    disabled={recoveryBlocked || Boolean(row?.is_locked)}
-                    className="underline text-primary hover:text-primary/80 disabled:cursor-not-allowed disabled:opacity-50"
-                    title={recoveryBlocked
-                      ? mutationBlockReason ?? undefined
-                      : row?.is_locked
-                        ? 'Unlock the instance to change the loader version.'
-                        : 'Change the loader version for this instance.'}
-                  >
-                    Change loader version
-                  </button>
-                </p>
-              )}
-              {healthReport && healthIssueCount > 0 && (
-                <div
-                  className={`mt-3 flex max-w-md items-center justify-between gap-3 rounded-lg border px-3 py-2 text-xs ${
-                    healthBlocked
-                      ? 'border-destructive/60 bg-destructive/10'
-                      : 'border-amber-500/60 bg-amber-500/10'
-                  }`}
-                  role="alert"
-                  aria-label={healthHeadline(counts)}
-                >
-                  <div className="min-w-0">
-                    <p className={healthBlocked ? 'font-medium text-destructive' : 'font-medium text-amber-700 dark:text-amber-300'}>
-                      {healthHeadline(counts)}
-                    </p>
-                    <p className="truncate text-muted-foreground">
-                      {healthLaunchNote(counts)}
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => onReviewHealth?.(instanceId, row?.name ?? 'Instance', healthReport)}
-                    className="shrink-0 rounded-sm border border-current/30 px-2 py-1 font-medium hover:bg-background/40"
-                  >
-                    Review & repair
+                    <Pencil className="h-4 w-4" aria-hidden="true" />
                   </button>
                 </div>
-              )}
-              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                <span title={LOCK_HELP}>{row?.is_locked ? '🔒 Locked' : '🔓 Unlocked'}</span>
-                {row?.is_locked ? (
+                <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                  {manifest?.loader && manifest.loader !== 'vanilla' ? (
+                    <button
+                      type="button"
+                      onClick={openLoaderChooser}
+                      disabled={recoveryBlocked || Boolean(row?.is_locked)}
+                      aria-label="Change loader version"
+                      className="rounded-full focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                      title={recoveryBlocked
+                        ? mutationBlockReason ?? undefined
+                        : row?.is_locked
+                          ? 'Unlock the instance to change the loader version.'
+                          : 'Change the loader version for this instance.'}
+                    >
+                      <LoaderChip loader={manifest.loader} loaderVersion={manifest.loader_version} />
+                    </button>
+                  ) : manifest?.loader ? (
+                    <LoaderChip loader={manifest.loader} loaderVersion={manifest.loader_version} />
+                  ) : null}
+                  <MetaChip>MC {row?.minecraft_version}</MetaChip>
                   <button
-                    onClick={handleUnlock}
+                    type="button"
+                    onClick={row?.is_locked ? handleUnlock : handleLock}
                     disabled={recoveryBlocked}
+                    aria-label={LOCK_HELP}
                     title={LOCK_HELP}
-                    className="rounded-lg border border-input bg-background px-2.5 py-1 text-xs font-medium hover:bg-accent"
+                    className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    Unlock
+                    {row?.is_locked
+                      ? <Lock className="h-4 w-4" aria-hidden="true" />
+                      : <Unlock className="h-4 w-4" aria-hidden="true" />}
                   </button>
-                ) : (
-                  <>
-                    <button
-                      onClick={handleLock}
-                      disabled={recoveryBlocked}
-                      title={LOCK_HELP}
-                      className="rounded-lg border border-input bg-background px-2.5 py-1 text-xs font-medium hover:bg-accent"
-                    >
-                      Lock
-                    </button>
-                    <button
-                      onClick={handleRevert}
-                      disabled={recoveryBlocked}
-                      title="Go back to the lock snapshot: mods and config changed since the instance was last locked are put back. You can undo this from Snapshots."
-                      className="rounded-lg border border-input bg-background px-2.5 py-1 text-xs font-medium hover:bg-accent"
-                    >
-                      Revert
-                    </button>
-                  </>
-                )}
-                {row?.last_launched_at && (
-                  <span className="ml-2">· Last launched {formatInstalledDate(row.last_launched_at)}</span>
-                )}
-                {formatPlayTime(row?.total_play_ms) && (
-                  <span className="ml-2" title="Time in game across launches Agora ran itself">
-                    · {formatPlayTime(row?.total_play_ms)} played
-                  </span>
-                )}
-                {!row?.is_locked && (
-                  <button
-                    type="button"
-                    onClick={handleSetInstanceIcon}
-                    disabled={recoveryBlocked}
-                    className="inline-flex items-center gap-1 rounded-lg border border-input bg-background px-2.5 py-1 text-xs font-medium hover:bg-accent"
-                    title="Set a custom instance image"
-                  >
-                    <ImagePlus className="h-3.5 w-3.5" aria-hidden="true" />
-                    Set image
-                  </button>
-                )}
                 </div>
+                {healthReport && healthIssueCount > 0 && (
+                  <div
+                    className={`mt-3 flex max-w-md items-center justify-between gap-3 rounded-lg border px-3 py-2 text-xs ${
+                      healthBlocked
+                        ? 'border-destructive/60 bg-destructive/10'
+                        : 'border-amber-500/60 bg-amber-500/10'
+                    }`}
+                    role="alert"
+                    aria-label={healthHeadline(counts)}
+                  >
+                    <div className="min-w-0">
+                      <p className={healthBlocked ? 'font-medium text-destructive' : 'font-medium text-amber-700 dark:text-amber-300'}>
+                        {healthHeadline(counts)}
+                      </p>
+                      <p className="truncate text-muted-foreground">
+                        {healthLaunchNote(counts)}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onReviewHealth?.(instanceId, row?.name ?? 'Instance', healthReport)}
+                      className="shrink-0 rounded-sm border border-current/30 px-2 py-1 font-medium hover:bg-background/40"
+                    >
+                      Review & repair
+                    </button>
+                  </div>
+                )}
+                {(row?.last_launched_at || formatPlayTime(row?.total_play_ms)) && (
+                  <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                    {row?.last_launched_at && (
+                      <span>Last launched {formatInstalledDate(row.last_launched_at)}</span>
+                    )}
+                    {formatPlayTime(row?.total_play_ms) && (
+                      <span title="Time in game across launches Agora ran itself">
+                        · {formatPlayTime(row?.total_play_ms)} played
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
             <div className="flex flex-col items-end gap-3 self-end xl:self-end">
-              <div className="flex flex-wrap justify-end gap-2">
-              <button
-                onClick={() => {
-                  setPackInstallOpen(true);
-                  setPackIdInput('');
-                  setPackProgress(null);
-                  setError(null);
-                }}
-                disabled={recoveryBlocked}
-                className="rounded-lg border border-input bg-background hover:bg-accent px-3 py-1.5 text-sm font-medium"
-              >
-                📦 Add mods from a pack…
-              </button>
-              <button
-                onClick={handleImportPack}
-                disabled={recoveryBlocked}
-                className="rounded-lg border border-input bg-background hover:bg-accent px-3 py-1.5 text-sm font-medium"
-              >
-                📥 Import pack as new instance
-              </button>
-              <button
-                onClick={() => openInstanceFolder(instanceId)}
-                className="rounded-lg border border-input bg-background hover:bg-accent px-3 py-1.5 text-sm font-medium"
-                title="Open instance folder in file explorer"
-              >
-                📂 Open in Folder
-              </button>
-              <button
-                onClick={() => onInvestigate?.(instanceId)}
-                className="rounded-lg border border-input bg-background hover:bg-accent px-3 py-1.5 text-sm font-medium"
-                title="Open Crash Doctor to look through the latest logs for what went wrong"
-              >
-                Diagnose a crash
-              </button>
-              <button
-                type="button"
-                onClick={() => { void requestReadinessCheck(); }}
-                className="rounded-lg border border-input bg-background hover:bg-accent px-3 py-1.5 text-sm font-medium"
-                title="Run the launch health check and show what it finds, even when nothing needs attention"
-              >
-                Check readiness
-              </button>
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => openInstanceFolder(instanceId)}
+                  className="rounded-lg border border-input bg-background p-2 hover:bg-accent"
+                  title="Open instance folder in file explorer"
+                  aria-label="Open in Folder"
+                >
+                  <FolderOpen className="h-4 w-4" aria-hidden="true" />
+                </button>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      className="inline-flex items-center gap-1 rounded-lg border border-input bg-background px-3 py-1.5 text-sm font-medium hover:bg-accent"
+                    >
+                      More
+                      <ChevronDown className="h-4 w-4" aria-hidden="true" />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-56">
+                    <DropdownMenuItem
+                      disabled={recoveryBlocked}
+                      onSelect={() => {
+                        setPackInstallOpen(true);
+                        setPackIdInput('');
+                        setPackProgress(null);
+                        setError(null);
+                      }}
+                    >
+                      Add mods from a pack…
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      disabled={recoveryBlocked}
+                      onSelect={() => { void handleImportPack(); }}
+                    >
+                      Import pack as new instance
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem onSelect={() => { void requestReadinessCheck(); }}>
+                      Check readiness
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onSelect={() => onInvestigate?.(instanceId)}>
+                      Diagnose a crash
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      disabled={recoveryBlocked || Boolean(row?.is_locked)}
+                      onSelect={() => { void handleSetInstanceIcon(); }}
+                    >
+                      Set image
+                    </DropdownMenuItem>
+                    {!row?.is_locked && (
+                      <DropdownMenuItem
+                        disabled={recoveryBlocked}
+                        title="Go back to the lock snapshot: mods and config changed since the instance was last locked are put back. You can undo this from Snapshots."
+                        onSelect={() => { void handleRevert(); }}
+                      >
+                        Revert
+                      </DropdownMenuItem>
+                    )}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+                {processRunning ? (
+                  <button
+                    type="button"
+                    onClick={() => { void onKillProcess?.(); }}
+                    disabled={!onKillProcess || processStopping}
+                    className="inline-flex items-center gap-2 rounded-lg bg-destructive px-5 py-3 text-base font-semibold text-destructive-foreground shadow-xs hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-50"
+                    aria-label={`Kill ${row?.name ?? 'instance'}`}
+                  >
+                    Kill
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      if (!onLaunch || playDisabled) return;
+                      setPlayBusy(true);
+                      setError(null);
+                      try {
+                        await onLaunch(instanceId);
+                      } catch (cause) {
+                        setError(formatError(cause));
+                      } finally {
+                        setPlayBusy(false);
+                      }
+                    }}
+                    disabled={!onLaunch || playDisabled}
+                    className="inline-flex items-center gap-2 rounded-lg bg-primary px-5 py-3 text-base font-semibold text-primary-foreground shadow-xs hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+                    aria-label={`Play ${row?.name ?? 'instance'}`}
+                  >
+                    <Play className="h-5 w-5 fill-current" aria-hidden="true" />
+                    {processLaunching || playBusy ? 'Starting…' : processStopping ? 'Stopping…' : processDelegated ? 'Running via Mojang' : anotherProcessActive ? 'Game already running' : 'Play'}
+                  </button>
+                )}
               </div>
-              {processRunning ? (
-                <button
-                  type="button"
-                  onClick={() => { void onKillProcess?.(); }}
-                  disabled={!onKillProcess || processStopping}
-                  className="inline-flex items-center gap-2 rounded-lg bg-destructive px-5 py-3 text-base font-semibold text-destructive-foreground shadow-xs hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-50"
-                  aria-label={`Kill ${row?.name ?? 'instance'}`}
-                >
-                  Kill
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={async () => {
-                    if (!onLaunch || playDisabled) return;
-                    setPlayBusy(true);
-                    setError(null);
-                    try {
-                      await onLaunch(instanceId);
-                    } catch (cause) {
-                      setError(formatError(cause));
-                    } finally {
-                      setPlayBusy(false);
-                    }
-                  }}
-                  disabled={!onLaunch || playDisabled}
-                  className="inline-flex items-center gap-2 rounded-lg bg-primary px-5 py-3 text-base font-semibold text-primary-foreground shadow-xs hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
-                  aria-label={`Play ${row?.name ?? 'instance'}`}
-                >
-                  <Play className="h-5 w-5 fill-current" aria-hidden="true" />
-                  {processLaunching || playBusy ? 'Starting…' : processStopping ? 'Stopping…' : processDelegated ? 'Running via Mojang' : anotherProcessActive ? 'Game already running' : 'Play'}
-                </button>
-              )}
               {readiness && !gameActive && (
                 <div className="max-w-sm text-right text-xs" data-testid="instance-readiness">
                   <p className={`font-medium ${
@@ -2373,26 +2372,48 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
         }
       />
 
-      {/* Sub-sidebar tabs */}
-      <div className="agora-tabbar">
-        {(['mods', 'resourcepacks', 'shaders', 'datapacks', 'worlds', 'screenshots', 'notes', 'snapshots', 'loadout-profiles', 'templates', 'migrate', 'import', 'export', 'console'] as const).map((tab) => (
-          <button
-            key={tab}
-            onClick={() => setActiveTab(tab)}
-            data-active={activeTab === tab}
-            className="agora-tab text-sm"
-          >
-            {tab === 'mods' ? `Mods (${mods.length})` : tab === 'resourcepacks' ? `Resource Packs (${manifest?.resourcepacks?.length ?? 0})` : tab === 'shaders' ? `Shaders (${manifest?.shaders?.length ?? 0})` : tab === 'datapacks' ? `Data Packs (${manifest?.datapacks?.length ?? 0})` : tab === 'worlds' ? 'Worlds & Servers' : tab === 'screenshots' ? 'Screenshots' : tab === 'notes' ? 'Notes' : tab === 'snapshots' ? 'Snapshots' : tab === 'loadout-profiles' ? 'Loadout Profiles' : tab === 'templates' ? 'Templates' : tab === 'migrate' ? 'Version Move' : tab === 'import' ? 'Other launchers & files' : tab === 'export' ? 'Export' : 'Console'}
-          </button>
-        ))}
-        <button
-            key="java-args"
-            onClick={() => setActiveTab('java-args')}
-            data-active={activeTab === 'java-args'}
-            className="agora-tab text-sm"
-          >
-            Java & Args
-        </button>
+      {/* Instance pages: six top tabs, with a quieter row inside the ones that hold several panels. */}
+      <div className="space-y-2">
+        <nav aria-label="Instance sections" className="agora-tabbar">
+          {TAB_LAYOUT.map((top) => {
+            const isActive = activeTopTab.id === top.id;
+            return (
+              <button
+                key={top.id}
+                type="button"
+                onClick={() => openTopTab(top)}
+                aria-current={isActive ? 'page' : undefined}
+                data-active={isActive}
+                className="agora-tab text-sm"
+              >
+                {top.label}
+              </button>
+            );
+          })}
+        </nav>
+        {activeTopTab.tabs.length > 1 && (
+          <div role="group" className="flex flex-wrap items-center gap-1" aria-label={`${activeTopTab.label} pages`}>
+            {activeTopTab.tabs.map((tab) => {
+              const isActive = activeTab === tab;
+              return (
+                <button
+                  key={tab}
+                  type="button"
+                  onClick={() => setActiveTab(tab)}
+                  aria-current={isActive ? 'page' : undefined}
+                  data-active={isActive}
+                  className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                    isActive
+                      ? 'bg-accent text-accent-foreground'
+                      : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground'
+                  }`}
+                >
+                  {tabLabel(tab)}
+                </button>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {activeTab === 'mods' && (
@@ -2603,9 +2624,9 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
               {mutationBlockReason ?? 'Snapshot actions are unavailable right now.'} Create, import and restore are unavailable until then.
             </p>
           )}
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <h3 className="font-semibold text-sm">Snapshots</h3>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               <button
                 onClick={() => void handleImportBackup()}
                 disabled={backupBusy || snapshotOperationPending}
@@ -2644,10 +2665,10 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
           </div>
 
           <p className="text-xs text-muted-foreground">
-            A snapshot is a restore point. It copies your mods, configs, resource packs, shader packs, data packs and options.txt. Worlds are included in full snapshots, but not in the quick ones taken before each launch. Logs, screenshots and other files are not included.
+            A snapshot is a restore point. For Minecraft it copies your mods, configs, resource packs, shader packs, data packs and options.txt; worlds are included in full snapshots, but not in the quick ones taken before each launch. For a game instance it records the instance's own state — its content layers, plugin lists, INI copies, loadouts, save choice and load-after rules — while the mod files stay once in the content store. Logs, screenshots and other files are not included.
           </p>
           <p className="text-xs text-muted-foreground">
-            Agora takes an automatic snapshot before changes to an existing instance: launches, mod installs, updates and removals, pack updates, templates, and pack mods added after an import. It keeps the last 5 of those. Turning a mod on or off takes none, and neither does importing a pack into a new instance, since there is nothing to go back to. Snapshots you create yourself, and ones from version moves, are kept until you delete them.
+            Agora takes an automatic snapshot before changes to an existing instance: launches, mod installs, updates and removals, pack updates, templates, pack mods added after an import, and for game instances its content, plugin list, INI, rule and loadout changes. It keeps the last 5 of those. Turning a mod on or off takes none, and neither does importing a pack into a new instance, since there is nothing to go back to. Snapshots you create yourself, and ones from version moves, are kept until you delete them.
           </p>
           {snapshots.length === 0 ? (
             <p className="text-sm text-muted-foreground">
@@ -2659,14 +2680,17 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                 <div key={snap.id} className="flex items-center justify-between rounded-lg border border-border px-3 py-2 text-sm">
                   <div className="min-w-0 flex-1">
                     <span className="font-medium flex items-center gap-2">
-                      <span>{snap.label}</span>
-                      {snap.effective_origin === 'automatic' && (
+                      <span>{snap.unreadable ? 'Unreadable snapshot' : snap.label}</span>
+                      {snap.unreadable && (
+                        <span className="rounded-full bg-destructive/10 px-2 py-0.5 text-xs text-destructive" title={snap.unreadable}>Unreadable</span>
+                      )}
+                      {!snap.unreadable && snap.effective_origin === 'automatic' && (
                         <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground" title="Taken by Agora before a change; only the last 5 are kept">Automatic</span>
                       )}
-                      {snap.effective_origin === 'lock' && (
+                      {!snap.unreadable && snap.effective_origin === 'lock' && (
                         <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-xs text-amber-700 dark:text-amber-300" title="Taken when the instance was locked. Revert returns to it until the next lock replaces it.">Lock</span>
                       )}
-                      {snap.effective_origin === 'migration' && (
+                      {!snap.unreadable && snap.effective_origin === 'migration' && (
                         <span className="rounded-full bg-sky-500/10 px-2 py-0.5 text-xs text-sky-700 dark:text-sky-300" title="Recovery point from a version move; kept">Migration</span>
                       )}
                       {snap.is_current_lkg && (
@@ -2682,6 +2706,9 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                     <span className="text-xs text-muted-foreground">
                       {formatDateTime(snap.created_at)} · {snap.file_count} file{snap.file_count !== 1 ? 's' : ''}
                     </span>
+                    {snap.unreadable && (
+                      <span className="block text-xs text-destructive">{snap.unreadable}</span>
+                    )}
                   </div>
                   <div className="flex gap-2 ml-3">
                     <button
@@ -2697,7 +2724,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                           setSnapshotDiffBusy(null);
                         }
                       }}
-                       disabled={snapshotDiffBusy === snap.id || snapshotBusy === snap.id}
+                       disabled={Boolean(snap.unreadable) || snapshotDiffBusy === snap.id || snapshotBusy === snap.id}
                       className="text-xs text-primary hover:underline disabled:opacity-50"
                     >
                       {snapshotDiffBusy === snap.id ? 'Loading diff…' : 'Show diff'}
@@ -2706,20 +2733,39 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                       onClick={async () => {
                         setSnapshotBusy(snap.id);
                         setError(null);
-                        try {
-                          await restoreSnapshot(instanceId, snap.id);
+                        const run = async (force: boolean) => {
+                          await restoreSnapshot(instanceId, snap.id, force);
                           // An expanded diff compared the pre-restore files;
                           // it would keep showing changes the restore undid.
                           setSnapshotDiff(null);
                           await reloadInstance();
                           setStatus('Snapshot restored.');
+                        };
+                        try {
+                          await run(false);
                         } catch (e) {
-                          setError(formatError(e));
+                          const message = formatError(e);
+                          const gameMayBeRunning = errorCode(e) === 'ERR_SNAPSHOT_NOT_IDLE';
+                          if (gameMayBeRunning && await confirm({
+                            title: 'The game is running',
+                            body: `${message}
+
+Restoring while the game runs can be overwritten by the game. Restore anyway?`,
+                            confirmLabel: 'Restore anyway',
+                          })) {
+                            try {
+                              await run(true);
+                            } catch (retryError) {
+                              setError(formatError(retryError));
+                            }
+                          } else {
+                            setError(message);
+                          }
                         } finally {
                           setSnapshotBusy(null);
                         }
                       }}
-                       disabled={snapshotBusy === snap.id || snapshotOperationPending}
+                       disabled={Boolean(snap.unreadable) || snapshotBusy === snap.id || snapshotOperationPending}
                       className="text-xs text-foreground hover:underline disabled:opacity-50"
                     >
                       {snapshotBusy === snap.id ? 'Restoring…' : 'Restore'}
@@ -2835,117 +2881,13 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
       )}
 
       {activeTab === 'loadout-profiles' && (
-        <section className="rounded-xl border border-border bg-card p-4 space-y-4">
-          <div className="flex items-center justify-between">
-            <h3 className="font-semibold text-sm">Loadout Profiles</h3>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={profileNameInput}
-                disabled={recoveryBlocked}
-                onChange={(e) => setProfileNameInput(e.target.value)}
-                placeholder="Profile name…"
-                className="rounded-lg border border-input bg-background px-3 py-1.5 text-sm w-48"
-              />
-              <button
-                onClick={async () => {
-                  const name = profileNameInput.trim();
-                  if (!name) return;
-                  setError(null);
-                  try {
-                    await createLoadoutProfile(instanceId, name);
-                    const result = await listLoadoutProfiles(instanceId);
-                    setProfiles(result);
-                    setProfileNameInput('');
-                    setStatus(`Profile "${name}" created.`);
-                  } catch (e) {
-                    setError(formatError(e));
-                  }
-                }}
-                disabled={recoveryBlocked || !profileNameInput.trim()}
-                className="rounded-lg bg-primary px-4 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 whitespace-nowrap"
-              >
-                Create Profile
-              </button>
-            </div>
-          </div>
-
-          <p className="text-xs text-muted-foreground">
-            A profile records which mods, resource packs, shader packs, data packs and worlds are switched on or off. Apply sets each item it records to that state. A mod it does not list, such as one added since it was saved, is asked about when you apply: keep it on, or switch it off. Packs and worlds it does not list are left as they are. Update from setup saves the profile again from what the instance has now, after showing you what would change. Configs, versions and the loader are not part of a profile.
-          </p>
-
-          {profiles.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              No loadout profiles yet. Enter a name and click Create Profile.
-            </p>
-          ) : (
-            <div className="space-y-2">
-              {profiles.map((prof) => (
-                <div key={prof.name} className="flex items-center justify-between rounded-lg border border-border px-3 py-2 text-sm">
-                  <div className="min-w-0 flex-1">
-                    <span className="font-medium block">{prof.name}</span>
-                    <span className="text-xs text-muted-foreground block">{describeLoadoutCoverage(prof)}</span>
-                  </div>
-                  <div className="flex gap-2 ml-3">
-                    <button
-                      onClick={() => requestProfileApply(prof.name)}
-                       disabled={profileBusy === prof.name || recoveryBlocked}
-                      className="text-xs text-foreground hover:underline disabled:opacity-50"
-                    >
-                      {profileBusy === prof.name ? 'Applying…' : 'Apply'}
-                    </button>
-                    <button
-                      onClick={() => requestProfileUpdate(prof.name)}
-                      disabled={profileBusy === prof.name || recoveryBlocked}
-                      className="text-xs text-foreground hover:underline disabled:opacity-50"
-                    >
-                      Update from setup
-                    </button>
-                    {confirmDeleteProfile === prof.name ? (
-                      <div className="flex gap-1">
-                        <button
-                          onClick={async () => {
-                            setProfileBusy(prof.name);
-                            setError(null);
-                            try {
-                              await deleteLoadoutProfile(instanceId, prof.name);
-                              const result = await listLoadoutProfiles(instanceId);
-                              setProfiles(result);
-                              setConfirmDeleteProfile(null);
-                            } catch (e) {
-                              setError(formatError(e));
-                            } finally {
-                              setProfileBusy(null);
-                            }
-                          }}
-                           disabled={recoveryBlocked}
-                           className="text-xs text-destructive font-medium disabled:opacity-50"
-                        >
-                          Confirm
-                        </button>
-                        <button
-                         onClick={() => setConfirmDeleteProfile(null)}
-                         disabled={recoveryBlocked}
-                          className="text-xs text-muted-foreground"
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    ) : (
-                      <button
-                         onClick={() => setConfirmDeleteProfile(prof.name)}
-                         disabled={recoveryBlocked}
-                         className="text-xs text-destructive hover:underline disabled:opacity-50"
-                      >
-                        Delete
-                      </button>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </section>
+        <LoadoutProfilesPanel
+          instanceId={instanceId}
+          disabled={recoveryBlocked}
+          onStatus={setStatus}
+          onError={setError}
+          onApplied={reloadInstance}
+        />
       )}
 
       {activeTab === 'migrate' && (
@@ -3292,6 +3234,79 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
               </div>
             )}
           </div>
+
+          {/* Card 4: server export */}
+          <div className="rounded-xl border border-border bg-card p-4 space-y-3">
+            <div className="flex items-start justify-between gap-2">
+              <h4 className="font-semibold text-sm">Export as a Minecraft server</h4>
+              <span className="rounded-full bg-muted text-muted-foreground text-xs font-semibold px-2 py-0.5 shrink-0">
+                Dedicated server
+              </span>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Writes a folder you can start with <span className="font-medium text-foreground">start.bat</span> (Windows)
+              or <span className="font-medium text-foreground">./start.sh</span> (Linux/macOS): your mods with
+              client-only ones removed, configs, the world you pick, the loader, and an
+              <span className="font-medium text-foreground"> eula.txt </span>
+              you must accept yourself. The server uses this instance's memory setting.
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Fabric and Quilt installers come from the loader's official Maven repository and are
+              checked against the <span className="font-medium text-foreground">.sha512</span> published
+              beside them; Forge and NeoForge are checked against Agora's pinned catalog. The first
+              start runs the installer, so it downloads the loader and the Minecraft server jar then.
+              Only allow an unverified download if the repository publishes no hash file at all.
+            </p>
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                <span className="font-medium text-foreground">World</span>
+                <select
+                  value={serverWorld}
+                  onChange={(event) => setServerWorld(event.target.value)}
+                  className="rounded-lg border border-input bg-background px-2 py-1 text-xs"
+                >
+                  <option value="">Most recently played</option>
+                  {serverWorlds.map((world) => (
+                    <option key={world.folder} value={world.folder}>
+                      {world.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={serverAllowUnverified}
+                  onChange={(event) => setServerAllowUnverified(event.target.checked)}
+                />
+                Allow an unverified loader download
+              </label>
+            </div>
+            <button
+              onClick={() => void handleExportServer()}
+              disabled={serverExportBusy}
+              className="rounded-lg border border-input bg-background hover:bg-accent px-3 py-1.5 text-sm font-medium disabled:opacity-50"
+            >
+              {serverExportBusy ? 'Exporting…' : 'Export server folder…'}
+            </button>
+            {serverExportResult && (
+              <div className="rounded-lg bg-accent/20 p-3 text-xs text-muted-foreground space-y-1">
+                <p>
+                  {serverExportResult.server_mods} of {serverExportResult.total_mods} mods kept
+                  {serverExportResult.removed_client_only.length > 0 &&
+                    `; client-only removed: ${serverExportResult.removed_client_only.join(', ')}`}
+                  {serverExportResult.world && `; world: ${serverExportResult.world}`}.
+                </p>
+                {serverExportResult.loader_artifact && (
+                  <p>Loader: {serverExportResult.loader_artifact}</p>
+                )}
+                <p>Accept the EULA in eula.txt before the first start.</p>
+                {serverExportResult.notes.map((note, index) => (
+                  <p key={index}>{note}</p>
+                ))}
+              </div>
+            )}
+          </div>
         </section>
       )}
 
@@ -3447,12 +3462,11 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                     <span className="block font-medium">Estimate from pack size</span>
                     <span className="block text-muted-foreground">Recalculates when enabled content changes.</span>
                   </span>
-                  <input
+                  <Switch
                     aria-label="Automatic memory allocation"
-                    type="checkbox"
                     checked={instanceMemoryMode === 'auto'}
                     disabled={recoveryBlocked}
-                    onChange={(event) => setInstanceMemoryMode(event.target.checked ? 'auto' : 'manual')}
+                    onCheckedChange={(checked) => setInstanceMemoryMode(checked ? 'auto' : 'manual')}
                   />
                 </span>
                 {copiedMemoryLabel && (
@@ -3475,8 +3489,8 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                 <input
                   aria-label="Memory allocation"
                   type="range"
-                  min={2048}
-                  max={32768}
+                  min={256}
+                  max={131072}
                   step={1}
                   value={instanceJvmMemory}
                   disabled={recoveryBlocked || instanceMemoryMode === 'auto'}
@@ -3484,9 +3498,22 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                   className="w-full accent-primary"
                 />
                 <span className="flex justify-between text-[11px] text-muted-foreground">
-                  <span>2 GB</span>
-                  <span>32 GB maximum</span>
+                  <span>256 MB</span>
+                  <span>128 GB maximum</span>
                 </span>
+                {instanceMemoryMode === 'manual' && instanceJvmMemory < 2048 && (
+                  <span className="text-xs text-destructive">
+                    Minecraft will likely run out of memory below 2 GB.
+                  </span>
+                )}
+                {instanceMemoryMode === 'manual'
+                  && memoryRecommendation
+                  && instanceJvmMemory > memoryRecommendation.system_ram_mb && (
+                    <span className="text-xs text-destructive">
+                      {formatMemoryMb(instanceJvmMemory)} is more than this machine&apos;s{' '}
+                      {formatMemoryMb(memoryRecommendation.system_ram_mb)}; the game may fail to start.
+                    </span>
+                  )}
                 {instanceMemoryMode === 'auto' && memoryRecommendation && (
                   <span className={memoryRecommendation.insufficient_system_ram ? 'text-xs text-destructive' : 'text-xs text-muted-foreground'}>
                     {memoryRecommendation.explanation}
@@ -3494,20 +3521,18 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                 )}
               </label>
 
-              <label className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2">
+              <div className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2">
                 <span>
                   <span className="block text-sm font-medium">Choose the best GC automatically</span>
                   <span className="block text-xs text-muted-foreground">Uses Generational ZGC on Java 21+ and tuned G1GC on older Java.</span>
                 </span>
-                <input
+                <Switch
                   aria-label="Automatic GC selection"
-                  type="checkbox"
                   checked={instanceGcMode === 'auto'}
                   disabled={recoveryBlocked}
-                  onChange={(e) => setInstanceGcMode(e.target.checked ? 'auto' : 'high_efficiency')}
-                  className="h-5 w-5 shrink-0 accent-primary"
+                  onCheckedChange={(checked) => setInstanceGcMode(checked ? 'auto' : 'high_efficiency')}
                 />
-              </label>
+              </div>
 
               {instanceGcMode !== 'auto' && (
                 <label className="block space-y-2">
@@ -3526,20 +3551,18 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                 </label>
               )}
 
-              <label className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2">
+              <div className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2">
                 <span>
                   <span className="block text-sm font-medium">Pre-touch allocated memory</span>
                   <span className="block text-xs text-muted-foreground">Reduces in-game stutter at the cost of a longer startup. Recommended for G1GC.</span>
                 </span>
-                <input
+                <Switch
                   aria-label="Pre-touch allocated memory"
-                  type="checkbox"
                   checked={instanceAlwaysPreTouch}
                   disabled={recoveryBlocked}
-                  onChange={(e) => setInstanceAlwaysPreTouch(e.target.checked)}
-                  className="h-5 w-5 shrink-0 accent-primary"
+                  onCheckedChange={setInstanceAlwaysPreTouch}
                 />
-              </label>
+              </div>
 
               <div className="rounded-lg bg-muted px-3 py-2 text-xs">
                 <div className="flex items-center justify-between gap-2">
@@ -3569,7 +3592,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                 <div className="space-y-2">
                   <label htmlFor="instance-java-args" className="text-sm font-medium">Additional JVM flags</label>
                   <p className="text-xs text-muted-foreground">
-                    Advanced flags are appended after Agora&apos;s managed memory settings. Do not include classpath or native-library flags.
+                    Advanced flags are appended after Agora&apos;s managed settings. A heap flag here (-Xmx, -Xms, or a RAM percentage) replaces Agora&apos;s matching one. Do not include classpath or native-library flags.
                   </p>
                   <textarea
                     id="instance-java-args"
@@ -3603,18 +3626,17 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
             {/* Allow incompatible override (Advanced Mode only) */}
             {advancedMode && (
               <div className="space-y-2">
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={instanceJavaAllowOverride}
-                    disabled={recoveryBlocked}
-                    onChange={(e) => setInstanceJavaAllowOverride(e.target.checked)}
-                    className="h-4 w-4 accent-primary"
-                  />
+                <div className="flex items-center justify-between gap-3">
                   <span className="text-sm">
                     Allow this Java version even when Minecraft requests a different version (⚠ advanced users only)
                   </span>
-                </label>
+                  <Switch
+                    aria-label="Allow this Java version even when Minecraft requests a different version"
+                    checked={instanceJavaAllowOverride}
+                    disabled={recoveryBlocked}
+                    onCheckedChange={setInstanceJavaAllowOverride}
+                  />
+                </div>
                 {instanceJavaAllowOverride && (
                   <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2">
                     <p className="text-xs text-amber-700 dark:text-amber-400 font-medium">⚠ Compatibility warning</p>
@@ -3852,91 +3874,6 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
         />
       )}
 
-      <Dialog
-        open={unlistedChoice !== null}
-        onOpenChange={(open) => { if (!open) setUnlistedChoice(null); }}
-      >
-        <DialogContent className="max-h-[85vh] max-w-lg overflow-hidden flex flex-col gap-3">
-          <DialogTitle className="shrink-0">Mods this profile does not list</DialogTitle>
-          <DialogDescription className="shrink-0">
-            {`Profile "${unlistedChoice?.profile ?? ''}" does not list ${unlistedChoice?.mods.length ?? 0} enabled ${unlistedChoice?.mods.length === 1 ? 'mod' : 'mods'}, such as ones added since it was saved. Keep them on, or switch them off?`}
-          </DialogDescription>
-          <ul className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border p-2 font-mono text-xs">
-            {(unlistedChoice?.mods ?? []).map((mod) => (
-              <li key={mod} className="truncate py-0.5">{mod}</li>
-            ))}
-          </ul>
-          <div className="flex shrink-0 justify-end gap-2">
-            <button
-              type="button"
-              onClick={() => setUnlistedChoice(null)}
-              className="rounded-lg border border-input px-4 py-2 text-sm font-medium hover:bg-accent"
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                const choice = unlistedChoice;
-                setUnlistedChoice(null);
-                if (choice) void runProfileApply(choice.profile, 'keep');
-              }}
-              className="rounded-lg border border-input px-4 py-2 text-sm font-medium hover:bg-accent"
-            >
-              Keep them on
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                const choice = unlistedChoice;
-                setUnlistedChoice(null);
-                if (choice) void runProfileApply(choice.profile, 'off');
-              }}
-              className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90"
-            >
-              Switch them off
-            </button>
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog
-        open={updateReview !== null}
-        onOpenChange={(open) => { if (!open) setUpdateReview(null); }}
-      >
-        <DialogContent className="max-h-[85vh] max-w-lg overflow-hidden flex flex-col gap-3">
-          <DialogTitle className="shrink-0">{`Update "${updateReview?.profile ?? ''}" from the current setup?`}</DialogTitle>
-          <DialogDescription className="shrink-0">
-            {`Saving records every mod, pack and world on this instance as it is now, on or off, and drops the ones that are gone. These changes would be saved (${updateReview?.changes.length ?? 0}):`}
-          </DialogDescription>
-          <ul className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border p-2 text-xs">
-            {(updateReview?.changes ?? []).map((change) => (
-              <li key={`${change.content_type}:${change.filename}`} className="truncate py-0.5">{describeLoadoutChange(change)}</li>
-            ))}
-          </ul>
-          <div className="flex shrink-0 justify-end gap-2">
-            <button
-              type="button"
-              onClick={() => setUpdateReview(null)}
-              className="rounded-lg border border-input px-4 py-2 text-sm font-medium hover:bg-accent"
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                const review = updateReview;
-                setUpdateReview(null);
-                if (review) void saveProfileUpdate(review.profile);
-              }}
-              className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90"
-            >
-              Save changes
-            </button>
-          </div>
-        </DialogContent>
-      </Dialog>
-
       {/* Optional dependencies overlay — the standard-editor mirror of the
           high-interaction instance editor's optional panel. Every listed target is
           installed (the dependency graph only reports resolved pairs), so rows
@@ -4046,17 +3983,6 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
         </Dialog>
       )}
     </div>
-  );
-}
-
-function BackButton({ onBack }: { onBack: () => void }) {
-  return (
-    <button
-      onClick={onBack}
-      className="rounded-lg border border-input bg-background hover:bg-accent px-3 py-1.5 text-sm font-medium"
-    >
-      ← Back
-    </button>
   );
 }
 

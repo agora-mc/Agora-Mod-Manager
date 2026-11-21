@@ -106,6 +106,13 @@ export function defaultLiveLoad(
   );
 }
 
+/** Verdicts that mean the session crashed, failed to start or froze. */
+function isCrashVerdict(verdict: import('@/lib/tauri').CrashInvestigationVerdict | null | undefined): boolean {
+  return verdict?.kind === 'crashed'
+    || verdict?.kind === 'failed_to_start'
+    || verdict?.kind === 'froze';
+}
+
 /** Assemble `LiveHostData` from the fragment reads, preserving availability. */
 export function buildHostData(reads: LiveReads, contentIcons: import('./readAdapters').ContentIcon[] = []): LiveHostData {
   const scene = assembleLiveScene(
@@ -125,13 +132,16 @@ export function buildHostData(reads: LiveReads, contentIcons: import('./readAdap
         ? ok(
             // "No evidence" is not a crash, and neither is an ordinary
             // latest.log: a never-launched (or cleanly exited) instance must
-            // not be told its game stopped. Only a crash report, JVM fatal log
-            // or the output of a launch that exited abnormally counts.
+            // not be told its game stopped. The live verdict is the source of
+            // truth, so a crash with only a supplementary log (a JVM that
+            // refused to start) still shows; the source kinds below keep older
+            // answers working.
             reads.investigation.value
-              && reads.investigation.value.evidence.sources.some((source) =>
-                source.meta.kind === 'CrashReport'
-                || source.meta.kind === 'JvmFatalErrorLog'
-                || source.meta.kind === 'LaunchOutput')
+              && (isCrashVerdict(reads.investigation.value.verdict)
+                || reads.investigation.value.evidence.sources.some((source) =>
+                  source.meta.kind === 'CrashReport'
+                  || source.meta.kind === 'JvmFatalErrorLog'
+                  || source.meta.kind === 'LaunchOutput'))
               ? crashToVisual(reads.investigation.value)
               : null,
           )

@@ -1,8 +1,8 @@
-# Agora Minecraft Launcher
+# Agora Mod Manager
 
 > This is not a warehouse. This is a boutique.
 
-Agora is a decentralized, ad-free, open-source Minecraft launcher and discovery platform. Agora uses community-curated manifests compiled into a signed catalog to provide a community managed, curated list of mods from any source. 
+Agora is a decentralized, ad-free, open-source mod manager and discovery platform for games. Minecraft is included as the default, other games come as plugins; Skyrim Special Edition is the first, shipped as an official plugin you install from the "More games" card on Home or in Settings > Game support. Agora uses community-curated manifests compiled into a signed catalog to provide a community managed, curated list of mods from any source. The catalog is mostly Minecraft today. 
 
 If you aren't a contributor or developer, I recommend visiting Agora's website, https://agoramc.com/.
 
@@ -12,7 +12,7 @@ I have a degree in game development and computer science. Using my experience, I
 
 ## Platforms and Signing
 
-Windows is tested and signed, I don't have macOS or Linux right now so they are not officially tested, releases are provided for your convenience but are not guaranteed to be functional.
+Windows is tested and signed. I don't have macOS or Linux right now, so they are not officially tested, and releases are provided for your convenience but are not guaranteed to be functional. Linux builds run games on Steam through Proton with `agora games wrap %command%`; that path has not been tested on real hardware yet.
 
 ## Download and documentation
 
@@ -23,6 +23,7 @@ Windows is tested and signed, I don't have macOS or Linux right now so they are 
 - [Troubleshooting](https://agoramc.com/docs/desktop-troubleshooting) and [FAQ](https://agoramc.com/docs/faq) for the desktop app
 - [CLI troubleshooting](https://agoramc.com/docs/troubleshooting)
 - [CLI reference](https://agoramc.com/docs/cli)
+- [Adding a game](./docs/plugins/game-packages.md) and [community plugins](./docs/plugins/README.md) for game and plugin authors
 - [How the documentation is organized](./docs/README.md)
 
 Agora also includes a searchable **Help & Guide** tied to the current desktop interface. The website also publishes the same guides as well as other useful documentation.
@@ -44,7 +45,8 @@ Agora supports two launch modes. Direct launch runs Minecraft inside Agora and g
 - Curated and optional Modrinth discovery with instance-aware compatibility labels.
 - Dependency-aware install plans with one review before files change.
 - Loader compatibility evidence, recommended signed versions, compatible alternatives, and manual candidates when a capability cannot be verified.
-- Health checks, Crash Doctor with guided mod bisect, snapshots, Last Known Good recovery, loadouts, and lockfiles.
+- Health checks and a Crash Doctor for Minecraft and other supported games, with guided mod bisect, snapshots, Last Known Good recovery, loadouts, and lockfiles.
+- Game instances for other games: pinned bases, framework and plugin load-order checks before launch, plugin conflict review with load-after rules, tools, and Mod Organizer 2 import.
 - Imports from supported packs and launcher profiles, plus `.mrpack` and Agora pack export.
 - Surgical pack updates that keep the mods you added and ask before overwriting a file you edited.
 - Minecraft version migration that reports which mods have a build for the target before moving anything.

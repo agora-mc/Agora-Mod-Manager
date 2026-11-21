@@ -1,0 +1,8 @@
+---- Not Really A Crash Report ----
+// This file only looks similar.
+
+Time: 2026-05-06 07:08:09
+Description: A test that must not be treated as a crash report
+
+java.lang.IllegalStateException: this is not a crash report
+	at com.example.mod.FakeThing.run(FakeThing.java:1)

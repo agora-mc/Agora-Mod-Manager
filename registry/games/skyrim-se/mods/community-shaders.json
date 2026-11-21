@@ -1,0 +1,24 @@
+{
+  "id": "community-shaders",
+  "name": "Community Shaders",
+  "content_type": "mod",
+  "author": "Community Shaders Team",
+  "license": "GPL-3.0-or-later",
+  "game": "skyrim-se",
+  "download_strategy": "github_release",
+  "source_identifier": "community-shaders/skyrim-community-shaders",
+  "page_url": "https://github.com/community-shaders/skyrim-community-shaders/releases",
+  "description": "An open source shader framework with a growing set of graphics features.",
+  "game_compatibility": [
+    {
+      "stores": ["steam", "gog"],
+      "game_versions": ["1.5.*", "1.6.*", "1.7.*"],
+      "requires": [
+        { "framework": "skse" },
+        { "framework": "address-library" }
+      ],
+      "asset": "CommunityShaders_AIO-*.7z"
+    }
+  ],
+  "curator_note": "Installs the AIO (all features) package; the plain CommunityShaders-*.zip is the core only. Stable releases only: the project publishes many -pr prereleases, which the installer skips. Requires SKSE and Address Library."
+}

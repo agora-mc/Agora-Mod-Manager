@@ -30,7 +30,9 @@
 //! coordination state must not be something a restore can roll back.
 
 use crate::app_paths::AppPaths;
+use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
+use crate::lock_manager::{LockGuard, LockResource};
 use crate::process_identity::{self, ProcessIdentity};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -94,12 +96,26 @@ fn write_lease(paths: &AppPaths, lease: &RuntimeLease) -> LauncherResult<()> {
     })
 }
 
-/// Read the current lease, if any. A corrupt lease is treated as present and
-/// unreadable rather than absent — see [`check_idle`].
+/// Read the current lease, if any. Only a missing file means "no lease": a permission denial, a
+/// Windows sharing violation, a directory at the path or any other read failure is "can't tell"
+/// and returned as an error, so no caller can proceed as if the instance were idle. A corrupt or
+/// future-version lease is likewise reported as occupied — see [`check_idle`].
 pub fn read(paths: &AppPaths, instance_id: &str) -> LauncherResult<Option<RuntimeLease>> {
     let path = lease_path(paths, instance_id)?;
-    let Ok(bytes) = fs::read(&path) else {
-        return Ok(None);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(LauncherError::Generic {
+                code: "ERR_RUNTIME_LEASE_UNREADABLE".into(),
+                message: format!(
+                    "The runtime record for '{instance_id}' at {} could not be read ({error}), so \
+                     it is not possible to tell whether a game is using it. Close any running game \
+                     and try again.",
+                    path.display()
+                ),
+            })
+        }
     };
     match serde_json::from_slice::<RuntimeLease>(&bytes) {
         Ok(lease) if lease.schema_version == RUNTIME_LEASE_SCHEMA_VERSION => Ok(Some(lease)),
@@ -145,6 +161,29 @@ pub fn publish_running(
     generation: &str,
     identity: ProcessIdentity,
 ) -> LauncherResult<()> {
+    write_running(paths, instance_id, generation, Some(identity))
+}
+
+/// Record that the game is running although its OS identity could not be read.
+///
+/// The launcher is watching the child handle, so it can still clear the lease
+/// when the game exits. After an Agora restart there is no identity to verify:
+/// the lease is then treated as an unfinished launch (indeterminate), never as
+/// a free instance, until the user clears it.
+pub fn publish_running_unverified(
+    paths: &AppPaths,
+    instance_id: &str,
+    generation: &str,
+) -> LauncherResult<()> {
+    write_running(paths, instance_id, generation, None)
+}
+
+fn write_running(
+    paths: &AppPaths,
+    instance_id: &str,
+    generation: &str,
+    identity: Option<ProcessIdentity>,
+) -> LauncherResult<()> {
     write_lease(
         paths,
         &RuntimeLease {
@@ -152,7 +191,7 @@ pub fn publish_running(
             instance_id: instance_id.to_string(),
             generation: generation.to_string(),
             state: RuntimeState::Running,
-            identity: Some(identity),
+            identity,
             launcher_pid: std::process::id(),
             recorded_at: chrono::Utc::now().to_rfc3339(),
         },
@@ -182,6 +221,25 @@ pub fn clear(paths: &AppPaths, instance_id: &str, generation: Option<&str>) -> L
             message: format!("Could not clear the runtime lease: {error}"),
         }),
     }
+}
+
+/// Whether the runtime lease proves the recorded game is gone. Only a `Running` lease whose
+/// process identity no longer verifies is proof; no lease at all is not, because a delegated
+/// launch keeps no process identity and the game may still run. Never clears anything.
+pub fn game_is_provably_gone(paths: &AppPaths, instance_id: &str) -> bool {
+    match read(paths, instance_id) {
+        Ok(Some(lease)) => match (lease.state, lease.identity) {
+            (RuntimeState::Running, Some(identity)) => process_identity::verify(&identity).is_err(),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether this instance has any runtime record at all, readable or not. An unreadable record
+/// counts as present: it cannot prove the game is gone.
+pub fn game_has_record(paths: &AppPaths, instance_id: &str) -> bool {
+    !matches!(read(paths, instance_id), Ok(None))
 }
 
 /// Establish that no game is using this instance.
@@ -223,9 +281,349 @@ pub fn check_idle(paths: &AppPaths, instance_id: &str) -> LauncherResult<()> {
     }
 }
 
+/// What is known about whether an instance's game is using it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GameActivity {
+    /// A live game, a launch between the swap and the spawn, or a view/wrap of the instance.
+    Running,
+    /// Nothing says a game is using it.
+    Idle,
+    /// A record that answers the question cannot be read. The risky action must refuse.
+    CouldNotTell(String),
+}
+
+/// Whether this instance's game is using it, from one place for every caller.
+///
+/// Game-free: it reads the instance's own user-files journal (which names its game and store), the
+/// session ledger's open sessions, and the runtime lease the Minecraft launch publishes. An open
+/// session with a live owner is a launch that has not ended, which is the only record a Linux view
+/// writes; a game with no journaled files writes no journal either. An unreadable record is
+/// [`GameActivity::CouldNotTell`], never `Idle`: a missing or unreadable store must not be read as
+/// "no game is running".
+pub fn game_activity(ctx: &Ctx, instance_id: &str) -> GameActivity {
+    // The runtime lease. Minecraft publishes one; another game has none.
+    match read(&ctx.paths, instance_id) {
+        Err(error) => return GameActivity::CouldNotTell(error.to_string()),
+        Ok(Some(lease)) => match (lease.state, &lease.identity) {
+            (RuntimeState::Running, Some(identity))
+                if process_identity::verify(identity).is_ok() =>
+            {
+                return GameActivity::Running;
+            }
+            // A launch with nothing to verify was recorded but never finished starting. It blocks
+            // mutation exactly as `check_idle` says it must.
+            (RuntimeState::Running, None) | (RuntimeState::Starting, _) => {
+                return GameActivity::Running;
+            }
+            _ => {}
+        },
+        Ok(None) => {}
+    }
+
+    // The instance's user-files journal: live processes, a running-from folder, or a launch that
+    // swapped the files in and has not spawned yet.
+    match instance_game_and_store(ctx, instance_id) {
+        Ok(Some((game, store))) => match crate::game_user_files::details(ctx, &game, &store) {
+            Err(error) => return GameActivity::CouldNotTell(error.to_string()),
+            Ok(Some(details)) if details.instance == instance_id && details.running => {
+                return GameActivity::Running;
+            }
+            _ => {}
+        },
+        Ok(None) => {}
+        Err(error) => return GameActivity::CouldNotTell(error),
+    }
+
+    // The session ledger's open sessions. A live owner means the session has not ended; this is
+    // the only record a Linux view or a game with no journaled files writes.
+    match ledger_session_running(ctx, instance_id) {
+        Ok(true) => GameActivity::Running,
+        Ok(false) => GameActivity::Idle,
+        Err(error) => GameActivity::CouldNotTell(error),
+    }
+}
+
+/// Refuse a change while the instance's game may be using it. `action` completes the sentence
+/// "close the game before ...". Only proven idle passes: running and "could not tell" both refuse.
+pub fn ensure_game_not_running(ctx: &Ctx, instance_id: &str, action: &str) -> Result<(), String> {
+    match game_activity(ctx, instance_id) {
+        GameActivity::Idle => Ok(()),
+        GameActivity::Running => Err(format!(
+            "'{instance_id}' is running; close the game before {action}"
+        )),
+        GameActivity::CouldNotTell(reason) => Err(format!(
+            "could not tell whether '{instance_id}' is running ({reason}); refusing to {action}"
+        )),
+    }
+}
+
+/// Permission to change an instance, from one place for every service.
+///
+/// Holding this proves two things at once: this process has the instance's
+/// exclusive writer lock, and (unless the user explicitly overrode it) the
+/// instance's game is not running. Services that change an instance take it
+/// instead of calling [`check_idle`] and `LockManager::acquire` themselves;
+/// functions they call while it is held take `&InstanceGuard` rather than
+/// taking the lock again (it is not re-entrant).
+///
+/// The game check comes *before* the wait for the lock. A running game holds no
+/// lock — the lock covers only the mutation or the launch through spawn — so
+/// asking first turns a 30-second timeout into an immediate, named refusal.
+/// The check is repeated after the lock is taken, because a launch that was
+/// already in flight can have published its lease while this guard waited.
+#[derive(Debug)]
+pub struct InstanceGuard {
+    instance_id: String,
+    lock: LockGuard,
+    allow_while_running: bool,
+}
+
+impl InstanceGuard {
+    /// Take the instance lock and make sure no game is using the instance.
+    ///
+    /// Blocks while another Agora operation holds the lock (the default
+    /// timeout). Use [`Self::for_mutation_async`] from async code.
+    pub fn for_mutation(ctx: &Ctx, instance_id: &str, operation: &str) -> LauncherResult<Self> {
+        Self::take(ctx, instance_id, operation, false, |resource, operation| {
+            ctx.lock_manager.acquire(resource, operation)
+        })
+    }
+
+    /// The explicit user override for the running-game check: take the lock and
+    /// allow the change while a game is running. The lock itself is never
+    /// skipped, so two Agora operations still never change one instance at once.
+    pub fn for_mutation_while_running(
+        ctx: &Ctx,
+        instance_id: &str,
+        operation: &str,
+    ) -> LauncherResult<Self> {
+        Self::take(ctx, instance_id, operation, true, |resource, operation| {
+            ctx.lock_manager.acquire(resource, operation)
+        })
+    }
+
+    /// Async counterpart of [`Self::for_mutation`]. The wait for a contested
+    /// lock yields to the runtime instead of blocking a worker thread.
+    pub async fn for_mutation_async(
+        ctx: &Ctx,
+        instance_id: &str,
+        operation: &str,
+    ) -> LauncherResult<Self> {
+        Self::take_async(ctx, instance_id, operation, false).await
+    }
+
+    /// Async counterpart of [`Self::for_mutation_while_running`].
+    pub async fn for_mutation_while_running_async(
+        ctx: &Ctx,
+        instance_id: &str,
+        operation: &str,
+    ) -> LauncherResult<Self> {
+        Self::take_async(ctx, instance_id, operation, true).await
+    }
+
+    fn take(
+        ctx: &Ctx,
+        instance_id: &str,
+        operation: &str,
+        allow_while_running: bool,
+        acquire: impl FnOnce(LockResource, &str) -> LauncherResult<LockGuard>,
+    ) -> LauncherResult<Self> {
+        if !allow_while_running {
+            ensure_mutation_allowed(ctx, instance_id)?;
+        }
+        let lock = acquire(LockResource::Instance(instance_id.to_string()), operation)?;
+        if !allow_while_running {
+            ensure_mutation_allowed(ctx, instance_id)?;
+        }
+        Ok(Self {
+            instance_id: instance_id.to_string(),
+            lock,
+            allow_while_running,
+        })
+    }
+
+    async fn take_async(
+        ctx: &Ctx,
+        instance_id: &str,
+        operation: &str,
+        allow_while_running: bool,
+    ) -> LauncherResult<Self> {
+        if !allow_while_running {
+            ensure_mutation_allowed(ctx, instance_id)?;
+        }
+        let lock = ctx
+            .lock_manager
+            .acquire_async(LockResource::Instance(instance_id.to_string()), operation)
+            .await?;
+        if !allow_while_running {
+            ensure_mutation_allowed(ctx, instance_id)?;
+        }
+        Ok(Self {
+            instance_id: instance_id.to_string(),
+            lock,
+            allow_while_running,
+        })
+    }
+
+    /// Whether the user explicitly allowed this change while the game runs. Services
+    /// that have their own running-session check use this to skip it as well.
+    pub fn allows_running(&self) -> bool {
+        self.allow_while_running
+    }
+
+    /// The instance this guard authorises changes to.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// The underlying lock path, for callers that pass it on.
+    pub fn lock(&self) -> &LockGuard {
+        &self.lock
+    }
+}
+
+fn ensure_mutation_allowed(ctx: &Ctx, instance_id: &str) -> LauncherResult<()> {
+    // The runtime lease first, because it is the record that keeps its own
+    // error codes: `ERR_INSTANCE_RUNNING` for a live game and
+    // `ERR_INSTANCE_LAUNCH_INDETERMINATE` for a launch with nothing to verify.
+    check_idle(&ctx.paths, instance_id)?;
+    match game_activity(ctx, instance_id) {
+        GameActivity::Idle => Ok(()),
+        GameActivity::Running => Err(LauncherError::Generic {
+            code: "ERR_INSTANCE_RUNNING".into(),
+            message: format!(
+                "The game is running in '{instance_id}'; close it before changing this instance."
+            ),
+        }),
+        GameActivity::CouldNotTell(reason) => Err(LauncherError::Generic {
+            code: "ERR_INSTANCE_LAUNCH_INDETERMINATE".into(),
+            message: format!(
+                "could not tell whether the game is running in '{instance_id}' ({reason}); \
+                 refusing to change this instance."
+            ),
+        }),
+    }
+}
+
+fn instance_game_and_store(
+    ctx: &Ctx,
+    instance_id: &str,
+) -> Result<Option<(agora_game_api::GameId, agora_game_api::StoreId)>, String> {
+    // The manifest is the instance's own record and needs no database row. It names the game and
+    // store the user-files journal is keyed by.
+    match crate::game_instance::get_manifest(ctx, instance_id) {
+        Ok(manifest) => Ok(
+            crate::game_instance::session_store(&manifest.base, &manifest)
+                .map(|store| (manifest.game.clone(), store)),
+        ),
+        Err(crate::game_instance::InstanceError::NotFound(_)) => Ok(None),
+        Err(error) => {
+            // A Minecraft manifest is not a generic instance manifest: it has no generic `base`
+            // and therefore no user-files journal keyed by a store. That is "no journal", not an
+            // unreadable record. A generic manifest whose base is present but damaged still
+            // fails closed.
+            let manifest_path = ctx
+                .paths
+                .instance_manifest(instance_id)
+                .map_err(|e| e.to_string())?;
+            let Ok(bytes) = std::fs::read(&manifest_path) else {
+                return Err(error.to_string());
+            };
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            let game_is_minecraft = value
+                .get("game")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|game| game == "minecraft");
+            match value.get("base") {
+                None | Some(serde_json::Value::Null) if game_is_minecraft => Ok(None),
+                _ => Err(error.to_string()),
+            }
+        }
+    }
+}
+
+fn ledger_session_running(ctx: &Ctx, instance_id: &str) -> Result<bool, String> {
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db())
+        .map_err(|error| format!("the session store could not be read: {error}"))?;
+    let open = crate::session_ledger::open_sessions_for_instance(&conn, instance_id)
+        .map_err(|error| format!("the session store could not be read: {error}"))?;
+    if open.is_empty() {
+        return Ok(false);
+    }
+    for session in &open {
+        if let (Some(pid), Some(started)) = (session.owner_pid, session.owner_start) {
+            if crate::session_ledger::Owner::is_alive(pid, started as u64) {
+                return Ok(true);
+            }
+        }
+    }
+    // A gone owner says nothing about the game. With a runtime record that cannot prove the game
+    // gone, the session may still be running (a delegated launch keeps no process identity).
+    Ok(game_has_record(&ctx.paths, instance_id) && !game_is_provably_gone(&ctx.paths, instance_id))
+}
+
+/// Stop the game running an instance, from any process.
+///
+/// A session this process launched is stopped through the session it tracks. Otherwise the game
+/// is found through the runtime lease the launch published, which carries its OS identity, and is
+/// stopped through [`ProcessSessionManager::terminate`](crate::process_session_manager::ProcessSessionManager::terminate)
+/// with the same pid and identity checks: a pid that now belongs to another program is never
+/// killed. A launch that recorded no identity (one that never finished starting, or the official
+/// launcher's, which Agora does not track) cannot be stopped here. Returns the stopped pid.
+pub fn stop_game(ctx: &Ctx, instance_id: &str) -> LauncherResult<u32> {
+    let sessions = &ctx.process_session_manager;
+    if let Some(session) = sessions
+        .list()
+        .into_iter()
+        .find(|session| session.instance_id == instance_id)
+    {
+        sessions.terminate(session.session_id, session.pid)?;
+        return Ok(session.pid);
+    }
+    let not_running = || LauncherError::Generic {
+        code: "ERR_GAME_NOT_RUNNING".into(),
+        message: format!("Agora has no record of a running game for '{instance_id}'."),
+    };
+    let lease = read(&ctx.paths, instance_id)?.ok_or_else(not_running)?;
+    let identity = match (lease.state, lease.identity) {
+        (RuntimeState::Running, Some(identity)) => identity,
+        (RuntimeState::Running, None) | (RuntimeState::Starting, _) => {
+            return Err(LauncherError::Generic {
+                code: "ERR_GAME_IDENTITY_UNKNOWN".into(),
+                message: format!(
+                    "A launch of '{instance_id}' was recorded without the game's process identity, \
+                     so Agora cannot safely tell which process to stop. Close the game yourself."
+                ),
+            })
+        }
+    };
+    let pid = identity.pid;
+    let session_id = uuid::Uuid::new_v4().as_u64_pair().0;
+    sessions.register(crate::process_session_manager::ProcessSession {
+        instance_id: instance_id.to_string(),
+        session_id,
+        pid,
+        process_identity: identity,
+        snapshot_id: String::new(),
+        start_time: std::time::SystemTime::now(),
+        attached: false,
+        user_cancelled: false,
+    })?;
+    let result = sessions.terminate(session_id, pid);
+    // The session existed only to run the checks; nothing in this process waits on its exit.
+    sessions.remove(session_id);
+    sessions.take_user_stop(session_id);
+    result.map(|()| pid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn init_test_state(ctx: &Ctx) {
+        crate::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    }
 
     fn paths() -> (AppPaths, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -243,27 +641,13 @@ mod tests {
     #[test]
     fn a_live_game_blocks_mutation() {
         let (paths, _tmp) = paths();
-        let mut child = if cfg!(windows) {
-            std::process::Command::new("cmd.exe")
-                .args(["/c", "ping", "-n", "60", "127.0.0.1"])
-                .stdout(std::process::Stdio::null())
-                .spawn()
-                .unwrap()
-        } else {
-            std::process::Command::new("sleep")
-                .arg("60")
-                .spawn()
-                .unwrap()
-        };
-        let identity = process_identity::capture(child.id()).unwrap();
+        // This test process is a live process with a verifiable identity.
+        let identity = process_identity::capture(std::process::id()).unwrap();
         let generation = publish_starting(&paths, "demo").unwrap();
         publish_running(&paths, "demo", &generation, identity).unwrap();
 
         let error = check_idle(&paths, "demo").unwrap_err();
         assert!(format!("{error:?}").contains("ERR_INSTANCE_RUNNING"));
-
-        let _ = child.kill();
-        let _ = child.wait();
     }
 
     /// The launcher dying does not prove the game did, so a half-published
@@ -300,5 +684,182 @@ mod tests {
         let path = lease_path(&paths, "demo").unwrap();
         fs::write(&path, b"{ this is not a lease").unwrap();
         assert!(check_idle(&paths, "demo").is_err());
+    }
+
+    /// A lease record that cannot be read at all (a directory at its path, a permission denial or
+    /// a sharing violation) must be can't-tell, never a missing lease that reads as idle.
+    #[test]
+    fn an_io_failure_reading_a_lease_is_not_idle() {
+        let (paths, _tmp) = paths();
+        let path = lease_path(&paths, "demo").unwrap();
+        fs::create_dir(&path).unwrap();
+
+        let error = read(&paths, "demo").unwrap_err();
+        assert_eq!(error.code(), "ERR_RUNTIME_LEASE_UNREADABLE");
+        assert!(
+            error.to_string().contains("try again"),
+            "a transient read failure must give a retryable message: {error}"
+        );
+        let idle = check_idle(&paths, "demo").unwrap_err();
+        assert_eq!(idle.code(), "ERR_RUNTIME_LEASE_UNREADABLE");
+        assert!(game_has_record(&paths, "demo"));
+        assert!(!game_is_provably_gone(&paths, "demo"));
+    }
+
+    #[test]
+    fn a_running_game_refuses_the_guard_at_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = Ctx::for_testing(tmp.path().to_path_buf());
+        init_test_state(&ctx);
+        let identity = process_identity::capture(std::process::id()).unwrap();
+        let generation = publish_starting(&ctx.paths, "demo").unwrap();
+        publish_running(&ctx.paths, "demo", &generation, identity).unwrap();
+
+        let error = InstanceGuard::for_mutation(&ctx, "demo", "test").unwrap_err();
+        assert_eq!(error.code(), "ERR_INSTANCE_RUNNING");
+    }
+
+    #[test]
+    fn the_running_game_override_still_takes_the_lock() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = Ctx::for_testing(tmp.path().to_path_buf());
+        init_test_state(&ctx);
+        let identity = process_identity::capture(std::process::id()).unwrap();
+        let generation = publish_starting(&ctx.paths, "demo").unwrap();
+        publish_running(&ctx.paths, "demo", &generation, identity).unwrap();
+
+        let guard = InstanceGuard::for_mutation_while_running(&ctx, "demo", "test").unwrap();
+        assert_eq!(guard.instance_id(), "demo");
+        // Another operation still cannot take the same lock, override or not.
+        let other = crate::lock_manager::LockManager::new(ctx.paths.locks_root().to_path_buf());
+        assert!(other
+            .acquire_with_timeout(
+                LockResource::Instance("demo".into()),
+                "other",
+                std::time::Duration::ZERO,
+                None,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn an_idle_instance_yields_the_guard_and_blocks_a_second_writer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = Ctx::for_testing(tmp.path().to_path_buf());
+        init_test_state(&ctx);
+        let guard = InstanceGuard::for_mutation(&ctx, "demo", "first").unwrap();
+        let other = crate::lock_manager::LockManager::new(ctx.paths.locks_root().to_path_buf());
+        assert!(other
+            .acquire_with_timeout(
+                LockResource::Instance("demo".into()),
+                "second",
+                std::time::Duration::ZERO,
+                None,
+            )
+            .is_err());
+        drop(guard);
+        InstanceGuard::for_mutation(&ctx, "demo", "third").unwrap();
+    }
+
+    /// The async form must wait with the runtime, not block its only thread.
+    #[test]
+    fn an_async_guard_does_not_block_a_current_thread_runtime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = Ctx::for_testing(tmp.path().to_path_buf());
+        init_test_state(&ctx);
+        let holder = crate::lock_manager::LockManager::new(ctx.paths.locks_root().to_path_buf());
+        let _held = holder
+            .acquire(LockResource::Instance("demo".into()), "holder")
+            .unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // If the guard blocked the thread instead of awaiting, the timer
+            // could not fire and this test would hang instead of failing.
+            let waited = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                InstanceGuard::for_mutation_async(&ctx, "demo", "waiter"),
+            )
+            .await;
+            assert!(waited.is_err(), "the async guard should have yielded");
+            drop(_held);
+            InstanceGuard::for_mutation_async(&ctx, "demo", "after")
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn only_a_stale_running_lease_proves_the_game_is_gone() {
+        let (paths, _tmp) = paths();
+        assert!(
+            !game_is_provably_gone(&paths, "demo"),
+            "no lease is not proof"
+        );
+
+        let identity = process_identity::capture(std::process::id()).unwrap();
+        let generation = publish_starting(&paths, "demo").unwrap();
+        publish_running(&paths, "demo", &generation, identity.clone()).unwrap();
+        assert!(
+            !game_is_provably_gone(&paths, "demo"),
+            "a live game is not gone"
+        );
+
+        let stale = crate::process_identity::ProcessIdentity {
+            pid: u32::MAX - 2,
+            ..identity
+        };
+        publish_running(&paths, "demo", &generation, stale).unwrap();
+        assert!(game_is_provably_gone(&paths, "demo"));
+
+        publish_starting(&paths, "demo").unwrap();
+        assert!(
+            !game_is_provably_gone(&paths, "demo"),
+            "an unfinished launch is not proof"
+        );
+    }
+
+    fn stop_ctx() -> (Ctx, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = crate::ctx::CoreContext::for_testing(tmp.path().to_path_buf());
+        fs::create_dir_all(ctx.paths.locks_root()).unwrap();
+        (ctx, tmp)
+    }
+
+    #[test]
+    fn stopping_an_instance_with_no_launch_record_is_an_error() {
+        let (ctx, _tmp) = stop_ctx();
+        let error = stop_game(&ctx, "demo").unwrap_err();
+        assert_eq!(error.code(), "ERR_GAME_NOT_RUNNING");
+    }
+
+    #[test]
+    fn a_launch_without_an_identity_is_never_guessed_at() {
+        let (ctx, _tmp) = stop_ctx();
+        publish_starting(&ctx.paths, "demo").unwrap();
+        let error = stop_game(&ctx, "demo").unwrap_err();
+        assert_eq!(error.code(), "ERR_GAME_IDENTITY_UNKNOWN");
+        assert!(ctx.process_session_manager.list().is_empty());
+    }
+
+    #[test]
+    fn a_recorded_game_that_is_gone_is_reported_stale_and_nothing_is_kept() {
+        let (ctx, _tmp) = stop_ctx();
+        let me = process_identity::capture_self().expect("identity of this test process");
+        let gone = ProcessIdentity {
+            pid: u32::MAX - 2,
+            ..me
+        };
+        let generation = publish_starting(&ctx.paths, "demo").unwrap();
+        publish_running(&ctx.paths, "demo", &generation, gone).unwrap();
+        let error = stop_game(&ctx, "demo").unwrap_err();
+        assert!(
+            matches!(error, LauncherError::ProcessStale { .. }),
+            "{error:?}"
+        );
+        assert!(ctx.process_session_manager.list().is_empty());
     }
 }

@@ -58,6 +58,7 @@ function sortValue(row: InstalledContentRow, column: SortColumn): string | numbe
     case 'enabled': return row.enabled ? 1 : 0;
     case 'agora_score': return row.agora_score;
     case 'modrinth_downloads': return row.modrinth_downloads;
+    case 'load_order': return null;
   }
 }
 
@@ -75,7 +76,16 @@ export function compareInstalledContent(a: InstalledContentRow, b: InstalledCont
   return filename !== 0 ? filename : a.key.localeCompare(b.key);
 }
 
-export function sortInstalledContent(rows: InstalledContentRow[], sort: SortState): InstalledContentRow[] {
+export function sortInstalledContent(
+  rows: InstalledContentRow[],
+  sort: SortState,
+  positionForRow?: (row: InstalledContentRow) => number,
+): InstalledContentRow[] {
+  if (sort.column === 'load_order') {
+    if (!positionForRow) return [...rows];
+    const direction = sort.direction === 'desc' ? -1 : 1;
+    return [...rows].sort((a, b) => (positionForRow(a) - positionForRow(b)) * direction);
+  }
   if (!sort.direction) return [...rows];
   const direction = sort.direction === 'asc' ? 1 : -1;
   return [...rows].sort((a, b) => {

@@ -1,0 +1,82 @@
+{
+  "contract": 1,
+  "games": ["skyrim-se"],
+  "sources": [
+    {
+      "id": "crash_logger",
+      "where": { "root": "user_data", "location": "documents", "path": "My Games/Skyrim Special Edition/SKSE" },
+      "match": { "glob": "crash-*.log" },
+      "format": "crash_logger",
+      "bind": ["pid_in_facts", { "time": { "before_s": 2, "after_s": 10 } }],
+      "role": "primary",
+      "privacy": "personal"
+    }
+  ],
+  "parsers": [
+    {
+      "id": "crash_logger",
+      "entry": { "script": { "export": "parseCrashLogger" } },
+      "detect": { "all": ["(?m)^Unhandled exception "] }
+    }
+  ],
+  "inspectors": [
+    { "id": "mesh_header", "accepts": ["*.nif"], "entry": { "script": { "export": "inspectMesh" } } }
+  ],
+  "ref_maps": [
+    { "kind": "module", "lookup": { "path": { "patterns": ["Data/SKSE/Plugins/{value}", "{value}"] } }, "match": "casefold" },
+    { "kind": "plugin", "lookup": { "path": { "patterns": ["Data/{value}"] } }, "match": "casefold" },
+    { "kind": "file", "lookup": { "path": { "patterns": ["Data/{value}"], "archives": true } }, "match": "casefold" }
+  ],
+  "roles": [
+    { "kind": "module", "value": "SkyrimSE.exe", "match": "casefold", "role": "platform" },
+    { "kind": "module", "value": "ntdll.dll", "match": "casefold", "role": "system" },
+    { "kind": "module", "value": "ExamplePhysics.dll", "match": "casefold", "role": "hook_framework" }
+  ],
+  "rules": [
+    {
+      "id": "bad_pointer_under_a_hook_framework",
+      "version": 1,
+      "scope": {
+        "runtime": { "min": "1.6.0" },
+        "producer": { "format": "crash_logger", "version": { "min": "1.0" } }
+      },
+      "when": {
+        "all": [
+          { "fact": { "kind": "core.exception", "where": { "category": "access_violation", "pointer_class": { "in": ["non_canonical", "garbage"] } } } },
+          { "fact": { "kind": "core.frame", "where": { "index": 0, "symbol_scheme": "addrlib-ae", "symbol": "10001", "symbol_offset": { "lte": 32 } }, "ref": { "kind": "module", "role": "platform" } } },
+          { "fact": { "kind": "core.frame", "where": { "actionable_index": { "lte": 1 } }, "ref": { "kind": "module", "role": "hook_framework", "bind": "hook" } } },
+          { "fact": { "kind": "creation.object", "where": { "type": { "glob": "*TriShape*" } }, "ref": { "kind": "file", "strength": "object", "bind": "mesh" } } }
+        ]
+      },
+      "effects": [
+        { "finding": { "scope": "mechanism", "level": "likely" } },
+        { "signal": { "family": "execution", "candidate": { "owner_of": "hook" }, "weight": 2 } },
+        { "signal": { "family": "resource_provider", "candidate": { "owner_of": "mesh" }, "weight": 3 } }
+      ],
+      "verify": {
+        "inspector": "mesh_header",
+        "target": "mesh",
+        "on_fail": [
+          {
+            "finding": {
+              "scope": "root_cause",
+              "level": "likely",
+              "candidate": { "owner_of": "mesh" },
+              "family": "verified_asset",
+              "weight": 10,
+              "text": { "headline": { "en": "{mesh} from {owner:mesh} has a bad header, and the game was handling it when it crashed." } }
+            }
+          }
+        ],
+        "on_unknown": [
+          { "context": { "text": { "en": "Agora could not open {mesh} to check it." } } }
+        ]
+      },
+      "text": {
+        "headline": { "en": "The game read a garbage pointer in its own code during physics work. {owner:hook} is on the stack, which is where bad meshes tend to show up." },
+        "why_not_sure": { "en": "The top frame is usually the victim here, not the cause, so this log can't name one mod by itself." }
+      },
+      "next_step": "bisect"
+    }
+  ]
+}

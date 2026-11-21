@@ -1,0 +1,71 @@
+CRASH TIME: 2026-01-01 12:00:00
+Skyrim SSE v1.6.1170
+CrashLoggerSSE v1-16-0-0 Jan  1 2026 00:00:00
+
+Unhandled exception "EXCEPTION_ACCESS_VIOLATION" at 0x7FF700001000 ExampleGame.exe+001000	mov rax, [rcx]
+Exception Flags: 0x00000000 (Continuable)
+Number of Parameters: 2
+Exception Thread ID: 4242
+Access Violation: Tried to read memory at 0x000000000010
+
+PROCESS INFO:
+	Process ID: 9001
+	Crash Thread ID: 4242
+	Process Uptime: 00:01:50 (110886ms)
+	Working Directory: C:\Games\Invented Game
+	Command Line: "C:\Games\Invented Game\ExampleGame.exe"
+	Executable MD5: 0123456789abcdef0123456789abcdef
+	Executable Size: 12345678 bytes
+
+SYSTEM SPECS:
+	OS: Microsoft Windows 11 Pro v10.0.26200
+	CPU: InventedVendor Invented CPU 9200
+	CPU Cores: 20 logical, 12 physical, 1 packages
+	GPU #1: Invented Graphics 9200
+	PHYSICAL MEMORY: 9.00 GB/16.00 GB
+	VIRTUAL MEMORY: 10.00 GB/131072.00 GB
+	PROCESS MEMORY: Working Set: 1000.00 MB, Private: 2000.00 MB, Peak: 3000.00 MB
+	GPU MEMORY: 3.00/8.00 GB
+
+PROBABLE CALL STACK:
+	[ 0] 0x7FF700001000 ExampleGame.exe+001000 -> 33333+0x3A	mov rax, [rcx]
+	[ 1] 0x7FF700002000 ExampleGame.exe+002000 -> 33334+0x6BC	test al, al
+	[ 2] 0x7FF700003000 ExamplePlugin.dll+003000
+
+REGISTERS:
+	RAX 0x7FF700001000     (void* -> ExampleGame.exe+001000	mov rax, [rcx])
+	RCX 0x0                (size_t) [0]
+	RDX 0x2F000000000      (ExampleForm*)
+		File: "ExampleBase.esm"
+		Modified by: ExamplePatch.esp -> ExampleBase.esm
+		Flags: 0x00000009 kInitialized
+		FormID: 0x00012345
+		FormType: FormList (91)
+		EditorID: "ExampleEditorId"
+
+STACK:
+	[RSP+0   ] 0x2F000000100      (ExampleRef*)
+		Object Reference: "Example Object"
+		ParentCell: ---
+			File: "ExampleBase.esm"
+			FormID: 0x0000003C
+			FormType: Cell (60)
+		File: "ExamplePatch.esp"
+		FormID: 0x00054321
+		FormType: Reference (61)
+
+MODULES:
+	ExampleGame.exe                                    0x7FF700000000
+	ExamplePlugin.dll                                  0x7FF700004000
+	ExampleRenderer.dll                                0x7FF700005000
+
+SKSE PLUGINS:
+	ExamplePlugin.dll v1.6.1
+	ExampleRenderer.dll
+
+PLUGINS:
+	Light: 1	Regular: 3	Total: 4
+	[ 0]     ExampleBase.esm
+	[ 1]     ExamplePatch.esp
+	[ 2]     ExampleOther.esp
+	[FE:  0] ExampleLight.esl

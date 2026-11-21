@@ -62,6 +62,7 @@ import {
 import { InstallFlow } from '../components/InstallFlow';
 import { showToast } from '../components/Toast';
 import { useConfirm } from '../components/ui/confirm';
+import { withUnverifiedConsent } from '../lib/unverifiedConsent';
 import { choosePackInstanceName } from '../lib/packInstanceName';
 
 /**
@@ -1011,10 +1012,14 @@ export function ModDetail({ itemId, initialInstanceId, requestedContentType, onB
     if (!technicDetail) return;
     setTechnicInstalling(true);
     try {
-      const outcome = await installTechnicPack(
-        technicDetail.slug,
-        allowUnverifiedPacks,
-        (title) => choosePackInstanceName(prompt, title),
+      // A zip pack may ask for confirmation and run again: the name is asked once.
+      let named: { name: string | undefined | null } | null = null;
+      const chooseOnce = async (title: string) => {
+        named ??= { name: await choosePackInstanceName(prompt, title) };
+        return named.name;
+      };
+      const outcome = await withUnverifiedConsent(confirm, (allowUnverified) =>
+        installTechnicPack(technicDetail.slug, allowUnverified, chooseOnce),
       );
       if (!outcome) return;
       showToast(
@@ -1037,7 +1042,9 @@ export function ModDetail({ itemId, initialInstanceId, requestedContentType, onB
       if (instanceName === null) return;
       let outcome;
       try {
-        outcome = await installCatalogProviderPack(item.id, false, instanceName);
+        outcome = await withUnverifiedConsent(confirm, (allowUnverified) =>
+          installCatalogProviderPack(item.id, false, instanceName, allowUnverified),
+        );
       } catch (e) {
         if (!hasErrorCode(e, 'ERR_PROVIDER_PACK_CHANGED')) throw e;
         const proceed = await confirm({
@@ -1047,8 +1054,11 @@ export function ModDetail({ itemId, initialInstanceId, requestedContentType, onB
           tone: 'danger',
         });
         if (!proceed) return;
-        outcome = await installCatalogProviderPack(item.id, true, instanceName);
+        outcome = await withUnverifiedConsent(confirm, (allowUnverified) =>
+          installCatalogProviderPack(item.id, true, instanceName, allowUnverified),
+        );
       }
+      if (!outcome) return;
       showToast(`Imported "${outcome.name}" — review before launch.`, 'success');
       onOpenInstanceEditor?.(outcome.instance_id);
     } catch (e) {
@@ -1412,14 +1422,14 @@ export function ModDetail({ itemId, initialInstanceId, requestedContentType, onB
             <button
               type="button"
               onClick={handleTechnicInstall}
-              disabled={technicInstalling || (technicDetail.tier === 'zip' && !allowUnverifiedPacks)}
+              disabled={technicInstalling}
               className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
             >
               {technicInstalling ? 'Installing…' : 'Install as new instance'}
             </button>
             {technicDetail.tier === 'zip' && !allowUnverifiedPacks && (
               <span className="text-xs text-muted-foreground">
-                Enable “Allow low security downloads” in Settings to install this.
+                Agora will ask you to confirm before installing it.
               </span>
             )}
           </div>

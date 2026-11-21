@@ -1,6 +1,6 @@
 //! Builds a shareable crash report.
 //!
-//! Agora diagnoses crashes locally (see `crash_investigator`). When the local
+//! Agora diagnoses crashes locally through the crash engine. When the local
 //! signals aren't enough, the user takes the evidence somewhere better — an AI
 //! assistant of their choosing, or the community Discord. This module assembles
 //! that evidence into one self-contained, redacted markdown document.
@@ -16,7 +16,8 @@ use serde::Serialize;
 pub struct CrashReportContext {
     pub instance_id: Option<String>,
     pub crash_log: Option<String>,
-    pub crash_signatures: Option<String>,
+    /// The rendered crash answer, shown after the log so a reader sees Agora's own conclusion.
+    pub answer: Option<String>,
     pub suspects: Option<String>,
 }
 
@@ -101,6 +102,30 @@ const NO_EVIDENCE: &str = "\
 Agora has no crash evidence to export yet. Run the game and let it crash, or \
 paste a crash log into Crash Doctor first.";
 
+/// Keep log text from ending the code fence it is shown inside.
+///
+/// A log line that starts with three backticks closes the block, and the rest of the log becomes
+/// live Markdown in a document built to be pasted into an assistant or Discord. The text is
+/// already redacted, but it is not ours: it must stay text. Insert an invisible zero-width space
+/// after the first backtick of such a line, so it can never be read as a fence while the line
+/// still reads exactly as the log did.
+fn safe_inside_fence(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let first_visible = line
+                .find(|character: char| !character.is_whitespace())
+                .unwrap_or(line.len());
+            let (indent, rest) = line.split_at(first_visible);
+            if rest.starts_with("```") {
+                format!("{indent}`\u{200B}{}", &rest[1..])
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Build the report.
 ///
 /// `manifest_path`, when supplied and readable, adds the instance's mod list —
@@ -119,14 +144,14 @@ pub fn build_crash_report(
     if let Some(ref crash_log) = context.crash_log {
         parts.push(format!(
             "## Crash Log\n\n```\n{}\n```",
-            crate::log_sanitizer::sanitize_log_lines(crash_log)
+            safe_inside_fence(&crate::log_sanitizer::sanitize_log_lines(crash_log))
         ));
     }
 
-    if let Some(ref crash_signatures) = context.crash_signatures {
+    if let Some(ref answer) = context.answer {
         parts.push(format!(
-            "## Crash Signatures Matched\n\n{}",
-            crate::log_sanitizer::sanitize_log_lines(crash_signatures)
+            "## Agora's Crash Answer\n\n{}",
+            crate::log_sanitizer::sanitize_log_lines(answer)
         ));
     }
 
@@ -150,6 +175,19 @@ pub fn build_crash_report(
         "{REPORT_HEADER}\n\n{}\n\n{AGORA_BRIEFING}\n\n{REPORT_FOOTER}\n",
         parts.join("\n\n")
     )
+}
+
+/// [`build_crash_report`] with the mod list of `context.instance_id`, read from its manifest under
+/// `paths`. An instance id that is not a valid path name adds no mod list, like a missing one.
+pub fn build_instance_crash_report(
+    paths: &crate::app_paths::AppPaths,
+    context: &CrashReportContext,
+) -> String {
+    let manifest_path = context
+        .instance_id
+        .as_ref()
+        .and_then(|id| paths.instance_manifest(id).ok());
+    build_crash_report(manifest_path, context)
 }
 
 /// The instance's installed mods, or `None` when the manifest is missing or
@@ -193,7 +231,7 @@ mod tests {
         CrashReportContext {
             instance_id: Some("inst-1".into()),
             crash_log: None,
-            crash_signatures: None,
+            answer: None,
             suspects: None,
         }
     }
@@ -222,7 +260,7 @@ mod tests {
         assert!(report.contains("examplemod.jar"));
         assert!(report.trim_end().ends_with("would help."));
         // Sections the context didn't supply are omitted, not left blank.
-        assert!(!report.contains("## Crash Signatures Matched"));
+        assert!(!report.contains("## Agora's Crash Answer"));
     }
 
     /// The report is read by people and models with no idea what Agora is, so
@@ -288,5 +326,42 @@ mod tests {
         let report = build_crash_report(Some("does/not/exist.json".into()), &ctx);
         assert!(report.contains("## Crash Log"));
         assert!(!report.contains("mod(s) installed"));
+    }
+
+    #[test]
+    fn an_instance_report_with_no_manifest_or_a_bad_id_still_carries_the_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::app_paths::AppPaths::from_root(tmp.path().to_path_buf());
+        for id in ["inst-1", "../outside"] {
+            let ctx = CrashReportContext {
+                instance_id: Some(id.into()),
+                crash_log: Some("boom".into()),
+                ..context()
+            };
+            let report = build_instance_crash_report(&paths, &ctx);
+            assert!(report.contains("## Crash Log"));
+            assert!(!report.contains("mod(s) installed"));
+        }
+    }
+
+    /// The log is shown inside one fenced block. A log line can itself be a fence, and then the
+    /// rest of the log becomes live Markdown: headings, links and instructions a reader trusts.
+    #[test]
+    fn a_crash_log_cannot_close_the_code_fence_it_is_shown_in() {
+        let ctx = CrashReportContext {
+            crash_log: Some(
+                "first invented line\n```\n## Injected heading\nlast invented line".into(),
+            ),
+            ..context()
+        };
+        let report = build_crash_report(None, &ctx);
+        let fences = report
+            .lines()
+            .filter(|line| line.trim_start().starts_with("```"))
+            .count();
+        assert_eq!(
+            fences, 2,
+            "the crash log closed its own code fence and became markup: {report}"
+        );
     }
 }

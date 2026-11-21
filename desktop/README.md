@@ -1,6 +1,6 @@
 # Agora (Desktop)
 
-Tauri + React + Tailwind CSS desktop shell for the curated Minecraft mod launcher.
+Tauri + React + Tailwind CSS desktop shell for Agora, the curated multi-game mod manager.
 
 ## Setup
 

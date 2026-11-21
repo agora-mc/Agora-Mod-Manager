@@ -1,0 +1,35 @@
+{
+  "contract": 1,
+  "producer": { "format": "red_report" },
+  "facts": [
+    {
+      "kind": "core.exception",
+      "attrs": { "class": "0xC0000005", "category": "access_violation", "access": "read", "near_null": true, "fault_address": "0x8" }
+    },
+    {
+      "kind": "core.frame",
+      "attrs": { "index": 0, "kind": "probable", "rva": "0x00A0B0C0", "symbol_scheme": "rva" },
+      "refs": [{ "kind": "module", "value": "Cyberpunk2077.exe", "strength": "exec_top" }]
+    },
+    {
+      "kind": "core.frame",
+      "attrs": { "index": 1, "kind": "scan", "rva": "0x0000F100" },
+      "refs": [{ "kind": "module", "value": "ExampleExtension.dll", "strength": "exec" }]
+    },
+    {
+      "kind": "core.module",
+      "attrs": { "version": "9.9.1.12345" },
+      "refs": [{ "kind": "module", "value": "Cyberpunk2077.exe" }]
+    },
+    {
+      "kind": "core.load_verdict",
+      "attrs": { "outcome": "failed", "reason": "syntax error" },
+      "refs": [{ "kind": "file", "value": "r6/scripts/example/broken.reds", "strength": "exec_top" }]
+    }
+  ],
+  "bucket": [{ "scheme": "rva", "value": "Cyberpunk2077.exe+A0B0C0@9.9.1.12345" }],
+  "coverage": [
+    { "kind": "core.log_line", "state": "not_applicable" },
+    { "kind": "core.system", "state": "absent", "why": "sysinfo.json is not kept." }
+  ]
+}

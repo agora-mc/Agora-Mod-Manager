@@ -1,6 +1,7 @@
 /**
  * Opening a named Settings section from elsewhere in the app (the command
- * palette, today).
+ * palette, and a game's pages that send players to its installs, bases or
+ * recovery).
  *
  * Settings remembers its top-level tab, not its sub-page, and it only reads
  * what it remembers when it mounts. A request is therefore held here until the
@@ -22,6 +23,23 @@ let pending: SettingsSectionTarget | null = null;
 export function requestSettingsSection(target: SettingsSectionTarget): void {
   pending = target;
   window.dispatchEvent(new CustomEvent(SETTINGS_SECTION_EVENT));
+}
+
+/**
+ * Open Settings at `target`, from any page. The shell listens for `agora-navigate` and opens
+ * Settings, which then takes the held request.
+ */
+export function openSettingsSection(target: SettingsSectionTarget): void {
+  requestSettingsSection(target);
+  window.dispatchEvent(new CustomEvent('agora-navigate', { detail: 'settings' }));
+}
+
+/** The pages of the selected game's own Settings section (rail id `game`). */
+export type GameSettingsPage = 'new-instances' | 'installs' | 'bases' | 'recovery';
+
+/** Open one page of the selected game's Settings section. */
+export function openGameSettings(page: GameSettingsPage): void {
+  openSettingsSection({ tab: 'game', page });
 }
 
 /** Read the held request without consuming it (a mount's first render). */
@@ -60,11 +78,42 @@ export const SETTINGS_SECTION_ENTRIES: SettingsSectionEntry[] = [
   },
 ];
 
-/** Entries whose label or keywords contain the query. An empty query finds all. */
-export function matchSettingsSections(query: string): SettingsSectionEntry[] {
+/**
+ * The selected game's own Settings pages (rail id `game`), for the palette. Only for a game other
+ * than Minecraft: with Minecraft selected that section has no pages. `gameName` is the short name
+ * the Settings rail shows, so an entry reads like the place it opens.
+ */
+export function gameSettingsEntries(gameName: string): SettingsSectionEntry[] {
+  const page = (
+    label: string,
+    icon: string,
+    keywords: string[],
+    id: GameSettingsPage,
+  ): SettingsSectionEntry => ({
+    label: `${gameName} settings: ${label}`,
+    icon,
+    keywords: [gameName, ...keywords],
+    target: { tab: 'game', page: id },
+  });
+  return [
+    page('Instances', '📦', ['new instances', 'create', 'defaults', 'recently deleted'], 'new-instances'),
+    page('Installs', '📁', ['install', 'game folder', 'steam', 'gog', 'add a game folder'], 'installs'),
+    page('Bases', '🧱', ['base', 'pinned', 'build a base'], 'bases'),
+    page('Recovery', '🛟', ['recover', 'repair', 'restore', 'backup'], 'recovery'),
+  ];
+}
+
+/**
+ * Entries whose label or keywords contain the query. An empty query finds all. `gameName`
+ * adds the selected game's own pages (see `gameSettingsEntries`).
+ */
+export function matchSettingsSections(query: string, gameName?: string | null): SettingsSectionEntry[] {
+  const entries = gameName
+    ? [...SETTINGS_SECTION_ENTRIES, ...gameSettingsEntries(gameName)]
+    : SETTINGS_SECTION_ENTRIES;
   const needle = query.trim().replace(/\s+/g, ' ').toLowerCase();
-  if (!needle) return [...SETTINGS_SECTION_ENTRIES];
-  return SETTINGS_SECTION_ENTRIES.filter((entry) =>
+  if (!needle) return [...entries];
+  return entries.filter((entry) =>
     [entry.label, ...entry.keywords].some((word) => word.toLowerCase().includes(needle)),
   );
 }

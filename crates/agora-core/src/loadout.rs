@@ -45,6 +45,11 @@ pub struct LoadoutProfile {
     /// Absent on profiles saved before this existed.
     #[serde(default)]
     pub items: Option<Vec<LoadoutItem>>,
+    /// A game instance's state: its content layers, plugin lists, INI copies,
+    /// load-after rules and save choice (MASTER_SPEC §26.10). `None` on a
+    /// Minecraft profile, which keeps the fields above instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game: Option<crate::game_loadout::GameLoadout>,
 }
 
 /// Mods are every kind that is not a pack or a world, matching `content_subdir`.
@@ -55,11 +60,11 @@ fn is_mod_kind(content_type: &str) -> bool {
     )
 }
 
-fn loadouts_dir(instance_dir: &Path) -> std::path::PathBuf {
+pub(crate) fn loadouts_dir(instance_dir: &Path) -> std::path::PathBuf {
     instance_dir.join(".agora_loadouts")
 }
 
-fn sanitize_profile_name(name: &str) -> String {
+pub(crate) fn sanitize_profile_name(name: &str) -> String {
     name.chars()
         .map(|c| match c {
             ':' | '/' | '\\' | '<' | '>' | '"' | '|' | '?' | '*' => '_',
@@ -148,10 +153,11 @@ fn profile_from_manifest(
         created_at,
         covers: Some(covers),
         items: Some(items),
+        game: None,
     }
 }
 
-fn write_profile(instance_dir: &Path, profile: &LoadoutProfile) -> Result<(), String> {
+pub(crate) fn write_profile(instance_dir: &Path, profile: &LoadoutProfile) -> Result<(), String> {
     let profiles_dir = loadouts_dir(instance_dir);
     fs::create_dir_all(&profiles_dir).map_err(|e| format!("Cannot create loadouts dir: {e}"))?;
 
@@ -314,7 +320,10 @@ pub fn list_profiles(instance_dir: &Path) -> Result<Vec<LoadoutProfile>, String>
     Ok(profiles)
 }
 
-fn read_profile(instance_dir: &Path, profile_name: &str) -> Result<LoadoutProfile, String> {
+pub(crate) fn read_profile(
+    instance_dir: &Path,
+    profile_name: &str,
+) -> Result<LoadoutProfile, String> {
     let safe_name = sanitize_profile_name(profile_name);
     let profile_path = loadouts_dir(instance_dir).join(format!("{safe_name}.json"));
     let content =
@@ -432,12 +441,14 @@ pub fn apply_profile_with_undo(
     instance_dir: &Path,
     profile_name: &str,
     unlisted: UnlistedMods,
+    entries: &[&str],
 ) -> Result<(), LoadoutApplyError> {
     let profile = read_profile(instance_dir, profile_name).map_err(LoadoutApplyError::Profile)?;
-    let undo = crate::snapshot::create_snapshot(instance_dir, Some(UNDO_SNAPSHOT_LABEL))
+    let undo = crate::snapshot::create_snapshot(instance_dir, Some(UNDO_SNAPSHOT_LABEL), entries)
         .map_err(LoadoutApplyError::UndoPoint)?;
     if let Err(error) = apply_profile_items(instance_dir, &profile, unlisted) {
-        let rollback = crate::snapshot::restore_snapshot(instance_dir, &undo.id).map(|_| ());
+        let rollback =
+            crate::snapshot::restore_snapshot(instance_dir, &undo.id, entries).map(|_| ());
         return Err(LoadoutApplyError::Apply { error, rollback });
     }
     crate::lkg::run_retention(instance_dir).map_err(LoadoutApplyError::Retention)
@@ -641,6 +652,18 @@ mod tests {
     use super::*;
     use crate::models::InstalledMod;
 
+    /// The Minecraft scope a test fixture models.
+    const TRACKED: &[&str] = &[
+        "mods",
+        "config",
+        "resourcepacks",
+        "shaderpacks",
+        "datapacks",
+        "saves",
+        "options.txt",
+        "instance_manifest.json",
+    ];
+
     fn make_manifest(_instance_dir: &Path, mod_files: &[&str]) -> InstanceManifest {
         let mods: Vec<InstalledMod> = mod_files
             .iter()
@@ -656,6 +679,7 @@ mod tests {
                 source_url: None,
                 version: None,
                 sha256: String::new(),
+                hash_verified: true,
                 installed_at: String::new(),
                 java_packages: Vec::new(),
                 mod_jar_id: None,
@@ -665,10 +689,14 @@ mod tests {
                 provided_mod_ids: Vec::new(),
                 enabled: true,
                 content_type: "mod".to_string(),
+
+                content_item_id: None,
+                object_sha256: None,
             })
             .collect();
         InstanceManifest {
             manifest_version: crate::models::CURRENT_MANIFEST_VERSION,
+            game_data: Default::default(),
             pack_origin: None,
             instance_id: "test".to_string(),
             name: "Test".to_string(),
@@ -744,6 +772,7 @@ mod tests {
             created_at: Utc::now().to_rfc3339(),
             covers: None,
             items: None,
+            game: None,
         };
         let profiles_dir = loadouts_dir(&dir);
         fs::create_dir_all(&profiles_dir).unwrap();
@@ -811,6 +840,7 @@ mod tests {
             created_at: Utc::now().to_rfc3339(),
             covers: None,
             items: None,
+            game: None,
         };
         let profiles_dir = loadouts_dir(&dir);
         fs::create_dir_all(&profiles_dir).unwrap();
@@ -907,6 +937,7 @@ mod tests {
             source_url: None,
             version: None,
             sha256: String::new(),
+            hash_verified: true,
             installed_at: String::new(),
             java_packages: Vec::new(),
             mod_jar_id: None,
@@ -916,6 +947,9 @@ mod tests {
             provided_mod_ids: Vec::new(),
             enabled: true,
             content_type: "shader".to_string(),
+
+            content_item_id: None,
+            object_sha256: None,
         });
         write_manifest(&dir, &manifest).unwrap();
 
@@ -925,6 +959,7 @@ mod tests {
             created_at: Utc::now().to_rfc3339(),
             covers: None,
             items: None,
+            game: None,
         };
         let profiles_dir = loadouts_dir(&dir);
         fs::create_dir_all(&profiles_dir).unwrap();
@@ -1091,7 +1126,7 @@ mod tests {
         manifest.mods[1].enabled = false;
         write_manifest(&dir, &manifest).unwrap();
 
-        apply_profile_with_undo(&dir, "all-on", UnlistedMods::Off).unwrap();
+        apply_profile_with_undo(&dir, "all-on", UnlistedMods::Off, TRACKED).unwrap();
         assert!(dir.join("mods").join("lithium.jar").exists());
 
         let snapshots = crate::snapshot::list_snapshots(&dir).unwrap();
@@ -1099,7 +1134,7 @@ mod tests {
             .iter()
             .find(|s| s.label.as_deref() == Some(UNDO_SNAPSHOT_LABEL))
             .expect("apply must save an undo point labelled before-loadout");
-        crate::snapshot::restore_snapshot(&dir, &undo.id).unwrap();
+        crate::snapshot::restore_snapshot(&dir, &undo.id, TRACKED).unwrap();
 
         assert!(
             dir.join("mods").join("lithium.jar.disabled").exists(),
@@ -1113,7 +1148,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = setup_instance(&tmp, &["sodium.jar"]);
 
-        let err = apply_profile_with_undo(&dir, "missing", UnlistedMods::Off)
+        let err = apply_profile_with_undo(&dir, "missing", UnlistedMods::Off, TRACKED)
             .expect_err("unknown profile");
         assert!(matches!(err, LoadoutApplyError::Profile(_)), "got {err:?}");
         assert!(crate::snapshot::list_snapshots(&dir).unwrap().is_empty());
@@ -1261,6 +1296,7 @@ mod tests {
             created_at: Utc::now().to_rfc3339(),
             covers: None,
             items: None,
+            game: None,
         };
         let profiles_dir = loadouts_dir(dir);
         fs::create_dir_all(&profiles_dir).unwrap();
@@ -1542,9 +1578,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = setup_instance(&tmp, &["a.jar", "b.jar", "c.jar", "d.jar"]);
         let manifest_before = fs::read(dir.join("instance_manifest.json")).unwrap();
-        // Every rename succeeds; then the manifest's temporary file cannot be
-        // written, so the write fails after the renames are done.
-        fs::create_dir_all(dir.join("instance_manifest.json.tmp")).unwrap();
+        // Every rename succeeds; then the manifest cannot be written, so the
+        // write fails after the renames are done.
+        let _fail = crate::helpers::fail_manifest_writes_on_this_thread();
 
         assert!(apply_enabled_set(&dir, &["a.jar".to_string(), "c.jar".to_string()]).is_err());
         for name in ["a.jar", "b.jar", "c.jar", "d.jar"] {

@@ -6,16 +6,16 @@
 
 use crate::error::LauncherResult;
 use agora_core::providers::{
-    self, install, ProjectDetail, ProviderDescriptor, ProviderRegistry, VersionsRequest,
-    VersionsResponse,
+    self, ProjectDetail, ProviderDescriptor, ProviderRegistry, VersionsRequest, VersionsResponse,
 };
+use agora_game_minecraft::providers::install;
 use tauri::AppHandle;
 
 /// The plugin service, when the user has plugins switched on. Providers work
 /// without it — the official ones need no plugin runtime at all.
 fn plugin_service(app: &AppHandle) -> Option<agora_core::plugins::PluginService> {
     let service = crate::plugins::service(app).ok()?;
-    service.is_enabled().then_some(service)
+    service.plugin_code_allowed().then_some(service)
 }
 
 /// Every provider this session knows about: Agora's own and any a plugin
@@ -114,14 +114,17 @@ pub async fn provider_install_preview(
 }
 
 /// Install a catalog entry that pins one version of a provider's pack.
-/// `accept_changed` is the user's answer to `ERR_PROVIDER_PACK_CHANGED`.
+/// `accept_changed` is the user's answer to `ERR_PROVIDER_PACK_CHANGED`;
+/// `allow_unverified` is the answer to `ERR_LOW_SECURITY_DISABLED` for this
+/// install.
 #[tauri::command]
 pub async fn install_catalog_provider_pack(
     app: AppHandle,
     item_id: String,
     accept_changed: bool,
     instance_name: Option<String>,
-) -> LauncherResult<agora_core::import::ImportResult> {
+    allow_unverified: Option<bool>,
+) -> LauncherResult<agora_game_minecraft::import::ImportResult> {
     let ctx = crate::core_context(&app)?;
     install::install_catalog_pack(
         &ctx,
@@ -129,6 +132,7 @@ pub async fn install_catalog_provider_pack(
         &item_id,
         accept_changed,
         instance_name.as_deref(),
+        allow_unverified.unwrap_or(false),
     )
     .await
 }
@@ -140,7 +144,8 @@ pub async fn provider_install_pack(
     item_id: String,
     version_id: Option<String>,
     instance_name: Option<String>,
-) -> LauncherResult<agora_core::import::ImportResult> {
+    allow_unverified: Option<bool>,
+) -> LauncherResult<agora_game_minecraft::import::ImportResult> {
     let ctx = crate::core_context(&app)?;
     install::install_pack(
         &ctx,
@@ -148,6 +153,7 @@ pub async fn provider_install_pack(
         &item_id,
         version_id.as_deref(),
         instance_name.as_deref(),
+        allow_unverified.unwrap_or(false),
     )
     .await
 }

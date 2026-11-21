@@ -28,6 +28,11 @@ pub struct HostRequest {
     /// [`MAX_REQUEST_DEADLINE_MS`]; a plugin cannot opt into waiting forever.
     #[serde(default = "default_deadline_ms")]
     pub deadline_ms: u64,
+    /// The instance a hook is bound to, when this call is made from inside a
+    /// scripted game hook. A `game.*` call naming a different instance is
+    /// refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_instance: Option<String>,
 }
 
 /// Longest any single host call may take before the host gives up on it.
@@ -47,6 +52,7 @@ impl HostRequest {
             method: method.into(),
             args,
             deadline_ms: DEFAULT_REQUEST_DEADLINE_MS,
+            bound_instance: None,
         }
     }
 

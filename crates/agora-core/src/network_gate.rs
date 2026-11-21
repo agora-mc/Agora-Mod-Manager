@@ -245,6 +245,31 @@ mod tests {
     }
 
     #[test]
+    fn every_switch_the_gate_can_name_is_a_declared_fail_closed_boolean() {
+        use crate::settings_registry::{lookup, SettingKind};
+
+        let mut keys: Vec<&str> = ClientCategory::ALL
+            .iter()
+            .filter_map(|category| endpoint_setting(*category))
+            .collect();
+        keys.push("network_plugins_enabled");
+        keys.push("plugin_updates_enabled");
+        keys.sort_unstable();
+        keys.dedup();
+
+        for key in keys {
+            let definition = lookup(key)
+                .unwrap_or_else(|| panic!("{key} is named by the network gate but is undeclared"));
+            match definition.kind {
+                SettingKind::Bool { invalid: false, .. } => {}
+                other => {
+                    panic!("{key} must be a boolean whose fail direction is off, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
     fn plugin_updates_use_lockdown_without_reusing_plugin_javascript_permission() {
         assert_eq!(
             endpoint_setting(ClientCategory::Plugin),

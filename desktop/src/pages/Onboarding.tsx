@@ -23,6 +23,7 @@ import {
 } from '../lib/tauri';
 import { useRegistryState } from '../lib/useRegistryState';
 import { RegistryStatusView } from '../components/registry-status-view';
+import { Switch } from '../components/ui/switch';
 import { DeviceFlowPanel } from '../components/DeviceFlowPanel';
 import { MsaDeviceFlowPanel } from '../components/MsaDeviceFlowPanel';
 import { LauncherImportWizard } from '../components/LauncherImportWizard';
@@ -322,7 +323,7 @@ function WelcomeStep({ onContinue }: { onContinue: () => void }) {
       <Stepper current="welcome" />
       <h2 className="text-2xl font-bold mb-2">Welcome to Agora</h2>
       <p className="text-muted-foreground mb-4">
-        A decentralized, ad-free, community run, open-source Minecraft mod launcher and discovery platform.
+        A decentralized, ad-free, community run, open-source mod manager and discovery platform. Minecraft is included as the default, other games come as plugins.
       </p>
       <div className="flex justify-end">
         <button
@@ -608,7 +609,7 @@ function ServicesStep({
     // another, which parsing a joined blob apart at the call
     // site could.
     body: [
-      'This lets you install content with NO integrity information at all — no hash of any kind — from any content source: Technic zip packs, or a plugin source that publishes no digest.',
+      'Agora asks before each install of content with NO integrity information at all — no hash of any kind — such as a Technic zip pack or a plugin source that publishes no digest. This turns that question off and installs it without asking.',
       'Agora cannot detect if the file was modified in transit, swapped by the host, or replaced after the listing was created. You are trusting the uploader and their host completely.',
       'Only enable this if you already trust the specific pack you are installing.',
     ].join('\n\n'),
@@ -662,7 +663,7 @@ function ServicesStep({
         <div>
           <ServiceToggle
             title="Low security downloads"
-            description="Shows and installs content with no integrity information at all — no hash, no curator review — from any source, such as Technic zip packs. You are accepting files on the uploader's word. Only enable if you trust the developers you install from."
+            description="Installs content with no integrity information at all — no hash, no curator review — such as Technic zip packs, without asking first each time. Left off, Agora asks before each such install. You are accepting files on the uploader's word."
             checked={values.allowUnverifiedPacks}
             onChange={async (allowUnverifiedPacks) => {
               if (allowUnverifiedPacks && !await confirm({
@@ -726,22 +727,11 @@ function ServiceToggle({
     <div className="rounded-xl border border-border bg-card p-4">
       <div className="flex items-center justify-between gap-4">
         <span className="font-medium text-sm">{title}</span>
-        <button
-          type="button"
-          role="switch"
-          aria-checked={checked}
+        <Switch
           aria-label={title}
-          onClick={() => onChange(!checked)}
-          className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
-            checked ? 'bg-primary' : 'bg-muted'
-          }`}
-        >
-          <span
-            className={`inline-block h-5 w-5 transform rounded-full bg-white shadow-sm transition-transform ${
-              checked ? 'translate-x-5' : 'translate-x-0.5'
-            }`}
-          />
-        </button>
+          checked={checked}
+          onCheckedChange={onChange}
+        />
       </div>
       <p className="mt-2 text-xs text-muted-foreground">{description}</p>
     </div>
@@ -845,24 +835,13 @@ function JavaStep({
               Older exact versions download automatically when needed for specific instances.
             </p>
           </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={checked}
+          <Switch
             aria-label="Prepare Java 25 for modern Minecraft"
-            onClick={() => {
-              if (!busy) setChecked(!checked);
+            checked={checked}
+            onCheckedChange={(value) => {
+              if (!busy) setChecked(value);
             }}
-            className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
-              checked ? 'bg-primary' : 'bg-muted'
-            }`}
-          >
-            <span
-              className={`inline-block h-5 w-5 transform rounded-full bg-white shadow-sm transition-transform ${
-                checked ? 'translate-x-5' : 'translate-x-0.5'
-              }`}
-            />
-          </button>
+          />
         </div>
       </div>
 

@@ -34,6 +34,11 @@ export interface LaunchProgressInfo {
   percent?: number | null;
   /** Status text to show beside the label, e.g. "Downloading Java 21: 40 of 52 MB". */
   detail?: string | null;
+  /**
+   * The offline-session sentence, when this launch is not using Microsoft.
+   * Kept for the whole launch so a later stage change cannot hide it.
+   */
+  notice?: string | null;
 }
 
 export interface LaunchProgressEventPayload {
@@ -66,7 +71,7 @@ export function applyLaunchProgressEvent(
   // "<phase>-complete" events only carry timings.
   if (event.phase.endsWith('-complete')) return previous;
   const startedAt = event.phase === 'checking-health' ? now : previous?.startedAt ?? now;
-  const base = { startedAt, files: null };
+  const base = { startedAt, files: null, notice: previous?.notice ?? null };
   switch (event.phase) {
     case 'checking-health':
       return { ...base, stage: 'checking', label: 'Checking the instance' };
@@ -93,6 +98,13 @@ export function applyLaunchProgressEvent(
       return { ...base, stage: 'snapshot', label: 'Saving a recovery snapshot' };
     case 'launching':
       return { ...base, stage: 'starting', label: 'Starting Minecraft' };
+    case 'offline':
+      return {
+        ...base,
+        stage: previous?.stage ?? 'starting',
+        label: previous?.label ?? 'Starting Minecraft',
+        notice: event.message || 'Playing offline: online servers and Realms will not accept this session.',
+      };
     case 'running':
       return { ...base, stage: 'loading', label: 'Running — loading' };
     case 'ready':

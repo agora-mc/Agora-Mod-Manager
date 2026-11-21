@@ -1,0 +1,3 @@
+An ordinary notes file that mentions Skyrim SSE v1.6.640
+and quotes Unhandled exception "EXCEPTION_ACCESS_VIOLATION" at 0x0.
+It is not a crash log: it has no CrashLoggerSSE or trainwreck header.

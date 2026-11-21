@@ -1,0 +1,20 @@
+{
+  "id": "pgpatcher",
+  "name": "PGPatcher",
+  "content_type": "mod",
+  "author": "hakasapl",
+  "license": "GPL-3.0",
+  "game": "skyrim-se",
+  "download_strategy": "github_release",
+  "source_identifier": "hakasapl/PGPatcher",
+  "page_url": "https://github.com/hakasapl/PGPatcher/releases",
+  "description": "Patches meshes and textures for parallax, complex materials and PBR.",
+  "game_compatibility": [
+    {
+      "stores": ["steam", "gog"],
+      "game_versions": ["1.5.*", "1.6.*", "1.7.*"],
+      "asset": "PGPatcher-*.zip"
+    }
+  ],
+  "curator_note": "The PGLite-*.zip asset is a different tool and is not this entry. The Skyrim package's pgpatcher tool expects Data/PGPatcher/PGPatcher.exe; check that the archive's folder layout lands the executable there."
+}

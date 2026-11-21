@@ -1,0 +1,1409 @@
+//! Import: bringing in a Mod Organizer 2 setup (MASTER_SPEC §26.10).
+//! Owned by the `import` slice. A thin adapter over `agora_core::game_import`: the CLI's
+//! `agora games import mo2` does the same work through the same functions.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use agora_core::content_store::Mo2Provenance;
+
+use agora_core::game_import::{
+    self, ImportError, ImportPhase, ImportProgress, Mo2Plan, Mo2Request, Mo2RunReport, RunOptions,
+    ScanReport, SetupFound,
+};
+use agora_core::game_registry::{installed_games, GameInventory};
+use serde::{Deserialize, Serialize};
+use tauri::Emitter;
+
+use super::dto::InstallSummary;
+use super::error::{GamesError, CORE_FAILED, NO_INSTALL, TASK_FAILED};
+
+/// The event each progress report is sent on while a run stores mods.
+pub const IMPORT_PROGRESS_EVENT: &str = "games-import-progress";
+
+const INI_NAME: &str = "ModOrganizer.ini";
+/// The request named a path that cannot be a setup (empty, missing, or not the setup's ini).
+const BAD_PATH: &str = "bad_path";
+/// Another import is already running.
+const IMPORT_BUSY: &str = "import_busy";
+
+static IMPORT_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug)]
+struct ImportGuard;
+
+impl ImportGuard {
+    fn acquire() -> Result<Self, GamesError> {
+        IMPORT_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self)
+            .map_err(|_| {
+                GamesError::new(
+                    IMPORT_BUSY,
+                    "Another import is already running. Wait for it to finish before starting another.",
+                )
+            })
+    }
+}
+
+impl Drop for ImportGuard {
+    fn drop(&mut self) {
+        IMPORT_IN_PROGRESS.store(false, Ordering::Release);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Finding setups
+// ---------------------------------------------------------------------------
+
+/// The setups on this machine, or the one folder the user chose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Mo2ScanReply {
+    pub setups: Vec<SetupDto>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupDto {
+    pub ini_path: String,
+    pub game_name: Option<String>,
+    pub profiles: Vec<String>,
+    /// `None` when the setup's `mods` folder cannot be read.
+    pub mod_count: Option<usize>,
+    pub found_by: String,
+}
+
+impl From<SetupFound> for SetupDto {
+    fn from(found: SetupFound) -> Self {
+        Self {
+            ini_path: found.ini_path.to_string_lossy().into_owned(),
+            game_name: found.game_name,
+            profiles: found.profiles,
+            mod_count: found.mod_count,
+            found_by: found.found_by,
+        }
+    }
+}
+
+impl From<ScanReport> for Mo2ScanReply {
+    fn from(report: ScanReport) -> Self {
+        Self {
+            setups: report.setups.into_iter().map(SetupDto::from).collect(),
+            warnings: report.warnings,
+        }
+    }
+}
+
+/// Look for Mod Organizer 2 setups. With `chosen` (a folder the user picked, or the setup's
+/// `ModOrganizer.ini`), summarise that one setup instead, and say why it is not one if it is not.
+/// Scanning reads the drives, so the work runs on a blocking thread.
+#[tauri::command]
+pub async fn games_import_mo2_scan(chosen: Option<String>) -> Result<Mo2ScanReply, GamesError> {
+    tokio::task::spawn_blocking(move || -> Result<Mo2ScanReply, GamesError> {
+        match chosen {
+            None => Ok(game_import::scan().into()),
+            Some(folder) => {
+                let ini = resolve_setup_path(&folder)?;
+                let found = game_import::inspect_setup(&ini).map_err(core_failed)?;
+                Ok(Mo2ScanReply {
+                    setups: vec![found.into()],
+                    warnings: Vec::new(),
+                })
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        GamesError::new(
+            TASK_FAILED,
+            "Looking for Mod Organizer 2 setups did not finish.",
+        )
+    })?
+}
+
+/// The `ModOrganizer.ini` a user's choice points at: the setup's folder, or the file itself.
+/// Anything else is refused with the reason, so a wrong pick never reads as "no setups".
+pub fn resolve_setup_path(input: &str) -> Result<PathBuf, GamesError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(bad_path(
+            "Pick the folder your Mod Organizer 2 setup is in (the one that holds ModOrganizer.ini).",
+        ));
+    }
+    let path = Path::new(trimmed);
+    if path.is_dir() {
+        let ini = path.join(INI_NAME);
+        if ini.is_file() {
+            return Ok(ini);
+        }
+        return Err(bad_path(format!(
+            "There is no {INI_NAME} in {}. Pick the folder Mod Organizer 2 keeps that file in.",
+            path.display()
+        )));
+    }
+    if path.is_file() {
+        let is_ini = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(INI_NAME));
+        if is_ini {
+            return Ok(path.to_path_buf());
+        }
+        return Err(bad_path(format!(
+            "{} is not {INI_NAME}. Pick the folder the setup is in instead.",
+            path.display()
+        )));
+    }
+    Err(bad_path(format!("Nothing exists at {}.", path.display())))
+}
+
+fn bad_path(message: impl Into<String>) -> GamesError {
+    GamesError::new(BAD_PATH, message)
+}
+
+// ---------------------------------------------------------------------------
+// Plan and run
+// ---------------------------------------------------------------------------
+
+/// One import request. `dry_run` plans and reports; otherwise the profile is imported.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Mo2ImportRequest {
+    /// The folder or `ModOrganizer.ini` the user chose.
+    pub setup_path: String,
+    pub profile: String,
+    /// The new instance's name. Needed only to import the same setup and profile again.
+    pub name: Option<String>,
+    pub copy_saves: bool,
+    pub dry_run: bool,
+    /// The install to import onto, by id, when the setup's own game folder is not one Agora
+    /// found. `None` uses the install at the setup's gamePath.
+    #[serde(default)]
+    pub install: Option<String>,
+}
+
+/// What `games_import_mo2` answered: the plan for a dry run, or the report of an import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Mo2ImportReply {
+    Plan(Box<PlanDto>),
+    Run(Box<RunDto>),
+    /// A dry run whose setup names a game folder Agora did not find, while the game is installed
+    /// elsewhere: the user picks which install to import onto, then previews again.
+    ChooseInstall(Box<ChooseInstallDto>),
+}
+
+/// The installs a setup could be imported onto instead of its own (missing) game folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChooseInstallDto {
+    pub game_id: String,
+    pub game_name: String,
+    /// The game folder the setup itself names.
+    pub setup_game_path: String,
+    pub installs: Vec<InstallSummary>,
+}
+
+/// A refusal from core in the desktop's words. The CLI's message tells the user to run commands;
+/// the app instead says what is wrong and offers Settings (code `no_install`).
+fn import_failed(error: ImportError) -> GamesError {
+    match error {
+        ImportError::NoInstall { game, path, .. } => GamesError::new(
+            NO_INSTALL,
+            format!(
+                "Agora has not found {game} on this computer. The setup expects it in {}. Install the game, or add the folder it is in under Installs in Settings, then preview again.",
+                path.display()
+            ),
+        ),
+        ImportError::NoSuchInstall(_) => GamesError::new(
+            NO_INSTALL,
+            "The install you chose is no longer one Agora finds. Check Installs in Settings, then preview again.",
+        ),
+        other => core_failed(other),
+    }
+}
+
+/// The dry run's answer when the setup's game folder is not a found install: the installs to
+/// choose from, or the refusal when there are none.
+fn choose_install_or_fail(
+    error: ImportError,
+    inventory: &GameInventory,
+) -> Result<Mo2ImportReply, GamesError> {
+    match error {
+        ImportError::NoInstall {
+            game,
+            game_id,
+            path,
+            candidates,
+        } if !candidates.is_empty() => {
+            Ok(Mo2ImportReply::ChooseInstall(Box::new(ChooseInstallDto {
+                game_id: game_id.as_str().to_string(),
+                game_name: game,
+                setup_game_path: path.to_string_lossy().into_owned(),
+                installs: inventory
+                    .installs
+                    .iter()
+                    .filter(|i| i.game == game_id)
+                    .map(InstallSummary::from)
+                    .collect(),
+            })))
+        }
+        other => Err(import_failed(other)),
+    }
+}
+
+/// The word the screen reads for a stage of the import.
+fn phase_name(phase: ImportPhase) -> &'static str {
+    match phase {
+        ImportPhase::Storing => "storing",
+        ImportPhase::Overwrite => "overwrite",
+        ImportPhase::Instance => "instance",
+        ImportPhase::Layers => "layers",
+        ImportPhase::Finishing => "finishing",
+    }
+}
+
+/// Progress of a long import, sent as the `games-import-progress` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportProgressDto {
+    pub phase: &'static str,
+    pub current_mod: Option<String>,
+    pub mods_done: usize,
+    pub mods_total: usize,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+}
+
+/// Plan or import a profile. Reads the setup and stores mods, so the work runs on a blocking
+/// thread; progress goes out as events while mods are stored.
+#[tauri::command]
+pub async fn games_import_mo2(
+    app: tauri::AppHandle,
+    request: Mo2ImportRequest,
+) -> Result<Mo2ImportReply, GamesError> {
+    tokio::task::spawn_blocking(move || -> Result<Mo2ImportReply, GamesError> {
+        let ctx = crate::core_context(&app)?;
+        let ini_path = resolve_setup_path(&request.setup_path)?;
+        let name = request
+            .name
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty());
+        let core_request = Mo2Request {
+            ini_path,
+            profile: request.profile,
+            name,
+            copy_saves: request.copy_saves,
+            install: request
+                .install
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty()),
+        };
+        let inventory = installed_games(&ctx);
+        if request.dry_run {
+            return match game_import::plan(&ctx, &inventory, &core_request) {
+                Ok(plan) => Ok(Mo2ImportReply::Plan(Box::new(PlanDto::from(&plan)))),
+                Err(error) => choose_install_or_fail(error, &inventory),
+            };
+        }
+        let _import_guard = ImportGuard::acquire()?;
+        let emitter = app.clone();
+        let report = game_import::run(
+            &ctx,
+            &inventory,
+            &core_request,
+            RunOptions::default(),
+            &|progress: ImportProgress| {
+                let payload = ImportProgressDto {
+                    phase: phase_name(progress.phase),
+                    current_mod: progress.current_mod,
+                    mods_done: progress.mods_done,
+                    mods_total: progress.mods_total,
+                    bytes_done: progress.bytes_done,
+                    bytes_total: progress.bytes_total,
+                };
+                // A progress event that cannot be delivered does not change the import.
+                let _ = emitter.emit(IMPORT_PROGRESS_EVENT, payload);
+            },
+        )
+        .map_err(import_failed)?;
+        Ok(Mo2ImportReply::Run(Box::new(RunDto::from(&report))))
+    })
+    .await
+    .map_err(|_| GamesError::new(TASK_FAILED, "Importing the setup did not finish."))?
+}
+
+fn core_failed(error: impl std::fmt::Display) -> GamesError {
+    GamesError::new(CORE_FAILED, error.to_string())
+}
+
+/// The plan, in words and numbers the import screen shows. Nothing here is stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanDto {
+    pub setup: String,
+    pub profile: String,
+    pub mo2_game_name: String,
+    pub game_id: String,
+    pub install_id: String,
+    pub install_location: String,
+    /// The game folder the setup names; differs from `install_location` when the user chose
+    /// another install.
+    pub setup_game_path: String,
+    pub store: String,
+    pub instance_name: String,
+    pub mods: Vec<PlannedModDto>,
+    pub mods_enabled: usize,
+    pub mods_disabled: usize,
+    pub files: usize,
+    pub bytes: u64,
+    /// Top-level `meta.ini` files left out of the stored content, across all mods.
+    pub meta_ini_excluded: usize,
+    pub separators: usize,
+    /// Entries MO2 lists that Agora does not import, by name.
+    pub unmanaged: Vec<String>,
+    /// Lines and folders that were skipped, each with the reason.
+    pub problems: Vec<ProblemDto>,
+    pub overwrite: OverwriteDto,
+    pub plugins: PluginsDto,
+    pub local_settings: bool,
+    pub inis: Vec<String>,
+    pub saves: SavesDto,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedModDto {
+    pub line: usize,
+    pub folder: String,
+    pub enabled: bool,
+    pub files: usize,
+    pub bytes: u64,
+    /// What the mod's `meta.ini` claims, in words. A claim is never checked against a download.
+    pub provenance: String,
+    pub plugin_files: Vec<String>,
+    pub meta_ini_excluded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProblemDto {
+    pub line: Option<usize>,
+    pub entry: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverwriteDto {
+    pub present: bool,
+    pub files: usize,
+    pub bytes: u64,
+    /// Files a known tool produced, which become that tool's generated layer (inputs unknown).
+    pub generated: Vec<GeneratedDto>,
+    pub rest_files: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratedDto {
+    pub name: String,
+    pub files: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginsDto {
+    /// Whether the game keeps a plugin list at all.
+    pub kept: bool,
+    pub listed: usize,
+    pub active: usize,
+    pub locked: Vec<String>,
+    /// Plugins the game always loads, which MO2 lists but Agora does not write.
+    pub implicit_skipped: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavesDto {
+    /// The profile keeps its own saves.
+    pub local: bool,
+    pub files: usize,
+    pub bytes: u64,
+    pub note: String,
+}
+
+impl From<&Mo2Plan> for PlanDto {
+    fn from(plan: &Mo2Plan) -> Self {
+        Self {
+            setup: plan.setup.to_string_lossy().into_owned(),
+            profile: plan.profile.clone(),
+            mo2_game_name: plan.mo2_game_name.clone(),
+            game_id: plan.game.as_str().to_string(),
+            install_id: plan.install_id.clone(),
+            install_location: plan.install_location.to_string_lossy().into_owned(),
+            setup_game_path: plan.setup_game_path.to_string_lossy().into_owned(),
+            store: plan.store.clone(),
+            instance_name: plan.instance_name.clone(),
+            mods: plan
+                .mods
+                .iter()
+                .map(|m| PlannedModDto {
+                    line: m.line,
+                    folder: m.folder.clone(),
+                    enabled: m.enabled,
+                    files: m.files,
+                    bytes: m.bytes,
+                    provenance: provenance_text(&m.provenance),
+                    plugin_files: m.plugin_files.clone(),
+                    meta_ini_excluded: m.meta_ini_excluded,
+                })
+                .collect(),
+            mods_enabled: plan.mods_enabled,
+            mods_disabled: plan.mods_disabled,
+            files: plan.files,
+            bytes: plan.bytes,
+            meta_ini_excluded: plan.meta_ini_excluded,
+            separators: plan.separators,
+            unmanaged: plan.unmanaged.clone(),
+            problems: plan
+                .problems
+                .iter()
+                .map(|p| ProblemDto {
+                    line: p.line,
+                    entry: p.entry.clone(),
+                    reason: p.reason.clone(),
+                })
+                .collect(),
+            overwrite: OverwriteDto {
+                present: plan.overwrite.present,
+                files: plan.overwrite.files,
+                bytes: plan.overwrite.bytes,
+                generated: plan
+                    .overwrite
+                    .generated
+                    .iter()
+                    .map(|g| GeneratedDto {
+                        name: g.name.clone(),
+                        files: g.files,
+                    })
+                    .collect(),
+                rest_files: plan.overwrite.rest_files,
+            },
+            plugins: PluginsDto {
+                kept: plan.plugins.kept,
+                listed: plan.plugins.lines.len(),
+                active: plan.plugins.active,
+                locked: plan.plugins.locked.clone(),
+                implicit_skipped: plan.plugins.implicit_skipped.clone(),
+                notes: plan.plugins.notes.clone(),
+            },
+            local_settings: plan.local_settings,
+            inis: plan.inis.iter().map(|i| i.name.clone()).collect(),
+            saves: SavesDto {
+                local: plan.saves.local,
+                files: plan.saves.files,
+                bytes: plan.saves.bytes,
+                note: plan.saves.note.clone(),
+            },
+            warnings: plan.warnings.clone(),
+        }
+    }
+}
+
+/// What an import did, after its plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunDto {
+    pub instance_id: Option<String>,
+    pub instance_name: String,
+    pub base_id: Option<String>,
+    /// `true` when the base was built by this import, `false` when an existing one was reused.
+    pub base_built: Option<bool>,
+    pub stored_mods: usize,
+    pub content_layers: usize,
+    pub disabled_layers: usize,
+    /// Mods whose bytes match a layer the instance already has.
+    pub duplicates: Vec<String>,
+    pub generated_layers: Vec<String>,
+    pub plugins_written: Option<usize>,
+    pub plugin_findings: Vec<String>,
+    pub inis_copied: Vec<String>,
+    pub saves_copied: usize,
+    pub saves_skipped_existing: usize,
+    pub saves_folder: Option<String>,
+    /// What still has to be done by hand, including each skipped line and why.
+    pub next_steps: Vec<String>,
+}
+
+impl From<&Mo2RunReport> for RunDto {
+    fn from(report: &Mo2RunReport) -> Self {
+        Self {
+            instance_id: report.instance_id.clone(),
+            instance_name: report.plan.instance_name.clone(),
+            base_id: report.base_id.clone(),
+            base_built: report.base_built,
+            stored_mods: report.stored_mods,
+            content_layers: report.content_layers,
+            disabled_layers: report.disabled_layers,
+            duplicates: report.duplicates.clone(),
+            generated_layers: report.generated_layers.clone(),
+            plugins_written: report.plugins_written,
+            plugin_findings: report.plugin_findings.clone(),
+            inis_copied: report.inis_copied.clone(),
+            saves_copied: report.saves_copied,
+            saves_skipped_existing: report.saves_skipped_existing,
+            saves_folder: report
+                .saves_folder
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            next_steps: report.next_steps.clone(),
+        }
+    }
+}
+
+/// A provenance claim as a player reads it, a quiet note under the mod's name. Claims are shown
+/// as claims, never as verified: "(not checked)" says Agora has not confirmed it.
+fn provenance_text(provenance: &Mo2Provenance) -> String {
+    match provenance {
+        Mo2Provenance::Claimed {
+            modid: Some(id), ..
+        } => format!("Nexus mod {id} (not checked)"),
+        Mo2Provenance::Claimed { modid: None, .. } => "No Nexus mod ID in meta.ini".to_string(),
+        Mo2Provenance::Absent => "No meta.ini".to_string(),
+        Mo2Provenance::Unreadable { reason } => format!("meta.ini could not be read: {reason}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("agora-import-test-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temp folder can be made");
+        dir
+    }
+
+    /// The app never tells a player to run a command: with no install of the game anywhere, the
+    /// preview fails with the Settings code and plain words, while core keeps its CLI wording.
+    #[test]
+    fn no_install_anywhere_is_told_in_the_apps_words() {
+        let error = ImportError::NoInstall {
+            game: "Skyrim Special Edition".into(),
+            game_id: agora_game_api::GameId::new("skyrim-se").unwrap(),
+            path: PathBuf::from(r"C:\Games\Skyrim"),
+            candidates: Vec::new(),
+        };
+        assert!(error.to_string().contains("agora games list"));
+        let inventory = GameInventory {
+            installs: Vec::new(),
+            unsupported: Vec::new(),
+        };
+        let refused = choose_install_or_fail(error, &inventory).expect_err("nothing to choose");
+        assert_eq!(refused.code, NO_INSTALL);
+        assert!(refused.message.contains(r"C:\Games\Skyrim"));
+        assert!(!refused.message.contains("agora "), "{}", refused.message);
+    }
+
+    #[test]
+    fn a_setup_folder_resolves_to_its_ini() {
+        let dir = temp_dir("folder");
+        std::fs::write(dir.join(INI_NAME), "[General]\n").unwrap();
+        let resolved = resolve_setup_path(&dir.to_string_lossy()).unwrap();
+        assert_eq!(resolved, dir.join(INI_NAME));
+    }
+
+    #[test]
+    fn the_ini_file_itself_is_accepted_in_any_case() {
+        let dir = temp_dir("ini-case");
+        let ini = dir.join("modorganizer.INI");
+        std::fs::write(&ini, "[General]\n").unwrap();
+        assert_eq!(resolve_setup_path(&ini.to_string_lossy()).unwrap(), ini);
+    }
+
+    #[test]
+    fn empty_and_whitespace_paths_are_refused_with_the_pick_prompt() {
+        for input in ["", "   \t "] {
+            let error = resolve_setup_path(input).expect_err(input);
+            assert_eq!(error.code, BAD_PATH, "{input:?}");
+            assert!(
+                error.message.starts_with("Pick the folder"),
+                "{input:?}: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn a_folder_without_an_ini_says_so() {
+        let dir = temp_dir("no-ini");
+        let error = resolve_setup_path(&dir.to_string_lossy()).unwrap_err();
+        assert_eq!(error.code, BAD_PATH);
+        assert!(error.message.contains(INI_NAME), "{}", error.message);
+    }
+
+    #[test]
+    fn a_file_that_is_not_the_setup_ini_is_refused() {
+        let dir = temp_dir("other-file");
+        let other = dir.join("plugins.txt");
+        std::fs::write(&other, "").unwrap();
+        let error = resolve_setup_path(&other.to_string_lossy()).unwrap_err();
+        assert_eq!(error.code, BAD_PATH);
+        assert!(
+            error.message.contains("not ModOrganizer.ini"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn a_missing_path_is_refused_with_its_name() {
+        let dir = temp_dir("missing");
+        let missing = dir.join("nope");
+        let error = resolve_setup_path(&missing.to_string_lossy()).unwrap_err();
+        assert_eq!(error.code, BAD_PATH);
+        assert!(
+            error.message.contains("Nothing exists"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn a_claimed_mod_id_is_described_as_unverified() {
+        let claimed = Mo2Provenance::Claimed {
+            modid: Some(42),
+            version: None,
+            installation_file: None,
+            repository: None,
+            game_name: None,
+            note: String::new(),
+        };
+        assert_eq!(provenance_text(&claimed), "Nexus mod 42 (not checked)");
+        assert_eq!(provenance_text(&Mo2Provenance::Absent), "No meta.ini");
+    }
+
+    #[test]
+    fn import_guard_refuses_a_second_import_and_releases() {
+        // Drop any leftover state from other tests in this process.
+        IMPORT_IN_PROGRESS.store(false, Ordering::SeqCst);
+        let first = ImportGuard::acquire().expect("first import acquires the guard");
+        let refused = ImportGuard::acquire().expect_err("a second import is refused");
+        assert_eq!(refused.code, IMPORT_BUSY);
+        assert!(
+            refused
+                .message
+                .contains("Another import is already running"),
+            "{}",
+            refused.message
+        );
+        drop(first);
+        let again = ImportGuard::acquire().expect("guard released on drop");
+        drop(again);
+    }
+
+    #[test]
+    fn import_guard_releases_on_panic() {
+        IMPORT_IN_PROGRESS.store(false, Ordering::SeqCst);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ImportGuard::acquire().expect("acquire before panic");
+            panic!("boom");
+        }));
+        let again = ImportGuard::acquire().expect("guard released on panic");
+        drop(again);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vortex (MASTER_SPEC §26.10)
+// ---------------------------------------------------------------------------
+
+use agora_core::game_import::vortex::{
+    self, VortexPlan, VortexRequest, VortexRunReport, VortexScan,
+};
+use agora_core::game_import::vortex_store;
+use agora_game_api::GameId;
+
+/// The Vortex store to read: the one given, or `%APPDATA%\Vortex\state.v2`. A machine with neither
+/// is told where we looked, rather than shown an empty list of games.
+fn resolve_vortex_store(store: Option<String>) -> Result<PathBuf, GamesError> {
+    match store.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        Some(store) => Ok(PathBuf::from(store)),
+        None => vortex_store::default_store_path().ok_or_else(|| {
+            GamesError::new(
+                BAD_PATH,
+                "This computer names no user-data folder for Vortex. Pick the folder that holds state.v2.",
+            )
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Importing several profiles (§26.10)
+// ---------------------------------------------------------------------------
+
+/// How several profiles import: one instance with a loadout per profile, or one
+/// instance per profile.
+fn grouping_from_mode(
+    mode: &str,
+) -> Result<agora_core::game_import::profiles::Grouping, GamesError> {
+    match mode {
+        "merged" => Ok(agora_core::game_import::profiles::Grouping::Merged),
+        "separate" => Ok(agora_core::game_import::profiles::Grouping::Separate),
+        other => Err(GamesError::new(
+            CORE_FAILED,
+            format!("'{other}' is not a grouping; use merged or separate"),
+        )),
+    }
+}
+
+/// One profile's numbers in a multi-profile plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiProfileSummary {
+    pub profile: String,
+    pub enabled: usize,
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// What a multi-profile import would do.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiPlanDto {
+    pub manager: String,
+    pub grouping: String,
+    pub profiles: Vec<String>,
+    pub bytes: u64,
+    pub free_bytes: Option<u64>,
+    pub fits: bool,
+    pub suggestion: agora_core::game_import::profiles::Suggestion,
+    pub plans: Vec<MultiProfileSummary>,
+    pub warnings: Vec<String>,
+}
+
+/// What a multi-profile import did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiRunDto {
+    pub instances: Vec<String>,
+    pub loadouts: Vec<String>,
+    pub profiles: Vec<game_import::Mo2ProfileOutcome>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MultiImportReply {
+    Plan(Box<MultiPlanDto>),
+    Run(Box<MultiRunDto>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexMultiRequest {
+    #[serde(default)]
+    pub store: Option<String>,
+    pub game: String,
+    pub profiles: Vec<String>,
+    pub mode: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub dry_run: bool,
+    #[serde(default)]
+    pub install: Option<String>,
+    #[serde(default)]
+    pub add_folder: bool,
+    #[serde(default)]
+    pub copy_saves: bool,
+    #[serde(default)]
+    pub all_mods: bool,
+}
+
+#[tauri::command]
+pub async fn games_import_vortex_multi(
+    app: tauri::AppHandle,
+    request: VortexMultiRequest,
+) -> Result<MultiImportReply, GamesError> {
+    tokio::task::spawn_blocking(move || -> Result<MultiImportReply, GamesError> {
+        let ctx = crate::core_context(&app)?;
+        let store = resolve_vortex_store(request.store)?;
+        let grouping = grouping_from_mode(&request.mode)?;
+        let game = GameId::new(&request.game).map_err(|error| {
+            GamesError::new(
+                CORE_FAILED,
+                format!("'{}' is not a game id: {error}", request.game),
+            )
+        })?;
+        let core_request = VortexRequest {
+            store,
+            game,
+            profile: request.profiles.first().cloned().unwrap_or_default(),
+            name: request
+                .name
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty()),
+            install: request
+                .install
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty()),
+            add_folder: request.add_folder,
+            copy_saves: request.copy_saves,
+            all_mods: request.all_mods,
+        };
+        let inventory = installed_games(&ctx);
+        if request.dry_run {
+            let plan =
+                vortex::plan_profiles(&ctx, &inventory, &core_request, &request.profiles, grouping)
+                    .map_err(import_failed)?;
+            return Ok(MultiImportReply::Plan(Box::new(MultiPlanDto {
+                manager: "vortex".into(),
+                grouping: request.mode,
+                profiles: plan.profiles.clone(),
+                bytes: plan.bytes,
+                free_bytes: plan.free_bytes,
+                fits: plan.fits,
+                suggestion: plan.suggestion.clone(),
+                plans: plan
+                    .profiles
+                    .iter()
+                    .zip(plan.plans.iter())
+                    .map(|(profile, planned)| MultiProfileSummary {
+                        profile: profile.clone(),
+                        enabled: planned.mods_enabled,
+                        files: planned.files,
+                        bytes: planned.bytes,
+                    })
+                    .collect(),
+                warnings: plan.warnings.clone(),
+            })));
+        }
+        let _import_guard = ImportGuard::acquire()?;
+        let report = vortex::run_profiles(
+            &ctx,
+            &inventory,
+            &core_request,
+            &request.profiles,
+            grouping,
+            RunOptions::default(),
+            &|_| {},
+        )
+        .map_err(import_failed)?;
+        Ok(MultiImportReply::Run(Box::new(MultiRunDto {
+            instances: report.instances,
+            loadouts: report.loadouts,
+            profiles: report.profiles,
+            warnings: report.plan.warnings,
+        })))
+    })
+    .await
+    .map_err(|_| GamesError::new(TASK_FAILED, "Importing the Vortex profiles did not finish."))?
+}
+
+#[tauri::command]
+pub async fn games_import_vortex_suggest(
+    app: tauri::AppHandle,
+    store: Option<String>,
+    game: String,
+) -> Result<agora_core::game_import::profiles::Suggestion, GamesError> {
+    tokio::task::spawn_blocking(move || -> Result<_, GamesError> {
+        let ctx = crate::core_context(&app)?;
+        let store = resolve_vortex_store(store)?;
+        let inventory = installed_games(&ctx);
+        let sets = vortex::profile_sets(&ctx, &inventory, &store, &game).map_err(import_failed)?;
+        Ok(agora_core::game_import::profiles::suggest_grouping(
+            &sets.profiles,
+        ))
+    })
+    .await
+    .map_err(|_| GamesError::new(TASK_FAILED, "Reading the Vortex profiles did not finish."))?
+}
+
+#[tauri::command]
+pub async fn games_import_mo2_suggest(
+    ini_path: String,
+) -> Result<agora_core::game_import::profiles::Suggestion, GamesError> {
+    tokio::task::spawn_blocking(move || -> Result<_, GamesError> {
+        let sets = game_import::mo2_profile_sets(Path::new(&ini_path)).map_err(import_failed)?;
+        Ok(agora_core::game_import::profiles::suggest_grouping(&sets))
+    })
+    .await
+    .map_err(|_| GamesError::new(TASK_FAILED, "Reading the setup's profiles did not finish."))?
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Mo2MultiRequest {
+    pub ini_path: String,
+    pub profiles: Vec<String>,
+    pub mode: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub dry_run: bool,
+    #[serde(default)]
+    pub copy_saves: bool,
+    #[serde(default)]
+    pub install: Option<String>,
+}
+
+#[tauri::command]
+pub async fn games_import_mo2_multi(
+    app: tauri::AppHandle,
+    request: Mo2MultiRequest,
+) -> Result<MultiImportReply, GamesError> {
+    tokio::task::spawn_blocking(move || -> Result<MultiImportReply, GamesError> {
+        let ctx = crate::core_context(&app)?;
+        let grouping = grouping_from_mode(&request.mode)?;
+        let core_request = Mo2Request {
+            ini_path: PathBuf::from(&request.ini_path),
+            profile: request.profiles.first().cloned().unwrap_or_default(),
+            name: request
+                .name
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty()),
+            copy_saves: request.copy_saves,
+            install: request
+                .install
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty()),
+        };
+        let inventory = installed_games(&ctx);
+        if request.dry_run {
+            let plan = game_import::mo2_plan_profiles(
+                &ctx,
+                &inventory,
+                &core_request,
+                &request.profiles,
+                grouping,
+            )
+            .map_err(import_failed)?;
+            return Ok(MultiImportReply::Plan(Box::new(MultiPlanDto {
+                manager: "mo2".into(),
+                grouping: request.mode,
+                profiles: plan.profiles.clone(),
+                bytes: plan.bytes,
+                free_bytes: plan.free_bytes,
+                fits: plan.fits,
+                suggestion: plan.suggestion.clone(),
+                plans: plan
+                    .profiles
+                    .iter()
+                    .zip(plan.plans.iter())
+                    .map(|(profile, planned)| MultiProfileSummary {
+                        profile: profile.clone(),
+                        enabled: planned.mods_enabled,
+                        files: planned.files,
+                        bytes: planned.bytes,
+                    })
+                    .collect(),
+                warnings: plan.warnings.clone(),
+            })));
+        }
+        let _import_guard = ImportGuard::acquire()?;
+        let report = game_import::mo2_run_profiles(
+            &ctx,
+            &inventory,
+            &core_request,
+            &request.profiles,
+            grouping,
+            RunOptions::default(),
+            &|_| {},
+        )
+        .map_err(import_failed)?;
+        Ok(MultiImportReply::Run(Box::new(MultiRunDto {
+            instances: report.instances,
+            loadouts: report.loadouts,
+            profiles: Vec::new(),
+            warnings: Vec::new(),
+        })))
+    })
+    .await
+    .map_err(|_| GamesError::new(TASK_FAILED, "Importing the MO2 profiles did not finish."))?
+}
+
+/// The games and profiles a Vortex store holds, and whether Agora supports each game. Reads a copy
+/// of the store; Vortex must be closed (its lock is refused).
+#[tauri::command]
+pub async fn games_import_vortex_scan(
+    app: tauri::AppHandle,
+    store: Option<String>,
+) -> Result<VortexScan, GamesError> {
+    tokio::task::spawn_blocking(move || -> Result<VortexScan, GamesError> {
+        let ctx = crate::core_context(&app)?;
+        let store = resolve_vortex_store(store)?;
+        let inventory = installed_games(&ctx);
+        vortex::scan(&ctx, &inventory, &store).map_err(core_failed)
+    })
+    .await
+    .map_err(|_| GamesError::new(TASK_FAILED, "Reading the Vortex store did not finish."))?
+}
+
+/// One Vortex import request. `dry_run` plans and reports; otherwise the profile is imported.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexImportRequest {
+    /// The folder that holds `state.v2`; `None` uses the usual place.
+    #[serde(default)]
+    pub store: Option<String>,
+    /// Agora's game id, as the scan lists it.
+    pub game: String,
+    /// The Vortex profile, by name.
+    pub profile: String,
+    pub name: Option<String>,
+    pub dry_run: bool,
+    #[serde(default)]
+    pub install: Option<String>,
+    /// Add Vortex's game folder to Agora before importing (the `games_add_folder` path).
+    #[serde(default)]
+    pub add_folder: bool,
+    /// Copy the profile's own saves into the instance.
+    #[serde(default)]
+    pub copy_saves: bool,
+    /// Bring the profile's disabled mods too, turned off. Off by default.
+    #[serde(default)]
+    pub all_mods: bool,
+}
+
+/// What `games_import_vortex` answered: the plan for a dry run, or the report of an import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VortexImportReply {
+    Plan(Box<VortexPlanDto>),
+    Run(Box<VortexRunDto>),
+}
+
+/// Plan or import one Vortex profile. Reads the store and copies mods, so the work runs on a
+/// blocking thread.
+#[tauri::command]
+pub async fn games_import_vortex(
+    app: tauri::AppHandle,
+    request: VortexImportRequest,
+) -> Result<VortexImportReply, GamesError> {
+    tokio::task::spawn_blocking(move || -> Result<VortexImportReply, GamesError> {
+        let ctx = crate::core_context(&app)?;
+        let store = resolve_vortex_store(request.store)?;
+        let game = GameId::new(&request.game).map_err(|error| {
+            GamesError::new(
+                CORE_FAILED,
+                format!("'{}' is not a game id: {error}", request.game),
+            )
+        })?;
+        let core_request = VortexRequest {
+            store,
+            game,
+            profile: request.profile,
+            name: request
+                .name
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty()),
+            install: request
+                .install
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty()),
+            add_folder: request.add_folder,
+            copy_saves: request.copy_saves,
+            all_mods: request.all_mods,
+        };
+        let inventory = installed_games(&ctx);
+        if request.dry_run {
+            let plan = vortex::plan(&ctx, &inventory, &core_request).map_err(import_failed)?;
+            return Ok(VortexImportReply::Plan(Box::new(VortexPlanDto::from(
+                &plan,
+            ))));
+        }
+        let _import_guard = ImportGuard::acquire()?;
+        let report = vortex::run(
+            &ctx,
+            &inventory,
+            &core_request,
+            RunOptions::default(),
+            &|_| {},
+        )
+        .map_err(import_failed)?;
+        Ok(VortexImportReply::Run(Box::new(VortexRunDto::from(
+            &report,
+        ))))
+    })
+    .await
+    .map_err(|_| GamesError::new(TASK_FAILED, "Importing the Vortex profile did not finish."))?
+}
+
+/// The plan, in the fields the import screen shows. Nothing here is stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexPlanDto {
+    pub store: String,
+    pub vortex_game: String,
+    pub game_id: String,
+    pub game_name: String,
+    pub profile: String,
+    pub instance_name: String,
+    pub install_id: String,
+    pub install_location: String,
+    /// The folder is a real install but Agora has not added it; a real import adds it first.
+    pub would_add_folder: bool,
+    pub staging: String,
+    pub mods: Vec<VortexModDto>,
+    pub mods_enabled: usize,
+    pub mods_disabled: usize,
+    /// Disabled mods left out by the default (not `--all-mods`), by name.
+    pub mods_left_out: Vec<String>,
+    pub files: usize,
+    pub bytes: u64,
+    pub manifest: VortexManifestDto,
+    /// The mod ids in layer order, highest first.
+    pub order: Vec<String>,
+    pub disagreements: Vec<VortexDisagreementDto>,
+    pub plugins: VortexPluginsDto,
+    pub userlist: VortexUserlistDto,
+    pub local_settings: bool,
+    pub inis: Vec<String>,
+    pub local_saves: bool,
+    pub saves: SavesDto,
+    pub problems: Vec<ProblemDto>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexUserlistDto {
+    pub path: Option<String>,
+    pub rules: Vec<VortexRuleDto>,
+    pub refused: Vec<VortexRefusedRuleDto>,
+    pub not_imported: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexRuleDto {
+    pub item: String,
+    pub after: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexRefusedRuleDto {
+    pub item: String,
+    pub after: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexModDto {
+    pub mod_id: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub nexus_mod_id: Option<u64>,
+    pub nexus_file_id: Option<u64>,
+    pub folder: String,
+    pub enabled: bool,
+    pub files: usize,
+    pub bytes: u64,
+    /// What the store claims, in words. A claim is never checked against a download.
+    pub provenance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexManifestDto {
+    pub path: String,
+    pub found: bool,
+    pub files: usize,
+    pub matched: usize,
+    pub damaged: Option<String>,
+    pub searched: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexDisagreementDto {
+    pub file: String,
+    pub manifest_supplied: String,
+    pub rules_supply: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexPluginsDto {
+    pub kept: bool,
+    pub listed: usize,
+    pub active: usize,
+    pub notes: Vec<String>,
+}
+
+impl From<&VortexPlan> for VortexPlanDto {
+    fn from(plan: &VortexPlan) -> Self {
+        Self {
+            store: plan.store.to_string_lossy().into_owned(),
+            vortex_game: plan.vortex_game.clone(),
+            game_id: plan.game.as_str().to_string(),
+            game_name: plan.game_name.clone(),
+            profile: plan.profile.clone(),
+            instance_name: plan.instance_name.clone(),
+            install_id: plan.install_id.clone(),
+            install_location: plan.install_location.to_string_lossy().into_owned(),
+            would_add_folder: plan.would_add_folder,
+            staging: plan.staging.to_string_lossy().into_owned(),
+            mods: plan
+                .mods
+                .iter()
+                .map(|m| VortexModDto {
+                    mod_id: m.mod_id.clone(),
+                    name: m.name.clone(),
+                    version: m.version.clone(),
+                    nexus_mod_id: m.nexus_mod_id,
+                    nexus_file_id: m.nexus_file_id,
+                    folder: m.folder.clone(),
+                    enabled: m.enabled,
+                    files: m.files,
+                    bytes: m.bytes,
+                    provenance: vortex_provenance_text(&m.provenance),
+                })
+                .collect(),
+            mods_enabled: plan.mods_enabled,
+            mods_disabled: plan.mods_disabled,
+            mods_left_out: plan.mods_left_out.clone(),
+            files: plan.files,
+            bytes: plan.bytes,
+            manifest: VortexManifestDto {
+                path: plan.manifest.path.to_string_lossy().into_owned(),
+                found: plan.manifest.found,
+                files: plan.manifest.files,
+                matched: plan.manifest.matched,
+                damaged: plan.manifest.damaged.clone(),
+                searched: plan
+                    .manifest
+                    .searched
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
+            },
+            order: plan.order.clone(),
+            disagreements: plan
+                .disagreements
+                .iter()
+                .map(|d| VortexDisagreementDto {
+                    file: d.file.clone(),
+                    manifest_supplied: d.manifest_supplied.clone(),
+                    rules_supply: d.rules_supply.clone(),
+                })
+                .collect(),
+            plugins: VortexPluginsDto {
+                kept: plan.plugins.kept,
+                listed: plan.plugins.lines.len(),
+                active: plan.plugins.active,
+                notes: plan.plugins.notes.clone(),
+            },
+            userlist: VortexUserlistDto {
+                path: plan
+                    .userlist
+                    .path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                rules: plan
+                    .userlist
+                    .rules
+                    .iter()
+                    .map(|rule| VortexRuleDto {
+                        item: rule.item.clone(),
+                        after: rule.after.clone(),
+                    })
+                    .collect(),
+                refused: plan
+                    .userlist
+                    .refused
+                    .iter()
+                    .map(|rule| VortexRefusedRuleDto {
+                        item: rule.item.clone(),
+                        after: rule.after.clone(),
+                        reason: rule.reason.clone(),
+                    })
+                    .collect(),
+                not_imported: plan.userlist.not_imported.clone(),
+            },
+            local_settings: plan.local_settings,
+            inis: plan.inis.iter().map(|ini| ini.name.clone()).collect(),
+            local_saves: plan.local_saves,
+            saves: SavesDto {
+                local: plan.saves.local,
+                files: plan.saves.files,
+                bytes: plan.saves.bytes,
+                note: plan.saves.note.clone(),
+            },
+            problems: plan
+                .problems
+                .iter()
+                .map(|p| ProblemDto {
+                    line: p.line,
+                    entry: p.entry.clone(),
+                    reason: p.reason.clone(),
+                })
+                .collect(),
+            warnings: plan.warnings.clone(),
+        }
+    }
+}
+
+/// What a Vortex import did, after its plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexRunDto {
+    pub instance_id: Option<String>,
+    pub instance_name: String,
+    pub stored_mods: usize,
+    pub content_layers: usize,
+    pub disabled_layers: usize,
+    pub duplicates: Vec<String>,
+    pub plugins_written: Option<usize>,
+    pub plugin_findings: Vec<String>,
+    pub rules_added: usize,
+    pub rules_refused: Vec<String>,
+    pub inis_copied: Vec<String>,
+    pub saves_copied: usize,
+    pub saves_skipped_existing: usize,
+    pub saves_folder: Option<String>,
+    pub next_steps: Vec<String>,
+}
+
+impl From<&VortexRunReport> for VortexRunDto {
+    fn from(report: &VortexRunReport) -> Self {
+        Self {
+            instance_id: report.instance_id.clone(),
+            instance_name: report.plan.instance_name.clone(),
+            stored_mods: report.stored_mods,
+            content_layers: report.content_layers,
+            disabled_layers: report.disabled_layers,
+            duplicates: report.duplicates.clone(),
+            plugins_written: report.plugins_written,
+            plugin_findings: report.plugin_findings.clone(),
+            rules_added: report.rules_added,
+            rules_refused: report.rules_refused.clone(),
+            inis_copied: report.inis_copied.clone(),
+            saves_copied: report.saves_copied,
+            saves_skipped_existing: report.saves_skipped_existing,
+            saves_folder: report
+                .saves_folder
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            next_steps: report.next_steps.clone(),
+        }
+    }
+}
+
+fn vortex_provenance_text(provenance: &agora_core::content_store::VortexProvenance) -> String {
+    use agora_core::content_store::VortexProvenance;
+    match provenance {
+        VortexProvenance::Claimed {
+            modid: Some(id), ..
+        } => format!("Nexus mod {id} (not checked)"),
+        VortexProvenance::Claimed { modid: None, .. } => "No Nexus mod ID in the store".to_string(),
+        VortexProvenance::Absent => "No source in the store".to_string(),
+    }
+}

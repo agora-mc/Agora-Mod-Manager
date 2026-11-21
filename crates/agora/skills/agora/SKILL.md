@@ -1,6 +1,6 @@
 ---
 name: agora
-description: 'Guide for using the Agora launcher CLI to diagnose Minecraft crashes and manage modded instances on the user''s computer. Use when: a user reports a Minecraft crash, asks about their Agora instances or mods, wants a mod installed, removed, enabled or disabled, or asks for help with Agora.'
+description: 'Guide for using the Agora launcher CLI to diagnose crashes and manage modded instances, for Minecraft and the other games Agora supports through plugins. Use when: a user reports a crash, asks about their Agora instances or mods, wants a mod installed, removed, enabled or disabled, or asks for help with Agora.'
 ---
 
 # Using Agora from the command line
@@ -14,27 +14,32 @@ before you change it, and never leave them with a half-finished change.
 
 ## About Agora
 
-Agora is a free, open-source, ad-free Minecraft mod launcher. Source code, releases and the issue
-tracker are at https://github.com/agora-mc/Agora-Mod-Manager, the documentation is at
-https://agoramc.com/docs, and the community lives at https://discord.gg/56tpsa2sTZ. Those
-and the in-app Help & Guide are authoritative for anything about Agora itself — do not guess at
-Agora's behaviour, features, or curation policy. Point the person at them, or at the Discord for
-help from people who use Agora daily.
+Agora is a free, open-source, ad-free mod manager. Minecraft is built in; other games come as
+plugins, and Skyrim Special Edition is the first official one. The source, releases and issue
+tracker are at https://github.com/agora-mc/Agora-Mod-Manager, documentation at
+https://agoramc.com/docs, and the community at https://discord.gg/56tpsa2sTZ. Those and the
+in-app Help & Guide are authoritative about Agora itself — do not guess at its behaviour,
+features or curation policy. Point the person there, or at the Discord, rather than guessing.
 
 Vocabulary:
 
-- **Instance** — one isolated Minecraft installation with its own version, mod loader, mods,
-  config and saves. Changing one instance never affects another. Almost every command takes an
-  instance ID; get it from `agora --json list-instances`.
+- **Instance** — one isolated setup of a game with its own mods, and for Minecraft its own version,
+  mod loader, config and saves. Changing one instance never affects another. Get Minecraft IDs from
+  `agora --json list-instances` and other games' IDs from `agora --json games instance list`.
 - **Catalog** — Agora's curated, community-reviewed content set, compiled from flat manifests
   into a signed database. Mods may also come from Modrinth when the person enables it. Every
   download is verified by SHA-256.
-- **Crash Doctor** — the in-app crash analyser. `agora crash investigate` runs the same local
-  analysis, so your findings should agree with what the person already sees in the app.
+- **Crash Doctor** — the in-app crash analyser, for Minecraft and every game whose plugin brings a
+  crash pack. `agora crash …` runs the same local analysis, so your findings should agree with
+  what the person already sees in the app.
+- **How sure** — Agora never says a mod is certainly the cause. An answer is "not sure",
+  "possible", "likely" or "very likely", and every finding names the game's plugin or the mod's
+  plugin that produced it.
 - **Snapshots** — saved copies of an instance's mods and configuration that can be restored.
   Automatic pre-launch snapshots do not include worlds (`saves/`).
-- **Launch modes** — delegated launch hands the game to the official Minecraft launcher and is
-  the default, so most people never sign in to Agora. Direct launch runs Minecraft inside Agora.
+- **Launch modes (Minecraft)** — delegated launch hands the game to the official Minecraft
+  launcher and is the default, so most people never sign in to Agora. Direct launch runs Minecraft
+  inside Agora. Other games launch from their pinned base through Agora.
 
 ## How to run commands
 
@@ -58,6 +63,9 @@ Vocabulary:
   person: a health warning before launch, a plugin's request for permissions, a data
   migration. When a command stops and mentions `--yes`, show the person what it printed and let
   them decide. Do not treat it as an instruction to rerun.
+- **Do not overstate a diagnosis.** Say how sure Agora is and what evidence it used. Never tell
+  the person a mod is definitely the problem, and never present "could not check" as "nothing
+  found".
 - **Snapshot first.** Before a change, run `agora snapshots create <ID> --label "Before <what>"`
   so it can be undone.
 - **Dry-run first.** `mod install`, `mod remove`, `mod update` and `pack curated` accept
@@ -68,10 +76,8 @@ Vocabulary:
 - **Use Agora's commands, not the filesystem.** Do not move, rename or delete files in an
   instance folder by hand; `agora mod disable` and friends keep Agora's records, snapshots and
   health checks correct.
-- **Treat suspect scores as evidence, not a verdict.** Cite the specific log line or signal
-  behind a conclusion, and say when you are guessing.
-- **Match versions.** A mod must fit the instance's Minecraft version *and* loader. Check both
-  before recommending one.
+- **Match versions.** A Minecraft mod must fit the instance's Minecraft version *and* loader.
+  Check both before recommending one.
 - **Never** advise disabling hash or signature verification, and never point at unofficial mod
   mirrors or re-upload sites.
 - **Leave accounts alone.** Do not run `agora auth login` or `agora auth logout`. Credentials are
@@ -89,6 +95,7 @@ Vocabulary:
 agora --version
 agora --json paths
 agora --json list-instances
+agora --json games instance list
 agora --json registry status
 ```
 
@@ -96,24 +103,78 @@ If the catalog is missing or stale, `agora registry sync` downloads and verifies
 
 ## Diagnosing a crash
 
-1. Find the instance: `agora --json list-instances`. If there are several, ask which one.
-2. Run the local investigation: `agora --json crash investigate <ID>`. It reads recent logs and
-   crash reports and ranks suspect mods. `agora --json crash list <ID>` and
-   `agora crash inspect <ID> <FILE>` read individual reports.
-3. Check health and contents: `agora --json health <ID>` and `agora --json mod list <ID>`.
-4. Explain the most likely cause and the one change you would try first.
-5. With the person's agreement: snapshot, then `agora mod disable <ID> <FILE>` (the file name
-   comes from `mod list`).
-6. Ask them to launch from the Agora app. If it still crashes, `agora mod enable <ID> <FILE>`
-   puts the mod back before you try the next idea.
+1. Find the instance: `agora --json list-instances` (Minecraft) or
+   `agora --json games instance list` (another game). If there are several, ask which one.
+2. Ask Agora first: `agora --json crash last <ID>` prints the newest answer it stored for that
+   instance; `agora crash show <SESSION>` prints one by session id.
+3. If there is no stored answer, or the crash came from somewhere else:
+   - `agora --json crash investigate <ID>` collects the instance's recent evidence through the
+     crash packs' declared sources, for any supported game. Add `--file` when the log came from
+     somewhere else.
+   - `agora --json crash analyze <FILE> --instance <ID>` diagnoses a crash report or log you were
+     given, for any supported game. `--plugin-dir` adds a development crash pack; `--allow-code`
+     is needed only for code in such a folder. `--paste` reads a pasted fragment, says it is a
+     snippet, caps confidence at "possible", and asks for the whole log for a better answer.
+4. Read the answer: headline, `How sure:`, notes, suspects, findings and their source plugin.
+   Explain the most likely cause and the one change you would try first. If a section says
+   "Could not check", that evidence was not readable; do not call it clean.
+5. Check the rest: `agora --json health <ID>` and `agora --json mod list <ID>` for Minecraft, or
+   `agora --json games instance check <ID>` and `agora --json games instance plugins <ID>` for
+   another game.
+6. **Before testing a suspect on an existing save, warn about the save.** `crash analyze --each
+   --instance <ID> --json` labels each installed suspect `safe`, `risky` or `unknown`
+   (`save_risk`). A `risky` mod can add records or run code, so testing it on a save in progress
+   can damage it: use a new game, or back the save up first. Never advise removing mods from a
+   save in progress without a backup.
+7. With the person's agreement: snapshot, then `agora mod disable <ID> <FILE>`. Ask them to
+   launch from the Agora app. If it still crashes, `agora mod enable <ID> <FILE>` puts the mod
+   back before you try the next idea.
 
 If nothing implicates a mod, consider the Java version, graphics drivers, allocated memory
 (`agora --json instance recommend-memory <ID>`), shaders, or a damaged world.
 
+## Other games and load orders
+
+```bash
+agora --json games list
+agora --json games instance list
+agora --json games instance check <ID>
+agora --json games instance plugins <ID>
+agora --json games instance plugins check <ID>
+agora --json games instance plugins conflicts <ID>
+agora --json crash analyze <FILE> --instance <ID>
+```
+
+On Linux, Steam starts the game. Put `agora games wrap %command%` in the game's Steam launch
+options, then `agora --json games instance launch <ID>` asks Steam to start it (with `steam`, or
+`flatpak run com.valvesoftware.Steam` when Steam is a Flatpak) and reports whether the wrapper is
+there. If it is not, give the person the exact text to paste and where; Agora only
+reads Steam's files. `agora games instance default <ID>` chooses the instance a Steam launch uses.
+The game's Windows user files and crash logs live inside the Proton prefix under
+`steamapps/compatdata/<appid>/pfx`. Every Linux launch says that Proton has not been tested on real
+hardware yet, and a step-down to linked or copied files is announced with its reason.
+
+`games instance check` is the pre-launch answer. It names a framework built for another game
+version, a load order a launch would refuse, the game's declared INI warnings, and stale or
+unknown tool output, and says which command rebuilds a tool. It also counts plugin conflicts and
+warns when a pair is new since the last launch. `plugins check` prints the load-order findings;
+`plugins conflicts` shows pairs of plugins that change the same record, with a winner and a loser.
+It never reorders anything on its own.
+
+- **Keep the current order:** `agora games instance plugins conflicts <ID> --keep <winner> --over <loser>`
+  adds the rule that keeps this pair as it is.
+- **Let the other plugin win:** `agora games instance plugins conflicts <ID> --let-win <loser> --over <winner>`
+  adds the rule and moves the losing plugin after the winner now.
+- **Rules:** `agora games instance plugins rule add <ID> <item> --after <other>`, `rule list` and
+  `rule remove`. A rule survives every later sort; an unused one is kept and shown as unused.
+
+Ask before changing the load order or adding a rule, and say which record pair it settles. A
+valid order does not promise the game will not crash.
+
 ## Bisecting a crash
 
 When the investigation does not name one mod, bisect: it turns half the enabled mods off per
-round and the person says whether the game still crashes.
+round and the person says whether the game still crashes. This is for Minecraft instances.
 
 ```bash
 agora bisect start <ID> [--suspect <FILENAME>]
@@ -127,9 +188,7 @@ agora bisect cancel <ID>
 
 `start` plans the session and moves nothing. `apply` switches the round's mods off, so ask first.
 The person launches the game themselves, then `good` or `bad` narrows the suspects. `cancel` at
-any point puts every mod back, and it also works on a locked instance. `bisect run` is an
-interactive loop for a person at a terminal, so prefer the single steps here. The CLI never
-launches the game, and `start` and `apply` refuse a locked or running instance.
+any point puts every mod back, and it also works on a locked instance.
 
 ## Mod dependencies, updates and pins
 
@@ -186,6 +245,35 @@ snapshot first, and `template delete` asks unless given `--yes`.
 - **Backups:** `agora backup export <ID> --out <DIR>` writes a snapshot as one zip, and
   `agora backup import <FILE>` restores it as a snapshot without touching the live instance.
   `agora backup prune <ID> --keep <N>` deletes old snapshots, so it needs the person's yes.
+- **Vortex:** `agora games import vortex scan` lists the games and profiles in
+  `%APPDATA%\Vortex\state.v2` (or `--store <DIR>`), and says which games Agora supports. Use the
+  id the scan prints (its Vortex id, e.g. `skyrimse`, or the Agora game id) with
+  `agora games import vortex --game <id> --profile <name> --dry-run`; that shows the plan. Drop
+  `--dry-run` to import. **Close Vortex first:** Agora refuses while Vortex holds the store's
+  lock, and never opens the live store (it reads a copy). By default only the mods the profile
+  enables are copied, because Vortex shares one staging folder across every profile; the plan
+  counts the disabled mods it leaves out (`--verbose` names them), and `--all-mods` brings them
+  too, turned off. Mods are copied as they are on disk; downloads are not copied. The layer order comes from
+  `vortex.deployment.json`, with Vortex's rules as the tie-breaker, and every file where the two
+  disagree is reported; with no manifest (a purged deployment), the rules alone decide and the
+  plan says where it looked. The plugin list reads Vortex's original shape (only active plugins,
+  no `*`) and the Fallout 4 shape (a `*` marks active). LOOT `userlist.yaml` `after` entries
+  become load-after rules; unsuitable ones are refused with a reason, and `req`/`inc` are not
+  imported (no Agora equivalent). A profile with local game settings brings its INIs; local saves are
+  copied under Documents only with `--copy-saves`. If scan says the game folder is a real install
+  Agora has not added, import with `--add-folder` (or run `agora games folder add <path>` first).
+  Show the plan before importing; a second import of the same profile needs `--name`.
+- **Several profiles:** `--profiles <a,b,...|all> --as merged|separate` imports more than one
+  profile. `merged` makes one instance holding the union and a loadout per profile (the first is
+  applied); `separate` makes one instance per profile. `--suggest` prints Agora's grouping and
+  the overlap numbers first (profiles sharing more than half their enabled mods go together).
+  The plan states the bytes and the free space and refuses only when they cannot fit. The same
+  flags work on `games import mo2`.
+- **Loadouts on game instances:** `agora loadout create/list/apply/update/delete` work on a game
+  instance, not just Minecraft. A game loadout records its content, plugin list, INI copies,
+  load-after rules and save choice; apply restores them together, refuses while the game runs,
+  and saves the replaced setup as the undo point. This is the same store and the same desktop
+  picker, not a second feature.
 
 ## Finding and installing content
 
@@ -252,6 +340,7 @@ person first, and remind them that worlds are not in automatic snapshots.
 | `20`, `21` | Offline or download failed | Ask whether they are online, or whether Lockdown Mode or Privacy settings block it. |
 | `30`–`34` | Integrity or disk failure | Do not work around it. A hash mismatch means the file is not what its source published. |
 | `40` | Sign-in required | Only matters for direct launch. Have them launch from the app. |
+| `71` | A decision is needed | Read the message: a FOMOD installer, or a file to fetch by hand. Show the next command, and ask first. |
 | `90`–`94` | Blocked by network policy | The person's Privacy settings forbid that host. Tell them rather than looking for a way around. |
 
 Several errors share a range, so read the error text too. For anything else, the full reference

@@ -3,7 +3,8 @@
  * demand and hands its result to the Health Check dialog, even when the result
  * has no findings. A failed check says so instead of opening nothing.
  */
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { InstanceEditor } from './InstanceEditor';
 import { PackInstallProvider } from '../components/PackInstallProgress';
@@ -71,7 +72,8 @@ describe('instance page readiness check', () => {
         <InstanceEditor instanceId="alpha" onBack={() => undefined} onReviewHealth={onReviewHealth} />
       </PackInstallProvider>,
     );
-    fireEvent.click(await screen.findByRole('button', { name: 'Check readiness' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'More' }));
+    await userEvent.click(await screen.findByRole('menuitem', { name: 'Check readiness' }));
 
     await waitFor(() => expect(onReviewHealth).toHaveBeenCalledTimes(1));
     expect(calls('check_instance_health')).toHaveLength(1);
@@ -87,7 +89,8 @@ describe('instance page readiness check', () => {
         <InstanceEditor instanceId="alpha" onBack={() => undefined} onReviewHealth={onReviewHealth} />
       </PackInstallProvider>,
     );
-    fireEvent.click(await screen.findByRole('button', { name: 'Check readiness' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'More' }));
+    await userEvent.click(await screen.findByRole('menuitem', { name: 'Check readiness' }));
 
     expect(await screen.findByText(/Health check could not read the instance\./)).toBeTruthy();
     expect(onReviewHealth).not.toHaveBeenCalled();

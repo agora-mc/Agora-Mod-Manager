@@ -5,6 +5,7 @@
  * one instance must not follow the user to another.
  */
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { InstanceEditor } from './InstanceEditor';
 import { PackInstallProvider } from '../components/PackInstallProgress';
@@ -40,7 +41,7 @@ function contentRow(filename: string, overrides: Record<string, unknown> = {}) {
     content_type: 'mod', enabled: true, installed_at: '2026-07-01T00:00:00Z', source: 'modrinth',
     source_label: 'Modrinth', pack_managed: false, installed_as_dependency: false, update_pinned: false,
     source_url: null, registry_id: null, modrinth_id: 'proj', mod_jar_id: null, loader_mod_id: null,
-    size_bytes: 10, file_present: true, resolved_path: null, author: null, categories: ['Utility'],
+    size_bytes: 10, file_present: true, file_state: 'ok', resolved_path: null, author: null, categories: ['Utility'],
     icon_url: null, curation_status: 'unknown', agora_score: null, modrinth_downloads: null,
     metadata_status: 'partial', ...overrides,
   };
@@ -158,7 +159,8 @@ describe('readiness line', () => {
 describe('instance header controls', () => {
   it('says what Revert returns to, and that it can be undone', async () => {
     render(editor('alpha'));
-    const revert = await screen.findByRole('button', { name: 'Revert' });
+    await userEvent.click(await screen.findByRole('button', { name: 'More' }));
+    const revert = await screen.findByRole('menuitem', { name: 'Revert' });
     const title = revert.getAttribute('title') ?? '';
     expect(title).toContain('lock snapshot');
     expect(title).toContain('undo');
@@ -169,14 +171,15 @@ describe('instance header controls', () => {
     invokeMock.mockImplementation(async (command: string, args: { instanceId?: string } = {}) =>
       command === 'list_snapshots' ? [] : previous?.(command, args));
     render(editor('alpha'));
-    fireEvent.click(await screen.findByRole('button', { name: 'Revert' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'More' }));
+    await userEvent.click(await screen.findByRole('menuitem', { name: 'Revert' }));
     await screen.findByText(/has no lock snapshot to revert to/);
     expect(invokeMock.mock.calls.some(([command]) => command === 'revert_instance')).toBe(false);
   });
 
-  it('explains Lock on the button itself, where a hover reaches it', async () => {
+  it('explains Lock on the icon button itself, where a hover reaches it', async () => {
     render(editor('alpha'));
-    const lock = await screen.findByRole('button', { name: 'Lock' });
+    const lock = await screen.findByRole('button', { name: /stops mod changes/ });
     expect(lock.getAttribute('title')).toContain('stops mod changes');
   });
 });
@@ -218,6 +221,7 @@ describe('installed content details', () => {
 describe('instance banners', () => {
   it('drops a status message when the editor moves to another instance', async () => {
     const view = render(editor('alpha'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Backups & Versions' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Loadout Profiles' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Apply' }));
     await screen.findByText(/Profile "Fast" applied\./);

@@ -1,0 +1,24 @@
+---- Minecraft Crash Report ----
+// A test crash, invented for these fixtures.
+
+Time: 2026-04-05 06:07:08
+Description: Loading a test world
+
+java.lang.IllegalArgumentException: examplemod could not build its data
+	at com.example.mod.ExampleData.load(ExampleData.java:55) ~[examplemod-neoforge-2.0.0.jar%231!/:?] {}
+	at net.neoforged.neoforge.event.EventBus.start(EventBus.java:100) ~[neoforge-21.1.80-universal.jar%232!/:?] {}
+
+A detailed walkthrough of the error, its code path and all known details is as follows:
+---------------------------------------------------------------------------------------
+-- System Details --
+Details:
+	Minecraft Version: 1.21.1
+	Operating System: Windows 11 (amd64) version 10.0
+	Java Version: 21.0.3, Example JDK Vendor
+	Java VM Version: OpenJDK 64-Bit Server VM (mixed mode), Example JDK Vendor
+	Memory: 800000000 bytes (763 MiB) / 1300000000 bytes (1239 MiB) up to 4000000000 bytes (3814 MiB)
+	Launched Version: neoforge-21.1.80
+	NeoForge: net.neoforged:21.1.80
+	Mod List: 
+		examplemod-neoforge-2.0.0.jar                     |Example Mod                   |examplemod                    |2.0.0               |DONE      |Manifest: example
+		examplelib-4.5.6.jar                              |Example Library               |examplelib                    |4.5.6               |DONE      |Manifest: example

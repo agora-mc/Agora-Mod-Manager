@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 import governance as gov
 
@@ -334,9 +335,11 @@ class TestStateIO(unittest.TestCase):
     def tearDown(self):
         import shutil; shutil.rmtree(self.tmp, ignore_errors=True)
     def test_load_missing_vote_issues(self):
-        self.assertEqual(gov.load_vote_issues(Path(self.tmp)/"v.json"), {"schema_version": 1, "items": {}})
+        with self.assertRaises(gov.GovernanceError):
+            gov.load_vote_issues(Path(self.tmp)/"v.json")
     def test_load_missing_state(self):
-        self.assertEqual(gov.load_governance_state(Path(self.tmp)/"s.json"), {"schema_version": 1, "events": []})
+        with self.assertRaises(gov.GovernanceError):
+            gov.load_governance_state(Path(self.tmp)/"s.json")
     def test_load_none_state(self):
         self.assertEqual(gov.load_governance_state(None), {"schema_version": 1, "events": []})
     def test_save_and_load(self):
@@ -405,29 +408,31 @@ class TestStateIO(unittest.TestCase):
         self.assertIsInstance(loaded["generated_at"], str)
     def test_malformed(self):
         p = Path(self.tmp)/"b.json"; p.write_text("{x", encoding="utf-8")
-        self.assertEqual(gov.load_governance_state(p), {"schema_version": 1, "events": []})
+        with self.assertRaises(gov.GovernanceError):
+            gov.load_governance_state(p)
     def test_repo_mismatch_rejected(self):
         p = Path(self.tmp)/"s.json"
         d = {"schema_version": 1, "governance_repository": "old/repo", "policy": "production", "events": [{"event_id":"e1"}]}
         gov.save_governance_state(p, d)
-        loaded = gov.load_governance_state(p, governance_repo="new/repo", policy="production")
-        self.assertEqual(loaded, {"schema_version": 1, "events": []})
+        with self.assertRaisesRegex(gov.GovernanceError, "old/repo"):
+            gov.load_governance_state(p, governance_repo="new/repo", policy="production")
     def test_policy_mismatch_rejected(self):
         p = Path(self.tmp)/"s.json"
         d = {"schema_version": 1, "governance_repository": "repo/org", "policy": "sandbox", "events": [{"event_id":"e1"}]}
         gov.save_governance_state(p, d)
-        loaded = gov.load_governance_state(p, governance_repo="repo/org", policy="production")
-        self.assertEqual(loaded, {"schema_version": 1, "events": []})
+        with self.assertRaisesRegex(gov.GovernanceError, "sandbox"):
+            gov.load_governance_state(p, governance_repo="repo/org", policy="production")
     def test_atomic_write(self):
         p = Path(self.tmp)/"s.json"; gov.save_governance_state(p, {"events": []}); self.assertTrue(p.exists())
     def test_quarantine_not_written(self):
         p = Path(self.tmp)/"q.json"; p.write_text(json.dumps({"schema_version": 1, "decisions": []}), encoding="utf-8")
         orig = p.read_text(encoding="utf-8")
         _clear()
+        gov.INJECTED_USER_PROFILES = {"a": _profile("a", 100)}
         gov.INJECTED_FETCH_ISSUES = lambda o,r,token: [_make_issue(1, "a", "sodium", "x"*100, labels=["registry-vote"])]
         gov.INJECTED_FETCH_REACTIONS = lambda o,r,i,token: [_reaction(1,"a","-1")]
         vi = Path(self.tmp)/"vi.json"; vi.write_text(json.dumps({"schema_version":1,"items":{"sodium":{"issue_number":1}}}), encoding="utf-8")
-        gs = Path(self.tmp)/"gs.json"
+        gs = Path(self.tmp)/"gs.json"; gs.write_text(json.dumps({"schema_version":1,"events":[]}), encoding="utf-8")
         gov.run_governance_pipeline([{"id":"sodium","name":"Sodium"}], mode=gov.GovernanceMode.MONITOR, policy=gov.GovernancePolicy.SANDBOX, governance_repo="owner/repo", token="t", blacklist=set(), vote_issues_path=vi, governance_state_in_path=gs, governance_state_out_path=gs, quarantine_decisions_path=p, discord_webhook_url=None)
         self.assertEqual(p.read_text(encoding="utf-8"), orig)
     def test_reviews_emitted_for_unmapped_item(self):
@@ -436,8 +441,9 @@ class TestStateIO(unittest.TestCase):
         gov.INJECTED_FETCH_ISSUES = lambda o,r,token: [_make_issue(1, "alice", "sodium", "x"*100)]
         gov.INJECTED_FETCH_REACTIONS = lambda o,r,i,token: [_reaction(1,"alice","+1")]
         vi = Path(self.tmp)/"vi.json"; vi.write_text(json.dumps({"schema_version":1,"items":{}}), encoding="utf-8")
-        gs = Path(self.tmp)/"gs.json"
-        r = gov.run_governance_pipeline([{"id":"sodium","name":"Sodium"}, {"id":"iris","name":"Iris"}], mode=gov.GovernanceMode.READ_ONLY, policy=gov.GovernancePolicy.SANDBOX, governance_repo="owner/repo", token="t", blacklist=set(), vote_issues_path=vi, governance_state_in_path=gs, governance_state_out_path=gs, quarantine_decisions_path=Path(self.tmp)/"qd.json", discord_webhook_url=None)
+        gs = Path(self.tmp)/"gs.json"; gs.write_text(json.dumps({"schema_version":1,"events":[]}), encoding="utf-8")
+        qd = Path(self.tmp)/"qd.json"; qd.write_text(json.dumps({"schema_version":1,"decisions":[]}), encoding="utf-8")
+        r = gov.run_governance_pipeline([{"id":"sodium","name":"Sodium"}, {"id":"iris","name":"Iris"}], mode=gov.GovernanceMode.READ_ONLY, policy=gov.GovernancePolicy.SANDBOX, governance_repo="owner/repo", token="t", blacklist=set(), vote_issues_path=vi, governance_state_in_path=gs, governance_state_out_path=gs, quarantine_decisions_path=qd, discord_webhook_url=None)
         # Even with empty vote_issues, both items appear in results with reviews
         self.assertIn("sodium", r)
         self.assertIn("iris", r)
@@ -522,12 +528,12 @@ class TestPipelineMocked(unittest.TestCase):
         self.assertEqual(r, {})
 
     def test_no_token(self):
-        r = gov.run_governance_pipeline([{"id":"sodium"}], mode=gov.GovernanceMode.READ_ONLY, policy=gov.GovernancePolicy.PRODUCTION, governance_repo="o/r", token=None, blacklist=set(), vote_issues_path=self.vi, governance_state_in_path=self.gs, governance_state_out_path=self.gs, quarantine_decisions_path=self.qd, discord_webhook_url=None)
-        self.assertEqual(r, {})
+        with self.assertRaisesRegex(gov.GovernanceError, "GITHUB_TOKEN"):
+            gov.run_governance_pipeline([{"id":"sodium"}], mode=gov.GovernanceMode.READ_ONLY, policy=gov.GovernancePolicy.PRODUCTION, governance_repo="o/r", token=None, blacklist=set(), vote_issues_path=self.vi, governance_state_in_path=self.gs, governance_state_out_path=self.gs, quarantine_decisions_path=self.qd, discord_webhook_url=None)
 
     def test_no_repo(self):
-        r = gov.run_governance_pipeline([{"id":"sodium"}], mode=gov.GovernanceMode.READ_ONLY, policy=gov.GovernancePolicy.PRODUCTION, governance_repo=None, token="t", blacklist=set(), vote_issues_path=self.vi, governance_state_in_path=self.gs, governance_state_out_path=self.gs, quarantine_decisions_path=self.qd, discord_webhook_url=None)
-        self.assertEqual(r, {})
+        with self.assertRaisesRegex(gov.GovernanceError, "repo"):
+            gov.run_governance_pipeline([{"id":"sodium"}], mode=gov.GovernanceMode.READ_ONLY, policy=gov.GovernancePolicy.PRODUCTION, governance_repo=None, token="t", blacklist=set(), vote_issues_path=self.vi, governance_state_in_path=self.gs, governance_state_out_path=self.gs, quarantine_decisions_path=self.qd, discord_webhook_url=None)
 
     def test_no_mapped_items(self):
         self.vi.write_text(json.dumps({"schema_version":1,"items":{}}), encoding="utf-8")
@@ -792,6 +798,182 @@ class TestPipelineMocked(unittest.TestCase):
         # Empty mapping still returns item results (reviews independent)
         self.assertIn("sodium", r)
         self.assertEqual(r["sodium"]["review_count"], 0)
+
+# ===================================================================
+# Pagination and fail-closed inputs
+# ===================================================================
+
+class _FakeResponse:
+    def __init__(self, payload, status_code: int = 200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+
+class TestPagination(unittest.TestCase):
+    def setUp(self):
+        _clear()
+
+    def tearDown(self):
+        _clear()
+
+    def _run_issues(self, pages):
+        def fake_get(url, *, headers, params):
+            return _FakeResponse(pages[params["page"] - 1])
+        with mock.patch.object(gov, "_github_get", side_effect=fake_get):
+            return gov._fetch_issues("owner", "repo", token="t")
+
+    def test_issues_past_old_ten_page_cap_are_all_paged(self):
+        pages = [
+            [{"number": page * 100 + n} for n in range(100)]
+            for page in range(10)
+        ]
+        pages.append([{"number": 1000}])
+        result = self._run_issues(pages)
+        self.assertEqual(len(result), 1001)
+        self.assertEqual(result[-1]["number"], 1000)
+
+    def test_reactions_past_old_five_page_cap_are_all_paged(self):
+        pages = [
+            [{"id": page * 100 + n} for n in range(100)]
+            for page in range(5)
+        ]
+        pages.append([{"id": 500}])
+
+        def fake_get(url, *, headers, params):
+            return _FakeResponse(pages[params["page"] - 1])
+
+        with mock.patch.object(gov, "_github_get", side_effect=fake_get):
+            result = gov._fetch_reactions("owner", "repo", 7, token="t")
+        self.assertEqual(len(result), 501)
+
+    def test_pagination_limit_stops_with_a_named_error(self):
+        old = gov.MAX_GITHUB_PAGES
+        gov.MAX_GITHUB_PAGES = 2
+        try:
+            pages = [
+                [{"number": page * 100 + n} for n in range(100)]
+                for page in range(2)
+            ]
+            with self.assertRaisesRegex(gov.GovernanceError, "2-page pagination limit"):
+                self._run_issues(pages)
+        finally:
+            gov.MAX_GITHUB_PAGES = old
+
+    def test_http_error_stops_and_names_the_source(self):
+        with mock.patch.object(
+            gov, "_github_get", return_value=_FakeResponse([], status_code=500)
+        ):
+            with self.assertRaisesRegex(gov.GovernanceError, "/issues.*HTTP 500"):
+                gov._fetch_issues("owner", "repo", token="t")
+
+    def test_invalid_json_stops(self):
+        with mock.patch.object(
+            gov, "_github_get",
+            return_value=_FakeResponse(ValueError("not json")),
+        ):
+            with self.assertRaisesRegex(gov.GovernanceError, "invalid JSON"):
+                gov._fetch_issues("owner", "repo", token="t")
+
+
+class TestFailClosed(unittest.TestCase):
+    def setUp(self):
+        _clear()
+        self.tmp = tempfile.mkdtemp()
+        self.vi = Path(self.tmp) / "vi.json"
+        self.gs = Path(self.tmp) / "gs.json"
+        self.qd = Path(self.tmp) / "qd.json"
+        self.vi.write_text(
+            json.dumps({"schema_version": 1, "items": {"sodium": {"issue_number": 1}}}),
+            encoding="utf-8",
+        )
+        self.gs.write_text(
+            json.dumps({"schema_version": 1, "events": []}), encoding="utf-8"
+        )
+        self.qd.write_text(
+            json.dumps({"schema_version": 1, "decisions": []}), encoding="utf-8"
+        )
+        gov.INJECTED_USER_PROFILES = {"alice": _profile("alice", 100)}
+
+    def tearDown(self):
+        _clear()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _pipeline(self, **overrides):
+        kwargs = dict(
+            items=[{"id": "sodium", "name": "Sodium"}],
+            mode=gov.GovernanceMode.READ_ONLY,
+            policy=gov.GovernancePolicy.SANDBOX,
+            governance_repo="owner/repo",
+            token="t",
+            blacklist=set(),
+            vote_issues_path=self.vi,
+            governance_state_in_path=self.gs,
+            governance_state_out_path=self.gs,
+            quarantine_decisions_path=self.qd,
+            discord_webhook_url=None,
+        )
+        kwargs.update(overrides)
+        return gov.run_governance_pipeline(**kwargs)
+
+    def test_issue_fetch_error_stops_the_run(self):
+        gov.INJECTED_FETCH_ISSUES = lambda o, r, token: (
+            _ for _ in ()
+        ).throw(gov.GovernanceError("/issues fetch failed"))
+        with self.assertRaisesRegex(gov.GovernanceError, "/issues"):
+            self._pipeline()
+
+    def test_reaction_fetch_error_stops_the_run(self):
+        gov.INJECTED_FETCH_ISSUES = lambda o, r, token: [
+            _make_issue(1, "alice", "sodium", "x" * 100, labels=["registry-vote"])
+        ]
+        gov.INJECTED_FETCH_REACTIONS = lambda o, r, i, token: (
+            _ for _ in ()
+        ).throw(gov.GovernanceError("reactions fetch failed"))
+        with self.assertRaisesRegex(gov.GovernanceError, "reactions"):
+            self._pipeline()
+
+    def test_unreadable_state_file_stops_the_run(self):
+        gov.INJECTED_FETCH_ISSUES = lambda o, r, token: []
+        self.gs.write_text("{not json", encoding="utf-8")
+        with self.assertRaisesRegex(gov.GovernanceError, "governance state"):
+            self._pipeline()
+
+    def test_unreadable_curator_file_stops_the_run(self):
+        gov.INJECTED_FETCH_ISSUES = lambda o, r, token: []
+        self.qd.write_text("{not json", encoding="utf-8")
+        with self.assertRaisesRegex(gov.GovernanceError, "curator decisions"):
+            self._pipeline()
+
+    def test_unreadable_vote_issues_file_stops_the_run(self):
+        self.vi.write_text("{not json", encoding="utf-8")
+        gov.INJECTED_FETCH_ISSUES = lambda o, r, token: []
+        with self.assertRaisesRegex(gov.GovernanceError, "vote-issues"):
+            self._pipeline()
+
+    def test_override_proceeds_after_a_fetch_error_and_logs(self):
+        gov.INJECTED_FETCH_ISSUES = lambda o, r, token: (
+            _ for _ in ()
+        ).throw(gov.GovernanceError("/issues fetch failed"))
+        with self.assertLogs("compiler.governance", level="WARNING") as logs:
+            result = self._pipeline(allow_partial=True)
+        self.assertIn("sodium", result)
+        self.assertEqual(result["sodium"]["review_count"], 0)
+        self.assertTrue(any("partial governance" in line for line in logs.output))
+
+    def test_override_proceeds_after_an_unreadable_state_file_and_logs(self):
+        gov.INJECTED_FETCH_ISSUES = lambda o, r, token: []
+        self.gs.write_text("{not json", encoding="utf-8")
+        with self.assertLogs("compiler.governance", level="WARNING") as logs:
+            result = self._pipeline(allow_partial=True)
+        self.assertIn("sodium", result)
+        self.assertTrue(any("partial governance" in line for line in logs.output))
+
 
 # ===================================================================
 # DB enrichment (exact columns)

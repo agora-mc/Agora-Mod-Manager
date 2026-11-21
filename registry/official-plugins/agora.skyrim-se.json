@@ -1,0 +1,16 @@
+{
+  "id": "agora.skyrim-se",
+  "name": "Skyrim Special Edition",
+  "description": "Adds The Elder Scrolls V: Skyrim Special Edition to Agora.",
+  "game_ids": [
+    "skyrim-se"
+  ],
+  "min_agora_version": "0.1.0",
+  "current": {
+    "version": "0.1.0",
+    "package_url": "https://github.com/agora-mc/Agora-Mod-Manager/releases/download/official-skyrim-se-v0.1.0/skyrim-se-0.1.0.zip",
+    "sha256": "78f6ac737f57479d91a66d5803be0a5fd784308aa7e9c5bd68b1f4d74a29ad64",
+    "tree_sha256": "a21e02d4ed0670650ddf9c6729b3ab447682256f8e29af229df2d416c1cab6ae",
+    "size": 24134
+  }
+}

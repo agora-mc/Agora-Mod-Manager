@@ -1,0 +1,5 @@
+# Agora captured Java output (sanitized, last 200 lines)
+# exit_code=1
+# runtime_ms=42000
+[stdout] [01:02:03] [main/INFO]: Loading Minecraft 1.21 with Fabric Loader 0.16.0
+[stderr] [01:02:04] [main/ERROR]: java.lang.OutOfMemoryError: Java heap space

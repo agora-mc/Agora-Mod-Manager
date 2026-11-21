@@ -25,6 +25,33 @@ Never use a sandbox policy with the production state file.
 
 The current nightly workflow sets `GOVERNANCE_MODE: monitor` and `GOVERNANCE_POLICY: production`. It validates and may commit `registry/governance/governance-state.json`, and production monitor mode requires the configured alert destination. Verify [`.github/workflows/compile.yml`](../.github/workflows/compile.yml) before every operational change rather than relying on an older runbook.
 
+## Fail-closed behavior
+
+The compiler refuses to build a catalog from partial governance data. The run
+stops with an error naming the source when:
+
+- a GitHub issues, reactions, or user-profile request fails or returns a
+  non-success status;
+- `vote_issues.json`, `poll_blacklist.json`, `known_conflicts.json`, the input
+  governance state, or `quarantine_decisions.json` is missing, unreadable, or
+  malformed;
+- the state file names a different `governance_repository` or `policy` than
+  the run was configured for;
+- pagination would exceed the safety rail while GitHub is still returning full
+  pages, so the result would be truncated.
+
+The compiler follows every GitHub page until a short page ends the list. The
+100-page rail is not a data cap; it only bounds a runaway loop, and hitting it
+is reported as a truncated result.
+
+### Maintainer override
+
+A maintainer may deliberately continue through these conditions with
+`--allow-partial-governance` or `AGORA_GOVERNANCE_ALLOW_PARTIAL=1`. The
+override logs a warning naming each skipped input or failed source, and the
+result is then partial. It exists for diagnosis and recovery, never for a
+release build. A catalog produced with the override must not be published.
+
 ## Production state
 
 The tracked governance state is:
@@ -70,8 +97,9 @@ Before sharing diagnostic output, remove tokens, webhook URLs, private usernames
 
 The compiler requires every catalog vote issue to carry the `registry-vote`
 label before it will parse reactions on it as votes. This applies to both the
-active governance pipeline (`run_governance_pipeline`, driven by
-`registry/governance/vote_issues.json`) and the legacy Pass 1 vote harvest.
+active governance pipeline (`run_governance_pipeline` in
+`compiler/governance.py`, driven by `registry/governance/vote_issues.json`).
+The compiler has a single governance implementation; there is no legacy pass.
 
 Consequences of an unlabeled vote issue:
 
@@ -121,9 +149,10 @@ Do not edit historical event IDs to make a decision apply.
 
 ## Malformed or stale state
 
-When state cannot be parsed or validated:
+When the compiler reports that state cannot be parsed or validated, the run
+has already stopped before writing or signing anything. Recover deliberately:
 
-1. Stop monitor writes.
+1. Stop monitor writes (the failed run did not write).
 2. Preserve the malformed file.
 3. Inspect recent Git history.
 4. Identify the last valid state.

@@ -21,7 +21,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('./api', () => ({
-  pluginsEnabled: mocks.enabled,
+  pluginCodeAllowed: mocks.enabled,
   listPlugins: mocks.list,
   listPluginContributions: mocks.contributions,
   startPlugins: mocks.start,

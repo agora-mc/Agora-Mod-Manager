@@ -1,0 +1,30 @@
+#
+# A fatal error has been detected by the Java Runtime Environment:
+#
+#  EXCEPTION_ACCESS_VIOLATION (0xc0000005) at pc=0x00007ff8cbde3153, pid=2216, tid=6304
+#
+# JRE version: Example Runtime (8.0.51) (build 1.8.0_51-b16)
+# Java VM: Example HotSpot(TM) 64-Bit Server VM (25.51-b03 mixed mode windows-amd64 compressed oops)
+# Problematic frame:
+# C  [examplegfx.dll+0xc03153]
+#
+# The crash happened outside the Java Virtual Machine in native code.
+#
+---------------  T H R E A D  ---------------
+
+Current thread (0x0000000002a44800):  JavaThread "Render thread" [_thread_in_native, id=6304]
+
+siginfo: ExceptionCode=0xc0000005, reading address 0x0000000031e41000
+
+Registers:
+RIP=0x00007ff8cbde3153, EFLAGS=0x0000000000010206
+
+---------------  S Y S T E M  ---------------
+
+OS: Windows 10.0 , 64 bit Build 19041 (10.0.19041.1503)
+
+CPU:total 6 (6 cores per cpu, 1 threads per core) family 21 model 2 stepping 0
+
+Memory: 4k page, physical 16743080k(2322528k free), swap 36666024k(15076432k free)
+
+vm_info: Example HotSpot(TM) 64-Bit Server VM (25.51-b03) for windows-amd64 JRE (1.8.0_51-b16)

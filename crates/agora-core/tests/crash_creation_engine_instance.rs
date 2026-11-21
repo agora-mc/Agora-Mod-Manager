@@ -1,0 +1,846 @@
+//! The first inspector end to end: a crash log, a test instance, and an invented DLL that declares
+//! a different game version. With the instance the DLL is named and the answer can reach
+//! `very_likely`; without one the same log names nothing new and no inspector runs. Every name here
+//! is invented.
+
+#[path = "common/dll.rs"]
+mod dll_fixture;
+
+use agora_core::crash_engine::attribution::{InstanceView, LayerOwner, LayerView, Resolver};
+use agora_core::crash_engine::{
+    analyze, analyze_with_facts, AnalyzeInput, AnalyzeOutput, CrashFile, InstanceAnalysis,
+    InstanceInspector,
+};
+use agora_core::crash_packs::{load_plugin_packs, LoadedCrashPack};
+use agora_game_api::crash::{
+    AttrValue, Cause, CouldNotCheck, CouldNotCheckReason, Fact, Family, GameHandle, InspectResult,
+    Level, Owner, Ref, ResolvedRepair, SaveRiskLabel, Scalar,
+};
+use agora_plugin_api::host::{
+    ActivationRequest, GameReads, HostBridge, ScriptHost, ScriptReadError,
+};
+use agora_plugin_api::manifest::{PluginId, PluginManifest};
+use agora_plugin_api::protocol::{HostRequest, HostResponse, LogLevel};
+use agora_plugin_host::QuickJsHost;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tempfile::TempDir;
+
+use dll_fixture::{dll, VersionData};
+
+const PLUGIN: &str = "agora.creation-engine";
+const GAME: &str = "skyrim-se";
+const RUNNING: &str = "1.6.1170";
+const DLL_NAME: &str = "InventedPlugin.dll";
+const DLL_PATH: &str = "Data/SKSE/Plugins/InventedPlugin.dll";
+
+struct NoopBridge;
+
+impl HostBridge for NoopBridge {
+    fn call(&self, _plugin_id: &PluginId, request: HostRequest) -> HostResponse {
+        HostResponse::Ok {
+            request_id: request.request_id,
+            value: serde_json::Value::Null,
+        }
+    }
+
+    fn log(&self, _plugin_id: &PluginId, _level: LogLevel, _message: &str) {}
+}
+
+fn official_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/official/creation-engine")
+}
+
+struct Running {
+    _data: TempDir,
+    host: QuickJsHost,
+    pack: LoadedCrashPack,
+}
+
+fn start() -> Running {
+    let root = official_root();
+    let text = std::fs::read_to_string(root.join("agora-plugin.json")).unwrap();
+    let manifest = PluginManifest::parse(&text).unwrap();
+    let report = load_plugin_packs(PLUGIN, &root, &manifest);
+    assert!(report.is_clean(), "{:#?}", report.problems);
+    let pack = report.packs[0].clone();
+    let data = tempfile::tempdir().unwrap();
+    let host = QuickJsHost::new();
+    host.activate(
+        ActivationRequest {
+            plugin_id: PluginId::parse(PLUGIN).unwrap(),
+            package_root: root,
+            data_root: data.path().to_path_buf(),
+            entrypoint: "main.js".into(),
+            memory_limit_bytes: ActivationRequest::DEFAULT_MEMORY_LIMIT,
+            stack_limit_bytes: ActivationRequest::DEFAULT_STACK_LIMIT,
+            api_version: agora_plugin_api::host_api_version_string(),
+            settings: serde_json::json!({}),
+        },
+        Arc::new(NoopBridge),
+    )
+    .unwrap();
+    Running {
+        _data: data,
+        host,
+        pack,
+    }
+}
+
+/// A Crash Logger 1.16 log whose stack and SKSE plugin list both name `InventedPlugin.dll`.
+fn log() -> String {
+    format!(
+        "Skyrim SSE v{RUNNING}\nCrashLoggerSSE v1-16-0-0 Jan  1 2026 00:00:00\n\n\
+Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x7FF700001000 SkyrimSE.exe+001000\tmov rax, [rcx]\n\n\
+SYSTEM SPECS:\n\tOS: Microsoft Windows 11 Pro v10.0.26200\n\tCPU: InventedVendor Invented CPU 9200\n\
+\tGPU #1: Invented Graphics 9200\n\tPHYSICAL MEMORY: 15.50 GB/16.00 GB\n\n\
+PROBABLE CALL STACK:\n\t[ 0] 0x7FF700000000 SkyrimSE.exe+001000\n\
+\t[ 1] 0x7FF700001000 {DLL_NAME}+001000\n\n\
+MODULES:\n\tSkyrimSE.exe                 0x7FF700000000\n\n\
+SKSE PLUGINS:\n\t{DLL_NAME} v1.0.0\n\n\
+PLUGINS:\n\tLight: 0\tRegular: 2\tTotal: 2\n\t[ 0]     Skyrim.esm\n\t[ 1]     InventedPatch.esp\n"
+    )
+}
+
+struct OneFile {
+    bytes: Vec<u8>,
+}
+
+impl GameReads for OneFile {
+    fn read_bytes(&self, path: &str, offset: u64, len: u64) -> Result<Vec<u8>, ScriptReadError> {
+        if !path.eq_ignore_ascii_case(DLL_PATH) {
+            return Err(ScriptReadError::new(
+                "not_found",
+                "that path is not in this instance",
+            ));
+        }
+        let start = (offset as usize).min(self.bytes.len());
+        let end = start.saturating_add(len as usize).min(self.bytes.len());
+        Ok(self.bytes[start..end].to_vec())
+    }
+
+    fn read_lines(
+        &self,
+        _path: &str,
+        _from_line: u64,
+        _max_lines: u32,
+    ) -> Result<serde_json::Value, ScriptReadError> {
+        Err(ScriptReadError::new(
+            "unreadable",
+            "this test reader has no lines",
+        ))
+    }
+
+    fn list(&self, _path: &str) -> Result<serde_json::Value, ScriptReadError> {
+        Err(ScriptReadError::new(
+            "unreadable",
+            "this test reader has no list",
+        ))
+    }
+
+    fn size(&self, path: &str) -> Option<u64> {
+        path.eq_ignore_ascii_case(DLL_PATH)
+            .then_some(self.bytes.len() as u64)
+    }
+}
+
+fn view() -> InstanceView {
+    InstanceView::new(vec![LayerView::new(
+        "bad-mod",
+        true,
+        LayerOwner::Item {
+            key: "bad-mod".to_string(),
+            name: "Invented Plugin Mod".to_string(),
+        },
+        vec![DLL_PATH.to_string()],
+    )])
+}
+
+fn with_instance(running: &Running, bytes: Vec<u8>) -> AnalyzeOutput {
+    with_instance_notes(running, bytes, &[])
+}
+
+fn with_instance_notes(
+    running: &Running,
+    bytes: Vec<u8>,
+    could_not_check: &[CouldNotCheck],
+) -> AnalyzeOutput {
+    let resolver = Resolver::new(
+        view(),
+        running.pack.pack.ref_maps.clone(),
+        running.pack.pack.roles.clone(),
+    );
+    let scope: Arc<dyn GameReads> = Arc::new(OneFile { bytes });
+    let inspector = InstanceInspector::new(
+        &running.host,
+        std::slice::from_ref(&running.pack),
+        &resolver,
+        scope,
+        GameHandle {
+            id: GAME.to_string(),
+            runtime_version: Some(RUNNING.to_string()),
+        },
+    );
+    let output = analyze(&AnalyzeInput {
+        packs: std::slice::from_ref(&running.pack),
+        files: &[CrashFile::new(
+            "crash-2026-01-01-12-00-00.log",
+            log().into_bytes(),
+        )],
+        runtime_version: Some(RUNNING),
+        host: &running.host,
+        built_in: &[],
+        instance: Some(InstanceAnalysis {
+            game_id: GAME,
+            resolver: &resolver,
+            inspector: &inspector,
+            could_not_check,
+        }),
+    })
+    .unwrap();
+    assert!(output.read_any(), "{:#?}", output.files);
+    output
+}
+
+fn loose(running: &Running) -> AnalyzeOutput {
+    let output = analyze(&AnalyzeInput {
+        packs: std::slice::from_ref(&running.pack),
+        files: &[CrashFile::new(
+            "crash-2026-01-01-12-00-00.log",
+            log().into_bytes(),
+        )],
+        runtime_version: Some(RUNNING),
+        host: &running.host,
+        built_in: &[],
+        instance: None,
+    })
+    .unwrap();
+    assert!(output.read_any(), "{:#?}", output.files);
+    output
+}
+
+fn names(output: &AnalyzeOutput) -> Vec<String> {
+    output
+        .answer
+        .candidates
+        .iter()
+        .map(|candidate| match &candidate.owner {
+            Owner::Item { name, .. } => name.clone(),
+            other => format!("{other:?}"),
+        })
+        .collect()
+}
+
+fn rule_fired(output: &AnalyzeOutput, rule: &str) -> bool {
+    output
+        .answer
+        .findings
+        .iter()
+        .any(|finding| finding.source.rule_id.as_deref() == Some(rule))
+}
+
+#[test]
+fn an_instance_names_a_listed_dll_that_declares_another_game_version() {
+    let running = start();
+    let data = VersionData {
+        compatible: vec![[1, 5, 97, 0]],
+        ..VersionData::default()
+    };
+    let output = with_instance(&running, dll(&data));
+
+    assert_eq!(
+        names(&output),
+        vec!["Invented Plugin Mod"],
+        "{:#?}",
+        output.answer
+    );
+    assert_eq!(output.answer.level, Level::VeryLikely);
+    assert!(rule_fired(
+        &output,
+        "skse_plugin_built_for_another_game_version"
+    ));
+    assert!(rule_fired(
+        &output,
+        "stack_module_built_for_another_game_version"
+    ));
+    let inspection = output
+        .answer
+        .inspections
+        .iter()
+        .find(|inspection| inspection.inspector == "skse_plugin_declaration")
+        .expect("the answer shows the inspection");
+    assert_eq!(inspection.result, InspectResult::Fail);
+    assert_eq!(inspection.target, DLL_NAME);
+    assert!(
+        !inspection.facts.is_empty(),
+        "the declaration reaches the answer"
+    );
+    assert!(inspection
+        .detail
+        .as_deref()
+        .unwrap_or("")
+        .contains("built for another game version"));
+}
+
+#[test]
+fn what_an_instance_could_not_supply_reaches_could_not_check() {
+    let running = start();
+    let note = CouldNotCheck {
+        reason: CouldNotCheckReason::InstanceIncomplete,
+        subject: "2 installed items".to_string(),
+        detail: Some("no class prefix is recorded for them".to_string()),
+        source: None,
+    };
+    let output = with_instance_notes(
+        &running,
+        dll(&VersionData::default()),
+        std::slice::from_ref(&note),
+    );
+    assert!(
+        output.answer.could_not_check.contains(&note),
+        "{:#?}",
+        output.answer.could_not_check
+    );
+}
+
+#[test]
+fn an_instance_labels_a_dll_as_risky_to_remove() {
+    let running = start();
+    let data = VersionData {
+        compatible: vec![[1, 5, 97, 0]],
+        ..VersionData::default()
+    };
+    let output = with_instance(&running, dll(&data));
+    let suspect = output
+        .answer
+        .candidates
+        .first()
+        .expect("the instance names the mod");
+    assert_eq!(suspect.save_risk, Some(SaveRiskLabel::Risky));
+}
+
+#[test]
+fn a_loose_file_never_carries_a_save_risk_label() {
+    let running = start();
+    let output = analyze(&AnalyzeInput {
+        packs: std::slice::from_ref(&running.pack),
+        files: &[CrashFile::new(
+            "crash-2026-01-01-12-00-00.log",
+            log().into_bytes(),
+        )],
+        runtime_version: Some(RUNNING),
+        host: &running.host,
+        built_in: &[],
+        instance: None,
+    })
+    .unwrap();
+    assert!(output.read_any(), "{:#?}", output.files);
+    assert!(output
+        .answer
+        .candidates
+        .iter()
+        .all(|candidate| candidate.save_risk.is_none()));
+}
+
+#[test]
+fn a_dll_that_declares_this_game_version_names_nobody() {
+    let running = start();
+    let data = VersionData {
+        compatible: vec![[1, 6, 1170, 0]],
+        ..VersionData::default()
+    };
+    let output = with_instance(&running, dll(&data));
+    // The older, log-only rules may still name the mod through the stack; the inspector must not.
+    assert!(!rule_fired(
+        &output,
+        "skse_plugin_built_for_another_game_version"
+    ));
+    assert!(!rule_fired(
+        &output,
+        "stack_module_built_for_another_game_version"
+    ));
+    assert!(output
+        .answer
+        .candidates
+        .iter()
+        .all(|candidate| !candidate.families.contains(&Family::VerifiedAsset)));
+    assert!(output.answer.level < Level::VeryLikely);
+    let inspection = output
+        .answer
+        .inspections
+        .iter()
+        .find(|inspection| inspection.inspector == "skse_plugin_declaration")
+        .expect("the answer shows the inspection");
+    assert_eq!(inspection.result, InspectResult::Pass);
+}
+
+#[test]
+fn without_an_instance_the_same_log_names_nothing_new_and_runs_no_inspector() {
+    let running = start();
+    let output = loose(&running);
+    // The loose file may still name the DLL as itself through the older log-only rules; it must not
+    // reach the mod the instance would have provided, and no inspector may run.
+    assert!(!names(&output)
+        .iter()
+        .any(|name| name == "Invented Plugin Mod"));
+    assert!(!rule_fired(
+        &output,
+        "skse_plugin_built_for_another_game_version"
+    ));
+    assert!(!rule_fired(
+        &output,
+        "stack_module_built_for_another_game_version"
+    ));
+    assert!(output.answer.inspections.is_empty());
+    assert!(!output
+        .answer
+        .could_not_check
+        .iter()
+        .any(|check| check.subject == "skse_plugin_declaration"));
+}
+
+#[test]
+fn the_inspector_only_runs_for_the_instance_game() {
+    let running = start();
+    let data = VersionData {
+        compatible: vec![[1, 5, 97, 0]],
+        ..VersionData::default()
+    };
+    let resolver = Resolver::new(
+        view(),
+        running.pack.pack.ref_maps.clone(),
+        running.pack.pack.roles.clone(),
+    );
+    let scope: Arc<dyn GameReads> = Arc::new(OneFile { bytes: dll(&data) });
+    let inspector = InstanceInspector::new(
+        &running.host,
+        std::slice::from_ref(&running.pack),
+        &resolver,
+        scope,
+        GameHandle {
+            id: "another-game".to_string(),
+            runtime_version: Some(RUNNING.to_string()),
+        },
+    );
+    let output = analyze(&AnalyzeInput {
+        packs: std::slice::from_ref(&running.pack),
+        files: &[CrashFile::new(
+            "crash-2026-01-01-12-00-00.log",
+            log().into_bytes(),
+        )],
+        runtime_version: Some(RUNNING),
+        host: &running.host,
+        built_in: &[],
+        instance: Some(InstanceAnalysis {
+            game_id: "another-game",
+            resolver: &resolver,
+            inspector: &inspector,
+            could_not_check: &[],
+        }),
+    })
+    .unwrap();
+    // The pack is for skyrim-se, so another game's analysis does not load it.
+    assert!(output.answer.inspections.is_empty());
+    assert!(output.answer.candidates.is_empty());
+}
+
+#[test]
+fn a_ref_that_is_not_in_the_instance_is_not_inspected() {
+    let running = start();
+    let data = VersionData {
+        compatible: vec![[1, 5, 97, 0]],
+        ..VersionData::default()
+    };
+    // The DLL is in the log, but the instance's layer does not provide it.
+    let resolver = Resolver::new(
+        InstanceView::new(vec![LayerView::new(
+            "bad-mod",
+            true,
+            LayerOwner::Item {
+                key: "bad-mod".to_string(),
+                name: "Invented Plugin Mod".to_string(),
+            },
+            Vec::new(),
+        )]),
+        running.pack.pack.ref_maps.clone(),
+        running.pack.pack.roles.clone(),
+    );
+    let scope: Arc<dyn GameReads> = Arc::new(OneFile { bytes: dll(&data) });
+    let inspector = InstanceInspector::new(
+        &running.host,
+        std::slice::from_ref(&running.pack),
+        &resolver,
+        scope,
+        GameHandle {
+            id: GAME.to_string(),
+            runtime_version: Some(RUNNING.to_string()),
+        },
+    );
+    let output = analyze(&AnalyzeInput {
+        packs: std::slice::from_ref(&running.pack),
+        files: &[CrashFile::new(
+            "crash-2026-01-01-12-00-00.log",
+            log().into_bytes(),
+        )],
+        runtime_version: Some(RUNNING),
+        host: &running.host,
+        built_in: &[],
+        instance: Some(InstanceAnalysis {
+            game_id: GAME,
+            resolver: &resolver,
+            inspector: &inspector,
+            could_not_check: &[],
+        }),
+    })
+    .unwrap();
+    assert!(
+        output.answer.inspections.is_empty(),
+        "{:#?}",
+        output.answer.inspections
+    );
+    assert!(!rule_fired(
+        &output,
+        "skse_plugin_built_for_another_game_version"
+    ));
+}
+
+/// A mesh path the game records with its `data\` prefix and its own casing. Two layers provide
+/// the file; the higher one wins and the overridden one is named.
+const MESH_PATH: &str = r"data\MESHES\actors\character\character assets\skeleton.nif";
+const MESH_FILE: &str = "Data/MESHES/actors/character/character assets/skeleton.nif";
+
+fn mesh_log(path: &str) -> String {
+    format!(
+        "Skyrim SSE v{RUNNING}\nCrashLoggerSSE v1-16-0-0 Jan  1 2026 00:00:00\n\n\
+Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x7FF700001000 SkyrimSE.exe+001000\tmov rax, [rcx]\n\n\
+SYSTEM SPECS:\n\tOS: Microsoft Windows 11 Pro v10.0.26200\n\tCPU: Invented CPU 9200\n\
+\tGPU #1: Invented Graphics 9200\n\tPHYSICAL MEMORY: 15.50 GB/16.00 GB\n\n\
+PROBABLE CALL STACK:\n\t[ 0] 0x7FF700000000 SkyrimSE.exe+001000\n\n\
+REGISTERS:\n\tRDX 0x0A000000000      (BSStream*)\n\
+\t\tstreamName: \"{path}\"\n\
+\t\tFormID: 0x00012345\n\
+\t\tFormType: Texture (61)\n\n\
+MODULES:\n\tSkyrimSE.exe                 0x7FF700000000\n\n\
+PLUGINS:\n\tLight: 0\tRegular: 1\tTotal: 1\n\t[ 0]     Skyrim.esm\n"
+    )
+}
+
+fn skeleton_view() -> InstanceView {
+    InstanceView::new(vec![
+        LayerView::new(
+            "base-skeleton",
+            true,
+            LayerOwner::Item {
+                key: "base-skeleton".to_string(),
+                name: "Base Skeleton Mod".to_string(),
+            },
+            vec![MESH_FILE.to_string()],
+        ),
+        LayerView::new(
+            "override-skeleton",
+            true,
+            LayerOwner::Item {
+                key: "override-skeleton".to_string(),
+                name: "Override Skeleton Mod".to_string(),
+            },
+            vec![MESH_FILE.to_string()],
+        ),
+    ])
+}
+
+#[test]
+fn a_mesh_named_with_the_data_prefix_resolves_to_the_mod_that_wins() {
+    let running = start();
+    let resolver = Resolver::new(
+        skeleton_view(),
+        running.pack.pack.ref_maps.clone(),
+        running.pack.pack.roles.clone(),
+    );
+    let scope: Arc<dyn GameReads> = Arc::new(OneFile { bytes: Vec::new() });
+    let inspector = InstanceInspector::new(
+        &running.host,
+        std::slice::from_ref(&running.pack),
+        &resolver,
+        scope,
+        GameHandle {
+            id: GAME.to_string(),
+            runtime_version: Some(RUNNING.to_string()),
+        },
+    );
+    let output = analyze(&AnalyzeInput {
+        packs: std::slice::from_ref(&running.pack),
+        files: &[CrashFile::new(
+            "crash-2026-01-01-12-00-00.log",
+            mesh_log(MESH_PATH).into_bytes(),
+        )],
+        runtime_version: Some(RUNNING),
+        host: &running.host,
+        built_in: &[],
+        instance: Some(InstanceAnalysis {
+            game_id: GAME,
+            resolver: &resolver,
+            inspector: &inspector,
+            could_not_check: &[],
+        }),
+    })
+    .unwrap();
+    let top = output
+        .answer
+        .candidates
+        .first()
+        .unwrap_or_else(|| panic!("no suspect: {:#?}", output.answer));
+    assert_eq!(
+        top.owner,
+        Owner::Item {
+            key: "override-skeleton".to_string(),
+            name: "Override Skeleton Mod".to_string(),
+        }
+    );
+    assert!(
+        top.also_provided_by
+            .iter()
+            .any(|name| name == "Base Skeleton Mod"),
+        "the overridden item is named: {:#?}",
+        top.also_provided_by
+    );
+    assert!(
+        !output.answer.could_not_check.iter().any(|note| note
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("could not tell who owns"))),
+        "{:#?}",
+        output.answer.could_not_check
+    );
+}
+
+#[test]
+fn a_loose_mesh_file_is_still_named_plainly() {
+    let running = start();
+    let output = analyze(&AnalyzeInput {
+        packs: std::slice::from_ref(&running.pack),
+        files: &[CrashFile::new(
+            "crash-2026-01-01-12-00-00.log",
+            mesh_log(MESH_PATH).into_bytes(),
+        )],
+        runtime_version: Some(RUNNING),
+        host: &running.host,
+        built_in: &[],
+        instance: None,
+    })
+    .unwrap();
+    let top = output
+        .answer
+        .candidates
+        .first()
+        .unwrap_or_else(|| panic!("no suspect: {:#?}", output.answer));
+    assert_eq!(
+        top.owner,
+        Owner::Item {
+            key: MESH_PATH.to_string(),
+            name: MESH_PATH.to_string(),
+        }
+    );
+}
+
+#[test]
+fn the_script_extenders_own_runtime_is_not_inspected_or_named() {
+    let running = start();
+    let text = format!(
+        "Skyrim SSE v{RUNNING}\nCrashLoggerSSE v1-16-0-0 Jan  1 2026 00:00:00\n\n\
+Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x7FF700001000 SkyrimSE.exe+001000\tmov rax, [rcx]\n\n\
+SYSTEM SPECS:\n\tOS: Microsoft Windows 11 Pro v10.0.26200\n\tCPU: Invented CPU 9200\n\
+\tGPU #1: Invented Graphics 9200\n\tPHYSICAL MEMORY: 15.50 GB/16.00 GB\n\n\
+PROBABLE CALL STACK:\n\t[ 0] 0x7FF700000000 SkyrimSE.exe+001000\n\n\
+MODULES:\n\tSkyrimSE.exe                 0x7FF700000000\n\n\
+SKSE PLUGINS:\n\tskse64_1_6_1170.dll v1.6.1170\n\n\
+PLUGINS:\n\tLight: 0\tRegular: 1\tTotal: 1\n\t[ 0]     Skyrim.esm\n"
+    );
+    let resolver = Resolver::new(
+        view(),
+        running.pack.pack.ref_maps.clone(),
+        running.pack.pack.roles.clone(),
+    );
+    let scope: Arc<dyn GameReads> = Arc::new(OneFile { bytes: Vec::new() });
+    let inspector = InstanceInspector::new(
+        &running.host,
+        std::slice::from_ref(&running.pack),
+        &resolver,
+        scope,
+        GameHandle {
+            id: GAME.to_string(),
+            runtime_version: Some(RUNNING.to_string()),
+        },
+    );
+    let output = analyze(&AnalyzeInput {
+        packs: std::slice::from_ref(&running.pack),
+        files: &[CrashFile::new(
+            "crash-2026-01-01-12-00-00.log",
+            text.into_bytes(),
+        )],
+        runtime_version: Some(RUNNING),
+        host: &running.host,
+        built_in: &[],
+        instance: Some(InstanceAnalysis {
+            game_id: GAME,
+            resolver: &resolver,
+            inspector: &inspector,
+            could_not_check: &[],
+        }),
+    })
+    .unwrap();
+    assert!(
+        output.answer.inspections.is_empty(),
+        "{:#?}",
+        output.answer.inspections
+    );
+    assert!(
+        !names(&output)
+            .iter()
+            .any(|name| name == "skse64_1_6_1170.dll"),
+        "{:?}",
+        names(&output)
+    );
+    assert!(
+        !output
+            .answer
+            .could_not_check
+            .iter()
+            .any(|note| note.subject == "skse_plugin_declaration"),
+        "{:#?}",
+        output.answer.could_not_check
+    );
+}
+
+fn fact_text(value: &str) -> AttrValue {
+    AttrValue::Scalar(Scalar::Text(value.to_string()))
+}
+
+#[test]
+fn a_missing_address_library_for_this_game_version_is_likely_and_offers_to_turn_it_on() {
+    let running = start();
+    let resolver = Resolver::new(
+        InstanceView::new(vec![
+            LayerView::new(
+                "address-library",
+                false,
+                LayerOwner::Item {
+                    key: "001 - Address Library for SKSE Plugins".to_string(),
+                    name: "001 - Address Library for SKSE Plugins".to_string(),
+                },
+                Vec::new(),
+            ),
+            LayerView::new(
+                "invented-fixes",
+                true,
+                LayerOwner::Item {
+                    key: "invented-fixes-key".to_string(),
+                    name: "Invented Fixes".to_string(),
+                },
+                vec!["Data/SKSE/Plugins/InventedFixes.dll".to_string()],
+            ),
+        ]),
+        running.pack.pack.ref_maps.clone(),
+        running.pack.pack.roles.clone(),
+    );
+    let scope: Arc<dyn GameReads> = Arc::new(OneFile { bytes: Vec::new() });
+    let inspector = InstanceInspector::new(
+        &running.host,
+        std::slice::from_ref(&running.pack),
+        &resolver,
+        scope,
+        GameHandle {
+            id: GAME.to_string(),
+            runtime_version: Some(RUNNING.to_string()),
+        },
+    );
+    let facts = vec![
+        Fact {
+            kind: "core.runtime_file".to_string(),
+            attrs: [
+                ("rule_id".to_string(), fact_text("address-library")),
+                (
+                    "rule_name".to_string(),
+                    fact_text("Address Library for SKSE Plugins"),
+                ),
+                ("problem".to_string(), fact_text("missing")),
+                (
+                    "expected".to_string(),
+                    fact_text("Data/SKSE/Plugins/versionlib-1-6-1170-0.bin"),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            refs: Vec::new(),
+            span: None,
+        },
+        Fact {
+            kind: "core.change".to_string(),
+            attrs: [("change".to_string(), fact_text("disabled"))]
+                .into_iter()
+                .collect(),
+            refs: vec![Ref {
+                kind: "content".to_string(),
+                value: "001 - Address Library for SKSE Plugins".to_string(),
+                strength: Default::default(),
+            }],
+            span: None,
+        },
+    ];
+    let preloader =
+        b"[12:00:00] attempting to load \"D:\\Game\\Data\\SKSE\\Plugins\\InventedFixes.dll\"\n"
+            .to_vec();
+    let output = analyze_with_facts(
+        &AnalyzeInput {
+            packs: std::slice::from_ref(&running.pack),
+            files: &[CrashFile::new("d3dx9_42.log", preloader)],
+            runtime_version: Some(RUNNING),
+            host: &running.host,
+            built_in: &[],
+            instance: Some(InstanceAnalysis {
+                game_id: GAME,
+                resolver: &resolver,
+                inspector: &inspector,
+                could_not_check: &[],
+            }),
+        },
+        &facts,
+        &[],
+    )
+    .unwrap();
+
+    let finding = output
+        .answer
+        .findings
+        .iter()
+        .find(|finding| {
+            finding
+                .headline
+                .get("en")
+                .is_some_and(|text| text.contains("Address Library for this game version"))
+        })
+        .unwrap_or_else(|| panic!("no Address Library finding: {:#?}", output.answer.findings));
+    assert_eq!(finding.level, Level::Likely);
+    assert_eq!(finding.cause, Cause::MissingRequirement);
+    assert!(
+        finding.headline["en"].contains("Data/SKSE/Plugins/versionlib-1-6-1170-0.bin"),
+        "{}",
+        finding.headline["en"]
+    );
+    assert!(
+        output.answer.repairs.iter().any(|offer| matches!(
+            &offer.request,
+            ResolvedRepair::EnableContent { key }
+                if key == "001 - Address Library for SKSE Plugins"
+        )),
+        "{:#?}",
+        output.answer.repairs
+    );
+    assert!(
+        output.answer.findings.iter().any(|finding| finding
+            .headline
+            .get("en")
+            .is_some_and(|text| text.contains("Invented Fixes"))),
+        "the plugin the preloader never finished is named: {:#?}",
+        output.answer.findings
+    );
+}

@@ -244,7 +244,7 @@ impl ClientCategory {
     ///
     /// This is the single definition that client construction and
     /// [`Self::index`] are both derived from — see [`HttpClients`].
-    const ALL: [ClientCategory; 17] = [
+    pub(crate) const ALL: [ClientCategory; 17] = [
         ClientCategory::MojangMetadata,
         ClientCategory::MojangContent,
         ClientCategory::Loader,
@@ -328,7 +328,7 @@ impl ClientCategory {
     }
 
     fn user_agent(&self) -> &'static str {
-        "AgoraLauncher/1.0"
+        "AgoraModManager/1.0"
     }
 
     fn max_response_bytes(&self) -> Option<u64> {
@@ -408,6 +408,18 @@ pub enum ProxySetting {
 }
 
 impl ProxySetting {
+    /// The setting as it may be printed: a manual proxy URL keeps its host and user name but
+    /// never its password (CodeQL rust/cleartext-logging).
+    pub fn redacted(&self) -> ProxySetting {
+        match self {
+            ProxySetting::Manual { url, username } => ProxySetting::Manual {
+                url: redact_proxy_url(url),
+                username: username.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
     /// Refuse a manual proxy reqwest could not use, before it is saved.
     pub fn validate(&self) -> LauncherResult<()> {
         if let ProxySetting::Manual { url, .. } = self {
@@ -427,6 +439,42 @@ impl ProxySetting {
         }
         Ok(())
     }
+}
+
+/// A proxy URL with its password replaced, for showing to the player. A URL without credentials
+/// is returned as it was. An unparseable one is still stripped of anything before an `@`, so a
+/// typo cannot print a secret either.
+pub fn redact_proxy_url(url: &str) -> String {
+    let trimmed = url.trim();
+    let Ok(mut parsed) = reqwest::Url::parse(trimmed) else {
+        return redact_raw_userinfo(trimmed);
+    };
+    if parsed.username().is_empty() && parsed.password().is_none() {
+        return url.to_string();
+    }
+    if parsed.username().is_empty() {
+        let _ = parsed.set_password(None);
+        let _ = parsed.set_username("***");
+    } else {
+        let _ = parsed.set_password(Some("***"));
+    }
+    parsed.to_string()
+}
+
+fn redact_raw_userinfo(raw: &str) -> String {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return raw.to_string();
+    };
+    let Some((userinfo, host)) = rest.rsplit_once('@') else {
+        return raw.to_string();
+    };
+    let user = userinfo.split(':').next().unwrap_or_default();
+    let shown = if user.is_empty() {
+        "***".to_string()
+    } else {
+        format!("{user}:***")
+    };
+    format!("{scheme}://{shown}@{host}")
 }
 
 static PROXY: std::sync::RwLock<Option<ProxySetting>> = std::sync::RwLock::new(None);
@@ -496,36 +544,107 @@ pub fn proxy_password_stored() -> bool {
     .is_some()
 }
 
-fn apply_proxy(builder: reqwest::ClientBuilder) -> LauncherResult<reqwest::ClientBuilder> {
-    let setting = PROXY
+fn configured_proxy() -> ProxySetting {
+    PROXY
         .read()
         .ok()
         .and_then(|slot| slot.clone())
+        .unwrap_or_default()
+}
+
+/// Whether a local DNS lookup failure must block the request.
+///
+/// Direct requests (`None`, or `System` with no environment proxy) have only
+/// their own resolver, so a name that does not resolve would fail anyway and is
+/// refused before any socket work. A configured proxy resolves the target
+/// itself: a local failure there does not establish that the destination is
+/// unsafe, so the request may proceed to the proxy.
+fn dns_failure_blocks_the_request() -> bool {
+    match configured_proxy() {
+        ProxySetting::None => true,
+        ProxySetting::Manual { .. } => false,
+        ProxySetting::System => ![
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty())),
+    }
+}
+
+fn proxy_for(setting: &ProxySetting) -> LauncherResult<Option<reqwest::Proxy>> {
+    let ProxySetting::Manual { url, username } = setting else {
+        return Ok(None);
+    };
+    let mut proxy = reqwest::Proxy::all(url.trim()).map_err(|e| LauncherError::Generic {
+        code: "ERR_PROXY_URL".into(),
+        message: format!("The saved proxy cannot be used: {e}"),
+    })?;
+    if let Some(username) = username.as_deref().filter(|name| !name.is_empty()) {
+        let password = crate::auth::load_secret(
+            crate::auth::KEYRING_SERVICE_NAME,
+            PROXY_SECRET_ACCOUNT,
+            PROXY_SECRET_FILE,
+            PROXY_SECRET_CONTEXT,
+        )
+        .ok()
+        .flatten()
         .unwrap_or_default();
+        proxy = proxy.basic_auth(username, &password);
+    }
+    Ok(Some(proxy))
+}
+
+/// Apply the user's proxy choice to an async client builder.
+///
+/// Every client Agora builds goes through this (or its blocking twin), so a
+/// path cannot quietly reach the internet without the proxy the user chose.
+pub fn apply_proxy(builder: reqwest::ClientBuilder) -> LauncherResult<reqwest::ClientBuilder> {
+    let setting = configured_proxy();
     Ok(match setting {
         ProxySetting::System => builder,
         ProxySetting::None => builder.no_proxy(),
-        ProxySetting::Manual { url, username } => {
-            let mut proxy =
-                reqwest::Proxy::all(url.trim()).map_err(|e| LauncherError::Generic {
-                    code: "ERR_PROXY_URL".into(),
-                    message: format!("The saved proxy cannot be used: {e}"),
-                })?;
-            if let Some(username) = username.filter(|name| !name.is_empty()) {
-                let password = crate::auth::load_secret(
-                    crate::auth::KEYRING_SERVICE_NAME,
-                    PROXY_SECRET_ACCOUNT,
-                    PROXY_SECRET_FILE,
-                    PROXY_SECRET_CONTEXT,
-                )
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-                proxy = proxy.basic_auth(&username, &password);
-            }
-            builder.proxy(proxy)
-        }
+        ProxySetting::Manual { .. } => match proxy_for(&setting)? {
+            Some(proxy) => builder.proxy(proxy),
+            None => builder,
+        },
     })
+}
+
+/// The blocking form of [`apply_proxy`]. Blocking requests used to build their
+/// own client and skip the proxy entirely.
+fn apply_proxy_blocking(
+    builder: reqwest::blocking::ClientBuilder,
+) -> LauncherResult<reqwest::blocking::ClientBuilder> {
+    let setting = configured_proxy();
+    Ok(match setting {
+        ProxySetting::System => builder,
+        ProxySetting::None => builder.no_proxy(),
+        ProxySetting::Manual { .. } => match proxy_for(&setting)? {
+            Some(proxy) => builder.proxy(proxy),
+            None => builder,
+        },
+    })
+}
+
+/// The one blocking client builder. Every synchronous request path uses it, so
+/// the proxy, redirect policy and user agent cannot drift between them.
+fn build_blocking_client(category: ClientCategory) -> LauncherResult<reqwest::blocking::Client> {
+    let builder = reqwest::blocking::Client::builder()
+        .timeout(category.timeout())
+        .user_agent(category.user_agent())
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(4);
+    apply_proxy_blocking(builder)?
+        .build()
+        .map_err(|e| LauncherError::Generic {
+            code: "ERR_HTTP_CLIENT_BUILD".into(),
+            message: format!("Failed to build blocking HTTP client for {category:?}: {e}"),
+        })
 }
 
 impl HttpClients {
@@ -729,6 +848,20 @@ pub fn check_request_url_with_policy(
     }
 
     // 6. SSRF protection: DNS resolution check for private IPs.
+    //
+    //    With no proxy in use, a name that cannot be resolved is not evidence
+    //    that the request is safe, so a DNS failure blocks it. (This used to
+    //    fall through as if the check had passed.)
+    //
+    //    With a proxy configured the promise is narrower: the request connects
+    //    to the proxy, and the proxy resolves the target, so a local lookup
+    //    failure says nothing about where the request would go, and is not
+    //    treated as fatal. The check still runs on the URL host, still refuses
+    //    to name an IP literal, and still blocks a host that resolves locally
+    //    to a private or reserved address; it cannot promise what an
+    //    operator's proxy then connects to. That is the proxy's policy to
+    //    enforce.
+    //
     //    Note: this is best-effort — the IP may change between check and
     //    connect. DNS-level hostname validation without DNSSEC cannot
     //    fully prevent DNS rebinding on attacker-controlled infrastructure.
@@ -736,12 +869,27 @@ pub fn check_request_url_with_policy(
     //    Every resolved address is checked, not just the first: a host that
     //    resolves to both a public and a private address must not pass because
     //    the public one happened to sort first.
-    if let Ok(addrs) = parsed.socket_addrs(|| None) {
-        if addrs.iter().any(|addr| is_blocked_ip(addr.ip())) {
-            return Err(LauncherError::Generic {
-                code: "ERR_SSRF_BLOCKED".into(),
-                message: format!("Request blocked: {host} resolves to a private/reserved address"),
-            });
+    match parsed.socket_addrs(|| None) {
+        Ok(addrs) if !addrs.is_empty() => {
+            if addrs.iter().any(|addr| is_blocked_ip(addr.ip())) {
+                return Err(LauncherError::Generic {
+                    code: "ERR_SSRF_BLOCKED".into(),
+                    message: format!(
+                        "Request blocked: {host} resolves to a private/reserved address"
+                    ),
+                });
+            }
+        }
+        Ok(_) | Err(_) => {
+            if dns_failure_blocks_the_request() {
+                return Err(LauncherError::Generic {
+                    code: "ERR_SSRF_BLOCKED".into(),
+                    message: format!(
+                        "Request blocked: {host} could not be resolved, so it cannot be shown to \
+                         be a public address"
+                    ),
+                });
+            }
         }
     }
 
@@ -760,14 +908,36 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
         return true;
     }
     match ip {
-        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            v4.is_private()
+                || v4.is_link_local()
+                || v4.is_documentation()
+                // 0.0.0.0/8 "this network".
+                || octets[0] == 0
+                // 100.64.0.0/10 carrier-grade NAT.
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                // 192.0.0.0/24 IETF protocol assignments.
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                // 198.18.0.0/15 benchmarking.
+                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+                // 240.0.0.0/4 reserved, including the broadcast address.
+                || (octets[0] & 0xf0) == 0xf0
+        }
         IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4() {
                 return is_blocked_ip(IpAddr::V4(v4));
             }
-            let first = v6.segments()[0];
+            let segments = v6.segments();
+            let first = segments[0];
             // fc00::/7 unique local, fe80::/10 link-local unicast.
-            (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+            (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+                // 2001:db8::/32 documentation.
+                || (first == 0x2001 && segments[1] == 0x0db8)
+                // 2001:10::/28 ORCHID and 2001:2::/48 benchmarking.
+                || (first == 0x2001 && (segments[1] & 0xfff0) == 0x0010)
+                || (first == 0x2001 && segments[1] == 0x0002)
         }
     }
 }
@@ -800,6 +970,21 @@ pub fn host_matches_domain(host: &str, domain: &str) -> bool {
 }
 
 /// Decide whether `host` is authorized under `policy`.
+/// The hosts a curator-pinned host always redirects its downloads to. A GitHub release URL
+/// (`github.com/<owner>/<repo>/releases/download/…`) answers with a redirect to GitHub's asset CDN,
+/// so a `direct_hash` pin on `github.com` could never download without them. The list is fixed and
+/// names the same origin's own hosts only; the pinned SHA-256 still has to match the bytes.
+fn pinned_host_redirects(pinned: &str) -> &'static [&'static str] {
+    if pinned.eq_ignore_ascii_case("github.com") {
+        &[
+            "objects.githubusercontent.com",
+            "release-assets.githubusercontent.com",
+        ]
+    } else {
+        &[]
+    }
+}
+
 fn host_authorized(category: ClientCategory, host: &str, policy: HostPolicy<'_>) -> bool {
     match policy {
         HostPolicy::Allowlist => {
@@ -808,7 +993,12 @@ fn host_authorized(category: ClientCategory, host: &str, policy: HostPolicy<'_>)
                 .iter()
                 .any(|allowed| host_matches_domain(host, allowed))
         }
-        HostPolicy::SignedManifest(pinned) => host_matches_domain(host, pinned),
+        HostPolicy::SignedManifest(pinned) => {
+            host_matches_domain(host, pinned)
+                || pinned_host_redirects(pinned)
+                    .iter()
+                    .any(|allowed| host_matches_domain(host, allowed))
+        }
         HostPolicy::UserConsented => {
             // Host authorization is delegated to the core consent check that
             // precedes this request. The empty ConsentedContent allowlist
@@ -850,7 +1040,7 @@ fn host_authorized(category: ClientCategory, host: &str, policy: HostPolicy<'_>)
 /// the same honest "no internet connection" story, and the failure is recorded
 /// for the Privacy status. Callers that have context attach it with
 /// [`LauncherError::while_attempting`].
-pub(crate) fn transport_failure() -> LauncherError {
+pub fn transport_failure() -> LauncherError {
     crate::connectivity::record_unreachable();
     LauncherError::NetworkOffline
 }
@@ -858,7 +1048,7 @@ pub(crate) fn transport_failure() -> LauncherError {
 /// [`transport_failure`] for a request that failed in reqwest: the user still
 /// sees "offline", but the log keeps why (DNS, TLS, refused, timeout). The URL
 /// is stripped first, since a query string can carry a token.
-pub(crate) fn transport_failure_from(error: reqwest::Error) -> LauncherError {
+pub fn transport_failure_from(error: reqwest::Error) -> LauncherError {
     eprintln!("[http] request failed: {}", describe_transport_error(error));
     transport_failure()
 }
@@ -1384,17 +1574,8 @@ pub fn blocking_checked_request_with_policy(
     crate::network_gate::authorize(category)?;
     let _validated = check_request_url_with_policy(category, url, policy)?;
 
-    // Build a blocking client with the same security posture.
-    let client = reqwest::blocking::Client::builder()
-        .timeout(category.timeout())
-        .user_agent(category.user_agent())
-        .redirect(reqwest::redirect::Policy::none())
-        .pool_max_idle_per_host(4)
-        .build()
-        .map_err(|e| LauncherError::Generic {
-            code: "ERR_HTTP_CLIENT_BUILD".into(),
-            message: format!("Failed to build blocking HTTP client: {e}"),
-        })?;
+    // Build a blocking client with the same security posture and proxy.
+    let client = build_blocking_client(category)?;
 
     let mut remaining_redirects: u8 = 10;
     let mut current_url = url.to_string();
@@ -1495,6 +1676,68 @@ pub fn blocking_checked_get_bytes_with_policy(
         });
     }
     Ok(bytes.to_vec())
+}
+
+/// Blocking JSON POST through the same policy path as [`blocking_checked_request`], returning the
+/// response bytes under the category's size cap. Used by synchronous metadata lookups.
+///
+/// A redirect is refused rather than followed: the caller posted a body to a specific endpoint,
+/// and silently replaying it elsewhere is exactly what the async path only does for 307/308.
+pub fn blocking_checked_post_json(
+    _clients: &HttpClients,
+    category: ClientCategory,
+    url: &str,
+    body: &serde_json::Value,
+) -> LauncherResult<Vec<u8>> {
+    crate::network_gate::authorize(category)?;
+    check_request_url(category, url)?;
+
+    let client = build_blocking_client(category)?;
+
+    let response = client
+        .post(url)
+        .json(body)
+        .send()
+        .map_err(transport_failure_from)?;
+    crate::connectivity::record_reachable();
+
+    if response.status().is_redirection() {
+        return Err(LauncherError::Generic {
+            code: "ERR_UNEXPECTED_REDIRECT".into(),
+            message: format!(
+                "Refusing a redirect from {} for a posted lookup",
+                network::sanitized_url_for_log(url)
+            ),
+        });
+    }
+    if !response.status().is_success() {
+        return Err(LauncherError::Generic {
+            code: "ERR_HTTP_STATUS".into(),
+            message: format!(
+                "HTTP {} for {}",
+                response.status(),
+                network::sanitized_url_for_log(url)
+            ),
+        });
+    }
+
+    let max = category.max_response_bytes().unwrap_or(10 * 1024 * 1024);
+    let mut limited = response.take(max.saturating_add(1));
+    let mut bytes = Vec::new();
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|_| transport_failure())?;
+    if bytes.len() as u64 > max {
+        return Err(LauncherError::Generic {
+            code: "ERR_RESPONSE_TOO_LARGE".into(),
+            message: format!(
+                "Response exceeds {} bytes (downloaded {})",
+                max,
+                bytes.len()
+            ),
+        });
+    }
+    Ok(bytes)
 }
 
 /// Log a sanitized summary of an HTTP response for diagnostics.
@@ -1810,6 +2053,40 @@ mod tests {
     }
 
     #[test]
+    fn a_github_pin_allows_only_githubs_own_asset_hosts() {
+        // A direct_hash pin on a GitHub release URL is redirected to GitHub's asset CDN.
+        let pinned = HostPolicy::SignedManifest("github.com");
+        for host in [
+            "github.com",
+            "release-assets.githubusercontent.com",
+            "objects.githubusercontent.com",
+        ] {
+            assert!(
+                host_authorized(ClientCategory::PinnedArtifact, host, pinned),
+                "{host}"
+            );
+        }
+        for host in [
+            "raw.githubusercontent.com",
+            "githubusercontent.com",
+            "release-assets.githubusercontent.com.attacker.example",
+            "evil-release-assets.githubusercontent.com",
+        ] {
+            assert!(
+                !host_authorized(ClientCategory::PinnedArtifact, host, pinned),
+                "{host}"
+            );
+        }
+        // Another pinned host gains nothing.
+        let other = HostPolicy::SignedManifest("cdn.example.com");
+        assert!(!host_authorized(
+            ClientCategory::PinnedArtifact,
+            "release-assets.githubusercontent.com",
+            other
+        ));
+    }
+
+    #[test]
     fn test_signed_manifest_policy_rejects_pinned_host_lookalike() {
         // The pinned host comes from the signed registry row; a redirect to a
         // host that merely embeds it must not inherit that authorization.
@@ -1846,12 +2123,9 @@ mod tests {
     #[test]
     fn test_check_allows_subdomain_of_allowlisted_host() {
         // Subdomains of allowlisted hosts are allowed (e.g., github.com
-        // covers *.github.com since GitHub controls all its subdomains).
-        assert!(check_request_url(
-            ClientCategory::GitHub,
-            "https://evil.github.com/malware.jar"
-        )
-        .is_ok());
+        // covers *.github.com since GitHub controls all its subdomains). The
+        // host must resolve, because an unresolvable name is now blocked.
+        assert!(check_request_url(ClientCategory::GitHub, "https://www.github.com/").is_ok());
     }
 
     #[test]
@@ -1918,10 +2192,11 @@ mod tests {
 
     #[test]
     fn test_signed_manifest_policy_allows_pinned_host_subdomain() {
+        // A real subdomain of a real parent, so the SSRF check can resolve it.
         assert!(check_request_url_with_policy(
             ClientCategory::PinnedArtifact,
-            "https://files.developer.com/releases/mod-v1.0.0.jar",
-            HostPolicy::SignedManifest("developer.com"),
+            "https://raw.githubusercontent.com/owner/repo/mod.jar",
+            HostPolicy::SignedManifest("githubusercontent.com"),
         )
         .is_ok());
     }
@@ -2018,6 +2293,50 @@ mod tests {
         assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
         assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
         assert!(!is_blocked_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+    }
+
+    #[test]
+    fn blocked_ip_covers_carrier_grade_nat_and_reserved_ranges() {
+        use std::net::Ipv4Addr;
+
+        // 100.64.0.0/10 carrier-grade NAT, including both edges.
+        assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(is_blocked_ip(IpAddr::V4(Ipv4Addr::new(100, 127, 255, 255))));
+        // One below and one above the /10 are ordinary public addresses.
+        assert!(!is_blocked_ip(IpAddr::V4(Ipv4Addr::new(100, 63, 255, 255))));
+        assert!(!is_blocked_ip(IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1))));
+
+        for address in [
+            [0, 1, 2, 3],         // 0.0.0.0/8
+            [192, 0, 0, 10],      // 192.0.0.0/24
+            [198, 18, 0, 1],      // 198.18.0.0/15
+            [198, 19, 255, 255],  // 198.18.0.0/15
+            [203, 0, 113, 5],     // 203.0.113.0/24 documentation
+            [240, 0, 0, 1],       // 240.0.0.0/4 reserved
+            [255, 255, 255, 255], // broadcast
+        ] {
+            assert!(
+                is_blocked_ip(IpAddr::V4(Ipv4Addr::from(address))),
+                "{address:?} must be blocked"
+            );
+        }
+        assert!(is_blocked_ip(IpAddr::V6("2001:db8::1".parse().unwrap())));
+    }
+
+    #[test]
+    fn a_dns_failure_blocks_the_request() {
+        // Direct connection, so the local resolver is the only one that could
+        // answer. `.invalid` is reserved by RFC 2606 and never resolves. A
+        // pinned host is authorized, so the only reason to refuse is the
+        // failed lookup.
+        configure_proxy(ProxySetting::None);
+        let err = check_request_url_with_policy(
+            ClientCategory::PinnedArtifact,
+            "https://agora-dns-failure.invalid/mod.jar",
+            HostPolicy::SignedManifest("agora-dns-failure.invalid"),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "ERR_SSRF_BLOCKED");
     }
 
     #[test]
@@ -2128,6 +2447,28 @@ mod tests {
         assert!(!category_allowlist(ClientCategory::Loader).is_empty());
         assert!(!category_allowlist(ClientCategory::MojangContent).is_empty());
         assert!(!category_allowlist(ClientCategory::Registry).is_empty());
+    }
+
+    #[test]
+    fn a_proxy_url_is_shown_without_its_password() {
+        let shown = redact_proxy_url("http://alice:s3cret@proxy.example:8080");
+        assert!(shown.contains("alice:***@proxy.example:8080"), "{shown}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+
+        let shown = redact_proxy_url("socks5h://proxy.example:1080");
+        assert_eq!(shown, "socks5h://proxy.example:1080");
+
+        let shown = redact_proxy_url("http://:s3cret@proxy.example:8080");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(shown.contains("***@proxy.example:8080"), "{shown}");
+
+        let setting = ProxySetting::Manual {
+            url: "http://alice:s3cret@proxy.example:8080".into(),
+            username: Some("alice".into()),
+        };
+        let shown = serde_json::to_string(&setting.redacted()).unwrap();
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(shown.contains("alice:***@proxy.example:8080"), "{shown}");
     }
 }
 

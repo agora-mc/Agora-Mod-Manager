@@ -388,7 +388,15 @@ export function useProcessController(beforeLaunch?: (instanceId: string) => Prom
     const unlisten = listen<LaunchProgressEventPayload>('launch-progress', (event) => {
       const current = stateRef.current;
       if (current.instanceId !== event.payload.instance_id) return;
-      if (current.phase !== 'launching' && current.phase !== 'running') return;
+      // The offline note is emitted while the account is checked, before the
+      // `launching` progress record exists, so it must be accepted too.
+      if (
+        current.phase !== 'launching' &&
+        current.phase !== 'running' &&
+        event.payload.phase !== 'offline'
+      ) {
+        return;
+      }
       setState((prev) => {
         const next = applyLaunchProgressEvent(prev.launchProgress ?? null, event.payload, Date.now());
         return next === (prev.launchProgress ?? null) ? prev : { ...prev, launchProgress: next };

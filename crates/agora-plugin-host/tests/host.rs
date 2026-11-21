@@ -25,6 +25,8 @@ struct TestBridge {
     logs: Mutex<Vec<(LogLevel, String)>>,
     /// Methods that should be refused, to exercise the error path.
     denied: Mutex<Vec<String>>,
+    event_begins: AtomicU64,
+    event_ends: AtomicU64,
 }
 
 impl TestBridge {
@@ -75,6 +77,14 @@ impl HostBridge for TestBridge {
     fn log(&self, _plugin_id: &PluginId, level: LogLevel, message: &str) {
         self.logs.lock().unwrap().push((level, message.to_string()));
     }
+
+    fn begin_event(&self, _plugin_id: &PluginId) {
+        self.event_begins.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn end_event(&self, _plugin_id: &PluginId) {
+        self.event_ends.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +109,7 @@ fn plugin(id: &str, files: &[(&str, &str)]) -> Fixture {
         request: ActivationRequest {
             plugin_id: PluginId::parse(id).unwrap(),
             package_root: dir.path().to_path_buf(),
+            data_root: dir.path().to_path_buf(),
             entrypoint: "main.js".into(),
             memory_limit_bytes: ActivationRequest::DEFAULT_MEMORY_LIMIT,
             stack_limit_bytes: ActivationRequest::DEFAULT_STACK_LIMIT,
@@ -482,7 +493,13 @@ fn a_plugin_exceeding_its_memory_ceiling_fails_without_taking_the_process() {
             Duration::from_secs(10),
         )
         .unwrap_err();
-    assert_eq!(err.code, PluginErrorCode::ResourceExhausted);
+    assert_eq!(
+        err.code,
+        PluginErrorCode::ResourceExhausted,
+        "code={:?} message={}",
+        err.code,
+        err.message
+    );
 }
 
 #[test]
@@ -598,6 +615,9 @@ fn a_subscriber_receives_events_and_can_act_on_them() {
         }
     }
     assert_eq!(seen, serde_json::json!(["sodium"]));
+    // Each handler call opens and closes a budget scope, so one call cannot spend another's.
+    assert!(bridge.event_begins.load(Ordering::SeqCst) >= 1);
+    assert!(bridge.event_ends.load(Ordering::SeqCst) >= 1);
     assert!(bridge
         .logs()
         .iter()
@@ -702,6 +722,7 @@ fn a_plugin_whose_entrypoint_is_missing_reports_a_package_problem() {
     let request = ActivationRequest {
         plugin_id: id("acme.absent"),
         package_root: dir.path().to_path_buf(),
+        data_root: dir.path().to_path_buf(),
         entrypoint: "main.js".into(),
         memory_limit_bytes: ActivationRequest::DEFAULT_MEMORY_LIMIT,
         stack_limit_bytes: ActivationRequest::DEFAULT_STACK_LIMIT,

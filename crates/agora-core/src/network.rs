@@ -7,7 +7,6 @@
 use crate::ctx::Ctx;
 use crate::db;
 use crate::error::{LauncherError, LauncherResult};
-use crate::loader_manifests;
 
 /// Categories of network access controlled by the launch planner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -111,15 +110,15 @@ impl NetworkPolicy {
     pub fn from_db(conn: &rusqlite::Connection) -> Self {
         let mut policy = Self::all_enabled();
 
-        // All launch-network settings default to enabled.
-        // Only explicit "false"/false in the DB disables the category.
-        if !is_network_enabled_default_true(conn, "network_mojang_metadata_enabled") {
+        // All launch-network settings default to enabled. The typed registry
+        // reads them, so an unreadable value reads as off, not as on.
+        if !db::is_network_enabled(conn, "network_mojang_metadata_enabled") {
             policy.set_category(NetworkCategory::MojangMetadata, false);
         }
-        if !is_network_enabled_default_true(conn, "network_mojang_content_enabled") {
+        if !db::is_network_enabled(conn, "network_mojang_content_enabled") {
             policy.set_category(NetworkCategory::MojangContent, false);
         }
-        if !is_network_enabled_default_true(conn, "network_loader_enabled") {
+        if !db::is_network_enabled(conn, "network_loader_enabled") {
             policy.set_category(NetworkCategory::LoaderMetadataAndContent, false);
         }
         if !db::is_network_enabled(conn, "network_msa_enabled") {
@@ -132,26 +131,6 @@ impl NetworkPolicy {
     }
 }
 
-/// Like `db::is_network_enabled` but returns `true` (default-enabled) when the
-/// setting key is absent from the database. Matches the first-party-network-defaults
-/// behaviour where missing keys are treated as enabled.
-fn is_network_enabled_default_true(conn: &rusqlite::Connection, key: &str) -> bool {
-    // Lockdown Mode is a global network block: when enabled the launch planner
-    // refuses every category even though these keys default to enabled.
-    if db::is_lockdown_enabled(conn) {
-        return false;
-    }
-    db::get_setting(conn, key)
-        .ok()
-        .flatten()
-        .map(|v| match v {
-            serde_json::Value::Bool(b) => b,
-            serde_json::Value::String(s) => s == "true",
-            _ => false,
-        })
-        .unwrap_or(true)
-}
-
 fn category_bit(category: NetworkCategory) -> u8 {
     match category {
         NetworkCategory::MicrosoftAuthentication => BIT_MSA,
@@ -160,34 +139,6 @@ fn category_bit(category: NetworkCategory) -> u8 {
         NetworkCategory::LoaderMetadataAndContent => BIT_LOADER,
         NetworkCategory::JavaRuntime => BIT_JAVA,
     }
-}
-
-/// Classify a URL host into a network category.
-///
-/// This enables callers to map an already-validated URL to the right
-/// policy category before opening a socket. Returns `None` for hosts
-/// that are not recognised as a known launch-network endpoint.
-pub fn classify_host(host: &str) -> Option<NetworkCategory> {
-    if matches!(host, "piston-meta.mojang.com" | "launcher.mojang.com") {
-        return Some(NetworkCategory::MojangMetadata);
-    }
-    if matches!(
-        host,
-        "piston-data.mojang.com" | "libraries.minecraft.net" | "resources.download.minecraft.net"
-    ) {
-        return Some(NetworkCategory::MojangContent);
-    }
-    if loader_manifests::is_allowed_host(host) {
-        return Some(NetworkCategory::LoaderMetadataAndContent);
-    }
-    None
-}
-
-/// Classify a full URL string into a network category by parsing its host.
-pub fn classify_url(raw: &str) -> Option<NetworkCategory> {
-    let url = reqwest::Url::parse(raw).ok()?;
-    let host = url.host_str()?;
-    classify_host(host)
 }
 
 /// Remove credentials, query parameters, and fragments before writing a URL
@@ -213,7 +164,11 @@ mod tests {
 
     fn test_db() -> rusqlite::Connection {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("agora-network-test-{}.db", n));
+        let path = std::env::temp_dir().join(format!(
+            "agora-network-test-{}-{}.db",
+            std::process::id(),
+            n
+        ));
         let _ = std::fs::remove_file(&path);
         let _ = crate::db::init_local_state_db(&path);
         rusqlite::Connection::open(&path).expect("test db")
@@ -280,51 +235,6 @@ mod tests {
     }
 
     #[test]
-    fn classify_mojang_metadata_hosts() {
-        assert_eq!(
-            classify_host("piston-meta.mojang.com"),
-            Some(NetworkCategory::MojangMetadata)
-        );
-        assert_eq!(
-            classify_host("launcher.mojang.com"),
-            Some(NetworkCategory::MojangMetadata)
-        );
-    }
-
-    #[test]
-    fn classify_mojang_content_hosts() {
-        assert_eq!(
-            classify_host("piston-data.mojang.com"),
-            Some(NetworkCategory::MojangContent)
-        );
-        assert_eq!(
-            classify_host("libraries.minecraft.net"),
-            Some(NetworkCategory::MojangContent)
-        );
-        assert_eq!(
-            classify_host("resources.download.minecraft.net"),
-            Some(NetworkCategory::MojangContent)
-        );
-    }
-
-    #[test]
-    fn classify_loader_hosts() {
-        // Fabric Maven — should NOT classify as Mojang content
-        if let Some(cat) = classify_host("maven.fabricmc.net") {
-            assert_eq!(cat, NetworkCategory::LoaderMetadataAndContent);
-        }
-        if let Some(cat) = classify_host("maven.quiltmc.org") {
-            assert_eq!(cat, NetworkCategory::LoaderMetadataAndContent);
-        }
-    }
-
-    #[test]
-    fn classify_unknown_host_returns_none() {
-        assert_eq!(classify_host("example.com"), None);
-        assert_eq!(classify_host("127.0.0.1"), None);
-    }
-
-    #[test]
     fn sanitized_url_for_log_removes_secrets_but_keeps_artifact_path() {
         assert_eq!(
             sanitized_url_for_log(
@@ -340,7 +250,8 @@ mod tests {
         // Connection with NO launch-network keys at all — all categories
         // default to enabled (first-party network defaults).
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("agora-network-raw-{}.db", n));
+        let path =
+            std::env::temp_dir().join(format!("agora-network-raw-{}-{}.db", std::process::id(), n));
         let _ = std::fs::remove_file(&path);
         let conn = rusqlite::Connection::open(&path).expect("raw test db");
         // Apply only minimal schema (no init, no default settings).
@@ -561,26 +472,5 @@ mod tests {
         assert!(policy.is_enabled(NetworkCategory::LoaderMetadataAndContent));
         assert!(policy.is_enabled(NetworkCategory::MicrosoftAuthentication));
         assert!(policy.is_enabled(NetworkCategory::JavaRuntime));
-    }
-
-    #[test]
-    fn classify_url_rejects_invalid_urls() {
-        assert_eq!(classify_url("not-a-url"), None);
-    }
-
-    #[test]
-    fn classify_url_parses_host() {
-        assert_eq!(
-            classify_url("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"),
-            Some(NetworkCategory::MojangMetadata)
-        );
-        assert_eq!(
-            classify_url("https://piston-data.mojang.com/v2/1.21/client.jar"),
-            Some(NetworkCategory::MojangContent)
-        );
-        assert_eq!(
-            classify_url("https://maven.fabricmc.net/v2/0.19.0/profile.json"),
-            Some(NetworkCategory::LoaderMetadataAndContent)
-        );
     }
 }
