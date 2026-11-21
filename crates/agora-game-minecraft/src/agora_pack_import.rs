@@ -538,7 +538,19 @@ fn resolve_pin(
 ) -> Result<(Option<String>, bool), Box<PackEntryOutcome>> {
     match normalize_pin(entry) {
         Ok(pin) => Ok((pin, false)),
-        Err(_) if backend.pack_hash_override() => Ok((None, true)),
+        // A blank hash is corrupt pack data, not a mismatch the player can
+        // accept. No override can turn it into "no pin".
+        Err(_) if backend.pack_hash_override() && !blank_pin(entry) => Ok((None, true)),
+        Err(_) if blank_pin(entry) => Err(Box::new(outcome(
+            entry,
+            PackEntryStatus::Failed,
+            Some(format!(
+                "{} has a blank pack SHA-256 entry; refusing to install because a blank hash \
+                 cannot be overridden.",
+                entry.display_name()
+            )),
+            None,
+        ))),
         Err(problem) => Err(Box::new(outcome(
             entry,
             PackEntryStatus::NeedsAction,
@@ -548,6 +560,13 @@ fn resolve_pin(
             Some(PackNeedsAction::ConfirmHash),
         ))),
     }
+}
+
+fn blank_pin(entry: &AgoraPackEntry) -> bool {
+    entry
+        .sha256
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
 }
 
 /// The candidate the pack pinned: the one with its filename, else its version.
@@ -2624,7 +2643,9 @@ mod tests {
 
     #[test]
     fn install_anyway_installs_a_file_whose_pack_hash_entry_is_malformed_and_says_so() {
-        for bad in ["", "  ", "deadbeef", &"zz".repeat(32)] {
+        // A blank entry is corrupt pack data, not an overridable mismatch; it
+        // is refused even with install-anyway (covered in its own test).
+        for bad in ["deadbeef", &"zz".repeat(32)] {
             let mut backend = fake();
             backend.modrinth = vec![candidate("2.0", "mod-2.0.jar")];
             backend.override_pack_hash = true;
@@ -2642,6 +2663,25 @@ mod tests {
             assert_eq!(installs.len(), 1);
             assert_eq!(installs[0].1, None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn review_install_anyway_cannot_override_a_blank_pack_hash() {
+        let mut backend = fake();
+        backend.modrinth = vec![candidate("2.0", "mod-2.0.jar")];
+        backend.override_pack_hash = true;
+        for blank in ["", "   "] {
+            let out = pack_installed(&backend, Some(blank));
+            assert_eq!(out.status, PackEntryStatus::Failed, "{blank:?}");
+            assert!(out.action.is_none(), "{blank:?} must not offer an override");
+            let reason = out.reason.expect("says why");
+            assert!(reason.contains("blank"), "{reason}");
+            assert!(reason.contains("mod-2.0.jar"), "{reason}");
+        }
+        assert!(
+            backend.installs.lock().unwrap().is_empty(),
+            "a blank assertion never reaches the installer"
+        );
     }
 
     #[test]
