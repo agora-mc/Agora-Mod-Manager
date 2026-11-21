@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::app_paths::validate_path_component;
 use crate::ctx::Ctx;
 use crate::game_instance::{generate_instance_id_from_name, InstanceError};
+use crate::lock_manager::{LockGuard, LockResource};
 use crate::settings::SettingsService;
 
 /// How long an entry stays restorable when the user has not chosen a window.
@@ -367,9 +368,9 @@ pub(crate) fn read_load_order_rules(
     rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
 }
 
-/// Move a live instance folder into a new entry. The caller deletes the row afterwards and
-/// rolls the move back if that fails. On any failure here nothing is changed.
-pub(crate) fn stash(
+/// Move a live instance folder into a new entry with InstanceLocations held by the caller.
+/// The caller deletes the row afterwards and rolls the move back if that fails.
+pub(crate) fn stash_locked(
     root: &Path,
     row: GameRow,
     load_order_rules: Vec<StoredRule>,
@@ -431,13 +432,19 @@ pub(crate) fn stash(
 
 /// Put a stashed folder back after its row could not be deleted.
 pub(crate) fn undo_stash(
-    root: &Path,
+    ctx: &Ctx,
     entry: &DeletedEntry,
     instance_dir: &Path,
 ) -> Result<(), InstanceError> {
-    let dir = entry_dir(root, &entry.entry_id)?;
-    std::fs::rename(dir.join(INSTANCE_SUBDIR), instance_dir)
-        .map_err(|e| io_err("ERR_INSTANCE_DELETE", "Cannot put the instance back", e))?;
+    let dir = entry_dir(&ctx.paths.recently_deleted_games_root(), &entry.entry_id)?;
+    {
+        let _locations = ctx
+            .lock_manager
+            .acquire(LockResource::InstanceLocations, "delete rollback")
+            .map_err(|error| err("ERR_INSTANCE_BUSY", error.to_string()))?;
+        std::fs::rename(dir.join(INSTANCE_SUBDIR), instance_dir)
+            .map_err(|e| io_err("ERR_INSTANCE_DELETE", "Cannot put the instance back", e))?;
+    }
     let _ = std::fs::remove_file(dir.join(ENTRY_FILE));
     let _ = std::fs::remove_dir(&dir);
     Ok(())
@@ -563,6 +570,12 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
+}
+
+pub(super) fn try_lock_locations(ctx: &Ctx, operation: &str) -> Result<LockGuard, InstanceError> {
+    ctx.lock_manager
+        .try_instance_locations(operation)
+        .map_err(|error| err("ERR_INSTANCE_BUSY", error.to_string()))
 }
 
 fn try_lock_instance(
@@ -852,6 +865,7 @@ pub fn restore(
         }
     };
 
+    let locations = try_lock_locations(ctx, "restore")?;
     std::fs::create_dir_all(&instances_root)
         .map_err(|e| io_err("ERR_INSTANCE_RESTORE", "Cannot prepare instances folder", e))?;
     let dest = instances_root.join(&new_id);
@@ -872,7 +886,9 @@ pub fn restore(
     // folder someone else created at the same id.
     write_restore_marker(&source, entry_id)?;
 
-    if let Err(e) = std::fs::rename(&source, &dest) {
+    let moved = std::fs::rename(&source, &dest);
+    drop(locations);
+    if let Err(e) = moved {
         let _ = std::fs::remove_file(&restoring_path);
         remove_restore_marker(&source);
         return Err(io_err(
@@ -884,9 +900,19 @@ pub fn restore(
 
     if let Err(error) = finish_restore(&conn, &dest, &stored, &restoring) {
         // Put the files back where they were found, so the entry is whole again.
-        if std::fs::rename(&dest, &source).is_ok() {
-            let _ = std::fs::remove_file(&restoring_path);
-            remove_restore_marker(&source);
+        match ctx
+            .lock_manager
+            .acquire(LockResource::InstanceLocations, "restore rollback")
+        {
+            Ok(_locations) => {
+                if std::fs::rename(&dest, &source).is_ok() {
+                    let _ = std::fs::remove_file(&restoring_path);
+                    remove_restore_marker(&source);
+                }
+            }
+            Err(rollback) => {
+                eprintln!("could not lock instance locations to roll back: {rollback}")
+            }
         }
         return Err(error);
     }
@@ -915,6 +941,7 @@ fn purge_one(ctx: &Ctx, root: &Path, entry_id: &str, trash: &TrashFn) -> Result<
             "Entry is not a plain folder; leaving it alone.",
         ));
     }
+    let _locations = try_lock_locations(ctx, "purge")?;
     let links = detach_links(&dir).map_err(|e| {
         io_err(
             "ERR_INSTANCE_DELETE",

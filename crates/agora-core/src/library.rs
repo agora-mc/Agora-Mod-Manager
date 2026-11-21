@@ -105,6 +105,7 @@ pub struct UnreadableInstanceManifest {
 pub struct InstanceUsage {
     pub instances: Vec<LibraryInstanceRef>,
     pub unreadable: Vec<UnreadableInstanceManifest>,
+    pub(crate) records_objects: bool,
 }
 
 /// One item no instance uses.
@@ -151,7 +152,9 @@ impl LibraryIcon {
 /// Every item in the store with its metadata and using instances. Read-only and network-free.
 pub fn list(ctx: &Ctx) -> Result<LibraryListing, ContentError> {
     let entries = content_store::list_items(ctx)?;
-    let scan = scan_instances(ctx);
+    let locations = ctx.lock_manager.try_instance_locations("library-list")?;
+    let scan = scan_instances_locked(ctx);
+    drop(locations);
     let own_games = own_games_by_item(&entries);
     let mut warnings = scan.warnings.clone();
     let mut registry = RegistryLookup::new(ctx);
@@ -1056,24 +1059,21 @@ impl InstanceScan {
 
 /// Which instances use one item. Scans every instance manifest (Minecraft and generic alike); an
 /// unreadable manifest is returned, never treated as "no instance uses it".
-pub fn instances_using(ctx: &Ctx, item_id: &str, object_hashes: &[String]) -> InstanceUsage {
-    let scan = scan_instances(ctx);
+pub(crate) fn instances_using_locked(
+    ctx: &Ctx,
+    item_id: &str,
+    object_hashes: &[String],
+) -> InstanceUsage {
+    let scan = scan_instances_locked(ctx);
     let hashes: HashSet<&str> = object_hashes.iter().map(String::as_str).collect();
     InstanceUsage {
         instances: scan.using(item_id, &hashes),
+        records_objects: scan
+            .instances
+            .iter()
+            .any(|instance| !instance.hashes.is_empty()),
         unreadable: scan.unreadable,
     }
-}
-
-/// Whether any readable instance manifest records a stored object hash. Only a Minecraft-style
-/// manifest does; a generic instance names items by id. Removal uses this when an item's own
-/// record cannot be read: its object hashes are unknown, so it cannot prove that none of those
-/// hashes is in use.
-pub fn any_instance_records_objects(ctx: &Ctx) -> bool {
-    scan_instances(ctx)
-        .instances
-        .iter()
-        .any(|instance| !instance.hashes.is_empty())
 }
 
 /// Every item no instance uses, with its size. When an instance manifest cannot be read, nothing
@@ -1081,7 +1081,11 @@ pub fn any_instance_records_objects(ctx: &Ctx) -> bool {
 /// warnings say which instance could not be read (fail closed, like removal).
 pub fn list_unused(ctx: &Ctx) -> Result<UnusedListing, ContentError> {
     let entries = content_store::list_items(ctx)?;
-    let scan = scan_instances(ctx);
+    let locations = ctx
+        .lock_manager
+        .try_instance_locations("library-list-unused")?;
+    let scan = scan_instances_locked(ctx);
+    drop(locations);
     let own_games = own_games_by_item(&entries);
     if !scan.unreadable.is_empty() {
         return Ok(UnusedListing {
@@ -1123,8 +1127,8 @@ pub fn list_unused(ctx: &Ctx) -> Result<UnusedListing, ContentError> {
 }
 
 /// Read every instance manifest under the data root. An unreadable manifest is a warning, never a
-/// vanished instance.
-fn scan_instances(ctx: &Ctx) -> InstanceScan {
+/// vanished instance. Caller holds InstanceLocations until all manifests have been read.
+fn scan_instances_locked(ctx: &Ctx) -> InstanceScan {
     let mut scan = InstanceScan {
         instances: Vec::new(),
         warnings: Vec::new(),
@@ -1132,6 +1136,11 @@ fn scan_instances(ctx: &Ctx) -> InstanceScan {
     };
     let mut dirs = Vec::new();
     collect_instance_dirs(&ctx.paths.instances_root(), None, &mut dirs, &mut scan);
+    #[cfg(test)]
+    crate::instance_location_tests::pause(
+        ctx,
+        crate::instance_location_tests::ScanPoint::LiveInstances,
+    );
     // An instance in Recently deleted still restores its items, so it still uses them. Both
     // Agora's game trash and Minecraft's keep `<entry>/instance/instance_manifest.json`; a purged
     // entry's folder is gone, so it stops counting on its own.
@@ -1141,6 +1150,11 @@ fn scan_instances(ctx: &Ctx) -> InstanceScan {
     ] {
         collect_instance_dirs(&root, Some("instance"), &mut dirs, &mut scan);
     }
+    #[cfg(test)]
+    crate::instance_location_tests::pause(
+        ctx,
+        crate::instance_location_tests::ScanPoint::InstanceFolders,
+    );
 
     for dir in dirs {
         let manifest_path = dir.join("instance_manifest.json");

@@ -5633,6 +5633,10 @@ Mod files live in `content/objects` with its own sweep, and snapshots keep a sec
   trash, in-flight operations, library items, icons) and rebuilds the references. An interrupted
   reference publication marks the index stale, so collection cannot resume until a reconcile. Collection then deletes only objects with
   no reference, under the store lock, after a grace period, and deletes nothing if any read fails.
+- Until the stores are unified, the snapshot and content-store scans hold a single
+  cross-process instance-locations lock from the first listing through the last manifest read.
+  Moves between live and Recently deleted and purges take the same lock. Acquire it after any
+  instance or content-store locks. If it is busy, deletion refuses and can be retried.
 - **Migration:** snapshot objects are moved in and re-hashed; mismatches are kept and reported;
   resumable.
 - `plugins/blobs` stays separate (a per-plugin key-value store, not content-addressed).

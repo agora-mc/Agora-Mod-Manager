@@ -7,6 +7,7 @@ use std::time::UNIX_EPOCH;
 use serde::{Deserialize, Serialize};
 
 use crate::app_paths::AppPaths;
+use crate::lock_manager::{LockGuard, LockManager};
 
 use sha2::Digest;
 #[cfg(unix)]
@@ -2868,12 +2869,21 @@ fn list_snapshots_with(
 
 /// Delete a snapshot.
 pub fn delete_snapshot(instance_dir: &Path, snapshot_id: &str) -> Result<(), String> {
+    delete_snapshot_with(instance_dir, snapshot_id, list_snapshot_scan_dir)
+}
+
+pub(super) fn delete_snapshot_with(
+    instance_dir: &Path,
+    snapshot_id: &str,
+    list_dir: impl Fn(&Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>>,
+) -> Result<(), String> {
     validate_snapshot_id(snapshot_id)?;
     let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
     let zip_path = snapshot_zip_path(instance_dir, snapshot_id);
     if !manifest_path.exists() && !zip_path.exists() {
         return Err(format!("snapshot {snapshot_id} not found"));
     }
+    let _locations = lock_snapshot_locations(instance_dir, "snapshot-delete")?;
 
     let mut blobs = Vec::new();
     if manifest_path.is_file() {
@@ -2899,7 +2909,7 @@ pub fn delete_snapshot(instance_dir: &Path, snapshot_id: &str) -> Result<(), Str
     let _ = fs::remove_file(snapshot_fingerprint_path(instance_dir, snapshot_id));
 
     for hash in blobs {
-        if !blob_is_referenced_by_any_snapshot(instance_dir, &hash) {
+        if !blob_is_referenced_by_any_snapshot(instance_dir, &hash, &list_dir) {
             let path = snapshot_blob_path(instance_dir, &hash);
             let _ = fs::remove_file(&path);
             if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
@@ -2931,20 +2941,25 @@ pub fn delete_snapshot(instance_dir: &Path, snapshot_id: &str) -> Result<(), Str
 /// violation and a half-written file look the same), the blob is reported as
 /// referenced and kept. Leaving an orphan blob costs disk space; deleting a
 /// needed one costs a restore point.
-fn blob_is_referenced_by_any_snapshot(instance_dir: &Path, hash: &str) -> bool {
-    blob_is_referenced_with(instance_dir, hash, |dir| {
-        fs::read_dir(dir).map(|entries| {
-            entries
-                .map(|entry| entry.map(|entry| entry.path()))
-                .collect()
-        })
+fn lock_snapshot_locations(instance_dir: &Path, operation: &str) -> Result<LockGuard, String> {
+    let paths = AppPaths::from_root(snapshot_app_root(instance_dir));
+    LockManager::new(paths.locks_root())
+        .try_instance_locations(operation)
+        .map_err(|error| format!("snapshot cleanup could not lock instance locations: {error}"))
+}
+
+pub(super) fn list_snapshot_scan_dir(dir: &Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>> {
+    fs::read_dir(dir).map(|entries| {
+        entries
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect()
     })
 }
 
 /// The reachability scan with its directory listing injected, so a listing
 /// entry that fails can be exercised without depending on the OS to fail on
-/// cue. The production wrapper above always lists the real filesystem.
-fn blob_is_referenced_with(
+/// cue. The caller holds InstanceLocations and production always lists the real filesystem.
+fn blob_is_referenced_by_any_snapshot(
     instance_dir: &Path,
     hash: &str,
     list_dir: impl Fn(&Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>>,
@@ -3102,6 +3117,7 @@ pub fn prune_unreferenced_objects(instance_dir: &Path) -> Result<(), String> {
     if !root.is_dir() {
         return Ok(());
     }
+    let _locations = lock_snapshot_locations(instance_dir, "snapshot-prune")?;
     let prefixes =
         fs::read_dir(&root).map_err(|e| format!("failed to scan snapshot object store: {e}"))?;
     for prefix in prefixes {
@@ -3117,7 +3133,7 @@ pub fn prune_unreferenced_objects(instance_dir: &Path) -> Result<(), String> {
                 continue;
             };
             if validate_blob_hash(&hash).is_ok()
-                && !blob_is_referenced_by_any_snapshot(instance_dir, &hash)
+                && !blob_is_referenced_by_any_snapshot(instance_dir, &hash, list_snapshot_scan_dir)
             {
                 let _ = fs::remove_file(entry.path());
             }
@@ -3264,7 +3280,7 @@ mod tests {
         let a = tmp.path().join("inst-a");
         fs::create_dir_all(a.join("mods")).unwrap();
         assert!(
-            super::blob_is_referenced_by_any_snapshot(&a, "not-a-sha256"),
+            super::blob_is_referenced_by_any_snapshot(&a, "not-a-sha256", list_snapshot_scan_dir),
             "a malformed hash cannot prove a blob is safe to delete"
         );
     }
@@ -3301,7 +3317,7 @@ mod tests {
         // One entry of the instances root cannot be listed. It may hold a
         // snapshot that needs the blob, so reachability cannot be decided.
         let blocked = instances_root.clone();
-        let referenced = super::blob_is_referenced_with(&a, &hash, |dir| {
+        let referenced = super::blob_is_referenced_by_any_snapshot(&a, &hash, |dir| {
             if dir == blocked {
                 Ok(vec![Err(std::io::Error::other(
                     "cannot list instance entry",

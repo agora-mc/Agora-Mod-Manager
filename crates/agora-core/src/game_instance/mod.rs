@@ -1011,6 +1011,12 @@ pub fn delete_with_options(
         }
         Err(error) => return Err(error.into()),
     };
+    // A recoverable delete must get the locations lock before harvesting or moving a farm.
+    // Harvest can update the instance's files and needs the live path until the rename.
+    let locations = options
+        .recoverable
+        .then(|| trash::try_lock_locations(ctx, "delete"))
+        .transpose()?;
     // Without the record the farm cannot be checked or harvested. It is left alone, and named.
     let left_in_place = if base_unreadable {
         match find_instance_deployment_folder(&ctx.paths, id)? {
@@ -1036,26 +1042,26 @@ pub fn delete_with_options(
         let row = trash::read_row(&conn, id)?;
         let load_order_rules = trash::read_load_order_rules(&conn, id)?;
         let entry = if instance_dir.exists() {
-            let entry = trash::stash(
+            let entry = trash::stash_locked(
                 &ctx.paths.recently_deleted_games_root(),
                 row,
                 load_order_rules,
                 &instance_dir,
                 chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()),
             )?;
+            drop(locations);
             if let Err(error) =
                 conn.execute("DELETE FROM game_instances WHERE instance_id = ?1", [id])
             {
-                let _ = trash::undo_stash(
-                    &ctx.paths.recently_deleted_games_root(),
-                    &entry,
-                    &instance_dir,
-                );
+                if let Err(rollback) = trash::undo_stash(ctx, &entry, &instance_dir) {
+                    eprintln!("could not roll back the move to Recently deleted: {rollback}");
+                }
                 return Err(error.into());
             }
             Some(entry)
         } else {
             // A row whose folder is already gone has nothing to recover.
+            drop(locations);
             conn.execute("DELETE FROM game_instances WHERE instance_id = ?1", [id])?;
             None
         };

@@ -339,6 +339,10 @@ pub enum LockResource {
     Instance(String),
     /// Exclusive access to the content store for adding or removing items.
     ContentStore,
+    /// Exclusive access while scanning live and deleted instances or moving between their roots.
+    /// Take it after Instance and ContentStore, in that order when both are needed, and acquire
+    /// no other resource while holding it.
+    InstanceLocations,
     /// Exclusive access for per-user game files journaled swap.
     GameUserFiles(GameId, StoreId),
     /// Exclusive access while a plugin's files are swapped (install, update, rollback), so a
@@ -376,6 +380,7 @@ impl LockResource {
                 Ok(format!("instance-{id}"))
             }
             LockResource::ContentStore => Ok("content-store".into()),
+            LockResource::InstanceLocations => Ok("instance-locations".into()),
             LockResource::GameUserFiles(game, store) => {
                 app_paths::validate_path_component(game.as_str())?;
                 app_paths::validate_path_component(store.as_str())?;
@@ -459,6 +464,17 @@ impl LockManager {
     // ------------------------------------------------------------------
     // Public acquire helpers
     // ------------------------------------------------------------------
+
+    /// Takes the locations lock without waiting. Moves and destructive scans can be retried
+    /// when the current holder finishes.
+    pub fn try_instance_locations(&self, operation: &str) -> LauncherResult<LockGuard> {
+        self.acquire_with_timeout(
+            LockResource::InstanceLocations,
+            operation,
+            Duration::ZERO,
+            None,
+        )
+    }
 
     fn prepare(&self, resource: &LockResource) -> LauncherResult<(String, PathBuf, PathBuf)> {
         let lock_name = resource.lock_name()?;

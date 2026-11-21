@@ -2432,7 +2432,8 @@ pub fn remove_item_with_options(
         Ok(item) => item.files.iter().map(|file| file.sha256.clone()).collect(),
         Err(_) => Vec::new(),
     };
-    let usage = crate::library::instances_using(ctx, &item_id, &target_hashes);
+    let locations = ctx.lock_manager.try_instance_locations("content-remove")?;
+    let usage = crate::library::instances_using_locked(ctx, &item_id, &target_hashes);
 
     if let Some(unreadable) = usage.unreadable.first() {
         return Err(ContentError::UnreadableManifest {
@@ -2472,13 +2473,11 @@ pub fn remove_item_with_options(
     // snapshot still holds would make that restore point unusable, so it refuses, naming the
     // snapshots and the command that deletes each. An unreadable snapshot manifest refuses too
     // (it might name any item) unless the caller explicitly overrides it.
-    let snapshot_usage =
-        crate::game_snapshot::snapshots_using_content(ctx, &item_id).map_err(|error| {
-            ContentError::UnreadableManifest {
-                item_id: item_id.clone(),
-                manifest: "game-instance snapshots".into(),
-                error,
-            }
+    let snapshot_usage = crate::game_snapshot::snapshots_using_content_locked(ctx, &item_id)
+        .map_err(|error| ContentError::UnreadableManifest {
+            item_id: item_id.clone(),
+            manifest: "game-instance snapshots".into(),
+            error,
         })?;
     if !snapshot_usage.using.is_empty() {
         let mut instance_ids: Vec<String> = snapshot_usage
@@ -2554,7 +2553,7 @@ pub fn remove_item_with_options(
     // A damaged target has no readable object hashes, so a Minecraft instance that recorded only
     // an object hash cannot be seen as using it. Refuse rather than delete files an instance may
     // still need; removing the record alone would let the next sweep delete them.
-    if parsed_target.is_err() && crate::library::any_instance_records_objects(ctx) {
+    if parsed_target.is_err() && usage.records_objects {
         return Err(ContentError::UnreadableManifest {
             item_id,
             manifest: target_manifest_path.display().to_string(),
@@ -2563,6 +2562,7 @@ pub fn remove_item_with_options(
                 .into(),
         });
     }
+    drop(locations);
     // 1. Read every other manifest, noting whether any is unreadable.
     let items_dir = ctx.paths.content_items_dir();
     let mut other_items = Vec::new();

@@ -652,6 +652,10 @@ agora snapshots restore-lkg <INSTANCE> [--force]
 
 `snapshots drift` lists the files added, removed and changed since a snapshot, and changes nothing.
 
+Snapshot deletion and content-store removal check both live and Recently deleted instances before
+removing data. If an instance move or another scan holds that lock, retry once it finishes.
+Instance delete, restore, and purge can also report that the lock is busy.
+
 A restore replaces tracked instance state. Preserve valuable worlds separately and verify the intended snapshot ID before restoring. Every restore takes a pre-restore snapshot first, so the restore itself can be undone by restoring that `pre-restore-…` entry.
 
 Agora's automatic pre-launch recovery snapshot is optimized for mod, configuration, and layout recovery and does not include `saves/`. Full manual and transactional snapshots use a broader scope, but no local snapshot system should be the only backup for an irreplaceable world.

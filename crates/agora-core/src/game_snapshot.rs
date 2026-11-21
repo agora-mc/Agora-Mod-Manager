@@ -1113,6 +1113,13 @@ fn snapshot_folders_with(
     roots.push((ctx.paths.recently_deleted_games_root(), true));
     roots.push((ctx.paths.recently_deleted_root(), true));
     for (root, in_trash) in roots {
+        #[cfg(test)]
+        if root == ctx.paths.recently_deleted_games_root() {
+            crate::instance_location_tests::pause(
+                ctx,
+                crate::instance_location_tests::ScanPoint::LiveSnapshots,
+            );
+        }
         let entries = match std::fs::read_dir(&root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1172,14 +1179,23 @@ fn snapshot_folders_with(
             });
         }
     }
+    #[cfg(test)]
+    crate::instance_location_tests::pause(
+        ctx,
+        crate::instance_location_tests::ScanPoint::SnapshotFolders,
+    );
     Ok(folders)
 }
 
 /// The snapshots that name a content item, and the ones that cannot be read.
 ///
 /// Fails closed on a folder that cannot be listed: if the answer cannot be
-/// determined, removal must treat it as "still needed".
-pub fn snapshots_using_content(ctx: &Ctx, item_id: &str) -> Result<SnapshotContentUsage, String> {
+/// determined, removal must treat it as "still needed". Caller holds InstanceLocations
+/// through both folder discovery and manifest reads.
+pub(crate) fn snapshots_using_content_locked(
+    ctx: &Ctx,
+    item_id: &str,
+) -> Result<SnapshotContentUsage, String> {
     let mut usage = SnapshotContentUsage::default();
     for folder in snapshot_folders(ctx)? {
         let entries = snapshot::list_snapshots(&folder.instance_dir).map_err(|error| {
