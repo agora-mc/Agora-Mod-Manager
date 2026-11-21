@@ -370,6 +370,62 @@ fn symlink_target(path: &Path) -> Option<PathBuf> {
     std::fs::read_link(path).ok()
 }
 
+/// Create a conflict archive without ever touching an existing file. `create_new` refuses both a
+/// regular file and a symlink already at the name, so a file someone put there — or a link pointing
+/// somewhere else — is never replaced or written through. If the name is taken, the next free
+/// numbered name is used and returned.
+fn write_conflict_file(path: &Path, bytes: &[u8]) -> Result<PathBuf, UserFilesError> {
+    use std::io::Write;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file")
+        .to_string();
+    for attempt in 0..1000u32 {
+        let candidate = if attempt == 0 {
+            path.to_path_buf()
+        } else {
+            parent.join(format!("{name}-{attempt}"))
+        };
+        // `symlink_metadata` does not follow the link, so a symlink at the name counts as taken
+        // too. Windows reports a directory at the name as a permission error rather than
+        // AlreadyExists; checking first keeps the "pick a new name" rule portable.
+        if std::fs::symlink_metadata(&candidate).is_ok() {
+            continue;
+        }
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(UserFilesError::Write {
+                    path: candidate,
+                    source: error,
+                })
+            }
+        };
+        file.write_all(bytes)
+            .map_err(|source| UserFilesError::Write {
+                path: candidate.clone(),
+                source,
+            })?;
+        file.sync_all().map_err(|source| UserFilesError::Write {
+            path: candidate.clone(),
+            source,
+        })?;
+        return Ok(candidate);
+    }
+    Err(UserFilesError::Other(format!(
+        "could not find a free conflict file name next to {}",
+        path.display()
+    )))
+}
+
 /// Write a user file atomically: a temp file beside it, synced, renamed over the target, then the
 /// directory synced where the platform supports it. A stop leaves the old bytes or the complete new
 /// bytes, never a torn file. The target is named when the write is refused.
@@ -1699,10 +1755,7 @@ fn restore_journal_internal(
                         .unwrap_or("file"),
                     &archive_hash[..8]
                 ));
-                if let Some(parent) = conflict_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                write_user_file(&conflict_path, &archived_bytes)?;
+                let conflict_path = write_conflict_file(&conflict_path, &archived_bytes)?;
                 // The explicit restore command's override (`--force`) writes the conflict
                 // copy first (done above) and then restores; automatic recovery never does.
                 if !force {

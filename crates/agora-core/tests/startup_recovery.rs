@@ -1783,3 +1783,125 @@ fn a_forced_restore_archives_the_instance_edit_it_overwrites() {
         "Player original\n"
     );
 }
+
+fn conflict_archives(f: &UserFilesFixture) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(f.copy.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("Plugins.txt.agora-conflict-"))
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+fn conflicting_user_files(f: &UserFilesFixture) {
+    agora_core::game_user_files::swap_in(
+        &f.ctx,
+        "instance-a",
+        &f.def,
+        &StoreId::steam(),
+        &f.running_from,
+    )
+    .unwrap();
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
+    std::fs::write(&f.real, "Game changed this after the crash\n").unwrap();
+    std::fs::write(&f.copy, "Instance copy changed too\n").unwrap();
+}
+
+/// A conflict archive uses create-new: a file already at that name is left exactly as it was and
+/// the archive is written under a new number.
+#[test]
+fn an_existing_file_at_the_conflict_name_is_not_replaced() {
+    let f = user_files_fixture(Some("Player original\n"));
+    conflicting_user_files(&f);
+    agora_core::game_user_files::restore(&f.ctx, &f.def, &StoreId::steam()).unwrap_err();
+    let taken = conflict_archives(&f)
+        .into_iter()
+        .next()
+        .expect("one archive");
+    std::fs::write(&taken, "you may not replace me").unwrap();
+
+    agora_core::game_user_files::restore(&f.ctx, &f.def, &StoreId::steam()).unwrap_err();
+
+    assert_eq!(
+        std::fs::read_to_string(&taken).unwrap(),
+        "you may not replace me",
+        "the file at the conflict name was replaced"
+    );
+    assert_eq!(
+        conflict_archives(&f).len(),
+        2,
+        "the second refusal wrote a numbered archive instead of replacing the first"
+    );
+}
+
+/// A symlink at the conflict name must not be followed: the archive goes to a new name and the
+/// link's target is untouched. Creating file symlinks needs a privilege on some Windows hosts, so
+/// this fixture is Unix-only; the directory case below covers the same create-new rule everywhere.
+#[cfg(unix)]
+#[test]
+fn a_symlink_at_the_conflict_name_is_not_followed() {
+    let f = user_files_fixture(Some("Player original\n"));
+    conflicting_user_files(&f);
+    agora_core::game_user_files::restore(&f.ctx, &f.def, &StoreId::steam()).unwrap_err();
+    let taken = conflict_archives(&f)
+        .into_iter()
+        .next()
+        .expect("one archive");
+    let sentinel = f.copy.parent().unwrap().join("sentinel.txt");
+    std::fs::write(&sentinel, "do not touch").unwrap();
+    std::fs::remove_file(&taken).unwrap();
+    std::os::unix::fs::symlink(&sentinel, &taken).unwrap();
+
+    agora_core::game_user_files::restore(&f.ctx, &f.def, &StoreId::steam()).unwrap_err();
+
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).unwrap(),
+        "do not touch",
+        "the conflict archive was written through the symlink"
+    );
+    assert!(
+        std::fs::symlink_metadata(&taken)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the symlink at the conflict name was replaced"
+    );
+    assert_eq!(conflict_archives(&f).len(), 2);
+}
+
+/// A directory already at the conflict name is an existing name too: create-new refuses it and the
+/// directory survives. This runs everywhere, including hosts where file symlinks need a privilege.
+#[test]
+fn a_directory_at_the_conflict_name_is_not_replaced() {
+    let f = user_files_fixture(Some("Player original\n"));
+    conflicting_user_files(&f);
+    agora_core::game_user_files::restore(&f.ctx, &f.def, &StoreId::steam()).unwrap_err();
+    let taken = conflict_archives(&f)
+        .into_iter()
+        .next()
+        .expect("one archive");
+    std::fs::remove_file(&taken).unwrap();
+    std::fs::create_dir(&taken).unwrap();
+    std::fs::write(taken.join("keep"), "do not touch").unwrap();
+
+    agora_core::game_user_files::restore(&f.ctx, &f.def, &StoreId::steam()).unwrap_err();
+
+    assert_eq!(
+        std::fs::read_to_string(taken.join("keep")).unwrap(),
+        "do not touch",
+        "the directory at the conflict name was replaced"
+    );
+    assert_eq!(conflict_archives(&f).len(), 2);
+}
