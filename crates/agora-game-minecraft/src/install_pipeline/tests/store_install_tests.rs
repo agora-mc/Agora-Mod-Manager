@@ -6,6 +6,11 @@
 //! alone.
 
 use super::*;
+use agora_core::instance_runtime::InstanceGuard as TestGuard;
+
+fn test_guard(ctx: &Ctx, id: &str, label: &str) -> TestGuard {
+    TestGuard::for_mutation(ctx, id, label).unwrap()
+}
 
 /// A context whose data root owns the instance, so the store and the instance sit under the
 /// same test root.
@@ -49,12 +54,7 @@ fn review_a_blank_curator_pin_is_refused_not_dropped() {
     let bytes = std::fs::read(&source).unwrap();
     let sha = super::sha256_hex(&bytes);
     let service = crate::install_service::InstallService::new(ctx.clone());
-    let guard = agora_core::instance_runtime::InstanceGuard::for_mutation(
-        &ctx,
-        "test",
-        "test-blank-curator-pin",
-    )
-    .unwrap();
+    let guard = test_guard(&ctx, "test", "test-blank-curator-pin");
 
     let error = service
         .commit_verified_artifact(
@@ -102,12 +102,7 @@ fn review_a_blank_pack_hash_is_refused_with_a_named_error() {
     let bytes = std::fs::read(&source).unwrap();
     let sha = super::sha256_hex(&bytes);
     let service = crate::install_service::InstallService::new(ctx.clone());
-    let guard = agora_core::instance_runtime::InstanceGuard::for_mutation(
-        &ctx,
-        "test",
-        "test-blank-pack-hash",
-    )
-    .unwrap();
+    let guard = test_guard(&ctx, "test", "test-blank-pack-hash");
 
     let error = service
         .commit_verified_artifact(
@@ -560,9 +555,7 @@ fn a_direct_artifact_install_links_from_the_store() {
     let bytes = std::fs::read(&source).unwrap();
     let sha = super::sha256_hex(&bytes);
     let service = crate::install_service::InstallService::new(ctx.clone());
-    let guard =
-        agora_core::instance_runtime::InstanceGuard::for_mutation(&ctx, "test", "test-commit")
-            .unwrap();
+    let guard = test_guard(&ctx, "test", "test-commit");
 
     let installed = service
         .commit_verified_artifact(
@@ -666,9 +659,7 @@ fn catalog_and_modrinth_provenance_survive_an_offline_add() {
     )
     .unwrap();
     let service = crate::install_service::InstallService::new(ctx.clone());
-    let guard =
-        agora_core::instance_runtime::InstanceGuard::for_mutation(&ctx, "first", "test-commit")
-            .unwrap();
+    let guard = test_guard(&ctx, "first", "test-commit");
 
     let catalog_jar = write_mod_jar(tmp.path(), "catalog-mod", "1.0.0");
     let catalog_bytes = std::fs::read(&catalog_jar).unwrap();
@@ -1011,9 +1002,7 @@ fn review_remove_never_deletes_a_same_named_file_in_another_folder() {
     let bytes = std::fs::read(&source).unwrap();
     let sha = super::sha256_hex(&bytes);
     let service = crate::install_service::InstallService::new(ctx.clone());
-    let guard =
-        agora_core::instance_runtime::InstanceGuard::for_mutation(&ctx, "test", "test-commit")
-            .unwrap();
+    let guard = test_guard(&ctx, "test", "test-commit");
     service
         .commit_verified_artifact(
             &guard,
