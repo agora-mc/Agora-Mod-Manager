@@ -992,6 +992,49 @@ test.describe('Settings recovery', () => {
     await expect(page.getByTestId('recovery-empty')).toContainText('Nothing needs recovering');
   });
 
+  test('a both-changed conflict offers the forced retry on a serialized IPC error', async ({ page }) => {
+    await boot(
+      page,
+      [
+        {
+          command: 'games_user_files_restore',
+          match: { force: false },
+          error: {
+            code: 'user_files_conflict',
+            coreCode: 'ERR_USER_FILES_CONFLICT',
+            message: 'both changed since the swap',
+          },
+        },
+        {
+          command: 'games_user_files_restore',
+          match: { force: true },
+          reply: {
+            gameId: 'skyrim-se',
+            store: 'steam',
+            instanceId: 'inst-1',
+            files: [
+              {
+                realPath: 'C:/Users/me/Documents/My Games/Skyrim Special Edition/Skyrim.ini',
+                changed: true,
+                originalSha256: 'ef'.repeat(32),
+                finalSha256: 'ef'.repeat(32),
+              },
+            ],
+          },
+        },
+      ],
+      { games_user_files_status: { sessions: [userFilesSession] } },
+    );
+
+    await openGameSettings(page, 'Recovery');
+    await page.getByTestId('recovery-session').getByRole('button', { name: 'Put the files back' }).click();
+    await page.getByRole('button', { name: 'Restore files', exact: true }).click();
+
+    await expect(page.getByRole('dialog')).toContainText('Both copies changed');
+    await page.getByRole('button', { name: 'Restore anyway' }).click();
+    await expect(page.getByTestId('recovery-restored')).toContainText('Put back 1 file(s)');
+  });
+
   test('a restore that fails shows the reason and leaves the session in place', async ({ page }) => {
     await boot(
       page,

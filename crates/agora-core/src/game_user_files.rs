@@ -23,6 +23,10 @@ use crate::ctx::Ctx;
 use crate::lock_manager::LockResource;
 use crate::process_identity::{self, ProcessIdentity};
 
+/// Stable code for a both-changed conflict. The desktop's restore command gives an explicit
+/// override only for this failure, matched by code rather than by message text.
+pub const ERR_USER_FILES_CONFLICT: &str = "ERR_USER_FILES_CONFLICT";
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -58,6 +62,10 @@ pub enum UserFilesError {
     },
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    /// Both the real file and the instance copy changed since the swap. Only an explicit
+    /// override may proceed; `ERR_USER_FILES_CONFLICT` is how a caller recognises it.
+    #[error("{0}")]
+    Conflict(String),
     #[error("{0}")]
     Other(String),
 }
@@ -1767,7 +1775,7 @@ fn restore_journal_internal(
                 // The explicit restore command's override (`--force`) writes the conflict
                 // copy first (done above) and then restores; automatic recovery never does.
                 if !force {
-                    return Err(UserFilesError::Other(format!(
+                    return Err(UserFilesError::Conflict(format!(
                         "the user file '{}' and the instance's copy '{}' both changed since \
                          the swap, so neither was overwritten: the real file's current bytes \
                          were kept as '{}'. Check both by hand, then put the files back \

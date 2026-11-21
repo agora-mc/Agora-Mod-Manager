@@ -12,7 +12,15 @@ import { Badge } from '@/components/ui/badge';
 import { useConfirm } from '@/components/ui/confirm';
 import { formatError } from '@/lib/tauri';
 import type { SectionFrame } from '../shared/sectionFrame';
-import { restoreUserFiles, userFilesStatus, type RestoreResult, type UserFileSession } from './api';
+import {
+  restoreUserFiles,
+  userFilesStatus,
+  USER_FILES_CONFLICT_CODE,
+  USER_FILES_CONFLICT_CORE_CODE,
+  type RestoreResult,
+  type UserFileSession,
+} from './api';
+import { isGamesError } from '../shared/types';
 
 type ListState =
   | { status: 'loading' }
@@ -62,13 +70,17 @@ export function RecoverySection({ gameId, frame }: { gameId: string; frame: Sect
         return error;
       }
     };
-    const error = await run(false);
-    // A both-changed conflict is the one protection the explicit restore can override: offer
-    // the forced retry, which still writes the conflict copy first.
-    if (error instanceof Error && formatError(error).includes('both changed since the swap')) {
+    const error: unknown = await run(false);
+    // A both-changed conflict is the one protection the explicit restore can override. IPC
+    // delivers a serialized GamesError, not an Error instance, so match its stable code; never
+    // read the human message to decide what the user may do.
+    if (
+      isGamesError(error)
+      && (error.code === USER_FILES_CONFLICT_CODE || error.coreCode === USER_FILES_CONFLICT_CORE_CODE)
+    ) {
       const retry = await confirm({
         title: 'Both copies changed — restore anyway?',
-        body: 'Both the game’s own file and the instance’s copy changed since the swap. Restoring anyway keeps the game’s file’s current bytes as a clearly named conflict copy next to the instance’s copy, then puts the original back.',
+        body: 'Both the game’s own file and the instance’s copy changed since the swap. Restoring anyway saves the instance’s current copy as a conflict file, then puts the original back.',
         confirmLabel: 'Restore anyway',
         tone: 'danger',
       });
