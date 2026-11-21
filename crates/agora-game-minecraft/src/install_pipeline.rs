@@ -7383,8 +7383,7 @@ mod tests {
         }];
         for accept in [false, true] {
             let error = verify_file_add(bytes, &add, accept)
-                .err()
-                .expect("a blank assertion is our own bad data, not a confirmable mismatch");
+                .expect_err("a blank assertion is our own bad data, not a confirmable mismatch");
             let message = error.message();
             assert!(message.contains("x.jar"), "names the item: {message}");
             assert!(
