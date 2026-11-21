@@ -2241,6 +2241,94 @@ fn forge_adoption_with_generated_artifacts_receipt_bound() {
     );
 }
 
+/// Regression test for a real Forge 1.21.1 (forge 52.1.21) install: the
+/// installer's patcher produces `net.minecraftforge:forge:<mc>-<ver>:client`
+/// with a *published SHA-1* (the `PATCHED_SHA` from `install_profile.json`)
+/// and a blank download URL. The receipt must pin that artifact from disk so
+/// adoption accepts the blank URL; before the fix the produced set was
+/// derived only from artifacts without an upstream hash, so adoption refused
+/// the profile right after the installer wrote it.
+#[test]
+fn forge_install_receipt_pins_processor_output_with_published_sha1() {
+    // Real installer artifacts captured from the Forge 52.1.21 installer.
+    const INSTALL_PROFILE_JSON: &str =
+        include_str!("fixtures/forge-1.21.1-52.1.21-install-profile.json");
+    const VERSION_JSON: &str = include_str!("fixtures/forge-1.21.1-52.1.21-version.json");
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let minecraft_dir = tmp.path().join("minecraft");
+    let receipts_root = tmp.path().join("receipts");
+    std::fs::create_dir_all(&minecraft_dir).unwrap();
+    std::fs::create_dir_all(&receipts_root).unwrap();
+
+    let mc_version = "1.21.1";
+    let loader_version = "52.1.21";
+    let profile_id = format!("forge-{mc_version}-{loader_version}");
+    let tuple = LoaderTuple {
+        loader: "forge".into(),
+        minecraft_version: mc_version.into(),
+        loader_version: loader_version.into(),
+    };
+
+    // Base version JSON the profile inherits from.
+    let base_json = make_adoption_base_json(mc_version);
+    write_installed_version_json(&minecraft_dir, mc_version, &base_json);
+
+    // The installer-generated version.json, with the id the launcher expects.
+    let mut profile: serde_json::Value =
+        serde_json::from_str(VERSION_JSON).expect("real Forge version.json must parse");
+    profile["id"] = serde_json::Value::String(profile_id.clone());
+    write_installed_version_json(&minecraft_dir, &profile_id, &profile);
+
+    // The patcher output the installer just produced on disk.
+    let client_jar_rel = "net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-client.jar";
+    let client_jar = minecraft_dir.join("libraries").join(client_jar_rel);
+    std::fs::create_dir_all(client_jar.parent().unwrap()).unwrap();
+    std::fs::write(&client_jar, b"patched client jar bytes").unwrap();
+
+    // Produced set, derived exactly like the install path derives it.
+    let install_profile: serde_json::Value = serde_json::from_str(INSTALL_PROFILE_JSON)
+        .expect("real Forge install_profile.json must parse");
+    let produced = installed_profile::processor_output_coordinates(&install_profile, "client");
+    assert!(
+        produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:client"),
+        "the installer parse must recognize the produced client jar, got: {produced:?}"
+    );
+
+    let source_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let receipt = installed_profile::create_receipt_for_installed_profile(
+        &minecraft_dir,
+        &receipts_root,
+        &tuple,
+        source_sha256,
+        "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-installer.jar",
+        0,
+        &produced,
+    )
+    .expect("Forge 1.21.1 receipt creation (incl. adoption proof) must succeed");
+
+    assert!(
+        receipt
+            .generated_artifact_sha256
+            .contains_key(client_jar_rel),
+        "receipt must pin the produced client jar from disk, got: {:?}",
+        receipt.generated_artifact_sha256.keys().collect::<Vec<_>>()
+    );
+
+    // Adoption must accept the blank URL because the receipt pins the artifact.
+    // (The produced jar carries a published SHA-1, so it is not in
+    // trusted_unhashed_library_paths; its launch-time trust is the receipt's
+    // generated_artifact_sha256 map, verified above.)
+    let adopted = installed_profile::adopt_installed_profile(
+        &minecraft_dir,
+        &receipts_root,
+        &tuple,
+        source_sha256,
+    )
+    .expect("adoption must accept the freshly installed Forge 1.21.1 profile");
+    assert_eq!(adopted.profile_id, profile_id);
+}
+
 #[test]
 fn neoforge_adoption_with_generated_artifacts_receipt_bound() {
     let tmp = tempfile::TempDir::new().unwrap();

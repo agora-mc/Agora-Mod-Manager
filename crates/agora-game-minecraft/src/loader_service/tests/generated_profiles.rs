@@ -9,7 +9,7 @@ const QUILT_PROFILE: &[u8] = include_bytes!("../../../tests/fixtures/quilt-1.21.
 const JAR: &[u8] = b"invented library bytes";
 
 #[derive(Clone, Copy)]
-enum MavenReply {
+pub(super) enum MavenReply {
     Match,
     Mismatch,
     Missing,
@@ -19,7 +19,7 @@ enum MavenReply {
 }
 
 // Read one HTTP request without waiting for EOF, then close the connection.
-async fn respond(mut socket: TcpStream, profile: &[u8], reply: MavenReply) {
+pub(super) async fn respond(mut socket: TcpStream, profile: &[u8], reply: MavenReply) {
     let mut request = String::new();
     let mut reader = BufReader::new(&mut socket);
     reader.read_line(&mut request).await.unwrap();

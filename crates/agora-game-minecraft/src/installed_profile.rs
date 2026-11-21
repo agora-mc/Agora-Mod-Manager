@@ -771,38 +771,58 @@ fn collect_unhashed_library_paths(libraries: &[crate::launch::Library]) -> Vec<S
     paths
 }
 
-pub fn processor_output_coordinates(install_profile: &serde_json::Value) -> BTreeSet<String> {
+/// Maven coordinates written by the installer's processors for `side`.
+///
+/// Processor outputs are placeholders such as `{PATCHED}`; the readable
+/// coordinate lives in `data[PATCHED][side]` as `[group:name:version:classifier]`.
+/// Resolving each output placeholder through `data` for the side being
+/// installed is the only reliable way to name those artifacts — collecting
+/// every `data` entry would also allow processor *inputs* and the other side's
+/// jars to be treated as outputs.
+pub fn processor_output_coordinates(
+    install_profile: &serde_json::Value,
+    side: &str,
+) -> BTreeSet<String> {
     fn collect(reference: &serde_json::Value, out: &mut BTreeSet<String>) {
         let Some(text) = reference.as_str() else {
             return;
         };
-        let Some(inner) = text
-            .split_once('[')
-            .and_then(|(_, rest)| rest.rsplit_once(']').map(|(value, _)| value))
-        else {
-            return;
-        };
+        let text = text.trim();
+        let inner = text
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .unwrap_or(text);
         let coordinate = inner.split('@').next().unwrap_or(inner).trim();
         if coordinate.matches(':').count() >= 2 {
             out.insert(coordinate.to_string());
         }
     }
 
+    let data = install_profile.get("data").and_then(|v| v.as_object());
     let mut out = BTreeSet::new();
     if let Some(processors) = install_profile.get("processors").and_then(|v| v.as_array()) {
         for processor in processors {
-            if let Some(outputs) = processor.get("outputs").and_then(|v| v.as_object()) {
-                for value in outputs.values() {
-                    collect(value, &mut out);
-                }
-            }
-        }
-    }
-    if let Some(data) = install_profile.get("data").and_then(|v| v.as_object()) {
-        for entry in data.values() {
-            for side in ["client", "server"] {
-                if let Some(value) = entry.get(side) {
-                    collect(value, &mut out);
+            let Some(outputs) = processor.get("outputs").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            for (key, value) in outputs {
+                // A literal bracketed coordinate in an output is already the
+                // answer; some installer versions use that form directly.
+                collect(value, &mut out);
+                // Placeholder keys/values (e.g. `{PATCHED}`) resolve through
+                // `data` for the installed side only.
+                for reference in [key.as_str(), value.as_str().unwrap_or_default()] {
+                    let Some(name) = reference
+                        .strip_prefix('{')
+                        .and_then(|name| name.strip_suffix('}'))
+                    else {
+                        continue;
+                    };
+                    if let Some(entry) = data.and_then(|data| data.get(name)) {
+                        if let Some(side_value) = entry.get(side) {
+                            collect(side_value, &mut out);
+                        }
+                    }
                 }
             }
         }
@@ -810,7 +830,10 @@ pub fn processor_output_coordinates(install_profile: &serde_json::Value) -> BTre
     out
 }
 
-pub fn processor_outputs_from_installer_jar(jar: &[u8]) -> Result<BTreeSet<String>, ProfileIssue> {
+pub fn processor_outputs_from_installer_jar(
+    jar: &[u8],
+    side: &str,
+) -> Result<BTreeSet<String>, ProfileIssue> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(jar)).map_err(|error| {
         ProfileIssue::corrupt(None, format!("Installer is not a readable JAR: {error}"))
     })?;
@@ -840,7 +863,7 @@ pub fn processor_outputs_from_installer_jar(jar: &[u8]) -> Result<BTreeSet<Strin
             format!("Installer's install_profile.json is invalid: {error}"),
         )
     })?;
-    Ok(processor_output_coordinates(&value))
+    Ok(processor_output_coordinates(&value, side))
 }
 
 fn receipt_produced_libraries(
@@ -1403,14 +1426,45 @@ pub fn create_receipt_for_installed_profile(
         produced_libraries,
     )?;
 
-    // 6. Enumerate library paths without upstream SHA1/SHA256.
-    let unhashed_paths = collect_unhashed_library_paths(&loader_version.libraries);
+    // 6. Enumerate library paths the receipt must pin from disk:
+    //    every library without an upstream hash, and every installer
+    //    processor output with a blank download URL — a processor output
+    //    is only ever created locally (the installer verified its bytes
+    //    against the hashes it declared in install_profile.json), so it
+    //    can never be downloaded at launch even when the generated
+    //    version.json publishes a SHA-1 for it. Pinning it here gives
+    //    adoption and the launch planner the SHA-256 they need to trust
+    //    the artifact, and fails fast if the installer did not actually
+    //    produce it.
+    let mut pinned_paths: BTreeSet<String> =
+        collect_unhashed_library_paths(&loader_version.libraries)
+            .into_iter()
+            .collect();
+    for lib in &loader_version.libraries {
+        if !produced_libraries.contains(&lib.name) {
+            continue;
+        }
+        // A non-blank URL means the artifact is downloadable, so it needs
+        // no receipt pin. Blank (or absent) means local-only: pin it.
+        let downloadable = lib
+            .downloads
+            .as_ref()
+            .and_then(|downloads| downloads.artifact.as_ref())
+            .map(|artifact| !artifact.url.trim().is_empty())
+            .unwrap_or(false);
+        if downloadable {
+            continue;
+        }
+        if let Ok(descriptor) = parse_maven_descriptor(&lib.name) {
+            pinned_paths.insert(descriptor.to_relative_path());
+        }
+    }
 
-    // 7. For each unhashed library, verify the file under .minecraft/libraries.
+    // 7. For each pinned library, verify the file under .minecraft/libraries.
     //    TOCTOU protection (item 7): capture metadata before reading, hash
     //    bounded stream, verify metadata again; fail if changed.
     let mut generated_artifact_sha256: BTreeMap<String, String> = BTreeMap::new();
-    for rel_path in &unhashed_paths {
+    for rel_path in &pinned_paths {
         // Reject unsafe paths.
         if is_unsafe_relative_path(rel_path) {
             return Err(ProfileIssue::corrupt(
@@ -1657,7 +1711,42 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn processor_outputs_are_collected_from_outputs_and_data_entries() {
+    fn real_forge_placeholder_outputs_resolve_to_the_client_side_only() {
+        let install_profile: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/forge-1.21.1-52.1.21-install-profile.json"
+        ))
+        .expect("real Forge install_profile.json fixture is valid JSON");
+        let produced = processor_output_coordinates(&install_profile, "client");
+        assert!(
+            produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:client"),
+            "the patched client jar is a client processor output: {produced:?}"
+        );
+        assert!(
+            !produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:server"),
+            "the server jar is not produced by a client install: {produced:?}"
+        );
+        assert_eq!(
+            produced.len(),
+            4,
+            "exactly the four client-side processor outputs: {produced:?}"
+        );
+
+        // The real generated version.json has the patched client jar with a
+        // blank URL; resolving {PATCHED} through data[PATCHED][client] is what
+        // lets the structural validation accept it.
+        let mut version: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/forge-1.21.1-52.1.21-version.json"
+        ))
+        .expect("real Forge version.json fixture is valid JSON");
+        version["id"] = serde_json::Value::String("forge-1.21.1-52.1.21".into());
+        let info: VersionInfo = serde_json::from_value(version).expect("VersionInfo");
+        let path = Path::new("versions/forge-1.21.1-52.1.21/forge-1.21.1-52.1.21.json");
+        validate_loader_profile(&info, path, "forge-1.21.1-52.1.21", "1.21.1", &produced)
+            .expect("the real Forge profile's blank client URL is a client processor output");
+    }
+
+    #[test]
+    fn processor_outputs_are_collected_from_output_values_and_placeholders() {
         let install_profile = json!({
             "processors": [
                 {
@@ -1681,7 +1770,7 @@ mod tests {
                 }
             }
         });
-        let produced = processor_output_coordinates(&install_profile);
+        let produced = processor_output_coordinates(&install_profile, "client");
         assert!(produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:client"));
         assert!(produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:server"));
         assert!(produced.contains("org.example:tool:2.0:client"));
@@ -1702,10 +1791,10 @@ mod tests {
             .unwrap();
             writer.finish().unwrap();
         }
-        let produced = processor_outputs_from_installer_jar(&bytes).unwrap();
+        let produced = processor_outputs_from_installer_jar(&bytes, "client").unwrap();
         assert!(produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:client"));
 
-        let err = processor_outputs_from_installer_jar(b"not a zip").unwrap_err();
+        let err = processor_outputs_from_installer_jar(b"not a zip", "client").unwrap_err();
         assert!(
             err.reasons
                 .iter()
@@ -1745,7 +1834,7 @@ mod tests {
                 }
             ]
         });
-        let produced = processor_output_coordinates(&install_profile);
+        let produced = processor_output_coordinates(&install_profile, "client");
         assert!(produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:client"));
         assert!(
             validate_loader_profile(&info, path, "forge-1.21.1-52.1.21", "1.21.1", &produced)

@@ -488,31 +488,65 @@ impl LoaderService {
 
         let is_maven_profile = entry.is_maven_profile(&loader);
         let expected_sha = entry.receipt_source_sha(&loader);
+        // Why the existing install (if any) failed adoption or cannot be
+        // used as-is — recorded so the reinstall that heals it explains
+        // itself; a failing heal reports the reason too. See warn_loader.
+        let mut adopt_failure: Option<String> = None;
         if !force_reinstall {
-            if let Ok(adopted) = installed_profile::adopt_installed_profile(
+            match installed_profile::adopt_installed_profile(
                 &minecraft_root,
                 &receipts_root,
                 &tuple,
                 expected_sha,
             ) {
-                let unverified = adopted
-                    .receipt
-                    .as_ref()
-                    .filter(|_| is_maven_profile)
-                    .map(|receipt| &receipt.generated_artifact_sha256);
-                if unverified.is_none_or(|paths| paths.is_empty() || allow_unverified_loader) {
-                    if let Some(paths) = unverified {
-                        for path in paths.keys() {
-                            self.warn_unverified_library(&op, path);
+                Ok(adopted) => {
+                    let unverified = adopted
+                        .receipt
+                        .as_ref()
+                        .filter(|_| is_maven_profile)
+                        .map(|receipt| &receipt.generated_artifact_sha256);
+                    if unverified.is_none_or(|paths| paths.is_empty() || allow_unverified_loader) {
+                        if let Some(paths) = unverified {
+                            for path in paths.keys() {
+                                self.warn_unverified_library(&op, path);
+                            }
                         }
+                        op.complete();
+                        return Ok(summary_from_adoption(tuple, adopted, true));
                     }
-                    op.complete();
-                    return Ok(summary_from_adoption(tuple, adopted, true));
+                    // Adopted, but the install is trusted only through
+                    // Maven libraries without published hashes and the user
+                    // has not opted in: heal by reinstalling.
+                    let reason = "loader has libraries with no published hash and unverified loader libraries are not allowed";
+                    self.warn_loader(&op, format!("Warning: {reason}; reinstalling"));
+                    adopt_failure = Some(reason.to_string());
+                }
+                Err(issue)
+                    if !matches!(
+                        issue.kind,
+                        installed_profile::ProfileIssueKind::MissingProfile
+                    ) =>
+                {
+                    let reason = issue.reasons.join("; ");
+                    self.warn_loader(
+                        &op,
+                        format!(
+                            "Warning: existing install could not be verified: {reason}; reinstalling"
+                        ),
+                    );
+                    adopt_failure =
+                        Some(format!("existing install could not be verified: {reason}"));
+                }
+                Err(_) => {
+                    // Nothing to verify (fresh install, missing base JSON):
+                    // a new install is not a heal, so there is no reason to
+                    // attach and nothing to warn about.
                 }
             }
         }
 
         if let Err(e) = policy.check(NetworkCategory::LoaderMetadataAndContent) {
+            let e = attach_reinstall_context(e, adopt_failure.as_deref());
             op.fail(e.to_string());
             return Err(e);
         }
@@ -572,10 +606,22 @@ impl LoaderService {
                 Ok(summary)
             }
             Err(e) => {
+                let e = attach_reinstall_context(e, adopt_failure.as_deref());
                 op.fail(e.to_string());
                 Err(e)
             }
         }
+    }
+
+    /// Report a loader-install warning for this operation: stderr plus a
+    /// progress event, following the warn_unverified_library pattern.
+    fn warn_loader(&self, op: &OpHandle, message: String) {
+        eprintln!("{message}");
+        self.ctx.progress_sink.report(ProgressEvent::new(
+            op.id().clone(),
+            ProgressPhase::Verifying,
+            message,
+        ));
     }
 
     fn warn_unverified_library(&self, op: &OpHandle, path: &str) {
@@ -693,12 +739,10 @@ impl LoaderService {
                 });
             }
             normalize_forge_profile(minecraft_root, tuple)?;
-            let produced =
-                installed_profile::processor_outputs_from_installer_jar(data).map_err(|issue| {
-                    LauncherError::Generic {
-                        code: "ERR_PROFILE_CORRUPT".into(),
-                        message: issue.reasons.join("; "),
-                    }
+            let produced = installed_profile::processor_outputs_from_installer_jar(data, "client")
+                .map_err(|issue| LauncherError::Generic {
+                    code: "ERR_PROFILE_CORRUPT".into(),
+                    message: issue.reasons.join("; "),
                 })?;
             let receipt = installed_profile::create_receipt_for_installed_profile(
                 minecraft_root,
@@ -823,6 +867,20 @@ pub struct LoaderChangeResult {
     pub loader_version: String,
     /// Post-switch health report computed from a fresh scan.
     pub health: HealthReport,
+}
+
+/// A heal-reinstall after a failed adoption must not lose why the adoption
+/// failed — prepend the reason so a failing heal (offline, corrupt download,
+/// ...) reports the original verification failure alongside the new error.
+/// The machine-readable code is preserved.
+fn attach_reinstall_context(error: LauncherError, adopt_failure: Option<&str>) -> LauncherError {
+    match adopt_failure {
+        Some(reason) => LauncherError::Generic {
+            code: error.code(),
+            message: format!("{reason}; reinstall failed: {error}"),
+        },
+        None => error,
+    }
 }
 
 fn summary_from_adoption(
@@ -1252,11 +1310,12 @@ fn delete_backup(minecraft_root: &Path, profile_id: &str) {
 mod tests {
     use super::*;
     use crate::loader_compatibility::CurrentLoaderStatus;
-    use agora_core::ctx::Ctx;
+    use agora_core::event_sink::CollectingProgressSink;
     use agora_core::models::InstalledMod;
     use std::io::Write;
 
     mod generated_profiles;
+    mod reinstall_fallback;
 
     fn context() -> (Ctx, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(
