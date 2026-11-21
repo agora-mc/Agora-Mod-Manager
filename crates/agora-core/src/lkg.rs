@@ -474,6 +474,22 @@ pub fn retention_plan_with_sizes(
 /// Lists snapshots, cross-references LKG state, evicts those exceeding the
 /// configured category counts and size cap.
 pub fn run_retention(instance_dir: &Path) -> Result<(), String> {
+    // Retention is automatic housekeeping. Hold the locations lock once for the whole round so an
+    // instance cannot move between live and Recently deleted while we decide what to delete, and
+    // so each delete does not try to take a non-reentrant lock again. A collision that outlasts the
+    // short wait means another operation is in flight: skip this round, delete nothing, keep going.
+    let locations =
+        match crate::snapshot::lock_snapshot_locations(instance_dir, "snapshot-retention", true) {
+            Ok(guard) => guard,
+            Err(error) => {
+                eprintln!(
+                    "skipping snapshot retention for {}: {error}",
+                    instance_dir.display()
+                );
+                return Ok(());
+            }
+        };
+
     let snapshots = crate::snapshot::list_snapshots(instance_dir)
         .map_err(|e| format!("list_snapshots: {e}"))?;
     if snapshots.is_empty() {
@@ -535,7 +551,12 @@ pub fn run_retention(instance_dir: &Path) -> Result<(), String> {
 
     let mut errors = Vec::new();
     for id in &to_evict {
-        if let Err(error) = crate::snapshot::delete_snapshot(instance_dir, id) {
+        if let Err(error) = crate::snapshot::delete_snapshot_with(
+            instance_dir,
+            id,
+            crate::snapshot::list_snapshot_scan_dir,
+            &locations,
+        ) {
             errors.push(format!("{id}: {error}"));
         }
     }

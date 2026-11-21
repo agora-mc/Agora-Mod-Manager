@@ -5635,10 +5635,13 @@ Mod files live in `content/objects` with its own sweep, and snapshots keep a sec
   no reference, under the store lock, after a grace period, and deletes nothing if any read fails.
 - Until the stores are unified, the snapshot and content-store scans hold a single
   cross-process instance-locations lock from the first listing through the last manifest read.
-  Moves between live and Recently deleted and purges take the same lock. Base removal takes it
-  after that base's own lock, from the first pinning read through the deletion, so an instance
-  cannot leave one list for the other while the answers disagree. Acquire it after any instance,
-  base or content-store locks. If it is busy, deletion refuses and can be retried.
+  Moves between live and Recently deleted and purges take the same lock. Base removal, and a build
+  replacing a damaged base's stale folder, take it after that base's own lock and check pinning
+  under both, so an instance cannot leave one list for the other while the answers disagree.
+  Automatic snapshot retention holds it for a whole round and, if it is still busy after a short
+  wait, skips that round without deleting anything and without failing. A user-requested delete
+  waits briefly before refusing. Acquire this lock after any instance, base or content-store locks,
+  and acquire nothing while holding it.
 - **Migration:** snapshot objects are moved in and re-hashed; mismatches are kept and reported;
   resumable.
 - `plugins/blobs` stays separate (a per-plugin key-value store, not content-addressed).

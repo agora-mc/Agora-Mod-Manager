@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use agora_game_api::{
     BaseMode, BaseReference, GameId, InstallId, Layer, LayerId, LayerSource, LayerStack,
@@ -113,13 +114,19 @@ fn snapshot_move_race(restore: bool) {
         ctx.paths.recently_deleted_games_root()
     };
     let fired = AtomicBool::new(false);
-    snapshot::delete_snapshot_with(&a, &first.id, |dir| {
-        let entries = snapshot::list_snapshot_scan_dir(dir);
-        if dir == pause_root && !fired.swap(true, Ordering::SeqCst) {
-            attempt_move(&ctx, entry.as_deref());
-        }
-        entries
-    })
+    let locations = contend(&ctx);
+    snapshot::delete_snapshot_with(
+        &a,
+        &first.id,
+        |dir| {
+            let entries = snapshot::list_snapshot_scan_dir(dir);
+            if dir == pause_root && !fired.swap(true, Ordering::SeqCst) {
+                attempt_move(&ctx, entry.as_deref());
+            }
+            entries
+        },
+        &locations,
+    )
     .unwrap();
     assert!(fired.load(Ordering::SeqCst), "the scan reached the pause");
     assert!(
@@ -479,4 +486,43 @@ fn base_removal_keeps_base_when_state_db_metadata_fails() {
         .unwrap_err()
         .to_string()
         .contains("metadata unavailable"));
+}
+
+fn retention_fixture(ctx: &Ctx) -> PathBuf {
+    let dir = instance(ctx, "retention", None);
+    for i in 0..7 {
+        snapshot::create_snapshot(&dir, Some(&format!("pre-launch-{i}")), &["tracked.txt"])
+            .unwrap();
+    }
+    assert_eq!(snapshot::list_snapshots(&dir).unwrap().len(), 7);
+    dir
+}
+
+#[test]
+fn retention_skips_a_round_when_locations_are_locked() {
+    let (_dir, ctx) = fixture();
+    let instance_dir = retention_fixture(&ctx);
+    let _held = contend(&ctx);
+    crate::lkg::run_retention(&instance_dir).expect("a busy lock skips the round, not an error");
+    assert_eq!(
+        snapshot::list_snapshots(&instance_dir).unwrap().len(),
+        7,
+        "a skipped round deletes nothing"
+    );
+}
+
+#[test]
+fn user_snapshot_delete_waits_for_a_lock_released_within_the_wait() {
+    let (_dir, ctx) = fixture();
+    let instance_dir = instance(&ctx, "waited", None);
+    let snap = snapshot::create_snapshot(&instance_dir, None, &["tracked.txt"]).unwrap();
+    let held = contend(&ctx);
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        drop(held);
+    });
+    snapshot::delete_snapshot(&instance_dir, &snap.id)
+        .expect("a user delete waits briefly instead of failing on a passing collision");
+    releaser.join().unwrap();
+    assert!(snapshot::list_snapshots(&instance_dir).unwrap().is_empty());
 }

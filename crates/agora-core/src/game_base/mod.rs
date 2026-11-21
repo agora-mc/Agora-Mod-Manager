@@ -574,6 +574,60 @@ fn pause_after_rename_if_asked(base_root: &Path) {
     BASE_RENAME_PAUSED.store(false, Ordering::SeqCst);
 }
 
+/// Test seam for the window between the early pinning check of a damaged record and the locked
+/// re-check before its stale folder is replaced. While paused the build holds no lock, so a test
+/// can move an instance into Recently deleted and check that the re-check refuses the rebuild.
+/// Keyed by the base root, like the rename pause, so unrelated builds carry on.
+#[cfg(debug_assertions)]
+static PAUSE_BEFORE_BASE_PIN_RECHECK_AT: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(debug_assertions)]
+static BASE_PIN_RECHECK_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test seam: make the next `build_base` under `base_root` stop after its early pinning check,
+/// until this is called with `None`. Off by default and absent from release builds.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_base_build_pause_before_pin_recheck(base_root: Option<&Path>) {
+    let mut target = PAUSE_BEFORE_BASE_PIN_RECHECK_AT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    *target = base_root.map(Path::to_path_buf);
+    BASE_PIN_RECHECK_PAUSED.store(false, Ordering::SeqCst);
+}
+
+/// Whether a paused build has reached its early pinning check and is waiting.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn base_build_pause_before_pin_recheck_reached() -> bool {
+    BASE_PIN_RECHECK_PAUSED.load(Ordering::SeqCst)
+}
+
+#[cfg(debug_assertions)]
+fn pause_before_pin_recheck_if_asked(base_root: &Path) {
+    let should_pause = PAUSE_BEFORE_BASE_PIN_RECHECK_AT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_deref()
+        == Some(base_root);
+    if !should_pause {
+        return;
+    }
+    BASE_PIN_RECHECK_PAUSED.store(true, Ordering::SeqCst);
+    loop {
+        let still_asked = PAUSE_BEFORE_BASE_PIN_RECHECK_AT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_deref()
+            == Some(base_root);
+        if !still_asked {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    BASE_PIN_RECHECK_PAUSED.store(false, Ordering::SeqCst);
+}
+
 /// The marker Agora writes into a base folder it built, so a rebuild only removes a folder it can
 /// prove is its own.
 const BASE_MARKER_FILE: &str = ".agora-base.json";
@@ -772,6 +826,9 @@ pub fn build_base_with_frameworks(
         )
     });
 
+    #[cfg(debug_assertions)]
+    pause_before_pin_recheck_if_asked(&base_root);
+
     // 3. Linked mode checks
     if mode == BaseMode::Linked {
         let detector = VolumeDetector::new();
@@ -879,7 +936,8 @@ pub fn build_base_with_frameworks(
     // the re-check under it answers a build that finished while this one was hashing.
     let locks_root = paths.locks_root();
     std::fs::create_dir_all(&locks_root)?;
-    let _base_lock = crate::lock_manager::LockManager::new(locks_root)
+    let locks = crate::lock_manager::LockManager::new(locks_root);
+    let _base_lock = locks
         .acquire(
             crate::lock_manager::LockResource::Base(base_id.clone()),
             "build-base",
@@ -892,6 +950,25 @@ pub fn build_base_with_frameworks(
                 return Ok(BuildOutcome::Existing(manifest));
             }
         }
+    }
+
+    // Only the path that replaces a base folder needs the locations lock: take it after Base, and
+    // acquire nothing while holding it. The early check above can be stale by now — an instance
+    // may have moved into Recently deleted while the source was hashed. Under both locks the
+    // answer cannot change, so a base that is still pinned is kept.
+    let _locations = locks
+        .try_instance_locations("build-base")
+        .map_err(|error| {
+            BaseError::Other(format!(
+                "base {base_id} was kept because instance locations are busy: {error}. Retry once the instance move or scan finishes."
+            ))
+        })?;
+    let pinning = instances_pinning_base(paths, &base_id)?;
+    if !pinning.is_empty() {
+        return Err(BaseError::Other(format!(
+            "instance(s) {} still use base {base_id} (including Recently deleted), so it was not replaced. Remove or purge those instances first.",
+            pinning.join(", ")
+        )));
     }
 
     let final_base_dir = base_root.join(&base_id);

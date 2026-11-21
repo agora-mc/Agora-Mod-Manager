@@ -967,6 +967,169 @@ fn a_base_build_holds_its_lock_between_the_rename_and_the_record() {
 }
 
 #[test]
+fn a_rebuild_refuses_when_an_instance_moves_to_trash_before_the_pin_recheck() {
+    use agora_core::ctx::CoreContext;
+    use agora_core::game_instance::{self, DeleteOptions, GameInstanceManifest};
+    use agora_game_api::BaseReference;
+
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("14"));
+    let root = tmp.path().join("AgoraBases");
+    let outcome = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        Some(&root),
+        BuildOptions::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+    let stale = root.join(&base_id);
+    assert!(stale.join(".agora-base.json").is_file());
+
+    // A damaged record makes the next build replace the still-marked stale folder.
+    std::fs::write(paths.base_manifest_path(&base_id), "{ not json").unwrap();
+
+    agora_core::game_base::set_base_build_pause_before_pin_recheck(Some(&root));
+    let build_paths = paths.clone();
+    let build_install = install.clone();
+    let build_root = root.clone();
+    let handle = std::thread::spawn(move || {
+        build_base(
+            &build_paths,
+            &build_install,
+            &test_definition(),
+            BaseMode::Linked,
+            Some(&build_root),
+            BuildOptions::default(),
+            &|_| {},
+        )
+    });
+
+    let mut reached = false;
+    for _ in 0..600 {
+        if agora_core::game_base::base_build_pause_before_pin_recheck_reached() {
+            reached = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !reached {
+        agora_core::game_base::set_base_build_pause_before_pin_recheck(None);
+        panic!(
+            "the build never reached the early pinning check: {:?}",
+            handle.join().unwrap()
+        );
+    }
+
+    // Create a live instance pinned to the base *during* the pause, then move it to Recently
+    // deleted. The early check saw no pinning; the locked re-check must see the trash entry.
+    let ctx = CoreContext::for_testing(tmp.path().join("data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let runtime = match &install.runtime {
+        RuntimeResolution::Identified { runtime, .. } => runtime.clone(),
+        _ => panic!("the fixture install is identified"),
+    };
+    let base_ref = BaseReference::Pinned {
+        id: base_id.clone(),
+        runtime,
+        mode: BaseMode::Linked,
+    };
+    let manifest = GameInstanceManifest::new(
+        GameId::new("skyrim-se").unwrap(),
+        "pinned-instance",
+        "Pinned",
+        None,
+        base_ref.clone(),
+    );
+    let instance_dir = ctx.paths.instance_dir("pinned-instance").unwrap();
+    std::fs::create_dir_all(&instance_dir).unwrap();
+    std::fs::write(
+        instance_dir.join("instance_manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "INSERT INTO game_instances (instance_id, game, name, base_json, created_at)
+         VALUES (?1, ?2, ?1, ?3, datetime('now'))",
+        rusqlite::params![
+            "pinned-instance",
+            manifest.game.as_str(),
+            serde_json::to_string(&base_ref).unwrap()
+        ],
+    )
+    .unwrap();
+
+    game_instance::delete_with_options(
+        &ctx,
+        "pinned-instance",
+        DeleteOptions {
+            force_unreadable_base: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    agora_core::game_base::set_base_build_pause_before_pin_recheck(None);
+    let outcome = handle.join().unwrap();
+    assert!(
+        outcome.is_err(),
+        "the rebuild replaced a base pinned by a deleted instance: {outcome:?}"
+    );
+    assert!(
+        stale.join(".agora-base.json").is_file(),
+        "the stale folder of a still-pinned base is kept"
+    );
+}
+
+#[test]
+fn a_rebuild_refuses_while_instance_locations_are_locked() {
+    use agora_core::lock_manager::{LockManager, LockResource};
+
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("15"));
+    let root = tmp.path().join("AgoraBases");
+    let outcome = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        Some(&root),
+        BuildOptions::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+    std::fs::write(paths.base_manifest_path(&base_id), "{ not json").unwrap();
+
+    let held = LockManager::new(paths.locks_root())
+        .acquire(LockResource::InstanceLocations, "test contender")
+        .unwrap();
+    let result = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        Some(&root),
+        BuildOptions::default(),
+        &|_| {},
+    );
+    drop(held);
+    assert!(
+        result.is_err()
+            && result
+                .unwrap_err()
+                .to_string()
+                .contains("instance-locations"),
+        "a busy locations lock must refuse the rebuild with a retry message"
+    );
+    assert!(root.join(&base_id).join(".agora-base.json").is_file());
+}
+
+#[test]
 fn base_id_parts_never_start_or_end_with_a_dot() {
     for odd in ["1.", ".1", ".", "..", "...", "a..b."] {
         let part = sanitize_base_id_part(odd);

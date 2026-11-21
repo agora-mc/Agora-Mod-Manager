@@ -2867,15 +2867,26 @@ fn list_snapshots_with(
     Ok(snapshots)
 }
 
-/// Delete a snapshot.
+/// Delete a snapshot. A user-requested delete waits briefly for a passing instance move or scan;
+/// if the lock is still busy it refuses, with the holder named in the retry message.
 pub fn delete_snapshot(instance_dir: &Path, snapshot_id: &str) -> Result<(), String> {
-    delete_snapshot_with(instance_dir, snapshot_id, list_snapshot_scan_dir)
+    let locations = lock_snapshot_locations(instance_dir, "snapshot-delete", true)?;
+    delete_snapshot_with(
+        instance_dir,
+        snapshot_id,
+        list_snapshot_scan_dir,
+        &locations,
+    )
 }
 
+/// Delete a snapshot whose caller already holds InstanceLocations. The guard is proof the
+/// non-reentrant lock is held: retention takes it once for a whole round and passes it to every
+/// delete, so no delete tries to take the lock again.
 pub(super) fn delete_snapshot_with(
     instance_dir: &Path,
     snapshot_id: &str,
     list_dir: impl Fn(&Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>>,
+    _locations: &LockGuard,
 ) -> Result<(), String> {
     validate_snapshot_id(snapshot_id)?;
     let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
@@ -2883,8 +2894,6 @@ pub(super) fn delete_snapshot_with(
     if !manifest_path.exists() && !zip_path.exists() {
         return Err(format!("snapshot {snapshot_id} not found"));
     }
-    let _locations = lock_snapshot_locations(instance_dir, "snapshot-delete")?;
-
     let mut blobs = Vec::new();
     if manifest_path.is_file() {
         if let Ok(manifest) = read_manifest_file(&manifest_path, snapshot_id) {
@@ -2934,18 +2943,21 @@ pub(super) fn delete_snapshot_with(
     Ok(())
 }
 
-/// Whether a blob may still be needed by some snapshot.
-///
-/// Fails closed: the object store is shared by every instance, so if any
-/// snapshot directory or manifest cannot be read right now (a sharing
-/// violation and a half-written file look the same), the blob is reported as
-/// referenced and kept. Leaving an orphan blob costs disk space; deleting a
-/// needed one costs a restore point.
-fn lock_snapshot_locations(instance_dir: &Path, operation: &str) -> Result<LockGuard, String> {
+/// Take instance locations for snapshot cleanup. `wait` uses the short bounded wait for operations
+/// where a passing collision should resolve itself; without it a busy lock is refused at once.
+pub(crate) fn lock_snapshot_locations(
+    instance_dir: &Path,
+    operation: &str,
+    wait: bool,
+) -> Result<LockGuard, String> {
     let paths = AppPaths::from_root(snapshot_app_root(instance_dir));
-    LockManager::new(paths.locks_root())
-        .try_instance_locations(operation)
-        .map_err(|error| format!("snapshot cleanup could not lock instance locations: {error}"))
+    let manager = LockManager::new(paths.locks_root());
+    let acquired = if wait {
+        manager.wait_instance_locations(operation)
+    } else {
+        manager.try_instance_locations(operation)
+    };
+    acquired.map_err(|error| format!("snapshot cleanup could not lock instance locations: {error}"))
 }
 
 pub(super) fn list_snapshot_scan_dir(dir: &Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>> {
@@ -2959,6 +2971,13 @@ pub(super) fn list_snapshot_scan_dir(dir: &Path) -> std::io::Result<Vec<std::io:
 /// The reachability scan with its directory listing injected, so a listing
 /// entry that fails can be exercised without depending on the OS to fail on
 /// cue. The caller holds InstanceLocations and production always lists the real filesystem.
+/// Whether a blob may still be needed by some snapshot.
+///
+/// Fails closed: the object store is shared by every instance, so if any
+/// snapshot directory or manifest cannot be read right now (a sharing
+/// violation and a half-written file look the same), the blob is reported as
+/// referenced and kept. Leaving an orphan blob costs disk space; deleting a
+/// needed one costs a restore point.
 fn blob_is_referenced_by_any_snapshot(
     instance_dir: &Path,
     hash: &str,
@@ -3117,7 +3136,7 @@ pub fn prune_unreferenced_objects(instance_dir: &Path) -> Result<(), String> {
     if !root.is_dir() {
         return Ok(());
     }
-    let _locations = lock_snapshot_locations(instance_dir, "snapshot-prune")?;
+    let _locations = lock_snapshot_locations(instance_dir, "snapshot-prune", false)?;
     let prefixes =
         fs::read_dir(&root).map_err(|e| format!("failed to scan snapshot object store: {e}"))?;
     for prefix in prefixes {

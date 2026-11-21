@@ -130,6 +130,10 @@ mod platform {
 /// Default timeout for acquiring a lock (30 seconds).
 const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Short wait for instance locations where a collision is expected to clear quickly: automatic
+/// retention and a user-requested snapshot delete.
+const SHORT_INSTANCE_LOCATIONS_WAIT: Duration = Duration::from_secs(3);
+
 /// First wait between attempts when a lock is contested.
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(10);
 
@@ -472,6 +476,17 @@ impl LockManager {
             LockResource::InstanceLocations,
             operation,
             Duration::ZERO,
+            None,
+        )
+    }
+
+    /// Takes the locations lock with a short bounded wait. Use where a passing collision with an
+    /// instance move or another scan is routine and waiting a few seconds avoids a spurious error.
+    pub fn wait_instance_locations(&self, operation: &str) -> LauncherResult<LockGuard> {
+        self.acquire_with_timeout(
+            LockResource::InstanceLocations,
+            operation,
+            SHORT_INSTANCE_LOCATIONS_WAIT,
             None,
         )
     }
