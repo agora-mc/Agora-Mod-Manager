@@ -1094,13 +1094,14 @@ fn folder_instance_id(dir: &Path, fallback: String) -> String {
         .unwrap_or(fallback)
 }
 
-/// Every snapshot folder under the data root: live instances and the game
-/// instances waiting in Recently deleted (their snapshot store travels with
-/// them, so a restore still needs their content).
+/// Every snapshot folder under the data root: live instances and instances
+/// waiting in either Recently deleted (their snapshot store travels with them,
+/// so a restore still needs their content).
 fn snapshot_folders(ctx: &Ctx) -> Result<Vec<SnapshotFolder>, String> {
     let mut folders = Vec::new();
     let mut roots: Vec<(std::path::PathBuf, bool)> = vec![(ctx.paths.instances_root(), false)];
     roots.push((ctx.paths.recently_deleted_games_root(), true));
+    roots.push((ctx.paths.recently_deleted_root(), true));
     for (root, in_trash) in roots {
         if !root.exists() {
             continue;

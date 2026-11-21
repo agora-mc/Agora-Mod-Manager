@@ -1020,6 +1020,7 @@ struct ScannedInstance {
     item_ids: HashSet<String>,
 }
 
+#[derive(Default)]
 struct InstanceScan {
     instances: Vec<ScannedInstance>,
     warnings: Vec<String>,
@@ -1143,8 +1144,40 @@ fn scan_instances(ctx: &Ctx) -> InstanceScan {
 
     for dir in dirs {
         let manifest_path = dir.join("instance_manifest.json");
-        if !manifest_path.is_file() {
-            continue;
+        // Only a missing manifest means "no instance here". A stat error or a
+        // directory where the manifest should be is can't-tell: the item might
+        // be in use, so removal must refuse.
+        match std::fs::metadata(&manifest_path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                let error = format!("{} is not a readable file", manifest_path.display());
+                scan.warnings.push(format!(
+                    "Instance '{}' could not be read: {error}",
+                    dir.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ));
+                scan.unreadable.push(UnreadableInstanceManifest {
+                    manifest_path: manifest_path.display().to_string(),
+                    error,
+                });
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                let error = error.to_string();
+                scan.warnings.push(format!(
+                    "Instance '{}' could not be read: {error}",
+                    dir.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ));
+                scan.unreadable.push(UnreadableInstanceManifest {
+                    manifest_path: manifest_path.display().to_string(),
+                    error,
+                });
+                continue;
+            }
         }
         let manifest = match read_manifest(&manifest_path) {
             Ok(manifest) => manifest,
@@ -1224,11 +1257,12 @@ fn collect_instance_dirs(
     dirs: &mut Vec<PathBuf>,
     scan: &mut InstanceScan,
 ) {
-    if !root.exists() {
-        return;
-    }
+    // Only "not found" means there are no instances here. Every other listing
+    // error is can't-tell and is recorded so removal refuses, not a silent
+    // "nothing uses this item".
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
         Err(error) => {
             let message = format!("Instances could not be listed: {error}");
             scan.warnings.push(message.clone());
@@ -1239,17 +1273,100 @@ fn collect_instance_dirs(
             return;
         }
     };
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
+    collect_instance_entries(
+        entries.map(|entry| entry.map(|entry| entry.path())),
+        root,
+        subdir,
+        dirs,
+        scan,
+    );
+}
+
+/// Apply one instance-folder listing. The listing is injected so a per-entry
+/// read failure can be exercised without depending on the OS to fail on cue.
+fn collect_instance_entries(
+    entries: impl Iterator<Item = std::io::Result<PathBuf>>,
+    root: &Path,
+    subdir: Option<&str>,
+    dirs: &mut Vec<PathBuf>,
+    scan: &mut InstanceScan,
+) {
+    for entry in entries {
+        let dir = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                let message = format!("An instance entry could not be listed: {error}");
+                scan.warnings.push(message.clone());
+                scan.unreadable.push(UnreadableInstanceManifest {
+                    manifest_path: root.display().to_string(),
+                    error: message,
+                });
+                continue;
+            }
+        };
+        match std::fs::metadata(&dir) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue, // a file beside the instance folders
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                let message = format!("An instance entry could not be inspected: {error}");
+                scan.warnings.push(message.clone());
+                scan.unreadable.push(UnreadableInstanceManifest {
+                    manifest_path: dir.display().to_string(),
+                    error: message,
+                });
+                continue;
+            }
         }
         let dir = match subdir {
             Some(subdir) => dir.join(subdir),
             None => dir,
         };
-        if dir.is_dir() {
-            dirs.push(dir);
+        match std::fs::metadata(&dir) {
+            Ok(metadata) if metadata.is_dir() => dirs.push(dir),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let message = format!("An instance folder could not be inspected: {error}");
+                scan.warnings.push(message.clone());
+                scan.unreadable.push(UnreadableInstanceManifest {
+                    manifest_path: dir.display().to_string(),
+                    error: message,
+                });
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A single `DirEntry` that cannot be read must make the whole instance
+    /// scan inconclusive: removal then refuses instead of deleting an object
+    /// that instance might use.
+    #[test]
+    fn review_an_unreadable_instance_entry_blocks_removal() {
+        let mut scan = InstanceScan::default();
+        let mut dirs = Vec::new();
+        collect_instance_entries(
+            vec![Err(std::io::Error::other("cannot list instance entry"))].into_iter(),
+            Path::new("instances"),
+            None,
+            &mut dirs,
+            &mut scan,
+        );
+        assert!(dirs.is_empty());
+        assert!(
+            !scan.unreadable.is_empty(),
+            "an unreadable entry must be recorded so removal refuses"
+        );
+        assert!(
+            scan.warnings
+                .iter()
+                .any(|warning| warning.contains("cannot list")),
+            "the reason is reported: {:?}",
+            scan.warnings
+        );
     }
 }
