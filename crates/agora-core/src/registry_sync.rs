@@ -14,10 +14,9 @@ use crate::registry_bundle::{
     RegistryTrust, VerifiedBundle,
 };
 use chrono::{DateTime, Datelike, Utc};
-use ed25519_dalek::{Signature, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -126,7 +125,7 @@ pub async fn check_and_download_update(
     lock_manager: &LockManager,
 ) -> LauncherResult<RegistryStatus> {
     let transport = GitHubTransport;
-    let trust = effective_trust(app_data_dir, &RegistryTrust::production());
+    let trust = effective_trust(app_data_dir, &RegistryTrust::production())?;
     check_and_download_update_inner(
         app_data_dir,
         local_state_path,
@@ -166,7 +165,7 @@ pub fn install_bundle_from_file(
     bundle_path: &Path,
     lock_manager: &LockManager,
 ) -> LauncherResult<InstalledBundle> {
-    let trust = effective_trust(app_data_dir, &RegistryTrust::production());
+    let trust = effective_trust(app_data_dir, &RegistryTrust::production())?;
     install_bundle_from_file_with_trust(
         app_data_dir,
         local_state_path,
@@ -619,153 +618,164 @@ fn parse_role(raw: &str) -> Option<RegistryKeyRole> {
     }
 }
 
-fn load_remembered_trust(app_data_dir: &Path, base: &RegistryTrust) -> RememberedTrust {
-    let path = match paths::registry_trust_state_path(app_data_dir) {
-        Ok(path) => path,
-        Err(_) => return RememberedTrust::default(),
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        // Missing or unreadable: the compiled keys are the whole trust set.
-        // No key introduced by certificate is trusted in this state.
-        return RememberedTrust::default();
-    };
-
-    let mut trusted: BTreeMap<String, ed25519_dalek::VerifyingKey> = BTreeMap::new();
-    let mut roles: BTreeMap<String, RegistryKeyRole> = BTreeMap::new();
-    let mut revoked: BTreeSet<String> = base.revoked_ids().into_iter().collect();
-    for key in base.keys() {
-        if revoked.contains(&key.id) {
-            continue;
-        }
-        if let Some(verifying) = verifying_key_hex(&key.public_key_hex) {
-            trusted.insert(key.id.clone(), verifying);
-            roles.insert(key.id.clone(), key.role);
-        }
-    }
-
-    let mut remembered_keys: Vec<RegistryKey> = Vec::new();
-    let mut remembered_revocations: Vec<KeyRevocation> = Vec::new();
-    for line in text.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        match fields.as_slice() {
-            ["v1", "key", id, public_key, role, signed_by, signature] => {
-                let Some(role) = parse_role(role) else {
-                    continue;
-                };
-                let certificate = KeyCertificate {
-                    key_id: (*id).to_string(),
-                    public_key: (*public_key).to_string(),
-                    role,
-                    signed_by: (*signed_by).to_string(),
-                    signature: (*signature).to_string(),
-                };
-                // Revocations win: a revoked id cannot be introduced again.
-                if revoked.contains(&certificate.key_id) {
-                    continue;
-                }
-                let Some(signer) = trusted.get(&certificate.signed_by).copied() else {
-                    continue;
-                };
-                if roles.get(&certificate.signed_by) != Some(&RegistryKeyRole::Recovery) {
-                    continue;
-                }
-                if revoked.contains(&certificate.signed_by) {
-                    continue;
-                }
-                if registry_bundle::key_id_for_public_key(&certificate.public_key)
-                    != certificate.key_id
-                {
-                    continue;
-                }
-                let Some(signature) = decode_hex_signature(&certificate.signature) else {
-                    continue;
-                };
-                use ed25519_dalek::Verifier;
-                let message = KeyCertificate::signed_bytes(
-                    &certificate.key_id,
-                    &certificate.public_key,
-                    certificate.role,
-                    &certificate.signed_by,
-                );
-                if signer.verify(&message, &signature).is_err() {
-                    continue;
-                }
-                let Some(verifying) = verifying_key_hex(&certificate.public_key) else {
-                    continue;
-                };
-                trusted.insert(certificate.key_id.clone(), verifying);
-                roles.insert(certificate.key_id.clone(), certificate.role);
-                remembered_keys.push(
-                    RegistryKey::from_hex(certificate.public_key.clone())
-                        .with_role(certificate.role),
-                );
-            }
-            ["v1", "revoke", revoked_id, signed_by, signature] => {
-                if revoked_id == signed_by {
-                    continue;
-                }
-                let Some(signer) = trusted.get(*signed_by).copied() else {
-                    continue;
-                };
-                if roles.get(*signed_by) != Some(&RegistryKeyRole::Recovery) {
-                    continue;
-                }
-                if revoked.contains(*signed_by) {
-                    continue;
-                }
-                let Some(decoded) = decode_hex_signature(signature) else {
-                    continue;
-                };
-                use ed25519_dalek::Verifier;
-                let message = KeyRevocation::signed_bytes(revoked_id, signed_by);
-                if signer.verify(&message, &decoded).is_err() {
-                    continue;
-                }
-                revoked.insert((*revoked_id).to_string());
-                trusted.remove(*revoked_id);
-                roles.remove(*revoked_id);
-                remembered_revocations.push(KeyRevocation {
-                    revoked_key_id: (*revoked_id).to_string(),
-                    signed_by: (*signed_by).to_string(),
-                    signature: (*signature).to_string(),
-                });
-            }
-            // A truncated line, an older version, or junk: ignore it.
-            _ => {}
-        }
-    }
-
-    RememberedTrust {
-        keys: remembered_keys,
-        revocations: remembered_revocations,
+fn trust_state_error(path: &Path, what: &str) -> LauncherError {
+    LauncherError::Generic {
+        code: "ERR_REGISTRY_TRUST_STATE".into(),
+        message: format!(
+            "The remembered catalog trust state {what}. The catalog will not be opened on a \
+             weaker set of keys; to forget what was remembered and trust only the keys built \
+             into Agora, remove `{}` yourself.",
+            path.display()
+        ),
     }
 }
 
-/// Compiled keys plus what this client remembered, minus what it remembered as
-/// revoked.
-fn effective_trust(app_data_dir: &Path, base: &RegistryTrust) -> RegistryTrust {
-    let remembered = load_remembered_trust(app_data_dir, base);
-    let mut trust = base.clone();
-    trust.merge_remembered(remembered.keys, remembered.revocations);
-    trust
-}
-
-/// A trust state that exists but cannot be read is not an empty trust state:
-/// it may hold revocations we are ignoring. Refuse trust decisions in that case
-/// rather than treating forgotten revocations as no revocations.
-fn remembered_trust_readable(app_data_dir: &Path) -> LauncherResult<()> {
+/// Read and authenticate the trust log.
+///
+/// One rule for every line: a statement counts when its signature chain
+/// authenticates from the base keys, regardless of line order and regardless of
+/// whether a later statement revokes its signer. Enforcement is separate:
+/// every authenticated revocation is in force, and a key survives only if
+/// nothing in its certificate chain is revoked. A missing file is "nothing
+/// remembered yet". A file that cannot be read, or a statement that does not
+/// authenticate, is an error: only a torn final line (no trailing newline) that
+/// does not parse or authenticate is dropped.
+fn load_remembered_trust(
+    app_data_dir: &Path,
+    base: &RegistryTrust,
+) -> LauncherResult<RememberedTrust> {
     let path =
         paths::registry_trust_state_path(app_data_dir).map_err(|_| LauncherError::Generic {
             code: "ERR_REGISTRY_TRUST_STATE".into(),
             message: "Could not resolve the catalog trust state path.".into(),
         })?;
-    if path.exists() && std::fs::read_to_string(&path).is_err() {
-        return Err(LauncherError::Generic {
-            code: "ERR_REGISTRY_TRUST_STATE".into(),
-            message: "The remembered catalog trust state could not be read.".into(),
-        });
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RememberedTrust::default())
+        }
+        Err(error) => {
+            return Err(trust_state_error(
+                &path,
+                &format!("could not be read ({error})"),
+            ))
+        }
+    };
+
+    // Each statement with whether it is the unterminated final line.
+    let mut certificates: Vec<(KeyCertificate, bool)> = Vec::new();
+    let mut revocations: Vec<(KeyRevocation, bool)> = Vec::new();
+    let unterminated = !text.ends_with('\n');
+    let line_count = text.lines().count();
+    for (index, line) in text.lines().enumerate() {
+        let tail = unterminated && index + 1 == line_count;
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        match fields.as_slice() {
+            ["v1", "key", id, public_key, role, signed_by, signature] => match parse_role(role) {
+                Some(role) => certificates.push((
+                    KeyCertificate {
+                        key_id: (*id).to_string(),
+                        public_key: (*public_key).to_string(),
+                        role,
+                        signed_by: (*signed_by).to_string(),
+                        signature: (*signature).to_string(),
+                    },
+                    tail,
+                )),
+                None if tail => {}
+                None => {
+                    return Err(trust_state_error(
+                        &path,
+                        &format!("has a key line with an unknown role on line {}", index + 1),
+                    ))
+                }
+            },
+            ["v1", "revoke", revoked_id, signed_by, signature] => revocations.push((
+                KeyRevocation {
+                    revoked_key_id: (*revoked_id).to_string(),
+                    signed_by: (*signed_by).to_string(),
+                    signature: (*signature).to_string(),
+                },
+                tail,
+            )),
+            ["v1", "key" | "revoke", ..] if !tail => {
+                return Err(trust_state_error(
+                    &path,
+                    &format!("has a malformed statement on line {}", index + 1),
+                ))
+            }
+            // A torn final line, another version, or junk: ignore it.
+            _ => {}
+        }
     }
-    Ok(())
+
+    let all_certificates: Vec<KeyCertificate> = certificates
+        .iter()
+        .map(|(statement, _)| statement.clone())
+        .collect();
+    let all_revocations: Vec<KeyRevocation> = revocations
+        .iter()
+        .map(|(statement, _)| statement.clone())
+        .collect();
+    let authenticated =
+        registry_bundle::authenticate_statements(base, &all_certificates, &all_revocations);
+    let base_revoked: BTreeSet<String> = base.revoked_ids().into_iter().collect();
+
+    for (certificate, tail) in &certificates {
+        let explained = authenticated.certificates.contains(certificate)
+            || base_revoked.contains(&certificate.key_id)
+            || base.keys().iter().any(|key| key.id == certificate.key_id);
+        if !explained && !tail {
+            return Err(trust_state_error(
+                &path,
+                &format!(
+                    "holds a key statement for {} that cannot be authenticated",
+                    certificate.key_id
+                ),
+            ));
+        }
+    }
+    for (revocation, tail) in &revocations {
+        let explained = authenticated.revocations.contains(revocation)
+            || base_revoked.contains(&revocation.revoked_key_id);
+        if !explained && !tail {
+            return Err(trust_state_error(
+                &path,
+                &format!(
+                    "holds a revocation of {} that cannot be authenticated",
+                    revocation.revoked_key_id
+                ),
+            ));
+        }
+    }
+
+    let mut revoked = base_revoked;
+    revoked.extend(
+        authenticated
+            .revocations
+            .iter()
+            .map(|revocation| revocation.revoked_key_id.clone()),
+    );
+    let keys = registry_bundle::surviving_certificates(base, &authenticated.certificates, &revoked)
+        .into_iter()
+        .map(|certificate| {
+            RegistryKey::from_hex(certificate.public_key).with_role(certificate.role)
+        })
+        .collect();
+    Ok(RememberedTrust {
+        keys,
+        revocations: authenticated.revocations,
+    })
+}
+
+/// Compiled keys plus what this client remembered, minus what it remembered as
+/// revoked. An unreadable or unauthenticatable trust log is an error, never a
+/// quiet fall back to the compiled keys.
+fn effective_trust(app_data_dir: &Path, base: &RegistryTrust) -> LauncherResult<RegistryTrust> {
+    let remembered = load_remembered_trust(app_data_dir, base)?;
+    let mut trust = base.clone();
+    trust.merge_remembered(remembered.keys, remembered.revocations);
+    Ok(trust)
 }
 
 /// The durable rollback floor: the highest signed build stamp ever committed,
@@ -1019,18 +1029,6 @@ fn remember_bundle_trust(app_data_dir: &Path, verified: &VerifiedBundle) -> Laun
         .map(|()| true)
 }
 
-fn verifying_key_hex(public_key_hex: &str) -> Option<ed25519_dalek::VerifyingKey> {
-    let bytes = hex::decode(public_key_hex.trim()).ok()?;
-    let array: [u8; PUBLIC_KEY_LENGTH] = bytes.try_into().ok()?;
-    ed25519_dalek::VerifyingKey::from_bytes(&array).ok()
-}
-
-fn decode_hex_signature(raw: &str) -> Option<Signature> {
-    let bytes = hex::decode(raw.trim()).ok()?;
-    let array: [u8; SIGNATURE_LENGTH] = bytes.try_into().ok()?;
-    Some(Signature::from_bytes(&array))
-}
-
 /// One bundle header that verified in this process, with the file identity it
 /// was read from. Re-reading and re-verifying a multi-megabyte bundle for every
 /// catalog read would be wasteful; the database itself is still hashed on every
@@ -1056,6 +1054,9 @@ fn trust_fingerprint(trust: &RegistryTrust) -> String {
 enum BundleLoadError {
     Io(std::io::Error),
     Bundle(BundleError),
+    /// The remembered trust log could not be read or authenticated. Not a fault
+    /// of the bundle, so it never causes a quarantine.
+    Trust(LauncherError),
 }
 
 impl std::fmt::Display for BundleLoadError {
@@ -1063,13 +1064,14 @@ impl std::fmt::Display for BundleLoadError {
         match self {
             Self::Io(error) => write!(f, "it could not be read ({error})"),
             Self::Bundle(error) => write!(f, "{error}"),
+            Self::Trust(error) => write!(f, "{error}"),
         }
     }
 }
 
 fn load_header(path: &Path, trust: &RegistryTrust) -> Result<CatalogHeader, BundleLoadError> {
     let app_data_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let trust = effective_trust(app_data_dir, trust);
+    let trust = effective_trust(app_data_dir, trust).map_err(BundleLoadError::Trust)?;
     let metadata = std::fs::metadata(path).map_err(BundleLoadError::Io)?;
     let fingerprint = trust_fingerprint(&trust);
     if let Ok(cache) = header_cache().lock() {
@@ -1101,7 +1103,7 @@ fn load_header(path: &Path, trust: &RegistryTrust) -> Result<CatalogHeader, Bund
 
 fn load_payload(path: &Path, trust: &RegistryTrust) -> Result<VerifiedBundle, BundleLoadError> {
     let app_data_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let trust = effective_trust(app_data_dir, trust);
+    let trust = effective_trust(app_data_dir, trust).map_err(BundleLoadError::Trust)?;
     let bytes = std::fs::read(path).map_err(BundleLoadError::Io)?;
     registry_bundle::verify_bundle(&bytes, &trust).map_err(BundleLoadError::Bundle)
 }
@@ -1251,11 +1253,13 @@ fn ensure_database(
     let payload = match payload {
         Some(payload) => payload,
         None => {
-            let verified =
-                load_payload(bundle_path, trust).map_err(|error| LauncherError::Generic {
+            let verified = load_payload(bundle_path, trust).map_err(|error| match error {
+                BundleLoadError::Trust(error) => error,
+                error => LauncherError::Generic {
                     code: "ERR_REGISTRY_BUNDLE_INVALID".into(),
                     message: format!("The catalog bundle could not be read: {error}."),
-                })?;
+                },
+            })?;
             owned_payload = verified.payload;
             &owned_payload
         }
@@ -1287,8 +1291,7 @@ fn install_bundle_bytes_checked(
     trust: &RegistryTrust,
     label: &str,
 ) -> LauncherResult<InstalledBundle> {
-    remembered_trust_readable(app_data_dir)?;
-    let trust = effective_trust(app_data_dir, trust);
+    let trust = effective_trust(app_data_dir, trust)?;
     let verified = registry_bundle::verify_bundle(bundle_bytes, &trust).map_err(bundle_error)?;
 
     // Anti-rollback is checked only after the signature, so the stamp being
@@ -1373,8 +1376,7 @@ fn unchanged_candidate(
     bundle_bytes: &[u8],
     trust: &RegistryTrust,
 ) -> LauncherResult<Option<InstalledBundle>> {
-    remembered_trust_readable(app_data_dir)?;
-    let trust = effective_trust(app_data_dir, trust);
+    let trust = effective_trust(app_data_dir, trust)?;
     let verified = registry_bundle::verify_bundle(bundle_bytes, &trust).map_err(bundle_error)?;
     let cached = rollback_baseline(app_data_dir, &trust)?;
     if compare_stamps(
@@ -1454,7 +1456,7 @@ fn install_bundle_bytes(
         paths::registry_bundle_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
     let previous_path = paths::registry_bundle_previous_path(app_data_dir)
         .map_err(|_| LauncherError::RegistryMissing)?;
-    let trust = effective_trust(app_data_dir, trust);
+    let trust = effective_trust(app_data_dir, trust)?;
     let payload = registry_bundle::verify_bundle(bundle_bytes, &trust).map_err(bundle_error)?;
 
     // Capture the pre-existing verified baseline before changing trust: the
@@ -1574,6 +1576,10 @@ fn verify_bundle_file(
         Err(BundleLoadError::Io(error)) => CachedRegistryIntegrity::Error(format!(
             "Cached catalog bundle could not be read ({error}); it will not be used."
         )),
+        // The bundle is not at fault, so it is neither recovered nor moved aside.
+        Err(BundleLoadError::Trust(error)) => CachedRegistryIntegrity::Error(format!(
+            "{error} The catalog will not be used this run."
+        )),
         Err(BundleLoadError::Bundle(error)) => {
             let reason = format!("Cached catalog bundle could not be used: {error}.");
             recover_previous(app_data_dir, bundle_path, trust, reason)
@@ -1593,7 +1599,7 @@ fn recover_previous(
     };
     // Recovery uses the remembered trust as its authority. A trust file that
     // exists but cannot be read is never treated as "no revocations".
-    if remembered_trust_readable(app_data_dir).is_err() {
+    if effective_trust(app_data_dir, trust).is_err() {
         return quarantine_bundle(
             bundle_path,
             format!("{reason} The remembered catalog trust state could not be read."),
@@ -2164,9 +2170,12 @@ fn open_bundle_once(
     bundle_path: &Path,
     trust: &RegistryTrust,
 ) -> LauncherResult<VerifiedRegistry> {
-    let header = load_header(bundle_path, trust).map_err(|error| LauncherError::Generic {
-        code: "ERR_REGISTRY_SIGNATURE_INVALID".into(),
-        message: format!("The catalog bundle could not be used: {error}."),
+    let header = load_header(bundle_path, trust).map_err(|error| match error {
+        BundleLoadError::Trust(error) => error,
+        error => LauncherError::Generic {
+            code: "ERR_REGISTRY_SIGNATURE_INVALID".into(),
+            message: format!("The catalog bundle could not be used: {error}."),
+        },
     })?;
     if below_floor(&header, app_data_dir, trust)? {
         return Err(LauncherError::Generic {
@@ -4612,9 +4621,10 @@ v1 key deadbeef deadbeef deadbeef deadbeef
     }
 
     /// A forged revocation line cannot remove a key: the signer is not a trusted
-    /// recovery key, so load ignores the line.
+    /// recovery key. The log is no longer trustworthy, so the open is refused
+    /// rather than the line quietly skipped.
     #[test]
-    fn a_forged_revocation_line_is_ignored() {
+    fn a_forged_revocation_line_is_refused() {
         let dir = tempfile::TempDir::new().unwrap();
         let primary = test_key(30);
         let recovery = test_key(31);
@@ -4641,8 +4651,8 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         )
         .unwrap();
         assert!(
-            open_verified_registry_with_trust(dir.path(), &trust).is_ok(),
-            "a revocation not signed by a recovery key must not remove the primary"
+            open_verified_registry_with_trust(dir.path(), &trust).is_err(),
+            "a revocation not signed by a recovery key means the log cannot be trusted"
         );
     }
 
@@ -4683,6 +4693,276 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         )
         .unwrap();
         assert!(open_verified_registry_with_trust(dir.path(), &trust).is_ok());
+    }
+
+    fn recovery_certificate(
+        signer: &ed25519_dalek::SigningKey,
+        new_public: &str,
+    ) -> KeyCertificate {
+        use ed25519_dalek::Signer;
+        let signed_by = registry_bundle::key_id_for_public_key(&test_public(signer));
+        let new_id = registry_bundle::key_id_for_public_key(new_public);
+        let message = KeyCertificate::signed_bytes(
+            &new_id,
+            new_public,
+            RegistryKeyRole::Recovery,
+            &signed_by,
+        );
+        KeyCertificate {
+            key_id: new_id,
+            public_key: new_public.to_string(),
+            role: RegistryKeyRole::Recovery,
+            signed_by,
+            signature: hex::encode(signer.sign(&message).to_bytes()),
+        }
+    }
+
+    /// Compiled keys for the rotation tests: one primary, one stolen primary,
+    /// one compiled recovery key.
+    fn rotation_trust(
+        primary: &ed25519_dalek::SigningKey,
+        stolen: &ed25519_dalek::SigningKey,
+        recovery: &ed25519_dalek::SigningKey,
+    ) -> RegistryTrust {
+        RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(recovery)),
+            (RegistryKeyRole::Primary, test_public(primary)),
+            (RegistryKeyRole::Primary, test_public(stolen)),
+        ])
+    }
+
+    /// The open must fail because the signer is no longer trusted, not because
+    /// of a rollback floor or an unreadable log.
+    fn assert_refused_as_untrusted_signer(dir: &Path, trust: &RegistryTrust) {
+        let error = open_verified_registry_with_trust(dir, trust)
+            .err()
+            .expect("a retired signer's bundle must not open");
+        assert_eq!(error.code(), "ERR_REGISTRY_SIGNATURE_INVALID", "{error:?}");
+    }
+
+    /// One bundle introduces a recovery key, uses it to revoke the stolen
+    /// primary, and then retires it. The remembered log must still enforce the
+    /// stolen-key revocation after a reload, however the bundle orders them.
+    #[test]
+    fn a_revocation_survives_its_signer_being_revoked_in_the_same_bundle() {
+        for reversed in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let primary = test_key(140);
+            let stolen = test_key(141);
+            let recovery = test_key(142);
+            let second_recovery = test_key(143);
+            let trust = rotation_trust(&primary, &stolen, &recovery);
+            let payload = sample_db();
+            let mut header = fresh_header(&primary, &payload);
+            header.certificates.push(recovery_certificate(
+                &recovery,
+                &test_public(&second_recovery),
+            ));
+            header
+                .revocations
+                .push(revocation(&second_recovery, &stolen));
+            header
+                .revocations
+                .push(revocation(&recovery, &second_recovery));
+            if reversed {
+                header.revocations.reverse();
+            }
+            let bundle = signed_bundle(&primary, &header, &payload);
+            install_bundle_bytes_checked(dir.path(), &bundle, &trust, "rotation").unwrap();
+
+            // A reload: the stolen key must stay retired.
+            let stale = fresh_header(&stolen, &payload);
+            fs::write(
+                paths::registry_bundle_path(dir.path()).unwrap(),
+                signed_bundle(&stolen, &stale, &payload),
+            )
+            .unwrap();
+            assert_refused_as_untrusted_signer(dir.path(), &trust);
+            let reloaded = effective_trust(dir.path(), &trust).unwrap();
+            let revoked = reloaded.revoked_ids();
+            for key in [&stolen, &second_recovery] {
+                assert!(
+                    revoked.contains(&registry_bundle::key_id_for_public_key(&test_public(key))),
+                    "both revocations are enforced after a reload (reversed: {reversed})"
+                );
+            }
+        }
+    }
+
+    /// The log's order is not a security fact: a revocation line written before
+    /// the line that introduces its signer still counts.
+    #[test]
+    fn the_order_of_remembered_lines_does_not_change_what_they_mean() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = test_key(144);
+        let stolen = test_key(145);
+        let recovery = test_key(146);
+        let second_recovery = test_key(147);
+        let trust = rotation_trust(&primary, &stolen, &recovery);
+        let cert = recovery_certificate(&recovery, &test_public(&second_recovery));
+        let by_second = revocation(&second_recovery, &stolen);
+        fs::write(
+            paths::registry_trust_state_path(dir.path()).unwrap(),
+            format!(
+                "v1 revoke {} {} {}\nv1 key {} {} recovery {} {}\n",
+                by_second.revoked_key_id,
+                by_second.signed_by,
+                by_second.signature,
+                cert.key_id,
+                cert.public_key,
+                cert.signed_by,
+                cert.signature
+            ),
+        )
+        .unwrap();
+        let payload = sample_db();
+        let stale = fresh_header(&stolen, &payload);
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            signed_bundle(&stolen, &stale, &payload),
+        )
+        .unwrap();
+        assert_refused_as_untrusted_signer(dir.path(), &trust);
+    }
+
+    /// A trust log that cannot be read is an error on an ordinary open, not a
+    /// quiet fall back to the compiled keys, and it does not quarantine a good
+    /// bundle.
+    #[test]
+    fn an_unreadable_trust_log_refuses_an_ordinary_open_without_quarantining() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = test_key(148);
+        let trust = RegistryTrust::with_key(test_public(&primary));
+        let payload = sample_db();
+        let header = fresh_header(&primary, &payload);
+        let bundle_path = paths::registry_bundle_path(dir.path()).unwrap();
+        fs::write(&bundle_path, signed_bundle(&primary, &header, &payload)).unwrap();
+        fs::create_dir_all(paths::registry_trust_state_path(dir.path()).unwrap()).unwrap();
+
+        let error = open_verified_registry_with_trust(dir.path(), &trust)
+            .err()
+            .expect("an unreadable trust log must not open the catalog");
+        assert_eq!(error.code(), "ERR_REGISTRY_TRUST_STATE");
+        let integrity = verify_cached_registry_with_trust(dir.path(), &trust);
+        assert!(
+            matches!(integrity, CachedRegistryIntegrity::Error(_)),
+            "{integrity:?}"
+        );
+        assert!(
+            bundle_path.exists(),
+            "a good bundle must not be moved aside"
+        );
+    }
+
+    /// A statement line that cannot be authenticated is an error, not an ignored
+    /// line; removing the log is the user's way to start over.
+    #[test]
+    fn an_unauthenticatable_trust_line_refuses_an_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = test_key(149);
+        let recovery = test_key(150);
+        let attacker = test_key(151);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&primary)),
+        ]);
+        let forged = revocation(&attacker, &primary);
+        let trust_path = paths::registry_trust_state_path(dir.path()).unwrap();
+        fs::write(
+            &trust_path,
+            format!(
+                "v1 revoke {} {} {}\n",
+                forged.revoked_key_id, forged.signed_by, forged.signature
+            ),
+        )
+        .unwrap();
+        let payload = sample_db();
+        let header = fresh_header(&primary, &payload);
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            signed_bundle(&primary, &header, &payload),
+        )
+        .unwrap();
+        let error = open_verified_registry_with_trust(dir.path(), &trust)
+            .err()
+            .expect("an unauthenticatable log must not open the catalog");
+        assert_eq!(error.code(), "ERR_REGISTRY_TRUST_STATE");
+
+        fs::remove_file(&trust_path).unwrap();
+        assert!(open_verified_registry_with_trust(dir.path(), &trust).is_ok());
+    }
+
+    /// One rule for chains: revoking a recovery key also retires every key it
+    /// certified, including keys remembered from an earlier bundle.
+    #[test]
+    fn revoking_a_signer_retires_the_keys_it_certified_after_a_reload() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = test_key(152);
+        let stolen = test_key(153);
+        let recovery = test_key(154);
+        let second_recovery = test_key(155);
+        let child = test_key(156);
+        let trust = rotation_trust(&primary, &stolen, &recovery);
+        let payload = sample_db();
+
+        let mut first = fresh_header(&primary, &payload);
+        first.certificates.push(recovery_certificate(
+            &recovery,
+            &test_public(&second_recovery),
+        ));
+        first
+            .certificates
+            .push(certificate(&second_recovery, &test_public(&child)));
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&primary, &first, &payload),
+            &trust,
+            "first",
+        )
+        .unwrap();
+        let child_bundle = signed_bundle(&child, &fresh_header(&child, &payload), &payload);
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            &child_bundle,
+        )
+        .unwrap();
+        assert!(
+            open_verified_registry_with_trust(dir.path(), &trust).is_ok(),
+            "the certified child is trusted until its signer is revoked"
+        );
+
+        let newer = sample_db_with_built_at("2026-11-18T12:00:00+00:00");
+        let mut second = header_for(
+            &primary,
+            &newer,
+            "2026-11-18T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        second
+            .revocations
+            .push(revocation(&recovery, &second_recovery));
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&primary, &second, &newer),
+            &trust,
+            "second",
+        )
+        .unwrap();
+
+        // Newer than the floor, so only the signer's standing can refuse it.
+        let later = sample_db_with_built_at("2026-11-19T12:00:00+00:00");
+        let later_header = header_for(
+            &child,
+            &later,
+            "2026-11-19T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            signed_bundle(&child, &later_header, &later),
+        )
+        .unwrap();
+        assert_refused_as_untrusted_signer(dir.path(), &trust);
     }
 
     /// The app and the CLI share one data folder. Their staging files must never

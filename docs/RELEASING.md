@@ -359,15 +359,23 @@ Next to the cached bundle the client keeps `registry.trust`, a line log of
 recovery-signed statements: certificates that introduced keys, and revocation
 statements with their signatures. A new entry is written before a verified
 bundle is installed, and the log only grows: a revocation is never removed.
-Every remembered line is re-verified on load against the recovery keys trusted at
-that point, so a forged revocation line is ignored, not obeyed. Every later
-verification starts from the compiled keys plus remembered keys minus
-remembered revocations. A compiled-in key that was revoked stays revoked.
+Every remembered line is re-verified on load by one rule: a statement counts
+when its signature chain authenticates from the compiled keys, whatever the
+order of the lines and whether or not a later statement revokes its signer (a
+recovery key introduced, used to revoke, and itself revoked in one bundle keeps
+its revocations). Authenticated revocations are all enforced, and a key survives
+only if nothing in its certificate chain is revoked, so revoking a recovery key
+also retires every key it certified. Every later verification starts from the
+compiled keys plus surviving remembered keys minus remembered revocations. A
+compiled-in key that was revoked stays revoked.
 
-A missing or unreadable state file falls back to the compiled keys and whatever
-complete lines can still be read (a truncated final line loses only that line).
-No key introduced by certificate is trusted without a valid certificate chain
-from a compiled key, so a garbage or forged state file cannot widen trust.
+A missing state file means nothing is remembered yet. A state file that cannot
+be read, or holds a statement that does not authenticate, is an error
+(`ERR_REGISTRY_TRUST_STATE`): the catalog is not opened and a good bundle is not
+quarantined, rather than falling back to a weaker set of keys. The only
+exception is a torn final line (no trailing newline) that does not parse or
+authenticate. To start over, remove `registry.trust` yourself; Agora then trusts
+only its compiled keys.
 
 ### Rotating a key
 
