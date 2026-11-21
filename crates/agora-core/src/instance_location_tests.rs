@@ -3,11 +3,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use agora_game_api::{BaseReference, GameId, InstallId, Layer, LayerId, LayerSource, LayerStack};
+use agora_game_api::{
+    BaseMode, BaseReference, GameId, InstallId, Layer, LayerId, LayerSource, LayerStack,
+    RuntimeIdentity,
+};
 use sha2::{Digest, Sha256};
 
 use crate::content_store::{self, ContentError};
 use crate::ctx::Ctx;
+use crate::game_base::{self, BaseError};
 use crate::game_instance::{self, trash, GameInstanceManifest};
 use crate::lock_manager::{LockGuard, LockManager, LockResource};
 use crate::snapshot::{self, SnapshotAux, SnapshotOrigin};
@@ -319,4 +323,160 @@ fn generic_purge_keeps_entry_when_locations_are_locked() {
         .unwrap_err()
         .to_string()
         .contains("instance-locations"));
+}
+
+/// A base with a real record and folder, so removal can only be refused by the pinning check or
+/// the locations lock — never by a malformed fixture.
+fn base_fixture(ctx: &Ctx, tmp: &Path, base_id: &str) -> PathBuf {
+    let folder = ctx.paths.bases_dir().join(base_id);
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("game.exe"), b"base bytes").unwrap();
+    let manifest = serde_json::json!({
+        "manifest_version": 1u32,
+        "base_id": base_id,
+        "runtime": RuntimeIdentity::minecraft("1.0"),
+        "mode": BaseMode::Linked,
+        "source_install": "steam:1",
+        "source_product": "Test Game",
+        "source_location": tmp.join("source"),
+        "location": folder,
+        "created_unix_ms": 0i64,
+        "files": [],
+        "skipped": [],
+    });
+    fs::create_dir_all(ctx.paths.base_manifests_dir()).unwrap();
+    fs::write(
+        ctx.paths.base_manifest_path(base_id),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    folder
+}
+
+fn pinned_instance(ctx: &Ctx, id: &str, base_id: &str) -> PathBuf {
+    let manifest = GameInstanceManifest::new(
+        GameId::new("test-game").unwrap(),
+        id,
+        id,
+        None,
+        BaseReference::Pinned {
+            id: base_id.into(),
+            runtime: RuntimeIdentity::minecraft("1.0"),
+            mode: BaseMode::Linked,
+        },
+    );
+    let dir = ctx.paths.instance_dir(id).unwrap();
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("instance_manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    fs::write(dir.join("tracked.txt"), b"shared snapshot bytes").unwrap();
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "INSERT INTO game_instances (instance_id, game, name, base_json, created_at)
+         VALUES (?1, ?2, ?1, ?3, datetime('now'))",
+        rusqlite::params![
+            id,
+            manifest.game.as_str(),
+            serde_json::to_string(&manifest.base).unwrap()
+        ],
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn base_removal_cannot_race_a_restore_between_pinning_reads() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    pinned_instance(&ctx, "pinned", base_id);
+    let entry = game_instance::delete(&ctx, "pinned")
+        .unwrap()
+        .trash_entry_id
+        .unwrap();
+    let move_ctx = ctx.clone();
+    let fired = AtomicBool::new(false);
+    let removal = game_base::remove_base_with(
+        &ctx.paths,
+        base_id,
+        || {
+            if !fired.swap(true, Ordering::SeqCst) {
+                let restore = trash::restore(&move_ctx, &entry, None);
+                assert!(
+                    restore.is_err(),
+                    "a restore completed while base removal held instance-locations"
+                );
+                assert!(restore
+                    .unwrap_err()
+                    .to_string()
+                    .contains("instance-locations"));
+            }
+        },
+        |path| std::fs::metadata(path),
+    );
+    assert!(fired.load(Ordering::SeqCst), "the pause was reached");
+    assert!(
+        matches!(removal, Err(BaseError::InUse { .. })),
+        "removal must refuse while the trash entry still pins the base: {removal:?}"
+    );
+    assert!(
+        base_dir.join("game.exe").is_file(),
+        "the base survived the race"
+    );
+    assert!(ctx.paths.base_manifest_path(base_id).is_file());
+    assert!(
+        ctx.paths
+            .recently_deleted_games_root()
+            .join(&entry)
+            .join("instance/tracked.txt")
+            .is_file(),
+        "the restore was refused, so the entry is still restorable"
+    );
+}
+
+#[test]
+fn base_removal_refuses_contended_location_lock() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    let _held = contend(&ctx);
+    let removal = game_base::remove_base(&ctx.paths, base_id);
+    assert!(base_dir.is_dir(), "a busy lock must keep the base folder");
+    assert!(ctx.paths.base_manifest_path(base_id).is_file());
+    assert!(removal
+        .unwrap_err()
+        .to_string()
+        .contains("instance-locations"));
+}
+
+#[test]
+fn base_removal_keeps_base_when_state_db_metadata_fails() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    let db = ctx.paths.local_state_db();
+    let removal = game_base::remove_base_with(
+        &ctx.paths,
+        base_id,
+        || {},
+        |path| {
+            if path == db {
+                Err(std::io::Error::other("metadata unavailable"))
+            } else {
+                std::fs::metadata(path)
+            }
+        },
+    );
+    assert!(
+        base_dir.is_dir(),
+        "an unreadable state db must keep the base"
+    );
+    assert!(ctx.paths.base_manifest_path(base_id).is_file());
+    assert!(removal
+        .unwrap_err()
+        .to_string()
+        .contains("metadata unavailable"));
 }
