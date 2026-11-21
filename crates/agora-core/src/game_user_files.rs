@@ -329,13 +329,13 @@ fn resolved_path(path: &Path) -> Option<PathBuf> {
 /// file — or a folder on its way — does not exist yet at swap time; a redirected ancestor changes
 /// this answer either way).
 fn resolved_path_for(path: &Path) -> Option<PathBuf> {
-    if let Some(resolved) = std::fs::canonicalize(path).ok() {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
         return Some(resolved);
     }
     let mut suffix: Vec<std::ffi::OsString> = vec![path.file_name()?.to_os_string()];
     let mut dir = path.parent()?;
     loop {
-        if let Some(resolved) = std::fs::canonicalize(dir).ok() {
+        if let Ok(resolved) = std::fs::canonicalize(dir) {
             let mut out = resolved;
             for component in suffix.iter().rev() {
                 out.push(component);
@@ -1660,53 +1660,52 @@ fn restore_journal_internal(
         // files: if the instance copy is a link to the real file (or a hard link to it), both
         // sides read the same changed bytes, and putting the backup over the shared target
         // would lose the edit, so that is a needs-a-hand case too.
-        if !file.restored && file_state(file) == FileState::Swapped {
-            if !real_is_original && !real_matches_backup {
-                let real_changed = real_hash
-                    .as_deref()
-                    .is_some_and(|hash| hash != file.written_sha256.as_str());
-                let instance_hash = std::fs::read(&derived_instance_copy)
-                    .ok()
-                    .map(|bytes| hash_bytes(&bytes));
-                let instance_changed = instance_hash
-                    .as_deref()
-                    .is_some_and(|hash| hash != file.written_sha256.as_str());
-                if real_changed
-                    && instance_changed
-                    && (real_hash != instance_hash
-                        || !provably_distinct_files(&file.real_path, &derived_instance_copy))
-                {
-                    let real_bytes = real_bytes.expect("read changed bytes above");
-                    let real_hash = real_hash.expect("hashed above");
-                    let conflict_path = derived_instance_copy.with_file_name(format!(
-                        "{}.agora-conflict-{}",
-                        derived_instance_copy
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("file"),
-                        &real_hash[..8]
-                    ));
-                    if let Some(parent) = conflict_path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    write_user_file(&conflict_path, &real_bytes)?;
-                    // The explicit restore command's override (`--force`) writes the conflict
-                    // copy first (done above) and then restores; automatic recovery never does.
-                    if !force {
-                        return Err(UserFilesError::Other(format!(
-                            "the user file '{}' and the instance's copy '{}' both changed since \
-                             the swap, so neither was overwritten: the real file's current bytes \
-                             were kept as '{}'. Check both by hand, then put the files back \
-                             with `{}`",
-                            file.real_path.display(),
-                            derived_instance_copy.display(),
-                            conflict_path.display(),
-                            restore_instruction_forced(
-                                journal.game.as_str(),
-                                journal.store.as_str()
-                            )
-                        )));
-                    }
+        if !file.restored
+            && file_state(file) == FileState::Swapped
+            && !real_is_original
+            && !real_matches_backup
+        {
+            let real_changed = real_hash
+                .as_deref()
+                .is_some_and(|hash| hash != file.written_sha256.as_str());
+            let instance_hash = std::fs::read(&derived_instance_copy)
+                .ok()
+                .map(|bytes| hash_bytes(&bytes));
+            let instance_changed = instance_hash
+                .as_deref()
+                .is_some_and(|hash| hash != file.written_sha256.as_str());
+            if real_changed
+                && instance_changed
+                && (real_hash != instance_hash
+                    || !provably_distinct_files(&file.real_path, &derived_instance_copy))
+            {
+                let real_bytes = real_bytes.expect("read changed bytes above");
+                let real_hash = real_hash.expect("hashed above");
+                let conflict_path = derived_instance_copy.with_file_name(format!(
+                    "{}.agora-conflict-{}",
+                    derived_instance_copy
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("file"),
+                    &real_hash[..8]
+                ));
+                if let Some(parent) = conflict_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                write_user_file(&conflict_path, &real_bytes)?;
+                // The explicit restore command's override (`--force`) writes the conflict
+                // copy first (done above) and then restores; automatic recovery never does.
+                if !force {
+                    return Err(UserFilesError::Other(format!(
+                        "the user file '{}' and the instance's copy '{}' both changed since \
+                         the swap, so neither was overwritten: the real file's current bytes \
+                         were kept as '{}'. Check both by hand, then put the files back \
+                         with `{}`",
+                        file.real_path.display(),
+                        derived_instance_copy.display(),
+                        conflict_path.display(),
+                        restore_instruction_forced(journal.game.as_str(), journal.store.as_str())
+                    )));
                 }
             }
         }

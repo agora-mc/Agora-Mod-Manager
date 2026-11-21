@@ -7569,7 +7569,7 @@ fn arm_fault_at_spawning_mark(fault_path: PathBuf, fired: Arc<Mutex<Vec<swap::Ru
             let fault_path = fault_path.clone();
             let once = Arc::new(std::sync::atomic::AtomicBool::new(true));
             swap::set_write_fault_hook(Some(Arc::new(move |p| {
-                p == &fault_path && once.swap(false, std::sync::atomic::Ordering::SeqCst)
+                *p == fault_path && once.swap(false, std::sync::atomic::Ordering::SeqCst)
             })));
         }
     })));
