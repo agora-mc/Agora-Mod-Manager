@@ -422,16 +422,10 @@ fn resolved_destination(path: &Path, what: &str) -> Result<PathBuf, UserFilesErr
                 Err(_) => match std::fs::symlink_metadata(parent) {
                     // A link (even a dangling one) or a non-directory at the parent means the
                     // parent changed identity: keep everything and report.
-                    Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
-                        Err(cant_tell(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "it is a link or not a folder",
-                        )))
-                    }
-                    Ok(_) => Err(cant_tell(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "it could not be resolved",
-                    ))),
+                    Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => Err(cant_tell(
+                        std::io::Error::other("it is a link or not a folder"),
+                    )),
+                    Ok(_) => Err(cant_tell(std::io::Error::other("it could not be resolved"))),
                     // A genuinely missing parent is normal for a file that never existed: no bytes
                     // will be written there, so the unmodified path is safe to carry forward.
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
