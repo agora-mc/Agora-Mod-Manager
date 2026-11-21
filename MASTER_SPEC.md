@@ -5475,7 +5475,8 @@ before and after.
     (`RelPath`, `FileName`, `validate_path_set`), path comparison (32.3), and reads that distinguish
     absent from can't-tell (32.13).
   - Helpers that need core's state are offered to packages through `GameHost` (the liveness check,
-    archive limits if the reader needs core configuration).
+    the instance guard, archive limits if the reader needs core configuration); A2 adds that host
+    guard contract, and test hooks on `Ctx` follow cloned contexts across threads.
   - Helpers only one package uses live in that package: staged apply lives in
     `agora-game-minecraft` (every writer it replaces is Minecraft code).
   - No new crate, and no budget raise.
@@ -5496,7 +5497,7 @@ before and after.
 
 | Step | Work | Runs |
 |---|---|---|
-| P0 | Live fail-open bugs found in review: snapshot deletion discards a directory-enumeration error while deciding reachability (`snapshot.rs` ~2896); a whitespace-only published digest is read as absent (`artifact_hash.rs` ~110) | first, small |
+| P0 | Live fail-open bugs found in review: snapshot deletion discards a directory-enumeration error while deciding reachability (`snapshot.rs` ~2896), and its reachability scan misses whole instance folders held in trash (`recently_deleted.rs` ~743); a whitespace-only published digest is read as absent (`artifact_hash.rs` ~110) | first, small |
 | A2 | Foundations: fail-closed reads and the one liveness check (32.13); the journal envelope and recovery contract (32.11); the error area enums (32.10); test seams on `Ctx` (32.9); the guards' counts (32.3, 32.10) | alone, after P0 |
 | B1 | Path rules, path comparison, one archive reader (32.3) | parallel with B2 |
 | B2 | One instance model (32.7) | parallel with B1; before B3 and C1 |
@@ -5562,9 +5563,12 @@ mid-install leaves a half-installed instance), a second `ApplyJournal` in `versi
 - **Who uses it:** C1 the install pipeline, the direct installs, `commit_verified_artifact` and
   `version_migration`'s journal. C2 the importers, `agora_pack_import`, `pack_install`,
   `pack_update::apply_merge`, `curated_pack`, `template_service`. **Launcher import** also writes
-  SQLite provenance, so it gets its own whole-folder protocol (stage the folder, commit folder and
-  provenance under one journal) rather than file-level staged apply. The slice lists every writer it
-  found.
+  SQLite provenance, so it gets its own whole-folder protocol: stage the folder, then register it and
+  write provenance together with a job-specific commit receipt in one SQLite transaction; recovery
+  reads the receipt to decide roll back or finish. **Any writer that changes files and SQLite
+  together** (loader migration in `version_migration.rs`, pack merge in `pack_update.rs`, launcher
+  import) uses the same receipt rule, so recovery never pairs old files with new metadata. The slice
+  lists every writer it found.
 - **Tests:** a real writer killed at each persistence boundary, recovered through the normal startup
   pass; a second process starting recovery during a live apply; user-modified files survive.
 - **Guard:** direct file writes under an instance folder outside `staged_apply` are counted.
@@ -5599,9 +5603,13 @@ modules, duplicated triggers.
   `instances`. The detail tables' DDL stays in core's migrations (core holds the schema, as today,
   and no Minecraft logic).
 - **Migration traps, each with a test:**
-  - foreign keys are on, so the table rebuild follows SQLite's procedure (foreign keys off for the
-    rebuild, `foreign_key_check` before commit); dropping `user_instances` must not cascade-delete
+  - foreign keys are on, so the table rebuild follows SQLite's procedure: foreign keys are turned off
+    **before** the migration runner's `BEGIN IMMEDIATE` (the pragma is ignored inside a transaction),
+    and `foreign_key_check` runs before commit; dropping `user_instances` must not cascade-delete
     child rows;
+  - not every instance-keyed row may take a foreign key: pre-registration import jobs and global
+    plugin storage (empty instance id) are valid rows a blanket foreign key would reject; each table is
+    decided individually;
   - the two tables are separate id namespaces: ids are checked for collisions before copying, and a
     collision stops the migration with a report;
   - recently-deleted entries that store `user_instances` rows are rewritten so they still restore;
@@ -5610,7 +5618,8 @@ modules, duplicated triggers.
 - **Core's instance type** carries the identity; Minecraft's detail type lives in its package.
   **Loadouts:** one service in core, each game contributing its sections. **Snapshots:** Minecraft
   declares its tracked folders instead of `TRACKED_ENTRIES`.
-- **Tests:** open an old database with both kinds and recently-deleted entries; delete one instance
+- **Tests:** open an old database with both kinds, both trash formats, pre-registration import jobs and
+  global plugin storage; delete one instance
   and see every dependent row go; restore a recently-deleted one.
 
 ### 32.8 One content store (before release)
@@ -5621,7 +5630,8 @@ Mod files live in `content/objects` with its own sweep, and snapshots keep a sec
 - **Deletion needs proof of reachability,** not just a readable index: an index can read fine and
   still be incomplete. Before the first collection, and whenever the index's generation is older than
   the last migration or recovery, a full reconcile scans every owner (live instances, snapshots,
-  trash, in-flight operations) and rebuilds the references. Collection then deletes only objects with
+  trash, in-flight operations, library items, icons) and rebuilds the references. An interrupted
+  reference publication marks the index stale, so collection cannot resume until a reconcile. Collection then deletes only objects with
   no reference, under the store lock, after a grace period, and deletes nothing if any read fails.
 - **Migration:** snapshot objects are moved in and re-hashed; mismatches are kept and reported;
   resumable.
@@ -5641,6 +5651,9 @@ Mod files live in `content/objects` with its own sweep, and snapshots keep a sec
   - a settings version number in the database, bumped in the same transaction as every settings write;
   - before every network request and every major action, read that one number (a single-row read);
     reload the full settings only when it changed;
+  - the version and the values are read in one snapshot, and a failed refresh denies the network
+    request (it never falls back to the last cached "allowed");
+  - the check repeats before following a redirect;
   - a periodic refresh as a backstop;
   - the network gate reads through this cache instead of opening a connection and loading settings
     per request.
@@ -5663,7 +5676,9 @@ eleven review rounds went.
   lock with no wait, reads and validates the journal under it, checks liveness (32.13), and returns
   either "busy" (a held lock means busy, not necessarily live: report and retry next start), "needs a
   hand" (with the reason), or a **capability scoped to the resources the journal proves it owns**.
-  Recovery handlers can act only through that capability.
+  Recovery handlers can act only through that capability; it holds the same non-reentrant lock for
+  its whole life and is bound to the verified target. A launcher that is already open checks for an
+  unresolved journal after acquiring the lock, before it acts.
 - **A journal envelope** carries what that decision needs: format version, operation id, operation
   kind, the lock key, the writer's process identity, the ownership marker, and a state from **that
   kind's own list of valid states** (a file swap does not inherit process-launch states). The
@@ -5674,8 +5689,8 @@ eleven review rounds went.
 - **Every "needs a hand" result has a way out:** a CLI command and a desktop action to resolve or
   override it, with the risk named, shipped in the same PR as the state that produces it (a refused
   import, conflict archives, quarantine folders, a stale catalog, an unreadable trust log).
-- **`agora doctor` works before the database is initialised,** so it can report a recovery that
-  blocks startup.
+- **`agora doctor` already runs before the database is initialised;** it gains a read-only recovery
+  report (including unreadable import journals), so it can explain a recovery that blocks startup.
 
 ### 32.12 Done means
 - Every guard is in `scripts/check_architecture.py` and passes.
