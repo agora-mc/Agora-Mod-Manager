@@ -2822,6 +2822,10 @@ fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
 /// clears it when it ends.
 static SWAP_SEAM: Mutex<()> = Mutex::new(());
 
+/// The two swap-path spawning-mark tests arm thread-local hooks but share process-wide user-data
+/// and seam settings; run them one at a time so neither observes the other's fixture.
+static SWAP_SPAWN_MARK: Mutex<()> = Mutex::new(());
+
 struct SwapTest {
     _lock: MutexGuard<'static, ()>,
 }
@@ -7580,6 +7584,7 @@ fn arm_fault_at_spawning_mark(fault_path: PathBuf, fired: Arc<Mutex<Vec<swap::Ru
 /// Data back byte for byte, no aside or copy, no journal) and the error is reported.
 #[test]
 fn a_failed_spawning_mark_on_the_swap_path_does_not_launch_the_tool() {
+    let _mark_lock = SWAP_SPAWN_MARK.lock().unwrap_or_else(|e| e.into_inner());
     let _swap = SwapTest::same_volume();
     let _hook_guard = RunHookGuard;
     let _fault_guard = WriteFaultGuard;
@@ -7632,11 +7637,83 @@ fn a_failed_spawning_mark_on_the_swap_path_does_not_launch_the_tool() {
     );
 }
 
+/// The Swap path persists two spawning marks before launching: the swap journal's and the
+/// user-files session's. When the SECOND one cannot be persisted, the run must still fail closed —
+/// no launch, both journals gone and the player's file and real Data put back.
+#[test]
+fn a_failed_user_files_spawning_mark_on_the_swap_path_does_not_launch_the_tool() {
+    let _mark_lock = SWAP_SPAWN_MARK.lock().unwrap_or_else(|e| e.into_inner());
+    let _user_data = UserData::new();
+    let _swap = SwapTest::same_volume();
+    let _hook_guard = RunHookGuard;
+    let _fault_guard = WriteFaultGuard;
+    let f = fixture_with(vec![writes_and_deletes("nemesis")], true, false);
+    let user_root = std::env::var("AGORA_TEST_USER_DATA_ROOT").unwrap();
+    let real = Path::new(&user_root)
+        .join("local")
+        .join("Test Game")
+        .join("Plugins.txt");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(&real, "Player original\n").unwrap();
+    let copy = f.instance_dir().join("user/Plugins.txt");
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::write(&copy, "Instance copy\n").unwrap();
+    let swap_journal = journal_file(&f);
+    let user_journal = f.ctx.paths.user_files_journal_path(GAME, "steam");
+
+    let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let launcher = CountingLauncher {
+        inner: swap_launcher(&f),
+        spawns: Arc::clone(&spawns),
+    };
+    let fired = Arc::new(Mutex::new(Vec::new()));
+    // The first mark (swap journal) succeeds; the second (user-files journal) fails.
+    arm_fault_at_spawning_mark(user_journal.clone(), Arc::clone(&fired));
+
+    let outcome = f.run_as("nemesis", &launcher, CaptureMode::Swap);
+
+    let err =
+        outcome.expect_err("the run must refuse when the user-files mark cannot be persisted");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("user-files journal") && msg.contains("not launched"),
+        "the error must name the second journal and the refusal: {msg}"
+    );
+    assert_eq!(
+        spawns.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the tool was spawned although the user-files mark could not be persisted"
+    );
+    let fired = fired.lock().unwrap().clone();
+    assert!(
+        fired.contains(&swap::RunHookPoint::BeforeSpawningMark),
+        "the pre-spawning-mark window was reached: {fired:?}"
+    );
+    assert!(
+        !fired.contains(&swap::RunHookPoint::AfterSpawnBeforeRecord),
+        "the spawn window was reached: {fired:?}"
+    );
+    assert!(
+        !swap_journal.exists(),
+        "the swap journal is gone after the undo"
+    );
+    assert!(
+        !user_journal.exists(),
+        "the user-files session journal is gone after the undo"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&real).unwrap(),
+        "Player original\n",
+        "the player's file was not put back by the undo"
+    );
+}
+
 /// The same fail-closed rule on the links path: when persisting the spawning mark fails, the
 /// tool is never spawned and the run is undone (deployment discarded, user-files session
 /// released, player's file back).
 #[test]
 fn a_failed_spawning_mark_on_the_links_path_does_not_launch_the_tool() {
+    let _mark_lock = SWAP_SPAWN_MARK.lock().unwrap_or_else(|e| e.into_inner());
     let _user_data = UserData::new();
     let _hook_guard = RunHookGuard;
     let _fault_guard = WriteFaultGuard;
@@ -7695,6 +7772,7 @@ fn a_failed_spawning_mark_on_the_links_path_does_not_launch_the_tool() {
 /// released).
 #[test]
 fn a_failed_spawning_mark_on_the_vfs_path_does_not_launch_the_tool() {
+    let _mark_lock = SWAP_SPAWN_MARK.lock().unwrap_or_else(|e| e.into_inner());
     let _user_data = UserData::new();
     let _hook_guard = RunHookGuard;
     let _fault_guard = WriteFaultGuard;
