@@ -17,7 +17,7 @@
 //! The network and install steps sit behind [`PackBackend`] so the decision
 //! logic can be tested without a network; [`CoreBackend`] is the real one.
 
-use agora_core::artifact_hash::HashOrigin;
+use agora_core::artifact_hash::{blank_asserted_hash, HashOrigin};
 use agora_core::ctx::Ctx;
 use agora_core::db::InstancePackGap;
 use agora_core::error::{HashConfirmation, LauncherError, LauncherResult};
@@ -853,16 +853,20 @@ async fn settle_entry(
 pub fn expected_sha256_for_candidate(
     item: &RegistryItem,
     candidate: &ModVersionCandidate,
-) -> Option<String> {
+) -> LauncherResult<Option<String>> {
     match candidate_strategy_of(item, candidate) {
-        // Hand-pinned: the registry hash is the whole integrity story.
-        "direct_hash" | "technic_pack" => item
-            .sha256
-            .as_deref()
-            .map(str::trim)
-            .filter(|hash| !hash.is_empty())
-            .map(str::to_string),
-        _ => candidate.sha256.clone(),
+        // Hand-pinned: the registry hash is the whole integrity story. A
+        // missing or blank hash is not "no pin" — that would install the file
+        // with no check at all, which is exactly what this strategy promises
+        // not to do.
+        "direct_hash" | "technic_pack" => {
+            let hash = item.sha256.as_deref().unwrap_or("").trim();
+            if hash.is_empty() {
+                return Err(blank_asserted_hash(&item.id, "direct hash sha256"));
+            }
+            Ok(Some(hash.to_string()))
+        }
+        _ => Ok(candidate.sha256.clone()),
     }
 }
 
@@ -1057,22 +1061,26 @@ impl PackBackend for CoreBackend {
         } else {
             item.content_type.clone()
         };
-        Ok(candidates
+        candidates
             .iter()
-            .map(|c| PackCandidate {
-                version: c.version.clone(),
-                filename: c.filename.clone(),
-                download_url: c.download_url.clone(),
-                sha1: c.sha1.clone(),
-                sha512: c.sha512.clone(),
-                expected_sha256: expected_sha256_for_candidate(&item, c),
-                curator_pin: curator_pin_for_pack(&item, c),
-                content_type: content_type.clone(),
-                registry_id: Some(item.id.clone()),
-                modrinth_id: item.modrinth_id.clone(),
-                source: "registry".into(),
+            .map(|c| -> Result<PackCandidate, BackendError> {
+                let expected_sha256 = expected_sha256_for_candidate(&item, c)
+                    .map_err(|error| BackendError::Failed(error.to_string()))?;
+                Ok(PackCandidate {
+                    version: c.version.clone(),
+                    filename: c.filename.clone(),
+                    download_url: c.download_url.clone(),
+                    sha1: c.sha1.clone(),
+                    sha512: c.sha512.clone(),
+                    expected_sha256,
+                    curator_pin: curator_pin_for_pack(&item, c),
+                    content_type: content_type.clone(),
+                    registry_id: Some(item.id.clone()),
+                    modrinth_id: item.modrinth_id.clone(),
+                    source: "registry".into(),
+                })
             })
-            .collect())
+            .collect()
     }
 
     async fn modrinth_versions(
@@ -2446,9 +2454,23 @@ mod tests {
         let sixty_five = format!("{}a", sha256_hex(bytes));
         let sixty_three = sha256_hex(bytes)[1..].to_string();
         let not_hex = "zz".repeat(32);
+        // A blank pack hash is an absent assertion, refused by name rather
+        // than reported as a mismatch against the bytes.
+        for blank in ["", "  "] {
+            for accept in [false, true] {
+                let (ctx, root) = temp_ctx_with_instance();
+                let err =
+                    commit_full(&ctx, bytes, Some(&sha1), Some(blank), None, accept).unwrap_err();
+                assert_eq!(
+                    err.code(),
+                    "ERR_ASSERTED_HASH_BLANK",
+                    "{blank:?} accept={accept}"
+                );
+                assert!(!mod_on_disk(&ctx), "{blank:?} wrote a file");
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
         for bad in [
-            "",
-            "  ",
             "ab",
             not_hex.as_str(),
             sixty_five.as_str(),
@@ -2725,6 +2747,19 @@ mod tests {
                 None,
                 "{strategy}"
             );
+        }
+    }
+
+    #[test]
+    fn review_a_blank_direct_hash_pin_is_refused() {
+        for blank in [None, Some(""), Some("   ")] {
+            let item = catalog_item("direct_hash", blank, None);
+            let error = expected_sha256_for_candidate(&item, &served("direct_hash", None))
+                .expect_err("a hand-pinned item with no hash cannot install unverified");
+            assert_eq!(error.code(), "ERR_ASSERTED_HASH_BLANK", "{blank:?}");
+            let message = error.to_string();
+            assert!(message.contains("oldmod"), "names the item: {message}");
+            assert!(message.contains("sha256"), "names the field: {message}");
         }
     }
 

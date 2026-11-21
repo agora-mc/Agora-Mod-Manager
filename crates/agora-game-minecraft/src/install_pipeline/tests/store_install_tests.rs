@@ -41,6 +41,109 @@ fn ctx_instance(tmp: &tempfile::TempDir, id: &str) -> (Ctx, std::path::PathBuf) 
     (ctx, dir)
 }
 
+#[test]
+fn review_a_blank_curator_pin_is_refused_not_dropped() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, _dir) = ctx_instance(&tmp, "test");
+    let source = write_mod_jar(tmp.path(), "blank-pin", "1.0.0");
+    let bytes = std::fs::read(&source).unwrap();
+    let sha = super::sha256_hex(&bytes);
+    let service = crate::install_service::InstallService::new(ctx.clone());
+    let guard = agora_core::instance_runtime::InstanceGuard::for_mutation(
+        &ctx,
+        "test",
+        "test-blank-curator-pin",
+    )
+    .unwrap();
+
+    let error = service
+        .commit_verified_artifact(
+            &guard,
+            "test",
+            "blank-pin.jar",
+            "mod",
+            "https://example.invalid/blank-pin.jar",
+            None,
+            None,
+            "registry",
+            Some("1.0.0"),
+            None,
+            Some(&sha), // the source published a matching hash
+            None,
+            None,
+            Some("   "), // but the curator's pin is blank
+            false,
+            bytes,
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "ERR_ASSERTED_HASH_BLANK");
+    let message = error.to_string();
+    assert!(
+        message.contains("blank-pin.jar"),
+        "names the item: {message}"
+    );
+    assert!(
+        message.contains("curator pin"),
+        "names the field: {message}"
+    );
+    assert!(
+        read_instance_manifest(&ctx.paths.instance_dir("test").unwrap())
+            .mods
+            .is_empty(),
+        "nothing was installed"
+    );
+}
+
+#[test]
+fn review_a_blank_pack_hash_is_refused_with_a_named_error() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, _dir) = ctx_instance(&tmp, "test");
+    let source = write_mod_jar(tmp.path(), "blank-pack-hash", "1.0.0");
+    let bytes = std::fs::read(&source).unwrap();
+    let sha = super::sha256_hex(&bytes);
+    let service = crate::install_service::InstallService::new(ctx.clone());
+    let guard = agora_core::instance_runtime::InstanceGuard::for_mutation(
+        &ctx,
+        "test",
+        "test-blank-pack-hash",
+    )
+    .unwrap();
+
+    let error = service
+        .commit_verified_artifact(
+            &guard,
+            "test",
+            "blank-pack.jar",
+            "mod",
+            "https://example.invalid/blank-pack.jar",
+            None,
+            None,
+            "registry",
+            Some("1.0.0"),
+            None,
+            Some(&sha),
+            Some("  "), // the pack's hash is blank
+            None,
+            None,
+            false,
+            bytes,
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "ERR_ASSERTED_HASH_BLANK");
+    let message = error.to_string();
+    assert!(
+        message.contains("blank-pack.jar"),
+        "names the item: {message}"
+    );
+    assert!(message.contains("pack hash"), "names the field: {message}");
+    assert!(
+        read_instance_manifest(&ctx.paths.instance_dir("test").unwrap())
+            .mods
+            .is_empty(),
+        "nothing was installed"
+    );
+}
+
 fn read_instance_manifest(dir: &Path) -> InstanceManifest {
     // allow-raw-instance-manifest
     serde_json::from_slice(&std::fs::read(dir.join("instance_manifest.json")).unwrap()).unwrap()

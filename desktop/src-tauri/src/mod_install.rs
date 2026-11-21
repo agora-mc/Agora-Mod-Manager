@@ -205,7 +205,7 @@ pub async fn install_mod_version(
         &item.content_type
     };
     let exp_sha256 =
-        agora_game_minecraft::agora_pack_import::expected_sha256_for_candidate(&item, candidate);
+        agora_game_minecraft::agora_pack_import::expected_sha256_for_candidate(&item, candidate)?;
     let pinned = agora_game_minecraft::resolver::curator_pins_for(&item, candidate)
         .into_iter()
         .next()
