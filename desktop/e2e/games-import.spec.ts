@@ -1002,7 +1002,8 @@ test.describe('Settings recovery', () => {
           error: {
             code: 'user_files_conflict',
             coreCode: 'ERR_USER_FILES_CONFLICT',
-            message: 'both changed since the swap',
+            // Deliberately unlike the old text-matching cue: only the structured code may decide.
+            message: 'The two copies disagree.',
           },
         },
         {
