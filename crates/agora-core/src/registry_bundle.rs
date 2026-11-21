@@ -98,7 +98,12 @@ impl RegistryKey {
 /// catalog (a test convenience; never true in a release build).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryTrust {
+    /// The compiled (or test) keys: the roots every chain starts from.
     keys: Vec<RegistryKey>,
+    /// Certificates remembered from earlier catalogs, each authenticated when
+    /// it was learned. They are evidence, not keys: a remembered key is trusted
+    /// only while its whole chain back to a root is unrevoked.
+    certificates: Vec<KeyCertificate>,
     /// Verified revocation statements remembered from earlier catalogs. This
     /// list only grows.
     revocations: Vec<KeyRevocation>,
@@ -120,6 +125,7 @@ impl RegistryTrust {
             .collect();
         Self {
             keys,
+            certificates: Vec::new(),
             revocations: Vec::new(),
             permit_unsigned_debug: false,
         }
@@ -129,6 +135,7 @@ impl RegistryTrust {
     pub fn with_key(public_key_hex: impl Into<String>) -> Self {
         Self {
             keys: vec![RegistryKey::from_hex(public_key_hex)],
+            certificates: Vec::new(),
             revocations: Vec::new(),
             permit_unsigned_debug: false,
         }
@@ -145,6 +152,7 @@ impl RegistryTrust {
                 .into_iter()
                 .map(|key| RegistryKey::from_hex(key.into()))
                 .collect(),
+            certificates: Vec::new(),
             revocations: Vec::new(),
             permit_unsigned_debug: false,
         }
@@ -161,6 +169,7 @@ impl RegistryTrust {
                 .into_iter()
                 .map(|(role, key)| RegistryKey::from_hex(key.into()).with_role(role))
                 .collect(),
+            certificates: Vec::new(),
             revocations: Vec::new(),
             permit_unsigned_debug: false,
         }
@@ -173,21 +182,23 @@ impl RegistryTrust {
     pub fn unverified_debug() -> Self {
         Self {
             keys: Vec::new(),
+            certificates: Vec::new(),
             revocations: Vec::new(),
             permit_unsigned_debug: cfg!(debug_assertions),
         }
     }
 
-    /// Add keys a verified catalog remembered, and the revocations it taught
-    /// us. Revocations always win over keys.
+    /// Add the certificates and revocations verified catalogs taught us.
+    /// Revocations always win, and a certificate's key is trusted only while
+    /// its chain is unrevoked.
     pub fn merge_remembered(
         &mut self,
-        keys: impl IntoIterator<Item = RegistryKey>,
+        certificates: impl IntoIterator<Item = KeyCertificate>,
         revocations: impl IntoIterator<Item = KeyRevocation>,
     ) {
-        for key in keys {
-            if !self.keys.iter().any(|known| known.id == key.id) {
-                self.keys.push(key);
+        for certificate in certificates {
+            if !self.certificates.contains(&certificate) {
+                self.certificates.push(certificate);
             }
         }
         for revocation in revocations {
@@ -195,6 +206,10 @@ impl RegistryTrust {
                 self.revocations.push(revocation);
             }
         }
+    }
+
+    pub fn certificates(&self) -> &[KeyCertificate] {
+        &self.certificates
     }
 
     pub fn keys(&self) -> &[RegistryKey] {
@@ -224,6 +239,13 @@ impl RegistryTrust {
             .map(|key| format!("{}:{}", key.id, key.role.as_str()))
             .collect();
         ids.sort_unstable();
+        let mut certified: Vec<String> = self
+            .certificates
+            .iter()
+            .map(|certificate| format!("{}:{}", certificate.key_id, certificate.signature))
+            .collect();
+        certified.sort_unstable();
+        ids.extend(certified);
         let mut revoked: Vec<String> = self
             .revocations
             .iter()
@@ -574,9 +596,11 @@ pub fn encode_bundle(
 pub struct VerifiedBundle {
     pub header: CatalogHeader,
     pub payload: Vec<u8>,
-    /// Certificates this verification actually accepted, so the client can
-    /// remember the keys they introduced. A certificate signed by an unknown,
-    /// primary or revoked key is not in this list.
+    /// Certificates this verification authenticated, so the client can
+    /// remember them. A certificate signed by an unknown, primary or
+    /// previously revoked key is not in this list. A certificate whose key or
+    /// signer is revoked by this same bundle is: the log needs it to
+    /// authenticate the revocations that key signed.
     pub newly_trusted: Vec<KeyCertificate>,
     /// Revocations a recovery key signed, to remember with their signatures.
     pub accepted_revocations: Vec<KeyRevocation>,
@@ -585,29 +609,25 @@ pub struct VerifiedBundle {
 /// Verify a bundle against the client's trust set.
 pub fn verify_bundle(bytes: &[u8], trust: &RegistryTrust) -> Result<VerifiedBundle, BundleError> {
     let parsed = parse_bundle(bytes)?;
+    // One rule for every statement in a bundle: it is authenticated by the key
+    // chain as it stood before this bundle's own revocations, so the order of
+    // statements and a signer revoked later in the same bundle change nothing.
+    // Enforcement is separate: once authenticated, a revocation is in force and
+    // the final trust set is rebuilt without the revoked keys (and so without
+    // anything certified through them).
+    let statements = authenticate_statements(
+        trust,
+        &parsed.header.certificates,
+        &parsed.header.revocations,
+    );
     let mut revoked: std::collections::BTreeSet<String> = trust.revoked_ids().into_iter().collect();
-    let mut accepted_revocations: Vec<KeyRevocation> = Vec::new();
-
-    // A revocation is a separately signed statement. Collect every one a
-    // recovery key vouches for, then rebuild trust without the revoked keys.
-    // Revocations only ever grow this set, so the loop terminates.
-    loop {
-        let current = build_trusted(trust, &parsed.header.certificates, &revoked);
-        let mut grew = false;
-        for revocation in &parsed.header.revocations {
-            if verify_revocation(revocation, &current, &revoked) {
-                if revoked.insert(revocation.revoked_key_id.clone()) {
-                    grew = true;
-                }
-                if !accepted_revocations.iter().any(|known| known == revocation) {
-                    accepted_revocations.push(revocation.clone());
-                }
-            }
-        }
-        if !grew {
-            break;
-        }
-    }
+    revoked.extend(
+        statements
+            .revocations
+            .iter()
+            .map(|revocation| revocation.revoked_key_id.clone()),
+    );
+    let accepted_revocations = statements.revocations;
 
     let final_trust = build_trusted(trust, &parsed.header.certificates, &revoked);
     let signing_key = final_trust
@@ -633,9 +653,40 @@ pub fn verify_bundle(bytes: &[u8], trust: &RegistryTrust) -> Result<VerifiedBund
     Ok(VerifiedBundle {
         header: parsed.header,
         payload: parsed.payload.to_vec(),
-        newly_trusted: final_trust.newly_trusted,
+        newly_trusted: statements.certificates,
         accepted_revocations,
     })
+}
+
+/// The statements of one bundle (or of the remembered log) that carry a valid
+/// signature chain, whether or not a later statement revokes their signer.
+pub struct AuthenticatedStatements {
+    pub certificates: Vec<KeyCertificate>,
+    pub revocations: Vec<KeyRevocation>,
+}
+
+/// Authenticate statements against `trust`. Authenticity is the signature
+/// chain from the compiled keys, ignoring revocations made by these same
+/// statements; keys already revoked in `trust` (or certified through a revoked
+/// key) cannot sign anything. Enforcing the revocations is the caller's job:
+/// merge them into the trust, and chains through revoked keys fall away.
+pub fn authenticate_statements(
+    trust: &RegistryTrust,
+    certificates: &[KeyCertificate],
+    revocations: &[KeyRevocation],
+) -> AuthenticatedStatements {
+    let prior: std::collections::BTreeSet<String> = trust.revoked_ids().into_iter().collect();
+    let chain = build_trusted(trust, certificates, &prior);
+    let mut accepted: Vec<KeyRevocation> = Vec::new();
+    for revocation in revocations {
+        if verify_revocation(revocation, &chain, &prior) && !accepted.contains(revocation) {
+            accepted.push(revocation.clone());
+        }
+    }
+    AuthenticatedStatements {
+        certificates: chain.newly_trusted,
+        revocations: accepted,
+    }
 }
 
 struct TrustedKeys {
@@ -667,11 +718,30 @@ fn build_trusted(
     }
 
     let mut newly_trusted = Vec::new();
-    for _ in 0..=certificates.len() {
+    let remembered = trust.certificates.len();
+    let chain: Vec<&KeyCertificate> = trust
+        .certificates
+        .iter()
+        .chain(certificates.iter())
+        .collect();
+    // Every certificate is accepted at most once, so the loop ends. A certificate
+    // for a key that is already trusted (say, a surviving recovery key
+    // re-certifying a remembered key) is still accepted when it checks out, so
+    // the log can keep it: the key may chain only through it after a revocation.
+    let mut accepted = vec![false; chain.len()];
+    for _ in 0..=chain.len() {
         let mut added = false;
-        for certificate in certificates {
-            if keys.contains_key(&certificate.key_id) || revoked.contains(&certificate.key_id) {
+        for (index, certificate) in chain.iter().copied().enumerate() {
+            if accepted[index]
+                || revoked.contains(&certificate.key_id)
+                || trust.keys.iter().any(|root| root.id == certificate.key_id)
+            {
                 continue;
+            }
+            if let Some(known) = roles.get(&certificate.key_id) {
+                if *known != certificate.role {
+                    continue;
+                }
             }
             let Some(signer) = keys.get(&certificate.signed_by).copied() else {
                 continue;
@@ -701,9 +771,17 @@ fn build_trusted(
             let Some(verifying) = verifying_key(&certificate.public_key) else {
                 continue;
             };
-            keys.insert(certificate.key_id.clone(), verifying);
-            roles.insert(certificate.key_id.clone(), certificate.role);
-            newly_trusted.push(certificate.clone());
+            keys.entry(certificate.key_id.clone()).or_insert(verifying);
+            roles
+                .entry(certificate.key_id.clone())
+                .or_insert(certificate.role);
+            accepted[index] = true;
+            if index >= remembered
+                && !trust.certificates.contains(certificate)
+                && !newly_trusted.contains(certificate)
+            {
+                newly_trusted.push(certificate.clone());
+            }
             added = true;
         }
         if !added {
