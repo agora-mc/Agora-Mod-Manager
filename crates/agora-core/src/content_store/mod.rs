@@ -2628,18 +2628,69 @@ pub fn remove_item_with_options(
     //    removed item's own, and any an interrupted add left behind before writing its manifest.
     //    A failure here only leaves an unreferenced object for the next sweep.
     let objects_dir = ctx.paths.content_objects_dir();
-    if objects_dir.exists() && !an_other_record_is_unreadable {
-        for shard in std::fs::read_dir(&objects_dir)?.flatten() {
-            if !shard.path().is_dir() {
-                continue;
-            }
-            for object in std::fs::read_dir(shard.path())?.flatten() {
-                let obj_path = object.path();
-                let name = object.file_name().to_string_lossy().into_owned();
-                if obj_path.is_file() && !remaining_hashes.contains(&name) {
-                    let _ = protect::unprotect(&obj_path);
-                    let _ = std::fs::remove_file(&obj_path);
+    if !an_other_record_is_unreadable {
+        let shards = match std::fs::read_dir(&objects_dir) {
+            Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
+        .map_err(|error| ContentError::UnreadableManifest {
+            item_id: item_id.clone(),
+            manifest: objects_dir.display().to_string(),
+            error: error.to_string(),
+        })?;
+        let mut to_remove = Vec::new();
+        for shard in shards {
+            let path = shard.path();
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(ContentError::UnreadableManifest {
+                        item_id: item_id.clone(),
+                        manifest: path.display().to_string(),
+                        error: error.to_string(),
+                    })
                 }
+            }
+            let objects =
+                std::fs::read_dir(&path).map_err(|error| ContentError::UnreadableManifest {
+                    item_id: item_id.clone(),
+                    manifest: path.display().to_string(),
+                    error: error.to_string(),
+                })?;
+            for object in objects {
+                let object = object.map_err(|error| ContentError::UnreadableManifest {
+                    item_id: item_id.clone(),
+                    manifest: path.display().to_string(),
+                    error: error.to_string(),
+                })?;
+                to_remove.push(object.path());
+            }
+        }
+        // A whole listing that cannot be read must not turn into "nothing to
+        // keep": collect first, then delete only from a complete picture.
+        for obj_path in to_remove {
+            let name = obj_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match std::fs::symlink_metadata(&obj_path) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(ContentError::UnreadableManifest {
+                        item_id: item_id.clone(),
+                        manifest: obj_path.display().to_string(),
+                        error: error.to_string(),
+                    })
+                }
+            }
+            if !remaining_hashes.contains(&name) {
+                let _ = protect::unprotect(&obj_path);
+                let _ = std::fs::remove_file(&obj_path);
             }
         }
     }

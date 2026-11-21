@@ -1098,6 +1098,16 @@ fn folder_instance_id(dir: &Path, fallback: String) -> String {
 /// waiting in either Recently deleted (their snapshot store travels with them,
 /// so a restore still needs their content).
 fn snapshot_folders(ctx: &Ctx) -> Result<Vec<SnapshotFolder>, String> {
+    snapshot_folders_with(ctx, |path| std::fs::symlink_metadata(path))
+}
+
+/// Folder discovery with the metadata lookups injected, so a failed lookup can
+/// be exercised without depending on the OS to fail on cue. The public wrapper
+/// always stats the real filesystem.
+fn snapshot_folders_with(
+    ctx: &Ctx,
+    metadata: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<Vec<SnapshotFolder>, String> {
     let mut folders = Vec::new();
     let mut roots: Vec<(std::path::PathBuf, bool)> = vec![(ctx.paths.instances_root(), false)];
     roots.push((ctx.paths.recently_deleted_games_root(), true));
@@ -1126,23 +1136,40 @@ fn snapshot_folders(ctx: &Ctx) -> Result<Vec<SnapshotFolder>, String> {
             } else {
                 entry.path()
             };
-            if !dir.is_dir() {
-                continue;
+            match metadata(&dir) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "cannot inspect '{}' to check snapshot content references: {error}",
+                        dir.display()
+                    ))
+                }
             }
             let snapshots = dir.join(".agora_snapshots");
-            if snapshots.is_dir() {
-                let instance_id = if in_trash {
-                    folder_instance_id(&dir, fallback)
-                } else {
-                    fallback
-                };
-                folders.push(SnapshotFolder {
-                    instance_id,
-                    instance_dir: dir,
-                    snapshots_dir: snapshots,
-                    in_trash,
-                });
+            match metadata(&snapshots) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "cannot inspect '{}' to check snapshot content references: {error}",
+                        snapshots.display()
+                    ))
+                }
             }
+            let instance_id = if in_trash {
+                folder_instance_id(&dir, fallback)
+            } else {
+                fallback
+            };
+            folders.push(SnapshotFolder {
+                instance_id,
+                instance_dir: dir,
+                snapshots_dir: snapshots,
+                in_trash,
+            });
         }
     }
     Ok(folders)
@@ -1210,4 +1237,36 @@ pub fn snapshots_using_content(ctx: &Ctx, item_id: &str) -> Result<SnapshotConte
         }
     }
     Ok(usage)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn review_snapshot_folders_refuse_when_folder_metadata_fails() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = Ctx::for_testing(tmp.path().to_path_buf());
+        let blocked = ctx
+            .paths
+            .instances_root()
+            .join("one")
+            .join(".agora_snapshots");
+        std::fs::create_dir_all(&blocked).unwrap();
+
+        let error = snapshot_folders_with(&ctx, |path| {
+            if path == blocked {
+                Err(std::io::Error::other("metadata unavailable"))
+            } else {
+                std::fs::symlink_metadata(path)
+            }
+        })
+        .err()
+        .expect("cannot tell whether the folder holds snapshots");
+        assert!(
+            error.contains("metadata unavailable"),
+            "the reason is reported: {error}"
+        );
+    }
 }

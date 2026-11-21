@@ -2760,17 +2760,44 @@ pub fn lock_snapshots(instance_dir: &Path) -> Result<Vec<Snapshot>, String> {
 
 /// List all snapshots for an instance.
 pub fn list_snapshots(instance_dir: &Path) -> Result<Vec<Snapshot>, String> {
+    list_snapshots_with(instance_dir, |path| fs::symlink_metadata(path))
+}
+
+/// Listing with the metadata lookups injected, so a failed lookup can be
+/// exercised without depending on the OS to fail on cue. The public wrapper
+/// always stats the real filesystem.
+fn list_snapshots_with(
+    instance_dir: &Path,
+    metadata: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<Vec<Snapshot>, String> {
     let marker = instance_dir.join(RESTORE_MARKER);
-    if marker.exists() {
-        return Err(
-            "Previous restore was interrupted. Check .agora_pre_restore/ for backed-up files."
-                .into(),
-        );
+    match metadata(&marker) {
+        Ok(_) => {
+            return Err(
+                "Previous restore was interrupted. Check .agora_pre_restore/ for backed-up files."
+                    .into(),
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot check restore marker {}: {error}",
+                marker.display()
+            ))
+        }
     }
 
     let dir = snapshots_dir(instance_dir);
-    if !dir.is_dir() {
-        return Ok(Vec::new());
+    match metadata(&dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect snapshots dir {}: {error}",
+                dir.display()
+            ))
+        }
     }
 
     let mut snapshots = Vec::new();
@@ -3239,6 +3266,26 @@ mod tests {
         assert!(
             super::blob_is_referenced_by_any_snapshot(&a, "not-a-sha256"),
             "a malformed hash cannot prove a blob is safe to delete"
+        );
+    }
+
+    #[test]
+    fn review_list_snapshots_refuses_when_snapshot_folder_metadata_fails() {
+        let tmp = TempDir::new().unwrap();
+        let inst = tmp.path().join("inst");
+        fs::create_dir_all(&inst).unwrap();
+        let snapshots = snapshots_dir(&inst);
+        let error = super::list_snapshots_with(&inst, |path| {
+            if path == snapshots {
+                Err(std::io::Error::other("metadata unavailable"))
+            } else {
+                fs::symlink_metadata(path)
+            }
+        })
+        .expect_err("cannot tell whether snapshots exist, so listing must fail");
+        assert!(
+            error.to_string().contains("metadata unavailable"),
+            "the reason is reported: {error}"
         );
     }
 
