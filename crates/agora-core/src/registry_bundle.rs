@@ -724,11 +724,24 @@ fn build_trusted(
         .iter()
         .chain(certificates.iter())
         .collect();
+    // Every certificate is accepted at most once, so the loop ends. A certificate
+    // for a key that is already trusted (say, a surviving recovery key
+    // re-certifying a remembered key) is still accepted when it checks out, so
+    // the log can keep it: the key may chain only through it after a revocation.
+    let mut accepted = vec![false; chain.len()];
     for _ in 0..=chain.len() {
         let mut added = false;
         for (index, certificate) in chain.iter().copied().enumerate() {
-            if keys.contains_key(&certificate.key_id) || revoked.contains(&certificate.key_id) {
+            if accepted[index]
+                || revoked.contains(&certificate.key_id)
+                || trust.keys.iter().any(|root| root.id == certificate.key_id)
+            {
                 continue;
+            }
+            if let Some(known) = roles.get(&certificate.key_id) {
+                if *known != certificate.role {
+                    continue;
+                }
             }
             let Some(signer) = keys.get(&certificate.signed_by).copied() else {
                 continue;
@@ -758,9 +771,15 @@ fn build_trusted(
             let Some(verifying) = verifying_key(&certificate.public_key) else {
                 continue;
             };
-            keys.insert(certificate.key_id.clone(), verifying);
-            roles.insert(certificate.key_id.clone(), certificate.role);
-            if index >= remembered {
+            keys.entry(certificate.key_id.clone()).or_insert(verifying);
+            roles
+                .entry(certificate.key_id.clone())
+                .or_insert(certificate.role);
+            accepted[index] = true;
+            if index >= remembered
+                && !trust.certificates.contains(certificate)
+                && !newly_trusted.contains(certificate)
+            {
                 newly_trusted.push(certificate.clone());
             }
             added = true;

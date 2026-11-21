@@ -265,11 +265,12 @@ async fn check_and_download_update_inner(
         });
     }
     drop(conn);
-    // One snapshot of the trust for the whole check, taken again only after an
-    // install has changed the log.
-    let trust = &TrustSnapshot::load(app_data_dir, compiled)?;
+    // This snapshot only describes the cached catalog for the early status
+    // returns below. Nothing is decided with it: another process may change the
+    // log before we hold the lock, so the decisions use a snapshot taken under it.
+    let display_trust = &TrustSnapshot::load(app_data_dir, compiled)?;
     let cached_tag = get_cached_tag(local_state_path)?;
-    let cached = cached_catalog_summary_with_trust(app_data_dir, trust);
+    let cached = cached_catalog_summary_with_trust(app_data_dir, display_trust);
     let has_cached_db = cached.is_some();
     let cached_schema_version = cached.as_ref().and_then(|summary| summary.schema_version);
     let failed_tag = get_failed_update_tag(local_state_path)?;
@@ -318,6 +319,11 @@ async fn check_and_download_update_inner(
             "registry-sync",
         )
         .await?;
+    // The one snapshot for every decision in this check: loaded only now that
+    // the lock keeps other writers of the log and the bundle out. It is loaded
+    // again only if this check itself installs something.
+    let snapshot = TrustSnapshot::load(app_data_dir, compiled)?;
+    let trust = &snapshot;
 
     let latest =
         match query_latest_catalog_release(transport, registry_repo, github_token.as_deref()).await
@@ -472,7 +478,13 @@ async fn check_and_download_update_inner(
 
     // An identical candidate skips extraction, and extraction can fail even
     // after a real install. Report the actual readable-database state.
-    let trust = &TrustSnapshot::load(app_data_dir, compiled)?;
+    let after;
+    let trust = if changed {
+        after = TrustSnapshot::load(app_data_dir, compiled)?;
+        &after
+    } else {
+        trust
+    };
     let ready = cached_catalog_summary_with_trust(app_data_dir, trust).is_some();
     Ok(RegistryStatus {
         has_cached_db: ready,
@@ -5662,6 +5674,159 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         )
         .await
         .expect("a remembered signer's delta must install without a full download");
+        assert_eq!(status.cached_tag.as_deref(), Some("registry-2026-11-19"));
+    }
+
+    /// A surviving recovery key re-certifies a remembered key and revokes the
+    /// key that first certified it, in one bundle. The new certificate must be
+    /// remembered too, or the key stops chaining after a reload.
+    #[test]
+    fn a_re_certified_key_still_chains_after_its_old_ancestor_is_revoked() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = test_key(194);
+        let stolen = test_key(195);
+        let recovery = test_key(196);
+        let second_recovery = test_key(197);
+        let signer = test_key(198);
+        let trust = rotation_trust(&primary, &stolen, &recovery);
+        let payload = sample_db();
+
+        let mut first = fresh_header(&primary, &payload);
+        first.certificates.push(recovery_certificate(
+            &recovery,
+            &test_public(&second_recovery),
+        ));
+        first
+            .certificates
+            .push(certificate(&second_recovery, &test_public(&signer)));
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&primary, &first, &payload),
+            &trust,
+            "first",
+        )
+        .unwrap();
+
+        let second_db = sample_db_with_built_at("2026-11-18T12:00:00+00:00");
+        let mut second = header_for(
+            &signer,
+            &second_db,
+            "2026-11-18T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        second
+            .certificates
+            .push(certificate(&recovery, &test_public(&signer)));
+        second
+            .revocations
+            .push(revocation(&recovery, &second_recovery));
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&signer, &second, &second_db),
+            &trust,
+            "second",
+        )
+        .unwrap();
+
+        let third_db = sample_db_with_built_at("2026-11-19T12:00:00+00:00");
+        let third = header_for(
+            &signer,
+            &third_db,
+            "2026-11-19T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&signer, &third, &third_db),
+            &trust,
+            "third",
+        )
+        .expect("the re-certified key still chains after a reload");
+        assert!(open_verified_registry_with_trust(dir.path(), &trust).is_ok());
+    }
+
+    /// Sync loads its trust only once it holds `RegistryUpdate`: a local install
+    /// that learns a signer while sync waits must be visible to sync.
+    #[tokio::test]
+    async fn sync_judges_a_catalog_with_the_trust_learned_while_it_waited() {
+        let (dir, ls_path, locks) = setup_sync_env();
+        let primary = test_key(199);
+        let stolen = test_key(200);
+        let recovery = test_key(201);
+        let learned = test_key(202);
+        let trust = rotation_trust(&primary, &stolen, &recovery);
+
+        let first_payload = sample_db_with_built_at("2026-11-17T02:00:00+00:00");
+        let first = header_for(
+            &primary,
+            &first_payload,
+            "2026-11-17T02:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&primary, &first, &first_payload),
+            &trust,
+            "first",
+        )
+        .unwrap();
+        set_cached_tag(&ls_path, "registry-2026-11-17").unwrap();
+        set_cached_asset_id(&ls_path, Some(2999)).unwrap();
+
+        // The catalog sync will fetch is signed by a key only the local install
+        // below teaches us.
+        let newest = sample_db_with_built_at("2026-11-19T02:00:00+00:00");
+        let newest_header = header_for(
+            &learned,
+            &newest,
+            "2026-11-19T02:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let newest_bundle = signed_bundle(&learned, &newest_header, &newest);
+        let recorded = r#"[{"tag_name": "registry-2026-11-19", "draft": false,
+            "prerelease": false, "assets": [{"id": 3001, "name": "registry.bundle"}]}]"#;
+        let transport =
+            FakeRegistryTransport::from_pages(vec![(1, release_json_to_list(recorded))]);
+        transport.push_asset_ok(3001, newest_bundle);
+
+        let held = locks
+            .acquire(crate::lock_manager::LockResource::RegistryUpdate, "test")
+            .unwrap();
+        let sync = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            true,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_000,
+        );
+        let local_install = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let second_payload = sample_db_with_built_at("2026-11-18T02:00:00+00:00");
+            let mut second = header_for(
+                &primary,
+                &second_payload,
+                "2026-11-18T02:00:00+00:00",
+                "2099-01-01T00:00:00+00:00",
+            );
+            second
+                .certificates
+                .push(certificate(&recovery, &test_public(&learned)));
+            install_bundle_bytes_checked(
+                dir.path(),
+                &signed_bundle(&primary, &second, &second_payload),
+                &trust,
+                "second",
+            )
+            .unwrap();
+            drop(held);
+        };
+        let (status, ()) = tokio::join!(sync, local_install);
+        let status = status.expect("sync must use the trust learned while it waited");
         assert_eq!(status.cached_tag.as_deref(), Some("registry-2026-11-19"));
     }
 
