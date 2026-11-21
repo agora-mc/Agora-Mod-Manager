@@ -176,32 +176,26 @@ pub enum RunHookPoint {
 #[doc(hidden)]
 type RunHook = std::sync::Arc<dyn Fn(&Ctx, Option<&SwapJournal>, RunHookPoint) + Send + Sync>;
 
-/// The hook with the thread that installed it: the hook fires only on that thread, so parallel
-/// tests that run tools never fire each other's hooks.
-static RUN_HOOK: Mutex<Option<(std::thread::ThreadId, RunHook)>> = Mutex::new(None);
+// Each test seam is thread-local: a hook fires only on the thread that set it, and parallel
+// tests in one process (`cargo test` runs tests as threads) each keep their own hook. A single
+// global slot let one test's hook overwrite another's, so a hook a test relied on never fired.
+thread_local! {
+    static RUN_HOOK: std::cell::RefCell<Option<RunHook>> = const { std::cell::RefCell::new(None) };
+    static WRITE_FAULT_HOOK: std::cell::RefCell<Option<WriteFaultHook>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Set or clear the run hook (a test seam; production never sets it). The hook fires only on the
 /// thread that sets it. Tests that set it must still run their tool runs on this thread.
 #[doc(hidden)]
 pub fn set_run_hook(hook: Option<RunHook>) {
-    if let Ok(mut guard) = RUN_HOOK.lock() {
-        *guard = hook.map(|hook| (std::thread::current().id(), hook));
-    }
+    RUN_HOOK.with(|slot| *slot.borrow_mut() = hook);
 }
 
-/// Clear the run hook, but only the one this thread installed, so a finishing test cannot clear
-/// another parallel test's hook.
+/// Clear this thread's run hook. Another thread's hook is untouched.
 #[doc(hidden)]
 pub fn clear_run_hook() {
-    if let Ok(mut guard) = RUN_HOOK.lock() {
-        let this_thread = std::thread::current().id();
-        if guard
-            .as_ref()
-            .is_some_and(|(thread, _)| *thread == this_thread)
-        {
-            *guard = None;
-        }
-    }
+    RUN_HOOK.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// Fire the run hook at `point`, when a test on this thread set one. `journal` is the swap
@@ -209,62 +203,37 @@ pub fn clear_run_hook() {
 /// session journal). Production never sets a hook, so this does nothing.
 #[doc(hidden)]
 pub fn run_hook(ctx: &Ctx, journal: Option<&SwapJournal>, point: RunHookPoint) {
-    let hook = RUN_HOOK.lock().ok().and_then(|guard| {
-        guard
-            .as_ref()
-            .filter(|(thread, _)| *thread == std::thread::current().id())
-            .map(|(_, hook)| hook.clone())
-    });
+    // Clone out of the cell before calling, so a hook may itself set or clear hooks.
+    let hook = RUN_HOOK.with(|slot| slot.borrow().clone());
     if let Some(hook) = hook {
         hook(ctx, journal, point);
     }
 }
 
 /// A test seam that makes journal writes fail: the hook returns `true` for a journal path
-/// whose write should fail. Gated to the installing thread, like the run hook.
+/// whose write should fail. Thread-local, like the run hook.
 #[doc(hidden)]
 type WriteFaultHook = std::sync::Arc<dyn Fn(&Path) -> bool + Send + Sync>;
-
-#[doc(hidden)]
-static WRITE_FAULT_HOOK: Mutex<Option<(std::thread::ThreadId, WriteFaultHook)>> = Mutex::new(None);
 
 /// Set or clear the journal write-fault hook (a test seam; production never sets it). The hook
 /// fires only on the thread that sets it.
 #[doc(hidden)]
 pub fn set_write_fault_hook(hook: Option<WriteFaultHook>) {
-    if let Ok(mut guard) = WRITE_FAULT_HOOK.lock() {
-        *guard = hook.map(|hook| (std::thread::current().id(), hook));
-    }
+    WRITE_FAULT_HOOK.with(|slot| *slot.borrow_mut() = hook);
 }
 
-/// Clear the write-fault hook, but only the one this thread installed.
+/// Clear this thread's write-fault hook.
 #[doc(hidden)]
 pub fn clear_write_fault_hook() {
-    if let Ok(mut guard) = WRITE_FAULT_HOOK.lock() {
-        let this_thread = std::thread::current().id();
-        if guard
-            .as_ref()
-            .is_some_and(|(thread, _)| *thread == this_thread)
-        {
-            *guard = None;
-        }
-    }
+    WRITE_FAULT_HOOK.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// Whether a journal write to `path` fails right now (a test on this thread set a fault hook
 /// that names the path). Production never sets a hook, so this is always `false`.
 #[doc(hidden)]
 pub fn write_fault_fires(path: &Path) -> bool {
-    WRITE_FAULT_HOOK
-        .lock()
-        .ok()
-        .and_then(|guard| {
-            guard
-                .as_ref()
-                .filter(|(thread, _)| *thread == std::thread::current().id())
-                .map(|(_, hook)| hook.clone())
-        })
-        .is_some_and(|hook| hook(path))
+    let hook = WRITE_FAULT_HOOK.with(|slot| slot.borrow().clone());
+    hook.is_some_and(|hook| hook(path))
 }
 
 /// The journal file of one game and store.
