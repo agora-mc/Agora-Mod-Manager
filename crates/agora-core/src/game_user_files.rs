@@ -1778,7 +1778,7 @@ fn restore_journal_internal(
                 .as_deref()
                 .is_some_and(|hash| hash != file.written_sha256.as_str());
             let instance_bytes = read_recovery_file(&derived_instance_copy, "instance copy")?;
-            let instance_hash = instance_bytes.as_ref().map(|bytes| hash_bytes(&bytes));
+            let instance_hash = instance_bytes.as_ref().map(|bytes| hash_bytes(bytes));
             let instance_changed = instance_hash
                 .as_deref()
                 .is_some_and(|hash| hash != file.written_sha256.as_str());
