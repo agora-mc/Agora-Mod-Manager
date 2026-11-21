@@ -1681,18 +1681,28 @@ fn restore_journal_internal(
             {
                 let real_bytes = real_bytes.expect("read changed bytes above");
                 let real_hash = real_hash.expect("hashed above");
+                // The forced restore is about to overwrite the instance's independently edited
+                // copy, so that is the version to archive. Without the override nothing is
+                // overwritten and the real file's current bytes are the ones worth naming.
+                let (archived_bytes, archive_hash) = if force {
+                    let instance_bytes = std::fs::read(&derived_instance_copy)?;
+                    let instance_hash = hash_bytes(&instance_bytes);
+                    (instance_bytes, instance_hash)
+                } else {
+                    (real_bytes.to_vec(), real_hash.clone())
+                };
                 let conflict_path = derived_instance_copy.with_file_name(format!(
                     "{}.agora-conflict-{}",
                     derived_instance_copy
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or("file"),
-                    &real_hash[..8]
+                    &archive_hash[..8]
                 ));
                 if let Some(parent) = conflict_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                write_user_file(&conflict_path, &real_bytes)?;
+                write_user_file(&conflict_path, &archived_bytes)?;
                 // The explicit restore command's override (`--force`) writes the conflict
                 // copy first (done above) and then restores; automatic recovery never does.
                 if !force {

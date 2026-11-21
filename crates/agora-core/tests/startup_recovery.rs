@@ -1613,9 +1613,9 @@ fn a_file_absent_at_swap_records_its_would_be_resolved_path_and_recovers_normall
 }
 
 /// The explicit restore command's override: on a both-changed conflict the plain restore (and
-/// automatic startup recovery, which never forces) refuses and writes the conflict copy; the
-/// forced restore writes the same conflict copy first and then puts the files back — the
-/// original goes back to the real file, the game's changed bytes are saved into the instance's
+/// automatic startup recovery, which never forces) refuses and archives the real file's bytes;
+/// the forced restore archives the instance edit it is about to overwrite and then puts the files
+/// back — the original goes back to the real file, the game's changed bytes become the instance's
 /// copy.
 #[test]
 fn a_both_changed_conflict_is_forced_only_by_the_explicit_restore_command() {
@@ -1701,17 +1701,85 @@ fn a_both_changed_conflict_is_forced_only_by_the_explicit_restore_command() {
                 .is_some_and(|name| name.starts_with("Plugins.txt.agora-conflict-"))
         })
         .collect();
-    assert_eq!(
-        conflicts.len(),
-        1,
-        "the forced restore still wrote the conflict copy first: {conflicts:?}"
+    // The unforced refusals archived the real file's bytes; the forced restore archives the
+    // instance edit it overwrites. Both versions stay on disk.
+    let archived: Vec<String> = conflicts
+        .iter()
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .collect();
+    assert!(
+        archived
+            .iter()
+            .any(|bytes| bytes == "Game changed this after the crash\n"),
+        "the unforced refusals kept the real file's bytes: {archived:?}"
     );
-    assert_eq!(
-        std::fs::read_to_string(&conflicts[0]).unwrap(),
-        "Game changed this after the crash\n"
+    assert!(
+        archived
+            .iter()
+            .any(|bytes| bytes == "Instance copy changed too\n"),
+        "the forced restore archived the instance edit it overwrote: {archived:?}"
     );
     assert!(
         !journal_path.exists(),
         "the journal is cleared by the forced restore"
+    );
+}
+
+/// A forced restore must archive the bytes it displaces — the independently edited instance copy —
+/// before overwriting them. This starts from a fresh fixture and calls only `restore_forced`, so
+/// the archive in this test cannot be a leftover from an earlier unforced call.
+#[test]
+fn a_forced_restore_archives_the_instance_edit_it_overwrites() {
+    let f = user_files_fixture(Some("Player original\n"));
+    agora_core::game_user_files::swap_in(
+        &f.ctx,
+        "instance-a",
+        &f.def,
+        &StoreId::steam(),
+        &f.running_from,
+    )
+    .unwrap();
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
+    std::fs::write(&f.real, "Game changed this after the crash\n").unwrap();
+    std::fs::write(&f.copy, "Instance copy changed too\n").unwrap();
+
+    let forced = agora_core::game_user_files::restore_forced(&f.ctx, &f.def, &StoreId::steam())
+        .expect("the forced restore completes");
+    assert!(forced.files.iter().any(|file| file.changed));
+
+    let conflicts: Vec<PathBuf> = std::fs::read_dir(f.copy.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("Plugins.txt.agora-conflict-"))
+        })
+        .collect();
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "one archive from this forced call: {conflicts:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&conflicts[0]).unwrap(),
+        "Instance copy changed too\n",
+        "the archive holds the instance edit that the restore overwrote"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&f.copy).unwrap(),
+        "Game changed this after the crash\n",
+        "the game's changed bytes are the instance's copy now"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&f.real).unwrap(),
+        "Player original\n"
     );
 }
