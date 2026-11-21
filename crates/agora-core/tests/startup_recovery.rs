@@ -1819,6 +1819,57 @@ fn conflicting_user_files(f: &UserFilesFixture) {
     std::fs::write(&f.copy, "Instance copy changed too\n").unwrap();
 }
 
+/// An instance copy whose bytes cannot be read is "can't tell", not "unchanged": neither the plain
+/// nor the forced restore may overwrite it. A directory at the path is unreadable as bytes on every
+/// platform; a Unix-only write-only-file fixture would exercise the same guard with a renameable
+/// file.
+#[test]
+fn an_unreadable_instance_copy_is_kept_by_both_restores() {
+    let f = user_files_fixture(Some("Player original\n"));
+    agora_core::game_user_files::swap_in(
+        &f.ctx,
+        "instance-a",
+        &f.def,
+        &StoreId::steam(),
+        &f.running_from,
+    )
+    .unwrap();
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
+    std::fs::write(&f.real, "Game changed this after the crash\n").unwrap();
+    std::fs::remove_file(&f.copy).unwrap();
+    std::fs::create_dir(&f.copy).unwrap();
+    std::fs::write(f.copy.join("keep"), "do not touch").unwrap();
+
+    for force in [false, true] {
+        let error = if force {
+            agora_core::game_user_files::restore_forced(&f.ctx, &f.def, &StoreId::steam())
+                .unwrap_err()
+        } else {
+            agora_core::game_user_files::restore(&f.ctx, &f.def, &StoreId::steam()).unwrap_err()
+        }
+        .to_string();
+        assert!(
+            error.contains("could not be read"),
+            "a read failure must be reported as can't-tell (force={force}): {error}"
+        );
+        assert!(
+            f.copy.join("keep").exists(),
+            "the unreadable instance copy was overwritten (force={force})"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f.real).unwrap(),
+            "Game changed this after the crash\n",
+            "the real file was changed (force={force})"
+        );
+    }
+}
+
 /// A conflict archive uses create-new: a file already at that name is left exactly as it was and
 /// the archive is written under a new number.
 #[test]

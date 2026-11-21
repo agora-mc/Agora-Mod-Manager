@@ -54,6 +54,16 @@ pub enum UserFilesError {
     Lock(#[from] crate::error::LauncherError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// A file needed by restore could not be read. Absence is handled separately; a read error
+    /// is "can't tell", so recovery keeps every copy. The Io source keeps a Windows sharing
+    /// violation retryable by `retry_while_running`.
+    #[error("the {what} '{path}' could not be read ({source}); Agora did not overwrite it and changed nothing. Check the file by hand")]
+    Read {
+        what: String,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("cannot write '{path}': {source}")]
     Write {
         path: PathBuf,
@@ -384,6 +394,21 @@ fn symlink_target(path: &Path) -> Option<PathBuf> {
         return None;
     }
     std::fs::read_link(path).ok()
+}
+
+/// Read a file whose absence is meaningful but whose unreadability is not. A missing file is
+/// `None`; any other read error is "can't tell", so recovery stops and keeps every copy rather
+/// than treating unreadable bytes as unchanged and overwriting them later.
+fn read_recovery_file(path: &Path, what: &str) -> Result<Option<Vec<u8>>, UserFilesError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(UserFilesError::Read {
+            what: what.to_string(),
+            path: path.to_path_buf(),
+            source: error,
+        }),
+    }
 }
 
 /// Create a conflict archive without ever touching an existing file. `create_new` refuses both a
@@ -1423,7 +1448,9 @@ fn retryable_restore(error: &UserFilesError) -> bool {
 
 fn sharing_violation(error: &UserFilesError) -> bool {
     let source = match error {
-        UserFilesError::Io(source) | UserFilesError::Write { source, .. } => source,
+        UserFilesError::Io(source)
+        | UserFilesError::Write { source, .. }
+        | UserFilesError::Read { source, .. } => source,
         _ => return false,
     };
     is_sharing_violation(source)
@@ -1625,12 +1652,10 @@ fn restore_journal_internal(
         let has_backup = derived_backup_path.exists();
         let existed = file.existed || has_backup || file.original_sha256.is_some();
 
-        let real_bytes = std::fs::read(&file.real_path).ok();
+        let real_bytes = read_recovery_file(&file.real_path, "user file")?;
         let real_hash = real_bytes.as_ref().map(|bytes| hash_bytes(bytes));
         let backup_hash = if has_backup {
-            std::fs::read(&derived_backup_path)
-                .ok()
-                .map(|bytes| hash_bytes(&bytes))
+            read_recovery_file(&derived_backup_path, "backup")?.map(|bytes| hash_bytes(&bytes))
         } else {
             None
         };
@@ -1740,9 +1765,8 @@ fn restore_journal_internal(
             let real_changed = real_hash
                 .as_deref()
                 .is_some_and(|hash| hash != file.written_sha256.as_str());
-            let instance_hash = std::fs::read(&derived_instance_copy)
-                .ok()
-                .map(|bytes| hash_bytes(&bytes));
+            let instance_bytes = read_recovery_file(&derived_instance_copy, "instance copy")?;
+            let instance_hash = instance_bytes.as_ref().map(|bytes| hash_bytes(&bytes));
             let instance_changed = instance_hash
                 .as_deref()
                 .is_some_and(|hash| hash != file.written_sha256.as_str());
@@ -1751,13 +1775,15 @@ fn restore_journal_internal(
                 && (real_hash != instance_hash
                     || !provably_distinct_files(&file.real_path, &derived_instance_copy))
             {
-                let real_bytes = real_bytes.expect("read changed bytes above");
+                let real_bytes = real_bytes.clone().expect("read changed bytes above");
                 let real_hash = real_hash.expect("hashed above");
                 // The forced restore is about to overwrite the instance's independently edited
                 // copy, so that is the version to archive. Without the override nothing is
                 // overwritten and the real file's current bytes are the ones worth naming.
                 let (archived_bytes, archive_hash) = if force {
-                    let instance_bytes = std::fs::read(&derived_instance_copy)?;
+                    // Force may overwrite only after archiving the displaced bytes. Those bytes
+                    // were read above; if they could not be read we already stopped.
+                    let instance_bytes = instance_bytes.expect("read changed instance bytes above");
                     let instance_hash = hash_bytes(&instance_bytes);
                     (instance_bytes, instance_hash)
                 } else {
@@ -1795,8 +1821,8 @@ fn restore_journal_internal(
         // never overwrites the instance's copy with such bytes and never deletes the file, so
         // the whole restore stops here, before anything is modified, and asks for a hand.
         if strict && !existed && file_state(file) == FileState::Swapped {
-            if let Ok(bytes) = std::fs::read(&file.real_path) {
-                if hash_bytes(&bytes) != file.written_sha256 {
+            if let Some(bytes) = &real_bytes {
+                if hash_bytes(bytes) != file.written_sha256 {
                     return Err(UserFilesError::Other(format!(
                         "the user file '{}' changed since the swap (it does not match what the \
                          session wrote), so recovery left it and the instance's copy '{}' exactly \
