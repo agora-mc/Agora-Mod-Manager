@@ -259,41 +259,77 @@ pub fn resolve_rel_case_insensitive(base: &Path, rel: &str) -> PathBuf {
     current
 }
 
-/// Compare two paths component-by-component case-insensitively.
+/// Compare two paths component-by-component case-insensitively. This is for checking a trusted
+/// journal's spelling, never for choosing a write target. Non-UTF-8 components are equal only when
+/// their native bytes match: lossy conversion would collapse distinct names into one.
 pub fn paths_eq_case_insensitive(a: &Path, b: &Path) -> bool {
-    let a_comps: Vec<_> = a
-        .components()
-        .map(|c| fold_path_case(&c.as_os_str().to_string_lossy()))
-        .collect();
-    let b_comps: Vec<_> = b
-        .components()
-        .map(|c| fold_path_case(&c.as_os_str().to_string_lossy()))
-        .collect();
-    a_comps == b_comps
-}
-
-/// Compare two already-resolved paths exactly. `canonicalize` returns the real casing on Windows,
-/// so a case-only difference between two canonical paths is a real change of target, not an
-/// equivalent spelling. This is for the restore's resolution guard; user-data folder matching
-/// elsewhere still uses the case-insensitive comparison.
-pub fn paths_eq_exact(a: &Path, b: &Path) -> bool {
-    // Windows canonicalize returns a verbatim `\\?\` prefix; a path carried forward from a journal
-    // that could not resolve its parent does not. That is one spelling of the same path, so strip
-    // it before comparing. Casing is still compared exactly.
-    fn normalize(path: &Path) -> String {
-        let text = path.as_os_str().to_string_lossy();
-        #[cfg(windows)]
-        {
-            text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
-        }
-        #[cfg(not(windows))]
-        {
-            text.to_string()
+    let mut ac = a.components();
+    let mut bc = b.components();
+    loop {
+        match (ac.next(), bc.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) => {
+                let (x, y) = (x.as_os_str(), y.as_os_str());
+                let equal = if x == y {
+                    true
+                } else {
+                    match (x.to_str(), y.to_str()) {
+                        (Some(x), Some(y)) => fold_path_case(x) == fold_path_case(y),
+                        _ => false,
+                    }
+                };
+                if !equal {
+                    return false;
+                }
+            }
+            _ => return false,
         }
     }
-    let a = normalize(a);
-    let b = normalize(b);
-    Path::new(&a).components().eq(Path::new(&b).components())
+}
+
+/// Compare two already-resolved paths exactly, losslessly. `canonicalize` returns the real casing
+/// on Windows, so a case-only difference between two canonical paths is a real change of target.
+/// Components are compared as native `OsStr` bytes/wide characters — never through a lossy string
+/// conversion, which could make two distinct non-UTF-8 targets compare equal.
+pub fn paths_eq_exact(a: &Path, b: &Path) -> bool {
+    let mut ac = a.components();
+    let mut bc = b.components();
+    loop {
+        match (ac.next(), bc.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) => {
+                if !component_eq_lossless(x.as_os_str(), y.as_os_str()) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Windows canonicalize returns a verbatim `\\?\` prefix; a path carried forward from a journal
+/// that could not resolve its parent does not. Strip that prefix natively, then compare the raw
+/// bytes/wide characters so no information is lost.
+fn component_eq_lossless(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        a.as_bytes() == b.as_bytes()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        fn strip_verbatim(s: &std::ffi::OsStr) -> Vec<u16> {
+            let wide: Vec<u16> = s.encode_wide().collect();
+            const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+            if wide.starts_with(&VERBATIM) {
+                wide[4..].to_vec()
+            } else {
+                wide
+            }
+        }
+        strip_verbatim(a) == strip_verbatim(b)
+    }
 }
 
 /// The Windows user folder a `UserDataLocation` names, inside a Proton prefix. Proton's default
@@ -391,49 +427,90 @@ fn file_presence(path: &Path, what: &str) -> Result<bool, UserFilesError> {
 }
 
 /// Resolve ONE destination exactly: the canonical path when it exists, otherwise its exact final
-/// name appended to a parent that resolves now. A parent that does not resolve is "can't tell" —
-/// never rebuild the path by appending ancestor names, which could reconstruct a stale journal
-/// path while the real parent has moved or become a dangling link.
+/// name appended to the deepest ancestor that resolves. Walking up checks EVERY ancestor on the
+/// way: a dangling link or a non-directory anywhere above the destination is "can't tell", never a
+/// path rebuilt from unresolved ancestor names. A genuinely missing folder is fine for a file that
+/// never existed, because no bytes are written there.
 fn resolved_destination(path: &Path, what: &str) -> Result<PathBuf, UserFilesError> {
     match std::fs::canonicalize(path) {
         Ok(canonical) => Ok(canonical),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let parent = path.parent().ok_or_else(|| {
-                UserFilesError::Other(format!("{what} '{}' has no parent folder", path.display()))
-            })?;
-            let cant_tell = |error: std::io::Error| {
+            let cant_tell = |at: &Path, reason: &str| {
                 UserFilesError::Other(format!(
-                    "the parent of {what} '{}' could not be resolved ({error}); Agora cannot tell \
-                     where to write and changed nothing. Check the folder by hand, then put the \
-                     files back.",
+                    "the ancestor '{}' of {what} '{}' could not be resolved ({reason}); Agora \
+                     cannot tell where to write and changed nothing. Check the folder by hand, \
+                     then put the files back.",
+                    at.display(),
                     path.display()
                 ))
             };
-            match std::fs::canonicalize(parent) {
-                Ok(resolved_parent) => {
-                    let name = path.file_name().ok_or_else(|| {
-                        UserFilesError::Other(format!(
-                            "{what} '{}' has no file name",
-                            path.display()
-                        ))
-                    })?;
-                    Ok(resolved_parent.join(name))
-                }
-                Err(_) => match std::fs::symlink_metadata(parent) {
-                    // A link (even a dangling one) or a non-directory at the parent means the
-                    // parent changed identity: keep everything and report.
-                    Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => Err(cant_tell(
-                        std::io::Error::other("it is a link or not a folder"),
-                    )),
-                    Ok(_) => Err(cant_tell(std::io::Error::other("it could not be resolved"))),
-                    // A genuinely missing parent is normal for a file that never existed: no bytes
-                    // will be written there, so the unmodified path is safe to carry forward.
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        Ok(path.to_path_buf())
+            let name = path.file_name().ok_or_else(|| {
+                UserFilesError::Other(format!("{what} '{}' has no file name", path.display()))
+            })?;
+            let mut suffix: Vec<std::ffi::OsString> = vec![name.to_os_string()];
+            let mut cursor = path.parent().ok_or_else(|| {
+                UserFilesError::Other(format!("{what} '{}' has no parent folder", path.display()))
+            })?;
+            let base = loop {
+                let resolved = match std::fs::canonicalize(cursor) {
+                    Ok(path) => Some(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(UserFilesError::Read {
+                            what: what.to_string(),
+                            path: cursor.to_path_buf(),
+                            source: error,
+                        })
                     }
-                    Err(error) => Err(cant_tell(error)),
-                },
+                };
+                // Metadata does not follow links, so it distinguishes a real folder from a link
+                // (including one whose target is gone) and from a file sitting in the path.
+                match std::fs::symlink_metadata(cursor) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        if resolved.as_ref().is_some_and(|path| path.is_dir()) {
+                            break resolved.expect("checked above");
+                        }
+                        return Err(cant_tell(cursor, "it is a dangling link"));
+                    }
+                    Ok(meta) if !meta.is_dir() => {
+                        return Err(cant_tell(cursor, "it is not a folder"));
+                    }
+                    Ok(_) => match resolved {
+                        Some(path) => break path,
+                        None => return Err(cant_tell(cursor, "it could not be resolved")),
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // Genuinely absent folder: keep walking up. Only a file that never
+                        // existed ends here, so no bytes will be written under it.
+                        if let Some(path) = resolved {
+                            break path;
+                        }
+                    }
+                    Err(error) => return Err(cant_tell(cursor, &error.to_string())),
+                }
+                suffix.push(
+                    cursor
+                        .file_name()
+                        .ok_or_else(|| {
+                            UserFilesError::Other(format!(
+                                "the ancestor '{}' has no name",
+                                cursor.display()
+                            ))
+                        })?
+                        .to_os_string(),
+                );
+                cursor = cursor.parent().ok_or_else(|| {
+                    UserFilesError::Other(format!(
+                        "no ancestor of {what} '{}' resolves",
+                        path.display()
+                    ))
+                })?;
+            };
+            let mut out = base;
+            for component in suffix.iter().rev() {
+                out.push(component);
             }
+            Ok(out)
         }
         Err(error) => Err(UserFilesError::Read {
             what: what.to_string(),
@@ -2429,6 +2506,46 @@ mod tests {
             error.to_string().contains("could not be read"),
             "an unresolvable path must be reported: {error}"
         );
+    }
+
+    /// Distinct non-UTF-8 file names must never compare equal. Lossy string conversion turns both
+    /// of these into the same replacement character, which would let recovery accept a retarget.
+    #[cfg(unix)]
+    #[test]
+    fn the_exact_comparator_is_lossless_for_non_utf8_names() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let one = Path::new(std::ffi::OsStr::from_bytes(b"Plugins\xff.txt"));
+        let two = Path::new(std::ffi::OsStr::from_bytes(b"Plugins\xfe.txt"));
+        assert!(
+            !super::paths_eq_exact(one, two),
+            "two distinct targets compared equal after lossy conversion"
+        );
+        assert!(super::paths_eq_exact(one, one));
+    }
+
+    /// The same rule on Windows: unpaired UTF-16 surrogates are not valid text, and lossy
+    /// conversion collapses different ones to the same replacement character.
+    #[cfg(windows)]
+    #[test]
+    fn the_exact_comparator_is_lossless_for_non_utf8_names() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let one = PathBuf::from(std::ffi::OsString::from_wide(&[
+            b'P' as u16,
+            0xD800,
+            b'.' as u16,
+        ]));
+        let two = PathBuf::from(std::ffi::OsString::from_wide(&[
+            b'P' as u16,
+            0xD801,
+            b'.' as u16,
+        ]));
+        assert!(
+            !super::paths_eq_exact(&one, &two),
+            "two distinct targets compared equal after lossy conversion"
+        );
+        assert!(super::paths_eq_exact(&one, &one));
     }
 
     /// Canonical paths are compared exactly: a case-only retarget is a different resolved file.

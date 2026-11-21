@@ -1964,6 +1964,54 @@ fn a_dangling_parent_keeps_the_journal_and_the_swapped_copy() {
     assert!(f.copy.exists(), "the swapped copy was removed");
 }
 
+/// A dangling ANCESTOR above the immediate parent must also be can't-tell. Checking only the
+/// parent sees NotFound through the broken link and could clear the journal for a file whose
+/// parent never existed on the real filesystem. Windows uses a junction, which needs no privilege.
+#[test]
+fn a_dangling_grandparent_keeps_the_journal_and_the_swapped_copy() {
+    let f = user_files_fixture(None);
+    agora_core::game_user_files::swap_in(
+        &f.ctx,
+        "instance-a",
+        &f.def,
+        &StoreId::steam(),
+        &f.running_from,
+    )
+    .unwrap();
+    agora_core::game_user_files::record_process(
+        &f.ctx,
+        &f.def.id,
+        &StoreId::steam(),
+        dead_identity(),
+    )
+    .unwrap();
+    let journal_path = f.ctx.paths.user_files_journal_path(GAME, "steam");
+    let parent = f.real.parent().unwrap().to_path_buf();
+    let grandparent = parent.parent().unwrap().to_path_buf();
+    std::fs::remove_dir_all(&grandparent).unwrap();
+    #[cfg(unix)]
+    {
+        let nowhere = f._user_data_dir.path().join("nowhere");
+        std::os::unix::fs::symlink(&nowhere, &grandparent).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        // A junction to a missing target is reported as NotFound by Windows metadata, so use a
+        // non-directory ancestor: it exercises the same "check every ancestor" walk deterministically.
+        std::fs::write(&grandparent, b"not a folder").unwrap();
+    }
+
+    let error = agora_core::game_user_files::restore(&f.ctx, &f.def, &StoreId::steam())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("could not be resolved") || error.contains("cannot be verified"),
+        "a dangling grandparent must be can't-tell: {error}"
+    );
+    assert!(journal_path.exists(), "the journal was cleared");
+    assert!(f.copy.exists(), "the swapped copy was removed");
+}
+
 /// A metadata error while checking the backup is can't-tell, never "no backup".
 #[cfg(unix)]
 #[test]
