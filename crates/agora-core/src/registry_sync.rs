@@ -1600,7 +1600,7 @@ fn install_bundle_bytes(
         &bundle_path,
         header,
         Some(&payload.payload),
-        &trust,
+        trust,
     );
     raise_floor(app_data_dir, &header.built_at, &header.db_sha256)
         .map_err(floor_after_swap_error)?;
@@ -5102,8 +5102,7 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         )
         .unwrap();
         let error = effective_trust(dir.path(), &trust)
-            .err()
-            .expect("a statement signed by a retired key in a later record is not authentic");
+            .expect_err("a statement signed by a retired key in a later record is not authentic");
         assert_eq!(error.code(), "ERR_REGISTRY_TRUST_STATE");
 
         // The same statements in one record are one bundle: authentic.
