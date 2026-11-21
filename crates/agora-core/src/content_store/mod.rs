@@ -657,16 +657,34 @@ impl Drop for StagingGuard {
 
 fn clean_staging_dir(paths: &AppPaths) {
     let staging_root = paths.content_staging_dir();
-    if staging_root.exists() {
-        if let Ok(entries) = std::fs::read_dir(&staging_root) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    let _ = std::fs::remove_dir_all(&p);
-                } else {
-                    let _ = std::fs::remove_file(&p);
-                }
+    let entries = match std::fs::read_dir(&staging_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            eprintln!(
+                "[content] staging sweep skipped: cannot list {}: {error}",
+                staging_root.display()
+            );
+            return;
+        }
+    };
+    // Decide the whole sweep before deleting anything: one entry that cannot
+    // be listed makes the listing incomplete, so nothing is removed on a guess.
+    let mut to_remove = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => to_remove.push(entry.path()),
+            Err(error) => {
+                eprintln!("[content] staging sweep skipped: an entry could not be listed: {error}");
+                return;
             }
+        }
+    }
+    for p in to_remove {
+        if p.is_dir() {
+            let _ = std::fs::remove_dir_all(&p);
+        } else {
+            let _ = std::fs::remove_file(&p);
         }
     }
 }
@@ -2550,24 +2568,33 @@ pub fn remove_item_with_options(
     let mut other_items = Vec::new();
     let mut an_other_record_is_unreadable = false;
 
-    if items_dir.exists() {
-        for entry in std::fs::read_dir(&items_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if stem == item_id {
-                        continue;
-                    }
-                    let parsed = std::fs::read_to_string(&path)
-                        .map_err(|e| e.to_string())
-                        .and_then(|content| {
-                            serde_json::from_str::<ContentItem>(&content).map_err(|e| e.to_string())
-                        });
-                    match parsed {
-                        Ok(item) => other_items.push(item),
-                        Err(_) => an_other_record_is_unreadable = true,
-                    }
+    let item_entries: Vec<_> = match std::fs::read_dir(&items_dir) {
+        Ok(entries) => entries.collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(ContentError::UnreadableManifest {
+                item_id,
+                manifest: items_dir.display().to_string(),
+                error: error.to_string(),
+            })
+        }
+    };
+    for entry in item_entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().map(|e| e == "json").unwrap_or(false) {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if stem == item_id {
+                    continue;
+                }
+                let parsed = std::fs::read_to_string(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|content| {
+                        serde_json::from_str::<ContentItem>(&content).map_err(|e| e.to_string())
+                    });
+                match parsed {
+                    Ok(item) => other_items.push(item),
+                    Err(_) => an_other_record_is_unreadable = true,
                 }
             }
         }

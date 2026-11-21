@@ -1103,15 +1103,16 @@ fn snapshot_folders(ctx: &Ctx) -> Result<Vec<SnapshotFolder>, String> {
     roots.push((ctx.paths.recently_deleted_games_root(), true));
     roots.push((ctx.paths.recently_deleted_root(), true));
     for (root, in_trash) in roots {
-        if !root.exists() {
-            continue;
-        }
-        let entries = std::fs::read_dir(&root).map_err(|error| {
-            format!(
-                "cannot list '{}' to check snapshot content references: {error}",
-                root.display()
-            )
-        })?;
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot list '{}' to check snapshot content references: {error}",
+                    root.display()
+                ))
+            }
+        };
         for entry in entries {
             let entry = entry.map_err(|error| {
                 format!(
