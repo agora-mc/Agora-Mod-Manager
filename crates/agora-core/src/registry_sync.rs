@@ -13,7 +13,7 @@ use crate::registry_bundle::{
     self, BundleError, CatalogHeader, KeyCertificate, KeyRevocation, RegistryKey, RegistryKeyRole,
     RegistryTrust, VerifiedBundle,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use ed25519_dalek::{Signature, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 /// Resolve the registry repository with priority:
 /// 1. CLI override (passed as parameter)
@@ -141,6 +142,105 @@ pub async fn check_and_download_update(
     .await
 }
 
+/// The parts of a bundle install that do not depend on where the bytes came
+/// from: verification, expiry, rollback and schema checks, the single-rename
+/// install and remembering the trust the bundle taught us.
+#[derive(Debug, Clone)]
+pub struct InstalledBundle {
+    pub tag: String,
+    pub schema_version: i64,
+    pub expires_at: String,
+}
+
+/// Install a signed `registry.bundle` from a local file.
+///
+/// Uses the same verification and install path as a downloaded bundle, with
+/// the compiled-in keys plus the remembered `registry.trust` state. A local
+/// file is just another source of bytes: it takes the same cross-process
+/// `RegistryUpdate` lock sync does, so the rollback check and the single-rename
+/// commit cannot race a concurrent sync. The tag named by the signed bundle
+/// header is kept for display, and no release asset id is recorded.
+pub fn install_bundle_from_file(
+    app_data_dir: &Path,
+    local_state_path: &Path,
+    bundle_path: &Path,
+    lock_manager: &LockManager,
+) -> LauncherResult<InstalledBundle> {
+    let trust = effective_trust(app_data_dir, &RegistryTrust::production());
+    install_bundle_from_file_with_trust(
+        app_data_dir,
+        local_state_path,
+        bundle_path,
+        &trust,
+        lock_manager,
+    )
+}
+
+/// As [`install_bundle_from_file`], with an explicit trust list. This is the
+/// entry point tests use to install a locally built signed bundle.
+pub fn install_bundle_from_file_with_trust(
+    app_data_dir: &Path,
+    local_state_path: &Path,
+    bundle_path: &Path,
+    trust: &RegistryTrust,
+    lock_manager: &LockManager,
+) -> LauncherResult<InstalledBundle> {
+    install_local_inner(
+        app_data_dir,
+        local_state_path,
+        bundle_path,
+        trust,
+        lock_manager,
+        None,
+    )
+}
+
+/// The local install body. `timeout` lets a test prove the lock is taken
+/// without waiting the production timeout; production always waits.
+fn install_local_inner(
+    app_data_dir: &Path,
+    local_state_path: &Path,
+    bundle_path: &Path,
+    trust: &RegistryTrust,
+    lock_manager: &LockManager,
+    timeout: Option<Duration>,
+) -> LauncherResult<InstalledBundle> {
+    // The rollback comparison in `install_bundle_bytes_checked` and the commit
+    // it guards must see the same catalog. Sync holds this lock across its
+    // check-and-commit, so a local install must hold it too.
+    let _registry_lock = match timeout {
+        Some(duration) => lock_manager.acquire_with_timeout(
+            crate::lock_manager::LockResource::RegistryUpdate,
+            "registry-local-install",
+            duration,
+            None,
+        )?,
+        None => lock_manager.acquire(
+            crate::lock_manager::LockResource::RegistryUpdate,
+            "registry-local-install",
+        )?,
+    };
+
+    let bytes = std::fs::read(bundle_path).map_err(|error| LauncherError::Generic {
+        code: "ERR_REGISTRY_BUNDLE_READ".into(),
+        message: format!(
+            "Could not read the catalog bundle file {}: {error}.",
+            bundle_path.display()
+        ),
+    })?;
+    let installed = install_bundle_bytes_checked(
+        app_data_dir,
+        &bytes,
+        trust,
+        &bundle_path.display().to_string(),
+    )?;
+    // Display metadata is written after the commit; a failure here must not
+    // report failure for a bundle that is already installed.
+    let _ = set_cached_tag(local_state_path, &installed.tag);
+    let _ = set_cached_asset_id(local_state_path, None);
+    Ok(installed)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn check_and_download_update_inner(
     app_data_dir: &Path,
@@ -253,8 +353,16 @@ async fn check_and_download_update_inner(
     // reinstating entries that curation has since quarantined.
     let latest_asset = latest.find_asset("registry.bundle");
     let cached_asset = get_cached_asset_id(local_state_path)?;
+    // Decide whether to fetch a candidate from the signed build stamp, not the
+    // signed display tag. An unverifiable cached bundle yields no date, which
+    // makes the pre-filter fetch so the signed checks can have the last word.
+    let cached_release_date = rollback_baseline(app_data_dir, trust)
+        .ok()
+        .flatten()
+        .as_ref()
+        .and_then(|stamp| cached_release_date_from_stamp(Some(stamp)));
     let update_available = update_is_available(
-        cached_tag.as_deref(),
+        cached_release_date.as_deref(),
         has_cached_db,
         cached_asset,
         &latest.tag_name,
@@ -262,8 +370,8 @@ async fn check_and_download_update_inner(
     );
 
     if !update_available && has_cached_db {
-        clear_update_failure(local_state_path)?;
-        set_last_success_time(local_state_path, now)?;
+        let _ = clear_update_failure(local_state_path);
+        let _ = set_last_success_time(local_state_path, now);
         let cached = cached_catalog_summary_with_trust(app_data_dir, trust);
         return Ok(RegistryStatus {
             has_cached_db,
@@ -281,7 +389,7 @@ async fn check_and_download_update_inner(
     // Register operation only when we are about to start network I/O.
     let _op = operation_manager.map(|m| m.register("Update registry"));
 
-    let install_result: LauncherResult<(i64, String)> = async {
+    let install_result: LauncherResult<(i64, String, bool)> = async {
         let bundle_id =
             latest
                 .find_asset("registry.bundle")
@@ -320,83 +428,63 @@ async fn check_and_download_update_inner(
             }
         };
 
-        let verified =
-            registry_bundle::verify_bundle(&bundle_bytes, trust).map_err(bundle_error)?;
-
-        // Anti-rollback, checked only after the signature so the compared stamp is
-        // one the signing key vouched for. The tag pre-check above works on
-        // unsigned API metadata and can be forged; this cannot.
-        let candidate_built_at = Some(verified.header.built_at.clone());
-        let cached_built_at = read_cached_built_at_checked(app_data_dir, trust)?;
-        if is_rollback(cached_built_at.as_deref(), candidate_built_at.as_deref()) {
-            return Err(LauncherError::Generic {
-                code: "ERR_REGISTRY_ROLLBACK".into(),
-                message: format!(
-                    "Refusing registry {}: it was built at {}, older than the registry already \
-                     installed ({}). The cached registry has been kept.",
-                    latest.tag_name,
-                    candidate_built_at.as_deref().unwrap_or("unknown"),
-                    cached_built_at.as_deref().unwrap_or("unknown"),
-                ),
-            });
+        // A same-day republish, or a tag published across UTC midnight, can
+        // hand us the bytes we already have. Do not reinstall or claim an
+        // update: just learn the asset id so the next check stops fetching it.
+        if let Some(current) = unchanged_candidate(app_data_dir, &bundle_bytes, trust)? {
+            let _ = set_cached_asset_id(local_state_path, Some(bundle_id));
+            return Ok((current.schema_version, current.expires_at, false));
         }
 
-        // An expired bundle is readable but never installed as current: doing so
-        // would replace a good cache with one that already cannot be used for an
-        // install or update.
-        if verified.header.is_expired_at(Utc::now()) {
-            return Err(LauncherError::Generic {
-                code: "ERR_REGISTRY_EXPIRED".into(),
-                message: format!(
-                    "Refusing registry {}: it expired at {}. The cached registry has been kept.",
-                    latest.tag_name, verified.header.expires_at
-                ),
-            });
-        }
-
-        let schema_version = verified.header.schema_version;
-        if schema_version > APP_REGISTRY_SCHEMA_VERSION {
-            return Err(LauncherError::Generic {
-                code: "ERR_REGISTRY_NEWER_SCHEMA".to_string(),
-                message: format!(
-                    "Catalog schema version {} is newer than supported {}. Please update the app.",
-                    schema_version, APP_REGISTRY_SCHEMA_VERSION
-                ),
-            });
-        }
-
-        install_bundle_bytes(app_data_dir, &verified.header, &bundle_bytes, trust)?;
-        set_cached_tag(local_state_path, &latest.tag_name)?;
-        set_cached_asset_id(local_state_path, Some(bundle_id))?;
-        Ok((schema_version, verified.header.expires_at))
+        let installed =
+            install_bundle_bytes_checked(app_data_dir, &bundle_bytes, trust, &latest.tag_name)?;
+        // Display/asset metadata is written after the commit. The bundle is
+        // already current, so a write failure here must not be reported as a
+        // failed install; the next sync can set it again.
+        let _ = set_cached_tag(local_state_path, &latest.tag_name);
+        let _ = set_cached_asset_id(local_state_path, Some(bundle_id));
+        Ok((installed.schema_version, installed.expires_at, true))
     }
     .await;
 
-    let (schema_version, expires_at) = match install_result {
+    let (schema_version, expires_at, changed) = match install_result {
         Ok(ok) => ok,
         Err(error) => {
-            set_update_failure(local_state_path, now, &latest.tag_name)?;
+            // Bookkeeping must never mask the real failure or make a committed
+            // bundle look like a failed update.
+            let _ = set_update_failure(local_state_path, now, &latest.tag_name);
             return Err(error);
         }
     };
 
-    clear_update_failure(local_state_path)?;
-    set_last_success_time(local_state_path, now)?;
+    let _ = clear_update_failure(local_state_path);
+    let _ = set_last_success_time(local_state_path, now);
 
     if let Some(op) = _op {
         op.complete();
     }
 
+    // An identical candidate skips extraction, and extraction can fail even
+    // after a real install. Report the actual readable-database state.
+    let ready = cached_catalog_summary_with_trust(app_data_dir, trust).is_some();
     Ok(RegistryStatus {
-        has_cached_db: true,
-        cached_tag: Some(latest.tag_name.clone()),
+        has_cached_db: ready,
+        cached_tag: if changed {
+            Some(latest.tag_name.clone())
+        } else {
+            cached_tag
+        },
         cached_schema_version: Some(schema_version),
         latest_tag: Some(latest.tag_name.clone()),
         update_available: false,
         checked: true,
         stale: false,
         expires_at: Some(expires_at),
-        message: format!("Catalog updated to {}.", latest.tag_name),
+        message: if changed {
+            format!("Catalog updated to {}.", latest.tag_name)
+        } else {
+            "Catalog is up to date.".to_string()
+        },
     })
 }
 
@@ -662,14 +750,215 @@ fn effective_trust(app_data_dir: &Path, base: &RegistryTrust) -> RegistryTrust {
     trust
 }
 
+/// A trust state that exists but cannot be read is not an empty trust state:
+/// it may hold revocations we are ignoring. Refuse trust decisions in that case
+/// rather than treating forgotten revocations as no revocations.
+fn remembered_trust_readable(app_data_dir: &Path) -> LauncherResult<()> {
+    let path =
+        paths::registry_trust_state_path(app_data_dir).map_err(|_| LauncherError::Generic {
+            code: "ERR_REGISTRY_TRUST_STATE".into(),
+            message: "Could not resolve the catalog trust state path.".into(),
+        })?;
+    if path.exists() && std::fs::read_to_string(&path).is_err() {
+        return Err(LauncherError::Generic {
+            code: "ERR_REGISTRY_TRUST_STATE".into(),
+            message: "The remembered catalog trust state could not be read.".into(),
+        });
+    }
+    Ok(())
+}
+
+/// The durable rollback floor: the highest signed build stamp ever committed,
+/// with the payload hash of the bundle that carried it. It lives beside the
+/// remembered trust state and is raised only after a successful commit, so a
+/// bundle that cannot be verified still cannot be used to argue that an older
+/// signed bundle is newer.
+fn registry_floor_path(app_data_dir: &Path) -> LauncherResult<PathBuf> {
+    Ok(app_data_dir.join("registry.floor"))
+}
+
+fn floor_error(message: impl Into<String>) -> LauncherError {
+    LauncherError::Generic {
+        code: "ERR_REGISTRY_FLOOR".into(),
+        message: message.into(),
+    }
+}
+
+/// Read the durable floor. A missing file is an unset floor; an unreadable or
+/// malformed one is an error and must never be mistaken for "no floor", because
+/// that would drop rollback protection.
+fn read_floor_file(app_data_dir: &Path) -> LauncherResult<Option<CachedStamp>> {
+    let path = registry_floor_path(app_data_dir)?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(floor_error(format!(
+                "Could not read the catalog rollback floor: {error}."
+            )))
+        }
+    };
+    let mut fields = text.split_whitespace();
+    let built_at = fields
+        .next()
+        .ok_or_else(|| floor_error("The catalog rollback floor is empty."))?
+        .to_string();
+    let db_sha256 = fields
+        .next()
+        .ok_or_else(|| floor_error("The catalog rollback floor has no payload hash."))?
+        .to_string();
+    if parse_utc(&built_at).is_none() || db_sha256.len() != 64 {
+        return Err(floor_error("The catalog rollback floor is malformed."));
+    }
+    Ok(Some(CachedStamp {
+        built_at,
+        db_sha256,
+    }))
+}
+
+/// Before any trust statement is appended, capture the verified baseline of a
+/// pre-floor cache. Otherwise the append can revoke the installed bundle's
+/// signer, a failed swap leaves that bundle unverifiable, and the effective
+/// floor is lost with it. The floor is durable before the trust change.
+fn ensure_floor_baseline(app_data_dir: &Path, trust: &RegistryTrust) -> LauncherResult<()> {
+    // Reading first also fails closed on a malformed or unreadable floor.
+    let _ = read_floor_file(app_data_dir)?;
+    // Checkpoint the maximum, not just an unset floor: a previous post-swap
+    // write may have failed and left the stored floor lagging the installed
+    // bundle. `raise_floor` keeps the higher of the two.
+    if let Some(stamp) = read_cached_stamp(app_data_dir, trust) {
+        raise_floor(app_data_dir, &stamp.built_at, &stamp.db_sha256)?;
+    }
+    Ok(())
+}
+
+/// The effective rollback floor. A client with a pre-floor trust state takes it
+/// from the installed bundle when that bundle still verifies; otherwise the
+/// floor is unset and candidates are judged on their own signed stamps.
+fn durable_floor(
+    app_data_dir: &Path,
+    trust: &RegistryTrust,
+) -> LauncherResult<Option<CachedStamp>> {
+    // An unreadable or malformed floor is an error everywhere: treating it as
+    // unset would drop rollback protection on installs, opens and recovery.
+    if let Some(floor) = read_floor_file(app_data_dir)? {
+        return Ok(Some(floor));
+    }
+    // Only a genuinely absent file migrates from the installed bundle.
+    let bundle_path = match paths::registry_bundle_path(app_data_dir) {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    if !bundle_path.exists() {
+        return Ok(None);
+    }
+    let header = match load_header(&bundle_path, trust) {
+        Ok(header) => header,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(CachedStamp {
+        built_at: header.built_at,
+        db_sha256: header.db_sha256,
+    }))
+}
+
+/// Raise the floor after a successful commit. An existing higher floor wins:
+/// the value is monotonic and never lowered by a replay or a recovery.
+fn raise_floor(app_data_dir: &Path, built_at: &str, db_sha256: &str) -> LauncherResult<()> {
+    let candidate = parse_utc(built_at).ok_or_else(|| LauncherError::Generic {
+        code: "ERR_REGISTRY_STAMP_INVALID".into(),
+        message: format!("The committed catalog's build stamp `{built_at}` cannot be read."),
+    })?;
+    if let Some(current) = read_floor_file(app_data_dir)? {
+        if parse_utc(&current.built_at).is_some_and(|time| time >= candidate) {
+            return Ok(());
+        }
+    }
+    let path = registry_floor_path(app_data_dir)?;
+    // Test-only failure injection, keyed by data root so parallel tests with
+    // their own TempDirs cannot affect each other. Unlike a read-only file,
+    // this fails identically on Windows, Linux and macOS: `write_atomic`
+    // renames a fresh temp file and would otherwise ignore the old file's
+    // attributes on Unix.
+    #[cfg(test)]
+    if injected_floor_write_failure(app_data_dir) {
+        return Err(floor_error(
+            "Injected catalog rollback floor write failure.",
+        ));
+    }
+    write_atomic(&path, format!("{built_at} {db_sha256}\n").as_bytes()).map_err(|error| {
+        floor_error(format!(
+            "Could not save the catalog rollback floor: {error}."
+        ))
+    })
+}
+
+#[cfg(test)]
+fn floor_write_failures() -> &'static Mutex<Vec<PathBuf>> {
+    static FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn injected_floor_write_failure(app_data_dir: &Path) -> bool {
+    floor_write_failures()
+        .lock()
+        .map(|dirs| dirs.iter().any(|dir| dir == app_data_dir))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+struct FloorWriteFailureGuard(PathBuf);
+
+#[cfg(test)]
+impl Drop for FloorWriteFailureGuard {
+    fn drop(&mut self) {
+        if let Ok(mut dirs) = floor_write_failures().lock() {
+            dirs.retain(|dir| dir != &self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+fn fail_floor_writes(app_data_dir: &Path) -> FloorWriteFailureGuard {
+    floor_write_failures()
+        .lock()
+        .unwrap()
+        .push(app_data_dir.to_path_buf());
+    FloorWriteFailureGuard(app_data_dir.to_path_buf())
+}
+
+/// The strongest baseline a replacement is compared against: the higher of the
+/// installed bundle's signed stamp and the durable floor. A bundle that cannot
+/// be verified contributes nothing here, but the floor still applies.
+fn rollback_baseline(
+    app_data_dir: &Path,
+    trust: &RegistryTrust,
+) -> LauncherResult<Option<CachedStamp>> {
+    let installed = read_cached_stamp(app_data_dir, trust);
+    let floor = durable_floor(app_data_dir, trust)?;
+    Ok(match (installed, floor) {
+        (Some(installed), Some(floor)) => {
+            match (parse_utc(&installed.built_at), parse_utc(&floor.built_at)) {
+                (Some(a), Some(b)) if b > a => Some(floor),
+                _ => Some(installed),
+            }
+        }
+        (Some(installed), None) => Some(installed),
+        (None, floor) => floor,
+    })
+}
+
 /// Persist the keys a verified bundle introduced and the revocations a recovery
 /// key signed. Only complete lines are appended, and the file is never
 /// rewritten, so a crash cannot lose an earlier revocation. Duplicate lines are
-/// harmless.
-fn remember_bundle_trust(app_data_dir: &Path, verified: &VerifiedBundle) -> LauncherResult<()> {
-    if verified.header.is_expired_at(Utc::now()) {
-        return Ok(());
-    }
+/// harmless. A write or flush error can leave some complete, verified entries
+/// behind and lose only the later ones: that is acceptable because every line
+/// is independently signed and verified, so a partial append never invents a
+/// trust fact and a later install can append the missing lines again.
+fn remember_bundle_trust(app_data_dir: &Path, verified: &VerifiedBundle) -> LauncherResult<bool> {
+    // Expiry is not a reason to skip a revocation: a retired key stays retired
+    // even if the bundle that carried the statement has since expired.
     let path =
         paths::registry_trust_state_path(app_data_dir).map_err(|_| LauncherError::Generic {
             code: "ERR_REGISTRY_TRUST_STATE".into(),
@@ -705,7 +994,7 @@ fn remember_bundle_trust(app_data_dir: &Path, verified: &VerifiedBundle) -> Laun
         ));
     }
     if lines.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     if existing.is_empty() {
         std::fs::create_dir_all(path.parent().unwrap_or(Path::new("."))).ok();
@@ -727,6 +1016,7 @@ fn remember_bundle_trust(app_data_dir: &Path, verified: &VerifiedBundle) -> Laun
             code: "ERR_REGISTRY_TRUST_STATE".into(),
             message: format!("Could not save the catalog trust state: {error}."),
         })
+        .map(|()| true)
 }
 
 fn verifying_key_hex(public_key_hex: &str) -> Option<ed25519_dalek::VerifyingKey> {
@@ -984,11 +1274,176 @@ fn ensure_database(
     Ok(())
 }
 
+/// Verify candidate bundle bytes and install them only when they are current,
+/// newer than the installed catalog and supported by this app.
+///
+/// Both the GitHub release sync and the local-file install call this after the
+/// bytes are obtained, so expiry, rollback and schema rules cannot drift
+/// between the two sources. `label` names the source in refusal messages: a
+/// release tag for sync, a file path for a local install.
+fn install_bundle_bytes_checked(
+    app_data_dir: &Path,
+    bundle_bytes: &[u8],
+    trust: &RegistryTrust,
+    label: &str,
+) -> LauncherResult<InstalledBundle> {
+    remembered_trust_readable(app_data_dir)?;
+    let trust = effective_trust(app_data_dir, trust);
+    let verified = registry_bundle::verify_bundle(bundle_bytes, &trust).map_err(bundle_error)?;
+
+    // Anti-rollback is checked only after the signature, so the stamp being
+    // compared is one the signing key vouched for. The release tag is display
+    // metadata and never takes part in this decision. An installed bundle that
+    // no longer verifies contributes nothing, but the durable floor still does.
+    let cached_stamp = rollback_baseline(app_data_dir, &trust)?;
+    match compare_stamps(
+        cached_stamp.as_ref(),
+        &verified.header.built_at,
+        &verified.header.db_sha256,
+    )? {
+        StampOrder::Older => {
+            return Err(LauncherError::Generic {
+                code: "ERR_REGISTRY_ROLLBACK".into(),
+                message: format!(
+                    "Refusing registry {}: it was built at {}, older than the registry already \
+                     installed ({}). The cached registry has been kept.",
+                    label,
+                    verified.header.built_at,
+                    cached_stamp
+                        .as_ref()
+                        .map(|stamp| stamp.built_at.as_str())
+                        .unwrap_or("unknown"),
+                ),
+            })
+        }
+        StampOrder::EqualDifferentBytes => {
+            return Err(LauncherError::Generic {
+                code: "ERR_REGISTRY_ROLLBACK".into(),
+                message: format!(
+                    "Refusing registry {}: it carries a different signed payload with the same \
+                     build stamp ({}) as the registry already installed. The cached registry has \
+                     been kept.",
+                    label, verified.header.built_at
+                ),
+            })
+        }
+        StampOrder::Newer | StampOrder::EqualSameBytes => {}
+    }
+
+    // An expired bundle stays readable but is never installed as current: doing
+    // so would replace a good cache with one that cannot be used for an install
+    // or update.
+    if verified.header.is_expired_at(Utc::now()) {
+        return Err(LauncherError::Generic {
+            code: "ERR_REGISTRY_EXPIRED".into(),
+            message: format!(
+                "Refusing registry {}: it expired at {}. The cached registry has been kept.",
+                label, verified.header.expires_at
+            ),
+        });
+    }
+
+    let schema_version = verified.header.schema_version;
+    if schema_version > APP_REGISTRY_SCHEMA_VERSION {
+        return Err(LauncherError::Generic {
+            code: "ERR_REGISTRY_NEWER_SCHEMA".to_string(),
+            message: format!(
+                "Catalog schema version {} is newer than supported {}. Please update the app.",
+                schema_version, APP_REGISTRY_SCHEMA_VERSION
+            ),
+        });
+    }
+
+    install_bundle_bytes(app_data_dir, &verified.header, bundle_bytes, &trust)?;
+
+    Ok(InstalledBundle {
+        tag: verified.header.tag,
+        schema_version,
+        expires_at: verified.header.expires_at,
+    })
+}
+
+/// If `bundle_bytes` are exactly the installed bundle, return its install
+/// metadata without writing anything. The installed bundle's trust statements
+/// are reconciled first, so reporting "up to date" can never skip a reconciliation
+/// that is still owed. Anything else — including equal stamps over different
+/// bytes — is not unchanged and goes through the normal checks.
+fn unchanged_candidate(
+    app_data_dir: &Path,
+    bundle_bytes: &[u8],
+    trust: &RegistryTrust,
+) -> LauncherResult<Option<InstalledBundle>> {
+    remembered_trust_readable(app_data_dir)?;
+    let trust = effective_trust(app_data_dir, trust);
+    let verified = registry_bundle::verify_bundle(bundle_bytes, &trust).map_err(bundle_error)?;
+    let cached = rollback_baseline(app_data_dir, &trust)?;
+    if compare_stamps(
+        cached.as_ref(),
+        &verified.header.built_at,
+        &verified.header.db_sha256,
+    )? != StampOrder::EqualSameBytes
+    {
+        return Ok(None);
+    }
+    let current =
+        paths::registry_bundle_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
+    if !std::fs::read(current)
+        .map(|bytes| bytes == bundle_bytes)
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    Ok(Some(InstalledBundle {
+        tag: verified.header.tag,
+        schema_version: verified.header.schema_version,
+        expires_at: verified.header.expires_at,
+    }))
+}
+
 /// Install the exact signed bytes of a bundle that has already been verified.
 ///
-/// The bundle is one file, so it is replaced by one rename. Before that, the
-/// previous good bundle is copied to `registry.bundle.prev`; a crash at any
-/// point leaves either the old current or the old previous usable.
+/// The remembered trust state is the single durable authority. As soon as the
+/// candidate verifies, its revocations and keys are appended and synced *before*
+/// any bundle file is touched; a failed append refuses the install and changes
+/// nothing. A revocation may untrust the bundle currently installed — that is
+/// safe now, because an unverifiable bundle contributes no stamp and the
+/// rollback floor keeps the catalogue from being replayed.
+///
+/// The bundle is one file, so it is replaced by one rename; the previous good
+/// bundle is copied to `registry.bundle.prev` first. The rollback floor is
+/// raised after the rename. The readable database is a derived copy that the
+/// next open can repair.
+///
+/// If a swap fails after a trust append, the catalog can be left offline: the
+/// verified revocation is kept while the bundle it revoked is still current.
+/// That is deliberate — a genuine revocation must not be discarded to keep a
+/// retired signer usable — and the error says exactly what happened. When no
+/// statement was appended it says the trust state did not change.
+fn swap_error(error: LauncherError, trust_written: bool) -> LauncherError {
+    let code = error.code();
+    let detail = if trust_written {
+        "The catalog trust update was kept; reinstall or sync the catalog to restore it."
+    } else {
+        "The catalog trust state was not changed."
+    };
+    LauncherError::Generic {
+        code,
+        message: format!("{error}. {detail}"),
+    }
+}
+
+/// A floor write that fails after the bundle swap is a different case: the new
+/// catalog is already installed and the floor can be checkpointed on the next
+/// install, so do not advise reinstalling or claim a trust update was kept.
+fn floor_after_swap_error(error: LauncherError) -> LauncherError {
+    LauncherError::Generic {
+        code: error.code(),
+        message: format!(
+            "{error}. The new catalog is installed; its rollback floor will be re-checkpointed next time."
+        ),
+    }
+}
+
 fn install_bundle_bytes(
     app_data_dir: &Path,
     header: &CatalogHeader,
@@ -1001,42 +1456,61 @@ fn install_bundle_bytes(
         .map_err(|_| LauncherError::RegistryMissing)?;
     let trust = effective_trust(app_data_dir, trust);
     let payload = registry_bundle::verify_bundle(bundle_bytes, &trust).map_err(bundle_error)?;
-    // Remember what this verified bundle teaches before it is installed. A
-    // failure to persist a revocation must not leave a catalog whose future
-    // keys the client has not learned about.
-    remember_bundle_trust(app_data_dir, &payload)?;
+
+    // Capture the pre-existing verified baseline before changing trust: the
+    // append below may revoke the installed bundle's signer, so its stamp must
+    // already be durable. A malformed or unreadable floor refuses the install.
+    ensure_floor_baseline(app_data_dir, &trust)?;
+    // Signed and verified trust facts only ever add, so writing them ahead of
+    // the swap is always safe and no revocation can be lost by a later failure.
+    let trust_written = remember_bundle_trust(app_data_dir, &payload)?;
 
     // Keep the previous copy only when the current file looks like a bundle.
     // A corrupt current must not overwrite a good previous one.
     if bundle_path.exists() {
         if let Ok(current) = std::fs::read(&bundle_path) {
             if registry_bundle::parse_bundle(&current).is_ok() {
-                write_atomic(&previous_path, &current).map_err(|error| LauncherError::Generic {
-                    code: "ERR_REGISTRY_WRITE".into(),
-                    message: format!("Could not keep the previous catalog: {error}."),
+                write_atomic(&previous_path, &current).map_err(|error| {
+                    swap_error(
+                        LauncherError::Generic {
+                            code: "ERR_REGISTRY_WRITE".into(),
+                            message: format!("Could not keep the previous catalog: {error}."),
+                        },
+                        trust_written,
+                    )
                 })?;
             }
         }
     }
 
-    write_atomic(&bundle_path, bundle_bytes).map_err(|error| LauncherError::Generic {
-        code: "ERR_REGISTRY_WRITE".into(),
-        message: format!("Could not install the catalog bundle: {error}."),
+    // COMMIT: one rename replaces the current bundle.
+    write_atomic(&bundle_path, bundle_bytes).map_err(|error| {
+        swap_error(
+            LauncherError::Generic {
+                code: "ERR_REGISTRY_WRITE".into(),
+                message: format!("Could not install the catalog bundle: {error}."),
+            },
+            trust_written,
+        )
     })?;
 
-    // The signature lives inside the bundle now. An old sidecar beside the new
-    // database would describe bytes that are no longer there.
+    // Post-commit, best-effort. The signature lives inside the bundle now, so
+    // an old sidecar would describe bytes that are no longer there.
     if let Ok(sig_path) = paths::registry_sig_path(app_data_dir) {
         let _ = std::fs::remove_file(sig_path);
     }
-
-    ensure_database(
+    // The readable database is a derived copy: if this fails, the next open
+    // extracts it again from the bundle that is now current.
+    let _ = ensure_database(
         app_data_dir,
         &bundle_path,
         header,
         Some(&payload.payload),
         &trust,
-    )
+    );
+    raise_floor(app_data_dir, &header.built_at, &header.db_sha256)
+        .map_err(floor_after_swap_error)?;
+    Ok(())
 }
 
 /// Verify the cached catalog, recovering from the previous bundle when the
@@ -1079,14 +1553,20 @@ fn verify_bundle_file(
 ) -> CachedRegistryIntegrity {
     match load_header(bundle_path, trust) {
         Ok(header) => match ensure_database(app_data_dir, bundle_path, &header, None, trust) {
-            Ok(()) => {
-                if header.is_expired_at(Utc::now()) {
-                    CachedRegistryIntegrity::Stale(stale_message(&header))
-                } else {
-                    remember_cached_bundle(app_data_dir, bundle_path, trust);
-                    CachedRegistryIntegrity::Verified
+            Ok(()) => match below_floor(&header, app_data_dir, trust) {
+                Ok(true) => CachedRegistryIntegrity::Stale(floor_stale_message()),
+                Ok(false) => {
+                    if header.is_expired_at(Utc::now()) {
+                        CachedRegistryIntegrity::Stale(stale_message(&header))
+                    } else {
+                        CachedRegistryIntegrity::Verified
+                    }
                 }
-            }
+                // A floor we cannot read is not a floor we can ignore.
+                Err(error) => CachedRegistryIntegrity::Error(format!(
+                    "{error} The catalog will not be used this run."
+                )),
+            },
             Err(error) => CachedRegistryIntegrity::Error(format!(
                 "{error} The catalog will not be used this run."
             )),
@@ -1111,10 +1591,23 @@ fn recover_previous(
         Ok(path) => path,
         Err(_) => return quarantine_bundle(bundle_path, reason),
     };
+    // Recovery uses the remembered trust as its authority. A trust file that
+    // exists but cannot be read is never treated as "no revocations".
+    if remembered_trust_readable(app_data_dir).is_err() {
+        return quarantine_bundle(
+            bundle_path,
+            format!("{reason} The remembered catalog trust state could not be read."),
+        );
+    }
     if previous_path.exists() {
         if let Ok(header) = load_header(&previous_path, trust) {
-            if ensure_database(app_data_dir, &previous_path, &header, None, trust).is_ok() {
-                remember_cached_bundle(app_data_dir, &previous_path, trust);
+            // A backup below the durable floor is a superseded catalog. Keep it
+            // for inspection but never promote it: a read-only mode would still
+            // expose stale curated data to installs, and needs new status state.
+            let is_below_floor = below_floor(&header, app_data_dir, trust).unwrap_or(true);
+            if !is_below_floor
+                && ensure_database(app_data_dir, &previous_path, &header, None, trust).is_ok()
+            {
                 let recovered = format!("{reason} The previous verified catalog was restored.");
                 if let Ok(previous_bytes) = std::fs::read(&previous_path) {
                     if quarantine_aside(bundle_path, "bundle.untrusted").is_ok()
@@ -1138,15 +1631,6 @@ fn quarantine_bundle(bundle_path: &Path, reason: String) -> CachedRegistryIntegr
     CachedRegistryIntegrity::Quarantined(reason)
 }
 
-/// Re-read a bundle that already verified and remember what it teaches. This
-/// is what lets a client upgraded from a pre-trust-state build learn the keys
-/// and revocations of the catalog it already has.
-fn remember_cached_bundle(app_data_dir: &Path, bundle_path: &Path, trust: &RegistryTrust) {
-    if let Ok(verified) = load_payload(bundle_path, trust) {
-        let _ = remember_bundle_trust(app_data_dir, &verified);
-    }
-}
-
 fn stale_message(header: &CatalogHeader) -> String {
     format!(
         "The catalog expired on {}. It can still be browsed, but installs and updates wait for a fresh catalog.",
@@ -1154,31 +1638,48 @@ fn stale_message(header: &CatalogHeader) -> String {
     )
 }
 
-/// The signed build stamp of the cached catalog, for the rollback check.
-///
-/// An absent catalog is `None` (nothing to roll back from). A catalog that is
-/// present but cannot be read or verified is an error: treating "unknown" as
-/// "older" is what lets a replayed old signed catalog replace a newer one.
-fn read_cached_built_at_checked(
+/// Whether a verified bundle's signed stamp is below the durable floor. The
+/// comparison is between parsed UTC instants, never between the stamp strings.
+fn below_floor(
+    header: &CatalogHeader,
     app_data_dir: &Path,
     trust: &RegistryTrust,
-) -> LauncherResult<Option<String>> {
-    let bundle_path =
-        paths::registry_bundle_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
-    if bundle_path.exists() {
-        return match load_header(&bundle_path, trust) {
-            Ok(header) => Ok(Some(header.built_at)),
-            Err(error) => Err(LauncherError::Generic {
-                code: "ERR_REGISTRY_CACHED_STAMP_UNREADABLE".into(),
-                message: format!(
-                    "The installed catalog's signed build stamp cannot be read ({error}), so an update cannot be proved newer. The cached catalog has been kept."
-                ),
-            }),
-        };
-    }
+) -> LauncherResult<bool> {
+    Ok(durable_floor(app_data_dir, trust)?.is_some_and(|floor| {
+        parse_utc(&header.built_at)
+            .zip(parse_utc(&floor.built_at))
+            .is_some_and(|(candidate, floor)| candidate < floor)
+    }))
+}
 
-    // No bundle is no catalog: there is no signed stamp to roll back from.
-    Ok(None)
+fn floor_stale_message() -> String {
+    "The cached catalog is older than a previously committed catalog. It is shown for browsing \
+     only; sync for a fresh catalog before installing or updating."
+        .to_string()
+}
+
+/// The signed build stamp and payload hash of the cached catalog, for the
+/// rollback check. The hash lets an equal stamp over different bytes be
+/// refused instead of silently replacing the current catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedStamp {
+    built_at: String,
+    db_sha256: String,
+}
+
+/// An installed bundle that cannot be verified contributes no stamp: neither
+/// trust statements nor a signed build time can be taken from it. The durable
+/// floor is the authority that still prevents replay in that state.
+fn read_cached_stamp(app_data_dir: &Path, trust: &RegistryTrust) -> Option<CachedStamp> {
+    let bundle_path = paths::registry_bundle_path(app_data_dir).ok()?;
+    if !bundle_path.exists() {
+        return None;
+    }
+    let header = load_header(&bundle_path, trust).ok()?;
+    Some(CachedStamp {
+        built_at: header.built_at,
+        db_sha256: header.db_sha256,
+    })
 }
 
 fn cached_catalog_summary_with_trust(
@@ -1188,9 +1689,24 @@ fn cached_catalog_summary_with_trust(
     let bundle_path = paths::registry_bundle_path(app_data_dir).ok()?;
     if bundle_path.exists() {
         let header = load_header(&bundle_path, trust).ok()?;
+        // Readiness is not "a header verified": the readable database must be
+        // present and be the bytes the header signed. A crash between the
+        // bundle rename and extraction, or a swapped registry.db, must show as
+        // not ready rather than a catalog the desktop thinks it can use.
+        let db_path = paths::registry_db_path(app_data_dir).ok()?;
+        if !db_path.exists() {
+            return None;
+        }
+        let digest = database_hash_memoized(&db_path).ok()?;
+        if !digest.eq_ignore_ascii_case(&header.db_sha256) {
+            return None;
+        }
         return Some(CachedCatalogSummary {
             schema_version: Some(header.schema_version),
-            stale: header.is_expired_at(Utc::now()),
+            // A below-floor catalog is stale in the same user-facing sense as
+            // an expired one: it can be browsed but not used for installations.
+            stale: header.is_expired_at(Utc::now())
+                || below_floor(&header, app_data_dir, trust).unwrap_or(true),
             expires_at: Some(header.expires_at),
         });
     }
@@ -1213,6 +1729,14 @@ pub fn verified_registry_digest(
             code: "ERR_REGISTRY_SIGNATURE_INVALID".into(),
             message: format!("The catalog bundle could not be used: {error}."),
         })?;
+        // The digest is used as a cache key for the readable database, so it
+        // must not materialize one for a bundle a plain open would refuse.
+        if below_floor(&header, app_data_dir, trust)? {
+            return Err(LauncherError::Generic {
+                code: "ERR_REGISTRY_ROLLBACK".into(),
+                message: floor_stale_message(),
+            });
+        }
         ensure_database(app_data_dir, &bundle_path, &header, None, trust)?;
         return Ok(Some(header.db_sha256.to_ascii_lowercase()));
     }
@@ -1644,6 +2168,12 @@ fn open_bundle_once(
         code: "ERR_REGISTRY_SIGNATURE_INVALID".into(),
         message: format!("The catalog bundle could not be used: {error}."),
     })?;
+    if below_floor(&header, app_data_dir, trust)? {
+        return Err(LauncherError::Generic {
+            code: "ERR_REGISTRY_ROLLBACK".into(),
+            message: floor_stale_message(),
+        });
+    }
     ensure_database(app_data_dir, bundle_path, &header, None, trust)?;
     let db_path =
         paths::registry_db_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
@@ -1778,6 +2308,15 @@ fn update_is_available(
         // roll back from.
         return true;
     };
+    // A release published just after UTC midnight can carry a tag a day ahead
+    // of its signed build stamp. If this is the exact asset we already have,
+    // the tag/date mismatch is not a reason to fetch it again; otherwise sync
+    // redownloads the same bytes on every check.
+    if let (Some(cached), Some(latest)) = (cached_asset, latest_asset) {
+        if cached == latest {
+            return false;
+        }
+    }
     if tag_is_newer(cached_tag, latest_tag) {
         return true;
     }
@@ -1805,24 +2344,69 @@ fn parse_registry_tag(tag: &str) -> Option<(u16, u8, u8)> {
     Some((year, month, day))
 }
 
-/// Whether installing `candidate` over `cached` would move the registry
-/// backwards in time.
+/// How a candidate's signed build stamp compares with the cached one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StampOrder {
+    /// The candidate is older; installing it would roll the catalog back.
+    Older,
+    /// Same instant and same signed payload: a harmless no-op.
+    EqualSameBytes,
+    /// Same instant but different signed bytes: refuse rather than pick a winner.
+    EqualDifferentBytes,
+    Newer,
+}
+
+/// Compare signed build stamps as parsed UTC instants, not as text: RFC 3339
+/// offsets can sort differently from the moments they represent. An unparseable
+/// stamp is an error, never permission to replace the current catalog.
 ///
-/// Both stamps come from inside signature-verified database bytes, so unlike
-/// the release tag they cannot be forged without the signing key. ISO-8601 UTC
-/// timestamps from the compiler compare correctly as strings.
-///
-/// An unstamped candidate over a stamped cache is a rollback: it predates the stamp, so it is
-/// older than anything stamped. Refusing it keeps the stamped registry. A *cached* database
-/// predating the stamp has no value to compare, and refusing every update in that state would
-/// strand clients on exactly the registry we want them to move off, so that direction still
-/// allows the update.
-fn is_rollback(cached_built_at: Option<&str>, candidate_built_at: Option<&str>) -> bool {
-    match (cached_built_at, candidate_built_at) {
-        (Some(cached), Some(candidate)) => candidate < cached,
-        (Some(_), None) => true,
-        _ => false,
+/// Both stamps come from signature-verified bytes, so unlike the release tag
+/// they cannot be forged without the signing key. A cached database predating
+/// the stamp has no value to compare, and refusing every update in that state
+/// would strand clients, so that direction allows the update.
+fn compare_stamps(
+    cached: Option<&CachedStamp>,
+    candidate_built_at: &str,
+    candidate_db_sha256: &str,
+) -> LauncherResult<StampOrder> {
+    let candidate_time = parse_utc(candidate_built_at).ok_or_else(|| LauncherError::Generic {
+        code: "ERR_REGISTRY_STAMP_INVALID".into(),
+        message: format!(
+            "The candidate catalog's signed build stamp `{candidate_built_at}` cannot be read."
+        ),
+    })?;
+    let Some(cached) = cached else {
+        return Ok(StampOrder::Newer);
+    };
+    let cached_time = parse_utc(&cached.built_at).ok_or_else(|| LauncherError::Generic {
+        code: "ERR_REGISTRY_CACHED_STAMP_UNREADABLE".into(),
+        message: "The installed catalog's signed build stamp cannot be read.".into(),
+    })?;
+    match candidate_time.cmp(&cached_time) {
+        std::cmp::Ordering::Less => Ok(StampOrder::Older),
+        std::cmp::Ordering::Greater => Ok(StampOrder::Newer),
+        std::cmp::Ordering::Equal => {
+            if candidate_db_sha256.eq_ignore_ascii_case(&cached.db_sha256) {
+                Ok(StampOrder::EqualSameBytes)
+            } else {
+                Ok(StampOrder::EqualDifferentBytes)
+            }
+        }
     }
+}
+
+/// The UTC release date carried by the cached catalog's signed stamp, in the
+/// `registry-YYYY-MM-DD` form `update_is_available` compares. This is the
+/// authority for "is the remote candidate newer"; the signed display tag can
+/// be future-dated or unparseable and must not decide that question.
+fn cached_release_date_from_stamp(stamp: Option<&CachedStamp>) -> Option<String> {
+    let time = parse_utc(&stamp?.built_at)?;
+    Some(format!(
+        "registry-{:04}-{:02}-{:02}",
+        time.year(),
+        time.month(),
+        time.day()
+    ))
 }
 
 /// Read the schema version from the cached registry database at `path`.
@@ -2188,6 +2772,12 @@ mod tests {
         bytes
     }
 
+    fn local_state_in(dir: &Path) -> PathBuf {
+        let path = dir.join("local_state.db");
+        db::init_local_state_db(&path).unwrap();
+        path
+    }
+
     #[test]
     fn test_registry_status_default() {
         let tmp_dir =
@@ -2276,12 +2866,22 @@ mod tests {
             "v0.9.0",
             Some(9)
         ));
-        assert!(update_is_available(
+        // A tag published after UTC midnight can be a day ahead of the signed
+        // stamp. The same asset id is still the same bytes, so do not fetch it.
+        assert!(!update_is_available(
             Some(today),
             true,
             Some(7),
             "registry-2026-11-01",
             Some(7)
+        ));
+        // A different asset id in that newer release is a real republish.
+        assert!(update_is_available(
+            Some(today),
+            true,
+            Some(7),
+            "registry-2026-11-01",
+            Some(8)
         ));
         assert!(update_is_available(None, false, None, today, Some(9)));
         assert!(update_is_available(
@@ -2294,15 +2894,40 @@ mod tests {
     }
 
     #[test]
-    fn is_rollback_compares_signed_build_stamps() {
+    fn compare_stamps_orders_signed_build_stamps() {
         let older = "2026-08-26T03:19:02+00:00";
         let newer = "2026-08-27T12:20:15+00:00";
-        assert!(is_rollback(Some(newer), Some(older)));
-        assert!(!is_rollback(Some(older), Some(newer)));
-        assert!(!is_rollback(Some(newer), Some(newer)));
-        assert!(!is_rollback(None, Some(newer)));
-        assert!(is_rollback(Some(newer), None));
-        assert!(!is_rollback(None, None));
+        let hash = "0".repeat(64);
+        let cached = |built_at: &str, sha: &str| CachedStamp {
+            built_at: built_at.into(),
+            db_sha256: sha.into(),
+        };
+        assert_eq!(
+            compare_stamps(Some(&cached(newer, &hash)), older, &hash).unwrap(),
+            StampOrder::Older
+        );
+        assert_eq!(
+            compare_stamps(Some(&cached(older, &hash)), newer, &hash).unwrap(),
+            StampOrder::Newer
+        );
+        assert_eq!(
+            compare_stamps(Some(&cached(newer, &hash)), newer, &hash).unwrap(),
+            StampOrder::EqualSameBytes
+        );
+        assert_eq!(
+            compare_stamps(Some(&cached(newer, &hash)), newer, &"1".repeat(64)).unwrap(),
+            StampOrder::EqualDifferentBytes
+        );
+        assert_eq!(
+            compare_stamps(None, newer, &hash).unwrap(),
+            StampOrder::Newer
+        );
+        assert_eq!(
+            compare_stamps(Some(&cached(newer, &hash)), "not a time", &hash)
+                .unwrap_err()
+                .code(),
+            "ERR_REGISTRY_STAMP_INVALID"
+        );
     }
 
     #[test]
@@ -2392,6 +3017,1280 @@ mod tests {
         assert_eq!(version, 10);
         assert!(!registry.freshness().is_stale());
         registry.require_fresh().unwrap();
+    }
+
+    /// A bundle supplied as a local file goes through the same verification
+    /// and install as a downloaded one, and the installed catalog opens.
+    #[test]
+    fn a_local_bundle_file_installs_and_opens() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
+        let key = test_key(60);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let header = fresh_header(&key, &payload);
+        let source_name = "supplied-registry.bundle";
+        write_bundle(dir.path(), source_name, &key, &header, &payload);
+        let locks = LockManager::new(dir.path().join("locks"));
+        // A previous online asset id must not survive a local install: it would
+        // make the next same-day sync look up to date.
+        set_cached_asset_id(&ls_path, Some(4242)).unwrap();
+
+        let installed = install_bundle_from_file_with_trust(
+            dir.path(),
+            &ls_path,
+            &dir.path().join(source_name),
+            &trust,
+            &locks,
+        )
+        .unwrap();
+        assert_eq!(installed.tag, header.tag);
+        assert_eq!(installed.schema_version, 10);
+        assert_eq!(installed.expires_at, header.expires_at);
+        // The signed header's tag is remembered exactly like a release tag, so
+        // status shows it and a later sync compares against it.
+        assert_eq!(
+            get_cached_tag(&ls_path).unwrap().as_deref(),
+            Some("registry-2026-11-16")
+        );
+        assert_eq!(get_cached_asset_id(&ls_path).unwrap(), None);
+        let status = get_status(dir.path(), &ls_path);
+        assert_eq!(status.cached_tag.as_deref(), Some("registry-2026-11-16"));
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            signed_bundle(&key, &header, &payload)
+        );
+        assert_eq!(
+            fs::read(paths::registry_db_path(dir.path()).unwrap()).unwrap(),
+            payload
+        );
+
+        let registry = open_verified_registry_with_key(dir.path(), &test_public(&key)).unwrap();
+        let version: i64 = registry
+            .connection()
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 10);
+        registry.require_fresh().unwrap();
+    }
+
+    /// A tampered local bundle is refused with the exact message the download
+    /// path gives for a payload whose hash does not match its signed header.
+    #[test]
+    fn a_tampered_local_bundle_is_refused_with_the_download_message() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
+        let key = test_key(61);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let header = fresh_header(&key, &payload);
+        let mut bytes = signed_bundle(&key, &header, &payload);
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        let source = dir.path().join("tampered.bundle");
+        fs::write(&source, &bytes).unwrap();
+        let locks = LockManager::new(dir.path().join("locks"));
+
+        let error =
+            install_bundle_from_file_with_trust(dir.path(), &ls_path, &source, &trust, &locks)
+                .unwrap_err();
+        assert_eq!(error.code(), "ERR_REGISTRY_BUNDLE_HASH");
+        assert_eq!(
+            error.to_string(),
+            "The catalog bundle could not be used: the catalog payload does not match the signed SHA-256."
+        );
+        assert!(!paths::registry_bundle_path(dir.path()).unwrap().exists());
+    }
+
+    /// A bundle signed by an unknown key is refused with the download path's
+    /// unknown-key message.
+    #[test]
+    fn an_unknown_key_local_bundle_is_refused_with_the_download_message() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
+        let signer = test_key(62);
+        let trust = RegistryTrust::with_key(test_public(&test_key(63)));
+        let payload = sample_db();
+        let header = header_for(
+            &signer,
+            &payload,
+            "2026-11-16T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let source_name = "unknown-key.bundle";
+        write_bundle(dir.path(), source_name, &signer, &header, &payload);
+        let locks = LockManager::new(dir.path().join("locks"));
+
+        let error = install_bundle_from_file_with_trust(
+            dir.path(),
+            &ls_path,
+            &dir.path().join(source_name),
+            &trust,
+            &locks,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "ERR_REGISTRY_SIGNATURE_INVALID");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "The catalog bundle could not be used: the catalog was signed by unknown key {}.",
+                header.key_id
+            )
+        );
+    }
+
+    /// An expired local bundle is refused even though its signature verifies,
+    /// with the same expiry message the download path gives.
+    #[test]
+    fn an_expired_local_bundle_is_refused_with_the_download_message() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
+        let key = test_key(64);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let header = header_for(
+            &key,
+            &payload,
+            "2026-11-16T12:00:00+00:00",
+            "2025-02-01T00:00:00+00:00",
+        );
+        let source = dir.path().join("expired.bundle");
+        write_bundle(dir.path(), "expired.bundle", &key, &header, &payload);
+        let locks = LockManager::new(dir.path().join("locks"));
+
+        let error =
+            install_bundle_from_file_with_trust(dir.path(), &ls_path, &source, &trust, &locks)
+                .unwrap_err();
+        assert_eq!(error.code(), "ERR_REGISTRY_EXPIRED");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Refusing registry {}: it expired at 2025-02-01T00:00:00+00:00. The cached registry has been kept.",
+                source.display()
+            )
+        );
+        assert!(!paths::registry_bundle_path(dir.path()).unwrap().exists());
+    }
+
+    /// A bundle built before the installed one is refused; there is deliberately
+    /// no override, because the installed stamp is signed.
+    #[test]
+    fn an_older_local_bundle_is_refused_with_the_download_message() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
+        let key = test_key(65);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let new_payload = sample_db();
+        let new_header = fresh_header(&key, &new_payload);
+        let new_source = dir.path().join("new.bundle");
+        write_bundle(dir.path(), "new.bundle", &key, &new_header, &new_payload);
+        let locks = LockManager::new(dir.path().join("locks"));
+        install_bundle_from_file_with_trust(dir.path(), &ls_path, &new_source, &trust, &locks)
+            .unwrap();
+
+        let old_payload = sample_db_with_built_at("2026-08-26T03:19:02+00:00");
+        let old_built_at = "2026-08-26T03:19:02+00:00";
+        let old_header = header_for(
+            &key,
+            &old_payload,
+            old_built_at,
+            "2099-01-01T00:00:00+00:00",
+        );
+        let old_source = dir.path().join("old.bundle");
+        write_bundle(dir.path(), "old.bundle", &key, &old_header, &old_payload);
+
+        let error =
+            install_bundle_from_file_with_trust(dir.path(), &ls_path, &old_source, &trust, &locks)
+                .unwrap_err();
+        assert_eq!(error.code(), "ERR_REGISTRY_ROLLBACK");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Refusing registry {}: it was built at {old_built_at}, older than the registry already installed (2026-11-16T12:00:00+00:00). The cached registry has been kept.",
+                old_source.display()
+            )
+        );
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            signed_bundle(&key, &new_header, &new_payload)
+        );
+    }
+
+    /// A locally supplied bundle with a schema newer than this app supports is
+    /// refused before anything is installed.
+    #[test]
+    fn a_local_bundle_with_an_unsupported_schema_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
+        let key = test_key(80);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let mut header = fresh_header(&key, &payload);
+        header.schema_version = APP_REGISTRY_SCHEMA_VERSION + 1;
+        let source = dir.path().join("future.bundle");
+        write_bundle(dir.path(), "future.bundle", &key, &header, &payload);
+        let locks = LockManager::new(dir.path().join("locks"));
+
+        let error =
+            install_bundle_from_file_with_trust(dir.path(), &ls_path, &source, &trust, &locks)
+                .unwrap_err();
+        assert_eq!(error.code(), "ERR_REGISTRY_NEWER_SCHEMA");
+        assert!(!paths::registry_bundle_path(dir.path()).unwrap().exists());
+        assert!(!paths::registry_db_path(dir.path()).unwrap().exists());
+    }
+
+    /// A revocation remembered from an earlier local install keeps blocking a
+    /// later local bundle signed by the retired key, even when that bundle does
+    /// not carry the revocation itself.
+    #[test]
+    fn a_remembered_revocation_blocks_a_later_local_bundle() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
+        let stolen = test_key(81);
+        let recovery = test_key(82);
+        let replacement = test_key(83);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&stolen)),
+            (RegistryKeyRole::Primary, test_public(&replacement)),
+        ]);
+        let locks = LockManager::new(dir.path().join("locks"));
+        let payload = sample_db();
+
+        let mut revoking = header_for(
+            &replacement,
+            &payload,
+            "2026-11-16T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        revoking.revocations.push(revocation(&recovery, &stolen));
+        let revoking_source = dir.path().join("revoking.bundle");
+        write_bundle(
+            dir.path(),
+            "revoking.bundle",
+            &replacement,
+            &revoking,
+            &payload,
+        );
+        install_bundle_from_file_with_trust(dir.path(), &ls_path, &revoking_source, &trust, &locks)
+            .unwrap();
+        assert!(
+            fs::read_to_string(paths::registry_trust_state_path(dir.path()).unwrap())
+                .unwrap()
+                .contains("v1 revoke")
+        );
+
+        let stale_header = header_for(
+            &stolen,
+            &payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let stale_source = dir.path().join("stale.bundle");
+        write_bundle(dir.path(), "stale.bundle", &stolen, &stale_header, &payload);
+        let error = install_bundle_from_file_with_trust(
+            dir.path(),
+            &ls_path,
+            &stale_source,
+            &trust,
+            &locks,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "ERR_REGISTRY_SIGNATURE_INVALID");
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            signed_bundle(&replacement, &revoking, &payload)
+        );
+    }
+
+    /// A candidate's trust statements are appended durably before any bundle
+    /// file changes. If that append fails, nothing at all is changed.
+    #[test]
+    fn a_failed_trust_append_refuses_before_any_file_change() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stolen = test_key(100);
+        let recovery = test_key(101);
+        let replacement = test_key(102);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&stolen)),
+            (RegistryKeyRole::Primary, test_public(&replacement)),
+        ]);
+        let payload = sample_db();
+        let current_header = fresh_header(&stolen, &payload);
+        let current = signed_bundle(&stolen, &current_header, &payload);
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &current).unwrap();
+
+        let mut candidate_header = header_for(
+            &replacement,
+            &payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        candidate_header
+            .revocations
+            .push(revocation(&recovery, &stolen));
+        let candidate = signed_bundle(&replacement, &candidate_header, &payload);
+        // A readable but unwritable trust file isolates the append failure from
+        // the fail-closed readability check.
+        let trust_path = paths::registry_trust_state_path(dir.path()).unwrap();
+        fs::write(&trust_path, b"").unwrap();
+        let mut permissions = fs::metadata(&trust_path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&trust_path, permissions).unwrap();
+
+        let error = install_bundle_bytes_checked(dir.path(), &candidate, &trust, "candidate")
+            .expect_err("a failed trust append must refuse the install");
+        assert_eq!(error.code(), "ERR_REGISTRY_TRUST_STATE");
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            current
+        );
+        assert!(!paths::registry_bundle_previous_path(dir.path())
+            .unwrap()
+            .exists());
+    }
+
+    /// Recovery cannot read the remembered trust state: a backup signed by a
+    /// key that might since have been retired must not be promoted.
+    #[test]
+    fn recovery_fails_closed_when_the_trust_authority_cannot_be_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let signer = test_key(103);
+        let trust = RegistryTrust::with_key(test_public(&signer));
+        let payload = sample_db();
+        let header = fresh_header(&signer, &payload);
+        let previous = signed_bundle(&signer, &header, &payload);
+        fs::write(
+            paths::registry_bundle_previous_path(dir.path()).unwrap(),
+            &previous,
+        )
+        .unwrap();
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), b"damaged").unwrap();
+        fs::create_dir_all(paths::registry_trust_state_path(dir.path()).unwrap()).unwrap();
+
+        let result = verify_cached_registry_with_trust(dir.path(), &trust);
+        assert!(
+            !matches!(result, CachedRegistryIntegrity::Recovered(_)),
+            "an unreadable trust authority must block recovery: {result:?}"
+        );
+    }
+
+    /// A backup signed by a key the remembered trust has retired is never
+    /// restored, even though the compiled keys still know it.
+    #[test]
+    fn recovery_does_not_restore_a_prev_signed_by_a_revoked_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stolen = test_key(104);
+        let recovery = test_key(105);
+        let replacement = test_key(106);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&stolen)),
+            (RegistryKeyRole::Primary, test_public(&replacement)),
+        ]);
+        let payload = sample_db();
+        let header = fresh_header(&stolen, &payload);
+        let previous = signed_bundle(&stolen, &header, &payload);
+        fs::write(
+            paths::registry_bundle_previous_path(dir.path()).unwrap(),
+            &previous,
+        )
+        .unwrap();
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), b"damaged").unwrap();
+        let statement = revocation(&recovery, &stolen);
+        fs::write(
+            paths::registry_trust_state_path(dir.path()).unwrap(),
+            format!(
+                "v1 revoke {} {} {}\n",
+                statement.revoked_key_id, statement.signed_by, statement.signature
+            ),
+        )
+        .unwrap();
+
+        let result = verify_cached_registry_with_trust(dir.path(), &trust);
+        assert!(
+            !matches!(result, CachedRegistryIntegrity::Recovered(_)),
+            "a retired signer's backup must not be restored: {result:?}"
+        );
+    }
+
+    /// An installed bundle signed by a now-retired key contributes neither
+    /// trust statements nor a stamp, but it must not block a valid replacement.
+    #[test]
+    fn a_retired_signer_installed_bundle_does_not_block_a_valid_replacement() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stolen = test_key(107);
+        let recovery = test_key(108);
+        let replacement = test_key(109);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&stolen)),
+            (RegistryKeyRole::Primary, test_public(&replacement)),
+        ]);
+        let payload = sample_db();
+        let old_header = fresh_header(&stolen, &payload);
+        install_bundle_bytes(
+            dir.path(),
+            &old_header,
+            &signed_bundle(&stolen, &old_header, &payload),
+            &trust,
+        )
+        .unwrap();
+        let statement = revocation(&recovery, &stolen);
+        fs::write(
+            paths::registry_trust_state_path(dir.path()).unwrap(),
+            format!(
+                "v1 revoke {} {} {}\n",
+                statement.revoked_key_id, statement.signed_by, statement.signature
+            ),
+        )
+        .unwrap();
+
+        let new_payload = sample_db_with_built_at("2026-11-18T12:00:00+00:00");
+        let new_header = header_for(
+            &replacement,
+            &new_payload,
+            "2026-11-18T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let new_bundle = signed_bundle(&replacement, &new_header, &new_payload);
+        install_bundle_bytes_checked(dir.path(), &new_bundle, &trust, "candidate")
+            .expect("an unverifiable installed bundle must not block a valid replacement");
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            new_bundle
+        );
+    }
+
+    /// Once the installed bundle is unverifiable, only the durable floor keeps
+    /// an older signed bundle from being replayed.
+    #[test]
+    fn a_replay_is_refused_against_the_durable_floor() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(110);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db_with_built_at("2026-11-16T12:00:00+00:00");
+        let header = header_for(
+            &key,
+            &payload,
+            "2026-11-16T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        install_bundle_bytes(
+            dir.path(),
+            &header,
+            &signed_bundle(&key, &header, &payload),
+            &trust,
+        )
+        .unwrap();
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), b"damaged").unwrap();
+
+        let replay_payload = sample_db_with_built_at("2026-11-15T12:00:00+00:00");
+        let replay_header = header_for(
+            &key,
+            &replay_payload,
+            "2026-11-15T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let error = install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&key, &replay_header, &replay_payload),
+            &trust,
+            "replay",
+        )
+        .expect_err("the durable floor must refuse an older signed bundle");
+        assert_eq!(error.code(), "ERR_REGISTRY_ROLLBACK");
+    }
+
+    /// A healthy open must not use a cached bundle below the durable floor, and
+    /// status shows the same stale state an expired catalog gets.
+    #[test]
+    fn a_bundle_below_the_floor_is_not_opened_and_looks_stale() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
+        let key = test_key(117);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db_with_built_at("2026-11-17T12:00:00+00:00");
+        let header = header_for(
+            &key,
+            &payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let bundle = signed_bundle(&key, &header, &payload);
+        install_bundle_bytes(dir.path(), &header, &bundle, &trust).unwrap();
+        set_cached_tag(&ls_path, &header.tag).unwrap();
+
+        // A signed older bundle is swapped in below the persisted floor.
+        let older_payload = sample_db_with_built_at("2026-11-15T12:00:00+00:00");
+        let older_header = header_for(
+            &key,
+            &older_payload,
+            "2026-11-15T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let older = signed_bundle(&key, &older_header, &older_payload);
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &older).unwrap();
+        fs::write(paths::registry_db_path(dir.path()).unwrap(), &older_payload).unwrap();
+
+        assert!(
+            open_verified_registry_with_trust(dir.path(), &trust).is_err(),
+            "a below-floor bundle must not be opened"
+        );
+        assert!(
+            get_status_with_trust(dir.path(), &ls_path, &trust).stale,
+            "a below-floor bundle must show the expired catalog's stale state"
+        );
+    }
+
+    /// Recovery compares the backup's stamp with the floor as an instant. This
+    /// stamp is textually later but an earlier moment, so it must not be restored.
+    #[test]
+    fn recovery_refuses_a_prev_below_the_floor_by_instant_not_text() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(118);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let header = header_for(
+            &key,
+            &payload,
+            "2026-11-16T13:00:00+02:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        fs::write(
+            paths::registry_bundle_previous_path(dir.path()).unwrap(),
+            signed_bundle(&key, &header, &payload),
+        )
+        .unwrap();
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), b"damaged").unwrap();
+        fs::write(
+            registry_floor_path(dir.path()).unwrap(),
+            format!("2026-11-16T12:00:00+00:00 {}\n", "0".repeat(64)),
+        )
+        .unwrap();
+
+        let result = verify_cached_registry_with_trust(dir.path(), &trust);
+        assert!(
+            !matches!(result, CachedRegistryIntegrity::Recovered(_)),
+            "13:00+02:00 is 11:00 UTC, below the floor: {result:?}"
+        );
+    }
+
+    /// A local install contends on the same cross-process `RegistryUpdate` lock
+    /// sync holds. While that lock is held, the local install must not commit.
+    #[test]
+    fn a_local_install_takes_the_registry_update_lock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
+        let key = test_key(66);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let locks = LockManager::new(dir.path().join("locks"));
+        let _holder = locks
+            .acquire(crate::lock_manager::LockResource::RegistryUpdate, "sync")
+            .unwrap();
+        let payload = sample_db();
+        let header = fresh_header(&key, &payload);
+        let source = dir.path().join("source.bundle");
+        write_bundle(dir.path(), "source.bundle", &key, &header, &payload);
+
+        let result = install_local_inner(
+            dir.path(),
+            &ls_path,
+            &source,
+            &trust,
+            &locks,
+            Some(Duration::from_millis(200)),
+        );
+        let error =
+            result.expect_err("a local install must not commit while sync holds RegistryUpdate");
+        assert_eq!(error.code(), "ERR_LOCK_TIMEOUT");
+        assert!(!paths::registry_bundle_path(dir.path()).unwrap().exists());
+    }
+
+    /// A candidate's revocation is durable before any bundle file changes, so
+    /// it survives a failed commit. The bundle files are untouched and a retry
+    /// works; the old bundle may now be untrusted, which is the intended
+    /// consequence of a committed revocation.
+    #[test]
+    fn a_failed_commit_keeps_the_trust_fact_and_the_old_bundle_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stolen = test_key(70);
+        let recovery = test_key(71);
+        let replacement = test_key(72);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&stolen)),
+            (RegistryKeyRole::Primary, test_public(&replacement)),
+        ]);
+        let payload = sample_db();
+        let current_header = fresh_header(&stolen, &payload);
+        let current = signed_bundle(&stolen, &current_header, &payload);
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &current).unwrap();
+
+        let mut candidate_header = header_for(
+            &replacement,
+            &payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        candidate_header
+            .revocations
+            .push(revocation(&recovery, &stolen));
+        let candidate = signed_bundle(&replacement, &candidate_header, &payload);
+
+        // Break the pre-commit backup so the bundle cannot be replaced.
+        let prev = paths::registry_bundle_previous_path(dir.path()).unwrap();
+        fs::create_dir_all(&prev).unwrap();
+        let error = install_bundle_bytes_checked(dir.path(), &candidate, &trust, "candidate")
+            .expect_err("the commit must fail while the backup path is obstructed");
+        assert_eq!(error.code(), "ERR_REGISTRY_WRITE");
+        assert!(
+            error.to_string().contains("trust update was kept")
+                && error.to_string().contains("reinstall or sync"),
+            "the failure must say the trust fact survived and how to repair: {error}"
+        );
+
+        let trust_path = paths::registry_trust_state_path(dir.path()).unwrap();
+        assert!(
+            fs::read_to_string(&trust_path)
+                .unwrap()
+                .contains("v1 revoke"),
+            "a verified revocation is durable before the commit"
+        );
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            current
+        );
+
+        // Retry once the obstruction is gone.
+        fs::remove_dir(&prev).unwrap();
+        install_bundle_bytes_checked(dir.path(), &candidate, &trust, "candidate").unwrap();
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            candidate
+        );
+        assert!(fs::read_to_string(&trust_path)
+            .unwrap()
+            .contains("v1 revoke"));
+    }
+
+    /// A pre-floor cache must persist its baseline before the append revokes its
+    /// signer. If the swap then fails, an older bundle from a still-trusted key
+    /// must still be refused by the floor.
+    #[test]
+    fn a_pre_floor_baseline_survives_a_failed_revoking_swap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stolen = test_key(112);
+        let recovery = test_key(113);
+        let replacement = test_key(114);
+        let trusted = test_key(115);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&stolen)),
+            (RegistryKeyRole::Primary, test_public(&replacement)),
+            (RegistryKeyRole::Primary, test_public(&trusted)),
+        ]);
+        assert!(!registry_floor_path(dir.path()).unwrap().exists());
+
+        let payload = sample_db_with_built_at("2026-11-16T12:00:00+00:00");
+        let current_header = header_for(
+            &stolen,
+            &payload,
+            "2026-11-16T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let current = signed_bundle(&stolen, &current_header, &payload);
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &current).unwrap();
+
+        let mut revoking = header_for(
+            &replacement,
+            &payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        revoking.revocations.push(revocation(&recovery, &stolen));
+        let revoking_bytes = signed_bundle(&replacement, &revoking, &payload);
+        let prev = paths::registry_bundle_previous_path(dir.path()).unwrap();
+        fs::create_dir_all(&prev).unwrap();
+        install_bundle_bytes_checked(dir.path(), &revoking_bytes, &trust, "revoking")
+            .expect_err("the obstructed swap must fail");
+
+        // The floor was captured from the installed bundle before its signer was
+        // revoked, so it outlives the failed swap.
+        let floor = read_floor_file(dir.path()).unwrap().unwrap();
+        assert_eq!(floor.built_at, "2026-11-16T12:00:00+00:00");
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            current
+        );
+
+        let older_payload = sample_db_with_built_at("2026-11-15T12:00:00+00:00");
+        let older = header_for(
+            &trusted,
+            &older_payload,
+            "2026-11-15T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let error = install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&trusted, &older, &older_payload),
+            &trust,
+            "older",
+        )
+        .expect_err("the persisted floor must refuse an older signed bundle");
+        assert_eq!(error.code(), "ERR_REGISTRY_ROLLBACK");
+    }
+
+    /// A floor read error (as opposed to an absent floor) must refuse an install.
+    #[test]
+    fn an_unreadable_floor_refuses_an_install() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(116);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let header = fresh_header(&key, &payload);
+        let current = signed_bundle(&key, &header, &payload);
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &current).unwrap();
+        fs::create_dir_all(registry_floor_path(dir.path()).unwrap()).unwrap();
+
+        let error = install_bundle_bytes_checked(dir.path(), &current, &trust, "candidate")
+            .expect_err("a floor read error is not an absent floor");
+        assert_eq!(error.code(), "ERR_REGISTRY_FLOOR");
+        assert!(
+            error
+                .to_string()
+                .contains("Could not read the catalog rollback floor"),
+            "the refusal must be the read error, not a later write failure: {error}"
+        );
+        assert!(
+            !paths::registry_bundle_previous_path(dir.path())
+                .unwrap()
+                .exists(),
+            "the install must fail before any backup is created"
+        );
+    }
+
+    /// A malformed but readable floor is an error, not an unset floor: treating
+    /// it as unset would silently drop rollback protection.
+    #[test]
+    fn a_malformed_floor_refuses_an_install() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(119);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let header = fresh_header(&key, &payload);
+        let bundle = signed_bundle(&key, &header, &payload);
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &bundle).unwrap();
+        fs::write(
+            registry_floor_path(dir.path()).unwrap(),
+            "not a stamp not a hash\n",
+        )
+        .unwrap();
+
+        let error = install_bundle_bytes_checked(dir.path(), &bundle, &trust, "candidate")
+            .expect_err("a malformed floor must refuse the install");
+        assert_eq!(error.code(), "ERR_REGISTRY_FLOOR");
+    }
+
+    /// The floor must be checkpointed to the verified maximum, not only when it
+    /// is unset: a lagging floor plus a revoking append must not expose an older
+    /// bundle again.
+    #[test]
+    fn a_lagging_floor_is_checkpointed_before_a_revoking_append() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let old = test_key(120);
+        let recovery = test_key(121);
+        let replacement = test_key(122);
+        let trusted = test_key(123);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&old)),
+            (RegistryKeyRole::Primary, test_public(&replacement)),
+            (RegistryKeyRole::Primary, test_public(&trusted)),
+        ]);
+
+        let first_payload = sample_db_with_built_at("2026-11-15T12:00:00+00:00");
+        let first_header = header_for(
+            &old,
+            &first_payload,
+            "2026-11-15T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let first = signed_bundle(&old, &first_header, &first_payload);
+        install_bundle_bytes(dir.path(), &first_header, &first, &trust).unwrap();
+        assert_eq!(
+            read_floor_file(dir.path()).unwrap().unwrap().built_at,
+            "2026-11-15T12:00:00+00:00"
+        );
+
+        // Install a newer bundle but make its post-swap floor write fail, so the
+        // stored floor lags behind the installed bundle.
+        let floor_failure = fail_floor_writes(dir.path());
+        let second_payload = sample_db_with_built_at("2026-11-17T12:00:00+00:00");
+        let second_header = header_for(
+            &old,
+            &second_payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let second = signed_bundle(&old, &second_header, &second_payload);
+        let error = install_bundle_bytes_checked(dir.path(), &second, &trust, "newer")
+            .expect_err("the lagging floor write must fail");
+        assert_eq!(error.code(), "ERR_REGISTRY_FLOOR");
+        drop(floor_failure);
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            second
+        );
+        assert_eq!(
+            read_floor_file(dir.path()).unwrap().unwrap().built_at,
+            "2026-11-15T12:00:00+00:00"
+        );
+
+        // A revoking append whose swap fails: the installed bundle's signer is
+        // retired, so only a checkpoint of its stamp can still block the replay.
+        let mut revoking = header_for(
+            &replacement,
+            &second_payload,
+            "2026-11-18T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        revoking.revocations.push(revocation(&recovery, &old));
+        let prev = paths::registry_bundle_previous_path(dir.path()).unwrap();
+        let _ = fs::remove_file(&prev);
+        fs::create_dir_all(&prev).unwrap();
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&replacement, &revoking, &second_payload),
+            &trust,
+            "revoking",
+        )
+        .expect_err("the obstructed swap must fail");
+        fs::remove_dir(&prev).unwrap();
+        assert_eq!(
+            read_floor_file(dir.path()).unwrap().unwrap().built_at,
+            "2026-11-17T12:00:00+00:00",
+            "the verified maximum must be checkpointed before the revoking append"
+        );
+
+        let replay_payload = sample_db_with_built_at("2026-11-16T12:00:00+00:00");
+        let replay_header = header_for(
+            &trusted,
+            &replay_payload,
+            "2026-11-16T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let error = install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&trusted, &replay_header, &replay_payload),
+            &trust,
+            "replay",
+        )
+        .expect_err("the checkpointed floor must refuse the older signed bundle");
+        assert_eq!(error.code(), "ERR_REGISTRY_ROLLBACK");
+    }
+
+    /// A floor write that fails after a successful swap must say the new catalog
+    /// is installed, not claim a trust update was kept or advise a restore.
+    #[test]
+    fn a_failed_floor_raise_after_swap_says_the_catalog_is_installed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(124);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let first_payload = sample_db_with_built_at("2026-11-15T12:00:00+00:00");
+        let first_header = header_for(
+            &key,
+            &first_payload,
+            "2026-11-15T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        install_bundle_bytes(
+            dir.path(),
+            &first_header,
+            &signed_bundle(&key, &first_header, &first_payload),
+            &trust,
+        )
+        .unwrap();
+        let _floor_failure = fail_floor_writes(dir.path());
+
+        let second_payload = sample_db_with_built_at("2026-11-17T12:00:00+00:00");
+        let second_header = header_for(
+            &key,
+            &second_payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let second = signed_bundle(&key, &second_header, &second_payload);
+        let error = install_bundle_bytes_checked(dir.path(), &second, &trust, "newer")
+            .expect_err("the post-swap floor write must fail");
+        assert_eq!(error.code(), "ERR_REGISTRY_FLOOR");
+        let message = error.to_string();
+        assert!(
+            message.contains("new catalog is installed") && message.contains("re-checkpointed"),
+            "message must describe the installed catalog: {message}"
+        );
+        assert!(
+            !message.contains("trust update was kept") && !message.contains("reinstall or sync"),
+            "no trust statement was appended and the bundle is installed: {message}"
+        );
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            second
+        );
+    }
+
+    /// A swap failure without a trust append must not claim a trust update.
+    #[test]
+    fn a_swap_failure_without_a_trust_append_says_trust_was_unchanged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(125);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let header = fresh_header(&key, &payload);
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            signed_bundle(&key, &header, &payload),
+        )
+        .unwrap();
+        fs::create_dir_all(paths::registry_bundle_previous_path(dir.path()).unwrap()).unwrap();
+
+        let error = install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&key, &header, &payload),
+            &trust,
+            "candidate",
+        )
+        .expect_err("the obstructed backup must fail the install");
+        assert!(
+            error.to_string().contains("trust state was not changed"),
+            "message must not claim a trust update: {error}"
+        );
+    }
+
+    /// Floor errors fail closed on a plain open and on backup recovery too.
+    #[test]
+    fn an_unreadable_floor_refuses_a_plain_open_and_recovery() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(126);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let header = fresh_header(&key, &payload);
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            signed_bundle(&key, &header, &payload),
+        )
+        .unwrap();
+        fs::create_dir_all(registry_floor_path(dir.path()).unwrap()).unwrap();
+
+        let error = match open_verified_registry_with_trust(dir.path(), &trust) {
+            Ok(_) => panic!("a floor read error must refuse a plain open"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "ERR_REGISTRY_FLOOR");
+
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), b"damaged").unwrap();
+        fs::write(
+            paths::registry_bundle_previous_path(dir.path()).unwrap(),
+            signed_bundle(&key, &header, &payload),
+        )
+        .unwrap();
+        let result = verify_cached_registry_with_trust(dir.path(), &trust);
+        assert!(
+            !matches!(result, CachedRegistryIntegrity::Recovered(_)),
+            "a floor read error must block recovery: {result:?}"
+        );
+    }
+
+    /// Offsets are compared as UTC instants, not as text. 11:00-02:00 is 13:00
+    /// UTC, so it is newer than a cached 12:00+00:00 even though it sorts lower.
+    #[test]
+    fn a_built_at_offset_is_compared_as_an_instant() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(76);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let current_payload = sample_db_with_built_at("2026-11-16T12:00:00+00:00");
+        let current_header = fresh_header(&key, &current_payload);
+        let current = signed_bundle(&key, &current_header, &current_payload);
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &current).unwrap();
+
+        let newer_payload = sample_db_with_built_at("2026-11-16T11:00:00-02:00");
+        let mut newer_header = header_for(
+            &key,
+            &newer_payload,
+            "2026-11-16T11:00:00-02:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        newer_header.tag = "registry-2026-11-16".into();
+        let newer = signed_bundle(&key, &newer_header, &newer_payload);
+
+        install_bundle_bytes_checked(dir.path(), &newer, &trust, "newer")
+            .expect("a later UTC instant must be accepted even if its text sorts earlier");
+    }
+
+    /// An equal signed build stamp with different signed bytes must not replace
+    /// the installed catalog.
+    #[test]
+    fn an_equal_stamp_with_different_bytes_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(77);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let stamp = "2026-11-16T12:00:00+00:00";
+        let current_payload = sample_db_with_built_at(stamp);
+        let current_header = fresh_header(&key, &current_payload);
+        let current = signed_bundle(&key, &current_header, &current_payload);
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &current).unwrap();
+
+        let other_payload = sample_db_with_built_at("2026-11-17T12:00:00+00:00");
+        let mut other_header = header_for(&key, &other_payload, stamp, "2099-01-01T00:00:00+00:00");
+        other_header.tag = "registry-2026-11-16".into();
+        let other = signed_bundle(&key, &other_header, &other_payload);
+
+        let error = install_bundle_bytes_checked(dir.path(), &other, &trust, "other")
+            .expect_err("an equal stamp over different bytes must be refused");
+        assert_eq!(error.code(), "ERR_REGISTRY_ROLLBACK");
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            current
+        );
+    }
+
+    /// Readiness means the readable database is present and matches the
+    /// installed bundle, not merely that a bundle header verifies.
+    #[test]
+    fn has_cached_db_requires_a_readable_matching_database() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ls_path = local_state_in(dir.path());
+        let key = test_key(98);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let header = fresh_header(&key, &payload);
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            signed_bundle(&key, &header, &payload),
+        )
+        .unwrap();
+
+        assert!(
+            !get_status_with_trust(dir.path(), &ls_path, &trust).has_cached_db,
+            "a bundle with no extracted database is not ready"
+        );
+        let db_path = paths::registry_db_path(dir.path()).unwrap();
+        fs::write(&db_path, &payload).unwrap();
+        assert!(get_status_with_trust(dir.path(), &ls_path, &trust).has_cached_db);
+        fs::write(&db_path, b"not the database the bundle signed").unwrap();
+        assert!(
+            !get_status_with_trust(dir.path(), &ls_path, &trust).has_cached_db,
+            "a database that does not match the bundle is not ready"
+        );
+    }
+
+    /// A signed display tag must not make an explicit sync report "up to date".
+    #[tokio::test]
+    async fn a_future_signed_tag_cannot_suppress_an_explicit_sync() {
+        let (dir, ls_path, locks) = setup_sync_env();
+        let key = test_key(78);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let local_payload = sample_db_with_built_at("2026-11-16T12:00:00+00:00");
+        let mut local_header = fresh_header(&key, &local_payload);
+        local_header.tag = "registry-2099-01-01".into();
+        let local_bundle = signed_bundle(&key, &local_header, &local_payload);
+        let source = dir.path().join("local.bundle");
+        fs::write(&source, &local_bundle).unwrap();
+        install_bundle_from_file_with_trust(dir.path(), &ls_path, &source, &trust, &locks).unwrap();
+        assert_eq!(
+            get_cached_tag(&ls_path).unwrap().as_deref(),
+            Some("registry-2099-01-01")
+        );
+
+        let remote_payload = sample_db_with_built_at("2026-11-20T02:00:00+00:00");
+        let mut remote_header = header_for(
+            &key,
+            &remote_payload,
+            "2026-11-20T02:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        remote_header.tag = "registry-2026-11-20".into();
+        let remote_bundle = signed_bundle(&key, &remote_header, &remote_payload);
+        let recorded = r#"[
+            {"tag_name": "registry-2026-11-20", "draft": false, "prerelease": false, "assets": [{"id": 5001, "name": "registry.bundle"}]}
+        ]"#;
+        let transport =
+            FakeRegistryTransport::from_pages(vec![(1, release_json_to_list(recorded))]);
+        transport.push_asset_ok(5001, remote_bundle.clone());
+
+        let status = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            true,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_000,
+        )
+        .await
+        .expect("explicit sync must check the remote, not trust the signed tag");
+
+        assert!(status.update_available || status.message.contains("updated"));
+        assert!(!status.message.contains("up to date"), "{}", status.message);
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            remote_bundle
+        );
+    }
+
+    /// An unreadable remembered trust state may be hiding revocations, so no
+    /// candidate is trusted against it — even one with no statements of its own.
+    #[test]
+    fn an_unreadable_trust_state_refuses_an_install() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(73);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let current_header = fresh_header(&key, &payload);
+        let current = signed_bundle(&key, &current_header, &payload);
+        fs::write(paths::registry_bundle_path(dir.path()).unwrap(), &current).unwrap();
+
+        let candidate_payload = sample_db_with_built_at("2026-11-17T12:00:00+00:00");
+        let candidate_header = header_for(
+            &key,
+            &candidate_payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let candidate = signed_bundle(&key, &candidate_header, &candidate_payload);
+
+        fs::create_dir_all(paths::registry_trust_state_path(dir.path()).unwrap()).unwrap();
+        let error = install_bundle_bytes_checked(dir.path(), &candidate, &trust, "candidate")
+            .expect_err("an unreadable trust state must refuse the install");
+        assert_eq!(error.code(), "ERR_REGISTRY_TRUST_STATE");
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            current
+        );
+    }
+
+    /// A bundle that carries a trust statement is not a clean install if the
+    /// durable append fails: a lost revocation must surface as a failure.
+    #[test]
+    fn a_post_commit_trust_write_failure_with_statements_is_reported() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stolen = test_key(90);
+        let recovery = test_key(91);
+        let replacement = test_key(92);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&stolen)),
+            (RegistryKeyRole::Primary, test_public(&replacement)),
+        ]);
+        let payload = sample_db();
+        let current_header = fresh_header(&stolen, &payload);
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            signed_bundle(&stolen, &current_header, &payload),
+        )
+        .unwrap();
+
+        let mut candidate_header = header_for(
+            &replacement,
+            &payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        candidate_header
+            .revocations
+            .push(revocation(&recovery, &stolen));
+        let candidate = signed_bundle(&replacement, &candidate_header, &payload);
+
+        fs::create_dir_all(paths::registry_trust_state_path(dir.path()).unwrap()).unwrap();
+        let error = install_bundle_bytes_checked(dir.path(), &candidate, &trust, "candidate")
+            .expect_err("a lost revocation must not be reported as a clean install");
+        assert_eq!(error.code(), "ERR_REGISTRY_TRUST_STATE");
+    }
+
+    /// Recovery from `.prev` is refused when its revocations cannot be
+    /// accounted for durably: an untrusted catalog is better than one whose
+    /// committed revocations were silently dropped.
+    #[test]
+    fn recovery_fails_closed_when_the_previous_bundles_trust_cannot_be_saved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stolen = test_key(93);
+        let recovery = test_key(94);
+        let replacement = test_key(95);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&stolen)),
+            (RegistryKeyRole::Primary, test_public(&replacement)),
+        ]);
+        let payload = sample_db();
+        let mut previous_header = fresh_header(&replacement, &payload);
+        previous_header
+            .revocations
+            .push(revocation(&recovery, &stolen));
+        let previous = signed_bundle(&replacement, &previous_header, &payload);
+        fs::write(
+            paths::registry_bundle_previous_path(dir.path()).unwrap(),
+            &previous,
+        )
+        .unwrap();
+        let current = paths::registry_bundle_path(dir.path()).unwrap();
+        fs::write(&current, b"damaged current bundle").unwrap();
+        fs::create_dir_all(paths::registry_trust_state_path(dir.path()).unwrap()).unwrap();
+
+        let result = verify_cached_registry_with_trust(dir.path(), &trust);
+        assert!(
+            !matches!(result, CachedRegistryIntegrity::Recovered(_)),
+            "recovery must not promote a bundle whose revocation cannot be saved: {result:?}"
+        );
+        assert!(fs::read(&current)
+            .map(|bytes| bytes != previous)
+            .unwrap_or(true));
+    }
+
+    /// An expired installed bundle still has a signed stamp, so it can be a
+    /// rollback baseline, but it contributes no trust statements: a valid
+    /// replacement is not blocked by what an expired bundle claims.
+    #[test]
+    fn an_expired_current_bundle_does_not_block_a_valid_replacement() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(87);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let expired = header_for(
+            &key,
+            &payload,
+            "2026-11-16T12:00:00+00:00",
+            "2020-01-01T00:00:00+00:00",
+        );
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            signed_bundle(&key, &expired, &payload),
+        )
+        .unwrap();
+
+        let newer_payload = sample_db_with_built_at("2026-11-18T12:00:00+00:00");
+        let newer = header_for(
+            &key,
+            &newer_payload,
+            "2026-11-18T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&key, &newer, &newer_payload),
+            &trust,
+            "candidate",
+        )
+        .expect("an expired installed bundle must not block a valid replacement");
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            signed_bundle(&key, &newer, &newer_payload)
+        );
     }
 
     /// A crash after the bundle is in place but before the readable database is
@@ -2494,10 +4393,10 @@ mod tests {
         assert_eq!(version, 10);
     }
 
-    /// A build stamp that cannot be read must refuse an update: treating it as
-    /// "older" lets a replayed old signed catalog replace a newer one.
+    /// An unverifiable installed bundle contributes no stamp; the durable
+    /// floor, not the unreadable bundle, is what still blocks a replay.
     #[test]
-    fn an_unreadable_cached_stamp_refuses_the_update() {
+    fn an_unreadable_cached_stamp_contributes_no_stamp() {
         let dir = tempfile::TempDir::new().unwrap();
         let key = test_key(7);
         let trust = RegistryTrust::with_key(test_public(&key));
@@ -2505,7 +4404,7 @@ mod tests {
         let header = fresh_header(&key, &payload);
         write_bundle(dir.path(), "registry.bundle", &key, &header, &payload);
         assert_eq!(
-            read_cached_built_at_checked(dir.path(), &trust).unwrap(),
+            read_cached_stamp(dir.path(), &trust).map(|stamp| stamp.built_at),
             Some(header.built_at)
         );
 
@@ -2514,8 +4413,7 @@ mod tests {
             b"corrupt current bundle",
         )
         .unwrap();
-        let error = read_cached_built_at_checked(dir.path(), &trust).unwrap_err();
-        assert_eq!(error.code(), "ERR_REGISTRY_CACHED_STAMP_UNREADABLE");
+        assert_eq!(read_cached_stamp(dir.path(), &trust), None);
     }
 
     /// A new key introduced by a certificate signed by an old trusted key is
@@ -2875,6 +4773,39 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         assert_eq!(
             verified_registry_digest(tempfile::TempDir::new().unwrap().path(), &trust,).unwrap(),
             None
+        );
+    }
+
+    /// The digest helper must not materialize the database of a below-floor
+    /// bundle, any more than a plain open may use one.
+    #[test]
+    fn the_verified_digest_refuses_a_below_floor_bundle() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(127);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db_with_built_at("2026-11-15T12:00:00+00:00");
+        let header = header_for(
+            &key,
+            &payload,
+            "2026-11-15T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        write_bundle(dir.path(), "registry.bundle", &key, &header, &payload);
+        fs::write(
+            registry_floor_path(dir.path()).unwrap(),
+            format!("2026-11-17T12:00:00+00:00 {}\n", "0".repeat(64)),
+        )
+        .unwrap();
+        assert!(!paths::registry_db_path(dir.path()).unwrap().exists());
+
+        let error = match verified_registry_digest(dir.path(), &trust) {
+            Ok(_) => panic!("a below-floor bundle has no usable digest"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "ERR_REGISTRY_ROLLBACK");
+        assert!(
+            !paths::registry_db_path(dir.path()).unwrap().exists(),
+            "the digest helper must not extract a below-floor database"
         );
     }
 
@@ -3445,5 +5376,164 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         assert!(!after_success.checked);
         assert!(!after_success.update_available);
         assert_eq!(after_success.message, "Catalog is up to date.");
+    }
+
+    /// A release tag published just after UTC midnight is a day ahead of the
+    /// signed build stamp. Once that asset id is recorded, sync must not fetch
+    /// the same bytes again just because the tag date looks newer.
+    #[tokio::test]
+    async fn a_tag_ahead_of_the_signed_stamp_does_not_redownload_the_same_asset() {
+        let (dir, ls_path, locks) = setup_sync_env();
+        let key = test_key(96);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db_with_built_at("2026-11-17T23:30:00+00:00");
+        let mut header = header_for(
+            &key,
+            &payload,
+            "2026-11-17T23:30:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        header.tag = "registry-2026-11-17".into();
+        let bundle = signed_bundle(&key, &header, &payload);
+        install_bundle_bytes(dir.path(), &header, &bundle, &trust).unwrap();
+        set_cached_tag(&ls_path, "registry-2026-11-17").unwrap();
+        set_cached_asset_id(&ls_path, Some(6001)).unwrap();
+
+        let recorded = r#"[
+            {"tag_name": "registry-2026-11-18", "draft": false, "prerelease": false, "assets": [{"id": 6001, "name": "registry.bundle"}]}
+        ]"#;
+        let transport =
+            FakeRegistryTransport::from_pages(vec![(1, release_json_to_list(recorded))]);
+        transport.push_asset_ok(6001, bundle.clone());
+
+        let status = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            true,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_000,
+        )
+        .await
+        .expect("sync should not redownload the asset it already has");
+        assert!(!status.update_available);
+        assert!(status.message.contains("up to date"), "{}", status.message);
+        assert_eq!(
+            transport.assets.lock().unwrap()[&6001].len(),
+            1,
+            "the identical asset must not be fetched again"
+        );
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            bundle
+        );
+    }
+
+    /// A candidate with the same signed stamp and the same bytes is "up to
+    /// date": record its asset id rather than reinstalling and claiming an
+    /// update (or refusing it as an equal-stamp conflict).
+    #[tokio::test]
+    async fn an_identical_candidate_records_its_asset_id_and_reports_up_to_date() {
+        let (dir, ls_path, locks) = setup_sync_env();
+        let key = test_key(97);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db_with_built_at("2026-11-17T23:30:00+00:00");
+        let mut header = header_for(
+            &key,
+            &payload,
+            "2026-11-17T23:30:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        header.tag = "registry-2099-01-01".into();
+        let bundle = signed_bundle(&key, &header, &payload);
+        install_bundle_bytes(dir.path(), &header, &bundle, &trust).unwrap();
+        set_cached_tag(&ls_path, "registry-2099-01-01").unwrap();
+        // A local install clears the online asset id; the next sync learns it.
+        set_cached_asset_id(&ls_path, None).unwrap();
+
+        let recorded = r#"[
+            {"tag_name": "registry-2026-11-18", "draft": false, "prerelease": false, "assets": [{"id": 6002, "name": "registry.bundle"}]}
+        ]"#;
+        let transport =
+            FakeRegistryTransport::from_pages(vec![(1, release_json_to_list(recorded))]);
+        transport.push_asset_ok(6002, bundle.clone());
+
+        let status = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            true,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_000,
+        )
+        .await
+        .expect("an identical candidate must not be a failure");
+        assert_eq!(get_cached_asset_id(&ls_path).unwrap(), Some(6002));
+        assert!(status.message.contains("up to date"), "{}", status.message);
+        assert_eq!(
+            get_cached_tag(&ls_path).unwrap().as_deref(),
+            Some("registry-2099-01-01")
+        );
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            bundle
+        );
+    }
+
+    /// An identical download skips extraction. Sync must report the real
+    /// readiness, not a hardcoded `true`, when the readable database is gone.
+    #[tokio::test]
+    async fn an_identical_download_reports_the_real_readiness() {
+        let (dir, ls_path, locks) = setup_sync_env();
+        let key = test_key(111);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db_with_built_at("2026-11-16T12:00:00+00:00");
+        let header = header_for(
+            &key,
+            &payload,
+            "2026-11-16T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let bundle = signed_bundle(&key, &header, &payload);
+        install_bundle_bytes(dir.path(), &header, &bundle, &trust).unwrap();
+        set_cached_tag(&ls_path, "registry-2026-11-16").unwrap();
+        set_cached_asset_id(&ls_path, Some(7000)).unwrap();
+        fs::remove_file(paths::registry_db_path(dir.path()).unwrap()).unwrap();
+        assert!(!get_status_with_trust(dir.path(), &ls_path, &trust).has_cached_db);
+
+        let recorded = r#"[
+            {"tag_name": "registry-2026-11-17", "draft": false, "prerelease": false, "assets": [{"id": 7001, "name": "registry.bundle"}]}
+        ]"#;
+        let transport =
+            FakeRegistryTransport::from_pages(vec![(1, release_json_to_list(recorded))]);
+        transport.push_asset_ok(7001, bundle.clone());
+
+        let status = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            true,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_000,
+        )
+        .await
+        .expect("an identical candidate is not a failure");
+        assert!(
+            !status.has_cached_db,
+            "sync must not claim readiness when extraction was skipped and the DB is missing"
+        );
+        assert!(status.message.contains("up to date"), "{}", status.message);
     }
 }

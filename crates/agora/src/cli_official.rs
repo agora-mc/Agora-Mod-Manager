@@ -9,6 +9,7 @@ use agora_core::plugins::{
     UpdateOutcome,
 };
 use clap::Subcommand;
+use std::path::PathBuf;
 
 #[derive(Subcommand)]
 pub enum OfficialCmd {
@@ -25,6 +26,12 @@ pub enum OfficialCmd {
         yes: bool,
         #[arg(long, help = "Install without allowing the plugin's code to run")]
         no_code: bool,
+        #[arg(
+            long,
+            value_name = "ZIP",
+            help = "Install a local package file instead of downloading it; it must match the signed catalog's pin"
+        )]
+        file: Option<PathBuf>,
     },
     /// Move an installed plugin to the catalog's current official version.
     Update {
@@ -98,7 +105,12 @@ pub async fn run(service: &PluginService, action: OfficialCmd, json: bool) -> an
                 &rows,
             );
         }
-        OfficialCmd::Install { id, yes, no_code } => {
+        OfficialCmd::Install {
+            id,
+            yes,
+            no_code,
+            file,
+        } => {
             let plugin_id = crate::parse_plugin_id(&id)?;
             // `--yes` is the answer to both questions; `--no-code` withholds the
             // second. Core only applies the code answer to a first install.
@@ -107,10 +119,25 @@ pub async fn run(service: &PluginService, action: OfficialCmd, json: bool) -> an
                 scripts: yes && !no_code,
                 previewed_digest: None,
             };
-            let outcome = service
-                .install_official(plugin_id.as_str(), consent, &service.http_fetcher())
-                .await?;
-            report(&id, outcome, "Installed", json, no_code)?;
+            // A local package may replace an installed copy (the pin still has
+            // to match); say so rather than calling it a first install.
+            let was_installed = match &file {
+                Some(_) => service.installed_version(plugin_id.as_str())?.is_some(),
+                None => false,
+            };
+            let outcome = match file {
+                Some(path) => {
+                    service
+                        .install_official_from_file(plugin_id.as_str(), &path, consent)
+                        .await?
+                }
+                None => {
+                    service
+                        .install_official(plugin_id.as_str(), consent, &service.http_fetcher())
+                        .await?
+                }
+            };
+            report(&id, outcome, install_verb(was_installed), json, no_code)?;
         }
         OfficialCmd::Update { id, yes } => {
             let plugin_id = crate::parse_plugin_id(&id)?;
@@ -130,6 +157,14 @@ pub async fn run(service: &PluginService, action: OfficialCmd, json: bool) -> an
     Ok(())
 }
 
+fn install_verb(was_installed: bool) -> &'static str {
+    if was_installed {
+        "Updated"
+    } else {
+        "Installed"
+    }
+}
+
 fn report(
     id: &str,
     outcome: UpdateOutcome,
@@ -138,7 +173,15 @@ fn report(
     no_code_available: bool,
 ) -> anyhow::Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(&outcome)?);
+        let mut value = serde_json::to_value(&outcome)?;
+        if matches!(outcome, UpdateOutcome::Installed { .. }) {
+            if let serde_json::Value::Object(map) = &mut value {
+                // The human report distinguishes a first install from a local
+                // package replacing an existing copy; --json must say too.
+                map.insert("action".into(), serde_json::Value::String(verb.to_string()));
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
     match outcome {
@@ -222,4 +265,15 @@ fn print_code_question(preview: &InstallPreview) {
         "  You can allow it later with `agora plugin scripts {} allow`.",
         manifest.id
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::install_verb;
+
+    #[test]
+    fn a_local_package_replacing_an_installed_plugin_says_updated() {
+        assert_eq!(install_verb(false), "Installed");
+        assert_eq!(install_verb(true), "Updated");
+    }
 }

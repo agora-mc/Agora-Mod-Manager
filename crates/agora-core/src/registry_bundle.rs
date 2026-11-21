@@ -910,15 +910,24 @@ mod tests {
         let signing = key(3);
         let header = header_for(&signing, payload);
         let mut bundle = sign(&signing, &header, payload);
-        // Change a byte inside the header JSON (the tag) without re-signing.
+        // Mutate the signed tag explicitly. Changing an arbitrary '2' landed in
+        // the key id and failed as UnknownKey before signature verification ran.
         let header_start = MAGIC_LEN + 4;
+        let header_len =
+            u32::from_le_bytes(bundle[MAGIC_LEN..MAGIC_LEN + 4].try_into().unwrap()) as usize;
+        let header_end = header_start + header_len;
+        let tag = b"registry-2026-11-16";
         let at = header_start
-            + bundle[header_start..]
-                .iter()
-                .position(|b| *b == b'2')
-                .unwrap();
-        bundle[at] = b'3';
-        assert!(verify_bundle(&bundle, &RegistryTrust::with_key(public(&signing))).is_err());
+            + bundle[header_start..header_end]
+                .windows(tag.len())
+                .position(|window| window == tag)
+                .expect("the header carries the tag")
+            + b"registry-".len();
+        bundle[at] = b'3'; // 2026 -> 3026
+        assert!(matches!(
+            verify_bundle(&bundle, &RegistryTrust::with_key(public(&signing))),
+            Err(BundleError::SignatureInvalid)
+        ));
     }
 
     #[test]

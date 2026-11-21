@@ -583,6 +583,203 @@ async fn a_good_install_is_official_and_records_the_signed_entry() {
 }
 
 #[tokio::test]
+async fn an_official_plugin_can_be_installed_from_a_local_package_file() {
+    let world = World::new();
+    let zip = fixture_zip("1.0.0");
+    world.publish(vec![(Release::of("1.0.0", "current", &zip), zip.clone())]);
+    let file = world.root().join("supplied.zip");
+    std::fs::write(&file, &zip).unwrap();
+    assert_eq!(world.service.installed_version(PLUGIN).unwrap(), None);
+
+    let plugin = installed(
+        world
+            .service
+            .install_official_from_file(PLUGIN, &file, true)
+            .await
+            .unwrap(),
+    );
+
+    assert_eq!(
+        world.service.installed_version(PLUGIN).unwrap().as_deref(),
+        Some("1.0.0")
+    );
+    assert_eq!(plugin.version, "1.0.0");
+    assert_eq!(
+        plugin.official,
+        OfficialStatus::Official {
+            version: "1.0.0".into()
+        }
+    );
+    // The bytes came from the file, not from the catalog's URL.
+    assert_eq!(world.fetcher.calls(), 0);
+    let conn = agora_core::db::local_state_connection(&world.paths().local_state_db()).unwrap();
+    let provenance = agora_core::plugins::store::list_official(&conn).unwrap();
+    assert_eq!(provenance[PLUGIN].entry_sha256, sha(&zip));
+}
+
+#[tokio::test]
+async fn a_local_package_can_replace_an_already_installed_official_plugin() {
+    let world = World::new();
+    let zip = fixture_zip("1.0.0");
+    world.publish(vec![(Release::of("1.0.0", "current", &zip), zip.clone())]);
+    let file = world.root().join("supplied.zip");
+    std::fs::write(&file, &zip).unwrap();
+
+    let first = installed(
+        world
+            .service
+            .install_official_from_file(PLUGIN, &file, true)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(first.version, "1.0.0");
+    // No "already installed" guard: the pin is checked again and the same
+    // package is installed over the existing copy. The CLI says "Updated".
+    let second = installed(
+        world
+            .service
+            .install_official_from_file(PLUGIN, &file, true)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(second.version, "1.0.0");
+    assert_eq!(
+        world.service.installed_version(PLUGIN).unwrap().as_deref(),
+        Some("1.0.0")
+    );
+    assert_eq!(world.fetcher.calls(), 0);
+}
+
+#[tokio::test]
+async fn a_local_package_that_does_not_match_its_pin_is_refused_naming_both_hashes() {
+    let world = World::new();
+    let good = fixture_zip("1.0.0");
+    let release = Release::of("1.0.0", "current", &good);
+    let pinned_hash = sha(&good);
+    let mut forged = good.clone();
+    let last = forged.len() - 1;
+    forged[last] ^= 0xFF;
+    let file = world.root().join("forged.zip");
+    std::fs::write(&file, &forged).unwrap();
+    world.publish(vec![(release, good)]);
+
+    let error = world
+        .service
+        .install_official_from_file(PLUGIN, &file, true)
+        .await
+        .expect_err("a local package that does not match the pin is refused");
+    assert_eq!(error.code(), "ERR_OFFICIAL_PLUGIN_HASH");
+    assert!(
+        error.to_string().contains(&sha(&forged)) && error.to_string().contains(&pinned_hash),
+        "the refusal must name both hashes: {error}"
+    );
+    assert!(files_under(&world.paths().plugins_root()).is_empty());
+    assert!(world.service.list().is_empty());
+}
+
+#[tokio::test]
+async fn a_local_package_for_an_unknown_plugin_id_is_refused() {
+    let world = World::new();
+    let zip = fixture_zip("1.0.0");
+    world.publish(vec![(Release::of("1.0.0", "current", &zip), zip.clone())]);
+    let file = world.root().join("unknown.zip");
+    std::fs::write(&file, &zip).unwrap();
+
+    let error = world
+        .service
+        .install_official_from_file("acme.unknown", &file, true)
+        .await
+        .expect_err("an id the signed catalog does not list is refused");
+    assert_eq!(error.code(), "ERR_OFFICIAL_PLUGIN_UNKNOWN");
+    assert!(
+        error.to_string().contains("acme.unknown"),
+        "the refusal must name the unknown id: {error}"
+    );
+}
+
+#[tokio::test]
+async fn a_local_package_with_a_missing_dependency_is_refused_offline() {
+    let world = World::new();
+    let base = dependency_zip(BASE, "1.0.0", &[], "", None, false);
+    let game = dependency_zip(
+        GAME_PLUGIN,
+        "1.0.0",
+        &[(BASE, ">=1.0, <2")],
+        "",
+        None,
+        false,
+    );
+    world.publish(vec![
+        (
+            Release::of_plugin(GAME_PLUGIN, "1.0.0", "current", &game),
+            game.clone(),
+        ),
+        (Release::of_plugin(BASE, "1.0.0", "current", &base), base),
+    ]);
+    let file = world.root().join("game.zip");
+    std::fs::write(&file, &game).unwrap();
+
+    let error = world
+        .service
+        .install_official_from_file(GAME_PLUGIN, &file, true)
+        .await
+        .expect_err("a dependency that is not installed cannot be fetched offline");
+    assert_eq!(error.code(), "ERR_OFFICIAL_PLUGIN_OFFLINE_DEPENDENCY");
+    assert!(
+        error.to_string().contains(BASE),
+        "the refusal must name the missing dependency: {error}"
+    );
+    assert_eq!(world.fetcher.calls(), 0);
+    assert!(files_under(&world.paths().plugins_root()).is_empty());
+}
+
+#[tokio::test]
+async fn a_local_package_accepts_an_already_installed_compatible_dependency() {
+    let world = World::new();
+    let base = dependency_zip(BASE, "1.0.0", &[], "", None, false);
+    let game = dependency_zip(
+        GAME_PLUGIN,
+        "1.0.0",
+        &[(BASE, ">=1.0, <2")],
+        "",
+        None,
+        false,
+    );
+    world.publish(vec![
+        (
+            Release::of_plugin(GAME_PLUGIN, "1.0.0", "current", &game),
+            game.clone(),
+        ),
+        (
+            Release::of_plugin(BASE, "1.0.0", "current", &base),
+            base.clone(),
+        ),
+    ]);
+    let base_file = world.root().join("base.zip");
+    std::fs::write(&base_file, &base).unwrap();
+    installed(
+        world
+            .service
+            .install_official_from_file(BASE, &base_file, true)
+            .await
+            .unwrap(),
+    );
+    let game_file = world.root().join("game.zip");
+    std::fs::write(&game_file, &game).unwrap();
+
+    installed(
+        world
+            .service
+            .install_official_from_file(GAME_PLUGIN, &game_file, true)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(world.version_of(BASE).as_deref(), Some("1.0.0"));
+    assert_eq!(world.version_of(GAME_PLUGIN).as_deref(), Some("1.0.0"));
+    assert_eq!(world.fetcher.calls(), 0);
+}
+
+#[tokio::test]
 async fn the_normal_capability_consent_still_applies() {
     let world = World::new();
     let zip = fixture_zip("1.0.0");

@@ -2026,6 +2026,12 @@ enum ModSourceArg {
 enum RegistryCmd {
     Status,
     Sync,
+    /// Install a signed catalog bundle from a local file, with the same checks as a download.
+    #[command(name = "install-bundle")]
+    InstallBundle {
+        /// Path to a signed `registry.bundle` file.
+        file: PathBuf,
+    },
     /// List registry items currently under review, lowest score first.
     #[command(name = "under-review")]
     UnderReview,
@@ -6237,6 +6243,39 @@ async fn run_registry_command(
                 );
             } else {
                 println!("Registry sync: {}", report.message);
+                for warning in catalog_warnings {
+                    println!("Catalog: {warning}");
+                }
+            }
+        }
+        RegistryCmd::InstallBundle { file } => {
+            let local_state = data_dir.join("local_state.db");
+            if !local_state.exists() {
+                agora_core::db::init_local_state_db(&local_state)?;
+            }
+            let installed = agora_core::registry_sync::install_bundle_from_file(
+                data_dir,
+                &local_state,
+                &file,
+                ctx.lock_manager(),
+            )?;
+            let catalog_warnings = ctx.reload_game_catalogs()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "file": file,
+                        "tag": installed.tag,
+                        "schema_version": installed.schema_version,
+                        "expires_at": installed.expires_at,
+                        "catalog_warnings": catalog_warnings,
+                    }))?
+                );
+            } else {
+                println!("Installed catalog bundle from {}.", file.display());
+                println!("Tag:           {}", installed.tag);
+                println!("Schema:        {}", installed.schema_version);
+                println!("Expires:       {}", installed.expires_at);
                 for warning in catalog_warnings {
                     println!("Catalog: {warning}");
                 }
