@@ -149,6 +149,9 @@ pub struct InstalledBundle {
     pub tag: String,
     pub schema_version: i64,
     pub expires_at: String,
+    /// Whether this install added entries to the remembered trust log, so a
+    /// caller holding a trust snapshot knows to take a new one.
+    pub trust_changed: bool,
 }
 
 /// Install a signed `registry.bundle` from a local file.
@@ -324,6 +327,15 @@ async fn check_and_download_update_inner(
     // again only if this check itself installs something.
     let snapshot = TrustSnapshot::load(app_data_dir, compiled)?;
     let trust = &snapshot;
+    // The cache and bookkeeping state are read again under the lock too: a
+    // local install may have filled or changed them while we waited, and the
+    // fallback and download decisions below must see what is really there. The
+    // reads above only served the early, display-only returns.
+    let cached_tag = get_cached_tag(local_state_path)?;
+    let cached = cached_catalog_summary_with_trust(app_data_dir, trust);
+    let has_cached_db = cached.is_some();
+    let cached_schema_version = cached.as_ref().and_then(|summary| summary.schema_version);
+    let failed_tag = get_failed_update_tag(local_state_path)?;
 
     let latest =
         match query_latest_catalog_release(transport, registry_repo, github_token.as_deref()).await
@@ -397,7 +409,7 @@ async fn check_and_download_update_inner(
     // Register operation only when we are about to start network I/O.
     let _op = operation_manager.map(|m| m.register("Update registry"));
 
-    let install_result: LauncherResult<(i64, String, bool)> = async {
+    let install_result: LauncherResult<(i64, String, bool, bool)> = async {
         let bundle_id =
             latest
                 .find_asset("registry.bundle")
@@ -441,7 +453,7 @@ async fn check_and_download_update_inner(
         // update: just learn the asset id so the next check stops fetching it.
         if let Some(current) = unchanged_candidate(app_data_dir, &bundle_bytes, trust)? {
             let _ = set_cached_asset_id(local_state_path, Some(bundle_id));
-            return Ok((current.schema_version, current.expires_at, false));
+            return Ok((current.schema_version, current.expires_at, false, false));
         }
 
         let installed = install_bundle_bytes_checked_with(
@@ -455,11 +467,16 @@ async fn check_and_download_update_inner(
         // failed install; the next sync can set it again.
         let _ = set_cached_tag(local_state_path, &latest.tag_name);
         let _ = set_cached_asset_id(local_state_path, Some(bundle_id));
-        Ok((installed.schema_version, installed.expires_at, true))
+        Ok((
+            installed.schema_version,
+            installed.expires_at,
+            true,
+            installed.trust_changed,
+        ))
     }
     .await;
 
-    let (schema_version, expires_at, changed) = match install_result {
+    let (schema_version, expires_at, changed, trust_changed) = match install_result {
         Ok(ok) => ok,
         Err(error) => {
             // Bookkeeping must never mask the real failure or make a committed
@@ -479,7 +496,7 @@ async fn check_and_download_update_inner(
     // An identical candidate skips extraction, and extraction can fail even
     // after a real install. Report the actual readable-database state.
     let after;
-    let trust = if changed {
+    let trust = if trust_changed {
         after = TrustSnapshot::load(app_data_dir, compiled)?;
         &after
     } else {
@@ -1555,12 +1572,14 @@ fn install_bundle_bytes_checked_with(
         });
     }
 
-    install_bundle_bytes_with(app_data_dir, &verified.header, bundle_bytes, trust)?;
+    let trust_changed =
+        install_bundle_bytes_with(app_data_dir, &verified.header, bundle_bytes, trust)?;
 
     Ok(InstalledBundle {
         tag: verified.header.tag,
         schema_version,
         expires_at: verified.header.expires_at,
+        trust_changed,
     })
 }
 
@@ -1597,6 +1616,7 @@ fn unchanged_candidate(
         tag: verified.header.tag,
         schema_version: verified.header.schema_version,
         expires_at: verified.header.expires_at,
+        trust_changed: false,
     }))
 }
 
@@ -1653,7 +1673,7 @@ fn install_bundle_bytes(
     compiled: &RegistryTrust,
 ) -> LauncherResult<()> {
     let trust = TrustSnapshot::load(app_data_dir, compiled)?;
-    install_bundle_bytes_with(app_data_dir, header, bundle_bytes, &trust)
+    install_bundle_bytes_with(app_data_dir, header, bundle_bytes, &trust).map(|_| ())
 }
 
 fn install_bundle_bytes_with(
@@ -1661,7 +1681,7 @@ fn install_bundle_bytes_with(
     header: &CatalogHeader,
     bundle_bytes: &[u8],
     trust: &TrustSnapshot,
-) -> LauncherResult<()> {
+) -> LauncherResult<bool> {
     let bundle_path =
         paths::registry_bundle_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
     let previous_path = paths::registry_bundle_previous_path(app_data_dir)
@@ -1722,7 +1742,7 @@ fn install_bundle_bytes_with(
     );
     raise_floor(app_data_dir, &header.built_at, &header.db_sha256)
         .map_err(floor_after_swap_error)?;
-    Ok(())
+    Ok(trust_written)
 }
 
 /// Verify the cached catalog, recovering from the previous bundle when the
@@ -5828,6 +5848,55 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         let (status, ()) = tokio::join!(sync, local_install);
         let status = status.expect("sync must use the trust learned while it waited");
         assert_eq!(status.cached_tag.as_deref(), Some("registry-2026-11-19"));
+    }
+
+    /// The cache state sync acts on is read under the lock: a local install that
+    /// fills the cache while sync waits means a GitHub failure falls back to it.
+    #[tokio::test]
+    async fn sync_falls_back_to_a_cache_filled_while_it_waited() {
+        let (dir, ls_path, locks) = setup_sync_env();
+        let primary = test_key(203);
+        let trust = RegistryTrust::with_key(test_public(&primary));
+        // No release at all: the lookup fails the way a GitHub outage would.
+        let transport = FakeRegistryTransport::from_pages(vec![]);
+
+        let held = locks
+            .acquire(crate::lock_manager::LockResource::RegistryUpdate, "test")
+            .unwrap();
+        let sync = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            true,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_000,
+        );
+        let local_install = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let payload = sample_db_with_built_at("2026-11-18T02:00:00+00:00");
+            let header = header_for(
+                &primary,
+                &payload,
+                "2026-11-18T02:00:00+00:00",
+                "2099-01-01T00:00:00+00:00",
+            );
+            install_bundle_bytes_checked(
+                dir.path(),
+                &signed_bundle(&primary, &header, &payload),
+                &trust,
+                "local",
+            )
+            .unwrap();
+            drop(held);
+        };
+        let (status, ()) = tokio::join!(sync, local_install);
+        let status = status.expect("a usable cache must absorb the GitHub failure");
+        assert!(status.has_cached_db);
+        assert!(!status.checked);
     }
 
     /// The app and the CLI share one data folder. Their staging files must never
