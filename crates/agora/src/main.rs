@@ -713,6 +713,10 @@ enum UserFilesCmd {
         game: String,
         /// Store ID of the session to restore (e.g. steam, gog).
         store: String,
+        /// Override the both-changed conflict: the conflict copy is still written first, then
+        /// the files are put back. Automatic startup recovery never forces.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -2707,20 +2711,21 @@ async fn async_main() {
         eprintln!("Warning: {warning}");
     }
     let _script_runtime = script_runtime_if_needed(&ctx);
-    cleanup_before_command(&cli.command, &ctx, &trash_adapter(), &progress, json);
-    // An interrupted tool swap is put back at startup: one file existence test per game and store
-    // when nothing is pending (MASTER_SPEC §26.9). A case that needs a hand is reported, not raised.
-    for recovery in agora_core::game_tool_swap::recover_all(&ctx) {
-        match recovery {
-            agora_core::game_tool_swap::Recovery::Restored(j) => eprintln!(
-                "Put back the real Data folder of {} after an interrupted run of {}.",
-                j.game, j.tool
-            ),
-            agora_core::game_tool_swap::Recovery::Stuck(message) => {
-                eprintln!("Warning: a tool swap was not put back: {message}");
-            }
-        }
+    // One startup recovery pass over every crash journal (tool swaps, user-files sessions, Recently
+    // deleted, the game packages' own journals), run once here so the CLI, the desktop and the MCP
+    // listener all recover the same things (MASTER_SPEC §32.11). A journal that belongs to a live
+    // operation in another process is left alone and reported, never recovered underneath it; a
+    // case that needs a hand is reported, not raised.
+    let recovery_report = agora_core::startup_recovery::run_at_startup(&ctx);
+    for action in &recovery_report.actions {
+        progress.log("info", action);
+        eprintln!("{action}");
     }
+    for warning in &recovery_report.warnings {
+        progress.log("warning", warning);
+        eprintln!("Warning: {warning}");
+    }
+    cleanup_before_command(&cli.command, &ctx, &trash_adapter(), &progress, json);
     let data_dir = paths.root().to_path_buf();
     let result = Box::pin(run_command(cli, &paths, &data_dir, &ctx, output_fmt)).await;
     if let Err(e) = result {
@@ -10807,7 +10812,7 @@ async fn run_command(
                         }
                     }
                 }
-                UserFilesCmd::Restore { game, store } => {
+                UserFilesCmd::Restore { game, store, force } => {
                     let game_id =
                         agora_game_api::GameId::new(&game).map_err(|e| anyhow::anyhow!("{e}"))?;
                     let store_id =
@@ -10815,7 +10820,12 @@ async fn run_command(
                     let game_def = ctx.games.game(&game_id).ok_or_else(|| {
                         anyhow::anyhow!("Game definition not found for {}", game_id)
                     })?;
-                    match agora_core::game_user_files::restore(ctx, game_def, &store_id) {
+                    let restored = if force {
+                        agora_core::game_user_files::restore_forced(ctx, game_def, &store_id)
+                    } else {
+                        agora_core::game_user_files::restore(ctx, game_def, &store_id)
+                    };
+                    match restored {
                         Ok(report) => {
                             if json {
                                 println!(

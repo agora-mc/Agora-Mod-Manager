@@ -12,7 +12,15 @@ import { Badge } from '@/components/ui/badge';
 import { useConfirm } from '@/components/ui/confirm';
 import { formatError } from '@/lib/tauri';
 import type { SectionFrame } from '../shared/sectionFrame';
-import { restoreUserFiles, userFilesStatus, type RestoreResult, type UserFileSession } from './api';
+import {
+  restoreUserFiles,
+  userFilesStatus,
+  USER_FILES_CONFLICT_CODE,
+  USER_FILES_CONFLICT_CORE_CODE,
+  type RestoreResult,
+  type UserFileSession,
+} from './api';
+import { isGamesError } from '../shared/types';
 
 type ListState =
   | { status: 'loading' }
@@ -51,13 +59,32 @@ export function RecoverySection({ gameId, frame }: { gameId: string; frame: Sect
       tone: 'danger',
     });
     if (!ok) return;
-    setRestores((current) => ({ ...current, [key]: { status: 'busy' } }));
-    try {
-      const result = await restoreUserFiles(session.gameId, session.store);
-      setRestores((current) => ({ ...current, [key]: { status: 'done', result } }));
-      load();
-    } catch (error) {
-      setRestores((current) => ({ ...current, [key]: { status: 'error', message: formatError(error) } }));
+    const run = async (force: boolean) => {
+      setRestores((current) => ({ ...current, [key]: { status: 'busy' } }));
+      try {
+        const result = await restoreUserFiles(session.gameId, session.store, force);
+        setRestores((current) => ({ ...current, [key]: { status: 'done', result } }));
+        load();
+      } catch (error) {
+        setRestores((current) => ({ ...current, [key]: { status: 'error', message: formatError(error) } }));
+        return error;
+      }
+    };
+    const error: unknown = await run(false);
+    // A both-changed conflict is the one protection the explicit restore can override. IPC
+    // delivers a serialized GamesError, not an Error instance, so match its stable code; never
+    // read the human message to decide what the user may do.
+    if (
+      isGamesError(error)
+      && (error.code === USER_FILES_CONFLICT_CODE || error.coreCode === USER_FILES_CONFLICT_CORE_CODE)
+    ) {
+      const retry = await confirm({
+        title: 'Both copies changed — restore anyway?',
+        body: 'Both the game’s own file and the instance’s copy changed since the swap. Restoring anyway saves the instance’s current copy as a conflict file, then puts the original back.',
+        confirmLabel: 'Restore anyway',
+        tone: 'danger',
+      });
+      if (retry) await run(true);
     }
   };
 

@@ -16,7 +16,6 @@ pub mod scripted;
 pub mod validate;
 pub use inherit::{PackageInput, ResolvedPackage};
 
-use crate::app_paths::AppPaths;
 use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
 use crate::game_discovery::{DiscoveredInstall, DiscoveryReport};
@@ -619,11 +618,12 @@ impl GameRegistry {
         self.games.is_empty()
     }
 
-    /// Run every package's startup recovery. Returns warnings.
-    pub fn recover_at_startup(&self, paths: &AppPaths) -> Vec<String> {
+    /// Run every package's startup recovery, through
+    /// [`crate::startup_recovery::run_at_startup`]. Returns the packages' report lines.
+    pub fn recover_at_startup(&self, ctx: &crate::ctx::Ctx) -> Vec<String> {
         self.services
             .iter()
-            .flat_map(|services| services.recover_at_startup(paths))
+            .flat_map(|services| services.recover_at_startup(ctx))
             .collect()
     }
 

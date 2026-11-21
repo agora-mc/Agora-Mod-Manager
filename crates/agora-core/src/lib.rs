@@ -109,6 +109,7 @@ pub mod shared_settings;
 pub mod snapshot;
 pub mod snapshot_service;
 pub mod source_identify;
+pub mod startup_recovery;
 pub mod task_scheduler;
 pub mod version_changelogs;
 pub mod version_match;

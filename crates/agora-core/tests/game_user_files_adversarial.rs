@@ -374,9 +374,11 @@ fn a_hash_mismatch_names_the_real_file_and_its_backup() {
 ",
     )
     .unwrap();
+    // The instance's copy still holds exactly what the session wrote, so only the real file
+    // changed: the restore reaches the backup and reports its hash mismatch by name.
     std::fs::write(
         &copy,
-        "the saved session
+        "the instance's bytes
 ",
     )
     .unwrap();
@@ -397,6 +399,7 @@ fn a_hash_mismatch_names_the_real_file_and_its_backup() {
         processes: Vec::new(),
         starting_launcher: None,
         launch_id: None,
+        spawning: false,
         files: vec![JournaledFile {
             real_path: real.clone(),
             instance_path: RelPath::new("user/Plugins.txt").unwrap(),
@@ -410,6 +413,8 @@ fn a_hash_mismatch_names_the_real_file_and_its_backup() {
             swapped: true,
             state: Some(agora_core::game_user_files::FileState::Swapped),
             restored: false,
+            // The production writer records where the real path resolves.
+            real_resolved_path: std::fs::canonicalize(&real).ok(),
         }],
     };
     let journal_path = journal_path_of(&h, &def);

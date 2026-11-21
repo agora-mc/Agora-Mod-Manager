@@ -503,10 +503,60 @@ fn free_id_for_name(
 /// finished (or called off) from the entry alone.
 const RESTORING_FILE: &str = "restoring.json";
 
+/// Written *inside* the instance folder a restore moves, before the move. It travels with the
+/// files, so recovery can prove the destination folder came from this trash entry. A stale
+/// `restoring.json` plus an unrelated folder at the destination id is not enough to rewrite that
+/// folder's manifest.
+const RESTORE_MARKER: &str = ".agora-restore-marker.json";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Restoring {
     new_id: String,
     new_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RestoreMarker {
+    entry_id: String,
+}
+
+fn write_restore_marker(source: &Path, entry_id: &str) -> Result<(), InstanceError> {
+    let bytes = serde_json::to_vec(&RestoreMarker {
+        entry_id: entry_id.to_string(),
+    })
+    .map_err(|e| err("ERR_INSTANCE_RESTORE", e.to_string()))?;
+    write_atomic(&source.join(RESTORE_MARKER), &bytes)
+        .map_err(|e| io_err("ERR_INSTANCE_RESTORE", "Cannot mark the restore source", e))
+}
+
+/// Prove that `dest` holds the files this trash entry moved. Missing, unreadable or foreign
+/// markers are all "could not tell", never permission to rewrite the folder.
+fn verify_restore_marker(dest: &Path, entry_id: &str) -> Result<(), InstanceError> {
+    let path = dest.join(RESTORE_MARKER);
+    let bytes = std::fs::read(&path).map_err(|e| {
+        io_err(
+            "ERR_INSTANCE_RESTORE",
+            "The restore destination has no readable marker from this trash entry",
+            e,
+        )
+    })?;
+    let marker: RestoreMarker = serde_json::from_slice(&bytes).map_err(|e| {
+        err(
+            "ERR_INSTANCE_RESTORE",
+            format!("Restore marker unreadable: {e}"),
+        )
+    })?;
+    if marker.entry_id != entry_id {
+        return Err(err(
+            "ERR_INSTANCE_RESTORE",
+            "The restore destination belongs to a different trash entry",
+        ));
+    }
+    Ok(())
+}
+
+fn remove_restore_marker(dest: &Path) {
+    let _ = std::fs::remove_file(dest.join(RESTORE_MARKER));
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -617,12 +667,14 @@ fn tidy_entry(root: &Path, entry_id: &str) {
 ///   the entry holds the files, so the row is dropped and the entry is restorable;
 /// * a restore cut off after the move leaves the folder in place and no row; it is finished;
 /// * a restore cut off before the move is called off.
+///
+/// Returns what it did, for the startup recovery report; `None` when there was nothing to do.
 fn recover_entry(
     ctx: &Ctx,
     conn: &Connection,
     root: &Path,
     stored: &StoredEntry,
-) -> Result<(), InstanceError> {
+) -> Result<Option<String>, InstanceError> {
     let entry_id = &stored.entry.entry_id;
     let dir = entry_dir(root, entry_id)?;
     let instances_root = ctx.paths.instances_root();
@@ -634,25 +686,46 @@ fn recover_entry(
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok());
         let Some(restoring) = restoring else {
-            return Ok(());
+            return Ok(None);
         };
         validate_path_component(&restoring.new_id)
             .map_err(|error| err("ERR_INSTANCE_RESTORE", error.to_string()))?;
         if is_plain_dir(&source) {
-            // The files never left: the restore did not get far enough to matter.
+            // The files never left: the restore did not get far enough to matter. Clear both
+            // markers — the entry's and the one inside the folder — so a later retry starts clean.
             let _ = std::fs::remove_file(&restoring_path);
-        } else if is_plain_dir(&instances_root.join(&restoring.new_id))
-            && !row_exists(conn, &restoring.new_id)?
-        {
-            finish_restore(
-                conn,
-                &instances_root.join(&restoring.new_id),
-                stored,
-                &restoring,
-            )?;
+            remove_restore_marker(&source);
+            return Ok(Some(format!(
+                "Called off the interrupted restore of instance {} from Recently deleted: its \
+                 files never moved.",
+                stored.entry.instance_id
+            )));
+        } else if is_plain_dir(&instances_root.join(&restoring.new_id)) {
+            let dest = instances_root.join(&restoring.new_id);
+            // The destination might have been reused since the crash. Only finish a restore when
+            // the folder still carries the marker the delete wrote for this very entry.
+            verify_restore_marker(&dest, entry_id)?;
+            let action = if !row_exists(conn, &restoring.new_id)? {
+                finish_restore(conn, &dest, stored, &restoring)?;
+                format!(
+                    "Finished the interrupted restore of instance {} from Recently deleted.",
+                    restoring.new_id
+                )
+            } else {
+                // The row made it in before the crash; the restore is already committed.
+                format!(
+                    "The interrupted restore of instance {} from Recently deleted was already \
+                     finished; its entry was tidied.",
+                    restoring.new_id
+                )
+            };
+            // Tidy first: while the entry exists recovery may look at it and needs the marker.
+            // Once it is gone, the marker has no purpose.
             tidy_entry(root, entry_id);
+            remove_restore_marker(&dest);
+            return Ok(Some(action));
         }
-        return Ok(());
+        return Ok(None);
     }
 
     if is_plain_dir(&source)
@@ -663,33 +736,73 @@ fn recover_entry(
             "DELETE FROM game_instances WHERE instance_id = ?1",
             [&stored.entry.instance_id],
         )?;
+        return Ok(Some(format!(
+            "Dropped the row of instance {} whose folder a crashed delete had already moved to \
+             Recently deleted; the entry stays restorable.",
+            stored.entry.instance_id
+        )));
     }
-    Ok(())
+    Ok(None)
+}
+
+/// Finish or call off whatever a crash left half done in Recently deleted, and report each entry:
+/// one action line for what was finished or called off, one warning for what could not be touched
+/// (an unreadable entry, or one whose instance lock another live operation holds). Safe to run at
+/// any time: an entry whose instance is busy is skipped, and nothing is touched unless an entry's
+/// own record says what happened.
+pub fn recover_interrupted_reporting(ctx: &Ctx) -> (Vec<String>, Vec<String>) {
+    let mut actions = Vec::new();
+    let mut warnings = Vec::new();
+    let root = ctx.paths.recently_deleted_games_root();
+    let Ok(read) = std::fs::read_dir(&root) else {
+        return (actions, warnings);
+    };
+    let Ok(conn) = crate::db::local_state_connection(&ctx.paths.local_state_db()) else {
+        return (actions, warnings);
+    };
+    for id in read
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+    {
+        let stored = match read_entry_file(&root, &id) {
+            Ok(stored) => stored,
+            Err(error) => {
+                warnings.push(format!(
+                    "Recently deleted entry {id} could not be read ({error}) and was left alone."
+                ));
+                continue;
+            }
+        };
+        let lock = try_lock_instance(ctx, &stored.entry.instance_id, "recover");
+        let _lock = match lock {
+            Ok(lock) => lock,
+            Err(error) => {
+                warnings.push(format!(
+                    "Recently deleted entry for instance {} was left alone: another operation \
+                     holds its lock ({error}).",
+                    stored.entry.instance_id
+                ));
+                continue;
+            }
+        };
+        match recover_entry(ctx, &conn, &root, &stored) {
+            Ok(Some(action)) => actions.push(action),
+            Ok(None) => {}
+            Err(error) => warnings.push(format!(
+                "Recently deleted entry for instance {} could not be recovered: {error}. It was \
+                 left as it is.",
+                stored.entry.instance_id
+            )),
+        }
+    }
+    (actions, warnings)
 }
 
 /// Finish or call off whatever a crash left half done in Recently deleted. Safe to run at any
 /// time: an entry whose instance is busy is skipped, and nothing is touched unless an entry's
 /// own record says what happened.
 pub fn recover_interrupted(ctx: &Ctx) {
-    let root = ctx.paths.recently_deleted_games_root();
-    let Ok(read) = std::fs::read_dir(&root) else {
-        return;
-    };
-    let Ok(conn) = crate::db::local_state_connection(&ctx.paths.local_state_db()) else {
-        return;
-    };
-    for id in read
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().into_string().ok())
-    {
-        let Ok(stored) = read_entry_file(&root, &id) else {
-            continue;
-        };
-        let Ok(_lock) = try_lock_instance(ctx, &stored.entry.instance_id, "recover") else {
-            continue;
-        };
-        let _ = recover_entry(ctx, &conn, &root, &stored);
-    }
+    let _ = recover_interrupted_reporting(ctx);
 }
 
 /// Restore an entry. With no `new_name`, the original id is restored and a taken id is refused
@@ -751,13 +864,17 @@ pub fn restore(
         new_name: new_name.clone(),
     };
     let restoring_path = entry_dir(&root, entry_id)?.join(RESTORING_FILE);
-    let marker =
+    let restoring_bytes =
         serde_json::to_vec(&restoring).map_err(|e| err("ERR_INSTANCE_RESTORE", e.to_string()))?;
-    write_atomic(&restoring_path, &marker)
+    write_atomic(&restoring_path, &restoring_bytes)
         .map_err(|e| io_err("ERR_INSTANCE_RESTORE", "Cannot mark the entry", e))?;
+    // The marker travels with the folder, so a later recovery can tell this destination from a
+    // folder someone else created at the same id.
+    write_restore_marker(&source, entry_id)?;
 
     if let Err(e) = std::fs::rename(&source, &dest) {
         let _ = std::fs::remove_file(&restoring_path);
+        remove_restore_marker(&source);
         return Err(io_err(
             "ERR_INSTANCE_RESTORE",
             "Cannot move the files back",
@@ -769,13 +886,16 @@ pub fn restore(
         // Put the files back where they were found, so the entry is whole again.
         if std::fs::rename(&dest, &source).is_ok() {
             let _ = std::fs::remove_file(&restoring_path);
+            remove_restore_marker(&source);
         }
         return Err(error);
     }
 
-    // Committed. Tidy the (now empty) entry; if that fails, listing skips it because its files
-    // are gone.
+    // Committed. Tidy the (now empty) entry first; if that fails, listing skips it because its
+    // files are gone. The marker stays until the entry is gone so a crash in between is still
+    // recoverable as an already-finished restore.
     tidy_entry(&root, entry_id);
+    remove_restore_marker(&dest);
     Ok(RestoreOutcome {
         instance_id: new_id,
         original_instance_id: original,

@@ -3,6 +3,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// Expected schema version for the mutable local SQLite database.
 /// Migrations are applied sequentially on startup.
@@ -51,6 +52,8 @@ pub struct LocalStateStartupReport {
     pub migrated_from: i64,
     /// The schema version recorded after migration.
     pub migrated_to: i64,
+    /// Problems that were left alone rather than guessed at, for the adapters to report.
+    pub warnings: Vec<String>,
 }
 
 /// A corrupt database kept on disk and how startup recovered from it.
@@ -70,6 +73,44 @@ pub struct NewerSchemaKept {
     pub supported: i64,
     /// Where the newer database was moved. It is never deleted.
     pub kept_at: PathBuf,
+}
+
+/// Test-only hook, run once immediately after the startup lock is acquired for `db_path`.
+/// Integration tests cannot use `cfg(test)` in a library, so this is a runtime hook; it is a no-op
+/// for every other database, and removes itself after the first matching call so only one of
+/// that database's initializers pauses. Path scoping keeps parallel tests from firing each
+/// other's hook.
+#[doc(hidden)]
+pub fn set_startup_lock_hook(db_path: &std::path::Path, hook: Box<dyn Fn() + Send>) {
+    let slot = STARTUP_LOCK_HOOK.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some((db_path.to_path_buf(), hook));
+}
+
+#[doc(hidden)]
+pub fn clear_startup_lock_hook() {
+    let slot = STARTUP_LOCK_HOOK.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = None;
+}
+
+type StartupLockHook = (std::path::PathBuf, Box<dyn Fn() + Send>);
+
+static STARTUP_LOCK_HOOK: OnceLock<Mutex<Option<StartupLockHook>>> = OnceLock::new();
+
+fn notify_startup_locked(db_path: &std::path::Path) {
+    let Some(hook) = STARTUP_LOCK_HOOK.get().and_then(|slot| {
+        let mut guard = slot.lock().ok()?;
+        let matches = guard.as_ref().is_some_and(|(path, _)| path == db_path);
+        if matches {
+            guard.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    }) else {
+        return;
+    };
+    hook();
 }
 
 /// Open a read-write connection to the local state database.
@@ -144,6 +185,27 @@ pub fn init_local_state_db_with(
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+
+    // One cross-process lock for the whole open: integrity check, any quarantine/restore, and
+    // migrations. The CLI and the desktop can start together; without this, the later process
+    // could restore the same backup over the first one's live database and remove its WAL/SHM
+    // sidecars. The second starter waits here and then reads the result. The lock file lives on
+    // the same data root as the database, so both adapters use the same key.
+    let locks_root = db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("locks");
+    let locks = crate::lock_manager::LockManager::new(locks_root);
+    let _db_guard = locks
+        .acquire(
+            crate::lock_manager::LockResource::LocalStateDatabase,
+            "init-local-state-db",
+        )
+        .map_err(|error| {
+            anyhow::anyhow!("Could not lock the local database for startup: {error}")
+        })?;
+    notify_startup_locked(db_path);
+
     let mut report = LocalStateStartupReport::default();
 
     // 1. Integrity check, and recovery before anything writes to the file.
@@ -151,16 +213,32 @@ pub fn init_local_state_db_with(
     //    launch that fails to restore a backup leaves evidence that recovery
     //    is unfinished. Without it, the absent database would look like a first
     //    run on the next start and recovery would be skipped.
+    let identity = ensure_identity(db_path)?;
     let recovery_marker = recovery_marker_path(db_path);
     if recovery_marker.is_file() {
-        if let Some(recovery) = recover_pending_database(db_path, &recovery_marker)? {
-            report.recovered_corrupt = Some(recovery);
+        match read_recovery_marker(&recovery_marker)
+            .filter(|marker| marker_belongs_to(marker, &identity, db_path))
+        {
+            Some(_) => {
+                if let Some(recovery) = recover_pending_database(db_path, &recovery_marker)? {
+                    report.recovered_corrupt = Some(recovery);
+                }
+            }
+            None => {
+                // A foreign or unreadable marker is "could not tell", never permission to
+                // restore a backup here or to clear the marker. Keep both and report.
+                report.warnings.push(format!(
+                    "A database recovery marker beside {} is not from this database and was left \
+                     alone; no backup was restored.",
+                    db_path.display()
+                ));
+            }
         }
     } else if db_path.exists() {
         match check_integrity(db_path)? {
             Integrity::Ok => {}
             Integrity::Corrupt(reason) => {
-                write_recovery_marker(&recovery_marker)?;
+                write_recovery_marker(db_path, &recovery_marker, &identity)?;
                 let kept_at = quarantine_database(db_path, "corrupt")?;
                 let restored_from = restore_newest_backup(db_path)?;
                 clear_recovery_marker(&recovery_marker);
@@ -426,8 +504,50 @@ fn recovery_marker_path(db_path: &Path) -> PathBuf {
     sidecar_path(db_path, ".recovery")
 }
 
-fn write_recovery_marker(marker: &Path) -> anyhow::Result<()> {
-    std::fs::write(marker, b"")?;
+/// A random id kept beside the database. The recovery marker carries this id and the database's
+/// path, so a marker copied from another data root (or from another database) is recognised as
+/// foreign and left alone instead of driving a backup restore here.
+fn identity_path(db_path: &Path) -> PathBuf {
+    sidecar_path(db_path, ".identity")
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RecoveryMarker {
+    identity: String,
+    db_path: PathBuf,
+}
+
+/// Read the database's identity, creating it on a first run. Called under the startup lock, so
+/// two starting processes cannot write different ids.
+fn ensure_identity(db_path: &Path) -> anyhow::Result<String> {
+    let path = identity_path(db_path);
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let identity = text.trim();
+        if !identity.is_empty() {
+            return Ok(identity.to_string());
+        }
+    }
+    let identity = uuid::Uuid::new_v4().to_string();
+    std::fs::write(&path, identity.as_bytes())?;
+    Ok(identity)
+}
+
+fn read_recovery_marker(marker: &Path) -> Option<RecoveryMarker> {
+    std::fs::read_to_string(marker)
+        .ok()
+        .and_then(|text| serde_json::from_str::<RecoveryMarker>(&text).ok())
+}
+
+fn marker_belongs_to(marker: &RecoveryMarker, identity: &str, db_path: &Path) -> bool {
+    marker.identity == identity && marker.db_path == db_path
+}
+
+fn write_recovery_marker(db_path: &Path, marker: &Path, identity: &str) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec(&RecoveryMarker {
+        identity: identity.to_string(),
+        db_path: db_path.to_path_buf(),
+    })?;
+    std::fs::write(marker, bytes)?;
     Ok(())
 }
 

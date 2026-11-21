@@ -498,6 +498,7 @@ fn delete_refuses_while_the_instances_session_is_starting_or_running() {
             None
         },
         launch_id: None,
+        spawning: false,
         files: Vec::new(),
     };
 

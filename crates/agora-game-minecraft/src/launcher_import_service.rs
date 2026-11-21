@@ -39,6 +39,8 @@ use crate::launcher_import::{
     LoaderTuple,
 };
 use crate::loader_service::LoaderService;
+use agora_core::instance_runtime;
+use agora_core::lock_manager::LockResource;
 use agora_core::models::{InstalledMod, InstanceManifest, InstanceRow};
 use agora_core::network::NetworkPolicy;
 use serde::{Deserialize, Serialize};
@@ -1011,7 +1013,7 @@ impl Drop for ImportJobGuard {
         }
         let _ = std::fs::remove_dir_all(&self.staging);
         if let Ok(connection) = agora_core::db::local_state_connection(&self.db_path) {
-            let _ = agora_core::db::delete_instance_import_job(&connection, &self.job_id);
+            let _ = db::delete_instance_import_job(&connection, &self.job_id);
         }
     }
 }
@@ -1506,7 +1508,7 @@ impl LauncherImportService {
             .ctx
             .lock_manager
             .acquire_async(
-                agora_core::lock_manager::LockResource::Instance(dest_id.clone()),
+                LockResource::Instance(dest_id.clone()),
                 "launcher-import-execute",
             )
             .await
@@ -1592,6 +1594,13 @@ impl LauncherImportService {
             }
             Ok(())
         };
+
+        // Mark the staging folder before anything is copied into it. The marker travels with the
+        // folder into the final directory on the rename, so recovery can prove it created it.
+        if let Err(error) = write_import_owner_marker(&staging, &job_id) {
+            let _ = rollback_staging();
+            return Err(error);
+        }
 
         // ── Stage: copy payload with hashing ─────────────────────────────
         let mut copied_bytes = 0u64;
@@ -2098,6 +2107,13 @@ impl LauncherImportService {
                             message: format!("Cannot quarantine old instance: {e}"),
                         }
                     })?;
+                    // Mark the quarantine as soon as it exists, before anything else happens to
+                    // it. A crash before this leaves an unmarked folder recovery will keep.
+                    if let Err(error) = write_import_owner_marker(quarantine, &job_id) {
+                        let _ = std::fs::rename(quarantine, &final_dir);
+                        let _ = rollback_staging();
+                        return Err(error);
+                    }
                 }
 
                 if let Err(e) = std::fs::rename(&staging, &final_dir) {
@@ -2107,6 +2123,7 @@ impl LauncherImportService {
                     }
                     if quarantine.exists() {
                         let _ = std::fs::rename(quarantine, &final_dir);
+                        remove_import_owner_marker(&final_dir);
                     }
                     let _ = rollback_staging();
                     return Err(LauncherError::Generic {
@@ -2118,6 +2135,7 @@ impl LauncherImportService {
                     let _ = std::fs::rename(&final_dir, &staging);
                     if quarantine.exists() {
                         let _ = std::fs::rename(quarantine, &final_dir);
+                        remove_import_owner_marker(&final_dir);
                     }
                     let _ = rollback_staging();
                     return Err(error);
@@ -2133,6 +2151,7 @@ impl LauncherImportService {
                         let _ = std::fs::rename(&final_dir, &staging);
                         if quarantine.exists() {
                             let _ = std::fs::rename(quarantine, &final_dir);
+                            remove_import_owner_marker(&final_dir);
                         }
                         let _ = rollback_staging();
                         return Err(LauncherError::Generic {
@@ -2216,6 +2235,7 @@ impl LauncherImportService {
                     let _ = std::fs::rename(&final_dir, &staging);
                     if quarantine.exists() {
                         let _ = std::fs::rename(quarantine, &final_dir);
+                        remove_import_owner_marker(&final_dir);
                     }
                     let _ = rollback_staging();
                     return Err(LauncherError::Generic {
@@ -2256,6 +2276,7 @@ impl LauncherImportService {
                     let _ = std::fs::rename(&final_dir, &staging);
                     if quarantine.exists() {
                         let _ = std::fs::rename(quarantine, &final_dir);
+                        remove_import_owner_marker(&final_dir);
                     }
                     let _ = rollback_staging();
                     return Err(LauncherError::Generic {
@@ -2368,106 +2389,378 @@ fn persist_import_job_state(
     })
 }
 
+/// Ownership marker written into every directory an import creates before any content is put in
+/// it: the staging folder (which becomes the final directory) and the quarantine folder. Recovery
+/// deletes or moves a directory only when this marker names its job; a directory without it may
+/// belong to a generic game instance or a different import and is kept and reported.
+const IMPORT_OWNER_MARKER: &str = ".agora-import-owner.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ImportOwnerMarker {
+    job_id: String,
+}
+
+fn write_import_owner_marker(dir: &Path, job_id: &str) -> LauncherResult<()> {
+    let bytes = serde_json::to_vec(&ImportOwnerMarker {
+        job_id: job_id.to_string(),
+    })
+    .map_err(|error| LauncherError::Generic {
+        code: "ERR_IMPORT_JOURNAL".into(),
+        message: error.to_string(),
+    })?;
+    std::fs::write(dir.join(IMPORT_OWNER_MARKER), bytes).map_err(|error| LauncherError::Generic {
+        code: "ERR_IMPORT_JOURNAL".into(),
+        message: format!("Cannot write the import ownership marker: {error}"),
+    })
+}
+
+fn import_owns(dir: &Path, job_id: &str) -> bool {
+    std::fs::read_to_string(dir.join(IMPORT_OWNER_MARKER))
+        .ok()
+        .and_then(|text| serde_json::from_str::<ImportOwnerMarker>(&text).ok())
+        .is_some_and(|marker| marker.job_id == job_id)
+}
+
+fn remove_import_owner_marker(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join(IMPORT_OWNER_MARKER));
+}
+
 /// Recover interrupted imports before normal app operations begin.
-pub fn recover_interrupted_jobs(paths: &agora_core::app_paths::AppPaths) -> Vec<String> {
+///
+/// Two-process rule: a job whose instance lock another Agora process holds belongs to a live
+/// import (the executing import takes `LockResource::Instance` before writing its journal), so it
+/// is left alone — staging, quarantine and the job row untouched — and reported, never recovered
+/// underneath the live operation. Ownership rule: a directory is only deleted or moved when its
+/// marker names the job; anything else is kept and reported.
+pub fn recover_interrupted_jobs(ctx: &Ctx) -> Vec<String> {
     let mut warnings = Vec::new();
+    let paths = &ctx.paths;
     let Ok(connection) = agora_core::db::local_state_connection(&paths.local_state_db()) else {
         return warnings;
     };
     let Ok(jobs) = agora_core::db::list_instance_import_jobs(&connection) else {
         return warnings;
     };
-    for job in jobs {
-        let staging = PathBuf::from(&job.staging_path);
-        let final_dir = PathBuf::from(&job.final_path);
-        if !staging.starts_with(paths.staging_root())
-            || !final_dir.starts_with(paths.instances_root())
-        {
-            warnings.push(format!(
-                "Ignored unsafe interrupted import paths for {}",
-                job.instance_id
-            ));
-            let _ = agora_core::db::delete_instance_import_job(&connection, &job.job_id);
-            continue;
+    for job in &jobs {
+        if let Some(line) = recover_one_job(ctx, &connection, job) {
+            warnings.push(line);
         }
-
-        let committed = agora_core::db::get_instance_import(&connection, &job.instance_id)
-            .ok()
-            .flatten()
-            .is_some_and(|record| record.source_fingerprint == job.plan_fingerprint)
-            && agora_core::db::get_instance(&connection, &job.instance_id)
-                .ok()
-                .flatten()
-                .is_some();
-
-        let quarantine = job
-            .quarantine_path
-            .as_ref()
-            .map(PathBuf::from)
-            .filter(|path| path.starts_with(paths.staging_root()) && path.exists())
-            .or_else(|| find_import_quarantine(paths, &job.instance_id));
-        if committed {
-            let _ = std::fs::remove_dir_all(&staging);
-            if let Some(quarantine) = quarantine {
-                let _ = std::fs::remove_dir_all(quarantine);
-            }
-            warnings.push(format!(
-                "Finished cleanup for imported instance {} after an interrupted shutdown",
-                job.instance_id
-            ));
-        } else if job.state.contains("update") {
-            if let Some(quarantine) = quarantine {
-                if final_dir.exists() {
-                    let _ = std::fs::remove_dir_all(&final_dir);
-                }
-                if std::fs::rename(&quarantine, &final_dir).is_err() {
-                    warnings.push(format!(
-                        "Could not restore interrupted update for {} from {}",
-                        job.instance_id,
-                        quarantine.display()
-                    ));
-                    continue;
-                }
-            }
-            let _ = std::fs::remove_dir_all(&staging);
-            warnings.push(format!(
-                "Rolled back interrupted update for {}",
-                job.instance_id
-            ));
-        } else {
-            let _ = std::fs::remove_dir_all(&staging);
-            if final_dir.exists()
-                && agora_core::db::get_instance(&connection, &job.instance_id)
-                    .ok()
-                    .flatten()
-                    .is_none()
-            {
-                let _ = std::fs::remove_dir_all(&final_dir);
-            }
-            warnings.push(format!(
-                "Rolled back interrupted import for {}",
-                job.instance_id
-            ));
-        }
-        let _ = agora_core::db::delete_instance_import_job(&connection, &job.job_id);
     }
     warnings
+}
+
+/// Recover one journal row. Split from the sweep so the read-under-lock contract can be tested
+/// with a row that changes between the listing and the lock acquisition.
+fn recover_one_job(
+    ctx: &Ctx,
+    connection: &rusqlite::Connection,
+    listed: &InstanceImportJob,
+) -> Option<String> {
+    let paths = &ctx.paths;
+    // Never wait on the lock at startup: a live import in another process may hold it.
+    let lock = ctx.lock_manager.acquire_with_timeout(
+        LockResource::Instance(listed.instance_id.clone()),
+        "import-recover",
+        std::time::Duration::ZERO,
+        None,
+    );
+    let _guard = match lock {
+        Ok(guard) => guard,
+        Err(error) => {
+            return Some(format!(
+                "The interrupted import for {} was left alone: another Agora holds the \
+                 instance's lock right now ({error}). Nothing was changed.",
+                listed.instance_id
+            ));
+        }
+    };
+    // The writer holds this lock for the whole operation, so once we have it the journal is
+    // final. Re-read it under the lock: a second recovery process may have finished this row
+    // while we waited, or the writer may have updated it just before it crashed. Acting on the
+    // row we listed before the lock would touch folders that no longer belong to this job.
+    let fresh = match db::list_instance_import_jobs(connection) {
+        Ok(list) => list,
+        Err(error) => {
+            return Some(format!(
+                "The interrupted import for {} was left alone: its journal could not be re-read \
+                 under the lock ({error}). Nothing was changed.",
+                listed.instance_id
+            ));
+        }
+    };
+    let Some(job) = fresh.into_iter().find(|row| row.job_id == listed.job_id) else {
+        return None; // another recovery process already finished this row
+    };
+    let staging = PathBuf::from(&job.staging_path);
+    let final_dir = PathBuf::from(&job.final_path);
+    if !staging.starts_with(paths.staging_root()) || !final_dir.starts_with(paths.instances_root())
+    {
+        let _ = db::delete_instance_import_job(connection, &job.job_id);
+        return Some(format!(
+            "Ignored unsafe interrupted import paths for {}",
+            job.instance_id
+        ));
+    }
+
+    // Launch releases the instance lock once the game is running and relies on a durable runtime
+    // lease instead. Check it before ANY rename or quarantine in this function: a live lease, or a
+    // lease whose state cannot be read, means the folder may belong to a running game.
+    if let Err(error) = instance_runtime::check_idle(&ctx.paths, &job.instance_id) {
+        return Some(format!(
+            "The interrupted import for {} is in use; will retry next start ({}). Nothing was \
+             changed.",
+            job.instance_id, error
+        ));
+    }
+
+    // Every directory this recovery deletes or moves must carry this job's marker. Absence of a
+    // marker means someone else may own the folder, so keep it and report rather than guess.
+    if staging.exists() && !import_owns(&staging, &job.job_id) {
+        return Some(format!(
+            "The interrupted import for {} was left alone: its staging folder is not marked as \
+             this job's. Nothing was changed.",
+            job.instance_id
+        ));
+    }
+
+    // A failed lookup is "could not tell", never "no row": stop without touching the journal.
+    let import_committed = match db::get_instance_import(connection, &job.instance_id) {
+        Ok(record) => {
+            record.is_some_and(|record| record.source_fingerprint == job.plan_fingerprint)
+        }
+        Err(error) => {
+            return Some(format!(
+                "The interrupted import for {} was left alone: its import record could not be \
+                     read ({error}). Nothing was changed.",
+                job.instance_id
+            ));
+        }
+    };
+    let instance_committed = match db::get_instance(connection, &job.instance_id) {
+        Ok(row) => row.is_some(),
+        Err(error) => {
+            return Some(format!(
+                "The interrupted import for {} was left alone: its instance record could not be \
+                 read ({error}). Nothing was changed.",
+                job.instance_id
+            ));
+        }
+    };
+    let committed = import_committed && instance_committed;
+
+    let quarantine = match resolve_import_quarantine(paths, &job) {
+        Ok(quarantine) => quarantine,
+        Err(reason) => {
+            return Some(format!(
+                "The interrupted import for {} was left alone: {reason} Nothing was changed.",
+                job.instance_id
+            ));
+        }
+    };
+    let line = if committed {
+        let _ = std::fs::remove_dir_all(&staging);
+        if let Some(quarantine) = quarantine {
+            let _ = std::fs::remove_dir_all(quarantine);
+        }
+        format!(
+            "Finished cleanup for imported instance {} after an interrupted shutdown",
+            job.instance_id
+        )
+    } else if job.state.contains("update") {
+        let line = if let Some(quarantine) = quarantine {
+            if final_dir.exists() && !import_owns(&final_dir, &job.job_id) {
+                return Some(format!(
+                    "The interrupted import for {} was left alone: its final directory is not \
+                     marked as this job's. Nothing was changed.",
+                    job.instance_id
+                ));
+            }
+            // The promoted tree may have been launched after the writer crashed and the OS
+            // released its lock, so the player may have made saves in it. Never delete it: move it
+            // aside next to the instance, mark it as this job's, and say where it went.
+            let mut promoted_aside: Option<PathBuf> = None;
+            if final_dir.exists() {
+                let parent = match final_dir.parent() {
+                    Some(parent) => parent.to_path_buf(),
+                    None => paths.instances_root(),
+                };
+                let aside = parent.join(format!(
+                    ".agora-quarantine-{}-{}",
+                    job.instance_id,
+                    Uuid::new_v4()
+                ));
+                match std::fs::symlink_metadata(&aside) {
+                    Ok(_) => {
+                        return Some(format!(
+                            "The interrupted import for {} was left alone: could not find a free \
+                             quarantine name next to {}. Nothing was changed.",
+                            job.instance_id,
+                            final_dir.display()
+                        ))
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Some(format!(
+                            "The interrupted import for {} was left alone: the quarantine name \
+                             next to {} could not be checked ({error}). Nothing was changed.",
+                            job.instance_id,
+                            final_dir.display()
+                        ))
+                    }
+                }
+                if let Err(error) = std::fs::rename(&final_dir, &aside) {
+                    return Some(format!(
+                        "The interrupted import for {} was left alone: the promoted folder could \
+                         not be moved aside ({error}). Nothing was changed.",
+                        job.instance_id
+                    ));
+                }
+                if let Err(error) = write_import_owner_marker(&aside, &job.job_id) {
+                    let _ = std::fs::rename(&aside, &final_dir);
+                    return Some(format!(
+                        "The interrupted import for {} was left alone: the promoted folder could \
+                         not be marked as this job's ({error}). It was put back.",
+                        job.instance_id
+                    ));
+                }
+                promoted_aside = Some(aside);
+            }
+            if std::fs::rename(&quarantine, &final_dir).is_err() {
+                if let Some(aside) = &promoted_aside {
+                    let _ = std::fs::rename(aside, &final_dir);
+                }
+                return Some(format!(
+                    "Could not restore interrupted update for {} from {}; the promoted folder was \
+                     put back. Nothing was deleted.",
+                    job.instance_id,
+                    quarantine.display()
+                ));
+            }
+            remove_import_owner_marker(&final_dir);
+            let aside_note = match &promoted_aside {
+                Some(aside) => format!(
+                    " The promoted folder, including anything saved since the crash, was kept at \
+                     {}.",
+                    aside.display()
+                ),
+                None => String::new(),
+            };
+            format!(
+                "Rolled back interrupted update for {}.{}",
+                job.instance_id, aside_note
+            )
+        } else {
+            format!("Rolled back interrupted update for {}", job.instance_id)
+        };
+        let _ = std::fs::remove_dir_all(&staging);
+        line
+    } else {
+        // Only a positive "no such instance" permits deleting the final directory. A failed
+        // lookup means we cannot tell whether a live or newly created instance now owns it.
+        let instance_exists = match db::get_instance(connection, &job.instance_id) {
+            Ok(row) => row.is_some(),
+            Err(error) => {
+                return Some(format!(
+                    "The interrupted import for {} was left alone: its instance record could not \
+                     be read ({error}). The final directory was not deleted.",
+                    job.instance_id
+                ));
+            }
+        };
+        if final_dir.exists() && !instance_exists {
+            if !import_owns(&final_dir, &job.job_id) {
+                // Keep the whole job — staging and row included — when any part of it is
+                // ambiguous. Deleting staging here would strand the row with no staged payload
+                // and make the "Nothing was changed" report a lie.
+                return Some(format!(
+                    "The interrupted import for {} was left alone: its final directory is not \
+                     marked as this job's. Nothing was changed.",
+                    job.instance_id
+                ));
+            }
+            let _ = std::fs::remove_dir_all(&final_dir);
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+        format!("Rolled back interrupted import for {}", job.instance_id)
+    };
+    let _ = db::delete_instance_import_job(connection, &job.job_id);
+    Some(line)
+}
+
+/// Resolve the update quarantine a job's journal names. A fallback scan must match exactly one
+/// directory *owned by this job*: the folder is `.agora-quarantine-<id>-<uuid>`, so the suffix
+/// after this job's prefix has to be a UUID, and the folder must carry this job's marker. A plain
+/// prefix match lets `foo` claim `foo-bar`'s backup, and more than one match is ambiguity.
+fn resolve_import_quarantine(
+    paths: &agora_core::app_paths::AppPaths,
+    job: &InstanceImportJob,
+) -> Result<Option<PathBuf>, String> {
+    if let Some(recorded) = &job.quarantine_path {
+        let path = PathBuf::from(recorded);
+        if !path.starts_with(paths.staging_root()) {
+            return Err(format!(
+                "its journal names a quarantine outside the staging folder ({})",
+                path.display()
+            ));
+        }
+        if path.exists() && !import_owns(&path, &job.job_id) {
+            return Err(format!(
+                "its recorded quarantine ({}) is not marked as this job's",
+                path.display()
+            ));
+        }
+        return Ok(path.exists().then_some(path));
+    }
+    find_import_quarantine(paths, &job.instance_id, &job.job_id)
 }
 
 fn find_import_quarantine(
     paths: &agora_core::app_paths::AppPaths,
     instance_id: &str,
-) -> Option<PathBuf> {
+    job_id: &str,
+) -> Result<Option<PathBuf>, String> {
     let prefix = format!(".agora-quarantine-{instance_id}-");
-    std::fs::read_dir(paths.staging_root())
-        .ok()?
+    let read = match std::fs::read_dir(paths.staging_root()) {
+        Ok(read) => read,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("the staging folder could not be read ({error})")),
+    };
+    let named: Vec<PathBuf> = read
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .find(|path| {
+        .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(&prefix))
+                .and_then(|name| name.strip_prefix(&prefix))
+                .is_some_and(|suffix| Uuid::parse_str(suffix).is_ok())
         })
+        .collect();
+    let format_paths = |paths: &[PathBuf]| {
+        paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let owned: Vec<PathBuf> = named
+        .iter()
+        .filter(|path| import_owns(path, job_id))
+        .cloned()
+        .collect();
+    match owned.len() {
+        0 if named.is_empty() => Ok(None),
+        0 => Err(format!(
+            "quarantine folders exist for instance {instance_id} but none is marked as this \
+             job's ({}); none was touched",
+            format_paths(&named)
+        )),
+        1 => Ok(Some(owned[0].clone())),
+        _ => Err(format!(
+            "more than one quarantine folder is marked as this job's for instance {instance_id} \
+             ({}); none was touched",
+            format_paths(&owned)
+        )),
+    }
 }
 
 /// Verify that source files are still present and have not changed in size
@@ -2594,6 +2887,7 @@ mod tests {
 
     use super::*;
     use crate::launcher_import::{ContentInventory, LaunchStrategy};
+    use agora_core::{instance_runtime, lock_manager::LockManager, process_identity};
 
     /// A fresh temp directory for one test. The random component matters:
     /// `%TEMP%` is shared, and a name built from the process id and a
@@ -2613,6 +2907,15 @@ mod tests {
         let ctx = crate::testing_context(tmp);
         let _ = agora_core::db::init_local_state_db(&ctx.paths.local_state_db());
         ctx
+    }
+
+    /// Mirror the ownership marker production writes into a directory before it puts content in.
+    fn mark_owner(dir: &Path, job_id: &str) {
+        std::fs::write(
+            dir.join(".agora-import-owner.json"),
+            serde_json::json!({ "job_id": job_id }).to_string(),
+        )
+        .unwrap();
     }
 
     // --------------------------------------------------------------
@@ -3639,6 +3942,8 @@ name=Dup Instance
         let final_dir = ctx.paths.instances_root().join("recover-new");
         std::fs::create_dir_all(&staging).unwrap();
         std::fs::create_dir_all(&final_dir).unwrap();
+        mark_owner(&staging, "recover-new-job");
+        mark_owner(&final_dir, "recover-new-job");
         let connection =
             agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let now = chrono::Utc::now().to_rfc3339();
@@ -3662,7 +3967,7 @@ name=Dup Instance
         .unwrap();
         drop(connection);
 
-        let warnings = recover_interrupted_jobs(&ctx.paths);
+        let warnings = recover_interrupted_jobs(&ctx);
         assert!(!warnings.is_empty());
         assert!(!staging.exists());
         assert!(!final_dir.exists());
@@ -3687,6 +3992,9 @@ name=Dup Instance
         std::fs::write(final_dir.join("new.txt"), b"new").unwrap();
         std::fs::create_dir_all(&quarantine).unwrap();
         std::fs::write(quarantine.join("old.txt"), b"old").unwrap();
+        mark_owner(&staging, "recover-update-job");
+        mark_owner(&final_dir, "recover-update-job");
+        mark_owner(&quarantine, "recover-update-job");
         let connection =
             agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let now = chrono::Utc::now().to_rfc3339();
@@ -3710,10 +4018,536 @@ name=Dup Instance
         .unwrap();
         drop(connection);
 
-        recover_interrupted_jobs(&ctx.paths);
+        recover_interrupted_jobs(&ctx);
         assert!(final_dir.join("old.txt").exists());
         assert!(!final_dir.join("new.txt").exists());
         assert!(!quarantine.exists());
+        let connection = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        assert!(
+            db::list_instance_import_jobs(&connection)
+                .unwrap()
+                .is_empty(),
+            "a finished rollback must clear its job row so it cannot re-run"
+        );
+    }
+
+    /// Crash after promotion but before provenance commit. An already-open desktop could have
+    /// launched the promoted folder and the player made a save. Recovery must keep that save —
+    /// either in place or in a quarantine next to the instance — and say where it went.
+    #[test]
+    fn test_recover_promoted_update_keeps_a_save_made_since_the_crash() {
+        let ctx = test_ctx();
+        let staging = ctx.paths.staging_root().join("promoted-save-staging");
+        let final_dir = ctx.paths.instances_root().join("promoted-save");
+        let quarantine = ctx.paths.staging_root().join(format!(
+            ".agora-quarantine-promoted-save-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&final_dir).unwrap();
+        std::fs::create_dir_all(&quarantine).unwrap();
+        std::fs::write(final_dir.join("new.txt"), b"new").unwrap();
+        std::fs::write(quarantine.join("old.txt"), b"old").unwrap();
+        mark_owner(&staging, "promoted-save-job");
+        mark_owner(&final_dir, "promoted-save-job");
+        mark_owner(&quarantine, "promoted-save-job");
+        let connection = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db::upsert_instance_import_job(
+            &connection,
+            &InstanceImportJob {
+                job_id: "promoted-save-job".into(),
+                instance_id: "promoted-save".into(),
+                launcher_kind: "prism".into(),
+                source_instance_key: "source".into(),
+                staging_path: staging.to_string_lossy().into_owned(),
+                final_path: final_dir.to_string_lossy().into_owned(),
+                quarantine_path: Some(quarantine.to_string_lossy().into_owned()),
+                state: "promoted_update".into(),
+                plan_fingerprint: "plan".into(),
+                error: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .unwrap();
+        drop(connection);
+
+        // A save made after the crash, in the promoted folder.
+        std::fs::create_dir_all(final_dir.join("saves")).unwrap();
+        std::fs::write(final_dir.join("saves/new-save.dat"), b"precious save").unwrap();
+
+        let warnings = recover_interrupted_jobs(&ctx);
+
+        let kept_in_place = final_dir.join("saves/new-save.dat").exists();
+        let aside = std::fs::read_dir(ctx.paths.instances_root())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".agora-quarantine-promoted-save-"))
+            })
+            .find(|path| path.join("saves/new-save.dat").exists());
+        assert!(
+            kept_in_place || aside.is_some(),
+            "the save made after the crash was deleted: {warnings:?}"
+        );
+        assert!(
+            aside.as_ref().is_some_and(|path| {
+                warnings
+                    .iter()
+                    .any(|w| w.contains(path.to_string_lossy().as_ref()))
+            }),
+            "the report must name the quarantine path, not just the instance id: {warnings:?}"
+        );
+        assert!(
+            final_dir.join("old.txt").exists(),
+            "the previous instance was not restored"
+        );
+    }
+
+    /// A running game holds a runtime lease, not the instance lock. Recovery must check the lease
+    /// before it renames or quarantines anything, and keep the whole job while the game is live.
+    #[test]
+    fn test_recover_interrupted_leaves_a_running_game_alone() {
+        let ctx = test_ctx();
+        let staging = ctx.paths.staging_root().join("live-game-staging");
+        let final_dir = ctx.paths.instances_root().join("live-game");
+        let quarantine = ctx
+            .paths
+            .staging_root()
+            .join(format!(".agora-quarantine-live-game-{}", Uuid::new_v4()));
+        for dir in [&staging, &final_dir, &quarantine] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        mark_owner(&staging, "live-game-job");
+        mark_owner(&final_dir, "live-game-job");
+        mark_owner(&quarantine, "live-game-job");
+        std::fs::write(final_dir.join("save.dat"), b"live game save").unwrap();
+        let connection = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db::upsert_instance_import_job(
+            &connection,
+            &InstanceImportJob {
+                job_id: "live-game-job".into(),
+                instance_id: "live-game".into(),
+                launcher_kind: "prism".into(),
+                source_instance_key: "source".into(),
+                staging_path: staging.to_string_lossy().into_owned(),
+                final_path: final_dir.to_string_lossy().into_owned(),
+                quarantine_path: Some(quarantine.to_string_lossy().into_owned()),
+                state: "promoted_update".into(),
+                plan_fingerprint: "plan".into(),
+                error: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .unwrap();
+        drop(connection);
+
+        // A real, live process identity — the same lease a launch publishes for a running game.
+        let identity = process_identity::capture(std::process::id()).unwrap();
+        instance_runtime::publish_running(&ctx.paths, "live-game", "gen-live", identity).unwrap();
+
+        let warnings = recover_interrupted_jobs(&ctx);
+
+        assert_eq!(
+            std::fs::read(final_dir.join("save.dat")).unwrap(),
+            b"live game save",
+            "recovery touched a live game's folder"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("in use") && w.contains("retry next start")),
+            "the skip must say it will retry: {warnings:?}"
+        );
+        instance_runtime::clear(&ctx.paths, "live-game", None).unwrap();
+    }
+
+    /// Two processes: an import job whose instance lock another Agora process holds belongs to a
+    /// live import, so recovery leaves the staging folder and the job row alone and reports it;
+    /// once the lock is free, the next pass finishes the job.
+    #[test]
+    fn test_recover_interrupted_leaves_a_live_import_alone() {
+        let ctx = test_ctx();
+        let staging = ctx.paths.staging_root().join("recover-live-staging");
+        let final_dir = ctx.paths.instances_root().join("recover-live");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("options.txt"), b"payload").unwrap();
+        mark_owner(&staging, "recover-live-job");
+        let connection = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db::upsert_instance_import_job(
+            &connection,
+            &InstanceImportJob {
+                job_id: "recover-live-job".into(),
+                instance_id: "recover-live".into(),
+                launcher_kind: "prism".into(),
+                source_instance_key: "source".into(),
+                staging_path: staging.to_string_lossy().into_owned(),
+                final_path: final_dir.to_string_lossy().into_owned(),
+                quarantine_path: None,
+                state: "staging".into(),
+                plan_fingerprint: "plan".into(),
+                error: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .unwrap();
+        drop(connection);
+
+        // A second lock manager on the same locks root is what another Agora process sees.
+        let other_process = LockManager::new(ctx.paths.locks_root());
+        let held = other_process
+            .acquire(
+                LockResource::Instance("recover-live".into()),
+                "launcher-import-execute",
+            )
+            .expect("the live import takes the instance lock");
+
+        let warnings = recover_interrupted_jobs(&ctx);
+
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("recover-live") && w.contains("left alone")),
+            "the skip is reported: {warnings:?}"
+        );
+        assert!(staging.join("options.txt").exists(), "staging untouched");
+        let connection = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        assert_eq!(
+            db::list_instance_import_jobs(&connection).unwrap().len(),
+            1,
+            "the job row is kept for the live import"
+        );
+        drop(connection);
+
+        // The live import finished; the next startup pass rolls the job back.
+        drop(held);
+        let warnings = recover_interrupted_jobs(&ctx);
+        assert!(
+            !warnings.iter().any(|w| w.contains("left alone")),
+            "{warnings:?}"
+        );
+        assert!(!staging.exists(), "staging rolled back");
+        let connection = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        assert!(
+            db::list_instance_import_jobs(&connection)
+                .unwrap()
+                .is_empty(),
+            "the job row is gone"
+        );
+    }
+
+    /// A quarantine fallback that only prefix-matches `foo` must never claim `foo-bar`'s backup:
+    /// holding only `foo`'s lock, recovery would otherwise delete `foo-bar`'s live backup or move
+    /// it over `foo`'s final directory.
+    #[test]
+    fn test_recover_interrupted_quarantine_fallback_does_not_steal_a_similar_id() {
+        let ctx = test_ctx();
+        // `foo-bar`'s quarantine, owned by a different job (possibly live in another process).
+        let other_quarantine = ctx
+            .paths
+            .staging_root()
+            .join(format!(".agora-quarantine-foo-bar-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&other_quarantine).unwrap();
+        std::fs::write(other_quarantine.join("keep.txt"), b"foo-bar data").unwrap();
+
+        let staging = ctx.paths.staging_root().join("recover-prefix-staging");
+        let final_dir = ctx.paths.instances_root().join("foo");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&final_dir).unwrap();
+        std::fs::write(final_dir.join("new.txt"), b"new").unwrap();
+        let connection = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db::upsert_instance_import_job(
+            &connection,
+            &InstanceImportJob {
+                job_id: "recover-prefix-job".into(),
+                instance_id: "foo".into(),
+                launcher_kind: "prism".into(),
+                source_instance_key: "source".into(),
+                staging_path: staging.to_string_lossy().into_owned(),
+                final_path: final_dir.to_string_lossy().into_owned(),
+                quarantine_path: None, // force the fallback scan
+                state: "prepared_update".into(),
+                plan_fingerprint: "plan".into(),
+                error: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .unwrap();
+        drop(connection);
+
+        recover_interrupted_jobs(&ctx);
+
+        assert!(
+            other_quarantine.join("keep.txt").exists(),
+            "another job's quarantine was stolen"
+        );
+        assert!(
+            final_dir.join("new.txt").exists(),
+            "an unrelated final directory was overwritten"
+        );
+    }
+
+    /// A failed `game_instances` lookup ("could not tell") is not proof that a final directory
+    /// can be deleted. The table is renamed here to make every lookup fail deterministically.
+    #[test]
+    fn test_recover_interrupted_new_import_keeps_final_dir_when_db_lookup_fails() {
+        let ctx = test_ctx();
+        let staging = ctx.paths.staging_root().join("recover-db-error-staging");
+        let final_dir = ctx.paths.instances_root().join("recover-db-error");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&final_dir).unwrap();
+        // Mark both folders so recovery gets past the ownership guards and actually reaches the
+        // SQL failure this test is about. Without the final-dir marker the ownership guard would
+        // protect the directory and mask a broken SQL guard.
+        mark_owner(&staging, "recover-db-error-job");
+        mark_owner(&final_dir, "recover-db-error-job");
+        std::fs::write(final_dir.join("sentinel.txt"), b"keep me").unwrap();
+        let connection = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db::upsert_instance_import_job(
+            &connection,
+            &InstanceImportJob {
+                job_id: "recover-db-error-job".into(),
+                instance_id: "recover-db-error".into(),
+                launcher_kind: "prism".into(),
+                source_instance_key: "source".into(),
+                staging_path: staging.to_string_lossy().into_owned(),
+                final_path: final_dir.to_string_lossy().into_owned(),
+                quarantine_path: None,
+                state: "staging".into(),
+                plan_fingerprint: "plan".into(),
+                error: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .unwrap();
+        connection
+            .execute_batch("ALTER TABLE user_instances RENAME TO user_instances_gone")
+            .unwrap();
+        drop(connection);
+
+        let warnings = recover_interrupted_jobs(&ctx);
+
+        assert!(
+            final_dir.join("sentinel.txt").exists(),
+            "the final directory was deleted on a failed lookup: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("could not") || w.contains("left alone")),
+            "the failure is reported: {warnings:?}"
+        );
+    }
+
+    /// The journal is re-read after the lock is taken. Here the caller passes a stale job pointing
+    /// at the old staging folder while the row in the database already names a new one; recovery
+    /// must act on the row it reads under the lock, not on the stale copy.
+    #[test]
+    fn test_recover_one_job_reloads_the_row_under_the_lock() {
+        let ctx = test_ctx();
+        let stale_staging = ctx.paths.staging_root().join("reload-stale");
+        let fresh_staging = ctx.paths.staging_root().join("reload-fresh");
+        let final_dir = ctx.paths.instances_root().join("reload-instance");
+        for dir in [&stale_staging, &fresh_staging, &final_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        mark_owner(&stale_staging, "reload-job");
+        mark_owner(&fresh_staging, "reload-job");
+        mark_owner(&final_dir, "reload-job");
+        let connection = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let stale = InstanceImportJob {
+            job_id: "reload-job".into(),
+            instance_id: "reload-instance".into(),
+            launcher_kind: "prism".into(),
+            source_instance_key: "source".into(),
+            staging_path: stale_staging.to_string_lossy().into_owned(),
+            final_path: final_dir.to_string_lossy().into_owned(),
+            quarantine_path: None,
+            state: "staging".into(),
+            plan_fingerprint: "plan".into(),
+            error: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        db::upsert_instance_import_job(&connection, &stale).unwrap();
+        db::delete_instance_import_job(&connection, &stale.job_id).unwrap();
+        db::upsert_instance_import_job(
+            &connection,
+            &InstanceImportJob {
+                staging_path: fresh_staging.to_string_lossy().into_owned(),
+                updated_at: now,
+                ..stale.clone()
+            },
+        )
+        .unwrap();
+
+        let _line = recover_one_job(&ctx, &connection, &stale);
+
+        assert!(stale_staging.exists(), "the stale row was acted on");
+        assert!(!fresh_staging.exists(), "the current row was not acted on");
+    }
+
+    /// A generic game instance can already own the final path of a `staging` job. Absence from
+    /// `user_instances` is not proof the import created it, so recovery must keep it.
+    #[test]
+    fn test_recover_interrupted_keeps_a_final_dir_it_cannot_prove_it_created() {
+        let ctx = test_ctx();
+        let staging = ctx.paths.staging_root().join("unowned-final-staging");
+        let final_dir = ctx.paths.instances_root().join("real-instance");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&final_dir).unwrap();
+        mark_owner(&staging, "unowned-final-job");
+        std::fs::write(
+            final_dir.join("instance_manifest.json"),
+            br#"{"instance_id":"real-instance","name":"Real"}"#,
+        )
+        .unwrap();
+        let connection = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db::upsert_instance_import_job(
+            &connection,
+            &InstanceImportJob {
+                job_id: "unowned-final-job".into(),
+                instance_id: "real-instance".into(),
+                launcher_kind: "prism".into(),
+                source_instance_key: "source".into(),
+                staging_path: staging.to_string_lossy().into_owned(),
+                final_path: final_dir.to_string_lossy().into_owned(),
+                quarantine_path: None,
+                state: "staging".into(),
+                plan_fingerprint: "plan".into(),
+                error: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .unwrap();
+        drop(connection);
+
+        let warnings = recover_interrupted_jobs(&ctx);
+
+        assert!(
+            final_dir.join("instance_manifest.json").exists(),
+            "a real instance at the final path was deleted"
+        );
+        assert!(
+            staging.exists(),
+            "a refused job keeps its staging folder, so 'Nothing was changed' is true"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("real-instance") && w.contains("left alone")),
+            "the refusal is reported: {warnings:?}"
+        );
+    }
+
+    /// A recorded quarantine that carries another job's marker (or none) is not this job's to
+    /// restore over the final directory.
+    #[test]
+    fn test_recover_interrupted_keeps_a_quarantine_it_cannot_prove_it_created() {
+        let ctx = test_ctx();
+        let staging = ctx.paths.staging_root().join("foreign-quarantine-staging");
+        let final_dir = ctx.paths.instances_root().join("foreign-quarantine");
+        let quarantine = ctx.paths.staging_root().join(format!(
+            ".agora-quarantine-foreign-quarantine-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&final_dir).unwrap();
+        std::fs::create_dir_all(&quarantine).unwrap();
+        mark_owner(&staging, "foreign-quarantine-job");
+        mark_owner(&final_dir, "foreign-quarantine-job");
+        mark_owner(&quarantine, "a-different-job");
+        std::fs::write(quarantine.join("old.txt"), b"other job's backup").unwrap();
+        let connection = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db::upsert_instance_import_job(
+            &connection,
+            &InstanceImportJob {
+                job_id: "foreign-quarantine-job".into(),
+                instance_id: "foreign-quarantine".into(),
+                launcher_kind: "prism".into(),
+                source_instance_key: "source".into(),
+                staging_path: staging.to_string_lossy().into_owned(),
+                final_path: final_dir.to_string_lossy().into_owned(),
+                quarantine_path: Some(quarantine.to_string_lossy().into_owned()),
+                state: "prepared_update".into(),
+                plan_fingerprint: "plan".into(),
+                error: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .unwrap();
+        drop(connection);
+
+        let warnings = recover_interrupted_jobs(&ctx);
+
+        assert!(
+            quarantine.join("old.txt").exists(),
+            "another job's quarantine was moved"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("left alone")),
+            "the refusal is reported: {warnings:?}"
+        );
+    }
+
+    /// The ambiguous branch must name the candidate folders, so a person can see what to keep or
+    /// remove instead of being told only that there was more than one.
+    #[test]
+    fn test_find_import_quarantine_lists_candidates_when_ambiguous() {
+        let ctx = test_ctx();
+        let first = ctx
+            .paths
+            .staging_root()
+            .join(format!(".agora-quarantine-multi-{}", Uuid::new_v4()));
+        let second = ctx
+            .paths
+            .staging_root()
+            .join(format!(".agora-quarantine-multi-{}", Uuid::new_v4()));
+        for dir in [&first, &second] {
+            std::fs::create_dir_all(dir).unwrap();
+            mark_owner(dir, "multi-job");
+        }
+
+        let error = find_import_quarantine(&ctx.paths, "multi", "multi-job").unwrap_err();
+
+        assert!(error.contains(first.to_string_lossy().as_ref()), "{error}");
+        assert!(error.contains(second.to_string_lossy().as_ref()), "{error}");
+    }
+
+    /// Candidate folders that carry no marker for this job are ambiguous too, and are reported
+    /// with their paths rather than being silently ignored.
+    #[test]
+    fn test_find_import_quarantine_lists_unowned_candidates() {
+        let ctx = test_ctx();
+        let candidate = ctx
+            .paths
+            .staging_root()
+            .join(format!(".agora-quarantine-unowned-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&candidate).unwrap();
+
+        let error = find_import_quarantine(&ctx.paths, "unowned", "unowned-job").unwrap_err();
+
+        assert!(
+            error.contains(candidate.to_string_lossy().as_ref()),
+            "{error}"
+        );
     }
 
     #[tokio::test]

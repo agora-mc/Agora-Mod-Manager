@@ -13,6 +13,9 @@ pub const CORE_FAILED: &str = "core_failed";
 pub const TASK_FAILED: &str = "task_failed";
 /// An MO2 import found no install of the setup's game anywhere; the user adds one in Settings.
 pub const NO_INSTALL: &str = "no_install";
+/// Both a game file and the instance copy changed: the only conflict an explicit restore may
+/// override. The frontend branches on this code, never on the message.
+pub const USER_FILES_CONFLICT: &str = "user_files_conflict";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +43,12 @@ impl GamesError {
     /// Attach the facts a page needs beyond the message.
     pub fn with_details(mut self, details: serde_json::Value) -> Self {
         self.details = Some(details);
+        self
+    }
+
+    /// Attach the stable agora-core code, when the failure came from core.
+    pub fn with_core_code(mut self, code: impl Into<String>) -> Self {
+        self.core_code = Some(code.into());
         self
     }
 

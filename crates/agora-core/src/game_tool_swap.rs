@@ -9,9 +9,14 @@
 //! and where it lives are in `game_tool_copy`.
 //!
 //! The discipline follows `game_user_files`: a journal is written, and made durable, before anything
-//! is renamed or copied. A journal left by a crash is put back by the next check, which runs before any
-//! launch, deploy, tool run or user-files session for that game, and at CLI start. Recovery discards the
-//! run's writes rather than capturing them: the copy is deleted, or moved home and deleted. It never
+//! is renamed or copied. The run holds the game/store user-files lock (`LockResource::GameUserFiles`)
+//! for the whole operation — from before the journal is written, through the copy, the spawned
+//! tool's run and the post-exit capture, until the journal is cleared — and every recovery takes
+//! that same lock with no wait, so a run that is still going can never be recovered underneath it.
+//! A journal left by a crash is put back by the next check, which runs before any
+//! launch, deploy, tool run or user-files session for that game, and by the one startup recovery pass
+//! every adapter runs (`startup_recovery::run_at_startup`). Recovery discards the run's writes rather
+//! than capturing them: the copy is deleted, or moved home and deleted. It never
 //! merges folders and never overwrites. It deletes a folder only when that folder's marker matches the
 //! journal and its path is one the swap derives from trusted inputs (the instance's base and install,
 //! never the journal's own paths).
@@ -87,6 +92,12 @@ pub struct SwapJournal {
     /// even when the tool runs from outside the install folder.
     #[serde(default)]
     pub processes: Vec<crate::process_identity::ProcessIdentity>,
+    /// Written (durably) before the tool is spawned. While this is set and no recorded process is
+    /// provably dead, recovery cannot tell whether a tool is running — the writer may have died
+    /// between the spawn and recording it — so the journal needs a hand, never an automatic
+    /// restore. Cleared when the spawned process is recorded.
+    #[serde(default)]
+    pub spawning: bool,
 }
 
 /// A journal found on disk, for `games tools-swap status`.
@@ -145,6 +156,117 @@ fn seam() -> VolumeSeam {
         .unwrap_or_default()
 }
 
+/// Where in a swap run the test hook fires.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunHookPoint {
+    /// The real `Data` is renamed aside and the copy is in place; the tool has not spawned yet.
+    BeforeSpawn,
+    /// The tool has exited; the copy is being put back and its writes captured.
+    PostExitCapture,
+    /// The tool was spawned but its identity is not yet recorded in the journal (the window in
+    /// which a dead Agora leaves a live tool unrecorded).
+    AfterSpawnBeforeRecord,
+    /// The links-captured tool has exited; its writes are being captured from the farm.
+    LinksPostExitCapture,
+    /// Immediately before the durable "spawning" mark is persisted, on any capture path.
+    BeforeSpawningMark,
+}
+
+#[doc(hidden)]
+type RunHook = std::sync::Arc<dyn Fn(&Ctx, Option<&SwapJournal>, RunHookPoint) + Send + Sync>;
+
+/// The hook with the thread that installed it: the hook fires only on that thread, so parallel
+/// tests that run tools never fire each other's hooks.
+static RUN_HOOK: Mutex<Option<(std::thread::ThreadId, RunHook)>> = Mutex::new(None);
+
+/// Set or clear the run hook (a test seam; production never sets it). The hook fires only on the
+/// thread that sets it. Tests that set it must still run their tool runs on this thread.
+#[doc(hidden)]
+pub fn set_run_hook(hook: Option<RunHook>) {
+    if let Ok(mut guard) = RUN_HOOK.lock() {
+        *guard = hook.map(|hook| (std::thread::current().id(), hook));
+    }
+}
+
+/// Clear the run hook, but only the one this thread installed, so a finishing test cannot clear
+/// another parallel test's hook.
+#[doc(hidden)]
+pub fn clear_run_hook() {
+    if let Ok(mut guard) = RUN_HOOK.lock() {
+        let this_thread = std::thread::current().id();
+        if guard
+            .as_ref()
+            .is_some_and(|(thread, _)| *thread == this_thread)
+        {
+            *guard = None;
+        }
+    }
+}
+
+/// Fire the run hook at `point`, when a test on this thread set one. `journal` is the swap
+/// journal of the run, when the run has one (the links and VFS paths have only the user-files
+/// session journal). Production never sets a hook, so this does nothing.
+#[doc(hidden)]
+pub fn run_hook(ctx: &Ctx, journal: Option<&SwapJournal>, point: RunHookPoint) {
+    let hook = RUN_HOOK.lock().ok().and_then(|guard| {
+        guard
+            .as_ref()
+            .filter(|(thread, _)| *thread == std::thread::current().id())
+            .map(|(_, hook)| hook.clone())
+    });
+    if let Some(hook) = hook {
+        hook(ctx, journal, point);
+    }
+}
+
+/// A test seam that makes journal writes fail: the hook returns `true` for a journal path
+/// whose write should fail. Gated to the installing thread, like the run hook.
+#[doc(hidden)]
+type WriteFaultHook = std::sync::Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+
+#[doc(hidden)]
+static WRITE_FAULT_HOOK: Mutex<Option<(std::thread::ThreadId, WriteFaultHook)>> = Mutex::new(None);
+
+/// Set or clear the journal write-fault hook (a test seam; production never sets it). The hook
+/// fires only on the thread that sets it.
+#[doc(hidden)]
+pub fn set_write_fault_hook(hook: Option<WriteFaultHook>) {
+    if let Ok(mut guard) = WRITE_FAULT_HOOK.lock() {
+        *guard = hook.map(|hook| (std::thread::current().id(), hook));
+    }
+}
+
+/// Clear the write-fault hook, but only the one this thread installed.
+#[doc(hidden)]
+pub fn clear_write_fault_hook() {
+    if let Ok(mut guard) = WRITE_FAULT_HOOK.lock() {
+        let this_thread = std::thread::current().id();
+        if guard
+            .as_ref()
+            .is_some_and(|(thread, _)| *thread == this_thread)
+        {
+            *guard = None;
+        }
+    }
+}
+
+/// Whether a journal write to `path` fails right now (a test on this thread set a fault hook
+/// that names the path). Production never sets a hook, so this is always `false`.
+#[doc(hidden)]
+pub fn write_fault_fires(path: &Path) -> bool {
+    WRITE_FAULT_HOOK
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            guard
+                .as_ref()
+                .filter(|(thread, _)| *thread == std::thread::current().id())
+                .map(|(_, hook)| hook.clone())
+        })
+        .is_some_and(|hook| hook(path))
+}
+
 /// The journal file of one game and store.
 pub fn journal_path(ctx: &Ctx, game: &str, store: &str) -> PathBuf {
     ctx.paths.tool_swap_journal_path(game, store)
@@ -154,6 +276,14 @@ pub fn journal_path(ctx: &Ctx, game: &str, store: &str) -> PathBuf {
 /// appears under its final name only once they are.
 pub fn write_journal(ctx: &Ctx, journal: &SwapJournal) -> Result<(), SwapError> {
     let path = journal_path(ctx, &journal.game, &journal.store);
+    // Test seam only: `write_fault_fires` is false unless a test on this thread installed a
+    // fault hook, so production writes never fail here.
+    if write_fault_fires(&path) {
+        return Err(SwapError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "journal write fault injected by the test hook",
+        )));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -706,6 +836,26 @@ pub fn recover_store_unlocked(
                 .unwrap_or_default()
         )));
     }
+    // The journal says a tool was spawning and no recorded process is provably dead: the writer
+    // may have died between the spawn and recording the process, so a tool may be running that
+    // no record can prove dead. That is a needs-a-hand case, never an automatic restore.
+    if journal.spawning
+        && !journal
+            .processes
+            .iter()
+            .any(|process| crate::process_identity::verify(process).is_err())
+    {
+        return Err(SwapError::Stuck(format!(
+            "the swap journal {} says a tool was spawning for instance {} and records no provably \
+             dead process, so Agora cannot tell whether a tool is still running. Nothing was \
+             changed. If no tool of that instance is running, check {} and {} by hand, put the \
+             real Data folder back, then delete the journal.",
+            path.display(),
+            journal.instance_id,
+            journal.real_data.display(),
+            journal.aside.display()
+        )));
+    }
     restore_and_discard(&journal)?;
     remove_journal(ctx, &journal)?;
     Ok(Some(journal))
@@ -725,37 +875,109 @@ fn recorded_process_running(
     })
 }
 
-/// The per-game check: for each store of the game with a journal, take the game's user-files lock
-/// and put back an interrupted swap. One file existence test per store when nothing is pending.
-pub fn recover_game(ctx: &Ctx, definition: &GameDefinition) -> Result<Vec<SwapJournal>, SwapError> {
-    let mut restored = Vec::new();
+/// How long a recovery pass waits for the game's user-files lock before giving up on a store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockWait {
+    /// The explicit `tools-swap restore` command waits for a live operation to let go.
+    Wait,
+    /// The startup pass never waits: another Agora process may hold the lock for a live swap, and
+    /// that swap must not be recovered underneath it, so the journal is left alone and reported.
+    NoWait,
+}
+
+/// One store's outcome in a recovery pass.
+enum StoreOutcome {
+    /// The interrupted swap was put back.
+    Restored(Box<SwapJournal>),
+    /// The journal was left alone because another Agora process holds its lock.
+    LeftAlone(String),
+    /// The journal could not be recovered; the original error keeps its variant (`Refused` for a
+    /// live run, `Stuck` for a needs-a-hand case).
+    Failed(SwapError),
+}
+
+/// The per-store check, under the caller's rules for waiting on the lock. Each store's outcome is
+/// reported on its own line; nothing is raised.
+fn recover_game_locked(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    wait: LockWait,
+) -> Vec<StoreOutcome> {
+    let mut out = Vec::new();
     for entry in &definition.stores {
         let store = entry.store.as_str();
         if !journal_path(ctx, definition.id.as_str(), store).exists() {
             continue;
         }
-        let _lock = ctx.lock_manager.acquire(
-            LockResource::GameUserFiles(definition.id.clone(), entry.store.clone()),
-            "tool-swap-recover",
-        )?;
-        if let Some(journal) = recover_store_unlocked(ctx, definition.id.as_str(), store)? {
-            restored.push(journal);
+        let resource = LockResource::GameUserFiles(definition.id.clone(), entry.store.clone());
+        let lock = match wait {
+            LockWait::Wait => ctx.lock_manager.acquire(resource, "tool-swap-recover"),
+            LockWait::NoWait => ctx.lock_manager.acquire_with_timeout(
+                resource,
+                "tool-swap-recover",
+                std::time::Duration::ZERO,
+                None,
+            ),
+        };
+        let _lock = match lock {
+            Ok(lock) => lock,
+            Err(error) => {
+                out.push(match wait {
+                    LockWait::Wait => StoreOutcome::Failed(SwapError::Lock(error)),
+                    LockWait::NoWait => StoreOutcome::LeftAlone(format!(
+                        "the swap journal for {}/{store} was left alone: another Agora \
+                         holds its lock right now ({error}). Nothing was changed.",
+                        definition.id
+                    )),
+                });
+                continue;
+            }
+        };
+        match recover_store_unlocked(ctx, definition.id.as_str(), store) {
+            Ok(Some(journal)) => out.push(StoreOutcome::Restored(Box::new(journal))),
+            Ok(None) => {}
+            Err(e) => out.push(StoreOutcome::Failed(e)),
+        }
+    }
+    out
+}
+
+/// The per-game check: for each store of the game with a journal, take the game's user-files lock
+/// and put back an interrupted swap. One file existence test per store when nothing is pending.
+pub fn recover_game(ctx: &Ctx, definition: &GameDefinition) -> Result<Vec<SwapJournal>, SwapError> {
+    let mut restored = Vec::new();
+    for outcome in recover_game_locked(ctx, definition, LockWait::Wait) {
+        match outcome {
+            StoreOutcome::Restored(journal) => restored.push(*journal),
+            StoreOutcome::LeftAlone(message) => return Err(SwapError::Stuck(message)),
+            StoreOutcome::Failed(e) => return Err(e),
         }
     }
     Ok(restored)
 }
 
-/// The startup check: recover every game the registry knows. Each result is reported, never raised.
+/// The explicit check: recover every game the registry knows, waiting for a live operation to let
+/// go of a store's lock. Each result is reported, never raised.
 pub fn recover_all(ctx: &Ctx) -> Vec<Recovery> {
+    recover_all_with(ctx, LockWait::Wait)
+}
+
+/// The startup check: the same pass, but never waiting on a lock. A journal whose lock another
+/// Agora process holds belongs to a live operation and is left alone and reported, not recovered
+/// underneath it. Each result is reported, never raised.
+pub fn recover_all_nowait(ctx: &Ctx) -> Vec<Recovery> {
+    recover_all_with(ctx, LockWait::NoWait)
+}
+
+fn recover_all_with(ctx: &Ctx, wait: LockWait) -> Vec<Recovery> {
     let mut out = Vec::new();
     for definition in ctx.games.games() {
-        match recover_game(ctx, definition) {
-            Ok(restored) => out.extend(
-                restored
-                    .into_iter()
-                    .map(|journal| Recovery::Restored(Box::new(journal))),
-            ),
-            Err(e) => out.push(Recovery::Stuck(e.to_string())),
+        for outcome in recover_game_locked(ctx, definition, wait) {
+            out.push(match outcome {
+                StoreOutcome::Restored(journal) => Recovery::Restored(journal),
+                StoreOutcome::LeftAlone(message) => Recovery::Stuck(message),
+                StoreOutcome::Failed(e) => Recovery::Stuck(e.to_string()),
+            });
         }
     }
     out

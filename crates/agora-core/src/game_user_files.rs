@@ -23,6 +23,10 @@ use crate::ctx::Ctx;
 use crate::lock_manager::LockResource;
 use crate::process_identity::{self, ProcessIdentity};
 
+/// Stable code for a both-changed conflict. The desktop's restore command gives an explicit
+/// override only for this failure, matched by code rather than by message text.
+pub const ERR_USER_FILES_CONFLICT: &str = "ERR_USER_FILES_CONFLICT";
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -50,6 +54,16 @@ pub enum UserFilesError {
     Lock(#[from] crate::error::LauncherError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// A file needed by restore could not be read. Absence is handled separately; a read error
+    /// is "can't tell", so recovery keeps every copy. The Io source keeps a Windows sharing
+    /// violation retryable by `retry_while_running`.
+    #[error("the {what} '{path}' could not be read ({source}); Agora did not overwrite it and changed nothing. Check the file by hand")]
+    Read {
+        what: String,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("cannot write '{path}': {source}")]
     Write {
         path: PathBuf,
@@ -58,6 +72,10 @@ pub enum UserFilesError {
     },
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    /// Both the real file and the instance copy changed since the swap. Only an explicit
+    /// override may proceed; `ERR_USER_FILES_CONFLICT` is how a caller recognises it.
+    #[error("{0}")]
+    Conflict(String),
     #[error("{0}")]
     Other(String),
 }
@@ -85,6 +103,12 @@ pub struct Journal {
     /// may give up its own start (for example when its spawn fails).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_id: Option<String>,
+    /// Written before a tool is spawned for this session. While this is set and no recorded
+    /// process is provably dead, automatic recovery cannot tell whether a tool is running — the
+    /// writer may have died between the spawn and recording it — so the session needs a hand,
+    /// never an automatic restore. Cleared when the spawned process is recorded.
+    #[serde(default)]
+    pub spawning: bool,
     pub files: Vec<JournaledFile>,
 }
 
@@ -132,6 +156,12 @@ pub struct JournaledFile {
     /// not put the user's file over the session's saved copy again.
     #[serde(default)]
     pub restored: bool,
+    /// Where `real_path` resolved to when the swap read it — the whole link chain and every
+    /// ancestor directory resolved (the canonical path); `None` when it did not resolve (a
+    /// legacy journal, or a dangling link). A restore never writes through a path that no
+    /// longer resolves there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_resolved_path: Option<PathBuf>,
 }
 
 /// Status of an active or recoverable user-file session.
@@ -229,17 +259,77 @@ pub fn resolve_rel_case_insensitive(base: &Path, rel: &str) -> PathBuf {
     current
 }
 
-/// Compare two paths component-by-component case-insensitively.
+/// Compare two paths component-by-component case-insensitively. This is for checking a trusted
+/// journal's spelling, never for choosing a write target. Non-UTF-8 components are equal only when
+/// their native bytes match: lossy conversion would collapse distinct names into one.
 pub fn paths_eq_case_insensitive(a: &Path, b: &Path) -> bool {
-    let a_comps: Vec<_> = a
-        .components()
-        .map(|c| fold_path_case(&c.as_os_str().to_string_lossy()))
-        .collect();
-    let b_comps: Vec<_> = b
-        .components()
-        .map(|c| fold_path_case(&c.as_os_str().to_string_lossy()))
-        .collect();
-    a_comps == b_comps
+    let mut ac = a.components();
+    let mut bc = b.components();
+    loop {
+        match (ac.next(), bc.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) => {
+                let (x, y) = (x.as_os_str(), y.as_os_str());
+                let equal = if x == y {
+                    true
+                } else {
+                    match (x.to_str(), y.to_str()) {
+                        (Some(x), Some(y)) => fold_path_case(x) == fold_path_case(y),
+                        _ => false,
+                    }
+                };
+                if !equal {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Compare two already-resolved paths exactly, losslessly. `canonicalize` returns the real casing
+/// on Windows, so a case-only difference between two canonical paths is a real change of target.
+/// Components are compared as native `OsStr` bytes/wide characters — never through a lossy string
+/// conversion, which could make two distinct non-UTF-8 targets compare equal.
+pub fn paths_eq_exact(a: &Path, b: &Path) -> bool {
+    let mut ac = a.components();
+    let mut bc = b.components();
+    loop {
+        match (ac.next(), bc.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) => {
+                if !component_eq_lossless(x.as_os_str(), y.as_os_str()) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Windows canonicalize returns a verbatim `\\?\` prefix; a path carried forward from a journal
+/// that could not resolve its parent does not. Strip that prefix natively, then compare the raw
+/// bytes/wide characters so no information is lost.
+fn component_eq_lossless(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        a.as_bytes() == b.as_bytes()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        fn strip_verbatim(s: &std::ffi::OsStr) -> Vec<u16> {
+            let wide: Vec<u16> = s.encode_wide().collect();
+            const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+            if wide.starts_with(&VERBATIM) {
+                wide[4..].to_vec()
+            } else {
+                wide
+            }
+        }
+        strip_verbatim(a) == strip_verbatim(b)
+    }
 }
 
 /// The Windows user folder a `UserDataLocation` names, inside a Proton prefix. Proton's default
@@ -300,8 +390,306 @@ pub fn resolve_user_file_source(source: &GamePath) -> Result<PathBuf, UserFilesE
     resolve_user_file_source_in(None, source)
 }
 
+/// A definition's path with its own casing, with no case-insensitive lookup. This is only a
+/// consistency check against the journal at restore time — recovery never writes to a path found
+/// by searching for a case-folded sibling.
+fn exact_source_path(prefix: Option<&Path>, source: &GamePath) -> Result<PathBuf, UserFilesError> {
+    match source {
+        GamePath::UserData { location, path } => {
+            let base = match prefix {
+                Some(prefix) => user_data_root_in_prefix(prefix, location),
+                None => user_data_root(location)
+                    .ok_or_else(|| UserFilesError::UserDataNotFound(location.clone()))?,
+            };
+            Ok(if path.as_str().is_empty() {
+                base
+            } else {
+                base.join(path.as_str())
+            })
+        }
+        other => Err(UserFilesError::Other(format!(
+            "unsupported user file source root: {other:?}"
+        ))),
+    }
+}
+
+/// A file's presence: only `NotFound` means absent, every other metadata error is "can't tell".
+fn file_presence(path: &Path, what: &str) -> Result<bool, UserFilesError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(UserFilesError::Read {
+            what: format!("metadata for {what}"),
+            path: path.to_path_buf(),
+            source: error,
+        }),
+    }
+}
+
+/// Resolve ONE destination exactly: the canonical path when it exists, otherwise its exact final
+/// name appended to the deepest ancestor that resolves. Walking up checks EVERY ancestor on the
+/// way: a dangling link or a non-directory anywhere above the destination is "can't tell", never a
+/// path rebuilt from unresolved ancestor names. A genuinely missing folder is fine for a file that
+/// never existed, because no bytes are written there.
+fn resolved_destination(path: &Path, what: &str) -> Result<PathBuf, UserFilesError> {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => Ok(canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let cant_tell = |at: &Path, reason: &str| {
+                UserFilesError::Other(format!(
+                    "the ancestor '{}' of {what} '{}' could not be resolved ({reason}); Agora \
+                     cannot tell where to write and changed nothing. Check the folder by hand, \
+                     then put the files back.",
+                    at.display(),
+                    path.display()
+                ))
+            };
+            let name = path.file_name().ok_or_else(|| {
+                UserFilesError::Other(format!("{what} '{}' has no file name", path.display()))
+            })?;
+            let mut suffix: Vec<std::ffi::OsString> = vec![name.to_os_string()];
+            let mut cursor = path.parent().ok_or_else(|| {
+                UserFilesError::Other(format!("{what} '{}' has no parent folder", path.display()))
+            })?;
+            let base = loop {
+                let resolved = match std::fs::canonicalize(cursor) {
+                    Ok(path) => Some(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(UserFilesError::Read {
+                            what: what.to_string(),
+                            path: cursor.to_path_buf(),
+                            source: error,
+                        })
+                    }
+                };
+                // Metadata does not follow links, so it distinguishes a real folder from a link
+                // (including one whose target is gone) and from a file sitting in the path.
+                match std::fs::symlink_metadata(cursor) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        if resolved.as_ref().is_some_and(|path| path.is_dir()) {
+                            break resolved.expect("checked above");
+                        }
+                        return Err(cant_tell(cursor, "it is a dangling link"));
+                    }
+                    Ok(meta) if !meta.is_dir() => {
+                        return Err(cant_tell(cursor, "it is not a folder"));
+                    }
+                    Ok(_) => match resolved {
+                        Some(path) => break path,
+                        None => return Err(cant_tell(cursor, "it could not be resolved")),
+                    },
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // Genuinely absent folder: keep walking up. Only a file that never
+                        // existed ends here, so no bytes will be written under it.
+                        if let Some(path) = resolved {
+                            break path;
+                        }
+                    }
+                    Err(error) => return Err(cant_tell(cursor, &error.to_string())),
+                }
+                suffix.push(
+                    cursor
+                        .file_name()
+                        .ok_or_else(|| {
+                            UserFilesError::Other(format!(
+                                "the ancestor '{}' has no name",
+                                cursor.display()
+                            ))
+                        })?
+                        .to_os_string(),
+                );
+                cursor = cursor.parent().ok_or_else(|| {
+                    UserFilesError::Other(format!(
+                        "no ancestor of {what} '{}' resolves",
+                        path.display()
+                    ))
+                })?;
+            };
+            let mut out = base;
+            for component in suffix.iter().rev() {
+                out.push(component);
+            }
+            Ok(out)
+        }
+        Err(error) => Err(UserFilesError::Read {
+            what: what.to_string(),
+            path: path.to_path_buf(),
+            source: error,
+        }),
+    }
+}
+
+/// The single destination set recovery validates and writes. Every field is derived once here;
+/// neither preflight nor writeback re-derives a path or looks one up case-insensitively.
+struct RestoreDestination {
+    /// The journal's exact real path — the one file that is checked and written.
+    real: PathBuf,
+    /// Where that exact path resolves now (or will resolve once it exists).
+    real_resolved: PathBuf,
+    instance_copy: PathBuf,
+    backup: PathBuf,
+}
+
+fn restore_destination(
+    file: &JournaledFile,
+    mapping: &UserFileMapping,
+    prefix: Option<&Path>,
+    instance_dir: &Path,
+    backup_dir: &Path,
+    index: usize,
+) -> Result<RestoreDestination, UserFilesError> {
+    let expected = exact_source_path(prefix, &mapping.source)?;
+    if !paths_eq_case_insensitive(&file.real_path, &expected) {
+        return Err(UserFilesError::Other(format!(
+            "journal entry real_path '{:?}' differs from derived real_path '{:?}'",
+            file.real_path, expected
+        )));
+    }
+    let instance_copy = instance_dir.join(mapping.instance_path.as_str());
+    let backup = backup_dir.join(index.to_string());
+    // These two only need their parent to resolve when they are actually present; the caller
+    // checks presence with file_presence first so an absent backup directory stays harmless.
+    let real_resolved = resolved_destination(&file.real_path, "the user file")?;
+    Ok(RestoreDestination {
+        real: file.real_path.clone(),
+        real_resolved,
+        instance_copy,
+        backup,
+    })
+}
+
 fn hash_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Where `path` resolves, or will resolve once it exists: the path itself when it resolves now,
+/// otherwise the deepest ancestor that exists and resolves, plus the remaining components (the
+/// file — or a folder on its way — does not exist yet at swap time; a redirected ancestor changes
+/// this answer either way).
+fn resolved_path_for(path: &Path) -> Option<PathBuf> {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return Some(resolved);
+    }
+    let mut suffix: Vec<std::ffi::OsString> = vec![path.file_name()?.to_os_string()];
+    let mut dir = path.parent()?;
+    loop {
+        if let Ok(resolved) = std::fs::canonicalize(dir) {
+            let mut out = resolved;
+            for component in suffix.iter().rev() {
+                out.push(component);
+            }
+            return Some(out);
+        }
+        suffix.push(dir.file_name()?.to_os_string());
+        dir = dir.parent()?;
+    }
+}
+
+/// Whether two paths are provably different files: neither is a link, and their file identities
+/// (device + inode on Unix, volume serial + file index on Windows) differ. Anything else — the
+/// same file under two names (a hard link), either path a link, or an identity that cannot be
+/// read — is NOT provably distinct.
+fn provably_distinct_files(a: &Path, b: &Path) -> bool {
+    if symlink_target(a).is_some() || symlink_target(b).is_some() {
+        return false;
+    }
+    crate::game_base::get_file_identity(a)
+        .zip(crate::game_base::get_file_identity(b))
+        .is_some_and(|(left, right)| left != right)
+}
+
+/// Where `path` points when it is a symbolic link, `None` when it is not one (or its target
+/// cannot be read).
+fn symlink_target(path: &Path) -> Option<PathBuf> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_symlink() {
+        return None;
+    }
+    std::fs::read_link(path).ok()
+}
+
+/// Read a file whose absence is meaningful but whose unreadability is not. A missing file is
+/// `None`; any other read error is "can't tell", so recovery stops and keeps every copy rather
+/// than treating unreadable bytes as unchanged and overwriting them later.
+fn read_recovery_file(path: &Path, what: &str) -> Result<Option<Vec<u8>>, UserFilesError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(UserFilesError::Read {
+            what: what.to_string(),
+            path: path.to_path_buf(),
+            source: error,
+        }),
+    }
+}
+
+/// Create a conflict archive without ever touching an existing file. `create_new` refuses both a
+/// regular file and a symlink already at the name, so a file someone put there — or a link pointing
+/// somewhere else — is never replaced or written through. If the name is taken, the next free
+/// numbered name is used and returned.
+fn write_conflict_file(path: &Path, bytes: &[u8]) -> Result<PathBuf, UserFilesError> {
+    use std::io::Write;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file")
+        .to_string();
+    for attempt in 0..1000u32 {
+        let candidate = if attempt == 0 {
+            path.to_path_buf()
+        } else {
+            parent.join(format!("{name}-{attempt}"))
+        };
+        // `symlink_metadata` does not follow the link, so a symlink at the name counts as taken
+        // too. Windows reports a directory at the name as a permission error rather than
+        // AlreadyExists; checking first keeps the "pick a new name" rule portable. A plain file
+        // that already holds exactly these bytes is the archive an earlier startup wrote: reuse it
+        // instead of adding a numbered duplicate on every start.
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || meta.is_dir() {
+                    continue;
+                }
+                if std::fs::read(&candidate).is_ok_and(|existing| existing.as_slice() == bytes) {
+                    return Ok(candidate);
+                }
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => continue,
+        }
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(UserFilesError::Write {
+                    path: candidate,
+                    source: error,
+                })
+            }
+        };
+        file.write_all(bytes)
+            .map_err(|source| UserFilesError::Write {
+                path: candidate.clone(),
+                source,
+            })?;
+        file.sync_all().map_err(|source| UserFilesError::Write {
+            path: candidate.clone(),
+            source,
+        })?;
+        return Ok(candidate);
+    }
+    Err(UserFilesError::Other(format!(
+        "could not find a free conflict file name next to {}",
+        path.display()
+    )))
 }
 
 /// Write a user file atomically: a temp file beside it, synced, renamed over the target, then the
@@ -413,6 +801,14 @@ fn sync_directory(dir: &Path) {
 fn sync_directory(_dir: &Path) {}
 
 fn write_journal(journal_path: &Path, journal: &Journal) -> Result<(), UserFilesError> {
+    // Test seam only: `write_fault_fires` is false unless a test on this thread installed a
+    // fault hook, so production writes never fail here.
+    if crate::game_tool_swap::write_fault_fires(journal_path) {
+        return Err(UserFilesError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "journal write fault injected by the test hook",
+        )));
+    }
     if let Some(parent) = journal_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -451,6 +847,7 @@ impl Drop for StartingMarkGuard<'_> {
         };
         if journal.starting_launcher.is_some() {
             journal.starting_launcher = None;
+            journal.spawning = false;
             let _ = write_journal(self.journal_path, &journal);
         }
     }
@@ -500,6 +897,72 @@ fn session_running_apart_from_starting(journal: &Journal) -> bool {
     false
 }
 
+/// Whether a journal records no process identity at all: no starting launcher and no recorded
+/// process. That is a legacy journal or a self-capture that failed, and it means liveness is
+/// unknown — a launch between its swap and its spawn looks exactly like this — so automatic
+/// recovery must not act on the journal; it is reported as needing a hand.
+pub fn liveness_unknown(journal: &Journal) -> bool {
+    journal.starting_launcher.is_none() && journal.processes.is_empty()
+}
+
+/// [`liveness_unknown`] for session details read without the full journal.
+pub fn details_liveness_unknown(details: &SessionDetails) -> bool {
+    details.starting_launcher.is_none() && details.processes.is_empty()
+}
+
+/// Whether a journal is in its "spawning" window with no provably dead recorded process: the
+/// writer recorded that it was about to spawn a tool, and no recorded process can be proven dead,
+/// so a tool may be running that no record can see. Automatic recovery treats that as needing a
+/// hand, never as a dead session.
+pub fn spawning_without_dead_process(journal: &Journal) -> bool {
+    journal.spawning
+        && !journal
+            .processes
+            .iter()
+            .any(|process| process_identity::verify(process).is_err())
+}
+
+/// [`spawning_without_dead_process`] for session details read without the full journal.
+pub fn details_spawning_without_dead_process(details: &SessionDetails) -> bool {
+    details.spawning
+        && !details
+            .processes
+            .iter()
+            .any(|process| process_identity::verify(process).is_err())
+}
+
+/// The needs-a-hand line for a session in its spawning window.
+pub fn spawning_needs_hand_message(journal_path: &Path, journal: &Journal) -> String {
+    format!(
+        "the user-files journal {} of instance {} ({}/{}) is marked as spawning a tool and \
+         records no provably dead process, so Agora cannot tell whether a tool is still running; \
+         it was left alone and nothing was changed. If no tool of {} is running, put the files \
+         back by hand with `{}`",
+        journal_path.display(),
+        journal.instance_id,
+        journal.game,
+        journal.store,
+        journal.game,
+        restore_instruction(journal.game.as_str(), journal.store.as_str())
+    )
+}
+
+/// The needs-a-hand line for a journal whose liveness is unknown: what was left alone, and the
+/// command that can decide once nothing of that game is running.
+pub fn needs_hand_message(journal_path: &Path, journal: &Journal) -> String {
+    format!(
+        "the user-files journal {} of instance {} ({}/{}) records no process identity, so Agora \
+         cannot tell whether its session is still live; it was left alone and nothing was \
+         changed. If no game or tool of {} is running, put the files back by hand with `{}`",
+        journal_path.display(),
+        journal.instance_id,
+        journal.game,
+        journal.store,
+        journal.game,
+        restore_instruction(journal.game.as_str(), journal.store.as_str())
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Core Operations: swap_in, restore, status
 // ---------------------------------------------------------------------------
@@ -516,7 +979,20 @@ pub fn swap_in(
         LockResource::GameUserFiles(definition.id.clone(), store.clone()),
         "swap-in",
     )?;
+    swap_in_locked(ctx, instance_id, definition, store, running_from)
+}
 
+/// [`swap_in`] for a caller that already holds the game/store user-files lock (the lock manager
+/// is not re-entrant). A tool swap holds that lock for the whole run — from before this journal
+/// is written until the run's own swap journal is cleared — so a recovery in another process
+/// can never act on the live run.
+pub fn swap_in_locked(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    store: &StoreId,
+    running_from: &Path,
+) -> Result<SwapOutcome, UserFilesError> {
     // This launch's own identity, recorded in the journal before any real file is touched. Only
     // the launch that made the swap may give up its start; a restore from the same process but a
     // different launch (the previous session's exit watcher, the Restore command) must not.
@@ -551,8 +1027,27 @@ pub fn swap_in(
                 game_display, store_display, existing.instance_id
             )));
         }
-        // Not running: recover/restore the previous session before proceeding.
-        let _ = restore_journal_internal(ctx, definition, &existing)?;
+        // Not running: recover/restore the previous session before proceeding. A journal that
+        // records no process identity at all (a legacy journal, or a self-capture that failed)
+        // has unknown liveness: another process's launch between its swap and its spawn looks
+        // exactly like this, so this launch must not restore under it. It refuses and names the
+        // command that can decide once nothing is running.
+        if liveness_unknown(&existing) {
+            return Err(UserFilesError::Other(needs_hand_message(
+                &journal_path,
+                &existing,
+            )));
+        }
+        // In its spawning window with no provably dead process, a tool may be running that no
+        // record can see: this launch must not restore under it.
+        if spawning_without_dead_process(&existing) {
+            return Err(UserFilesError::Other(spawning_needs_hand_message(
+                &journal_path,
+                &existing,
+            )));
+        }
+        // A new launch's catch-up is automatic recovery, so it is strict.
+        let _ = restore_journal_internal(ctx, definition, &existing, true, false)?;
     }
 
     // 2. Filter mappings that apply to this store
@@ -630,6 +1125,7 @@ pub fn swap_in(
             swapped: false,
             state: Some(FileState::BackingUp),
             restored: false,
+            real_resolved_path: None,
         })
         .collect();
 
@@ -642,6 +1138,7 @@ pub fn swap_in(
         processes: Vec::new(),
         starting_launcher: process_identity::capture_self(),
         launch_id: Some(launch_id.clone()),
+        spawning: false,
         files: journal_files,
     };
 
@@ -673,6 +1170,7 @@ pub fn swap_in(
                 journal.files[i].swapped = false;
                 journal.files[i].state = Some(FileState::BackingUp);
                 journal.files[i].restored = false;
+                journal.files[i].real_resolved_path = resolved_path_for(&real_path);
                 write_journal(&journal_path, &journal)?;
 
                 // Copy to a temp name, make it durable, verify it, and only then give it the final
@@ -735,13 +1233,19 @@ pub fn swap_in(
                     None => String::new(),
                 };
 
+                // The file is NOT marked swapped yet. There is no backup that could prove what
+                // happened, so the mark is written only once Agora has actually created the
+                // real file: a stop in between leaves a journal that says the real file was
+                // never touched, and recovery then never treats a file the player made in the
+                // meantime as Agora's own write.
                 journal.files[i].existed = false;
                 journal.files[i].backup_path = None;
                 journal.files[i].original_sha256 = None;
                 journal.files[i].written_sha256 = written_hash;
-                journal.files[i].swapped = true;
-                journal.files[i].state = Some(FileState::Swapped);
+                journal.files[i].swapped = false;
+                journal.files[i].state = Some(FileState::BackingUp);
                 journal.files[i].restored = false;
+                journal.files[i].real_resolved_path = resolved_path_for(&real_path);
                 write_journal(&journal_path, &journal)?;
 
                 if let Some(instance_bytes) = instance_bytes {
@@ -750,6 +1254,10 @@ pub fn swap_in(
                     }
                     write_user_file(&real_path, &instance_bytes)?;
                 }
+
+                journal.files[i].swapped = true;
+                journal.files[i].state = Some(FileState::Swapped);
+                write_journal(&journal_path, &journal)?;
             }
         }
         Ok(())
@@ -758,7 +1266,7 @@ pub fn swap_in(
     if let Err(e) = swap_result {
         // Any error puts back what was swapped so far. A restore that also fails is reported, and
         // its journal is left for the next launch or a restore to finish.
-        return Err(match restore_journal_internal(ctx, definition, &journal) {
+        return Err(match restore_journal_internal(ctx, definition, &journal, true, false) {
             Ok(_) => e,
             Err(restore_error) => UserFilesError::Other(format!(
                 "{e}; putting the player's files back also failed: {restore_error}. The journal was kept so recovery can finish it."
@@ -783,7 +1291,76 @@ pub fn restore(
         LockResource::GameUserFiles(definition.id.clone(), store.clone()),
         "restore",
     )?;
+    restore_locked(ctx, definition, store)
+}
 
+/// [`restore`] with the explicit override: on a both-changed conflict it still writes the
+/// conflict copy first, then restores. This is the human override for that one protection;
+/// automatic startup recovery never forces.
+pub fn restore_forced(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    store: &StoreId,
+) -> Result<RestoreReport, UserFilesError> {
+    let _lock = ctx.lock_manager.acquire(
+        LockResource::GameUserFiles(definition.id.clone(), store.clone()),
+        "restore-forced",
+    )?;
+    restore_locked_forced(ctx, definition, store)
+}
+
+/// The body of [`restore`] under the caller's game-user-files lock: read the journal, refuse a
+/// live session, put the files back. Callers that already hold the lock (startup recovery) use
+/// this instead of taking the lock again — the lock manager is not re-entrant.
+pub fn restore_locked(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    store: &StoreId,
+) -> Result<RestoreReport, UserFilesError> {
+    restore_locked_mode(ctx, definition, store, false, false)
+}
+
+/// [`restore_forced`] for a caller that already holds the game/store user-files lock.
+pub fn restore_locked_forced(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    store: &StoreId,
+) -> Result<RestoreReport, UserFilesError> {
+    restore_locked_mode(ctx, definition, store, false, true)
+}
+
+/// [`restore`] as automatic crash recovery, under the caller's game-user-files lock: the same
+/// put-back, but strict — it never acts on a file whose content changed since the swap (see
+/// [`restore_journal_internal`]). The explicit [`restore`] command is the human override that
+/// may do the full put-back after checking nothing of that game is running.
+pub fn restore_locked_recovery(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    store: &StoreId,
+) -> Result<RestoreReport, UserFilesError> {
+    restore_locked_mode(ctx, definition, store, true, false)
+}
+
+/// [`restore_locked_recovery`] for an automatic caller that does not hold the lock.
+pub fn restore_for_recovery(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    store: &StoreId,
+) -> Result<RestoreReport, UserFilesError> {
+    let _lock = ctx.lock_manager.acquire(
+        LockResource::GameUserFiles(definition.id.clone(), store.clone()),
+        "restore-recovery",
+    )?;
+    restore_locked_recovery(ctx, definition, store)
+}
+
+fn restore_locked_mode(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    store: &StoreId,
+    strict: bool,
+    force: bool,
+) -> Result<RestoreReport, UserFilesError> {
     let journal_path = ctx
         .paths
         .user_files_journal_path(definition.id.as_str(), store.as_str());
@@ -817,7 +1394,7 @@ pub fn restore(
         });
     }
 
-    restore_journal_internal(ctx, definition, &journal)
+    restore_journal_internal(ctx, definition, &journal, strict, force)
 }
 
 /// What a catch-up did with the per-user files of one finished session.
@@ -863,6 +1440,22 @@ pub fn restore_finished_for_instance(ctx: &Ctx, instance_id: &str) -> Option<Fin
         if is_session_running(&journal) {
             return None;
         }
+        // Unknown liveness (no recorded identity): automatic recovery must not act on it; the
+        // report says it needs a hand instead.
+        if liveness_unknown(&journal) {
+            return Some(report(
+                Some(needs_hand_message(&journal_path, &journal)),
+                0,
+                0,
+            ));
+        }
+        if spawning_without_dead_process(&journal) {
+            return Some(report(
+                Some(spawning_needs_hand_message(&journal_path, &journal)),
+                0,
+                0,
+            ));
+        }
         let Some(definition) = ctx.games.game(&journal.game) else {
             return Some(report(
                 Some(format!(
@@ -873,16 +1466,144 @@ pub fn restore_finished_for_instance(ctx: &Ctx, instance_id: &str) -> Option<Fin
                 0,
             ));
         };
-        return Some(match restore(ctx, definition, &journal.store) {
-            Ok(found) => report(
-                None,
-                found.files.len(),
-                found.files.iter().filter(|file| file.changed).count(),
-            ),
-            Err(error) => report(Some(error.to_string()), 0, 0),
-        });
+        return Some(
+            match restore_for_recovery(ctx, definition, &journal.store) {
+                Ok(found) => report(
+                    None,
+                    found.files.len(),
+                    found.files.iter().filter(|file| file.changed).count(),
+                ),
+                Err(error) => report(Some(error.to_string()), 0, 0),
+            },
+        );
     }
     None
+}
+
+/// Startup recovery over every user-files journal on disk: a session whose game is no longer
+/// running has its files put back. A session that is still running (a live game or launch, in
+/// this or another process) is left alone — that is a normal session, not interrupted work — and
+/// a store whose lock another Agora process holds is skipped and reported rather than recovered
+/// underneath the live operation. Returns `(actions, warnings)`; nothing is raised.
+pub fn recover_finished_sessions(ctx: &Ctx) -> (Vec<String>, Vec<String>) {
+    let mut actions = Vec::new();
+    let mut warnings = Vec::new();
+    let root = ctx.paths.user_files_root();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return (actions, warnings);
+    };
+    let mut dirs: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    dirs.sort();
+    for dir in dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        let journal_path = dir.join("journal.json");
+        if !journal_path.exists() {
+            continue;
+        }
+        // Fail closed on an unreadable journal: never read "cannot tell" as "nothing pending".
+        let text = match std::fs::read_to_string(&journal_path) {
+            Ok(text) => text,
+            Err(e) => {
+                warnings.push(format!(
+                    "the user-files journal {} cannot be read ({e}), so it was left alone",
+                    journal_path.display()
+                ));
+                continue;
+            }
+        };
+        let journal: Journal = match serde_json::from_str(&text) {
+            Ok(journal) => journal,
+            Err(e) => {
+                warnings.push(format!(
+                    "the user-files journal {} is malformed ({e}), so it was left alone",
+                    journal_path.display()
+                ));
+                continue;
+            }
+        };
+        if is_session_running(&journal) {
+            continue;
+        }
+        let Some(definition) = ctx.games.game(&journal.game) else {
+            warnings.push(format!(
+                "the user-files session of instance {} was left alone: its game '{}' is not registered",
+                journal.instance_id, journal.game
+            ));
+            continue;
+        };
+        // Never wait on the lock at startup: another Agora may be mid-swap on this game and store.
+        let lock = ctx.lock_manager.acquire_with_timeout(
+            LockResource::GameUserFiles(journal.game.clone(), journal.store.clone()),
+            "startup-recovery",
+            std::time::Duration::ZERO,
+            None,
+        );
+        let _lock = match lock {
+            Ok(lock) => lock,
+            Err(error) => {
+                warnings.push(format!(
+                    "the user-files session of instance {} ({}/{}) was left alone: another Agora \
+                     holds its lock right now ({error}). Nothing was changed.",
+                    journal.instance_id, journal.game, journal.store
+                ));
+                continue;
+            }
+        };
+        // Under the lock, re-read the journal: another process may have finished or changed it
+        // between the directory scan and the lock. A journal that records no process identity
+        // has unknown liveness, so it is reported as needing a hand, never recovered.
+        let text = match std::fs::read_to_string(&journal_path) {
+            Ok(text) => text,
+            Err(e) => {
+                warnings.push(format!(
+                    "the user-files journal {} cannot be read ({e}), so it was left alone",
+                    journal_path.display()
+                ));
+                continue;
+            }
+        };
+        let journal: Journal = match serde_json::from_str(&text) {
+            Ok(journal) => journal,
+            Err(e) => {
+                warnings.push(format!(
+                    "the user-files journal {} is malformed ({e}), so it was left alone",
+                    journal_path.display()
+                ));
+                continue;
+            }
+        };
+        if liveness_unknown(&journal) {
+            warnings.push(needs_hand_message(&journal_path, &journal));
+            continue;
+        }
+        if spawning_without_dead_process(&journal) {
+            warnings.push(spawning_needs_hand_message(&journal_path, &journal));
+            continue;
+        }
+        match restore_locked_recovery(ctx, definition, &journal.store) {
+            Ok(report) => actions.push(format!(
+                "Put back the user files of {} ({}) after the interrupted session of instance {} \
+                 ({} file(s) restored).",
+                report.game,
+                report.store,
+                report.instance_id,
+                report.files.len()
+            )),
+            // Another process finished the session between the directory scan and the lock.
+            Err(UserFilesError::NoSession { .. }) => {}
+            Err(UserFilesError::CannotRestoreRunning { instance }) => warnings.push(format!(
+                "the user-files session of instance {instance} ({}/{}) was left alone: the game is still running",
+                journal.game, journal.store
+            )),
+            Err(e) => warnings.push(format!(
+                "the user-files session of instance {} ({}/{}) could not be put back: {e}",
+                journal.instance_id, journal.game, journal.store
+            )),
+        }
+    }
+    (actions, warnings)
 }
 
 /// Restore user files, retrying while the game is still leaving the process table. A game that
@@ -901,6 +1622,12 @@ pub fn restore_retrying_while_running(
 /// The exact command that finishes a restore a launch or catch-up could not run.
 pub fn restore_instruction(game: &str, store: &str) -> String {
     format!("agora games user-files restore {game} {store}")
+}
+
+/// The explicit restore command with its override flag, for a conflict that refuses without it
+/// (both sides changed since the swap). Automatic startup recovery never forces.
+pub fn restore_instruction_forced(game: &str, store: &str) -> String {
+    format!("agora games user-files restore {game} {store} --force")
 }
 
 /// What a person is told when a restore did not finish. It names the error, says the files are
@@ -946,7 +1673,9 @@ fn retryable_restore(error: &UserFilesError) -> bool {
 
 fn sharing_violation(error: &UserFilesError) -> bool {
     let source = match error {
-        UserFilesError::Io(source) | UserFilesError::Write { source, .. } => source,
+        UserFilesError::Io(source)
+        | UserFilesError::Write { source, .. }
+        | UserFilesError::Read { source, .. } => source,
         _ => return false,
     };
     is_sharing_violation(source)
@@ -973,6 +1702,15 @@ pub fn finish_starting(ctx: &Ctx, game: &GameId, store: &StoreId) -> Result<(), 
         LockResource::GameUserFiles(game.clone(), store.clone()),
         "finish-starting",
     )?;
+    finish_starting_locked(ctx, game, store)
+}
+
+/// [`finish_starting`] for a caller that already holds the game/store user-files lock.
+pub fn finish_starting_locked(
+    ctx: &Ctx,
+    game: &GameId,
+    store: &StoreId,
+) -> Result<(), UserFilesError> {
     let journal_path = ctx
         .paths
         .user_files_journal_path(game.as_str(), store.as_str());
@@ -983,6 +1721,7 @@ pub fn finish_starting(ctx: &Ctx, game: &GameId, store: &StoreId) -> Result<(), 
     let mut journal: Journal = serde_json::from_str(&text)?;
     if journal.starting_launcher.is_some() {
         journal.starting_launcher = None;
+        journal.spawning = false;
         write_journal(&journal_path, &journal)?;
     }
     Ok(())
@@ -1001,6 +1740,16 @@ pub fn finish_starting_launch(
         LockResource::GameUserFiles(game.clone(), store.clone()),
         "finish-starting-launch",
     )?;
+    finish_starting_launch_locked(ctx, game, store, launch_id)
+}
+
+/// [`finish_starting_launch`] for a caller that already holds the game/store user-files lock.
+pub fn finish_starting_launch_locked(
+    ctx: &Ctx,
+    game: &GameId,
+    store: &StoreId,
+    launch_id: &str,
+) -> Result<(), UserFilesError> {
     let journal_path = ctx
         .paths
         .user_files_journal_path(game.as_str(), store.as_str());
@@ -1020,6 +1769,7 @@ pub fn finish_starting_launch(
         ));
     }
     journal.starting_launcher = None;
+    journal.spawning = false;
     write_journal(&journal_path, &journal)?;
     Ok(())
 }
@@ -1028,6 +1778,8 @@ fn restore_journal_internal(
     ctx: &Ctx,
     definition: &GameDefinition,
     journal: &Journal,
+    strict: bool,
+    force: bool,
 ) -> Result<RestoreReport, UserFilesError> {
     if journal.game != definition.id {
         return Err(UserFilesError::Other(format!(
@@ -1078,9 +1830,7 @@ fn restore_journal_internal(
         file: JournaledFile,
         instance_path: RelPath,
         original_sha256: Option<String>,
-        derived_real_path: PathBuf,
-        derived_instance_copy: PathBuf,
-        derived_backup_path: PathBuf,
+        destination: RestoreDestination,
         state: FileState,
         existed: bool,
     }
@@ -1100,39 +1850,210 @@ fn restore_journal_internal(
             )));
         };
 
-        let derived_real_path = resolve_user_file_source_in(prefix.as_deref(), &mapping.source)?;
-        if !paths_eq_case_insensitive(&file.real_path, &derived_real_path) {
-            return Err(UserFilesError::Other(format!(
-                "journal entry real_path '{:?}' differs from derived real_path '{:?}'",
-                file.real_path, derived_real_path
-            )));
-        }
-
-        let derived_instance_copy = instance_dir.join(mapping.instance_path.as_str());
-        let derived_backup_path = backup_dir.join(format!("{i}"));
+        let destination = restore_destination(
+            file,
+            mapping,
+            prefix.as_deref(),
+            &instance_dir,
+            &backup_dir,
+            i,
+        )?;
 
         if let Some(ref bp) = file.backup_path {
-            if !paths_eq_case_insensitive(bp, &derived_backup_path) {
+            if !paths_eq_case_insensitive(bp, &destination.backup) {
                 return Err(UserFilesError::Other(format!(
                     "journal backup path '{:?}' does not match expected backup index path '{:?}'",
-                    bp, derived_backup_path
+                    bp, destination.backup
                 )));
             }
         }
 
         // A backup on disk proves the real file was there, even when a stop happened before the
         // journal said so. It is only usable when its hash matches the recorded original.
-        let has_backup = derived_backup_path.exists();
+        let has_backup = file_presence(&destination.backup, "the backup")?;
         let existed = file.existed || has_backup || file.original_sha256.is_some();
+        // Resolving the present destinations also proves their parents resolve. An absent backup
+        // has nothing to resolve and is harmless.
+        if has_backup {
+            resolved_destination(&destination.backup, "the backup")?;
+        }
+        if file_presence(&destination.instance_copy, "the instance copy")? {
+            resolved_destination(&destination.instance_copy, "the instance copy")?;
+        }
+
+        let real_bytes = read_recovery_file(&destination.real, "user file")?;
+        let real_hash = real_bytes.as_ref().map(|bytes| hash_bytes(bytes));
+        let backup_hash = if has_backup {
+            read_recovery_file(&destination.backup, "backup")?.map(|bytes| hash_bytes(&bytes))
+        } else {
+            None
+        };
+        // The restore moves no bytes for this entry when the real file already holds the
+        // original or the backup's bytes: the entry is then only marked restored.
+        let real_is_original = file.original_sha256.as_deref().is_some()
+            && real_hash.as_deref() == file.original_sha256.as_deref();
+        let real_matches_backup = real_hash.is_some() && real_hash == backup_hash;
+
+        // The one destination is compared fully resolved against where it resolved at swap time.
+        // `destination.real_resolved` never appends names onto an unresolved parent: a missing
+        // parent was can't-tell and already stopped above. A final link that no longer resolves is
+        // a changed (or broken) link, not a deleted file.
+        let resolution_ok = match &file.real_resolved_path {
+            Some(recorded) => {
+                let full_resolves = std::fs::canonicalize(&destination.real).is_ok();
+                if symlink_target(&destination.real).is_some() && !full_resolves {
+                    false
+                } else {
+                    paths_eq_exact(recorded, &destination.real_resolved)
+                }
+            }
+            None => {
+                // A legacy journal recorded no resolved path, so nothing proves the real path
+                // still resolves where the swap read it — an ancestor could have been replaced
+                // by a link while the final component stays an ordinary file. Fail closed on
+                // any entry whose restore would write; only entries that move no bytes (already
+                // restored, the real file already holding the original or the backup's bytes,
+                // or a not-swapped entry with nothing to remove) may proceed.
+                if symlink_target(&file.real_path).is_some() {
+                    false
+                } else {
+                    file.restored
+                        || real_is_original
+                        || real_matches_backup
+                        || (file_state(file) != FileState::Swapped
+                            && !has_backup
+                            && !(real_hash.as_deref() == Some(file.written_sha256.as_str())
+                                && !file.written_sha256.is_empty()))
+                }
+            }
+        };
+        if !resolution_ok {
+            let recorded = match &file.real_resolved_path {
+                Some(recorded) => format!(
+                    "resolved to '{}' at the swap and to '{}' now",
+                    recorded.display(),
+                    destination.real_resolved.display()
+                ),
+                None => "the journal records no resolved path for it (a journal from before \
+                         resolved paths were recorded)"
+                    .to_string(),
+            };
+            // A legacy journal that cannot prove the resolution refuses any write; name the
+            // backup too, so the report says where every copy is.
+            let backup_note = if file.real_resolved_path.is_none() && has_backup {
+                format!(
+                    "; its backup '{}' was left in place",
+                    destination.backup.display()
+                )
+            } else {
+                String::new()
+            };
+            return Err(UserFilesError::Other(format!(
+                "the user file '{}' cannot be verified to still resolve where the journal records \
+                 ({}{}); Agora did not write through it and changed nothing. Check the links by \
+                 hand, then put the files back with `{}`",
+                file.real_path.display(),
+                recorded,
+                backup_note,
+                restore_instruction(journal.game.as_str(), journal.store.as_str())
+            )));
+        }
+
+        // Three-way check, before anything is modified: when the journal records the swap as
+        // done, both the real file and the instance's copy are compared against what the
+        // session wrote. When BOTH changed since the swap, recovery cannot tell whose bytes are
+        // the ones to keep, so it overwrites neither: the real file's current bytes are kept as
+        // a clearly named conflict copy next to the instance's copy, and the restore stops and
+        // asks for a hand. Only when at most one side changed may bytes move — and equal bytes
+        // on both sides count as unambiguous only when the two paths are provably DIFFERENT
+        // files: if the instance copy is a link to the real file (or a hard link to it), both
+        // sides read the same changed bytes, and putting the backup over the shared target
+        // would lose the edit, so that is a needs-a-hand case too.
+        if !file.restored
+            && file_state(file) == FileState::Swapped
+            && !real_is_original
+            && !real_matches_backup
+        {
+            let real_changed = real_hash
+                .as_deref()
+                .is_some_and(|hash| hash != file.written_sha256.as_str());
+            let instance_bytes = read_recovery_file(&destination.instance_copy, "instance copy")?;
+            let instance_hash = instance_bytes.as_ref().map(|bytes| hash_bytes(bytes));
+            let instance_changed = instance_hash
+                .as_deref()
+                .is_some_and(|hash| hash != file.written_sha256.as_str());
+            if real_changed
+                && instance_changed
+                && (real_hash != instance_hash
+                    || !provably_distinct_files(&destination.real, &destination.instance_copy))
+            {
+                let real_bytes = real_bytes.clone().expect("read changed bytes above");
+                let real_hash = real_hash.expect("hashed above");
+                // The forced restore is about to overwrite the instance's independently edited
+                // copy, so that is the version to archive. Without the override nothing is
+                // overwritten and the real file's current bytes are the ones worth naming.
+                let (archived_bytes, archive_hash) = if force {
+                    // Force may overwrite only after archiving the displaced bytes. Those bytes
+                    // were read above; if they could not be read we already stopped.
+                    let instance_bytes = instance_bytes.expect("read changed instance bytes above");
+                    let instance_hash = hash_bytes(&instance_bytes);
+                    (instance_bytes, instance_hash)
+                } else {
+                    (real_bytes.to_vec(), real_hash.clone())
+                };
+                let conflict_path = destination.instance_copy.with_file_name(format!(
+                    "{}.agora-conflict-{}",
+                    destination
+                        .instance_copy
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("file"),
+                    &archive_hash[..8]
+                ));
+                let conflict_path = write_conflict_file(&conflict_path, &archived_bytes)?;
+                // The explicit restore command's override (`--force`) writes the conflict
+                // copy first (done above) and then restores; automatic recovery never does.
+                if !force {
+                    return Err(UserFilesError::Conflict(format!(
+                        "the user file '{}' and the instance's copy '{}' both changed since \
+                         the swap, so neither was overwritten: the real file's current bytes \
+                         were kept as '{}'. Check both by hand, then put the files back \
+                         with `{}`",
+                        destination.real.display(),
+                        destination.instance_copy.display(),
+                        conflict_path.display(),
+                        restore_instruction_forced(journal.game.as_str(), journal.store.as_str())
+                    )));
+                }
+            }
+        }
+
+        // Strict mode is crash recovery, not a human at the restore command: a file Agora
+        // created during the session (no original existed) whose content no longer matches
+        // what the session wrote may have been made by the player after the crash. Recovery
+        // never overwrites the instance's copy with such bytes and never deletes the file, so
+        // the whole restore stops here, before anything is modified, and asks for a hand.
+        if strict && !existed && file_state(file) == FileState::Swapped {
+            if let Some(bytes) = &real_bytes {
+                if hash_bytes(bytes) != file.written_sha256 {
+                    return Err(UserFilesError::Other(format!(
+                        "the user file '{}' changed since the swap (it does not match what the \
+                         session wrote), so recovery left it and the instance's copy '{}' exactly \
+                         as they are and changed nothing. Check the file by hand, then run `{}`",
+                        destination.real.display(),
+                        destination.instance_copy.display(),
+                        restore_instruction(journal.game.as_str(), journal.store.as_str())
+                    )));
+                }
+            }
+        }
 
         validated_entries.push(ValidatedEntry {
             index: i,
             file: file.clone(),
             instance_path: mapping.instance_path.clone(),
             original_sha256: file.original_sha256.clone(),
-            derived_real_path,
-            derived_instance_copy,
-            derived_backup_path,
+            destination,
             state: file_state(file),
             existed,
         });
@@ -1149,17 +2070,9 @@ fn restore_journal_internal(
             continue;
         }
 
-        let real_bytes = if entry.derived_real_path.exists() {
-            Some(std::fs::read(&entry.derived_real_path)?)
-        } else {
-            None
-        };
+        let real_bytes = read_recovery_file(&entry.destination.real, "user file")?;
         let real_hash = real_bytes.as_ref().map(|bytes| hash_bytes(bytes));
-        let backup_bytes = if entry.derived_backup_path.exists() {
-            Some(std::fs::read(&entry.derived_backup_path)?)
-        } else {
-            None
-        };
+        let backup_bytes = read_recovery_file(&entry.destination.backup, "backup")?;
         let backup_hash = backup_bytes.as_ref().map(|bytes| hash_bytes(bytes));
 
         // The real file still holding the recorded original means the swap never changed it (or an
@@ -1173,14 +2086,14 @@ fn restore_journal_internal(
         // By design: a session that ends on exactly the player's original bytes has no changed
         // bytes to save, so the instance copy is left as it was.
         if real_is_original || real_matches_backup {
-            if entry.derived_backup_path.exists() {
-                let _ = std::fs::remove_file(&entry.derived_backup_path);
+            if file_presence(&entry.destination.backup, "the backup")? {
+                let _ = std::fs::remove_file(&entry.destination.backup);
             }
-            let _ = std::fs::remove_file(entry.derived_backup_path.with_extension("tmp"));
+            let _ = std::fs::remove_file(entry.destination.backup.with_extension("tmp"));
             journal.files[entry.index].restored = true;
             write_journal(&journal_path, &journal)?;
             restored_files.push(RestoredFile {
-                real_path: entry.derived_real_path.clone(),
+                real_path: entry.destination.real.clone(),
                 instance_path: entry.instance_path.clone(),
                 changed: false,
                 original_sha256: entry.original_sha256.clone(),
@@ -1193,14 +2106,24 @@ fn restore_journal_internal(
             // The journal records that no write reached the real file. A backup that matches it was
             // already handled; one that does not may be the only copy of the player's file, so it
             // is kept and reported instead of removed.
-            if entry.derived_backup_path.exists() {
+            if file_presence(&entry.destination.backup, "the backup")? {
                 return Err(UserFilesError::Other(format!(
                     "the user file '{}' does not match its backup '{}', and the journal records no swap; both were left in place",
-                    entry.derived_real_path.display(),
-                    entry.derived_backup_path.display()
+                    entry.destination.real.display(),
+                    entry.destination.backup.display()
                 )));
             }
-            let _ = std::fs::remove_file(entry.derived_backup_path.with_extension("tmp"));
+            // A stop between Agora's write and the "swapped" mark leaves the file Agora wrote
+            // under a journal that says no swap happened. Only bytes exactly matching the
+            // recorded write are removed; anything else was not written by Agora and is left
+            // exactly as it is.
+            if file_presence(&entry.destination.real, "the user file")?
+                && !entry.file.written_sha256.is_empty()
+                && real_hash.as_deref() == Some(entry.file.written_sha256.as_str())
+            {
+                let _ = std::fs::remove_file(&entry.destination.real);
+            }
+            let _ = std::fs::remove_file(entry.destination.backup.with_extension("tmp"));
             journal.files[entry.index].restored = true;
             write_journal(&journal_path, &journal)?;
             continue;
@@ -1215,21 +2138,21 @@ fn restore_journal_internal(
             let Some(original) = entry.original_sha256.as_deref() else {
                 return Err(UserFilesError::Other(format!(
                     "the backup '{}' of the user file '{}' cannot be verified: the journal has no original hash; both were left in place",
-                    entry.derived_backup_path.display(),
-                    entry.derived_real_path.display()
+                    entry.destination.backup.display(),
+                    entry.destination.real.display()
                 )));
             };
             let Some(backup_hash) = backup_hash.as_deref() else {
                 return Err(UserFilesError::Other(format!(
                     "the backup '{}' of the user file '{}' is missing; the file and the journal were left in place",
-                    entry.derived_backup_path.display(),
-                    entry.derived_real_path.display()
+                    entry.destination.backup.display(),
+                    entry.destination.real.display()
                 )));
             };
             if backup_hash != original {
                 return Err(UserFilesError::HashMismatch {
-                    path: entry.derived_backup_path.clone(),
-                    real_path: entry.derived_real_path.clone(),
+                    path: entry.destination.backup.clone(),
+                    real_path: entry.destination.real.clone(),
                     expected: original.to_string(),
                     actual: backup_hash.to_string(),
                 });
@@ -1239,50 +2162,47 @@ fn restore_journal_internal(
             // it from what Agora wrote.
             if let Some(current) = &real_bytes {
                 if real_hash.as_deref() != Some(entry.file.written_sha256.as_str()) {
-                    if let Some(parent) = entry.derived_instance_copy.parent() {
+                    if let Some(parent) = entry.destination.instance_copy.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    write_user_file(&entry.derived_instance_copy, current)?;
+                    write_user_file(&entry.destination.instance_copy, current)?;
                 }
             }
 
             let backup_bytes = backup_bytes.expect("checked above");
-            if let Some(parent) = entry.derived_real_path.parent() {
+            if let Some(parent) = entry.destination.real.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            write_user_file(&entry.derived_real_path, &backup_bytes)?;
+            write_user_file(&entry.destination.real, &backup_bytes)?;
         } else {
             // Agora created this file during the session; the session's copy goes back and the real
-            // file goes.
+            // file goes. (Crash recovery never reaches a file whose content changed since the
+            // swap: the strict check in the validation above stops the whole restore first.)
             if let Some(current) = &real_bytes {
                 if real_hash.as_deref() != Some(entry.file.written_sha256.as_str()) {
-                    if let Some(parent) = entry.derived_instance_copy.parent() {
+                    if let Some(parent) = entry.destination.instance_copy.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    write_user_file(&entry.derived_instance_copy, current)?;
+                    write_user_file(&entry.destination.instance_copy, current)?;
                 }
             }
-            if entry.derived_real_path.exists() {
-                std::fs::remove_file(&entry.derived_real_path)?;
+            if file_presence(&entry.destination.real, "the user file")? {
+                std::fs::remove_file(&entry.destination.real)?;
             }
         }
 
-        let final_sha256 = if entry.derived_real_path.exists() {
-            let bytes = std::fs::read(&entry.derived_real_path)?;
-            Some(hash_bytes(&bytes))
-        } else {
-            None
-        };
+        let final_sha256 = read_recovery_file(&entry.destination.real, "user file")?
+            .map(|bytes| hash_bytes(&bytes));
 
         // Record the entry before its backup can go, so a stop from here on does not restore it a
         // second time.
         journal.files[entry.index].restored = true;
         write_journal(&journal_path, &journal)?;
-        let _ = std::fs::remove_file(&entry.derived_backup_path);
-        let _ = std::fs::remove_file(entry.derived_backup_path.with_extension("tmp"));
+        let _ = std::fs::remove_file(&entry.destination.backup);
+        let _ = std::fs::remove_file(entry.destination.backup.with_extension("tmp"));
 
         restored_files.push(RestoredFile {
-            real_path: entry.derived_real_path.clone(),
+            real_path: entry.destination.real.clone(),
             instance_path: entry.instance_path.clone(),
             changed: real_hash != entry.original_sha256,
             original_sha256: entry.original_sha256.clone(),
@@ -1320,7 +2240,16 @@ pub fn record_process(
         LockResource::GameUserFiles(game.clone(), store.clone()),
         "record-process",
     )?;
+    record_process_locked(ctx, game, store, identity)
+}
 
+/// [`record_process`] for a caller that already holds the game/store user-files lock.
+pub fn record_process_locked(
+    ctx: &Ctx,
+    game: &GameId,
+    store: &StoreId,
+    identity: ProcessIdentity,
+) -> Result<(), UserFilesError> {
     let journal_path = ctx
         .paths
         .user_files_journal_path(game.as_str(), store.as_str());
@@ -1337,9 +2266,35 @@ pub fn record_process(
     let text = std::fs::read_to_string(&journal_path)?;
     let mut journal: Journal = serde_json::from_str(&text)?;
     journal.processes.push(identity);
-    // The game now has an identity that says whether it is alive; the launcher mark is done.
+    // The game now has an identity that says whether it is alive; the launcher mark is done, and
+    // the spawn is recorded, so the spawning window is over.
     journal.starting_launcher = None;
+    journal.spawning = false;
     write_journal(&journal_path, &journal)?;
+    Ok(())
+}
+
+/// Mark the session as spawning a tool, written (durably) before the spawn. For a caller that
+/// already holds the game/store user-files lock. While the mark is set and no recorded process
+/// is provably dead, automatic recovery treats the session as needing a hand (see
+/// [`spawning_without_dead_process`]); [`record_process_locked`] clears it.
+pub fn mark_spawning_locked(
+    ctx: &Ctx,
+    game: &GameId,
+    store: &StoreId,
+) -> Result<(), UserFilesError> {
+    let journal_path = ctx
+        .paths
+        .user_files_journal_path(game.as_str(), store.as_str());
+    if !journal_path.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&journal_path)?;
+    let mut journal: Journal = serde_json::from_str(&text)?;
+    if !journal.spawning {
+        journal.spawning = true;
+        write_journal(&journal_path, &journal)?;
+    }
     Ok(())
 }
 
@@ -1386,6 +2341,7 @@ pub struct SessionDetails {
     pub running_from: PathBuf,
     pub processes: Vec<ProcessIdentity>,
     pub starting_launcher: Option<ProcessIdentity>,
+    pub spawning: bool,
 }
 
 /// Read a session's details. An unreadable journal is an error, never "no session".
@@ -1420,6 +2376,7 @@ pub fn details(
         running_from: journal.running_from,
         processes: journal.processes,
         starting_launcher: journal.starting_launcher,
+        spawning: journal.spawning,
     }))
 }
 
@@ -1478,7 +2435,174 @@ pub fn list_statuses(
 
 #[cfg(test)]
 mod tests {
-    use super::write_user_file;
+    use super::{write_user_file, JournaledFile};
+    use std::path::{Path, PathBuf};
+
+    use agora_game_api::RelPath;
+
+    /// The one destination comes from the journal, never from a case-insensitive filesystem lookup.
+    /// A mapping whose spelling differs in case must not change which path recovery writes.
+    #[test]
+    fn the_restore_destination_is_the_journal_path() {
+        use agora_game_api::{GamePath, UserDataLocation, UserFileMapping, UserFileStrategy};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = tmp.path();
+        let mapping = UserFileMapping::new(
+            GamePath::UserData {
+                location: UserDataLocation::LocalAppData,
+                path: RelPath::new("My Games/Plugins.txt").unwrap(),
+            },
+            RelPath::new("user/Plugins.txt").unwrap(),
+            UserFileStrategy::JournaledSwap,
+        );
+        let recorded = super::user_data_root_in_prefix(prefix, &UserDataLocation::LocalAppData)
+            .join("My Games/plugins.txt");
+        let file = JournaledFile {
+            real_path: recorded.clone(),
+            instance_path: RelPath::new("user/Plugins.txt").unwrap(),
+            instance_copy_path: tmp.path().join("instance/Plugins.txt"),
+            existed: true,
+            backup_path: None,
+            original_sha256: None,
+            written_sha256: String::new(),
+            swapped: true,
+            state: None,
+            restored: false,
+            real_resolved_path: Some(recorded.clone()),
+        };
+        let destination = super::restore_destination(
+            &file,
+            &mapping,
+            Some(prefix),
+            &tmp.path().join("instances"),
+            &tmp.path().join("backup"),
+            0,
+        )
+        .expect("the destination resolves");
+        assert_eq!(
+            destination.real, recorded,
+            "recovery must write the exact journal path"
+        );
+    }
+
+    /// A metadata error on the backup path is can't-tell, never "no backup". An invalid path gives
+    /// a metadata error on every platform, so this mechanism test runs everywhere.
+    #[test]
+    fn metadata_errors_are_never_absence() {
+        let error = super::file_presence(Path::new("invalid\0path"), "the backup").unwrap_err();
+        assert!(
+            error.to_string().contains("could not be read"),
+            "a metadata error must be reported, not swallowed: {error}"
+        );
+    }
+
+    /// An unresolvable destination is can't-tell; recovery must not substitute a rebuilt path.
+    #[test]
+    fn an_unresolvable_destination_is_cant_tell() {
+        let error =
+            super::resolved_destination(Path::new("invalid\0path"), "the user file").unwrap_err();
+        assert!(
+            error.to_string().contains("could not be read"),
+            "an unresolvable path must be reported: {error}"
+        );
+    }
+
+    /// Distinct non-UTF-8 file names must never compare equal. Lossy string conversion turns both
+    /// of these into the same replacement character, which would let recovery accept a retarget.
+    #[cfg(unix)]
+    #[test]
+    fn the_exact_comparator_is_lossless_for_non_utf8_names() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let one = Path::new(std::ffi::OsStr::from_bytes(b"Plugins\xff.txt"));
+        let two = Path::new(std::ffi::OsStr::from_bytes(b"Plugins\xfe.txt"));
+        assert!(
+            !super::paths_eq_exact(one, two),
+            "two distinct targets compared equal after lossy conversion"
+        );
+        assert!(super::paths_eq_exact(one, one));
+    }
+
+    /// The same rule on Windows: unpaired UTF-16 surrogates are not valid text, and lossy
+    /// conversion collapses different ones to the same replacement character.
+    #[cfg(windows)]
+    #[test]
+    fn the_exact_comparator_is_lossless_for_non_utf8_names() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let one = PathBuf::from(std::ffi::OsString::from_wide(&[
+            b'P' as u16,
+            0xD800,
+            b'.' as u16,
+        ]));
+        let two = PathBuf::from(std::ffi::OsString::from_wide(&[
+            b'P' as u16,
+            0xD801,
+            b'.' as u16,
+        ]));
+        assert!(
+            !super::paths_eq_exact(&one, &two),
+            "two distinct targets compared equal after lossy conversion"
+        );
+        assert!(super::paths_eq_exact(&one, &one));
+    }
+
+    /// Canonical paths are compared exactly: a case-only retarget is a different resolved file.
+    /// The case-insensitive comparator stays for user-data folder matching, not for this guard.
+    #[test]
+    fn the_canonical_path_guard_does_not_fold_case() {
+        let recorded = Path::new("/home/Player/Documents/My Games/Plugins.txt");
+        let retargeted = Path::new("/home/player/documents/my games/Plugins.txt");
+
+        assert!(
+            !super::paths_eq_exact(recorded, retargeted),
+            "a case-only change must not compare equal"
+        );
+        assert!(super::paths_eq_exact(recorded, recorded));
+        assert!(
+            super::paths_eq_case_insensitive(recorded, retargeted),
+            "the other comparator is deliberately case-insensitive for user-data folders"
+        );
+    }
+
+    #[test]
+    fn the_recorded_resolved_path_round_trips_and_old_journals_have_none() {
+        let file = JournaledFile {
+            real_path: PathBuf::from("/home/player/.local/share/Test/Plugins.txt"),
+            instance_path: RelPath::new("user/Plugins.txt").unwrap(),
+            instance_copy_path: PathBuf::from("/data/inst/user/Plugins.txt"),
+            existed: true,
+            backup_path: None,
+            original_sha256: Some("ab".into()),
+            written_sha256: "cd".into(),
+            swapped: true,
+            state: None,
+            restored: false,
+            real_resolved_path: Some(PathBuf::from("/home/player/elsewhere/Plugins.txt")),
+        };
+        let text = serde_json::to_string(&file).unwrap();
+        assert!(text.contains("real_resolved_path"), "{text}");
+        let back: JournaledFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            back.real_resolved_path,
+            Some(PathBuf::from("/home/player/elsewhere/Plugins.txt"))
+        );
+        // A journal written before the field existed — including one that recorded the old
+        // link-text field — parses with no resolved path: unknown, which recovery treats as
+        // "cannot prove the path still resolves where the swap read it".
+        let old = r#"{
+            "real_path": "/home/player/.local/share/Test/Plugins.txt",
+            "instance_path": "user/Plugins.txt",
+            "instance_copy_path": "/data/inst/user/Plugins.txt",
+            "existed": true,
+            "written_sha256": "cd",
+            "swapped": true,
+            "real_link_target": "/home/player/elsewhere/Plugins.txt"
+        }"#;
+        let parsed: JournaledFile = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.real_resolved_path, None);
+    }
 
     fn make_read_writable(path: &std::path::Path) {
         let mut perms = std::fs::metadata(path).unwrap().permissions();

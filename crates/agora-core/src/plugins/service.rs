@@ -1557,6 +1557,14 @@ impl PluginService {
             }
         }
 
+        // The whole swap — stash, extract, record — runs under the plugin-install lock, so a
+        // second Agora process starting up cannot "recover" this live install from under it:
+        // startup recovery takes the same lock and never waits on it.
+        let _install_lock = self.inner.ctx.lock_manager.acquire(
+            crate::lock_manager::LockResource::PluginInstall,
+            "plugin-install",
+        )?;
+
         let had_files = destination.exists();
         if had_files {
             install::stash_for_rollback(&destination, &rollback)?;

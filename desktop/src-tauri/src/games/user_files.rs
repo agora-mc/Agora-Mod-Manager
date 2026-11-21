@@ -5,7 +5,7 @@
 use agora_core::game_user_files::{self, RestoreReport, SessionStatus};
 use serde::Serialize;
 
-use super::error::{GamesError, CORE_FAILED, TASK_FAILED};
+use super::error::{GamesError, CORE_FAILED, TASK_FAILED, USER_FILES_CONFLICT};
 
 /// The game id is not one Agora supports.
 const BAD_GAME: &str = "bad_game";
@@ -95,11 +95,14 @@ pub async fn games_user_files_status(
 }
 
 /// Put one session's files back from Agora's backup. Refused while the game runs on them.
+/// `force` is the explicit override for a both-changed conflict: the conflict copy is still
+/// written first, then the files are put back. Automatic startup recovery never forces.
 #[tauri::command]
 pub async fn games_user_files_restore(
     app: tauri::AppHandle,
     game_id: String,
     store: String,
+    force: Option<bool>,
 ) -> Result<RestoreDto, GamesError> {
     tokio::task::spawn_blocking(move || -> Result<RestoreDto, GamesError> {
         let ctx = crate::core_context(&app)?;
@@ -125,7 +128,12 @@ pub async fn games_user_files_restore(
                     ),
                 )
             })?;
-        let report = game_user_files::restore(&ctx, game, &store_id).map_err(core_failed)?;
+        let report = if force.unwrap_or(false) {
+            game_user_files::restore_forced(&ctx, game, &store_id)
+        } else {
+            game_user_files::restore(&ctx, game, &store_id)
+        }
+        .map_err(restore_failed)?;
         Ok(restore_dto(report))
     })
     .await
@@ -178,9 +186,31 @@ fn core_failed(error: impl std::fmt::Display) -> GamesError {
     GamesError::new(CORE_FAILED, error.to_string())
 }
 
+/// The both-changed conflict gets a code of its own: it is the one core refusal the UI may offer
+/// an explicit override for. Every other failure stays a plain core failure.
+fn restore_failed(error: game_user_files::UserFilesError) -> GamesError {
+    if matches!(error, game_user_files::UserFilesError::Conflict(_)) {
+        GamesError::new(USER_FILES_CONFLICT, error.to_string())
+            .with_core_code(game_user_files::ERR_USER_FILES_CONFLICT)
+    } else {
+        core_failed(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_core_conflict_keeps_a_code_the_frontend_can_branch_on() {
+        let error = game_user_files::UserFilesError::Conflict("both changed since the swap".into());
+        let games = restore_failed(error);
+        assert_eq!(games.code, USER_FILES_CONFLICT);
+        assert_eq!(
+            games.core_code.as_deref(),
+            Some(game_user_files::ERR_USER_FILES_CONFLICT)
+        );
+    }
 
     /// A session as the journal stores it, read through the same serde shape.
     fn status_from_journal(running: bool) -> SessionStatus {

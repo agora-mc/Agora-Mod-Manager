@@ -96,12 +96,26 @@ fn write_lease(paths: &AppPaths, lease: &RuntimeLease) -> LauncherResult<()> {
     })
 }
 
-/// Read the current lease, if any. A corrupt lease is treated as present and
-/// unreadable rather than absent — see [`check_idle`].
+/// Read the current lease, if any. Only a missing file means "no lease": a permission denial, a
+/// Windows sharing violation, a directory at the path or any other read failure is "can't tell"
+/// and returned as an error, so no caller can proceed as if the instance were idle. A corrupt or
+/// future-version lease is likewise reported as occupied — see [`check_idle`].
 pub fn read(paths: &AppPaths, instance_id: &str) -> LauncherResult<Option<RuntimeLease>> {
     let path = lease_path(paths, instance_id)?;
-    let Ok(bytes) = fs::read(&path) else {
-        return Ok(None);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(LauncherError::Generic {
+                code: "ERR_RUNTIME_LEASE_UNREADABLE".into(),
+                message: format!(
+                    "The runtime record for '{instance_id}' at {} could not be read ({error}), so \
+                     it is not possible to tell whether a game is using it. Close any running game \
+                     and try again.",
+                    path.display()
+                ),
+            })
+        }
     };
     match serde_json::from_slice::<RuntimeLease>(&bytes) {
         Ok(lease) if lease.schema_version == RUNTIME_LEASE_SCHEMA_VERSION => Ok(Some(lease)),
@@ -670,6 +684,26 @@ mod tests {
         let path = lease_path(&paths, "demo").unwrap();
         fs::write(&path, b"{ this is not a lease").unwrap();
         assert!(check_idle(&paths, "demo").is_err());
+    }
+
+    /// A lease record that cannot be read at all (a directory at its path, a permission denial or
+    /// a sharing violation) must be can't-tell, never a missing lease that reads as idle.
+    #[test]
+    fn an_io_failure_reading_a_lease_is_not_idle() {
+        let (paths, _tmp) = paths();
+        let path = lease_path(&paths, "demo").unwrap();
+        fs::create_dir(&path).unwrap();
+
+        let error = read(&paths, "demo").unwrap_err();
+        assert_eq!(error.code(), "ERR_RUNTIME_LEASE_UNREADABLE");
+        assert!(
+            error.to_string().contains("try again"),
+            "a transient read failure must give a retryable message: {error}"
+        );
+        let idle = check_idle(&paths, "demo").unwrap_err();
+        assert_eq!(idle.code(), "ERR_RUNTIME_LEASE_UNREADABLE");
+        assert!(game_has_record(&paths, "demo"));
+        assert!(!game_is_provably_gone(&paths, "demo"));
     }
 
     #[test]

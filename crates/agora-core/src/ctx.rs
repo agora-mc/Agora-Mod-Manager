@@ -230,6 +230,7 @@ impl CoreContext {
                 newer.kept_at.display()
             ));
         }
+        warnings.extend(local_state_report.warnings.iter().cloned());
 
         // The plugin runtime is created later, but a scripted package needs a
         // stable handle to it now. The handle is empty until the plugin service
@@ -497,7 +498,11 @@ impl CoreContext {
         }
 
         let games = Arc::new(game_builder.build());
-        warnings.extend(games.recover_at_startup(&paths));
+        // The packages' own crash recovery (game-registry `recover_at_startup`) does NOT run
+        // here: it is part of the one startup recovery pass every adapter calls once the context
+        // exists, `startup_recovery::run_at_startup` (MASTER_SPEC §32.11). The plugin-install
+        // recovery above is the one exception: it must finish before the plugin records are
+        // read to build this registry, so it stays inside construction.
 
         // 3. Verify the cached registry's Ed25519 signature before anything
         //    reads it. Download-time verification only covers transit; the

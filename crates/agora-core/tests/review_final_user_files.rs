@@ -215,6 +215,7 @@ fn bug_crash_between_overwrite_and_journal_loses_the_original_file() {
         processes: vec![],
         starting_launcher: None,
         launch_id: None,
+        spawning: false,
         files: vec![
             JournaledFile {
                 real_path: h.plugins(),
@@ -227,6 +228,11 @@ fn bug_crash_between_overwrite_and_journal_loses_the_original_file() {
                 swapped: false,
                 state: None,
                 restored: false,
+                // The production writer records where the real path resolves (the file may be
+                // absent at swap time; its resolved folder plus the name is what it records).
+                real_resolved_path: std::fs::canonicalize(h.plugins().parent().unwrap())
+                    .ok()
+                    .map(|p| p.join(h.plugins().file_name().unwrap())),
             },
             JournaledFile {
                 real_path: h.ini(),
@@ -239,6 +245,9 @@ fn bug_crash_between_overwrite_and_journal_loses_the_original_file() {
                 swapped: false,
                 state: None,
                 restored: false,
+                real_resolved_path: std::fs::canonicalize(h.ini().parent().unwrap())
+                    .ok()
+                    .map(|p| p.join(h.ini().file_name().unwrap())),
             },
         ],
     };

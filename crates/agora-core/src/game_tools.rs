@@ -2040,8 +2040,10 @@ fn refuse_during_session(
     }
 }
 
-/// Restore the game's user files once a run is over, if a session was swapped in for it.
-fn release_session(
+/// Restore the game's user files once a run is over, if a session was swapped in for it. Every
+/// tool run holds the game/store user-files lock for its whole operation (the lock manager is
+/// not re-entrant), so the run releases through this locked variant.
+fn release_session_locked(
     ctx: &Ctx,
     definition: &GameDefinition,
     store: &StoreId,
@@ -2052,8 +2054,8 @@ fn release_session(
     }
     // This run swapped the files in, so it is the launch that may give up its own start before
     // restoring. A restore from another caller refuses while a launch is starting.
-    game_user_files::finish_starting_launch(ctx, &definition.id, store, launch_id)?;
-    match game_user_files::restore(ctx, definition, store) {
+    game_user_files::finish_starting_launch_locked(ctx, &definition.id, store, launch_id)?;
+    match game_user_files::restore_locked(ctx, definition, store) {
         Ok(_) | Err(UserFilesError::NoSession { .. }) => Ok(()),
         Err(e) => Err(e.into()),
     }
@@ -3515,16 +3517,25 @@ fn run_under_vfs(
         log: log.clone(),
     });
 
-    let swapped = match game_user_files::swap_in(ctx, instance_id, definition, &store, &game_dir) {
-        Ok(swapped) => swapped,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(e.into());
-        }
-    };
+    // The game/store user-files lock keys this whole operation, exactly as in `run_by_swap`: the
+    // session journal lives under it, and every recovery takes it with no wait. Holding it from
+    // before the journal is written until the session is released means a recovery in another
+    // process can never act on a live run.
+    let _run_lock = ctx.lock_manager.acquire(
+        crate::lock_manager::LockResource::GameUserFiles(definition.id.clone(), store.clone()),
+        "tool-run",
+    )?;
+    let swapped =
+        match game_user_files::swap_in_locked(ctx, instance_id, definition, &store, &game_dir) {
+            Ok(swapped) => swapped,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(e.into());
+            }
+        };
     if let Some(configured) = configured {
         if let Err(e) = configured.move_aside() {
-            release_session(ctx, definition, &store, &swapped.launch_id)?;
+            release_session_locked(ctx, definition, &store, &swapped.launch_id)?;
             let _ = std::fs::remove_dir_all(&staging);
             return Err(e);
         }
@@ -3534,10 +3545,26 @@ fn run_under_vfs(
     let log_from = game_launch::log_len(&log);
     // The real install is watched from just before the tool starts until it exits (MASTER_SPEC §26.9).
     let watch = InstallWatch::start(&base.source_location);
+    // Before the spawn, the journal says a tool is spawning: if Agora dies in the window between
+    // the spawn and recording the process, recovery can see that and needs a hand instead of
+    // restoring under a tool no record can see.
+    game_tool_swap::run_hook(ctx, None, game_tool_swap::RunHookPoint::BeforeSpawningMark);
+    // Fail closed: without the durable spawning mark, a crash in the spawn window would leave a
+    // live tool that no record can see, and recovery could restore under it. Undo what this run
+    // set up and do not launch.
+    if let Err(e) = game_user_files::mark_spawning_locked(ctx, &definition.id, &store) {
+        let _ = watch.finish();
+        let _ = release_session_locked(ctx, definition, &store, &swapped.launch_id);
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(ToolError::Other(format!(
+            "the spawning state could not be recorded ({e}), so the tool was not launched and \
+             this run was undone"
+        )));
+    }
     let mut launched = match launcher.launch_capturing(&prepared) {
         Ok(launched) => launched,
         Err(e) => {
-            release_session(ctx, definition, &store, &swapped.launch_id)?;
+            release_session_locked(ctx, definition, &store, &swapped.launch_id)?;
             let _ = std::fs::remove_dir_all(&staging);
             return Err(match e {
                 LaunchError::VfsUnavailable { reason } => ToolError::VfsUnavailable {
@@ -3550,7 +3577,12 @@ fn run_under_vfs(
             });
         }
     };
-    let _ = game_user_files::record_process(ctx, &definition.id, &store, launched.identity.clone());
+    let _ = game_user_files::record_process_locked(
+        ctx,
+        &definition.id,
+        &store,
+        launched.identity.clone(),
+    );
 
     let exit = wait_for_tree(&game_dir, &mut launched, cancel);
     let installed = watch.finish();
@@ -3575,7 +3607,7 @@ fn run_under_vfs(
         });
     // The game's files go back whatever became of the output, and a failure to settle is reported
     // only after that.
-    let released = release_session(ctx, definition, &store, &swapped.launch_id);
+    let released = release_session_locked(ctx, definition, &store, &swapped.launch_id);
     let (settled, unchanged_dropped) = settled?;
     released?;
 
@@ -3670,28 +3702,64 @@ fn run_from_links(
     let mut prepared = PreparedLaunch::undeployed(resolved, Vec::new(), None);
     prepared.deployment = Some(DeployMode::Links);
 
-    let swapped = game_user_files::swap_in(ctx, instance_id, definition, &store, &game_dir)?;
+    // The game/store user-files lock keys this whole operation, exactly as in `run_by_swap`: the
+    // session journal lives under it, and every recovery takes it with no wait. Holding it from
+    // before the journal is written, through the tool's run and the post-exit capture, until the
+    // session is released means a recovery in another process can never act on a live run.
+    let _run_lock = ctx.lock_manager.acquire(
+        crate::lock_manager::LockResource::GameUserFiles(definition.id.clone(), store.clone()),
+        "tool-run",
+    )?;
+    let swapped = game_user_files::swap_in_locked(ctx, instance_id, definition, &store, &game_dir)?;
     if let Some(configured) = configured {
         if let Err(e) = configured.move_aside() {
             let _ = discard_deployment(&deployment_dir, instance_id);
-            release_session(ctx, definition, &store, &swapped.launch_id)?;
+            release_session_locked(ctx, definition, &store, &swapped.launch_id)?;
             return Err(e);
         }
     }
 
     // The real install is watched from just before the tool starts until it exits (MASTER_SPEC §26.9).
     let watch = InstallWatch::start(&base.source_location);
+    // Before the spawn, the journal says a tool is spawning: if Agora dies in the window between
+    // the spawn and recording the process, recovery can see that and needs a hand instead of
+    // restoring under a tool no record can see.
+    game_tool_swap::run_hook(ctx, None, game_tool_swap::RunHookPoint::BeforeSpawningMark);
+    // Fail closed: without the durable spawning mark, a crash in the spawn window would leave a
+    // live tool that no record can see, and recovery could restore under it. Undo what this run
+    // set up (the links deployment and the user-files session) and do not launch.
+    if let Err(e) = game_user_files::mark_spawning_locked(ctx, &definition.id, &store) {
+        let _ = watch.finish();
+        let _ = discard_deployment(&deployment_dir, instance_id);
+        let _ = release_session_locked(ctx, definition, &store, &swapped.launch_id);
+        return Err(ToolError::Other(format!(
+            "the spawning state could not be recorded ({e}), so the tool was not launched and \
+             this run was undone"
+        )));
+    }
     let mut launched = match launcher.launch_capturing(&prepared) {
         Ok(launched) => launched,
         Err(e) => {
-            release_session(ctx, definition, &store, &swapped.launch_id)?;
+            release_session_locked(ctx, definition, &store, &swapped.launch_id)?;
             return Err(ToolError::Launch(e));
         }
     };
-    let _ = game_user_files::record_process(ctx, &definition.id, &store, launched.identity.clone());
+    let _ = game_user_files::record_process_locked(
+        ctx,
+        &definition.id,
+        &store,
+        launched.identity.clone(),
+    );
 
     let exit = wait_for_tree(&game_dir, &mut launched, cancel);
     let installed = watch.finish();
+    // The tool has exited and the post-exit capture window is open. A recovery running right now
+    // must leave the operation alone (the lock above is held).
+    game_tool_swap::run_hook(
+        ctx,
+        None,
+        game_tool_swap::RunHookPoint::LinksPostExitCapture,
+    );
     let settled = capture_from_links(
         ctx,
         instance_id,
@@ -3709,7 +3777,7 @@ fn run_from_links(
     // The farm holds whatever the tool wrote. It goes whatever became of the output, and without a
     // harvest: the writes were captured above, and the next launch deploys the promoted output.
     let forgotten = discard_deployment(&deployment_dir, instance_id);
-    let released = release_session(ctx, definition, &store, &swapped.launch_id);
+    let released = release_session_locked(ctx, definition, &store, &swapped.launch_id);
     let settled = settled?;
     forgotten?;
     released?;
@@ -3771,9 +3839,20 @@ fn run_by_swap(
     game_tool_swap::preflight(&install, &real_data, &aside, &copy.space_need())?;
     let fingerprint = input_fingerprint_scoped(ctx, instance_id, definition, tool, scope_item)?;
 
+    // The game/store user-files lock keys this whole operation: both journals the run writes (the
+    // user-files session and this swap journal) live under it, and every recovery — the startup
+    // pass in another Agora process, the explicit restore — takes the same lock with no wait.
+    // Holding it from before the first journal write until the swap journal is cleared means a
+    // recovery can never act on a live run: it cannot take the lock, so it skips and reports.
+    let _swap_lock = ctx.lock_manager.acquire(
+        crate::lock_manager::LockResource::GameUserFiles(definition.id.clone(), store.clone()),
+        "tool-swap-run",
+    )?;
+
     // The user files go in before the real Data moves, so the swap journal is the only swap in progress
-    // for this game when the recovery check runs.
-    let swapped = game_user_files::swap_in(ctx, instance_id, definition, &store, &install)?;
+    // for this game when the recovery check runs. The lock is already held, so this does not take
+    // it again.
+    let swapped = game_user_files::swap_in_locked(ctx, instance_id, definition, &store, &install)?;
 
     let mut journal = SwapJournal {
         version: game_tool_swap::JOURNAL_VERSION,
@@ -3790,10 +3869,11 @@ fn run_by_swap(
         copy_dir: copy.copy_dir.clone(),
         swap_dir: copy.location.swap_dir.clone(),
         processes: Vec::new(),
+        spawning: false,
     };
     // The journal is written, and made durable, before the copy or the real Data is touched.
     if let Err(e) = game_tool_swap::write_journal(ctx, &journal) {
-        let _ = release_session(ctx, definition, &store, &swapped.launch_id);
+        let _ = release_session_locked(ctx, definition, &store, &swapped.launch_id);
         return Err(e.into());
     }
 
@@ -3820,6 +3900,13 @@ fn run_by_swap(
             e.into(),
         ));
     }
+    // The copy is in place of the real Data and the journal is durable; the tool has not spawned
+    // yet. A recovery running right now must leave the operation alone (the lock above is held).
+    game_tool_swap::run_hook(
+        ctx,
+        Some(&journal),
+        game_tool_swap::RunHookPoint::BeforeSpawn,
+    );
     if let Some(configured) = configured {
         if let Err(e) = configured.move_aside() {
             return Err(put_back_after(
@@ -3859,6 +3946,44 @@ fn run_by_swap(
     prepared_launch.deployment = Some(DeployMode::Copies);
 
     let watch = InstallWatch::start(&install);
+    // Before the spawn, the journal durably says a tool is spawning: if Agora dies in the window
+    // between the spawn and recording the process, a recovery can see that and needs a hand
+    // instead of restoring real Data under a tool no record can see.
+    game_tool_swap::run_hook(
+        ctx,
+        Some(&journal),
+        game_tool_swap::RunHookPoint::BeforeSpawningMark,
+    );
+    // Fail closed: without the durable spawning mark, a crash in the spawn window would leave a
+    // live tool that no record can see, and recovery could restore real Data under it. Put the
+    // swap back and do not launch.
+    journal.spawning = true;
+    if let Err(e) = game_tool_swap::write_journal(ctx, &journal) {
+        return Err(put_back_after(
+            ctx,
+            definition,
+            &store,
+            &swapped.launch_id,
+            &journal,
+            ToolError::Other(format!(
+                "the spawning state could not be recorded in the swap journal ({e}), so the \
+                 tool was not launched"
+            )),
+        ));
+    }
+    if let Err(e) = game_user_files::mark_spawning_locked(ctx, &definition.id, &store) {
+        return Err(put_back_after(
+            ctx,
+            definition,
+            &store,
+            &swapped.launch_id,
+            &journal,
+            ToolError::Other(format!(
+                "the spawning state could not be recorded in the user-files journal ({e}), so \
+                 the tool was not launched"
+            )),
+        ));
+    }
     let mut launched = match launcher.launch_capturing(&prepared_launch) {
         Ok(launched) => launched,
         Err(e) => {
@@ -3873,20 +3998,42 @@ fn run_by_swap(
             ));
         }
     };
-    let _ = game_user_files::record_process(ctx, &definition.id, &store, launched.identity.clone());
+    // The tool is spawned but not yet recorded in the journal: the window in which a dead Agora
+    // leaves a live tool unrecorded.
+    game_tool_swap::run_hook(
+        ctx,
+        Some(&journal),
+        game_tool_swap::RunHookPoint::AfterSpawnBeforeRecord,
+    );
+    let _ = game_user_files::record_process_locked(
+        ctx,
+        &definition.id,
+        &store,
+        launched.identity.clone(),
+    );
 
     // Record the tool's identity in the swap journal too, so recovery can tell a run is still going
-    // when the tool runs from outside the install folder.
+    // when the tool runs from outside the install folder. The spawn is recorded, so the spawning
+    // window is over.
     journal.processes.push(launched.identity.clone());
+    journal.spawning = false;
     let _ = game_tool_swap::write_journal(ctx, &journal);
 
     let exit = wait_for_tree(&install, &mut launched, cancel);
     let installed = watch.finish();
 
+    // The tool has exited and the post-exit capture window is open (disengage, capture, finish,
+    // journal clear). A recovery running right now must leave the operation alone too.
+    game_tool_swap::run_hook(
+        ctx,
+        Some(&journal),
+        game_tool_swap::RunHookPoint::PostExitCapture,
+    );
+
     // Put the real Data back before capturing: the copy is moved home, then the aside comes back. If that
     // fails, the copy and the journal are kept for the next check.
     if let Err(e) = game_tool_swap::disengage(&journal) {
-        let _ = release_session(ctx, definition, &store, &swapped.launch_id);
+        let _ = release_session_locked(ctx, definition, &store, &swapped.launch_id);
         return Err(e.into());
     }
 
@@ -3905,7 +4052,7 @@ fn run_by_swap(
         output_dir,
     );
     let finished = game_tool_copy::finish_copy(ctx, definition, &journal);
-    let released = release_session(ctx, definition, &store, &swapped.launch_id);
+    let released = release_session_locked(ctx, definition, &store, &swapped.launch_id);
     let refreshed = finished?;
     game_tool_swap::remove_journal(ctx, &journal)?;
     released?;
@@ -4041,7 +4188,7 @@ fn abandon_swap(
         return e.into();
     }
     let _ = game_tool_swap::remove_journal(ctx, journal);
-    let _ = release_session(ctx, definition, store, launch_id);
+    let _ = release_session_locked(ctx, definition, store, launch_id);
     error
 }
 
@@ -4057,18 +4204,18 @@ fn put_back_after(
     error: ToolError,
 ) -> ToolError {
     if let Err(e) = game_tool_swap::disengage(journal) {
-        let _ = release_session(ctx, definition, store, launch_id);
+        let _ = release_session_locked(ctx, definition, store, launch_id);
         return e.into();
     }
     if let Err(e) = game_tool_copy::finish_copy(ctx, definition, journal) {
-        let _ = release_session(ctx, definition, store, launch_id);
+        let _ = release_session_locked(ctx, definition, store, launch_id);
         return e.into();
     }
     if let Err(e) = game_tool_swap::remove_journal(ctx, journal) {
-        let _ = release_session(ctx, definition, store, launch_id);
+        let _ = release_session_locked(ctx, definition, store, launch_id);
         return e.into();
     }
-    let _ = release_session(ctx, definition, store, launch_id);
+    let _ = release_session_locked(ctx, definition, store, launch_id);
     error
 }
 

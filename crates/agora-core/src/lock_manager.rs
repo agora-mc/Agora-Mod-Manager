@@ -341,8 +341,14 @@ pub enum LockResource {
     ContentStore,
     /// Exclusive access for per-user game files journaled swap.
     GameUserFiles(GameId, StoreId),
+    /// Exclusive access while a plugin's files are swapped (install, update, rollback), so a
+    /// starting process's crash recovery cannot undo a live install.
+    PluginInstall,
     /// Exclusive access to building a base by id (the rename into place through its record).
     Base(String),
+    /// Exclusive access to opening, checking and (if needed) restoring the local state database.
+    /// Two processes starting at once must not both quarantine or replace the same file.
+    LocalStateDatabase,
 }
 
 impl LockResource {
@@ -379,6 +385,8 @@ impl LockResource {
                     store.as_str()
                 ))
             }
+            LockResource::PluginInstall => Ok("plugin-install".into()),
+            LockResource::LocalStateDatabase => Ok("local-state-db".into()),
             LockResource::Base(id) => {
                 app_paths::validate_path_component(id)?;
                 Ok(format!("base-{id}"))

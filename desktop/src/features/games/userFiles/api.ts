@@ -5,6 +5,11 @@
 
 import { invoke } from '@tauri-apps/api/core';
 
+/** `games_user_files_restore` rejects with this code for a both-changed conflict. */
+export const USER_FILES_CONFLICT_CODE = 'user_files_conflict';
+/** The agora-core code the adapter attaches for the same conflict. */
+export const USER_FILES_CONFLICT_CORE_CODE = 'ERR_USER_FILES_CONFLICT';
+
 export interface SessionFile {
   realPath: string;
   /** The game's own file is currently replaced by Agora's copy. */
@@ -51,9 +56,9 @@ export async function userFilesStatus(gameId: string): Promise<UserFilesStatus> 
   return reply as unknown as UserFilesStatus;
 }
 
-/** Put one session's files back from Agora's backup. */
-export async function restoreUserFiles(gameId: string, store: string): Promise<RestoreResult> {
-  const reply: unknown = await invoke<unknown>('games_user_files_restore', { gameId, store });
+/** Put one session's files back from Agora's backup. `force` overrides a both-changed conflict (the conflict copy is still written first). */
+export async function restoreUserFiles(gameId: string, store: string, force = false): Promise<RestoreResult> {
+  const reply: unknown = await invoke<unknown>('games_user_files_restore', { gameId, store, force });
   if (!isRecord(reply) || !Array.isArray(reply.files)) {
     throw new Error('games_user_files_restore did not return a restore report.');
   }
