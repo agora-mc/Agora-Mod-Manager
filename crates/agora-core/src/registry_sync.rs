@@ -614,9 +614,9 @@ fn quarantine_aside(path: &Path, kind: &str) -> std::io::Result<()> {
 struct RememberedTrust {
     keys: Vec<RegistryKey>,
     revocations: Vec<KeyRevocation>,
-    /// An unterminated final line that did not parse or authenticate. The
-    /// writer removes it before appending.
-    dropped_tail: bool,
+    /// The log exactly as it was read, so a writer can refuse to build on a
+    /// log that changed underneath it.
+    log_text: String,
 }
 
 fn parse_role(raw: &str) -> Option<RegistryKeyRole> {
@@ -653,8 +653,135 @@ fn trust_state_error(path: &Path, what: &str) -> LauncherError {
 /// A log written before records existed is one implicit record.
 #[derive(Default)]
 struct LogRecord {
-    certificates: Vec<(KeyCertificate, bool)>,
-    revocations: Vec<(KeyRevocation, bool)>,
+    certificates: Vec<KeyCertificate>,
+    revocations: Vec<KeyRevocation>,
+}
+
+enum LogStatement {
+    Certificate(KeyCertificate),
+    Revocation(KeyRevocation),
+}
+
+/// One `v1 key` / `v1 revoke` line, or `None` when the line is not one.
+fn parse_statement(line: &str) -> Option<LogStatement> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    match fields.as_slice() {
+        ["v1", "key", id, public_key, role, signed_by, signature] => {
+            Some(LogStatement::Certificate(KeyCertificate {
+                key_id: (*id).to_string(),
+                public_key: (*public_key).to_string(),
+                role: parse_role(role)?,
+                signed_by: (*signed_by).to_string(),
+                signature: (*signature).to_string(),
+            }))
+        }
+        ["v1", "revoke", revoked_id, signed_by, signature] => {
+            Some(LogStatement::Revocation(KeyRevocation {
+                revoked_key_id: (*revoked_id).to_string(),
+                signed_by: (*signed_by).to_string(),
+                signature: (*signature).to_string(),
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// Split the log into records. The log is only ever replaced whole (see
+/// [`remember_bundle_trust`]), so it is always a sequence of complete records:
+///
+/// ```text
+/// v1 record <n>      followed by exactly n statement lines
+/// ```
+///
+/// Lines before the first `v1 record` are a log from before records existed and
+/// form one implicit record (other junk there is ignored, as it always was).
+/// Anything else, including a missing final newline or a record that is cut
+/// short, is damage, never a smaller record.
+fn parse_log(text: &str, path: &Path) -> LauncherResult<Vec<LogRecord>> {
+    if !text.is_empty() && !text.ends_with('\n') {
+        return Err(trust_state_error(
+            path,
+            "ends in the middle of a line, so it is damaged",
+        ));
+    }
+    let mut records: Vec<LogRecord> = vec![LogRecord::default()];
+    let mut seen_marker = false;
+    let mut remaining = 0usize;
+    for (index, line) in text.lines().enumerate() {
+        let number = index + 1;
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if remaining > 0 {
+            match parse_statement(line) {
+                Some(LogStatement::Certificate(certificate)) => records
+                    .last_mut()
+                    .expect("there is always a record")
+                    .certificates
+                    .push(certificate),
+                Some(LogStatement::Revocation(revocation)) => records
+                    .last_mut()
+                    .expect("there is always a record")
+                    .revocations
+                    .push(revocation),
+                None => {
+                    return Err(trust_state_error(
+                        path,
+                        &format!("has a record cut short before line {number}"),
+                    ))
+                }
+            }
+            remaining -= 1;
+            continue;
+        }
+        match fields.as_slice() {
+            ["v1", "record", count] => {
+                let count = count.parse::<usize>().ok().filter(|count| *count > 0);
+                let Some(count) = count else {
+                    return Err(trust_state_error(
+                        path,
+                        &format!("has a record header it cannot read on line {number}"),
+                    ));
+                };
+                seen_marker = true;
+                remaining = count;
+                records.push(LogRecord::default());
+            }
+            ["v1", "record", ..] => {
+                return Err(trust_state_error(
+                    path,
+                    &format!("has a record header it cannot read on line {number}"),
+                ))
+            }
+            ["v1", "key" | "revoke", ..] if !seen_marker => match parse_statement(line) {
+                Some(LogStatement::Certificate(certificate)) => {
+                    records[0].certificates.push(certificate)
+                }
+                Some(LogStatement::Revocation(revocation)) => {
+                    records[0].revocations.push(revocation)
+                }
+                None => {
+                    return Err(trust_state_error(
+                        path,
+                        &format!("has a malformed statement on line {number}"),
+                    ))
+                }
+            },
+            // Junk or another version before any record: ignored, as before.
+            _ if !seen_marker => {}
+            _ => {
+                return Err(trust_state_error(
+                    path,
+                    &format!("has a line outside any record on line {number}"),
+                ))
+            }
+        }
+    }
+    if remaining > 0 {
+        return Err(trust_state_error(
+            path,
+            "ends with a record cut short, so it is damaged",
+        ));
+    }
+    Ok(records)
 }
 
 /// Read and authenticate the trust log.
@@ -669,9 +796,8 @@ struct LogRecord {
 /// `base` keys the caller passes, which must never be an already merged set.
 ///
 /// A missing or empty file is "nothing remembered yet". A file that cannot be
-/// read, or a statement that does not authenticate, is an error: only a torn
-/// final line (no trailing newline) that does not parse or authenticate is
-/// dropped, and reported so the writer can remove it before appending.
+/// read, is damaged, or holds a statement that does not authenticate is an
+/// error.
 fn load_remembered_trust(
     app_data_dir: &Path,
     base: &RegistryTrust,
@@ -693,55 +819,7 @@ fn load_remembered_trust(
             ))
         }
     };
-
-    let mut dropped_tail = false;
-    let mut records: Vec<LogRecord> = vec![LogRecord::default()];
-    let unterminated = !text.ends_with('\n');
-    let line_count = text.lines().count();
-    for (index, line) in text.lines().enumerate() {
-        let tail = unterminated && index + 1 == line_count;
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let current = records.last_mut().expect("there is always a record");
-        match fields.as_slice() {
-            ["v1", "record"] => records.push(LogRecord::default()),
-            ["v1", "key", id, public_key, role, signed_by, signature] => match parse_role(role) {
-                Some(role) => current.certificates.push((
-                    KeyCertificate {
-                        key_id: (*id).to_string(),
-                        public_key: (*public_key).to_string(),
-                        role,
-                        signed_by: (*signed_by).to_string(),
-                        signature: (*signature).to_string(),
-                    },
-                    tail,
-                )),
-                None if tail => dropped_tail = true,
-                None => {
-                    return Err(trust_state_error(
-                        &path,
-                        &format!("has a key line with an unknown role on line {}", index + 1),
-                    ))
-                }
-            },
-            ["v1", "revoke", revoked_id, signed_by, signature] => current.revocations.push((
-                KeyRevocation {
-                    revoked_key_id: (*revoked_id).to_string(),
-                    signed_by: (*signed_by).to_string(),
-                    signature: (*signature).to_string(),
-                },
-                tail,
-            )),
-            ["v1", "key" | "revoke", ..] if !tail => {
-                return Err(trust_state_error(
-                    &path,
-                    &format!("has a malformed statement on line {}", index + 1),
-                ))
-            }
-            // A torn final line is reported; another version or junk is ignored.
-            _ if tail && !line.trim().is_empty() => dropped_tail = true,
-            _ => {}
-        }
-    }
+    let records = parse_log(&text, &path)?;
 
     let mut all_certificates: Vec<KeyCertificate> = Vec::new();
     let mut revocations: Vec<KeyRevocation> = Vec::new();
@@ -749,21 +827,14 @@ fn load_remembered_trust(
     let mut keys: Vec<RegistryKey> = Vec::new();
     let mut standing = base.clone();
     for record in &records {
-        let certificates: Vec<KeyCertificate> = record
-            .certificates
-            .iter()
-            .map(|(statement, _)| statement.clone())
-            .collect();
-        let record_revocations: Vec<KeyRevocation> = record
-            .revocations
-            .iter()
-            .map(|(statement, _)| statement.clone())
-            .collect();
-        let authenticated =
-            registry_bundle::authenticate_statements(&standing, &certificates, &record_revocations);
+        let authenticated = registry_bundle::authenticate_statements(
+            &standing,
+            &record.certificates,
+            &record.revocations,
+        );
         let standing_revoked: BTreeSet<String> = standing.revoked_ids().into_iter().collect();
 
-        for (certificate, tail) in &record.certificates {
+        for certificate in &record.certificates {
             let explained = authenticated.certificates.contains(certificate)
                 || standing_revoked.contains(&certificate.key_id)
                 || standing
@@ -771,10 +842,6 @@ fn load_remembered_trust(
                     .iter()
                     .any(|key| key.id == certificate.key_id);
             if !explained {
-                if *tail {
-                    dropped_tail = true;
-                    continue;
-                }
                 return Err(trust_state_error(
                     &path,
                     &format!(
@@ -784,14 +851,10 @@ fn load_remembered_trust(
                 ));
             }
         }
-        for (revocation, tail) in &record.revocations {
+        for revocation in &record.revocations {
             let explained = authenticated.revocations.contains(revocation)
                 || standing_revoked.contains(&revocation.revoked_key_id);
             if !explained {
-                if *tail {
-                    dropped_tail = true;
-                    continue;
-                }
                 return Err(trust_state_error(
                     &path,
                     &format!(
@@ -822,7 +885,7 @@ fn load_remembered_trust(
     Ok(RememberedTrust {
         keys,
         revocations,
-        dropped_tail,
+        log_text: text,
     })
 }
 
@@ -1018,16 +1081,44 @@ fn rollback_baseline(
     })
 }
 
-/// Persist the keys a verified bundle introduced and the revocations a recovery
-/// key signed. Only complete lines are appended, and the file is never
-/// rewritten, so a crash cannot lose an earlier revocation. Duplicate lines are
-/// harmless. A write or flush error can leave some complete, verified entries
-/// behind and lose only the later ones: that is acceptable because every line
-/// is independently signed and verified, so a partial append never invents a
-/// trust fact and a later install can append the missing lines again.
+/// Test-only failure injection for the trust log write, keyed by data root.
+#[cfg(test)]
+fn trust_write_failures() -> &'static Mutex<Vec<PathBuf>> {
+    static FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+struct TrustWriteFailureGuard(PathBuf);
+
+#[cfg(test)]
+impl Drop for TrustWriteFailureGuard {
+    fn drop(&mut self) {
+        if let Ok(mut dirs) = trust_write_failures().lock() {
+            dirs.retain(|dir| dir != &self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+fn fail_trust_writes(app_data_dir: &Path) -> TrustWriteFailureGuard {
+    trust_write_failures()
+        .lock()
+        .unwrap()
+        .push(app_data_dir.to_path_buf());
+    TrustWriteFailureGuard(app_data_dir.to_path_buf())
+}
+
+/// Remember what a verified bundle taught, as one record.
+///
+/// The whole log is replaced atomically (temp file, fsync, rename), so a record
+/// is either entirely present or entirely absent and no prefix of a record can
+/// ever change trust. `remembered` is the log as this operation read it; if the
+/// file has changed since, the write is refused rather than built on a stale
+/// view. Returns whether anything was written.
 fn remember_bundle_trust(
     app_data_dir: &Path,
-    base: &RegistryTrust,
+    remembered_log: &str,
     verified: &VerifiedBundle,
 ) -> LauncherResult<bool> {
     // Expiry is not a reason to skip a revocation: a retired key stays retired
@@ -1037,7 +1128,7 @@ fn remember_bundle_trust(
             code: "ERR_REGISTRY_TRUST_STATE".into(),
             message: "Could not resolve the catalog trust state path.".into(),
         })?;
-    let mut existing = match std::fs::read_to_string(&path) {
+    let on_disk = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => {
@@ -1047,72 +1138,60 @@ fn remember_bundle_trust(
             ))
         }
     };
-    // A torn final fragment must not survive an append: the next line would
-    // turn it into a fatal interior line. Remove it first (atomically). A final
-    // line that is complete and authentic only lacks its newline.
-    let mut separator = "";
-    if !existing.is_empty() && !existing.ends_with('\n') {
-        if load_remembered_trust(app_data_dir, base)?.dropped_tail {
-            let keep = existing.rfind('\n').map_or(0, |index| index + 1);
-            existing.truncate(keep);
-            write_atomic(&path, existing.as_bytes()).map_err(|error| LauncherError::Generic {
-                code: "ERR_REGISTRY_TRUST_STATE".into(),
-                message: format!("Could not repair the catalog trust state: {error}."),
-            })?;
-        } else {
-            separator = "\n";
-        }
+    if on_disk != remembered_log {
+        return Err(trust_state_error(
+            &path,
+            "changed while the catalog was being installed",
+        ));
     }
-    let mut lines = String::new();
+    let mut statements: Vec<String> = Vec::new();
     for certificate in &verified.newly_trusted {
         let line = format!(
-            "v1 key {} {} {} {} {}\n",
+            "v1 key {} {} {} {} {}",
             certificate.key_id,
             certificate.public_key,
             certificate.role.as_str(),
             certificate.signed_by,
             certificate.signature
         );
-        if existing.lines().any(|known| known == line.trim_end()) {
-            continue;
+        if !remembered_log.lines().any(|known| known == line) {
+            statements.push(line);
         }
-        lines.push_str(&line);
     }
     for revocation in &verified.accepted_revocations {
         let line = format!(
-            "v1 revoke {} {} {}\n",
+            "v1 revoke {} {} {}",
             revocation.revoked_key_id, revocation.signed_by, revocation.signature
         );
-        if existing.lines().any(|known| known == line.trim_end()) {
-            continue;
+        if !remembered_log.lines().any(|known| known == line) {
+            statements.push(line);
         }
-        lines.push_str(&line);
     }
-    if lines.is_empty() {
+    if statements.is_empty() {
         return Ok(false);
     }
-    // One record per verified bundle: replay judges its statements against the
-    // trust standing before it.
-    let lines = format!("{separator}v1 record\n{lines}");
-    if existing.is_empty() {
-        std::fs::create_dir_all(path.parent().unwrap_or(Path::new("."))).ok();
+    let mut text = remembered_log.to_string();
+    text.push_str(&format!("v1 record {}\n", statements.len()));
+    for line in &statements {
+        text.push_str(line);
+        text.push('\n');
     }
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|error| LauncherError::Generic {
-            code: "ERR_REGISTRY_TRUST_STATE".into(),
-            message: format!("Could not write the catalog trust state: {error}."),
+    #[cfg(test)]
+    if trust_write_failures()
+        .lock()
+        .map(|dirs| dirs.iter().any(|dir| dir == app_data_dir))
+        .unwrap_or(false)
+    {
+        return Err(trust_state_error(&path, "could not be saved (injected)"));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            trust_state_error(&path, &format!("could not be created ({error})"))
         })?;
-    file.write_all(lines.as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(|error| LauncherError::Generic {
-            code: "ERR_REGISTRY_TRUST_STATE".into(),
-            message: format!("Could not save the catalog trust state: {error}."),
-        })
-        .map(|()| true)
+    }
+    write_atomic(&path, text.as_bytes())
+        .map_err(|error| trust_state_error(&path, &format!("could not be saved ({error})")))?;
+    Ok(true)
 }
 
 /// One bundle header that verified in this process, with the file identity it
@@ -1557,7 +1636,8 @@ fn install_bundle_bytes(
     ensure_floor_baseline(app_data_dir, trust)?;
     // Signed and verified trust facts only ever add, so writing them ahead of
     // the swap is always safe and no revocation can be lost by a later failure.
-    let trust_written = remember_bundle_trust(app_data_dir, trust, &payload)?;
+    let log_text = load_remembered_trust(app_data_dir, trust)?.log_text;
+    let trust_written = remember_bundle_trust(app_data_dir, &log_text, &payload)?;
 
     // Keep the previous copy only when the current file looks like a bundle.
     // A corrupt current must not overwrite a good previous one.
@@ -3437,13 +3517,9 @@ mod tests {
             .revocations
             .push(revocation(&recovery, &stolen));
         let candidate = signed_bundle(&replacement, &candidate_header, &payload);
-        // A readable but unwritable trust file isolates the append failure from
-        // the fail-closed readability check.
+        // Fail the log write itself (not the read), identically on every OS.
         let trust_path = paths::registry_trust_state_path(dir.path()).unwrap();
-        fs::write(&trust_path, b"").unwrap();
-        let mut permissions = fs::metadata(&trust_path).unwrap().permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(&trust_path, permissions).unwrap();
+        let _failing = fail_trust_writes(dir.path());
 
         let error = install_bundle_bytes_checked(dir.path(), &candidate, &trust, "candidate")
             .expect_err("a failed trust append must refuse the install");
@@ -3455,6 +3531,7 @@ mod tests {
         assert!(!paths::registry_bundle_previous_path(dir.path())
             .unwrap()
             .exists());
+        assert!(!trust_path.exists(), "a failed write leaves no log behind");
     }
 
     /// Recovery cannot read the remembered trust state: a backup signed by a
@@ -5094,7 +5171,7 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         fs::write(
             paths::registry_trust_state_path(dir.path()).unwrap(),
             format!(
-                "v1 record\n{}{}v1 record\n{}",
+                "v1 record 2\n{}{}v1 record 1\n{}",
                 key_line(&cert),
                 revoke_line(&retire),
                 revoke_line(&late)
@@ -5109,7 +5186,7 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         fs::write(
             paths::registry_trust_state_path(dir.path()).unwrap(),
             format!(
-                "v1 record\n{}{}{}",
+                "v1 record 3\n{}{}{}",
                 key_line(&cert),
                 revoke_line(&retire),
                 revoke_line(&late)
@@ -5182,10 +5259,11 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         .expect("a normal install after a cascade must not be blocked");
     }
 
-    /// A torn final fragment is removed before the next record is appended, so
-    /// it cannot become a fatal interior line.
+    /// A log that stops in the middle of a line, or in the middle of a record,
+    /// is damage: it is never read as a smaller record, and an install refuses to
+    /// build on it. Removing the log is the explicit override.
     #[test]
-    fn a_torn_fragment_is_repaired_before_the_next_install_appends() {
+    fn a_log_cut_mid_line_or_mid_record_is_damage() {
         let dir = tempfile::TempDir::new().unwrap();
         let primary = test_key(169);
         let stolen = test_key(170);
@@ -5199,6 +5277,7 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         first
             .certificates
             .push(certificate(&recovery, &test_public(&first_new)));
+        first.revocations.push(revocation(&recovery, &stolen));
         install_bundle_bytes_checked(
             dir.path(),
             &signed_bundle(&primary, &first, &payload),
@@ -5207,10 +5286,71 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         )
         .unwrap();
         let trust_path = paths::registry_trust_state_path(dir.path()).unwrap();
-        let mut text = fs::read_to_string(&trust_path).unwrap();
-        text.push_str("v1 revoke abcdef01 abcdef");
-        fs::write(&trust_path, text).unwrap();
+        let intact = fs::read_to_string(&trust_path).unwrap();
         assert!(effective_trust(dir.path(), &trust).is_ok());
+
+        // Cut between two complete lines of the record: a prefix would trust the
+        // new key but lose the revocation of the stolen one.
+        let lines: Vec<&str> = intact.lines().collect();
+        assert!(lines.len() >= 3, "{intact}");
+        let cut_between_lines = format!("{}\n{}\n", lines[0], lines[1]);
+        // Cut in the middle of a line.
+        let cut_mid_line = &intact[..intact.len() - 5];
+        for damaged in [cut_between_lines.as_str(), cut_mid_line] {
+            fs::write(&trust_path, damaged).unwrap();
+            let error = effective_trust(dir.path(), &trust)
+                .expect_err("a cut record must be refused, not read as a smaller one");
+            assert_eq!(error.code(), "ERR_REGISTRY_TRUST_STATE");
+
+            let second_db = sample_db_with_built_at("2026-11-18T12:00:00+00:00");
+            let mut second = header_for(
+                &primary,
+                &second_db,
+                "2026-11-18T12:00:00+00:00",
+                "2099-01-01T00:00:00+00:00",
+            );
+            second
+                .certificates
+                .push(certificate(&recovery, &test_public(&second_new)));
+            let error = install_bundle_bytes_checked(
+                dir.path(),
+                &signed_bundle(&primary, &second, &second_db),
+                &trust,
+                "second",
+            )
+            .expect_err("an install must not build on a damaged log");
+            assert_eq!(error.code(), "ERR_REGISTRY_TRUST_STATE");
+        }
+
+        fs::remove_file(&trust_path).unwrap();
+        assert!(effective_trust(dir.path(), &trust).is_ok());
+    }
+
+    /// The log is replaced whole, so a failed write leaves the earlier log
+    /// byte for byte as it was.
+    #[test]
+    fn a_failed_log_write_leaves_the_earlier_log_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = test_key(176);
+        let stolen = test_key(177);
+        let recovery = test_key(178);
+        let first_new = test_key(179);
+        let second_new = test_key(180);
+        let trust = rotation_trust(&primary, &stolen, &recovery);
+        let payload = sample_db();
+        let mut first = fresh_header(&primary, &payload);
+        first
+            .certificates
+            .push(certificate(&recovery, &test_public(&first_new)));
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&primary, &first, &payload),
+            &trust,
+            "first",
+        )
+        .unwrap();
+        let trust_path = paths::registry_trust_state_path(dir.path()).unwrap();
+        let before = fs::read(&trust_path).unwrap();
 
         let second_db = sample_db_with_built_at("2026-11-18T12:00:00+00:00");
         let mut second = header_for(
@@ -5222,22 +5362,16 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         second
             .certificates
             .push(certificate(&recovery, &test_public(&second_new)));
-        install_bundle_bytes_checked(
+        let _failing = fail_trust_writes(dir.path());
+        let error = install_bundle_bytes_checked(
             dir.path(),
             &signed_bundle(&primary, &second, &second_db),
             &trust,
             "second",
         )
-        .unwrap();
-        let reloaded = effective_trust(dir.path(), &trust)
-            .expect("the fragment must not become a fatal interior line");
-        assert!(reloaded
-            .keys()
-            .iter()
-            .any(|key| key.public_key_hex == test_public(&second_new)));
-        assert!(!fs::read_to_string(&trust_path)
-            .unwrap()
-            .contains("abcdef01"));
+        .expect_err("a failed write must refuse the install");
+        assert_eq!(error.code(), "ERR_REGISTRY_TRUST_STATE");
+        assert_eq!(fs::read(&trust_path).unwrap(), before);
     }
 
     /// An empty log is "nothing remembered", not an error.
