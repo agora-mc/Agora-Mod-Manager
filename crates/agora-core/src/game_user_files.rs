@@ -254,6 +254,14 @@ pub fn paths_eq_case_insensitive(a: &Path, b: &Path) -> bool {
     a_comps == b_comps
 }
 
+/// Compare two already-resolved paths exactly. `canonicalize` returns the real casing on Windows,
+/// so a case-only difference between two canonical paths is a real change of target, not an
+/// equivalent spelling. This is for the restore's resolution guard; user-data folder matching
+/// elsewhere still uses the case-insensitive comparison.
+pub fn paths_eq_exact(a: &Path, b: &Path) -> bool {
+    a.components().eq(b.components())
+}
+
 /// The Windows user folder a `UserDataLocation` names, inside a Proton prefix. Proton's default
 /// user is `steamuser`; a prefix that names another single user folder uses that one instead.
 pub fn user_data_root_in_prefix(prefix: &Path, location: &UserDataLocation) -> PathBuf {
@@ -1640,13 +1648,13 @@ fn restore_journal_internal(
                     false
                 } else {
                     match &resolved_now {
-                        Some(now) => paths_eq_case_insensitive(recorded, now),
+                        Some(now) => paths_eq_exact(recorded, now),
                         // The path no longer fully resolves (the file is gone, or an ancestor
                         // link now dangles): compare the anchored resolution instead, so a
                         // redirected ancestor still refuses.
                         None => would_be_now
                             .as_ref()
-                            .is_some_and(|now| paths_eq_case_insensitive(recorded, now)),
+                            .is_some_and(|now| paths_eq_exact(recorded, now)),
                     }
                 }
             }
@@ -2195,9 +2203,27 @@ pub fn list_statuses(
 #[cfg(test)]
 mod tests {
     use super::{write_user_file, JournaledFile};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use agora_game_api::RelPath;
+
+    /// Canonical paths are compared exactly: a case-only retarget is a different resolved file.
+    /// The case-insensitive comparator stays for user-data folder matching, not for this guard.
+    #[test]
+    fn the_canonical_path_guard_does_not_fold_case() {
+        let recorded = Path::new("/home/Player/Documents/My Games/Plugins.txt");
+        let retargeted = Path::new("/home/player/documents/my games/Plugins.txt");
+
+        assert!(
+            !super::paths_eq_exact(recorded, retargeted),
+            "a case-only change must not compare equal"
+        );
+        assert!(super::paths_eq_exact(recorded, recorded));
+        assert!(
+            super::paths_eq_case_insensitive(recorded, retargeted),
+            "the other comparator is deliberately case-insensitive for user-data folders"
+        );
+    }
 
     #[test]
     fn the_recorded_resolved_path_round_trips_and_old_journals_have_none() {
