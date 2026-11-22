@@ -732,7 +732,7 @@ def check_process_state_allowlisted() -> None:
     except (OSError, ValueError) as exc:
         err(f"Cannot read {PROCESS_STATE_ALLOWLIST.name}: {exc}")
         return
-    found: dict[str, dict[str, str]] = {}
+    found: set[str] = set()
     for root in (CORE_SRC, MC_SRC):
         for path, _line, name, owner in process_state_items(root):
             relative = path.relative_to(REPO_ROOT).as_posix()
@@ -744,8 +744,8 @@ def check_process_state_allowlisted() -> None:
             while key in found:
                 count += 1
                 key = f"{relative}::{owner}::{name}#{count}" if owner else f"{relative}::{name}#{count}"
-            found[key] = {"category": name}
-    unknown = sorted(set(found) - set(allowlist))
+            found.add(key)
+    unknown = sorted(found - set(allowlist))
     stale = sorted(set(allowlist) - set(found))
     bad_entry = sorted(
         key
