@@ -6,6 +6,11 @@
 //! alone.
 
 use super::*;
+use agora_core::instance_runtime::InstanceGuard as TestGuard;
+
+fn test_guard(ctx: &Ctx, id: &str, label: &str) -> TestGuard {
+    TestGuard::for_mutation(ctx, id, label).unwrap()
+}
 
 /// A context whose data root owns the instance, so the store and the instance sit under the
 /// same test root.
@@ -39,6 +44,99 @@ fn ctx_instance(tmp: &tempfile::TempDir, id: &str) -> (Ctx, std::path::PathBuf) 
     )
     .unwrap();
     (ctx, dir)
+}
+
+#[test]
+fn review_a_blank_curator_pin_is_refused_not_dropped() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, _dir) = ctx_instance(&tmp, "test");
+    let source = write_mod_jar(tmp.path(), "blank-pin", "1.0.0");
+    let bytes = std::fs::read(&source).unwrap();
+    let sha = super::sha256_hex(&bytes);
+    let service = crate::install_service::InstallService::new(ctx.clone());
+    let guard = test_guard(&ctx, "test", "test-blank-curator-pin");
+
+    let error = service
+        .commit_verified_artifact(
+            &guard,
+            "test",
+            "blank-pin.jar",
+            "mod",
+            "https://example.invalid/blank-pin.jar",
+            None,
+            None,
+            "registry",
+            Some("1.0.0"),
+            None,
+            Some(&sha), // the source published a matching hash
+            None,
+            None,
+            Some("   "), // but the curator's pin is blank
+            false,
+            bytes,
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "ERR_ASSERTED_HASH_BLANK");
+    let message = error.to_string();
+    assert!(
+        message.contains("blank-pin.jar"),
+        "names the item: {message}"
+    );
+    assert!(
+        message.contains("curator pin"),
+        "names the field: {message}"
+    );
+    assert!(
+        read_instance_manifest(&ctx.paths.instance_dir("test").unwrap())
+            .mods
+            .is_empty(),
+        "nothing was installed"
+    );
+}
+
+#[test]
+fn review_a_blank_pack_hash_is_refused_with_a_named_error() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, _dir) = ctx_instance(&tmp, "test");
+    let source = write_mod_jar(tmp.path(), "blank-pack-hash", "1.0.0");
+    let bytes = std::fs::read(&source).unwrap();
+    let sha = super::sha256_hex(&bytes);
+    let service = crate::install_service::InstallService::new(ctx.clone());
+    let guard = test_guard(&ctx, "test", "test-blank-pack-hash");
+
+    let error = service
+        .commit_verified_artifact(
+            &guard,
+            "test",
+            "blank-pack.jar",
+            "mod",
+            "https://example.invalid/blank-pack.jar",
+            None,
+            None,
+            "registry",
+            Some("1.0.0"),
+            None,
+            Some(&sha),
+            Some("  "), // the pack's hash is blank
+            None,
+            None,
+            false,
+            bytes,
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "ERR_ASSERTED_HASH_BLANK");
+    let message = error.to_string();
+    assert!(
+        message.contains("blank-pack.jar"),
+        "names the item: {message}"
+    );
+    assert!(message.contains("pack hash"), "names the field: {message}");
+    assert!(
+        read_instance_manifest(&ctx.paths.instance_dir("test").unwrap())
+            .mods
+            .is_empty(),
+        "nothing was installed"
+    );
 }
 
 fn read_instance_manifest(dir: &Path) -> InstanceManifest {
@@ -457,9 +555,7 @@ fn a_direct_artifact_install_links_from_the_store() {
     let bytes = std::fs::read(&source).unwrap();
     let sha = super::sha256_hex(&bytes);
     let service = crate::install_service::InstallService::new(ctx.clone());
-    let guard =
-        agora_core::instance_runtime::InstanceGuard::for_mutation(&ctx, "test", "test-commit")
-            .unwrap();
+    let guard = test_guard(&ctx, "test", "test-commit");
 
     let installed = service
         .commit_verified_artifact(
@@ -563,9 +659,7 @@ fn catalog_and_modrinth_provenance_survive_an_offline_add() {
     )
     .unwrap();
     let service = crate::install_service::InstallService::new(ctx.clone());
-    let guard =
-        agora_core::instance_runtime::InstanceGuard::for_mutation(&ctx, "first", "test-commit")
-            .unwrap();
+    let guard = test_guard(&ctx, "first", "test-commit");
 
     let catalog_jar = write_mod_jar(tmp.path(), "catalog-mod", "1.0.0");
     let catalog_bytes = std::fs::read(&catalog_jar).unwrap();
@@ -908,9 +1002,7 @@ fn review_remove_never_deletes_a_same_named_file_in_another_folder() {
     let bytes = std::fs::read(&source).unwrap();
     let sha = super::sha256_hex(&bytes);
     let service = crate::install_service::InstallService::new(ctx.clone());
-    let guard =
-        agora_core::instance_runtime::InstanceGuard::for_mutation(&ctx, "test", "test-commit")
-            .unwrap();
+    let guard = test_guard(&ctx, "test", "test-commit");
     service
         .commit_verified_artifact(
             &guard,

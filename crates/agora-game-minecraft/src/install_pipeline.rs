@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use agora_core::{
-    artifact_hash::{all_unmet, ConfirmableHash, HashOrigin},
+    artifact_hash::{all_unmet, blank_asserted_hash, ConfirmableHash, HashOrigin},
     ctx::Ctx,
     error::HashConfirmation,
     task_scheduler::{BlockingPriority, TaskScheduler},
@@ -3669,6 +3669,16 @@ fn verify_file_add(
     let nothing_to_check = add.hashes.values.is_empty() && (low_security || add.hashes.unpublished);
     if !nothing_to_check {
         verify_bytes(contents, &add.hashes)?;
+    }
+    // An expectation is Agora's or the pack author's own data. A blank one is
+    // corrupt data, not a hash mismatch the user can choose to accept, so an
+    // install-anyway confirmation cannot override it.
+    for expected in &add.hashes.confirmable {
+        if expected.sha256.trim().is_empty() {
+            return Err(StageFailure::Message(
+                blank_asserted_hash(&add.target_filename, expected.origin.as_str()).to_string(),
+            ));
+        }
     }
     if accept_confirmations || add.hashes.confirmable.is_empty() {
         return Ok(());
@@ -7355,6 +7365,32 @@ mod tests {
         let refused = provider_artifact(Vec::new(), false);
         assert!(validate_artifact_hashes(&refused.artifact).is_err());
         assert!(verify_file_add(b"anything", &refused, false).is_err());
+    }
+
+    #[test]
+    fn review_a_blank_curator_expectation_cannot_be_overridden_by_confirmation() {
+        let bytes = b"mod bytes";
+        let mut add = provider_artifact(
+            vec![HashedValue {
+                algorithm: HashAlgorithm::Sha256,
+                value: sha256_hex(bytes),
+            }],
+            false,
+        );
+        add.hashes.confirmable = vec![ConfirmableHash {
+            origin: HashOrigin::CuratorPin,
+            sha256: "   ".into(),
+        }];
+        for accept in [false, true] {
+            let error = verify_file_add(bytes, &add, accept)
+                .expect_err("a blank assertion is our own bad data, not a confirmable mismatch");
+            let message = error.message();
+            assert!(message.contains("x.jar"), "names the item: {message}");
+            assert!(
+                message.contains("curator_pin"),
+                "names the field: {message}"
+            );
+        }
     }
 
     #[test]

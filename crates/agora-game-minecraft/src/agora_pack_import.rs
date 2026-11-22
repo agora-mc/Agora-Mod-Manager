@@ -17,7 +17,7 @@
 //! The network and install steps sit behind [`PackBackend`] so the decision
 //! logic can be tested without a network; [`CoreBackend`] is the real one.
 
-use agora_core::artifact_hash::HashOrigin;
+use agora_core::artifact_hash::{blank_asserted_hash, HashOrigin};
 use agora_core::ctx::Ctx;
 use agora_core::db::InstancePackGap;
 use agora_core::error::{HashConfirmation, LauncherError, LauncherResult};
@@ -538,7 +538,19 @@ fn resolve_pin(
 ) -> Result<(Option<String>, bool), Box<PackEntryOutcome>> {
     match normalize_pin(entry) {
         Ok(pin) => Ok((pin, false)),
-        Err(_) if backend.pack_hash_override() => Ok((None, true)),
+        // A blank hash is corrupt pack data, not a mismatch the player can
+        // accept. No override can turn it into "no pin".
+        Err(_) if backend.pack_hash_override() && !blank_pin(entry) => Ok((None, true)),
+        Err(_) if blank_pin(entry) => Err(Box::new(outcome(
+            entry,
+            PackEntryStatus::Failed,
+            Some(format!(
+                "{} has a blank pack SHA-256 entry; refusing to install because a blank hash \
+                 cannot be overridden.",
+                entry.display_name()
+            )),
+            None,
+        ))),
         Err(problem) => Err(Box::new(outcome(
             entry,
             PackEntryStatus::NeedsAction,
@@ -548,6 +560,13 @@ fn resolve_pin(
             Some(PackNeedsAction::ConfirmHash),
         ))),
     }
+}
+
+fn blank_pin(entry: &AgoraPackEntry) -> bool {
+    entry
+        .sha256
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
 }
 
 /// The candidate the pack pinned: the one with its filename, else its version.
@@ -853,16 +872,20 @@ async fn settle_entry(
 pub fn expected_sha256_for_candidate(
     item: &RegistryItem,
     candidate: &ModVersionCandidate,
-) -> Option<String> {
+) -> LauncherResult<Option<String>> {
     match candidate_strategy_of(item, candidate) {
-        // Hand-pinned: the registry hash is the whole integrity story.
-        "direct_hash" | "technic_pack" => item
-            .sha256
-            .as_deref()
-            .map(str::trim)
-            .filter(|hash| !hash.is_empty())
-            .map(str::to_string),
-        _ => candidate.sha256.clone(),
+        // Hand-pinned: the registry hash is the whole integrity story. A
+        // missing or blank hash is not "no pin" — that would install the file
+        // with no check at all, which is exactly what this strategy promises
+        // not to do.
+        "direct_hash" | "technic_pack" => {
+            let hash = item.sha256.as_deref().unwrap_or("").trim();
+            if hash.is_empty() {
+                return Err(blank_asserted_hash(&item.id, "direct hash sha256"));
+            }
+            Ok(Some(hash.to_string()))
+        }
+        _ => Ok(candidate.sha256.clone()),
     }
 }
 
@@ -891,24 +914,33 @@ fn candidate_strategy_of<'a>(
 pub fn curator_pin_for_pack(
     item: &RegistryItem,
     candidate: &ModVersionCandidate,
-) -> Option<String> {
+) -> LauncherResult<Option<String>> {
     if let Some(pin) = crate::resolver::curator_pins_for(item, candidate)
         .into_iter()
         .next()
     {
-        return Some(pin.sha256);
+        return Ok(Some(pin.sha256));
     }
     let published = |hash: &Option<String>| non_empty(hash).is_some();
     if published(&candidate.sha256) || published(&candidate.sha1) || published(&candidate.sha512) {
-        return None;
+        return Ok(None);
     }
     if matches!(
         candidate_strategy_of(item, candidate),
         "direct_hash" | "technic_pack" | "github_release"
     ) {
-        return None;
+        return Ok(None);
     }
-    non_empty(&item.sha256).map(str::to_ascii_lowercase)
+    match item.sha256.as_deref() {
+        None => Ok(None),
+        // The field is present but blank: that is a broken curator assertion,
+        // not "no pin". An absent hash stays "no pin"; a present blank is
+        // refused (the compiler and resolver reject it upstream too).
+        Some(value) if value.trim().is_empty() => {
+            Err(blank_asserted_hash(&item.id, "curator fallback sha256"))
+        }
+        Some(value) => Ok(Some(value.trim().to_ascii_lowercase())),
+    }
 }
 
 pub struct CoreBackend {
@@ -1057,22 +1089,27 @@ impl PackBackend for CoreBackend {
         } else {
             item.content_type.clone()
         };
-        Ok(candidates
+        candidates
             .iter()
-            .map(|c| PackCandidate {
-                version: c.version.clone(),
-                filename: c.filename.clone(),
-                download_url: c.download_url.clone(),
-                sha1: c.sha1.clone(),
-                sha512: c.sha512.clone(),
-                expected_sha256: expected_sha256_for_candidate(&item, c),
-                curator_pin: curator_pin_for_pack(&item, c),
-                content_type: content_type.clone(),
-                registry_id: Some(item.id.clone()),
-                modrinth_id: item.modrinth_id.clone(),
-                source: "registry".into(),
+            .map(|c| -> Result<PackCandidate, BackendError> {
+                let expected_sha256 = expected_sha256_for_candidate(&item, c)
+                    .map_err(|error| BackendError::Failed(error.to_string()))?;
+                Ok(PackCandidate {
+                    version: c.version.clone(),
+                    filename: c.filename.clone(),
+                    download_url: c.download_url.clone(),
+                    sha1: c.sha1.clone(),
+                    sha512: c.sha512.clone(),
+                    expected_sha256,
+                    curator_pin: curator_pin_for_pack(&item, c)
+                        .map_err(|error| BackendError::Failed(error.to_string()))?,
+                    content_type: content_type.clone(),
+                    registry_id: Some(item.id.clone()),
+                    modrinth_id: item.modrinth_id.clone(),
+                    source: "registry".into(),
+                })
             })
-            .collect())
+            .collect()
     }
 
     async fn modrinth_versions(
@@ -2446,9 +2483,23 @@ mod tests {
         let sixty_five = format!("{}a", sha256_hex(bytes));
         let sixty_three = sha256_hex(bytes)[1..].to_string();
         let not_hex = "zz".repeat(32);
+        // A blank pack hash is an absent assertion, refused by name rather
+        // than reported as a mismatch against the bytes.
+        for blank in ["", "  "] {
+            for accept in [false, true] {
+                let (ctx, root) = temp_ctx_with_instance();
+                let err =
+                    commit_full(&ctx, bytes, Some(&sha1), Some(blank), None, accept).unwrap_err();
+                assert_eq!(
+                    err.code(),
+                    "ERR_ASSERTED_HASH_BLANK",
+                    "{blank:?} accept={accept}"
+                );
+                assert!(!mod_on_disk(&ctx), "{blank:?} wrote a file");
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
         for bad in [
-            "",
-            "  ",
             "ab",
             not_hex.as_str(),
             sixty_five.as_str(),
@@ -2570,15 +2621,18 @@ mod tests {
         backend.modrinth = vec![candidate("2.0", "mod-2.0.jar")];
         let sixty_five = format!("{GOOD_PIN}a");
         let not_hex = "zz".repeat(32);
-        for bad in [
-            "",
-            "  ",
-            "\t",
-            "ab",
-            not_hex.as_str(),
-            sixty_five.as_str(),
-            &GOOD_PIN[1..],
-        ] {
+        // Blank entries are corrupt data: refused outright, with no override.
+        for blank in ["", "  ", "\t"] {
+            let out = pack_installed(&backend, Some(blank));
+            assert_eq!(out.status, PackEntryStatus::Failed, "{blank:?}");
+            assert_eq!(out.action, None, "{blank:?}");
+            assert!(
+                out.reason.as_deref().unwrap().contains("blank"),
+                "{blank:?}: {:?}",
+                out.reason
+            );
+        }
+        for bad in ["ab", not_hex.as_str(), sixty_five.as_str(), &GOOD_PIN[1..]] {
             let out = pack_installed(&backend, Some(bad));
             assert_eq!(out.status, PackEntryStatus::NeedsAction, "{bad:?}");
             assert_eq!(out.action, Some(PackNeedsAction::ConfirmHash), "{bad:?}");
@@ -2602,7 +2656,9 @@ mod tests {
 
     #[test]
     fn install_anyway_installs_a_file_whose_pack_hash_entry_is_malformed_and_says_so() {
-        for bad in ["", "  ", "deadbeef", &"zz".repeat(32)] {
+        // A blank entry is corrupt pack data, not an overridable mismatch; it
+        // is refused even with install-anyway (covered in its own test).
+        for bad in ["deadbeef", &"zz".repeat(32)] {
             let mut backend = fake();
             backend.modrinth = vec![candidate("2.0", "mod-2.0.jar")];
             backend.override_pack_hash = true;
@@ -2620,6 +2676,25 @@ mod tests {
             assert_eq!(installs.len(), 1);
             assert_eq!(installs[0].1, None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn review_install_anyway_cannot_override_a_blank_pack_hash() {
+        let mut backend = fake();
+        backend.modrinth = vec![candidate("2.0", "mod-2.0.jar")];
+        backend.override_pack_hash = true;
+        for blank in ["", "   "] {
+            let out = pack_installed(&backend, Some(blank));
+            assert_eq!(out.status, PackEntryStatus::Failed, "{blank:?}");
+            assert!(out.action.is_none(), "{blank:?} must not offer an override");
+            let reason = out.reason.expect("says why");
+            assert!(reason.contains("blank"), "{reason}");
+            assert!(reason.contains("mod-2.0.jar"), "{reason}");
+        }
+        assert!(
+            backend.installs.lock().unwrap().is_empty(),
+            "a blank assertion never reaches the installer"
+        );
     }
 
     #[test]
@@ -2697,34 +2772,65 @@ mod tests {
         let item = catalog_item("curseforge_id", Some(&CURATOR.to_uppercase()), None);
         // Nothing published: the catalog's hash is held, in lower case.
         assert_eq!(
-            curator_pin_for_pack(&item, &served("curseforge_id", None)).as_deref(),
+            curator_pin_for_pack(&item, &served("curseforge_id", None))
+                .unwrap()
+                .as_deref(),
             Some(CURATOR)
         );
         // Any published hash means the source vouches; the catalog hash (one
         // historical file) is not compared with another version.
         assert_eq!(
-            curator_pin_for_pack(&item, &served("curseforge_id", Some(&"1".repeat(40)))),
+            curator_pin_for_pack(&item, &served("curseforge_id", Some(&"1".repeat(40)))).unwrap(),
             None
         );
         // A blank published hash is nothing published.
-        assert!(curator_pin_for_pack(&item, &served("curseforge_id", Some("  "))).is_some());
-        // No catalog hash, or a blank one: no pin.
-        for none in [None, Some(""), Some("   ")] {
-            let item = catalog_item("curseforge_id", none, None);
-            assert_eq!(
-                curator_pin_for_pack(&item, &served("curseforge_id", None)),
-                None
-            );
-        }
+        assert!(
+            curator_pin_for_pack(&item, &served("curseforge_id", Some("  ")))
+                .unwrap()
+                .is_some()
+        );
+        // An absent catalog hash means no pin. A present-but-blank one is
+        // refused (see review_a_blank_catalog_fallback_pin_is_refused).
+        let item = catalog_item("curseforge_id", None, None);
+        assert_eq!(
+            curator_pin_for_pack(&item, &served("curseforge_id", None)).unwrap(),
+            None
+        );
         // Hand-pinned strategies already hold the manifest hash as the expectation,
         // and github releases carry per-release pins instead.
         for strategy in ["direct_hash", "technic_pack", "github_release"] {
             let item = catalog_item(strategy, Some(CURATOR), None);
             assert_eq!(
-                curator_pin_for_pack(&item, &served(strategy, None)),
+                curator_pin_for_pack(&item, &served(strategy, None)).unwrap(),
                 None,
                 "{strategy}"
             );
+        }
+    }
+
+    #[test]
+    fn review_a_blank_catalog_fallback_pin_is_refused() {
+        for blank in ["", "   "] {
+            let item = catalog_item("curseforge_id", Some(blank), None);
+            let error = curator_pin_for_pack(&item, &served("curseforge_id", None))
+                .expect_err("a present-but-blank catalog hash is bad data, not no pin");
+            assert_eq!(error.code(), "ERR_ASSERTED_HASH_BLANK", "{blank:?}");
+            let message = error.to_string();
+            assert!(message.contains("oldmod"), "names the item: {message}");
+            assert!(message.contains("sha256"), "names the field: {message}");
+        }
+    }
+
+    #[test]
+    fn review_a_blank_direct_hash_pin_is_refused() {
+        for blank in [None, Some(""), Some("   ")] {
+            let item = catalog_item("direct_hash", blank, None);
+            let error = expected_sha256_for_candidate(&item, &served("direct_hash", None))
+                .expect_err("a hand-pinned item with no hash cannot install unverified");
+            assert_eq!(error.code(), "ERR_ASSERTED_HASH_BLANK", "{blank:?}");
+            let message = error.to_string();
+            assert!(message.contains("oldmod"), "names the item: {message}");
+            assert!(message.contains("sha256"), "names the field: {message}");
         }
     }
 
@@ -2736,12 +2842,13 @@ mod tests {
         let item = catalog_item("github_release", None, Some(&sources));
         assert_eq!(
             curator_pin_for_pack(&item, &served("github_release", Some(&"1".repeat(40))))
+                .unwrap()
                 .as_deref(),
             Some(CURATOR)
         );
         let mut other = served("github_release", None);
         other.version = "v2".into();
-        assert_eq!(curator_pin_for_pack(&item, &other), None);
+        assert_eq!(curator_pin_for_pack(&item, &other).unwrap(), None);
     }
 
     fn curator_pinned(pin: &str) -> PackCandidate {
@@ -2988,7 +3095,16 @@ mod tests {
         let mut backend = fake();
         backend.modrinth = vec![candidate("2.0", "mod-2.0.jar")];
         let out = run(&backend, vec![entry("mod-2.0.jar", "2.0", Some("   "))]);
-        assert_eq!(out[0].status, PackEntryStatus::NeedsAction);
+        assert_eq!(out[0].status, PackEntryStatus::Failed);
+        assert_eq!(out[0].action, None);
+        assert!(
+            out[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("blank")),
+            "names the reason: {:?}",
+            out[0].reason
+        );
         assert!(backend.installs.lock().unwrap().is_empty());
     }
 

@@ -26,6 +26,58 @@ pub use clone::{clone_instance, CloneOptions, ClonedInstance};
 pub use session::{end_session, stop, watch_session, SessionEnd, StopOutcome};
 pub use trash::{DeletedEntry, PurgeSummary, RestoreOutcome, TrashFn};
 
+/// Test seam: make the next create that pins `base_id` stop after choosing it,
+/// until [`set_create_pause_before_publishing_pin`] is called with `None`.
+#[cfg(debug_assertions)]
+static PAUSE_BEFORE_PIN_PUBLISH_AT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+#[cfg(debug_assertions)]
+static PIN_PUBLISH_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test seam for the window between a create choosing its pinned base and publishing its
+/// row. Off by default and absent from release builds.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_create_pause_before_publishing_pin(base_id: Option<&str>) {
+    let mut target = PAUSE_BEFORE_PIN_PUBLISH_AT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    *target = base_id.map(str::to_string);
+    PIN_PUBLISH_PAUSED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether a paused create has reached the window and is waiting.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn create_pause_before_publishing_pin_reached() -> bool {
+    PIN_PUBLISH_PAUSED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(debug_assertions)]
+fn pause_before_publishing_pin_if_asked(base_id: &str) {
+    let should_pause = PAUSE_BEFORE_PIN_PUBLISH_AT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_deref()
+        == Some(base_id);
+    if !should_pause {
+        return;
+    }
+    PIN_PUBLISH_PAUSED.store(true, std::sync::atomic::Ordering::SeqCst);
+    loop {
+        let still_asked = PAUSE_BEFORE_PIN_PUBLISH_AT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_deref()
+            == Some(base_id);
+        if !still_asked {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    PIN_PUBLISH_PAUSED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// A generic instance manifest stored at `<instances_root>/<id>/instance_manifest.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameInstanceManifest {
@@ -385,6 +437,7 @@ pub fn create_with_options(
 
     // The id is settled before the base is built: a duplicate or invalid id
     // must not cost a full build and hash first.
+    let mut base_lock: Option<crate::lock_manager::LockGuard> = None;
     let (base_ref, build_outcome) = if install.discovered.capabilities.executables_readable
         && install.discovered.capabilities.relocatable
     {
@@ -400,11 +453,52 @@ pub fn create_with_options(
             progress,
         )?;
         let manifest = outcome.manifest();
+        let base_id = manifest.base_id.clone();
+        // The build released its lock on the base, and the pin this instance will publish does
+        // not exist yet, so a removal could sweep the base out from between those two moments.
+        // Take the base's lock (first in the documented order; no other lock is acquired while
+        // it is held) from choosing the base until the pin's row is inserted below: a removal
+        // either decided before this (detected by re-reading the record) or sees the pin after.
+        let hold = ctx
+            .lock_manager
+            .acquire(
+                crate::lock_manager::LockResource::Base(base_id.clone()),
+                "create-instance",
+            )
+            .map_err(|error| {
+                InstanceError::Other(format!(
+                    "could not lock base {base_id} to publish this instance's pin: {error}"
+                ))
+            })?;
+        let manifest_path = ctx.paths.base_manifest_path(&base_id);
+        let text = std::fs::read_to_string(&manifest_path).map_err(|error| {
+            InstanceError::Other(format!(
+                "the base {base_id} this instance would pin was kept (its record at \
+                 {} cannot be read: {error}); its removal may have finished while the \
+                 instance was being created. Try again.",
+                manifest_path.display()
+            ))
+        })?;
+        let record: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+            InstanceError::Other(format!(
+                "the base {base_id} this instance would pin was kept (its record at \
+                 {} cannot be read: {error}); its removal may have finished while the \
+                 instance was being created. Try again.",
+                manifest_path.display()
+            ))
+        })?;
+        if record.get("base_id").and_then(|id| id.as_str()) != Some(base_id.as_str()) {
+            return Err(InstanceError::Other(format!(
+                "the base {base_id} this instance would pin no longer exists as itself; \
+                 its removal may have finished while the instance was being created. Try again."
+            )));
+        }
         let b_ref = BaseReference::Pinned {
             id: manifest.base_id.clone(),
             runtime: manifest.runtime.clone(),
             mode: manifest.mode,
         };
+        base_lock = Some(hold);
         (b_ref, Some(outcome))
     } else {
         let reason = if !install.discovered.capabilities.executables_readable
@@ -426,6 +520,14 @@ pub fn create_with_options(
         };
         (b_ref, None)
     };
+
+    // Test seam for the window between choosing a pinned base and publishing this
+    // instance's row (the pin). While paused, a test races a base removal against
+    // the create, exactly like the base build pauses.
+    #[cfg(debug_assertions)]
+    if let BaseReference::Pinned { id, .. } = &base_ref {
+        pause_before_publishing_pin_if_asked(id);
+    }
 
     let instance_dir = ctx
         .paths
@@ -484,6 +586,9 @@ pub fn create_with_options(
         let _ = std::fs::remove_dir_all(&instance_dir);
         return Err(e);
     }
+    // The pin's row is published, so the base cannot be removed silently out from
+    // under the new instance anymore; its lock can go.
+    drop(base_lock);
 
     let created_at: String = conn.query_row(
         "SELECT created_at FROM game_instances WHERE instance_id = ?1",
@@ -1011,6 +1116,12 @@ pub fn delete_with_options(
         }
         Err(error) => return Err(error.into()),
     };
+    // A recoverable delete must get the locations lock before harvesting or moving a farm.
+    // Harvest can update the instance's files and needs the live path until the rename.
+    let locations = options
+        .recoverable
+        .then(|| trash::try_lock_locations(ctx, "delete"))
+        .transpose()?;
     // Without the record the farm cannot be checked or harvested. It is left alone, and named.
     let left_in_place = if base_unreadable {
         match find_instance_deployment_folder(&ctx.paths, id)? {
@@ -1036,26 +1147,26 @@ pub fn delete_with_options(
         let row = trash::read_row(&conn, id)?;
         let load_order_rules = trash::read_load_order_rules(&conn, id)?;
         let entry = if instance_dir.exists() {
-            let entry = trash::stash(
+            let entry = trash::stash_locked(
                 &ctx.paths.recently_deleted_games_root(),
                 row,
                 load_order_rules,
                 &instance_dir,
                 chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()),
             )?;
+            drop(locations);
             if let Err(error) =
                 conn.execute("DELETE FROM game_instances WHERE instance_id = ?1", [id])
             {
-                let _ = trash::undo_stash(
-                    &ctx.paths.recently_deleted_games_root(),
-                    &entry,
-                    &instance_dir,
-                );
+                if let Err(rollback) = trash::undo_stash(ctx, &entry, &instance_dir) {
+                    eprintln!("could not roll back the move to Recently deleted: {rollback}");
+                }
                 return Err(error.into());
             }
             Some(entry)
         } else {
             // A row whose folder is already gone has nothing to recover.
+            drop(locations);
             conn.execute("DELETE FROM game_instances WHERE instance_id = ?1", [id])?;
             None
         };

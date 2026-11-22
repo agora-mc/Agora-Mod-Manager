@@ -574,6 +574,60 @@ fn pause_after_rename_if_asked(base_root: &Path) {
     BASE_RENAME_PAUSED.store(false, Ordering::SeqCst);
 }
 
+/// Test seam for the window between the early pinning check of a damaged record and the locked
+/// re-check before its stale folder is replaced. While paused the build holds no lock, so a test
+/// can move an instance into Recently deleted and check that the re-check refuses the rebuild.
+/// Keyed by the base root, like the rename pause, so unrelated builds carry on.
+#[cfg(debug_assertions)]
+static PAUSE_BEFORE_BASE_PIN_RECHECK_AT: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(debug_assertions)]
+static BASE_PIN_RECHECK_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test seam: make the next `build_base` under `base_root` stop after its early pinning check,
+/// until this is called with `None`. Off by default and absent from release builds.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_base_build_pause_before_pin_recheck(base_root: Option<&Path>) {
+    let mut target = PAUSE_BEFORE_BASE_PIN_RECHECK_AT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    *target = base_root.map(Path::to_path_buf);
+    BASE_PIN_RECHECK_PAUSED.store(false, Ordering::SeqCst);
+}
+
+/// Whether a paused build has reached its early pinning check and is waiting.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn base_build_pause_before_pin_recheck_reached() -> bool {
+    BASE_PIN_RECHECK_PAUSED.load(Ordering::SeqCst)
+}
+
+#[cfg(debug_assertions)]
+fn pause_before_pin_recheck_if_asked(base_root: &Path) {
+    let should_pause = PAUSE_BEFORE_BASE_PIN_RECHECK_AT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_deref()
+        == Some(base_root);
+    if !should_pause {
+        return;
+    }
+    BASE_PIN_RECHECK_PAUSED.store(true, Ordering::SeqCst);
+    loop {
+        let still_asked = PAUSE_BEFORE_BASE_PIN_RECHECK_AT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_deref()
+            == Some(base_root);
+        if !still_asked {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    BASE_PIN_RECHECK_PAUSED.store(false, Ordering::SeqCst);
+}
+
 /// The marker Agora writes into a base folder it built, so a rebuild only removes a folder it can
 /// prove is its own.
 const BASE_MARKER_FILE: &str = ".agora-base.json";
@@ -662,7 +716,8 @@ pub fn build_base_with_frameworks(
     // a base record is damaged: the build replaces it (and the folder it left) once it is known
     // that no instance is pinned to it. A record that cannot be read at all is an error, because
     // a failed read of a healthy record must not be taken as permission to replace its base.
-    let mut damaged_record = false;
+    // Whether the record is damaged is judged again under the base lock below; the state here
+    // only decides whether hashing is worth it.
     if manifest_path.exists() {
         let content = std::fs::read_to_string(&manifest_path).map_err(|error| {
             BaseError::Other(format!(
@@ -680,7 +735,6 @@ pub fn build_base_with_frameworks(
                         pinning.join(", ")
                     )));
                 }
-                damaged_record = true;
             }
         }
     }
@@ -771,6 +825,9 @@ pub fn build_base_with_frameworks(
             install.discovered.volume.as_ref().map(|v| v.id.as_str()),
         )
     });
+
+    #[cfg(debug_assertions)]
+    pause_before_pin_recheck_if_asked(&base_root);
 
     // 3. Linked mode checks
     if mode == BaseMode::Linked {
@@ -879,19 +936,53 @@ pub fn build_base_with_frameworks(
     // the re-check under it answers a build that finished while this one was hashing.
     let locks_root = paths.locks_root();
     std::fs::create_dir_all(&locks_root)?;
-    let _base_lock = crate::lock_manager::LockManager::new(locks_root)
+    let locks = crate::lock_manager::LockManager::new(locks_root);
+    let _base_lock = locks
         .acquire(
             crate::lock_manager::LockResource::Base(base_id.clone()),
             "build-base",
         )
         .map_err(|e| BaseError::Other(e.to_string()))?;
+    // Re-check the record under the lock, without a suppressed error: a failed read here
+    // must never be permission to fall through on a damage flag from before the lock, from
+    // a record that may be healthy by now. Healthy returns Existing; unreadable is an error
+    // that keeps the folder; still-damaged is judged from the record as it is right now.
+    let mut damaged_record = false;
     if manifest_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-            if let Ok(manifest) = serde_json::from_str::<BaseManifest>(&content) {
+        let content = std::fs::read_to_string(&manifest_path).map_err(|error| {
+            BaseError::Other(format!(
+                "the record of base {base_id} ({}) cannot be read: {error}",
+                manifest_path.display()
+            ))
+        })?;
+        match serde_json::from_str::<BaseManifest>(&content) {
+            Ok(manifest) => {
                 // The staging folder goes with the guard when this returns.
                 return Ok(BuildOutcome::Existing(manifest));
             }
+            Err(_) => {
+                damaged_record = true;
+            }
         }
+    }
+
+    // Only the path that replaces a base folder needs the locations lock: take it after Base, and
+    // acquire nothing while holding it. The early check above can be stale by now — an instance
+    // may have moved into Recently deleted while the source was hashed. Under both locks the
+    // answer cannot change, so a base that is still pinned is kept.
+    let _locations = locks
+        .try_instance_locations("build-base")
+        .map_err(|error| {
+            BaseError::Other(format!(
+                "base {base_id} was kept because instance locations are busy: {error}. Retry once the instance move or scan finishes."
+            ))
+        })?;
+    let pinning = instances_pinning_base(paths, &base_id)?;
+    if !pinning.is_empty() {
+        return Err(BaseError::Other(format!(
+            "instance(s) {} still use base {base_id} (including Recently deleted), so it was not replaced. Remove or purge those instances first.",
+            pinning.join(", ")
+        )));
     }
 
     let final_base_dir = base_root.join(&base_id);
@@ -1559,34 +1650,63 @@ pub(crate) fn trusted_base_folder(
 /// cannot be read, or a row's base reference cannot be parsed, the answer is an
 /// error rather than "none", because the caller may be about to delete the base.
 pub fn instances_pinning_base(paths: &AppPaths, base_id: &str) -> Result<Vec<String>, BaseError> {
-    let db_path = paths.local_state_db();
-    if !db_path.exists() {
-        // No state database means no instances were ever created here.
-        return Ok(Vec::new());
-    }
+    instances_pinning_base_with(paths, base_id, |path| std::fs::metadata(path), || {})
+}
+
+/// The same read with its state-database metadata lookup and its between-reads hook injected, so
+/// an unreadable database and a move between the two reads can be exercised without depending on
+/// the OS or the thread scheduler. Production passes the real filesystem and a no-op.
+fn instances_pinning_base_with(
+    paths: &AppPaths,
+    base_id: &str,
+    metadata: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+    between_reads: impl Fn(),
+) -> Result<Vec<String>, BaseError> {
     let unreadable = |e: &dyn std::fmt::Display| {
         BaseError::Other(format!(
             "cannot tell which instances use base {base_id}, so it is kept: {e}"
         ))
     };
-    let conn = rusqlite::Connection::open(&db_path).map_err(|e| unreadable(&e))?;
-    let mut stmt = conn
-        .prepare("SELECT instance_id, base_json FROM game_instances")
-        .map_err(|e| unreadable(&e))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|e| unreadable(&e))?;
+    // No live database means no live pins ever were created here, but that is not
+    // "nothing pins this base": a Recently-deleted entry is an independent source
+    // and is scanned below either way.
+    let db_path = paths.local_state_db();
     let mut instances = Vec::new();
-    for row in rows {
-        let (instance_id, base_json) = row.map_err(|e| unreadable(&e))?;
-        let base_ref: agora_game_api::BaseReference = serde_json::from_str(&base_json)
-            .map_err(|e| unreadable(&format!("instance {instance_id}: {e}")))?;
-        if matches!(&base_ref, agora_game_api::BaseReference::Pinned { id, .. } if id == base_id) {
-            instances.push(instance_id);
+    match metadata(&db_path) {
+        Ok(_) => {
+            let conn = rusqlite::Connection::open(&db_path).map_err(|e| unreadable(&e))?;
+            let mut stmt = conn
+                .prepare("SELECT instance_id, base_json FROM game_instances")
+                .map_err(|e| unreadable(&e))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| unreadable(&e))?;
+            for row in rows {
+                let (instance_id, base_json) = row.map_err(|e| unreadable(&e))?;
+                let base_ref: agora_game_api::BaseReference = serde_json::from_str(&base_json)
+                    .map_err(|e| unreadable(&format!("instance {instance_id}: {e}")))?;
+                if matches!(&base_ref, agora_game_api::BaseReference::Pinned { id, .. } if id == base_id)
+                {
+                    instances.push(instance_id);
+                }
+            }
+        }
+        // A failed lookup other than absence is not an empty database. Without this,
+        // an error would be read as "no instances", the base would be deleted, and a
+        // later restore would lose its files.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(unreadable(&format!(
+                "cannot inspect {}: {error}",
+                db_path.display()
+            )));
         }
     }
+    // The caller holds InstanceLocations across both reads through the deletion: an instance
+    // cannot move between live and Recently deleted while these two answers disagree.
+    between_reads();
     // An instance in Recently deleted is still restorable, so its base must stay.
     for instance_id in trash_instances_pinning_base(paths, base_id)? {
         if !instances.contains(&instance_id) {
@@ -1705,7 +1825,41 @@ fn damaged_record_listed_as(paths: &AppPaths, base_id: &str) -> Result<Option<Pa
 }
 
 pub fn remove_base(paths: &AppPaths, base_id: &str) -> Result<(), BaseError> {
-    if !is_plain_base_id(base_id) {
+    remove_base_with(paths, base_id, || {}, |path| std::fs::metadata(path))
+}
+
+/// Removal with the pinning read's hooks injected. See [`instances_pinning_base_with`].
+/// Production calls this through [`remove_base`]; the closure runs inside the removal's locks.
+pub(crate) fn remove_base_with(
+    paths: &AppPaths,
+    base_id: &str,
+    between_reads: impl Fn(),
+    metadata: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<(), BaseError> {
+    let locks = crate::lock_manager::LockManager::new(paths.locks_root());
+    // A plain id can also be named by a build or a framework repair, so take its lock first. A
+    // damaged record is listed under a file name that need not be a valid lock component; it only
+    // removes that one record, but still takes the locations lock below.
+    let plain_id = is_plain_base_id(base_id);
+    let _base_lock = plain_id
+        .then(|| {
+            locks.acquire(
+                crate::lock_manager::LockResource::Base(base_id.to_string()),
+                "remove-base",
+            )
+        })
+        .transpose()
+        .map_err(|error| BaseError::Other(error.to_string()))?;
+    // Hold InstanceLocations from the first pinning read through the deletion. A move between live
+    // and Recently deleted can otherwise hide an instance from both reads, letting us delete a
+    // base it still pins. Nothing else is locked while this guard is alive; on a busy lock, keep
+    // the base and tell the caller to retry.
+    let _locations = locks.try_instance_locations("remove-base").map_err(|error| {
+        BaseError::Other(format!(
+            "base {base_id} was kept because instance locations are busy: {error}. Retry once the instance move or scan finishes."
+        ))
+    })?;
+    if !plain_id {
         // Not a name that can reach a folder or a manifest path, but the list can still show a
         // damaged record under it. That record file (and nothing else) is removed.
         let Some(record) = damaged_record_listed_as(paths, base_id)? else {
@@ -1713,12 +1867,14 @@ pub fn remove_base(paths: &AppPaths, base_id: &str) -> Result<(), BaseError> {
                 "'{base_id}' is not a base id, so nothing was removed."
             )));
         };
-        let pinning = instances_pinning_base(paths, base_id)?;
+        let pinning = instances_pinning_base_with(paths, base_id, &metadata, &between_reads)?;
         if !pinning.is_empty() {
             return Err(BaseError::InUse { instances: pinning });
         }
-        let metadata = std::fs::symlink_metadata(&record)?;
-        if !metadata.is_file() || record.parent() != Some(paths.base_manifests_dir().as_path()) {
+        let record_metadata = std::fs::symlink_metadata(&record)?;
+        if !record_metadata.is_file()
+            || record.parent() != Some(paths.base_manifests_dir().as_path())
+        {
             return Err(BaseError::Other(format!(
                 "refusing to remove {}: it is not a plain record file",
                 record.display()
@@ -1727,7 +1883,7 @@ pub fn remove_base(paths: &AppPaths, base_id: &str) -> Result<(), BaseError> {
         std::fs::remove_file(&record)?;
         return Ok(());
     }
-    let pinning = instances_pinning_base(paths, base_id)?;
+    let pinning = instances_pinning_base_with(paths, base_id, &metadata, &between_reads)?;
     if !pinning.is_empty() {
         return Err(BaseError::InUse { instances: pinning });
     }

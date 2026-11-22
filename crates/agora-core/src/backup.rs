@@ -539,7 +539,11 @@ pub fn run_backup_retention(
         return Ok(Vec::new());
     }
 
-    let lkg = crate::lkg::read_lkg_state(instance_dir).unwrap_or_default();
+    // A recovery pointer that cannot be read is "cannot tell", not "nothing was
+    // ever promoted": planning around a blank state would nominate the
+    // last-known-good snapshot for deletion.
+    let lkg = crate::lkg::read_lkg_state(instance_dir)
+        .map_err(|error| format!("backup retention skipped: {error}"))?;
     let to_evict = plan_backup_retention(&snapshots, &lkg, policy);
 
     let mut evicted = Vec::new();
@@ -2667,7 +2671,9 @@ pub fn preview_instance_retention(
         return Ok(Vec::new());
     }
     let snapshots = crate::snapshot::list_snapshots(&instance_dir).map_err(backup_error)?;
-    let lkg = crate::lkg::read_lkg_state(&instance_dir).unwrap_or_default();
+    // A preview that cannot read the recovery pointer must say so, not describe
+    // the plan an empty pointer would produce.
+    let lkg = crate::lkg::read_lkg_state(&instance_dir).map_err(backup_error)?;
     Ok(plan_backup_retention(&snapshots, &lkg, policy))
 }
 
@@ -3281,5 +3287,42 @@ mod tests {
         // Verify the two older snapshots are gone.
         assert!(crate::snapshot::snapshot_file_index(&instance, &a.id).is_err());
         assert!(crate::snapshot::snapshot_file_index(&instance, &b.id).is_err());
+    }
+
+    #[test]
+    fn backup_retention_cannot_treat_an_unreadable_recovery_pointer_as_empty() {
+        let tmp = TempDir::new().unwrap();
+        let instance = make_instance(&tmp);
+        let a = create_snapshot(&instance, Some("a"), TRACKED).unwrap();
+        std::fs::write(instance.join("mods").join("mod-a.jar"), b"mod a v2").unwrap();
+        create_snapshot(&instance, Some("b"), TRACKED).unwrap();
+        std::fs::write(instance.join("mods").join("mod-a.jar"), b"mod a v3").unwrap();
+        create_snapshot(&instance, Some("c"), TRACKED).unwrap();
+        // The oldest snapshot is the current recovery pointer; a blank state would
+        // let keep_last(1) evict it.
+        crate::lkg::record_launch_outcome(
+            &instance,
+            Some(&a.id),
+            "launch-1",
+            crate::lkg::LaunchOutcome::Success,
+        )
+        .unwrap();
+        // A parse failure must never be read as "nothing was ever promoted".
+        fs::write(instance.join("lkg.json"), "{ not json").unwrap();
+
+        let policy = BackupRetentionPolicy::keep_last(1);
+        let result = run_backup_retention(&instance, &policy);
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.contains("failed to parse LKG state")),
+            "backup retention must refuse to plan around an unreadable recovery pointer: {result:?}"
+        );
+        assert_eq!(
+            list_snapshots(&instance).unwrap().len(),
+            3,
+            "nothing is deleted on a failed recovery-pointer read"
+        );
+        assert!(crate::snapshot::snapshot_file_index(&instance, &a.id).is_ok());
     }
 }

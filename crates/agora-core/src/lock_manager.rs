@@ -130,6 +130,10 @@ mod platform {
 /// Default timeout for acquiring a lock (30 seconds).
 const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Short wait for instance locations where a collision is expected to clear quickly: automatic
+/// retention and a user-requested snapshot delete.
+const SHORT_INSTANCE_LOCATIONS_WAIT: Duration = Duration::from_secs(3);
+
 /// First wait between attempts when a lock is contested.
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(10);
 
@@ -339,6 +343,10 @@ pub enum LockResource {
     Instance(String),
     /// Exclusive access to the content store for adding or removing items.
     ContentStore,
+    /// Exclusive access while scanning live and deleted instances or moving between their roots.
+    /// Take it after Instance and ContentStore, in that order when both are needed, and acquire
+    /// no other resource while holding it.
+    InstanceLocations,
     /// Exclusive access for per-user game files journaled swap.
     GameUserFiles(GameId, StoreId),
     /// Exclusive access while a plugin's files are swapped (install, update, rollback), so a
@@ -376,6 +384,7 @@ impl LockResource {
                 Ok(format!("instance-{id}"))
             }
             LockResource::ContentStore => Ok("content-store".into()),
+            LockResource::InstanceLocations => Ok("instance-locations".into()),
             LockResource::GameUserFiles(game, store) => {
                 app_paths::validate_path_component(game.as_str())?;
                 app_paths::validate_path_component(store.as_str())?;
@@ -459,6 +468,28 @@ impl LockManager {
     // ------------------------------------------------------------------
     // Public acquire helpers
     // ------------------------------------------------------------------
+
+    /// Takes the locations lock without waiting. Moves and destructive scans can be retried
+    /// when the current holder finishes.
+    pub fn try_instance_locations(&self, operation: &str) -> LauncherResult<LockGuard> {
+        self.acquire_with_timeout(
+            LockResource::InstanceLocations,
+            operation,
+            Duration::ZERO,
+            None,
+        )
+    }
+
+    /// Takes the locations lock with a short bounded wait. Use where a passing collision with an
+    /// instance move or another scan is routine and waiting a few seconds avoids a spurious error.
+    pub fn wait_instance_locations(&self, operation: &str) -> LauncherResult<LockGuard> {
+        self.acquire_with_timeout(
+            LockResource::InstanceLocations,
+            operation,
+            SHORT_INSTANCE_LOCATIONS_WAIT,
+            None,
+        )
+    }
 
     fn prepare(&self, resource: &LockResource) -> LauncherResult<(String, PathBuf, PathBuf)> {
         let lock_name = resource.lock_name()?;

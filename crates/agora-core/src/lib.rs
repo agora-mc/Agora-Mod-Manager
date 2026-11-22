@@ -115,4 +115,6 @@ pub mod version_changelogs;
 pub mod version_match;
 
 #[cfg(test)]
+mod instance_location_tests;
+#[cfg(test)]
 mod test_root;

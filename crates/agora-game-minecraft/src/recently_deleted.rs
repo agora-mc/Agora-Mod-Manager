@@ -19,8 +19,12 @@
 //! them.
 
 use crate::instance_service::TrashFn;
-use agora_core::app_paths::validate_path_component;
-use agora_core::error::{LauncherError, LauncherResult};
+use agora_core::{
+    app_paths::validate_path_component,
+    ctx::Ctx,
+    error::{LauncherError, LauncherResult},
+    lock_manager::LockResource,
+};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -688,7 +692,7 @@ fn expires_at(deleted_at: &str, retention_days: i64) -> String {
 /// lock held and the row still present; deletes the row (and its cascade)
 /// last. On any failure nothing is changed.
 pub(crate) fn stash_instance(
-    root: &Path,
+    ctx: &Ctx,
     conn: &Connection,
     row: &agora_core::models::InstanceRow,
     instance_dir: &Path,
@@ -726,10 +730,11 @@ pub(crate) fn stash_instance(
     let bytes = serde_json::to_vec_pretty(&stored)
         .map_err(|e| err("ERR_INSTANCE_DELETE", format!("Cannot record entry: {e}")))?;
 
-    let dir = entry_dir(root, &entry_id)?;
+    let dir = entry_dir(&ctx.paths.recently_deleted_root(), &entry_id)?;
     let abandon = |dir: &Path| {
         let _ = std::fs::remove_dir_all(dir);
     };
+    let locations = ctx.lock_manager.try_instance_locations("delete")?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| io_err("ERR_INSTANCE_DELETE", "Cannot create Recently deleted", e))?;
     let tmp = dir.join("entry.json.tmp");
@@ -740,7 +745,9 @@ pub(crate) fn stash_instance(
         return Err(io_err("ERR_INSTANCE_DELETE", "Cannot record entry", e));
     }
     let target = dir.join(INSTANCE_SUBDIR);
-    if let Err(e) = std::fs::rename(instance_dir, &target) {
+    let moved = std::fs::rename(instance_dir, &target);
+    drop(locations);
+    if let Err(e) = moved {
         abandon(&dir);
         return Err(err(
             "ERR_INSTANCE_DELETE",
@@ -751,11 +758,18 @@ pub(crate) fn stash_instance(
         ));
     }
     if let Err(e) = delete_instance_rows(conn, &row.instance_id) {
-        match std::fs::rename(&target, instance_dir) {
-            Ok(()) => abandon(&dir),
-            Err(_) => {
-                // The files could not go back; keep the entry so they stay
-                // reachable and restorable.
+        match ctx
+            .lock_manager
+            .acquire(LockResource::InstanceLocations, "delete rollback")
+        {
+            Ok(_locations) => {
+                if std::fs::rename(&target, instance_dir).is_ok() {
+                    abandon(&dir);
+                }
+            }
+            // Keep the entry if the files could not go back.
+            Err(rollback) => {
+                eprintln!("could not lock instance locations to roll back: {rollback}")
             }
         }
         return Err(e);
@@ -808,19 +822,20 @@ pub(crate) fn choose_restore_id(
     ))
 }
 
-/// Restore an entry. Caller holds the lock for `new_id`.
+/// Restore an entry. Caller holds the lock for its original instance id.
 pub(crate) fn restore_entry(
-    root: &Path,
+    ctx: &Ctx,
     entry_id: &str,
     conn: &mut Connection,
     instances_root: &Path,
     is_free: &dyn Fn(&str) -> bool,
 ) -> LauncherResult<RestoreOutcome> {
-    let stored = read_entry(root, entry_id)?;
+    let root = ctx.paths.recently_deleted_root();
+    let stored = read_entry(&root, entry_id)?;
     let original = stored.info.instance_id.clone();
     validate_path_component(&original)?;
     let (new_id, renamed) = choose_restore_id(&original, is_free)?;
-    let source = entry_dir(root, entry_id)?.join(INSTANCE_SUBDIR);
+    let source = entry_dir(&root, entry_id)?.join(INSTANCE_SUBDIR);
     let dest = instances_root.join(&new_id);
     if std::fs::symlink_metadata(&dest).is_ok() {
         return Err(err(
@@ -828,6 +843,7 @@ pub(crate) fn restore_entry(
             "A folder already exists where this instance would be restored.",
         ));
     }
+    let locations = ctx.lock_manager.try_instance_locations("restore")?;
     std::fs::create_dir_all(instances_root)
         .map_err(|e| io_err("ERR_INSTANCE_RESTORE", "Cannot prepare instances folder", e))?;
 
@@ -861,7 +877,9 @@ pub(crate) fn restore_entry(
             let _ = std::fs::write(&manifest_path, bytes);
         }
     };
-    if let Err(e) = std::fs::rename(&source, &dest) {
+    let moved = std::fs::rename(&source, &dest);
+    drop(locations);
+    if let Err(e) = moved {
         undo_manifest(&original_manifest);
         return Err(io_err(
             "ERR_INSTANCE_RESTORE",
@@ -870,14 +888,24 @@ pub(crate) fn restore_entry(
         ));
     }
     if let Err(e) = replay_db_state(conn, &stored.db, &original, &new_id, new_name.as_deref()) {
-        if std::fs::rename(&dest, &source).is_ok() {
-            undo_manifest(&original_manifest);
+        match ctx
+            .lock_manager
+            .acquire(LockResource::InstanceLocations, "restore rollback")
+        {
+            Ok(_locations) => {
+                if std::fs::rename(&dest, &source).is_ok() {
+                    undo_manifest(&original_manifest);
+                }
+            }
+            Err(rollback) => {
+                eprintln!("could not lock instance locations to roll back: {rollback}")
+            }
         }
         return Err(e);
     }
     // Committed. Tidy the (now empty) entry; if that fails the entry is
     // skipped by listing because its instance folder is gone.
-    let dir = entry_dir(root, entry_id)?;
+    let dir = entry_dir(&root, entry_id)?;
     let _ = std::fs::remove_file(dir.join(ENTRY_FILE));
     let _ = std::fs::remove_dir(&dir);
     Ok(RestoreOutcome {
@@ -889,8 +917,9 @@ pub(crate) fn restore_entry(
 
 /// Send one entry to the OS trash. The links inside are detached first; any
 /// failure leaves the entry in place.
-pub fn purge_entry(root: &Path, entry_id: &str, trash: &TrashFn) -> LauncherResult<()> {
-    let dir = entry_dir(root, entry_id)?;
+pub fn purge_entry(ctx: &Ctx, entry_id: &str, trash: &TrashFn) -> LauncherResult<()> {
+    let root = ctx.paths.recently_deleted_root();
+    let dir = entry_dir(&root, entry_id)?;
     // Refuse anything that is not a plain folder directly under the root.
     if !is_plain_dir(&dir) {
         return Err(err(
@@ -898,6 +927,16 @@ pub fn purge_entry(root: &Path, entry_id: &str, trash: &TrashFn) -> LauncherResu
             "Entry is not a plain folder; leaving it alone.",
         ));
     }
+    let stored = read_entry_file(&root, entry_id)?;
+    let _instance = ctx.lock_manager.acquire_with_timeout(
+        LockResource::Instance(stored.info.instance_id),
+        "purge",
+        std::time::Duration::ZERO,
+        None,
+    )?;
+    // Re-check after taking the instance lock, since a restore might have removed the entry.
+    read_entry(&root, entry_id)?;
+    let _locations = ctx.lock_manager.try_instance_locations("purge")?;
     let links = detach_links(&dir).map_err(|e| {
         io_err(
             "ERR_INSTANCE_DELETE",
@@ -923,24 +962,25 @@ pub fn purge_entry(root: &Path, entry_id: &str, trash: &TrashFn) -> LauncherResu
 /// total fits the size budget. Also removes empty shells left by a restore
 /// whose tidy-up failed. Never errors as a whole: failures are counted.
 pub fn cleanup(
-    root: &Path,
+    ctx: &Ctx,
     now: chrono::DateTime<chrono::Utc>,
     trash: &TrashFn,
     retention_days: i64,
 ) -> CleanupSummary {
-    cleanup_with_budget(root, now, trash, SIZE_BUDGET_BYTES, retention_days)
+    cleanup_with_budget(ctx, now, trash, SIZE_BUDGET_BYTES, retention_days)
 }
 
 pub(crate) fn cleanup_with_budget(
-    root: &Path,
+    ctx: &Ctx,
     now: chrono::DateTime<chrono::Utc>,
     trash: &TrashFn,
     budget: u64,
     retention_days: i64,
 ) -> CleanupSummary {
     let mut summary = CleanupSummary::default();
+    let root = ctx.paths.recently_deleted_root();
     // Truly empty folders hold nothing; `remove_dir` refuses anything else.
-    if let Ok(read) = std::fs::read_dir(root) {
+    if let Ok(read) = std::fs::read_dir(&root) {
         for item in read.filter_map(Result::ok) {
             let path = item.path();
             if is_plain_dir(&path) {
@@ -948,7 +988,7 @@ pub(crate) fn cleanup_with_budget(
             }
         }
     }
-    let mut entries = list_entries(root, retention_days);
+    let mut entries = list_entries(&root, retention_days);
     entries.sort_by(|a, b| a.deleted_at.cmp(&b.deleted_at)); // oldest first
     let mut total: u64 = entries.iter().map(|e| e.size_bytes).sum();
     for entry in entries {
@@ -960,7 +1000,7 @@ pub(crate) fn cleanup_with_budget(
             summary.kept += 1;
             continue;
         }
-        match purge_entry(root, &entry.entry_id, trash) {
+        match purge_entry(ctx, &entry.entry_id, trash) {
             Ok(()) => {
                 summary.purged += 1;
                 total = total.saturating_sub(entry.size_bytes);

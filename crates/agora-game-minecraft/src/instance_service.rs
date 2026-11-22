@@ -2,10 +2,10 @@
 
 use crate::clone::ClonePrefs;
 use crate::loader_service::LoaderService;
-use agora_core::ctx::Ctx;
 use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::event_sink::{CoreEvent, EventStatus, ProgressEvent, ProgressPhase};
 use agora_core::models::{InstanceManifest, InstanceRow};
+use agora_core::{ctx::Ctx, lock_manager::LockResource};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -1133,10 +1133,11 @@ impl InstanceService {
             .ctx
             .operation_manager
             .register_for_instance("Delete instance", &instance_id);
-        let _lock = match self.ctx.lock_manager.acquire(
-            agora_core::lock_manager::LockResource::Instance(instance_id.clone()),
-            "delete",
-        ) {
+        let _lock = match self
+            .ctx
+            .lock_manager
+            .acquire(LockResource::Instance(instance_id.clone()), "delete")
+        {
             Ok(l) => l,
             Err(e) => {
                 op.fail(e.to_string());
@@ -1177,7 +1178,7 @@ impl InstanceService {
         let dir = self.ctx.paths.instance_dir(&instance_id)?;
         let result = if std::fs::symlink_metadata(&dir).is_ok() {
             crate::recently_deleted::stash_instance(
-                &self.ctx.paths.recently_deleted_root(),
+                &self.ctx,
                 &conn,
                 &row,
                 &dir,
@@ -1264,10 +1265,11 @@ impl InstanceService {
             .ctx
             .operation_manager
             .register_for_instance("Restore instance", &original);
-        let _lock = match self.ctx.lock_manager.acquire(
-            agora_core::lock_manager::LockResource::Instance(original.clone()),
-            "restore",
-        ) {
+        let _lock = match self
+            .ctx
+            .lock_manager
+            .acquire(LockResource::Instance(original.clone()), "restore")
+        {
             Ok(l) => l,
             Err(e) => {
                 op.fail(e.to_string());
@@ -1290,7 +1292,7 @@ impl InstanceService {
                 && matches!(agora_core::db::get_instance(&probe, candidate), Ok(None))
         };
         match crate::recently_deleted::restore_entry(
-            &root,
+            &self.ctx,
             entry_id,
             &mut conn,
             &paths.instances_root(),
@@ -1309,11 +1311,7 @@ impl InstanceService {
 
     /// Send one deleted instance to the OS trash now ("Delete now").
     pub fn purge_deleted(&self, entry_id: &str, trash: &TrashFn) -> LauncherResult<()> {
-        crate::recently_deleted::purge_entry(
-            &self.ctx.paths.recently_deleted_root(),
-            entry_id,
-            trash,
-        )
+        crate::recently_deleted::purge_entry(&self.ctx, entry_id, trash)
     }
 
     /// Cleanup pass: entries older than `retention_days` or over the size
@@ -1332,7 +1330,7 @@ impl InstanceService {
             );
         }
         crate::recently_deleted::cleanup(
-            &self.ctx.paths.recently_deleted_root(),
+            &self.ctx,
             chrono::DateTime::<chrono::Utc>::from(self.ctx.clock.now()),
             trash,
             retention_days,
@@ -3468,6 +3466,84 @@ $#
         }
 
         #[test]
+        fn instance_locations_blocks_minecraft_delete() {
+            let tmp = tempfile::tempdir().unwrap();
+            let ctx = Ctx::for_testing(tmp.path().to_path_buf());
+            agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+            seed(&ctx, "pack");
+            let service = InstanceService::new(ctx.clone());
+            let _held = ctx
+                .lock_manager
+                .acquire(LockResource::InstanceLocations, "scan")
+                .unwrap();
+
+            let dir = ctx.paths.instance_dir("pack").unwrap();
+            let before = files_of(&dir);
+            let result = service.delete("pack");
+            assert!(dir.is_dir(), "the contended delete moved the instance");
+            assert_eq!(files_of(&dir), before);
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("instance-locations"));
+        }
+
+        fn parked_instance() -> (tempfile::TempDir, Ctx, String) {
+            let tmp = tempfile::tempdir().unwrap();
+            let ctx = Ctx::for_testing(tmp.path().to_path_buf());
+            agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+            seed(&ctx, "pack");
+            let service = InstanceService::new(ctx.clone());
+            service.delete("pack").unwrap();
+            let entry = service.list_recently_deleted(DAYS).unwrap().remove(0);
+            (tmp, ctx, entry.entry_id)
+        }
+
+        #[test]
+        fn instance_locations_blocks_minecraft_restore() {
+            let (_tmp, ctx, entry) = parked_instance();
+            let service = InstanceService::new(ctx.clone());
+            let dir = ctx.paths.recently_deleted_root().join(&entry);
+            let before = files_of(&dir);
+            let _held = ctx
+                .lock_manager
+                .acquire(LockResource::InstanceLocations, "scan")
+                .unwrap();
+
+            let restore = service.restore_deleted(&entry);
+            assert!(dir.is_dir(), "the contended restore moved the instance");
+            assert!(restore
+                .unwrap_err()
+                .to_string()
+                .contains("instance-locations"));
+            assert_eq!(files_of(&dir), before);
+        }
+
+        #[test]
+        fn instance_locations_blocks_minecraft_purge() {
+            let (tmp, ctx, entry) = parked_instance();
+            let service = InstanceService::new(ctx.clone());
+            let dir = ctx.paths.recently_deleted_root().join(&entry);
+            let (trash, seen) = fake_trash(tmp.path().join("bin"));
+            let before = files_of(&dir);
+            let _held = ctx
+                .lock_manager
+                .acquire(LockResource::InstanceLocations, "scan")
+                .unwrap();
+
+            let purge = service.purge_deleted(&entry, &trash);
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "the contended purge sent the entry to trash"
+            );
+            assert!(purge
+                .unwrap_err()
+                .to_string()
+                .contains("instance-locations"));
+            assert_eq!(files_of(&dir), before);
+        }
+
+        #[test]
         fn delete_lists_then_restore_is_identical() {
             let (ctx, root) = context();
             seed(&ctx, "pack");
@@ -3706,7 +3782,7 @@ $#
             let (trash, seen) = fake_trash(root.join("bin"));
             // Room for two of the three: only the oldest goes.
             let summary = crate::recently_deleted::cleanup_with_budget(
-                &ctx.paths.recently_deleted_root(),
+                &ctx,
                 chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()),
                 &trash,
                 each * 2 + 10,

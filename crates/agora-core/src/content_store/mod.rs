@@ -657,16 +657,34 @@ impl Drop for StagingGuard {
 
 fn clean_staging_dir(paths: &AppPaths) {
     let staging_root = paths.content_staging_dir();
-    if staging_root.exists() {
-        if let Ok(entries) = std::fs::read_dir(&staging_root) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    let _ = std::fs::remove_dir_all(&p);
-                } else {
-                    let _ = std::fs::remove_file(&p);
-                }
+    let entries = match std::fs::read_dir(&staging_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            eprintln!(
+                "[content] staging sweep skipped: cannot list {}: {error}",
+                staging_root.display()
+            );
+            return;
+        }
+    };
+    // Decide the whole sweep before deleting anything: one entry that cannot
+    // be listed makes the listing incomplete, so nothing is removed on a guess.
+    let mut to_remove = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => to_remove.push(entry.path()),
+            Err(error) => {
+                eprintln!("[content] staging sweep skipped: an entry could not be listed: {error}");
+                return;
             }
+        }
+    }
+    for p in to_remove {
+        if p.is_dir() {
+            let _ = std::fs::remove_dir_all(&p);
+        } else {
+            let _ = std::fs::remove_file(&p);
         }
     }
 }
@@ -2414,7 +2432,8 @@ pub fn remove_item_with_options(
         Ok(item) => item.files.iter().map(|file| file.sha256.clone()).collect(),
         Err(_) => Vec::new(),
     };
-    let usage = crate::library::instances_using(ctx, &item_id, &target_hashes);
+    let locations = ctx.lock_manager.try_instance_locations("content-remove")?;
+    let usage = crate::library::instances_using_locked(ctx, &item_id, &target_hashes);
 
     if let Some(unreadable) = usage.unreadable.first() {
         return Err(ContentError::UnreadableManifest {
@@ -2454,13 +2473,11 @@ pub fn remove_item_with_options(
     // snapshot still holds would make that restore point unusable, so it refuses, naming the
     // snapshots and the command that deletes each. An unreadable snapshot manifest refuses too
     // (it might name any item) unless the caller explicitly overrides it.
-    let snapshot_usage =
-        crate::game_snapshot::snapshots_using_content(ctx, &item_id).map_err(|error| {
-            ContentError::UnreadableManifest {
-                item_id: item_id.clone(),
-                manifest: "game-instance snapshots".into(),
-                error,
-            }
+    let snapshot_usage = crate::game_snapshot::snapshots_using_content_locked(ctx, &item_id)
+        .map_err(|error| ContentError::UnreadableManifest {
+            item_id: item_id.clone(),
+            manifest: "game-instance snapshots".into(),
+            error,
         })?;
     if !snapshot_usage.using.is_empty() {
         let mut instance_ids: Vec<String> = snapshot_usage
@@ -2536,7 +2553,7 @@ pub fn remove_item_with_options(
     // A damaged target has no readable object hashes, so a Minecraft instance that recorded only
     // an object hash cannot be seen as using it. Refuse rather than delete files an instance may
     // still need; removing the record alone would let the next sweep delete them.
-    if parsed_target.is_err() && crate::library::any_instance_records_objects(ctx) {
+    if parsed_target.is_err() && usage.records_objects {
         return Err(ContentError::UnreadableManifest {
             item_id,
             manifest: target_manifest_path.display().to_string(),
@@ -2545,29 +2562,39 @@ pub fn remove_item_with_options(
                 .into(),
         });
     }
+    drop(locations);
     // 1. Read every other manifest, noting whether any is unreadable.
     let items_dir = ctx.paths.content_items_dir();
     let mut other_items = Vec::new();
     let mut an_other_record_is_unreadable = false;
 
-    if items_dir.exists() {
-        for entry in std::fs::read_dir(&items_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if stem == item_id {
-                        continue;
-                    }
-                    let parsed = std::fs::read_to_string(&path)
-                        .map_err(|e| e.to_string())
-                        .and_then(|content| {
-                            serde_json::from_str::<ContentItem>(&content).map_err(|e| e.to_string())
-                        });
-                    match parsed {
-                        Ok(item) => other_items.push(item),
-                        Err(_) => an_other_record_is_unreadable = true,
-                    }
+    let item_entries: Vec<_> = match std::fs::read_dir(&items_dir) {
+        Ok(entries) => entries.collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(ContentError::UnreadableManifest {
+                item_id,
+                manifest: items_dir.display().to_string(),
+                error: error.to_string(),
+            })
+        }
+    };
+    for entry in item_entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().map(|e| e == "json").unwrap_or(false) {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if stem == item_id {
+                    continue;
+                }
+                let parsed = std::fs::read_to_string(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|content| {
+                        serde_json::from_str::<ContentItem>(&content).map_err(|e| e.to_string())
+                    });
+                match parsed {
+                    Ok(item) => other_items.push(item),
+                    Err(_) => an_other_record_is_unreadable = true,
                 }
             }
         }
@@ -2601,18 +2628,69 @@ pub fn remove_item_with_options(
     //    removed item's own, and any an interrupted add left behind before writing its manifest.
     //    A failure here only leaves an unreferenced object for the next sweep.
     let objects_dir = ctx.paths.content_objects_dir();
-    if objects_dir.exists() && !an_other_record_is_unreadable {
-        for shard in std::fs::read_dir(&objects_dir)?.flatten() {
-            if !shard.path().is_dir() {
-                continue;
-            }
-            for object in std::fs::read_dir(shard.path())?.flatten() {
-                let obj_path = object.path();
-                let name = object.file_name().to_string_lossy().into_owned();
-                if obj_path.is_file() && !remaining_hashes.contains(&name) {
-                    let _ = protect::unprotect(&obj_path);
-                    let _ = std::fs::remove_file(&obj_path);
+    if !an_other_record_is_unreadable {
+        let shards = match std::fs::read_dir(&objects_dir) {
+            Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
+        .map_err(|error| ContentError::UnreadableManifest {
+            item_id: item_id.clone(),
+            manifest: objects_dir.display().to_string(),
+            error: error.to_string(),
+        })?;
+        let mut to_remove = Vec::new();
+        for shard in shards {
+            let path = shard.path();
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(ContentError::UnreadableManifest {
+                        item_id: item_id.clone(),
+                        manifest: path.display().to_string(),
+                        error: error.to_string(),
+                    })
                 }
+            }
+            let objects =
+                std::fs::read_dir(&path).map_err(|error| ContentError::UnreadableManifest {
+                    item_id: item_id.clone(),
+                    manifest: path.display().to_string(),
+                    error: error.to_string(),
+                })?;
+            for object in objects {
+                let object = object.map_err(|error| ContentError::UnreadableManifest {
+                    item_id: item_id.clone(),
+                    manifest: path.display().to_string(),
+                    error: error.to_string(),
+                })?;
+                to_remove.push(object.path());
+            }
+        }
+        // A whole listing that cannot be read must not turn into "nothing to
+        // keep": collect first, then delete only from a complete picture.
+        for obj_path in to_remove {
+            let name = obj_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match std::fs::symlink_metadata(&obj_path) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(ContentError::UnreadableManifest {
+                        item_id: item_id.clone(),
+                        manifest: obj_path.display().to_string(),
+                        error: error.to_string(),
+                    })
+                }
+            }
+            if !remaining_hashes.contains(&name) {
+                let _ = protect::unprotect(&obj_path);
+                let _ = std::fs::remove_file(&obj_path);
             }
         }
     }

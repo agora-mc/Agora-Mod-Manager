@@ -50,6 +50,20 @@ pub struct ConfirmableHash {
     pub sha256: String,
 }
 
+/// A hash Agora or a pack author asserted is blank. A blank assertion is never
+/// "no pin": it would silently drop a check the curator or pack asked for, so
+/// it is an error that names the item and the field it came from. A blank hash
+/// a third-party source published is *not* this error; that still means "the
+/// source published nothing" and is reported as an unverified install.
+pub fn blank_asserted_hash(item: &str, field: &str) -> crate::error::LauncherError {
+    crate::error::LauncherError::Generic {
+        code: "ERR_ASSERTED_HASH_BLANK".into(),
+        message: format!(
+            "'{item}' has a blank {field}; refusing to install without a valid hash for it."
+        ),
+    }
+}
+
 /// Whether `value` is a well-formed SHA-256 hex digest (64 hex characters).
 pub fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -117,6 +131,16 @@ pub fn verify_download(
     release: Option<&str>,
 ) -> crate::error::LauncherResult<DownloadCheck> {
     use crate::error::{HashConfirmation, LauncherError};
+
+    // Published blanks mean "the source published no hash" and are handled
+    // below. An expectation is different: it was asserted by a curator, a pack
+    // author or an earlier install, and a blank one is an error, not a check
+    // that can be skipped or a confirmation the user can answer.
+    for expected in expectations {
+        if expected.sha256.trim().is_empty() {
+            return Err(blank_asserted_hash(file, expected.origin.as_str()));
+        }
+    }
 
     let sha1 = published_sha1.unwrap_or("").trim().to_lowercase();
     let sha256 = published_sha256.unwrap_or("").trim().to_lowercase();
@@ -257,6 +281,32 @@ mod tests {
         let check = verify_download(b"x", Some(""), Some("   "), &[], false, "a.jar", None)
             .expect("accepted");
         assert!(!check.verified);
+    }
+
+    #[test]
+    fn a_blank_asserted_expectation_is_refused_not_treated_as_no_pin() {
+        for blank in ["", "   "] {
+            // `accept_confirmation` is true on purpose: a blank assertion is
+            // not something the user can confirm. It must be an error, while
+            // the blank published hashes stay "nothing published".
+            let error = verify_download(
+                b"x",
+                Some(""),
+                Some("   "),
+                std::slice::from_ref(&pin(blank)),
+                true,
+                "a.jar",
+                Some("v1"),
+            )
+            .expect_err("a blank assertion cannot be ignored or confirmed");
+            assert_eq!(error.code(), "ERR_ASSERTED_HASH_BLANK");
+            let message = error.to_string();
+            assert!(message.contains("a.jar"), "names the item: {message}");
+            assert!(
+                message.contains("curator_pin"),
+                "names the field: {message}"
+            );
+        }
     }
 
     #[test]

@@ -10,7 +10,9 @@ use crate::install_pipeline::{
 };
 use crate::resolver::Resolver;
 use ac::{
-    artifact_hash::{is_sha256_hex, verify_download, ConfirmableHash, HashOrigin},
+    artifact_hash::{
+        blank_asserted_hash, is_sha256_hex, verify_download, ConfirmableHash, HashOrigin,
+    },
     ctx::Ctx,
     dependency_ops::AliasMap,
     error::{LauncherError, LauncherResult},
@@ -572,9 +574,12 @@ impl InstallService {
         // agora_core::artifact_hash.
         let mut expectations = Vec::new();
         if let Some(required) = required_sha256 {
+            let required = required.trim().to_lowercase();
+            if required.is_empty() {
+                return Err(blank_asserted_hash(filename, "pack hash"));
+            }
             // A pack hash that is not a well-formed digest can never be matched, so
             // it is refused outright: confirming it would install an unchecked file.
-            let required = required.trim().to_lowercase();
             if !is_sha256_hex(&required) {
                 return Err(LauncherError::HashMismatch);
             }
@@ -583,10 +588,13 @@ impl InstallService {
                 sha256: required,
             });
         }
-        if let Some(pin) = pinned_sha256
-            .map(|hash| hash.trim().to_lowercase())
-            .filter(|hash| !hash.is_empty())
-        {
+        if let Some(pin) = pinned_sha256 {
+            let pin = pin.trim().to_lowercase();
+            // A blank curator pin is an assertion that cannot be checked, not
+            // an absent pin. Dropping it would install an unchecked file.
+            if pin.is_empty() {
+                return Err(blank_asserted_hash(filename, "curator pin"));
+            }
             expectations.push(ConfirmableHash {
                 origin: HashOrigin::CuratorPin,
                 sha256: pin,

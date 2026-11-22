@@ -6,6 +6,9 @@ use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
 
+use crate::app_paths::AppPaths;
+use crate::lock_manager::{LockGuard, LockManager};
+
 use sha2::Digest;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -518,16 +521,25 @@ struct LiveFileIndexEntry {
 /// root. Tests and callers that pass a standalone directory still get a
 /// sibling object store, while normal instances resolve to `<app>/snapshot-objects`.
 pub(crate) fn snapshot_objects_dir(instance_dir: &Path) -> PathBuf {
+    snapshot_app_root(instance_dir).join("snapshot-objects")
+}
+
+/// The app data root a live instance belongs to. Shared stores and the trash
+/// roots are siblings of `instances/`, so the same derivation serves every scan
+/// that starts from an instance directory alone.
+fn snapshot_app_root(instance_dir: &Path) -> PathBuf {
     let instances_root = instance_dir.parent().unwrap_or(instance_dir);
-    let app_root = if instances_root
+    if instances_root
         .file_name()
         .is_some_and(|name| name == "instances")
     {
-        instances_root.parent().unwrap_or(instances_root)
-    } else {
         instances_root
-    };
-    app_root.join("snapshot-objects")
+            .parent()
+            .unwrap_or(instances_root)
+            .to_path_buf()
+    } else {
+        instances_root.to_path_buf()
+    }
 }
 
 pub(crate) fn snapshot_blob_path(instance_dir: &Path, hash: &str) -> PathBuf {
@@ -2749,17 +2761,44 @@ pub fn lock_snapshots(instance_dir: &Path) -> Result<Vec<Snapshot>, String> {
 
 /// List all snapshots for an instance.
 pub fn list_snapshots(instance_dir: &Path) -> Result<Vec<Snapshot>, String> {
+    list_snapshots_with(instance_dir, |path| fs::symlink_metadata(path))
+}
+
+/// Listing with the metadata lookups injected, so a failed lookup can be
+/// exercised without depending on the OS to fail on cue. The public wrapper
+/// always stats the real filesystem.
+fn list_snapshots_with(
+    instance_dir: &Path,
+    metadata: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<Vec<Snapshot>, String> {
     let marker = instance_dir.join(RESTORE_MARKER);
-    if marker.exists() {
-        return Err(
-            "Previous restore was interrupted. Check .agora_pre_restore/ for backed-up files."
-                .into(),
-        );
+    match metadata(&marker) {
+        Ok(_) => {
+            return Err(
+                "Previous restore was interrupted. Check .agora_pre_restore/ for backed-up files."
+                    .into(),
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot check restore marker {}: {error}",
+                marker.display()
+            ))
+        }
     }
 
     let dir = snapshots_dir(instance_dir);
-    if !dir.is_dir() {
-        return Ok(Vec::new());
+    match metadata(&dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect snapshots dir {}: {error}",
+                dir.display()
+            ))
+        }
     }
 
     let mut snapshots = Vec::new();
@@ -2828,15 +2867,33 @@ pub fn list_snapshots(instance_dir: &Path) -> Result<Vec<Snapshot>, String> {
     Ok(snapshots)
 }
 
-/// Delete a snapshot.
+/// Delete a snapshot. A user-requested delete waits briefly for a passing instance move or scan;
+/// if the lock is still busy it refuses, with the holder named in the retry message.
 pub fn delete_snapshot(instance_dir: &Path, snapshot_id: &str) -> Result<(), String> {
+    let locations = lock_snapshot_locations(instance_dir, "snapshot-delete", true)?;
+    delete_snapshot_with(
+        instance_dir,
+        snapshot_id,
+        list_snapshot_scan_dir,
+        &locations,
+    )
+}
+
+/// Delete a snapshot whose caller already holds InstanceLocations. The guard is proof the
+/// non-reentrant lock is held: retention takes it once for a whole round and passes it to every
+/// delete, so no delete tries to take the lock again.
+pub(super) fn delete_snapshot_with(
+    instance_dir: &Path,
+    snapshot_id: &str,
+    list_dir: impl Fn(&Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>>,
+    _locations: &LockGuard,
+) -> Result<(), String> {
     validate_snapshot_id(snapshot_id)?;
     let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
     let zip_path = snapshot_zip_path(instance_dir, snapshot_id);
     if !manifest_path.exists() && !zip_path.exists() {
         return Err(format!("snapshot {snapshot_id} not found"));
     }
-
     let mut blobs = Vec::new();
     if manifest_path.is_file() {
         if let Ok(manifest) = read_manifest_file(&manifest_path, snapshot_id) {
@@ -2861,7 +2918,7 @@ pub fn delete_snapshot(instance_dir: &Path, snapshot_id: &str) -> Result<(), Str
     let _ = fs::remove_file(snapshot_fingerprint_path(instance_dir, snapshot_id));
 
     for hash in blobs {
-        if !blob_is_referenced_by_any_snapshot(instance_dir, &hash) {
+        if !blob_is_referenced_by_any_snapshot(instance_dir, &hash, &list_dir) {
             let path = snapshot_blob_path(instance_dir, &hash);
             let _ = fs::remove_file(&path);
             if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
@@ -2886,6 +2943,34 @@ pub fn delete_snapshot(instance_dir: &Path, snapshot_id: &str) -> Result<(), Str
     Ok(())
 }
 
+/// Take instance locations for snapshot cleanup. `wait` uses the short bounded wait for operations
+/// where a passing collision should resolve itself; without it a busy lock is refused at once.
+pub(crate) fn lock_snapshot_locations(
+    instance_dir: &Path,
+    operation: &str,
+    wait: bool,
+) -> Result<LockGuard, String> {
+    let paths = AppPaths::from_root(snapshot_app_root(instance_dir));
+    let manager = LockManager::new(paths.locks_root());
+    let acquired = if wait {
+        manager.wait_instance_locations(operation)
+    } else {
+        manager.try_instance_locations(operation)
+    };
+    acquired.map_err(|error| format!("snapshot cleanup could not lock instance locations: {error}"))
+}
+
+pub(super) fn list_snapshot_scan_dir(dir: &Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>> {
+    fs::read_dir(dir).map(|entries| {
+        entries
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect()
+    })
+}
+
+/// The reachability scan with its directory listing injected, so a listing
+/// entry that fails can be exercised without depending on the OS to fail on
+/// cue. The caller holds InstanceLocations and production always lists the real filesystem.
 /// Whether a blob may still be needed by some snapshot.
 ///
 /// Fails closed: the object store is shared by every instance, so if any
@@ -2893,22 +2978,77 @@ pub fn delete_snapshot(instance_dir: &Path, snapshot_id: &str) -> Result<(), Str
 /// violation and a half-written file look the same), the blob is reported as
 /// referenced and kept. Leaving an orphan blob costs disk space; deleting a
 /// needed one costs a restore point.
-fn blob_is_referenced_by_any_snapshot(instance_dir: &Path, hash: &str) -> bool {
-    if validate_blob_hash(hash).is_err() {
-        return false;
+fn blob_is_referenced_by_any_snapshot(
+    instance_dir: &Path,
+    hash: &str,
+    list_dir: impl Fn(&Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>>,
+) -> bool {
+    if let Err(error) = validate_blob_hash(hash) {
+        // A malformed hash cannot be compared, so reachability is unknown. Both
+        // production callers filter hashes before reaching here; keep the blob
+        // rather than rely on that forever.
+        eprintln!("snapshot blob cleanup skipped: invalid blob hash: {error}");
+        return true;
     }
     let instances_root = instance_dir.parent().unwrap_or(instance_dir);
-    let mut dirs: Vec<PathBuf> = match fs::read_dir(instances_root) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path().join(".agora_snapshots"))
-            .collect(),
+    let mut dirs: Vec<PathBuf> = match list_dir(instances_root) {
+        Ok(entries) => {
+            let mut dirs = Vec::new();
+            for entry in entries {
+                match entry {
+                    Ok(entry) => dirs.push(entry.join(".agora_snapshots")),
+                    Err(error) => {
+                        eprintln!(
+                            "snapshot blob cleanup skipped: cannot list an instance: {error}"
+                        );
+                        return true;
+                    }
+                }
+            }
+            dirs
+        }
         Err(error) => {
             eprintln!("snapshot blob cleanup skipped: cannot list instances: {error}");
             return true;
         }
     };
     dirs.push(snapshots_dir(instance_dir));
+
+    // A deleted instance keeps its `.agora_snapshots` inside the moved folder,
+    // so it can still be restored. Both trash roots are siblings of `instances`
+    // under the app data root, which `AppPaths` already owns; core needs no
+    // knowledge of the game that put the instance there.
+    let app_root = snapshot_app_root(instance_dir);
+    let paths = AppPaths::from_root(app_root);
+    for root in [
+        paths.recently_deleted_root(),
+        paths.recently_deleted_games_root(),
+    ] {
+        let entries = match list_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                eprintln!(
+                    "snapshot blob cleanup skipped: cannot list trash root {}: {error}",
+                    root.display()
+                );
+                return true;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    eprintln!(
+                        "snapshot blob cleanup skipped: cannot list a trash entry in {}: {error}",
+                        root.display()
+                    );
+                    return true;
+                }
+            };
+            dirs.push(entry.join("instance").join(".agora_snapshots"));
+        }
+    }
 
     for dir in dirs {
         let entries = match fs::read_dir(&dir) {
@@ -2996,6 +3136,7 @@ pub fn prune_unreferenced_objects(instance_dir: &Path) -> Result<(), String> {
     if !root.is_dir() {
         return Ok(());
     }
+    let _locations = lock_snapshot_locations(instance_dir, "snapshot-prune", false)?;
     let prefixes =
         fs::read_dir(&root).map_err(|e| format!("failed to scan snapshot object store: {e}"))?;
     for prefix in prefixes {
@@ -3011,7 +3152,7 @@ pub fn prune_unreferenced_objects(instance_dir: &Path) -> Result<(), String> {
                 continue;
             };
             if validate_blob_hash(&hash).is_ok()
-                && !blob_is_referenced_by_any_snapshot(instance_dir, &hash)
+                && !blob_is_referenced_by_any_snapshot(instance_dir, &hash, list_snapshot_scan_dir)
             {
                 let _ = fs::remove_file(entry.path());
             }
@@ -3122,6 +3263,136 @@ mod tests {
             .filter_map(Result::ok)
             .map(|prefix| fs::read_dir(prefix.path()).unwrap().count())
             .sum()
+    }
+
+    fn hash_of_first_blob(dir: &Path, id: &str) -> String {
+        let manifest = read_manifest_file(&snapshot_manifest_path(dir, id), id).unwrap();
+        manifest
+            .files
+            .iter()
+            .filter_map(|file| file.blob_sha256.as_deref().or(file.sha256.as_deref()))
+            .next()
+            .expect("snapshot records a blob hash")
+            .to_string()
+    }
+
+    /// Two instances with identical content, so their snapshots share one blob
+    /// in the app-wide object store. The instances live under `<data>/instances`
+    /// so the reachability scan derives the right app root.
+    fn two_instances_sharing_a_blob(tmp: &TempDir) -> (PathBuf, PathBuf, String, Snapshot) {
+        let instances = tmp.path().join("instances");
+        let a = instances.join("inst-a");
+        let b = instances.join("inst-b");
+        for dir in [&a, &b] {
+            fs::create_dir_all(dir.join("mods")).unwrap();
+            fs::write(dir.join("mods").join("shared.jar"), b"same bytes in both").unwrap();
+        }
+        let snap_a = create_snapshot(&a, Some("a")).unwrap();
+        let _snap_b = create_snapshot(&b, Some("b")).unwrap();
+        let hash = hash_of_first_blob(&a, &snap_a.id);
+        (a, b, hash, snap_a)
+    }
+
+    #[test]
+    fn review_invalid_blob_hash_is_kept_not_treated_as_unreferenced() {
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("inst-a");
+        fs::create_dir_all(a.join("mods")).unwrap();
+        assert!(
+            super::blob_is_referenced_by_any_snapshot(&a, "not-a-sha256", list_snapshot_scan_dir),
+            "a malformed hash cannot prove a blob is safe to delete"
+        );
+    }
+
+    #[test]
+    fn review_list_snapshots_refuses_when_snapshot_folder_metadata_fails() {
+        let tmp = TempDir::new().unwrap();
+        let inst = tmp.path().join("inst");
+        fs::create_dir_all(&inst).unwrap();
+        let snapshots = snapshots_dir(&inst);
+        let error = super::list_snapshots_with(&inst, |path| {
+            if path == snapshots {
+                Err(std::io::Error::other("metadata unavailable"))
+            } else {
+                fs::symlink_metadata(path)
+            }
+        })
+        .expect_err("cannot tell whether snapshots exist, so listing must fail");
+        assert!(
+            error.to_string().contains("metadata unavailable"),
+            "the reason is reported: {error}"
+        );
+    }
+
+    #[test]
+    fn review_delete_keeps_blob_when_an_instance_entry_cannot_be_listed() {
+        let tmp = TempDir::new().unwrap();
+        let (a, b, hash, snap_a) = two_instances_sharing_a_blob(&tmp);
+        let instances_root = a.parent().unwrap().to_path_buf();
+        // delete_snapshot removes the manifest before it checks reachability,
+        // so only the other instance could still hold the blob.
+        fs::remove_file(snapshot_manifest_path(&a, &snap_a.id)).unwrap();
+        fs::rename(&b, tmp.path().join("moved-b")).unwrap();
+        // One entry of the instances root cannot be listed. It may hold a
+        // snapshot that needs the blob, so reachability cannot be decided.
+        let blocked = instances_root.clone();
+        let referenced = super::blob_is_referenced_by_any_snapshot(&a, &hash, |dir| {
+            if dir == blocked {
+                Ok(vec![Err(std::io::Error::other(
+                    "cannot list instance entry",
+                ))])
+            } else {
+                fs::read_dir(dir).map(|entries| entries.map(|e| e.map(|e| e.path())).collect())
+            }
+        });
+        assert!(
+            referenced,
+            "an unreadable instance entry must count as 'may reference' and keep the blob"
+        );
+    }
+
+    #[test]
+    fn review_delete_keeps_blob_referenced_only_from_each_trash_root() {
+        for trash_root in ["recently-deleted", "recently-deleted-games"] {
+            let tmp = TempDir::new().unwrap();
+            let (a, b, hash, snap_a) = two_instances_sharing_a_blob(&tmp);
+            let blob = snapshot_blob_path(&a, &hash);
+            assert!(blob.is_file(), "setup: shared blob should exist");
+
+            // The other snapshot travels with its instance into Recently
+            // deleted; its `.agora_snapshots` folder is inside the moved folder.
+            let trashed = tmp.path().join(trash_root).join("entry-b").join("instance");
+            fs::create_dir_all(trashed.parent().unwrap()).unwrap();
+            fs::rename(&b, &trashed).unwrap();
+
+            delete_snapshot(&a, &snap_a.id).unwrap();
+            assert!(
+                blob.is_file(),
+                "{trash_root}: blob needed only by a trashed snapshot was deleted"
+            );
+        }
+    }
+
+    #[test]
+    fn review_delete_keeps_blob_when_a_trash_root_cannot_be_listed() {
+        let tmp = TempDir::new().unwrap();
+        let instances = tmp.path().join("instances");
+        let a = instances.join("inst-a");
+        fs::create_dir_all(a.join("mods")).unwrap();
+        fs::write(a.join("mods").join("only.jar"), b"only here").unwrap();
+        let snap = create_snapshot(&a, Some("a")).unwrap();
+        let hash = hash_of_first_blob(&a, &snap.id);
+        let blob = snapshot_blob_path(&a, &hash);
+
+        // The root exists but cannot be listed (a file where a directory was
+        // expected). There may be a snapshot in it: "can't tell" keeps the blob.
+        fs::write(tmp.path().join("recently-deleted"), b"not a directory").unwrap();
+
+        delete_snapshot(&a, &snap.id).unwrap();
+        assert!(
+            blob.is_file(),
+            "an unreadable trash root must keep the blob"
+        );
     }
 
     // Shared blobs live in one app-wide object store. An unreadable sibling

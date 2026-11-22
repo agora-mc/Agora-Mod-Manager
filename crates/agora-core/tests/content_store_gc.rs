@@ -201,6 +201,74 @@ fn an_unreadable_minecraft_manifest_blocks_removal() {
     assert!(obj.exists(), "no object is swept");
 }
 
+#[test]
+fn review_a_malformed_instance_entry_blocks_removal() {
+    let (_tmp, ctx) = test_ctx();
+    let bytes = b"an item a damaged instance might use";
+    let item_id = add_bytes(&ctx, "Might Be Used", bytes);
+    let obj = object_path(&ctx, &sha256_hex(bytes));
+
+    // A damaged instance: the place where its manifest should be is a folder
+    // instead of a readable file. It cannot be read, so removal must not
+    // conclude that no instance uses the item.
+    let dir = ctx.paths.instance_dir("mc-damaged").unwrap();
+    std::fs::create_dir_all(dir.join("instance_manifest.json")).unwrap();
+
+    let error = remove_item(&ctx, &item_id).unwrap_err();
+    assert!(
+        matches!(error, ContentError::UnreadableManifest { .. }),
+        "an unreadable instance entry must refuse removal: {error:?}"
+    );
+    assert!(
+        ctx.paths.content_item_path(&item_id).exists(),
+        "the item is kept"
+    );
+    assert!(obj.exists(), "its object is kept");
+}
+
+#[test]
+fn review_a_snapshot_in_minecraft_trash_blocks_removal() {
+    let (_tmp, ctx) = test_ctx();
+    let bytes = b"an item held by a snapshot in Minecraft's Recently deleted";
+    let item_id = add_bytes(&ctx, "Held By Trashed Snapshot", bytes);
+    let obj = object_path(&ctx, &sha256_hex(bytes));
+
+    // A Minecraft trash entry keeps `<entry>/instance/.agora_snapshots` with
+    // its manifests. One of them names the item, so removing it would break a
+    // snapshot the player can still restore.
+    let snapshot_dir = ctx
+        .paths
+        .recently_deleted_root()
+        .join("entry-1")
+        .join("instance")
+        .join(".agora_snapshots");
+    std::fs::create_dir_all(&snapshot_dir).unwrap();
+    let manifest = serde_json::json!({
+        "schema_version": 4,
+        "snapshot": {
+            "id": "snap-1",
+            "label": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "file_count": 0,
+            "size_estimate": 0
+        },
+        "files": [],
+        "content_refs": [item_id]
+    });
+    std::fs::write(snapshot_dir.join("snap-1.json"), manifest.to_string()).unwrap();
+
+    let error = remove_item(&ctx, &item_id).unwrap_err();
+    assert!(
+        matches!(error, ContentError::InUse { .. }),
+        "a snapshot in Minecraft's trash still uses the item: {error:?}"
+    );
+    assert!(
+        ctx.paths.content_item_path(&item_id).exists(),
+        "the item is kept"
+    );
+    assert!(obj.exists(), "its object is kept");
+}
+
 // ---------------------------------------------------------------------------
 // 3. The unused listing only names items no instance uses
 // ---------------------------------------------------------------------------
