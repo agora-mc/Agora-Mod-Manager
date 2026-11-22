@@ -734,19 +734,13 @@ fn validate_rule(
 // Unhashed library detection
 // ---------------------------------------------------------------------------
 
-/// Check if a library has an upstream SHA-1 or SHA-256 hash.
+/// Check if a library publishes an upstream SHA-1.
+///
+/// "Publishes" means a non-blank one: a blank digest is what a manifest writes
+/// when it has no hash, and reading it as one would leave the library neither
+/// checked nor pinned from disk (see [`published_sha1s`]).
 fn has_upstream_hash(lib: &crate::launch::Library) -> bool {
-    if lib.sha1.is_some() {
-        return true;
-    }
-    if let Some(ref downloads) = lib.downloads {
-        if let Some(ref artifact) = downloads.artifact {
-            if artifact.sha1.is_some() {
-                return true;
-            }
-        }
-    }
-    false
+    !published_sha1s(lib).is_empty()
 }
 
 /// Every SHA-1 a profile publishes for a library: the artifact download's and
@@ -3208,6 +3202,84 @@ mod tests {
     // -----------------------------------------------------------------------
     // create_receipt_for_installed_profile tests
     // -----------------------------------------------------------------------
+
+    /// A blank published SHA-1 is not a published hash: the library is treated
+    /// as unhashed, so the receipt pins it from disk (and its bytes are then
+    /// known to adoption and the launch planner). Reading a blank digest as a
+    /// hash left the library neither pinned nor checked.
+    #[test]
+    fn a_library_with_only_a_blank_published_sha1_is_pinned_from_disk() {
+        // The digest may be blank on the library (`sha1`) or on its artifact.
+        for blank_on_the_artifact in [false, true] {
+            let fix = TempFixture::new();
+            let tuple = TempFixture::forge_tuple();
+            fix.write_base("1.21");
+
+            let mut profile = TempFixture::forge_profile_json();
+            let mut blank = json!({
+                "name": "org.example:blank:1.0",
+                "downloads": {
+                    "artifact": {
+                        "path": "org/example/blank/1.0/blank-1.0.jar",
+                        "url": "https://maven.minecraftforge.net/org/example/blank/1.0/blank-1.0.jar",
+                        "sha1": "not blank"
+                    }
+                }
+            });
+            if blank_on_the_artifact {
+                blank["downloads"]["artifact"]["sha1"] = serde_json::Value::String("   ".into());
+            } else {
+                blank["sha1"] = serde_json::Value::String(String::new());
+                blank["downloads"]["artifact"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("sha1");
+            }
+            profile["libraries"].as_array_mut().unwrap().push(blank);
+            fix.write_profile("forge-1.21-47.1.0", &profile);
+
+            let lib_dir = fix
+                .minecraft_dir
+                .join("libraries")
+                .join("org/example/blank/1.0");
+            fs::create_dir_all(&lib_dir).expect("create lib dir");
+            fs::write(lib_dir.join("blank-1.0.jar"), b"blank digest bytes").expect("write lib");
+
+            // The base fixture's own unhashed library is pinned too, so it has
+            // to exist before the blank-digest library is reached.
+            let legacy_dir = fix
+                .minecraft_dir
+                .join("libraries")
+                .join("net/minecraft/legacy/1.0");
+            fs::create_dir_all(&legacy_dir).expect("create legacy lib dir");
+            fs::write(
+                legacy_dir.join("legacy-1.0.jar"),
+                b"generated library content",
+            )
+            .expect("write legacy lib");
+
+            let receipt = create_receipt_for_installed_profile(
+                &fix.minecraft_dir,
+                &fix.receipts_root,
+                &tuple,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "https://maven.minecraftforge.net/forge.jar",
+                0,
+                &BTreeSet::new(),
+            )
+            .expect("a blank published digest is no hash to check");
+
+            assert_eq!(
+                receipt
+                    .generated_artifact_sha256
+                    .get("org/example/blank/1.0/blank-1.0.jar"),
+                Some(&sha256_hex(b"blank digest bytes")),
+                "a library whose only digest is blank must be pinned from disk \
+                 (blank on the artifact: {blank_on_the_artifact}): {:?}",
+                receipt.generated_artifact_sha256.keys().collect::<Vec<_>>()
+            );
+        }
+    }
 
     #[test]
     fn test_create_receipt_valid_forge() {
