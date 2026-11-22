@@ -345,11 +345,16 @@ pub fn game_activity(ctx: &Ctx, instance_id: &str) -> GameActivity {
 
 /// Refuse a change while the instance's game may be using it. `action` completes the sentence
 /// "close the game before ...". Only proven idle passes: running and "could not tell" both refuse.
+///
+/// The wording covers a launch that is only recorded as starting: `game_activity` cannot tell that
+/// apart from a running game (a `Starting` lease, or a `Running` one with no identity to verify,
+/// is [`GameActivity::Running`]), so the refusal says "running or still starting" rather than
+/// claiming a game the player could close.
 pub fn ensure_game_not_running(ctx: &Ctx, instance_id: &str, action: &str) -> Result<(), String> {
     match game_activity(ctx, instance_id) {
         GameActivity::Idle => Ok(()),
         GameActivity::Running => Err(format!(
-            "'{instance_id}' is running; close the game before {action}"
+            "'{instance_id}' is running or still starting; close the game before {action}"
         )),
         GameActivity::CouldNotTell(reason) => Err(format!(
             "could not tell whether '{instance_id}' is running ({reason}); refusing to {action}"
@@ -1039,6 +1044,24 @@ mod tests {
             }
             other => panic!("an unfinished launch must be can't-tell: {other:?}"),
         }
+    }
+
+    /// A launch that recorded no game identity is only *starting* as far as anyone knows, so the
+    /// refusal must not tell the player a game is running and to close it.
+    #[test]
+    fn a_starting_launch_is_refused_without_claiming_a_game_is_running() {
+        let (ctx, _tmp) = guard_ctx();
+        publish_starting(&ctx.paths, "demo").unwrap();
+
+        let refusal = ensure_game_not_running(&ctx, "demo", "take a snapshot").unwrap_err();
+        assert!(
+            refusal.contains("still starting"),
+            "the refusal must allow for a launch that is only starting: {refusal}"
+        );
+        assert!(
+            refusal.contains("before take a snapshot"),
+            "the refusal still names the action: {refusal}"
+        );
     }
 
     /// A lease record that cannot be read is can't-tell, never a grant.
