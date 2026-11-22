@@ -112,19 +112,24 @@ pub struct DownloadCheck {
 
 /// Decide whether downloaded bytes may be installed.
 ///
-/// * A hash the source published (`published_sha1` or `published_sha256`) must
-///   match the bytes. A mismatch fails with `HashMismatch`, and nothing overrides
-///   it. An empty value counts as nothing published; a malformed one never
-///   matches.
+/// * A hash the source published (`published_sha1`, `published_sha256` or
+///   `published_sha512`) must match the bytes. A mismatch fails with
+///   `HashMismatch`, and nothing overrides it. An empty value counts as nothing
+///   published; a malformed one never matches.
 /// * Every `expectations` entry (a curator pin, a hash remembered from an
 ///   earlier install) must match too. A mismatch fails with
 ///   `HashConfirmationRequired`, unless `accept_confirmation` is set.
 /// * When the source published no hash at all, the bytes are accepted and the
 ///   result is `verified: false`, so the caller can tell the user.
+// Three published digests are positional, in algorithm order and all
+// `Option<&str>`: a caller that names its own values at the call site stays
+// readable, and one aggregating them already holds them together.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_download(
     bytes: &[u8],
     published_sha1: Option<&str>,
     published_sha256: Option<&str>,
+    published_sha512: Option<&str>,
     expectations: &[ConfirmableHash],
     accept_confirmation: bool,
     file: &str,
@@ -144,17 +149,21 @@ pub fn verify_download(
 
     let sha1 = published_sha1.unwrap_or("").trim().to_lowercase();
     let sha256 = published_sha256.unwrap_or("").trim().to_lowercase();
+    let sha512 = published_sha512.unwrap_or("").trim().to_lowercase();
     let actual_sha256 = crate::download::sha256_hex(bytes);
 
     // Every hash the source published must match: a SHA-1 alone is weak, so when the source also
-    // published a SHA-256 that is checked too, never one in place of the other.
+    // published a SHA-256 or a SHA-512 that is checked too, never one in place of the other.
     if !sha256.is_empty() && actual_sha256 != sha256 {
+        return Err(LauncherError::HashMismatch);
+    }
+    if !sha512.is_empty() && crate::download::sha512_hex(bytes) != sha512 {
         return Err(LauncherError::HashMismatch);
     }
     if !sha1.is_empty() && crate::download::sha1_hex(bytes) != sha1 {
         return Err(LauncherError::HashMismatch);
     }
-    let verified = !sha256.is_empty() || !sha1.is_empty();
+    let verified = !sha256.is_empty() || !sha1.is_empty() || !sha512.is_empty();
 
     if !accept_confirmation {
         let unmet = all_unmet(&actual_sha256, expectations);
@@ -227,6 +236,7 @@ mod tests {
             bytes,
             None,
             Some(&digest_of(bytes)),
+            None,
             &[],
             false,
             "a.jar",
@@ -242,13 +252,23 @@ mod tests {
         let bytes = b"mod bytes";
         let sha1 = crate::download::sha1_hex(bytes);
         let wrong = "cd".repeat(32);
-        let error = verify_download(bytes, Some(&sha1), Some(&wrong), &[], true, "a.jar", None)
-            .expect_err("both published hashes must match");
+        let error = verify_download(
+            bytes,
+            Some(&sha1),
+            Some(&wrong),
+            None,
+            &[],
+            true,
+            "a.jar",
+            None,
+        )
+        .expect_err("both published hashes must match");
         assert_eq!(error.code(), "ERR_HASH_MISMATCH");
         let both = verify_download(
             bytes,
             Some(&sha1),
             Some(&digest_of(bytes)),
+            None,
             &[],
             false,
             "a.jar",
@@ -259,26 +279,63 @@ mod tests {
     }
 
     #[test]
+    fn a_published_sha512_is_checked_too() {
+        let bytes = b"mod bytes";
+        let sha512 = crate::download::sha512_hex(bytes);
+        let check = verify_download(bytes, None, None, Some(&sha512), &[], false, "a.jar", None)
+            .expect("a SHA-512 alone is a published hash");
+        assert!(
+            check.verified,
+            "the source published a hash, so the bytes count as verified"
+        );
+
+        // A matching SHA-256 does not stand in for a published SHA-512: every
+        // published digest describes the one file.
+        let wrong = "ab".repeat(64);
+        let error = verify_download(
+            bytes,
+            None,
+            Some(&digest_of(bytes)),
+            Some(&wrong),
+            &[],
+            true,
+            "a.jar",
+            None,
+        )
+        .expect_err("a SHA-512 mismatch is never overridable");
+        assert_eq!(error.code(), "ERR_HASH_MISMATCH");
+    }
+
+    #[test]
     fn a_published_digest_that_differs_is_a_hard_mismatch_even_when_accepted() {
         let bytes = b"mod bytes";
         let wrong = "cd".repeat(32);
-        let error = verify_download(bytes, None, Some(&wrong), &[], true, "a.jar", Some("v1"))
-            .expect_err("mismatch");
+        let error = verify_download(
+            bytes,
+            None,
+            Some(&wrong),
+            None,
+            &[],
+            true,
+            "a.jar",
+            Some("v1"),
+        )
+        .expect_err("mismatch");
         assert_eq!(error.code(), "ERR_HASH_MISMATCH");
     }
 
     #[test]
     fn no_published_hash_installs_as_not_verified_with_the_bytes_hash_recorded() {
         let bytes = b"old release file";
-        let check =
-            verify_download(bytes, None, None, &[], false, "a.jar", Some("v1")).expect("accepted");
+        let check = verify_download(bytes, None, None, None, &[], false, "a.jar", Some("v1"))
+            .expect("accepted");
         assert!(!check.verified);
         assert_eq!(check.sha256, digest_of(bytes));
     }
 
     #[test]
     fn an_empty_published_hash_is_nothing_published_not_a_match() {
-        let check = verify_download(b"x", Some(""), Some("   "), &[], false, "a.jar", None)
+        let check = verify_download(b"x", Some(""), Some("   "), None, &[], false, "a.jar", None)
             .expect("accepted");
         assert!(!check.verified);
     }
@@ -293,6 +350,7 @@ mod tests {
                 b"x",
                 Some(""),
                 Some("   "),
+                None,
                 std::slice::from_ref(&pin(blank)),
                 true,
                 "a.jar",
@@ -311,7 +369,7 @@ mod tests {
 
     #[test]
     fn a_malformed_published_hash_is_refused_not_treated_as_verified() {
-        let error = verify_download(b"x", None, Some("not-hex"), &[], false, "a.jar", None)
+        let error = verify_download(b"x", None, Some("not-hex"), None, &[], false, "a.jar", None)
             .expect_err("refused");
         assert_eq!(error.code(), "ERR_HASH_MISMATCH");
     }
@@ -325,6 +383,7 @@ mod tests {
         };
         let error = verify_download(
             bytes,
+            None,
             None,
             None,
             std::slice::from_ref(&pin),
@@ -347,6 +406,7 @@ mod tests {
             bytes,
             None,
             None,
+            None,
             std::slice::from_ref(&pin),
             true,
             "a.jar",
@@ -364,6 +424,7 @@ mod tests {
         };
         let error = verify_download(
             b"second download",
+            None,
             None,
             None,
             std::slice::from_ref(&remembered),
@@ -388,7 +449,7 @@ mod tests {
             sha256: digest_of(bytes),
         };
         let expectations = [pack.clone(), met, curator.clone()];
-        let error = verify_download(bytes, None, None, &expectations, false, "a.jar", None)
+        let error = verify_download(bytes, None, None, None, &expectations, false, "a.jar", None)
             .expect_err("asks");
         match error {
             crate::error::LauncherError::HashConfirmationRequired(detail) => {
@@ -416,8 +477,8 @@ mod tests {
             origin: HashOrigin::CuratorPin,
             sha256: digest_of(bytes),
         };
-        let check =
-            verify_download(bytes, None, None, &[pin], false, "a.jar", Some("v1")).expect("passes");
+        let check = verify_download(bytes, None, None, None, &[pin], false, "a.jar", Some("v1"))
+            .expect("passes");
         assert!(!check.verified);
     }
 }

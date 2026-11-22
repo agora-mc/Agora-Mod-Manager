@@ -162,11 +162,11 @@ pub(crate) async fn download_maven_library(
         return Ok((bytes, true));
     }
 
-    // No sidecar. A profile that carries the library's own SHA-256 (Fabric
-    // does; Quilt publishes nothing) has already published a hash for it, so
-    // the bytes are checked against that rather than treated as unhashed.
-    let (sha1, sha256) = declared_digests(artifact);
-    if sha1.is_some() || sha256.is_some() {
+    // No sidecar. A profile that carries the library's own digests (Fabric
+    // publishes SHA-1, SHA-256 and SHA-512; Quilt publishes nothing) has
+    // already published a hash for it, so the bytes are checked against those
+    // rather than treated as unhashed.
+    if !DeclaredDigests::of(artifact).is_empty() {
         let bytes = download_bytes_with_clients(clients, url).await?;
         verify_profile_digests(artifact, &bytes)?;
         return Ok((bytes, true));
@@ -183,44 +183,86 @@ pub(crate) async fn download_maven_library(
     Ok((download_bytes_with_clients(clients, url).await?, false))
 }
 
-/// The non-blank digests a profile publishes for a library, as `(sha1, sha256)`.
-fn declared_digests(artifact: &LibraryArtifact) -> (Option<&str>, Option<&str>) {
-    fn non_blank(value: Option<&String>) -> Option<&str> {
-        value
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
+/// The non-blank digests a profile publishes for a library.
+///
+/// Every algorithm a generated profile can carry is kept, because a profile
+/// that publishes more than one is checked against all of them: a SHA-1 alone
+/// is weak, and the resolution already merged the digests the library entry and
+/// its `downloads.artifact` publish. A blank digest is not a hash — the same
+/// rule [`agora_core::artifact_hash`] applies to a blank published digest
+/// anywhere else.
+#[derive(Clone, Copy, Default)]
+struct DeclaredDigests<'a> {
+    sha1: Option<&'a str>,
+    sha256: Option<&'a str>,
+    sha512: Option<&'a str>,
+}
+
+impl<'a> DeclaredDigests<'a> {
+    fn of(artifact: &'a LibraryArtifact) -> Self {
+        fn non_blank(value: &Option<String>) -> Option<&str> {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        }
+        Self {
+            sha1: non_blank(&artifact.sha1),
+            sha256: non_blank(&artifact.sha256),
+            sha512: non_blank(&artifact.sha512),
+        }
     }
-    (
-        non_blank(artifact.sha1.as_ref()),
-        non_blank(artifact.sha256.as_ref()),
-    )
+
+    fn is_empty(&self) -> bool {
+        self.sha1.is_none() && self.sha256.is_none() && self.sha512.is_none()
+    }
+
+    /// The published algorithms, for a refusal that says what it checked.
+    fn names(&self) -> String {
+        [
+            (self.sha1, "SHA-1"),
+            (self.sha256, "SHA-256"),
+            (self.sha512, "SHA-512"),
+        ]
+        .into_iter()
+        .filter_map(|(digest, name)| digest.map(|_| name))
+        .collect::<Vec<_>>()
+        .join("/")
+    }
 }
 
 /// Check downloaded bytes against the digests the loader profile publishes.
 ///
 /// These are the source's own published hashes, so a mismatch is never
 /// overridable: `--allow-unverified-loader` is about a source that published
-/// nothing, not about one whose digest disagrees with its bytes. A blank
-/// digest is not a hash — the same rule [`agora_core::artifact_hash`] applies
-/// to a blank published digest anywhere else.
+/// nothing, not about one whose digest disagrees with its bytes.
 fn verify_profile_digests(artifact: &LibraryArtifact, bytes: &[u8]) -> LauncherResult<()> {
-    let (sha1, sha256) = declared_digests(artifact);
-    if sha1.is_none() && sha256.is_none() {
+    let declared = DeclaredDigests::of(artifact);
+    if declared.is_empty() {
         return Ok(());
     }
-    verify_download(bytes, sha1, sha256, &[], false, &artifact.path, None)
-        .map(|_| ())
-        .map_err(|error| match error {
-            LauncherError::HashMismatch => LauncherError::Generic {
-                code: "ERR_HASH_MISMATCH".into(),
-                message: format!(
-                    "{} does not match the {} its loader profile publishes",
-                    artifact.url,
-                    if sha256.is_some() { "SHA-256" } else { "SHA-1" }
-                ),
-            },
-            other => other,
-        })
+    verify_download(
+        bytes,
+        declared.sha1,
+        declared.sha256,
+        declared.sha512,
+        &[],
+        false,
+        &artifact.path,
+        None,
+    )
+    .map(|_| ())
+    .map_err(|error| match error {
+        LauncherError::HashMismatch => LauncherError::Generic {
+            code: "ERR_HASH_MISMATCH".into(),
+            message: format!(
+                "{} does not match the {} its loader profile publishes",
+                artifact.url,
+                declared.names()
+            ),
+        },
+        other => other,
+    })
 }
 
 /// Download a loader file and verify its hash against the pinned value.

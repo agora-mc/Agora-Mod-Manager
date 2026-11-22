@@ -1088,6 +1088,7 @@ async fn download_vanilla_server(
         &bytes,
         server.sha1.as_deref(),
         None,
+        None,
         &[],
         false,
         "server.jar",

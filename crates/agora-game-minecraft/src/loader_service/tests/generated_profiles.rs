@@ -211,6 +211,31 @@ fn without_library_digests(profile: &mut Value) {
     }
 }
 
+/// A captured Fabric profile where `coordinate` is the only library that
+/// publishes a digest, and only the one named by `field`. Returns that digest.
+///
+/// An install can only refuse on a library that publishes a digest, so this
+/// narrows the profile to one check.
+fn only_digest(profile: &mut Value, coordinate: &str, field: &str) -> String {
+    let published = profile["libraries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|library| library["name"] == coordinate)
+        .and_then(|library| library[field].as_str())
+        .unwrap_or_else(|| panic!("the captured profile publishes {coordinate}'s {field}"))
+        .to_string();
+    without_library_digests(profile);
+    let library = profile["libraries"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|library| library["name"] == coordinate)
+        .unwrap_or_else(|| panic!("the captured profile lists {coordinate}"));
+    library[field] = json!(published.clone());
+    published
+}
+
 /// The captured Fabric profile as the local Maven responder describes it.
 ///
 /// The responder serves [`JAR`] for every library, so a reply that publishes a
@@ -384,24 +409,15 @@ async fn a_library_with_digests_in_both_places_keeps_all_of_them() {
     let mut profile = fabric_263_profile();
     let coordinate = "org.ow2.asm:asm:9.10.1";
     let path = "org/ow2/asm/asm/9.10.1/asm-9.10.1.jar";
-    let published = profile["libraries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|library| library["name"] == coordinate)
-        .and_then(|library| library["sha256"].as_str())
-        .unwrap_or_else(|| panic!("the captured profile publishes {coordinate}'s SHA-256"))
-        .to_string();
     // Every other library publishes nothing, so the mixed one is the only
     // library this install can refuse on.
-    without_library_digests(&mut profile);
+    only_digest(&mut profile, coordinate, "sha256");
     let library = profile["libraries"]
         .as_array_mut()
         .unwrap()
         .iter_mut()
         .find(|library| library["name"] == coordinate)
         .unwrap_or_else(|| panic!("the captured profile lists {coordinate}"));
-    library["sha256"] = json!(published);
     // The same library, now also naming its artifact without digests there.
     library["downloads"] = json!({
         "artifact": {
@@ -428,6 +444,37 @@ async fn a_library_with_digests_in_both_places_keeps_all_of_them() {
     );
     assert!(
         error.to_string().contains("SHA-256") && error.to_string().contains("asm-9.10.1.jar"),
+        "the refusal names the digest kind and the jar: {error}"
+    );
+}
+
+/// Fabric publishes a SHA-512 beside the SHA-1 and SHA-256. A library whose
+/// only published digest is that SHA-512 is still a hashed download: bytes
+/// that contradict it are refused, even when the install allows an unverified
+/// loader.
+#[tokio::test]
+async fn a_library_whose_only_published_digest_is_sha512_is_checked() {
+    let mut profile = fabric_263_profile();
+    only_digest(&mut profile, "org.ow2.asm:asm:9.10.1", "sha512");
+
+    let error = create_for(
+        "26.3",
+        "fabric",
+        "0.20.1",
+        serde_json::to_vec(&profile).unwrap(),
+        MavenReply::Missing,
+        true,
+        PinKind::Curated,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.code(),
+        "ERR_HASH_MISMATCH",
+        "the SHA-512 describes the download: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("SHA-512") && error.to_string().contains("asm-9.10.1.jar"),
         "the refusal names the digest kind and the jar: {error}"
     );
 }

@@ -2723,6 +2723,12 @@ pub(crate) fn resolve_library_artifact(
             artifact.sha256.as_deref(),
             library.sha256.as_deref(),
         )?;
+        artifact.sha512 = merge_published_digest(
+            &library.name,
+            "SHA-512",
+            artifact.sha512.as_deref(),
+            library.sha512.as_deref(),
+        )?;
         return Ok(Some(artifact));
     }
     let Some(repository) = library.url.as_deref() else {
@@ -2738,6 +2744,7 @@ pub(crate) fn resolve_library_artifact(
         url,
         sha1: library.sha1.clone(),
         sha256: library.sha256.clone(),
+        sha512: library.sha512.clone(),
         size: library.size,
     }))
 }
