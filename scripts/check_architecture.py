@@ -870,6 +870,29 @@ def count_fail_closed_reads_in(path: Path) -> int:
     return count_fail_closed_reads(path.read_text(encoding="utf-8", errors="replace"))
 
 
+def is_test_only_module_file(path: Path) -> bool:
+    """True when the module that declares `path` declares it `#[cfg(test)] mod name;`.
+
+    Such a file is test code in full (a benchmark or fixture module), so the
+    production count skips it. The declaring module is the sibling `mod.rs`,
+    `lib.rs` or `main.rs`, or the parent directory's `<dir>.rs`.
+    """
+    stem = path.stem
+    if stem in ("mod", "lib", "main"):
+        return False
+    candidates = [path.parent / name for name in ("mod.rs", "lib.rs", "main.rs")]
+    candidates.append(path.parent.parent / f"{path.parent.name}.rs")
+    declaration = re.compile(
+        r"#\[cfg\(test\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+" + re.escape(stem) + r"\s*;"
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            text = blank_rust_noise(candidate.read_text(encoding="utf-8", errors="replace"))
+            if declaration.search(text):
+                return True
+    return False
+
+
 def check_fail_closed_reads() -> None:
     try:
         budget = json.loads(FAIL_CLOSED_READ_BUDGET.read_text(encoding="utf-8"))
@@ -918,7 +941,9 @@ def check_fail_closed_reads() -> None:
         # Every Rust file below the directory, not just the ones beside it: a
         # recovery module that grows a subdirectory must be counted, not skipped.
         present = {
-            path.relative_to(root).as_posix(): path for path in sorted(root.rglob("*.rs"))
+            path.relative_to(root).as_posix(): path
+            for path in sorted(root.rglob("*.rs"))
+            if not is_test_only_module_file(path)
         }
         for name in sorted(set(present) - set(expected)):
             problems.append(
