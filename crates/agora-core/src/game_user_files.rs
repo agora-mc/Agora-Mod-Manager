@@ -1088,6 +1088,10 @@ pub fn swap_in_locked(
         std::collections::HashMap::new();
     for m in &applicable_mappings {
         let real_path = resolve_user_file_source_in(prefix.as_deref(), &m.source)?;
+        // A journaled path whose parent cannot be resolved (a dangling junction,
+        // a file sitting where a folder should be) is "can't tell", not an
+        // absent player file. Refuse before writing a journal or touching bytes.
+        resolved_destination(&real_path, "the user file")?;
         let real_key = fold_path_case(&real_path.to_string_lossy());
         let instance_key = fold_path_case(m.instance_path.as_str());
         if let Some(other) = real_to_instance.get(&real_key) {
