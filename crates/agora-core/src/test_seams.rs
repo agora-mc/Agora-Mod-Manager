@@ -51,6 +51,10 @@ struct Seams {
     create_pin_pause: PauseSlot,
     #[cfg(debug_assertions)]
     restore_rename_pause: PauseSlot,
+    /// Where a plugin install should stop, so a test sees the files and the journal exactly as a
+    /// killed process leaves them.
+    #[cfg(debug_assertions)]
+    install_crash: Mutex<Option<crate::plugins::install::InstallCrashPoint>>,
 }
 
 /// Lock a slot, taking the value back from a panic that left it poisoned: a seam is test state, and
@@ -303,6 +307,22 @@ impl PauseSlot {
 
 #[cfg(debug_assertions)]
 impl TestSeams {
+    /// Test seam: make the next plugin install stop (panic) at `point`, the way a killed process
+    /// leaves an install. `None` disarms it.
+    ///
+    /// A test asserts the seam fired: an install that never reached the point must fail the test,
+    /// not pass silently.
+    pub fn set_install_crash(&self, point: Option<crate::plugins::install::InstallCrashPoint>) {
+        *slot(&self.0.install_crash) = point;
+    }
+
+    /// Stop the install here if this context asked it to.
+    pub(crate) fn install_crash_point(&self, point: crate::plugins::install::InstallCrashPoint) {
+        if *slot(&self.0.install_crash) == Some(point) {
+            panic!("a test cut this plugin install short at {point:?}");
+        }
+    }
+
     /// Test seam: make the next base build under `base_root` stop right after it renames its
     /// folder into place, until the returned handle is released.
     pub fn pause_base_build_after_rename(&self, base_root: &Path) -> BaseBuildPauseHandle {

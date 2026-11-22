@@ -39,9 +39,8 @@
 //! journal that is a legacy one — no envelope, or nothing that proves who wrote it — is
 //! [`Decision::NeedsHand`], never recovered automatically.
 
-use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
-use crate::lock_manager::{LockGuard, LockRefusal, LockResource};
+use crate::lock_manager::{LockGuard, LockManager, LockRefusal, LockResource};
 use crate::process_identity::{self, ProcessIdentity};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -197,12 +196,15 @@ impl<S: JournalState> Envelope<S> {
 ///
 /// A journal is what makes an operation recoverable, so it is never half-written: a crash leaves
 /// either the previous journal or the new one.
-pub fn write<S: JournalState>(path: &Path, envelope: &Envelope<S>) -> LauncherResult<()> {
+///
+/// `journal` is either an [`Envelope`] or a kind's own file with an envelope flattened into it —
+/// [`read`] and [`decide`] look for the envelope's fields at the top level.
+pub fn write<T: Serialize>(path: &Path, journal: &T) -> LauncherResult<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| journal_error(format!("could not create {}: {e}", parent.display())))?;
     }
-    let bytes = serde_json::to_vec_pretty(envelope)
+    let bytes = serde_json::to_vec_pretty(journal)
         .map_err(|e| journal_error(format!("could not write the journal: {e}")))?;
     let tmp = temporary_path(path);
     let written = (|| -> std::io::Result<()> {
@@ -536,13 +538,17 @@ pub enum Decision<S> {
 ///    means carry on;
 /// 4. each owned path's proof: a path whose proof does not match is left alone and reported, a path
 ///    whose proof cannot be *checked* means a hand.
+///
+/// The lock manager rather than the whole context: the decision uses nothing else, and the one
+/// startup pass that recovers plugin installs runs inside `CoreContext::initialize`, before the
+/// context it is building exists.
 pub fn decide<S: JournalState>(
-    ctx: &Ctx,
+    locks: &LockManager,
     resource: &LockResource,
     journal_path: &Path,
     proof: &dyn ContentProof,
 ) -> Decision<S> {
-    let lock = match ctx.lock_manager.acquire_with_timeout_typed(
+    let lock = match locks.acquire_with_timeout_typed(
         resource.clone(),
         RECOVERY_OPERATION,
         Duration::ZERO,
@@ -580,11 +586,13 @@ pub fn decide<S: JournalState>(
     }
 
     match writer_liveness(envelope.writer.as_ref()) {
-        WriterLiveness::Alive => return Decision::Busy(format!(
+        WriterLiveness::Alive => {
+            return Decision::Busy(format!(
             "The process that wrote the journal (pid {}) is still running, so the operation may \
                  still be going. Nothing was changed.",
             envelope.writer.as_ref().map(|w| w.pid).unwrap_or_default()
-        )),
+        ))
+        }
         WriterLiveness::CantTell(reason) => {
             return Decision::NeedsHand(format!(
                 "The journal cannot say whether the operation is still running: {reason}. Nothing \

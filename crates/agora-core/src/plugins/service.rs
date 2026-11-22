@@ -1566,8 +1566,26 @@ impl PluginService {
         )?;
 
         let had_files = destination.exists();
+        // The journal is written before anything moves, so a crash from here on is recoverable
+        // (MASTER_SPEC §32.11). It says which paths this install owns and how each is proven, and
+        // its state advances as the install gets further.
+        let mut journal = install::InstallJournal::begin(
+            &self.inner.ctx.paths,
+            &manifest.id,
+            had_files,
+            install::readable_version(&destination),
+            manifest.version.to_string(),
+        )?;
+        journal.start(&self.inner.ctx.paths)?;
+        install::crash_point(&self.inner.ctx, install::InstallCrashPoint::JournalWritten);
+
         if had_files {
-            install::stash_for_rollback(&destination, &rollback)?;
+            if let Err(error) = install::stash_for_rollback(&destination, &rollback) {
+                let _ = journal.discard(&self.inner.ctx.paths);
+                return Err(error);
+            }
+            journal.advance(&self.inner.ctx.paths, install::PluginInstallState::Stashed)?;
+            install::crash_point(&self.inner.ctx, install::InstallCrashPoint::Stashed);
         }
 
         if let Err(error) = install::extract_package(bytes, &destination) {
@@ -1576,8 +1594,14 @@ impl PluginService {
                 // than being left believing the old version is back.
                 install::restore_rollback(&rollback, &destination)?;
             }
+            journal.discard(&self.inner.ctx.paths)?;
             return Err(error);
         }
+        journal.advance(
+            &self.inner.ctx.paths,
+            install::PluginInstallState::Extracted,
+        )?;
+        install::crash_point(&self.inner.ctx, install::InstallCrashPoint::Extracted);
 
         // Read from the files that were just written, before the record says
         // the install happened, so a failure here still rolls back cleanly.
@@ -1590,6 +1614,7 @@ impl PluginService {
                 } else {
                     let _ = std::fs::remove_dir_all(&destination);
                 }
+                journal.discard(&self.inner.ctx.paths)?;
                 return Err(error);
             }
         };
@@ -1622,9 +1647,14 @@ impl PluginService {
             } else {
                 let _ = std::fs::remove_dir_all(&destination);
             }
+            journal.discard(&self.inner.ctx.paths)?;
             return Err(error);
         }
         let _ = std::fs::remove_dir_all(&rollback);
+        install::crash_point(&self.inner.ctx, install::InstallCrashPoint::Recorded);
+        // The install is over: the journal goes last, so a crash before this point is still
+        // recovered and a crash after it does nothing.
+        journal.discard(&self.inner.ctx.paths)?;
 
         // Pinned at the moment consent was given, and only then. A package
         // that declares no update source clears any previous pin rather than
