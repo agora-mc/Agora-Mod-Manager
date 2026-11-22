@@ -244,6 +244,67 @@ class FailClosedReadBudgetTests(unittest.TestCase):
         )
         self.assertEqual(architecture.count_fail_closed_reads(source), 3)
 
+    def test_a_test_module_declaration_does_not_hide_the_code_after_it(self):
+        # content_store/mod.rs declares `#[cfg(test)] mod import_bench;` early, then keeps going.
+        source = (
+            "mod convert;\n"
+            "#[cfg(test)]\n"
+            "mod import_bench;\n"
+            "pub fn place(p: &Path) -> bool { p.exists() }\n"
+        )
+        self.assertEqual(architecture.count_fail_closed_reads(source), 1)
+
+    def test_string_literals_do_not_count(self):
+        source = (
+            'fn a() -> &\'static str { "p.exists() and text.parse().ok()" }\n'
+            'const B: &str = r#"a raw string mentioning .exists() and .unwrap_or_default()"#;\n'
+            "fn b() -> char { '(' }\n"
+        )
+        self.assertEqual(architecture.count_fail_closed_reads(source), 0)
+
+    def test_an_inline_test_module_is_skipped_but_the_code_after_it_is_not(self):
+        source = (
+            "fn a(p: &Path) -> bool { p.exists() }\n"
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    fn t(p: &Path) { assert!(p.exists()); let _ = \"}\".parse::<u8>().ok(); }\n"
+            "}\n"
+            "fn b(p: &Path) -> bool { p.exists() }\n"
+        )
+        self.assertEqual(architecture.count_fail_closed_reads(source), 2)
+
+    def test_a_test_only_helper_function_is_skipped(self):
+        source = (
+            "#[cfg(test)]\n"
+            "fn helper(p: &Path) -> bool { p.exists() }\n"
+            "fn production(p: &Path) -> bool { p.exists() }\n"
+        )
+        self.assertEqual(architecture.count_fail_closed_reads(source), 1)
+
+    def test_whitespace_inside_the_call_is_counted(self):
+        source = "fn a(p: &Path) -> bool { p.exists () } fn b(t: &str) { t.parse::<u8>().ok ( ) ; }\n"
+        self.assertEqual(architecture.count_fail_closed_reads(source), 2)
+
+    def test_a_nested_file_in_a_counted_directory_needs_its_own_number(self):
+        self.write("crates/agora-core/src/content_store/mod.rs", "fn a() {}\n")
+        self.write(
+            "crates/agora-core/src/content_store/recovery/inner.rs",
+            "fn a(p: &Path) -> bool { p.exists() }\n",
+        )
+        self.budget_of(
+            directories={"crates/agora-core/src/content_store": {"mod.rs": 0}}
+        )
+        self.assertEqual(self.check(), 1)
+        self.budget_of(
+            directories={
+                "crates/agora-core/src/content_store": {
+                    "mod.rs": 0,
+                    "recovery/inner.rs": 1,
+                }
+            }
+        )
+        self.assertEqual(self.check(), 0)
+
     def test_at_budget_passes(self):
         self.write("crates/agora-core/src/lkg.rs", "fn a(p: &Path) -> bool { p.exists() }\n")
         self.budget_of(files={"crates/agora-core/src/lkg.rs": 1})

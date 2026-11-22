@@ -678,36 +678,167 @@ def check_game_package_core_budget() -> None:
 # same rule as the game-package budget above.
 #
 # What the count is, exactly: the three patterns, matched textually in the
-# file's production code. Comments are stripped, and a `#[cfg(test)] mod` block
-# is not counted — a test's `.exists()` is how it checks what the code did, not
-# a decision about user data. The count is deliberately textual: telling a
-# filesystem result from a parse result needs types, and a count that needs a
-# compiler is not a count any contributor can run. It may therefore count a
-# harmless site, which a slice can remove or leave, but it cannot miss one.
+# file's production code.
+#
+# - Comments and the insides of string and char literals are blanked before
+#   counting, so `// p.exists()` and a `".ok()"` message string count nothing.
+# - Only the item a `#[cfg(test)]` attribute applies to is blanked: an inline
+#   `mod tests { ... }` with its braces, a `#[cfg(test)] mod helper;`
+#   declaration line, or a `#[cfg(test)] fn ...` test-only helper. Everything
+#   after it is still counted — a test-module declaration early in a file must
+#   not hide the production code below it.
+# - Whitespace inside a call is allowed (`p.exists ()`, `.ok ( )`).
+#
+# The count is deliberately textual: telling a filesystem result from a parse
+# result needs types, and a count that needs a compiler is not a count any
+# contributor can run. It may therefore count a harmless site, which a slice can
+# remove or leave, but it does not miss one.
 #
 # The list is the modules the spec names: recovery (`startup_recovery`, the
-# journals and their passes), trust (the signed registry and plugin signatures),
-# leases and locks (the runtime lease, the recorded process, the OS lock, the
-# session ledger), garbage collection (`snapshot`, `game_base`, Recently
-# deleted) and staging (`game_user_files`, `game_tool_swap`, `content_store`).
-# The authority for the list is MASTER_SPEC §32.13; a slice that converts a
-# whole module adds it here, and one that splits a file moves its entry.
+# journals and their passes, `backup`), trust (the signed registry and plugin
+# signatures), leases and locks (the runtime lease, the recorded process, the OS
+# lock, the session ledger), garbage collection (`snapshot`, `game_base`,
+# Recently deleted) and staging (`game_user_files`, `game_tool_swap`, plugin
+# installs, `content_store`). The authority for the list is MASTER_SPEC §32.13;
+# a slice that converts a whole module adds it here, and one that splits a file
+# moves its entry.
 FAIL_CLOSED_READ_BUDGET = REPO_ROOT / "scripts" / "fail_closed_read_budget.json"
-FAIL_CLOSED_READ_PATTERNS = (".exists()", ".ok()", ".unwrap_or_default()")
-# A top-level `#[cfg(test)]` on a module: everything from there on is test code.
-TEST_MODULE = re.compile(
-    r"^#\[cfg\(test\)\]\s*\n\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+", flags=re.M
+FAIL_CLOSED_READ_PATTERNS = (
+    re.compile(r"\.exists\s*\(\s*\)"),
+    re.compile(r"\.ok\s*\(\s*\)"),
+    re.compile(r"\.unwrap_or_default\s*\(\s*\)"),
 )
+# A `#[cfg(test)]` attribute, with any spacing.
+CFG_TEST_ATTRIBUTE = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+# An attribute group, e.g. `#[allow(clippy::too_many_lines)]` on the same item.
+ATTRIBUTE = re.compile(r"#\s*!?\s*\[[^\]]*\]")
+
+
+def blank_rust_noise(source: str) -> str:
+    """Comments and the insides of string/char literals replaced by spaces.
+
+    Line structure is kept, so the result lines up with the input. What is left
+    cannot contain a pattern that only appears in a comment or a message string.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(source):
+        pair = source[index : index + 2]
+        if pair == "//":
+            end = source.find("\n", index)
+            end = len(source) if end == -1 else end
+            out.append(" " * (end - index))
+            index = end
+        elif pair == "/*":
+            # Rust block comments nest.
+            depth = 0
+            end = index
+            while end < len(source):
+                if source[end : end + 2] == "/*":
+                    depth += 1
+                    end += 2
+                elif source[end : end + 2] == "*/":
+                    depth -= 1
+                    end += 2
+                    if depth == 0:
+                        break
+                else:
+                    end += 1
+            out.append("".join("\n" if c == "\n" else " " for c in source[index:end]))
+            index = end
+        elif source[index] == "r" and re.match(r'r#*"', source[index:]):
+            # A raw string: r"..." or r#"..."#, closed by a quote and its hashes.
+            hashes = re.match(r'r(#*)"', source[index:]).group(1)
+            close = '"' + hashes
+            end = source.find(close, index + len(hashes) + 2)
+            end = len(source) if end == -1 else end + len(close)
+            out.append("".join("\n" if c == "\n" else " " for c in source[index:end]))
+            index = end
+        elif source[index] == '"':
+            end = index + 1
+            while end < len(source):
+                if source[end] == "\\":
+                    end += 2
+                elif source[end] == '"':
+                    end += 1
+                    break
+                else:
+                    end += 1
+            out.append("".join("\n" if c == "\n" else " " for c in source[index:end]))
+            index = end
+        elif source[index] == "'" and source[index + 1 : index + 2] != "":
+            # A char literal ('x', '\n', '\\', '\u{..}') or a lifetime ('a). Only a
+            # literal closes on its own quote, so a lifetime is left alone.
+            if source[index + 1] == "\\":
+                close = source.find("'", index + 2)
+            else:
+                close = index + 2 if source[index + 2 : index + 3] == "'" else -1
+            if close == -1:
+                out.append(source[index])
+                index += 1
+            else:
+                out.append(" " * (close + 1 - index))
+                index = close + 1
+        else:
+            out.append(source[index])
+            index += 1
+    return "".join(out)
+
+
+def item_end(source: str, start: int) -> int | None:
+    """One past the end of the item starting at `start`: its `;` or its brace block."""
+    brace = source.find("{", start)
+    semicolon = source.find(";", start)
+    if semicolon != -1 and (brace == -1 or semicolon < brace):
+        return semicolon + 1
+    if brace == -1:
+        return None
+    depth = 0
+    for index in range(brace, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return None
+
+
+def blank_test_items(source: str) -> str:
+    """Blank what a `#[cfg(test)]` attribute applies to, and only that.
+
+    A test module sits in the middle of some files (`content_store/mod.rs` declares one before its
+    production code), so dropping everything from the first test attribute to the end of the file
+    would hide real sites. Each attribute is followed to its own item instead.
+    """
+    while True:
+        match = CFG_TEST_ATTRIBUTE.search(source)
+        if not match:
+            return source
+        cursor = match.end()
+        while True:
+            whitespace = len(source[cursor:]) - len(source[cursor:].lstrip())
+            cursor += whitespace
+            further = ATTRIBUTE.match(source, cursor)
+            if not further:
+                break
+            cursor = further.end()
+        end = item_end(source, cursor)
+        if end is None:
+            # Nothing that looks like an item follows: blank the attribute only, so the count
+            # still sees whatever comes next.
+            end = match.end()
+        source = (
+            source[: match.start()]
+            + "".join("\n" if c == "\n" else " " for c in source[match.start() : end])
+            + source[end:]
+        )
 
 
 def count_fail_closed_reads(source: str) -> int:
-    """Error-read-as-absent sites in one Rust file, comments and tests excluded."""
-    source = re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group().count("\n"), source, flags=re.S)
-    test_module = TEST_MODULE.search(source)
-    if test_module:
-        source = source[: test_module.start()]
-    production = "\n".join(line.split("//", 1)[0] for line in source.splitlines())
-    return sum(production.count(pattern) for pattern in FAIL_CLOSED_READ_PATTERNS)
+    """Error-read-as-absent sites in one Rust file, comments and test items excluded."""
+    cleaned = blank_test_items(blank_rust_noise(source))
+    return sum(len(pattern.findall(cleaned)) for pattern in FAIL_CLOSED_READ_PATTERNS)
 
 
 def count_fail_closed_reads_in(path: Path) -> int:
@@ -759,7 +890,11 @@ def check_fail_closed_reads() -> None:
         if not isinstance(expected, dict):
             problems.append(f"  {relative}/: budget must map each file to its count")
             continue
-        present = {path.name: path for path in sorted(root.glob("*.rs"))}
+        # Every Rust file below the directory, not just the ones beside it: a
+        # recovery module that grows a subdirectory must be counted, not skipped.
+        present = {
+            path.relative_to(root).as_posix(): path for path in sorted(root.rglob("*.rs"))
+        }
         for name in sorted(set(present) - set(expected)):
             problems.append(
                 f"  {relative}/{name}: not in the budget "
