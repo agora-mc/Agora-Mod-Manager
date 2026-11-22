@@ -1157,28 +1157,43 @@ fn write_pending_floor(app_data_dir: &Path, built_at: &str, db_sha256: &str) -> 
             message: format!("The candidate catalog's build stamp `{built_at}` cannot be read."),
         });
     }
-    let path = registry_pending_floor_path(app_data_dir);
     #[cfg(test)]
     if injected_pending_floor_write_failure(app_data_dir) {
         return Err(floor_error(
             "Injected pending catalog rollback floor write failure.",
         ));
     }
-    write_atomic(&path, format!("{built_at} {db_sha256}\n").as_bytes()).map_err(|error| {
+    save_pending_floor(app_data_dir, built_at, db_sha256).map_err(|error| {
         floor_error(format!(
             "Could not save the pending catalog rollback floor: {error}."
         ))
     })
 }
 
-/// Drop the write-ahead stamp. Best effort: a stamp that stays behind can only
-/// hold the floor at a value this client accepted, never lower it.
-fn clear_pending_floor(app_data_dir: &Path) {
+fn save_pending_floor(app_data_dir: &Path, built_at: &str, db_sha256: &str) -> std::io::Result<()> {
+    write_atomic(
+        &registry_pending_floor_path(app_data_dir),
+        format!("{built_at} {db_sha256}\n").as_bytes(),
+    )
+}
+
+/// Drop the write-ahead stamp after an install that used it, or put back the one
+/// a failed attempt superseded. Best effort in both directions: a stamp that
+/// stays behind can only hold the floor at a stamp this client accepted, never
+/// lower it, and the committed floor still protects the installed catalog.
+fn clear_pending_floor(app_data_dir: &Path, superseded: Option<&CachedStamp>) {
     let path = registry_pending_floor_path(app_data_dir);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => {}
+    match superseded {
+        // An earlier install was interrupted after it recorded its stamp and
+        // before it finished: that fact is not this attempt's to discard.
+        Some(stamp) => {
+            let _ = save_pending_floor(app_data_dir, &stamp.built_at, &stamp.db_sha256);
+        }
+        None => match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        },
     }
 }
 
@@ -1580,10 +1595,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         // file. The rename is never reached, so `path` keeps its old contents.
         #[cfg(test)]
         if injected_sync_failure(path) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "injected flush failure",
-            ));
+            return Err(std::io::Error::other("injected flush failure"));
         }
         file.sync_all()?;
     }
@@ -1925,6 +1937,7 @@ fn install_bundle_bytes_with(
     // The floor's write-ahead half: this client has verified the candidate and
     // is about to swap it in, so its stamp must be durable before the bundle it
     // names. A failed write refuses the install with nothing swapped.
+    let superseded_pending = read_pending_floor(app_data_dir)?;
     write_pending_floor(app_data_dir, &header.built_at, &header.db_sha256)?;
 
     // Keep the previous copy only when the current file looks like a bundle.
@@ -1933,10 +1946,10 @@ fn install_bundle_bytes_with(
         if let Ok(current) = std::fs::read(&bundle_path) {
             if registry_bundle::parse_bundle(&current).is_ok() {
                 write_atomic(&previous_path, &current).map_err(|error| {
-                    // Nothing was swapped, so the write-ahead stamp no longer
-                    // describes anything this client has: drop it rather than
-                    // holding the floor above the catalog still installed.
-                    clear_pending_floor(app_data_dir);
+                    // Nothing was swapped, so the stamp this attempt wrote no
+                    // longer describes anything: put back what it superseded
+                    // rather than holding the floor above the installed catalog.
+                    clear_pending_floor(app_data_dir, superseded_pending.as_ref());
                     swap_error(
                         LauncherError::Generic {
                             code: "ERR_REGISTRY_WRITE".into(),
@@ -1952,9 +1965,9 @@ fn install_bundle_bytes_with(
     // COMMIT: one rename replaces the current bundle.
     write_atomic(&bundle_path, bundle_bytes).map_err(|error| {
         // The rename failed, so the bundle named by the write-ahead stamp was
-        // never installed. Drop it: the committed floor still protects the
-        // catalog that is installed.
-        clear_pending_floor(app_data_dir);
+        // never installed. Put back what the attempt superseded: the committed
+        // floor still protects the catalog that is installed.
+        clear_pending_floor(app_data_dir, superseded_pending.as_ref());
         swap_error(
             LauncherError::Generic {
                 code: "ERR_REGISTRY_WRITE".into(),
@@ -1981,9 +1994,10 @@ fn install_bundle_bytes_with(
     raise_floor(app_data_dir, &header.built_at, &header.db_sha256)
         .map_err(floor_after_swap_error)?;
     // The stamp is in the committed floor now, so the write-ahead copy has done
-    // its job. A removal that fails is harmless: the reader takes the higher of
-    // the two, and both name this bundle.
-    clear_pending_floor(app_data_dir);
+    // its job: the candidate is at least as new as the stamp it superseded, so
+    // removing the file loses nothing. A removal that fails is harmless too:
+    // the reader takes the higher of the two, and both name this bundle.
+    clear_pending_floor(app_data_dir, None);
     Ok(trust_written)
 }
 
@@ -4564,6 +4578,82 @@ mod tests {
             open_verified_registry_with_trust(dir.path(), &trust).is_ok(),
             "the installed catalog is not below the floor"
         );
+    }
+
+    /// A failed swap puts back the stamp an interrupted earlier install left
+    /// behind: that accepted stamp is not this attempt's to discard.
+    #[test]
+    fn a_failed_swap_keeps_an_interrupted_installs_stamp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(210);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let first_payload = sample_db_with_built_at("2026-11-15T12:00:00+00:00");
+        let first_header = header_for(
+            &key,
+            &first_payload,
+            "2026-11-15T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&key, &first_header, &first_payload),
+            &trust,
+            "first",
+        )
+        .unwrap();
+
+        // A crash between recording a stamp and swapping it in leaves it behind,
+        // with the older catalog still installed.
+        let second_payload = sample_db_with_built_at("2026-11-17T12:00:00+00:00");
+        save_pending_floor(
+            dir.path(),
+            "2026-11-17T12:00:00+00:00",
+            &hex::encode(Sha256::digest(&second_payload)),
+        )
+        .unwrap();
+
+        // A later install whose swap fails must put that stamp back, not drop it.
+        let third_payload = sample_db_with_built_at("2026-11-19T12:00:00+00:00");
+        let third_header = header_for(
+            &key,
+            &third_payload,
+            "2026-11-19T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let previous = paths::registry_bundle_previous_path(dir.path()).unwrap();
+        let _ = fs::remove_file(&previous);
+        fs::create_dir_all(&previous).unwrap();
+        let error = install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&key, &third_header, &third_payload),
+            &trust,
+            "third",
+        )
+        .expect_err("the obstructed backup must fail the swap");
+        assert_eq!(error.code(), "ERR_REGISTRY_WRITE");
+        fs::remove_dir(&previous).unwrap();
+        assert_eq!(
+            read_pending_floor(dir.path()).unwrap().unwrap().built_at,
+            "2026-11-17T12:00:00+00:00",
+            "the interrupted install's stamp is not discarded by a failed swap"
+        );
+
+        // So the stamp in between is still refused.
+        let between_payload = sample_db_with_built_at("2026-11-16T12:00:00+00:00");
+        let between_header = header_for(
+            &key,
+            &between_payload,
+            "2026-11-16T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let error = install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&key, &between_header, &between_payload),
+            &trust,
+            "between",
+        )
+        .expect_err("a bundle older than an accepted stamp must be refused");
+        assert_eq!(error.code(), "ERR_REGISTRY_ROLLBACK");
     }
 
     /// A swap failure without a trust append must not claim a trust update.
