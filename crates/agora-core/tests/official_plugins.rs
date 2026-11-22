@@ -13,12 +13,12 @@ use agora_core::app_paths::AppPaths;
 use agora_core::ctx::CoreContext;
 use agora_core::error::LauncherResult;
 use agora_core::game_registry::{GameRegistry, PackageSource};
+use agora_core::plugins::install::PluginInstallState;
 use agora_core::plugins::official::{tree_digest, zip_tree_digest};
 use agora_core::plugins::{
     Consent, NoopUiSink, OfficialCatalog, OfficialInstallState, OfficialStatus, PackageFetcher,
     PluginService, PluginStatus, RegistryTrust, UpdateOutcome, PLUGINS_EMERGENCY_STOP_SETTING,
 };
-use agora_core::plugins::install::PluginInstallState;
 use agora_core::registry_bundle::{self, CatalogHeader};
 use agora_game_api::{
     DeploymentStrategy, GameDefinition, GameId, PackageDefinition, StoreId, StoreIdentifier,
@@ -3141,8 +3141,12 @@ fn crash_journal(world: &World, previous: Option<&str>, new: &str, state: Plugin
         PluginInstallState::Starting => {}
         PluginInstallState::Stashed => journal.advance(&paths, state).unwrap(),
         PluginInstallState::Extracted => {
-            journal.advance(&paths, PluginInstallState::Stashed).unwrap();
-            journal.advance(&paths, PluginInstallState::Extracted).unwrap();
+            journal
+                .advance(&paths, PluginInstallState::Stashed)
+                .unwrap();
+            journal
+                .advance(&paths, PluginInstallState::Extracted)
+                .unwrap();
         }
     }
     let path = install_journal_path(&paths, &id);
@@ -3168,7 +3172,12 @@ async fn a_crash_mid_install_restores_the_previous_version_at_startup() {
     std::fs::create_dir_all(rollback.parent().unwrap()).unwrap();
     std::fs::rename(&installed, &rollback).unwrap();
     agora_core::plugins::install::extract_package(&fixture_zip("2.0.0"), &installed).unwrap();
-    crash_journal(&world, Some("1.0.0"), "2.0.0", PluginInstallState::Extracted);
+    crash_journal(
+        &world,
+        Some("1.0.0"),
+        "2.0.0",
+        PluginInstallState::Extracted,
+    );
 
     let (ctx, warnings) = world.start();
     assert!(
@@ -3211,7 +3220,12 @@ async fn a_finished_install_left_in_the_rollback_folder_is_just_cleaned_up() {
     let rollback = world.paths().plugin_rollback_root().join(PLUGIN);
     std::fs::create_dir_all(rollback.parent().unwrap()).unwrap();
     agora_core::plugins::install::extract_package(&fixture_zip("1.0.0"), &rollback).unwrap();
-    crash_journal(&world, Some("1.0.0"), "2.0.0", PluginInstallState::Extracted);
+    crash_journal(
+        &world,
+        Some("1.0.0"),
+        "2.0.0",
+        PluginInstallState::Extracted,
+    );
 
     let (ctx, _) = world.start();
     assert!(!rollback.exists());
