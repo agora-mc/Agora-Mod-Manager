@@ -1042,10 +1042,74 @@ fn exit_code_for_unsupported_file_extension() {
     );
 }
 
+/// `agora loader install` with loader downloads disabled, on an install whose
+/// adoption failed: the error carries the reason adoption failed *and* keeps
+/// the code for "loader downloads are disabled", so the exit code stays 92.
+/// Wrapping the typed error to prepend that reason used to flatten it to 1.
+///
+/// Offline: the base version JSON is already on disk, so nothing is fetched,
+/// and the network policy refuses the loader download before it is attempted.
+#[test]
+fn loader_install_with_loader_downloads_disabled_after_a_failed_adoption_exits_92() {
+    let (_tmp, data_dir) = temp_data_dir();
+
+    let versions = data_dir.join("minecraft-runtime").join("versions");
+    std::fs::create_dir_all(versions.join("1.21.1")).unwrap();
+    std::fs::write(
+        versions.join("1.21.1").join("1.21.1.json"),
+        br#"{"id":"1.21.1","mainClass":"net.minecraft.client.main.Main","type":"release","libraries":[]}"#,
+    )
+    .unwrap();
+
+    // A Forge profile the installer left behind half-written: adoption cannot
+    // verify it, so the install becomes a heal that needs a loader download.
+    let forge_dir = versions.join("forge-1.21.1-52.1.21");
+    std::fs::create_dir_all(&forge_dir).unwrap();
+    std::fs::write(
+        forge_dir.join("forge-1.21.1-52.1.21.json"),
+        b"{ this is not a version profile",
+    )
+    .unwrap();
+
+    let set = run_agora_json(
+        &data_dir,
+        &["settings", "set", "network_loader_enabled", "0"],
+    );
+    assert!(
+        set.status.success(),
+        "disabling loader downloads failed:\n{}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+
+    let output = run_agora_json(
+        &data_dir,
+        &["loader", "install", "forge", "1.21.1", "52.1.21"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(92),
+        "loader downloads disabled must exit 92, not 1:\nstderr:\n{stderr}"
+    );
+    let envelope: serde_json::Value = serde_json::from_str(
+        &stderr[stderr
+            .find('{')
+            .unwrap_or_else(|| panic!("stderr must carry the error envelope:\n{stderr}"))..],
+    )
+    .unwrap_or_else(|e| panic!("stderr must end in one JSON envelope: {e}\nstderr:\n{stderr}"));
+    assert_eq!(envelope["exitCode"], 92, "{envelope}");
+    let message = envelope["error"]
+        .as_str()
+        .expect("the envelope names the error");
+    assert!(
+        message.contains("existing install could not be verified"),
+        "the reason adoption failed must still be reported: {message}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Import registration (local directory, no network)
 // ---------------------------------------------------------------------------
-
 #[test]
 fn import_directory_creates_instance() {
     let (_tmp, data_dir) = temp_data_dir();
