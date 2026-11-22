@@ -716,7 +716,8 @@ pub fn build_base_with_frameworks(
     // a base record is damaged: the build replaces it (and the folder it left) once it is known
     // that no instance is pinned to it. A record that cannot be read at all is an error, because
     // a failed read of a healthy record must not be taken as permission to replace its base.
-    let mut damaged_record = false;
+    // Whether the record is damaged is judged again under the base lock below; the state here
+    // only decides whether hashing is worth it.
     if manifest_path.exists() {
         let content = std::fs::read_to_string(&manifest_path).map_err(|error| {
             BaseError::Other(format!(
@@ -734,7 +735,6 @@ pub fn build_base_with_frameworks(
                         pinning.join(", ")
                     )));
                 }
-                damaged_record = true;
             }
         }
     }
@@ -944,9 +944,10 @@ pub fn build_base_with_frameworks(
         )
         .map_err(|e| BaseError::Other(e.to_string()))?;
     // Re-check the record under the lock, without a suppressed error: a failed read here
-    // would be permission to reuse a damage flag computed before the lock, from a record
-    // that may be healthy by now. Healthy returns Existing; unreadable is an error that
-    // keeps the folder; still-damaged only falls through to the replacement below.
+    // must never be permission to fall through on a damage flag from before the lock, from
+    // a record that may be healthy by now. Healthy returns Existing; unreadable is an error
+    // that keeps the folder; still-damaged is judged from the record as it is right now.
+    let mut damaged_record = false;
     if manifest_path.exists() {
         let content = std::fs::read_to_string(&manifest_path).map_err(|error| {
             BaseError::Other(format!(
@@ -963,8 +964,6 @@ pub fn build_base_with_frameworks(
                 damaged_record = true;
             }
         }
-    } else {
-        damaged_record = false;
     }
 
     // Only the path that replaces a base folder needs the locations lock: take it after Base, and

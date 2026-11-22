@@ -578,6 +578,59 @@ pub(super) fn try_lock_locations(ctx: &Ctx, operation: &str) -> Result<LockGuard
         .map_err(|error| err("ERR_INSTANCE_BUSY", error.to_string()))
 }
 
+/// Test seam for the window between a restore's rename and its database insert. Keyed by the
+/// id being restored, like the base build pauses; unrelated restores carry on.
+#[cfg(debug_assertions)]
+static PAUSE_RESTORE_AFTER_RENAME_AT: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+#[cfg(debug_assertions)]
+static RESTORE_RENAME_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test seam: make the next restore of `instance_id` pause right after its rename, until this is
+/// called with `None`. Off by default and absent from release builds.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_restore_pause_after_rename_for(instance_id: Option<&str>) {
+    let mut target = PAUSE_RESTORE_AFTER_RENAME_AT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    *target = instance_id.map(str::to_string);
+    RESTORE_RENAME_PAUSED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether a paused restore has reached its rename and is waiting.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn restore_pause_after_rename_reached() -> bool {
+    RESTORE_RENAME_PAUSED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(debug_assertions)]
+fn pause_restore_after_rename_if_asked(instance_id: &str) {
+    let should_pause = PAUSE_RESTORE_AFTER_RENAME_AT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_deref()
+        == Some(instance_id);
+    if !should_pause {
+        return;
+    }
+    RESTORE_RENAME_PAUSED.store(true, std::sync::atomic::Ordering::SeqCst);
+    loop {
+        let still_asked = PAUSE_RESTORE_AFTER_RENAME_AT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_deref()
+            == Some(instance_id);
+        if !still_asked {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    RESTORE_RENAME_PAUSED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 fn try_lock_instance(
     ctx: &Ctx,
     instance_id: &str,
@@ -886,8 +939,17 @@ pub fn restore(
     // folder someone else created at the same id.
     write_restore_marker(&source, entry_id)?;
 
+    // The move is only half the restore. The locations guard now stays until the row is
+    // inserted and the entry is tidied: a pinning scan holds it across both of its reads
+    // (live database, then Recently deleted), so it either sees the entry before this move
+    // or the row afterwards — never a database read before the insert paired with a trash
+    // read after the tidy, the one interleaving that could hide the pin from both. Nothing
+    // else is locked while the guard is held.
     let moved = std::fs::rename(&source, &dest);
-    drop(locations);
+    if moved.is_ok() {
+        #[cfg(debug_assertions)]
+        pause_restore_after_rename_if_asked(&new_id);
+    }
     if let Err(e) = moved {
         let _ = std::fs::remove_file(&restoring_path);
         remove_restore_marker(&source);
@@ -899,20 +961,11 @@ pub fn restore(
     }
 
     if let Err(error) = finish_restore(&conn, &dest, &stored, &restoring) {
-        // Put the files back where they were found, so the entry is whole again.
-        match ctx
-            .lock_manager
-            .acquire(LockResource::InstanceLocations, "restore rollback")
-        {
-            Ok(_locations) => {
-                if std::fs::rename(&dest, &source).is_ok() {
-                    let _ = std::fs::remove_file(&restoring_path);
-                    remove_restore_marker(&source);
-                }
-            }
-            Err(rollback) => {
-                eprintln!("could not lock instance locations to roll back: {rollback}")
-            }
+        // Put the files back where they were found, so the entry is whole again. The
+        // locations guard is still held for the rollback.
+        if std::fs::rename(&dest, &source).is_ok() {
+            let _ = std::fs::remove_file(&restoring_path);
+            remove_restore_marker(&source);
         }
         return Err(error);
     }
@@ -922,6 +975,8 @@ pub fn restore(
     // recoverable as an already-finished restore.
     tidy_entry(&root, entry_id);
     remove_restore_marker(&dest);
+    // The pin is published in the database and the entry is gone; the guard can go.
+    drop(locations);
     Ok(RestoreOutcome {
         instance_id: new_id,
         original_instance_id: original,

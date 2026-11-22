@@ -3295,7 +3295,7 @@ mod tests {
         let instance = make_instance(&tmp);
         let a = create_snapshot(&instance, Some("a"), TRACKED).unwrap();
         std::fs::write(instance.join("mods").join("mod-a.jar"), b"mod a v2").unwrap();
-        let b = create_snapshot(&instance, Some("b"), TRACKED).unwrap();
+        create_snapshot(&instance, Some("b"), TRACKED).unwrap();
         std::fs::write(instance.join("mods").join("mod-a.jar"), b"mod a v3").unwrap();
         create_snapshot(&instance, Some("c"), TRACKED).unwrap();
         // The oldest snapshot is the current recovery pointer; a blank state would

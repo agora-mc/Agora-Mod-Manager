@@ -16,6 +16,7 @@ use crate::game_base::{self, BaseError};
 use crate::game_instance::{self, trash, GameInstanceManifest};
 use crate::lock_manager::{LockGuard, LockManager, LockResource};
 use crate::snapshot::{self, SnapshotAux, SnapshotOrigin};
+use rusqlite::OptionalExtension;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScanPoint {
@@ -441,6 +442,117 @@ fn base_removal_cannot_race_a_restore_between_pinning_reads() {
             .join("instance/tracked.txt")
             .is_file(),
         "the restore was refused, so the entry is still restorable"
+    );
+}
+
+#[test]
+fn base_removal_cannot_delete_a_base_a_restore_is_publishing() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    pinned_instance(&ctx, "pinned", base_id);
+    let entry = game_instance::delete(&ctx, "pinned")
+        .unwrap()
+        .trash_entry_id
+        .unwrap();
+
+    // Park the restore in the window between its rename and its database insert.
+    trash::set_restore_pause_after_rename_for(Some("pinned"));
+    let restore_ctx = ctx.clone();
+    let restore_entry = entry.clone();
+    let restore = std::thread::spawn(move || {
+        trash::restore(&restore_ctx, &restore_entry, None).expect("the restore completes")
+    });
+    let mut reached = false;
+    for _ in 0..600 {
+        if trash::restore_pause_after_rename_reached() {
+            reached = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(reached, "the restore never reached its rename");
+
+    // A removal whose between-reads hook lets the parked restore finish: its
+    // database read happened before the insert, its Recently-deleted read
+    // would happen after the entry is tidied — the exact pairing that must
+    // never be able to see "no pins". Keeping the base back at the locations
+    // lock is a pass too; then the hook never fires.
+    let fired = Arc::new(AtomicBool::new(false));
+    let gate = fired.clone();
+    let entry_dir = ctx
+        .paths
+        .recently_deleted_games_root()
+        .join(&entry)
+        .to_path_buf();
+    let removal = game_base::remove_base_with(
+        &ctx.paths,
+        base_id,
+        move || {
+            if !gate.swap(true, Ordering::SeqCst) {
+                trash::set_restore_pause_after_rename_for(None);
+                for _ in 0..600 {
+                    if !entry_dir.exists() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                panic!("the restore never tidied its entry");
+            }
+        },
+        |path| std::fs::metadata(path),
+    );
+    if !fired.load(Ordering::SeqCst) {
+        // The removal was kept back at the locations lock while the restore still
+        // held it. Let the restore commit and publish its row.
+        trash::set_restore_pause_after_rename_for(None);
+    }
+    restore.join().unwrap();
+
+    assert!(
+        matches!(&removal, Err(_)),
+        "the removal must not delete a base while a restore is publishing its pin: {removal:?}"
+    );
+    assert!(
+        base_dir.join("game.exe").is_file(),
+        "a base a restored instance pins was removed from under it"
+    );
+    assert!(ctx.paths.base_manifest_path(base_id).is_file());
+    assert!(
+        ctx.paths
+            .instance_dir("pinned")
+            .unwrap()
+            .join("tracked.txt")
+            .is_file(),
+        "the restored instance is whole"
+    );
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let present: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM game_instances WHERE instance_id = 'pinned'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| panic!("row read failed: {e}"))
+        .unwrap();
+    assert_eq!(
+        present,
+        Some(1),
+        "the restored instance's row is published"
+    );
+
+    // Either the removal read the pair the dangerous way and had to refuse with
+    // the pinning refusal, or it never got past the locations lock and the row
+    // now answers for the instance.
+    let verdict = if fired.load(Ordering::SeqCst) {
+        removal
+    } else {
+        game_base::remove_base(&ctx.paths, base_id)
+    };
+    assert!(
+        matches!(&verdict, Err(BaseError::InUse { instances }) if instances == &vec!["pinned".to_string()]),
+        "the pin is visible to a scan that runs entirely after the restore: {verdict:?}"
     );
 }
 
