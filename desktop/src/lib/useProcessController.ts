@@ -36,7 +36,10 @@ import { activeHealthWarnings, loadHealthPreferences } from './healthPreferences
 /** Whether a launch failure means the Microsoft sign-in itself is the problem,
  *  so the health report shown before launch no longer applies. */
 export function releasesHealthDialog(code: string | null): boolean {
-  return code === 'ERR_MSA_AUTH_REQUIRED' || code === 'ERR_MSA_LOGIN_EXPIRED';
+  // An expired Microsoft session is not its own code: `msa` clears credentials it cannot
+  // renew and the launch reports ERR_MSA_AUTH_REQUIRED. (ERR_MSA_LOGIN_EXPIRED is the
+  // device-code sign-in timing out, which a launch never reports.)
+  return code === 'ERR_MSA_AUTH_REQUIRED';
 }
 
 /** Only the backend's structured `ERR_PROCESS_STALE` code means a kill found a

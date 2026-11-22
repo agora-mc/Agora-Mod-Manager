@@ -9,8 +9,8 @@ import { isStaleProcessError, releasesHealthDialog } from './useProcessControlle
 describe('launch error classification', () => {
   it('releases the health dialog only on real Microsoft sign-in codes', () => {
     expect(releasesHealthDialog('ERR_MSA_AUTH_REQUIRED')).toBe(true);
-    // A stored Microsoft session that expired emits ERR_MSA_LOGIN_EXPIRED.
-    expect(releasesHealthDialog('ERR_MSA_LOGIN_EXPIRED')).toBe(true);
+    // ERR_MSA_LOGIN_EXPIRED is the device-code sign-in timing out; a launch never reports it.
+    expect(releasesHealthDialog('ERR_MSA_LOGIN_EXPIRED')).toBe(false);
     // There is no ERR_MSA_AUTH_EXPIRED in the backend; relying on it would
     // leave a stale health dialog on a genuine expired-sign-in failure.
     expect(releasesHealthDialog('ERR_MSA_AUTH_EXPIRED')).toBe(false);

@@ -2476,69 +2476,20 @@ fn print_table(columns: &[&str], rows: &[Vec<String>]) {
 /// that adds context to a typed error wraps it in `LauncherError::Generic`
 /// with the same code (`LoaderService`'s reinstall reason does), and a
 /// classified failure must not become an unclassified exit code just because
-/// it was explained. One table keyed by code is what keeps the two forms from
-/// drifting apart.
+/// it was explained. One declaration per code, in `agora_core::error_code`, is
+/// what keeps the two forms from drifting apart.
 fn exit_code_from_launcher_error(err: &agora_core::error::LauncherError) -> i32 {
     exit_code_for_code(&err.code())
 }
 
 /// The exit code that belongs to a machine-readable error code, or 1 for a
-/// code this table does not classify.
+/// code the registry does not declare.
+///
+/// The number lives beside the code in `agora_core::error_code`, which is also
+/// what [`agora_core::error::LauncherError::code`] reports: one declaration, so
+/// a code cannot be classified in one place and unclassified in another.
 fn exit_code_for_code(code: &str) -> i32 {
-    match code {
-        "ERR_NETWORK_OFFLINE" => 20,
-        "ERR_REGISTRY_DOWNLOAD_FAILED" => 21,
-        "ERR_REGISTRY_SIGNATURE_INVALID" => 13,
-        "ERR_SCHEMA_TOO_NEW" => 13,
-        "ERR_ZIP_BOMB" => 30,
-        "ERR_OVERRIDE_SECURITY_VIOLATION" => 30,
-        "ERR_HASH_MISMATCH" => 30,
-        "ERR_HASH_CONFIRMATION_REQUIRED" => 30,
-        "ERR_UNTRUSTED_SOURCE" => 31,
-        "ERR_DISKFULL" => 34,
-        "ERR_AUTH_EXPIRED" => 40,
-        "ERR_AUTH_REQUIRED" => 40,
-        "ERR_MSA_AUTH_REQUIRED" => 40,
-        "ERR_MODRINTH_DISABLED" => 50,
-        "ERR_INSTANCE_LOCKED" => 11,
-        "ERR_SANDBOX_UNAVAILABLE" => 50,
-        "ERR_MOJANG_NOT_FOUND" => 60,
-        "ERR_LAUNCH_FAILED" => 61,
-        "ERR_GAME_CRASH" => 7,
-        "ERR_LOCAL_STATE_FAILED" => 10,
-        "ERR_INSTANCE_CREATE_FAILED" => 12,
-        "ERR_PROFILE_WRITE_FAILED" => 60,
-        "ERR_REGISTRY_MISSING" => 13,
-        "ERR_UNSUPPORTED_LOADER" => 61,
-        "ERR_VERSION_NOT_FOUND" => 61,
-        "ERR_GAME_VERSION_NOT_FOUND" => 61,
-        "ERR_LOADER_PROFILE_NOT_FOUND" => 61,
-        "ERR_PROFILE_MISSING" => 11,
-        "ERR_PROFILE_UNSUPPORTED_METADATA" => 11,
-        "ERR_PROFILE_CORRUPT" => 11,
-        "ERR_JAVA_INCOMPATIBLE" => 62,
-        "ERR_JAVA_RUNTIME_MISSING" => 62,
-        "ERR_JAVA_RUNTIME_CATALOG_MISSING" => 62,
-        "ERR_UNRESOLVED_PLACEHOLDER" => 70,
-        "ERR_DEPENDENCY_MISSING" => 70,
-        "ERR_MCP_TOO_MANY_REQUESTS" => 80,
-        "ERR_MCP_DENIED" => 81,
-        "ERR_MCP_UNAUTHORIZED" => 82,
-        "ERR_NETWORK_MOJANG_METADATA_DISABLED" => 90,
-        "ERR_NETWORK_MOJANG_CONTENT_DISABLED" => 91,
-        "ERR_NETWORK_LOADER_DISABLED" => 92,
-        "ERR_NETWORK_MSA_DISABLED" => 93,
-        "ERR_NETWORK_JAVA_DISABLED" => 94,
-        "ERR_JAVA_RUNTIME_CANCELLED" => 62,
-        "ERR_JAVA_RUNTIME_DOWNLOAD_DISABLED" => 94,
-        "ERR_MAVEN_DESCRIPTOR" => 30,
-        "ERR_MIGRATION_CONFLICT" => 71,
-        "ERR_MIGRATION_FAILED" => 72,
-        "ERR_PROCESS_CAPTURE_FAILED" => 100,
-        "ERR_PROCESS_STALE" => 101,
-        "ERR_USER_DECISION_REQUIRED" => 71,
-        _ => 1,
-    }
+    agora_core::error_code::ErrorCode::from_code(code).map_or(1, |code| code.exit_code())
 }
 
 /// Map any error to a stable exit code.  If the error wraps a `LauncherError`
@@ -16517,6 +16468,97 @@ mod tests {
             }),
             1
         );
+    }
+
+    /// The exit-code table as it stood before `agora_core::error_code` held it,
+    /// kept as the reference the registry must keep matching: every code the
+    /// CLI classified, and 1 for everything else.
+    fn pre_registry_exit_table(code: &str) -> i32 {
+        match code {
+            "ERR_NETWORK_OFFLINE" => 20,
+            "ERR_REGISTRY_DOWNLOAD_FAILED" => 21,
+            "ERR_REGISTRY_SIGNATURE_INVALID" => 13,
+            "ERR_SCHEMA_TOO_NEW" => 13,
+            "ERR_ZIP_BOMB" => 30,
+            "ERR_OVERRIDE_SECURITY_VIOLATION" => 30,
+            "ERR_HASH_MISMATCH" => 30,
+            "ERR_HASH_CONFIRMATION_REQUIRED" => 30,
+            "ERR_UNTRUSTED_SOURCE" => 31,
+            "ERR_DISKFULL" => 34,
+            "ERR_AUTH_EXPIRED" => 40,
+            "ERR_AUTH_REQUIRED" => 40,
+            "ERR_MSA_AUTH_REQUIRED" => 40,
+            "ERR_MODRINTH_DISABLED" => 50,
+            "ERR_INSTANCE_LOCKED" => 11,
+            "ERR_SANDBOX_UNAVAILABLE" => 50,
+            "ERR_MOJANG_NOT_FOUND" => 60,
+            "ERR_LAUNCH_FAILED" => 61,
+            "ERR_GAME_CRASH" => 7,
+            "ERR_LOCAL_STATE_FAILED" => 10,
+            "ERR_INSTANCE_CREATE_FAILED" => 12,
+            "ERR_PROFILE_WRITE_FAILED" => 60,
+            "ERR_REGISTRY_MISSING" => 13,
+            "ERR_UNSUPPORTED_LOADER" => 61,
+            "ERR_VERSION_NOT_FOUND" => 61,
+            "ERR_GAME_VERSION_NOT_FOUND" => 61,
+            "ERR_LOADER_PROFILE_NOT_FOUND" => 61,
+            "ERR_PROFILE_MISSING" => 11,
+            "ERR_PROFILE_UNSUPPORTED_METADATA" => 11,
+            "ERR_PROFILE_CORRUPT" => 11,
+            "ERR_JAVA_INCOMPATIBLE" => 62,
+            "ERR_JAVA_RUNTIME_MISSING" => 62,
+            "ERR_JAVA_RUNTIME_CATALOG_MISSING" => 62,
+            "ERR_UNRESOLVED_PLACEHOLDER" => 70,
+            "ERR_DEPENDENCY_MISSING" => 70,
+            "ERR_MCP_TOO_MANY_REQUESTS" => 80,
+            "ERR_MCP_DENIED" => 81,
+            "ERR_MCP_UNAUTHORIZED" => 82,
+            "ERR_NETWORK_MOJANG_METADATA_DISABLED" => 90,
+            "ERR_NETWORK_MOJANG_CONTENT_DISABLED" => 91,
+            "ERR_NETWORK_LOADER_DISABLED" => 92,
+            "ERR_NETWORK_MSA_DISABLED" => 93,
+            "ERR_NETWORK_JAVA_DISABLED" => 94,
+            "ERR_JAVA_RUNTIME_CANCELLED" => 62,
+            "ERR_JAVA_RUNTIME_DOWNLOAD_DISABLED" => 94,
+            "ERR_MAVEN_DESCRIPTOR" => 30,
+            "ERR_MIGRATION_CONFLICT" => 71,
+            "ERR_MIGRATION_FAILED" => 72,
+            "ERR_PROCESS_CAPTURE_FAILED" => 100,
+            "ERR_PROCESS_STALE" => 101,
+            "ERR_USER_DECISION_REQUIRED" => 71,
+            _ => 1,
+        }
+    }
+
+    /// No code may change exit code by moving into the registry: every declared
+    /// code answers exactly what the table answered before, and a code the
+    /// table classified is still classified (and vice versa).
+    #[test]
+    fn every_declared_code_keeps_its_pre_registry_exit_code() {
+        for code in agora_core::error_code::ALL {
+            assert_eq!(
+                exit_code_for_code(code.as_str()),
+                pre_registry_exit_table(code.as_str()),
+                "{} ({:?}) exits differently than before the registry",
+                code.as_str(),
+                code.area(),
+            );
+        }
+
+        // The old table classified 51 codes. If the registry stops declaring one
+        // of them the loop above cannot notice, so the count is pinned too.
+        let classified = agora_core::error_code::ALL
+            .iter()
+            .filter(|code| pre_registry_exit_table(code.as_str()) != 1)
+            .count();
+        assert_eq!(
+            classified, 51,
+            "the old table classified 51 codes; the registry declares {classified} of them"
+        );
+
+        // A string no declaration holds is still unclassified, not a new code.
+        assert_eq!(exit_code_for_code("ERR_NOT_A_CODE"), 1);
+        assert!(agora_core::error_code::ErrorCode::from_code("ERR_NOT_A_CODE").is_none());
     }
 
     #[test]
