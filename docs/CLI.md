@@ -786,6 +786,9 @@ agora plugin disable <PLUGIN_ID>
 agora plugin remove <PLUGIN_ID>
 agora plugin remove <PLUGIN_ID> --purge-data
 agora plugin restore-data <PLUGIN_ID> [--yes]
+agora plugin recover [PLUGIN_ID]
+agora plugin recover <PLUGIN_ID> --restore --yes
+agora plugin recover <PLUGIN_ID> --discard --yes
 agora plugin log <PLUGIN_ID> --lines 200
 agora plugin disable-all
 agora plugin run <PLUGIN_ID> <COMMAND> [--args <JSON>]
@@ -919,7 +922,16 @@ signs an update document in place. The document does not need a `signatures` blo
 
 See `docs/plugins/publishing.md` for what the signature does and does not prove.
 
-`plugin restore-data <ID>` puts a plugin's saved data back to the copy Agora kept before its last data-shape change. It always asks first (`--yes` skips the question), and it discards anything the plugin wrote since that copy, so it is a deliberate recovery step, not an undo for an ordinary update. `plugin enable` and `plugin disable` change only the installed plugin's enabled state. `plugin remove` removes the plugin and its log while keeping plugin data by default; add `--purge-data` only when that separate data-removal decision is intended. Removing a development plugin never deletes its source folder. `plugin log` reads the requested number of recent lines, defaulting to 200. `plugin disable-all` is the recovery path: it stops and disables every currently enabled plugin without removing installations or stored data.
+`plugin restore-data <ID>` puts a plugin's saved data back to the copy Agora kept before its last data-shape change. It always asks first (`--yes` skips the question), and it discards anything the plugin wrote since that copy, so it is a deliberate recovery step, not an undo for an ordinary update.
+
+`plugin recover [ID]` is the way out of a plugin install that a crash cut short (MASTER_SPEC §32.11). Every install writes a journal saying which folders it may touch and how far it got, and the next start finishes or undoes it by itself when that is safe. With no id, `recover` does the same for every interrupted install and lists anything that needs a hand. A case that needs a hand — a package folder whose `agora-plugin.json` cannot be read, a stashed copy from an older Agora that wrote no journal, a journal this build cannot read — is resolved only by naming a direction, and each says what it will do before it does it:
+
+- `--restore --yes` puts the stashed previous version back. **Risk:** whatever is in the plugin's folder now is replaced, including a newer version that could not be read.
+- `--discard --yes` keeps what is installed and drops the stashed copy. **Risk:** the previous version is gone, so going back to it is no longer possible.
+
+Both exit non-zero without `--yes`, having changed nothing.
+
+`plugin enable` and `plugin disable` change only the installed plugin's enabled state. `plugin remove` removes the plugin and its log while keeping plugin data by default; add `--purge-data` only when that separate data-removal decision is intended. Removing a development plugin never deletes its source folder. `plugin log` reads the requested number of recent lines, defaulting to 200. `plugin disable-all` is the recovery path: it stops and disables every currently enabled plugin without removing installations or stored data.
 
 ### Launching
 

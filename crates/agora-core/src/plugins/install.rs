@@ -1035,16 +1035,30 @@ pub fn crash_point(ctx: &crate::ctx::Ctx, point: InstallCrashPoint) {
     let _ = (ctx, point);
 }
 
-/// What recovery did about one interrupted install.
-enum InstallRecovery {
+/// What recovery did about one interrupted install, or what it found and would not decide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallRecovery {
     /// There was nothing to recover.
     None,
     /// Recovery finished or undid the install. The line is ready to show.
     Done(String),
-    /// A person has to decide; `why` says what was found and what to do.
+    /// A person has to decide; the line says what was found and what to do about it.
     NeedsHand(String),
     /// Another Agora holds the install lock, so nothing here was even looked at.
     Busy(String),
+}
+
+/// What a person decided about an install that needs a hand (MASTER_SPEC §32.11: every "needs a
+/// hand" has a way out).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallResolution {
+    /// Do what the journal proves is safe, and report what needs a hand. The startup pass's answer.
+    Automatic,
+    /// Put the previous version back even though the package folder is not provably this install's:
+    /// whatever is in it is replaced by the stashed copy. Only a person can decide that.
+    Restore,
+    /// Keep what is installed, and drop the stashed copy and the journal.
+    Discard,
 }
 
 /// Finish or undo an install that a crash interrupted (MASTER_SPEC §32.11).
@@ -1079,15 +1093,9 @@ pub fn recover_interrupted_installs(
         let outcome = if has_journal {
             recover_one(&locks, conn, paths, &id)
         } else {
-            // A stash from an Agora that wrote no journal. Its files are this plugin's, but nothing
-            // says which install made it or whether that install finished, so it is not ours to act
-            // on: the explicit commands are the way out.
-            InstallRecovery::NeedsHand(format!(
-                "A plugin install needs a hand: a stashed copy of plugin {id} is in the rollback \
-                 folder with no install journal, so Agora cannot tell whether the install that made \
-                 it finished. Nothing was changed. Put it back with `agora plugin recover {id} \
-                 --restore`, or drop it with `agora plugin recover {id} --discard`."
-            ))
+            // A stash from an Agora that wrote no journal: nothing says which install made it or
+            // whether that install finished, so the explicit commands are the way out.
+            legacy_stash(&id)
         };
         match outcome {
             InstallRecovery::None => {}
@@ -1102,8 +1110,177 @@ pub fn recover_interrupted_installs(
     Ok(warnings)
 }
 
-/// The plugins whose installs may have been interrupted: those with a journal (a
-/// `<id>.json` file), and those with a stashed folder and no journal (an older Agora's).
+/// Resolve one or every interrupted install, for an explicit command (`agora plugin recover`).
+///
+/// Opens the local database itself: the adapter has no other way in, and this is the one place the
+/// recovery needs a record.
+pub fn resolve_installs(
+    ctx: &crate::ctx::Ctx,
+    id: Option<&PluginId>,
+    resolution: InstallResolution,
+) -> LauncherResult<Vec<(PluginId, InstallRecovery)>> {
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db())
+        .map_err(|error| io_error(format!("could not open the local database: {error}")))?;
+    let ids: Vec<PluginId> = match id {
+        Some(id) => vec![id.clone()],
+        None => interrupted_installs(&ctx.paths.plugin_rollback_root())?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect(),
+    };
+    let mut out = Vec::new();
+    for id in ids {
+        let outcome = resolve_interrupted_install(&conn, &ctx.paths, &id, resolution)?;
+        out.push((id, outcome));
+    }
+    Ok(out)
+}
+
+/// Resolve one plugin's interrupted install.
+///
+/// [`InstallResolution::Automatic`] is the startup pass's answer. The other two are a person's
+/// answer to a "needs a hand", and they are the only way past a journal this build will not act on
+/// by itself: `Restore` puts the stashed copy back over whatever the package folder holds, and
+/// `Discard` drops the stashed copy and keeps what is installed.
+pub fn resolve_interrupted_install(
+    conn: &rusqlite::Connection,
+    paths: &crate::app_paths::AppPaths,
+    id: &PluginId,
+    resolution: InstallResolution,
+) -> LauncherResult<InstallRecovery> {
+    let rollback = paths.plugin_rollback_root().join(id.as_str());
+    let destination = package_dir(&paths.plugin_packages_root(), id);
+    let locks = crate::lock_manager::LockManager::new(paths.locks_root());
+    let journal_path = install_journal_path(paths, id);
+    if resolution == InstallResolution::Automatic {
+        // No journal and no stash is nothing at all; no journal with a stash is an older Agora's.
+        if let crate::recovery::JournalRead::Absent =
+            crate::recovery::read::<PluginInstallState>(&journal_path)
+        {
+            return Ok(match folder_manifest(&rollback) {
+                FolderManifest::Absent => InstallRecovery::None,
+                _ => legacy_stash(id),
+            });
+        }
+        return Ok(recover_one(&locks, conn, paths, id));
+    }
+    // A person asked for this one: wait for a live install to let go (the caller is an explicit
+    // command, not a startup pass), then do exactly what they asked.
+    let _lock = match locks.acquire(
+        crate::lock_manager::LockResource::PluginInstall,
+        "plugin-recover",
+    ) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return Ok(InstallRecovery::Busy(format!(
+            "Plugin {id} was left alone: another Agora holds the plugin-install lock ({error}). \
+                 Nothing was changed; try again once it finishes."
+        )))
+        }
+    };
+    match resolution {
+        InstallResolution::Restore => {
+            let stashed = match folder_manifest(&rollback) {
+                FolderManifest::Absent => None,
+                FolderManifest::Readable { version, .. } => Some(version),
+                FolderManifest::Unreadable(why) => {
+                    return Ok(InstallRecovery::NeedsHand(format!(
+                        "Plugin {id} has a stashed copy that cannot be read ({why}), so it was not \
+                         put back. Nothing was changed."
+                    )))
+                }
+            };
+            let Some(version) = stashed else {
+                return Ok(InstallRecovery::NeedsHand(format!(
+                    "There is no stashed copy of plugin {id} to put back. Nothing was changed."
+                )));
+            };
+            match std::fs::symlink_metadata(&destination) {
+                Ok(_) => match std::fs::remove_dir_all(&destination) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        return Ok(InstallRecovery::NeedsHand(format!(
+                            "The installed files of plugin {id} could not be removed ({error}), so \
+                             the stashed copy was not put back. Nothing was changed."
+                        )))
+                    }
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Ok(InstallRecovery::NeedsHand(format!(
+                        "The folder of plugin {id} could not be examined ({error}), so the stashed \
+                         copy was not put back. Nothing was changed."
+                    )))
+                }
+            }
+            if let Err(error) = std::fs::rename(&rollback, &destination) {
+                return Ok(InstallRecovery::NeedsHand(format!(
+                    "The stashed copy of plugin {id} could not be put back ({error})."
+                )));
+            }
+            remove_if_present(&journal_path)?;
+            remove_if_present(&install_marker_path(paths, id))?;
+            Ok(InstallRecovery::Done(format!(
+                "Put plugin {id} back to version {version}; whatever was in its folder was replaced."
+            )))
+        }
+        InstallResolution::Discard => {
+            let dropped = match folder_manifest(&rollback) {
+                FolderManifest::Absent => None,
+                FolderManifest::Readable { version, .. } => Some(version),
+                FolderManifest::Unreadable(why) => {
+                    return Ok(InstallRecovery::NeedsHand(format!(
+                        "Plugin {id} has a stashed copy that cannot be read ({why}), so it was not \
+                         dropped. Nothing was changed."
+                    )))
+                }
+            };
+            let had_journal = !matches!(
+                crate::recovery::read::<PluginInstallState>(&journal_path),
+                crate::recovery::JournalRead::Absent
+            );
+            if dropped.is_none() && !had_journal {
+                return Ok(InstallRecovery::NeedsHand(format!(
+                    "There is nothing stashed for plugin {id} and no install journal. Nothing was \
+                     changed."
+                )));
+            }
+            match std::fs::remove_dir_all(&rollback) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Ok(InstallRecovery::NeedsHand(format!(
+                    "The stashed copy of plugin {id} could not be dropped ({error}). Nothing was \
+                         changed."
+                )))
+                }
+            }
+            remove_if_present(&journal_path)?;
+            remove_if_present(&install_marker_path(paths, id))?;
+            Ok(InstallRecovery::Done(match dropped {
+                Some(version) => format!(
+                    "Dropped the stashed copy of plugin {id} version {version}. What is installed \
+                     stays."
+                ),
+                None => format!("Dropped the journal of plugin {id}. Nothing else was changed."),
+            }))
+        }
+        InstallResolution::Automatic => unreachable!("handled above"),
+    }
+}
+
+/// The line for a stashed copy from an Agora that wrote no journal.
+fn legacy_stash(id: &PluginId) -> InstallRecovery {
+    InstallRecovery::NeedsHand(format!(
+        "A plugin install needs a hand: a stashed copy of plugin {id} is in the rollback folder with \
+         no install journal, so Agora cannot tell whether the install that made it finished. \
+         Nothing was changed. Put it back with `agora plugin recover {id} --restore`, or drop it \
+         with `agora plugin recover {id} --discard`."
+    ))
+}
+
+/// The plugins whose installs may have been interrupted: those with a journal (a `<id>.json`
+/// file), and those with a stashed folder and no journal (an older Agora's).
 fn interrupted_installs(rollback_root: &Path) -> LauncherResult<Vec<(PluginId, bool)>> {
     let read = match std::fs::read_dir(rollback_root) {
         Ok(read) => read,
@@ -1168,7 +1345,7 @@ fn recover_one(
              recover {id} --restore`, or keep what is installed with `agora plugin recover {id} \
              --discard`."
         )),
-        Decision::Act(capability) => apply(capability, conn, paths, id),
+        Decision::Act(capability) => apply(*capability, conn, paths, id),
     }
 }
 
@@ -1255,11 +1432,13 @@ fn apply(
     let stashed = match folder_manifest(&rollback) {
         FolderManifest::Absent => None,
         FolderManifest::Readable { version, .. } => Some(version),
-        FolderManifest::Unreadable(why) => return InstallRecovery::NeedsHand(format!(
+        FolderManifest::Unreadable(why) => {
+            return InstallRecovery::NeedsHand(format!(
             "Plugin {id} has a stashed copy that cannot be checked: {why}. Nothing was changed. \
                  Put it back with `agora plugin recover {id} --restore`, or drop it with `agora \
                  plugin recover {id} --discard`."
-        )),
+        ))
+        }
     };
     let Some(restoring) = stashed else {
         // Nothing was moved aside, so there is nothing to put back: the install did not finish and
@@ -2018,7 +2197,7 @@ mod tests {
         std::fs::create_dir_all(&destination).unwrap();
         std::fs::write(
             destination.join(MANIFEST_FILENAME),
-            manifest_json("acme.one").replace("\"1.0.0\"", "\"1.0.0\""),
+            manifest_json("acme.one"),
         )
         .unwrap();
         // The record the install writes last.
@@ -2055,6 +2234,109 @@ mod tests {
     /// The on-disk state a crash leaves: a journal in its first state, its marker, the previous
     /// version stashed, and a writer that no longer exists (the process that died; a test process
     /// is still running, so the identity is pointed at a pid no process has).
+    /// A package as `install_package` receives it, for the crash test below.
+    fn installable_package(version: &str) -> Vec<u8> {
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buffer);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file(MANIFEST_FILENAME, options).unwrap();
+            zip.write_all(
+                manifest_json("acme.one")
+                    .replace("\"1.0.0\"", &format!("\"{version}\""))
+                    .as_bytes(),
+            )
+            .unwrap();
+            zip.start_file("main.js", options).unwrap();
+            zip.write_all(format!("// version {version}").as_bytes())
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        buffer.into_inner()
+    }
+
+    /// The journal a killed process leaves points at a process that no longer exists. This one is
+    /// still running, so its journal is repointed at a pid the system does not have.
+    fn writer_is_gone(paths: &crate::app_paths::AppPaths, id: &str) {
+        let path = install_journal_path(paths, &PluginId::parse(id).unwrap());
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["writer"] = serde_json::json!({
+            "pid": u32::MAX,
+            "start_time": 1,
+            "expected_exe": null,
+        });
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+
+    /// The crash a killed process leaves at each boundary of a real install, through the seam on
+    /// the context: recovery lands on the previous version or the new one, never on neither, and
+    /// leaves no journal behind (MASTER_SPEC §32.11).
+    #[test]
+    fn a_crash_at_each_boundary_of_an_install_recovers_to_the_old_or_the_new_version() {
+        use crate::plugins::service::PluginService;
+        let points = [
+            InstallCrashPoint::JournalWritten,
+            InstallCrashPoint::Stashed,
+            InstallCrashPoint::Extracted,
+            InstallCrashPoint::Recorded,
+        ];
+        for point in points {
+            let tmp = tempfile::tempdir().unwrap();
+            let ctx = crate::ctx::CoreContext::for_testing(tmp.path().join("data"));
+            ctx.paths.create_required_dirs().unwrap();
+            crate::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+            let service = PluginService::headless(
+                ctx.clone(),
+                std::sync::Arc::new(agora_plugin_host::QuickJsHost::new()),
+            );
+            service
+                .install_package_bytes(&installable_package("1.0.0"), true)
+                .expect("the first version installs");
+
+            // The crash: a panic where the process would have died.
+            ctx.test_seams.set_install_crash(Some(point));
+            let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = service.install_package_bytes(&installable_package("2.0.0"), true);
+            }));
+            ctx.test_seams.set_install_crash(None);
+            assert!(crashed.is_err(), "the seam cut the install at {point:?}");
+
+            writer_is_gone(&ctx.paths, "acme.one");
+            let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+            let warnings = recover_interrupted_installs(&conn, &ctx.paths).unwrap();
+
+            let destination = package_dir(
+                &ctx.paths.plugin_packages_root(),
+                &PluginId::parse("acme.one").unwrap(),
+            );
+            let version = readable_version(&destination);
+            assert!(
+                matches!(version.as_deref(), Some("1.0.0") | Some("2.0.0")),
+                "an install cut short at {point:?} recovered to neither version: {version:?} \
+                 ({warnings:?})"
+            );
+            assert!(
+                matches!(
+                    crate::recovery::read::<PluginInstallState>(&install_journal_path(
+                        &ctx.paths,
+                        &PluginId::parse("acme.one").unwrap()
+                    )),
+                    crate::recovery::JournalRead::Absent
+                ),
+                "the journal was left behind after a crash at {point:?}: {warnings:?}"
+            );
+            assert!(
+                matches!(
+                    folder_manifest(&ctx.paths.plugin_rollback_root().join("acme.one")),
+                    FolderManifest::Absent
+                ),
+                "a stashed copy was left behind after a crash at {point:?}: {warnings:?}"
+            );
+        }
+    }
+
     fn crashed_install(
         paths: &crate::app_paths::AppPaths,
         id: &str,

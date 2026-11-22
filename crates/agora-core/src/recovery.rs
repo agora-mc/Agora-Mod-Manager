@@ -234,10 +234,10 @@ pub fn write<T: Serialize>(path: &Path, journal: &T) -> LauncherResult<()> {
 
 /// The temporary file a journal is built in before it is published.
 fn temporary_path(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
+    let mut name = match path.file_name() {
+        Some(name) => name.to_os_string(),
+        None => std::ffi::OsString::from("journal"),
+    };
     name.push(".tmp");
     path.with_file_name(name)
 }
@@ -522,7 +522,7 @@ pub enum Decision<S> {
     /// do. Nothing was touched, and the journal is kept for diagnosis.
     NeedsHand(String),
     /// Recovery may act, through the capability, on exactly the paths the journal proved it owns.
-    Act(RecoveryCapability<S>),
+    Act(Box<RecoveryCapability<S>>),
 }
 
 /// Decide what to do about one operation's journal (MASTER_SPEC §32.11).
@@ -587,11 +587,14 @@ pub fn decide<S: JournalState>(
 
     match writer_liveness(envelope.writer.as_ref()) {
         WriterLiveness::Alive => {
+            let pid = match envelope.writer.as_ref() {
+                Some(writer) => writer.pid.to_string(),
+                None => "unknown".to_string(),
+            };
             return Decision::Busy(format!(
-            "The process that wrote the journal (pid {}) is still running, so the operation may \
-                 still be going. Nothing was changed.",
-            envelope.writer.as_ref().map(|w| w.pid).unwrap_or_default()
-        ))
+                "The process that wrote the journal (pid {pid}) is still running, so the operation \
+                 may still be going. Nothing was changed."
+            ));
         }
         WriterLiveness::CantTell(reason) => {
             return Decision::NeedsHand(format!(
@@ -633,14 +636,14 @@ pub fn decide<S: JournalState>(
         }
     }
 
-    Decision::Act(RecoveryCapability {
+    Decision::Act(Box::new(RecoveryCapability {
         lock,
         journal_path: journal_path.to_path_buf(),
         envelope: *envelope,
         owned,
         left_alone,
         markers,
-    })
+    }))
 }
 
 /// What a marker file says about ownership.
@@ -990,5 +993,145 @@ mod tests {
     fn the_live_test_process_is_alive() {
         let identity = process_identity::capture_self().expect("the test process is readable");
         assert_eq!(writer_liveness(Some(&identity)), WriterLiveness::Alive);
+    }
+
+    // -- the decision and the capability ------------------------------------
+
+    /// An envelope whose writer provably no longer exists: what a crash leaves.
+    fn crashed_envelope(owned: Vec<OwnedPath>) -> Envelope<TestState> {
+        let mut envelope = envelope();
+        envelope.owned = owned;
+        envelope.writer = Some(ProcessIdentity {
+            pid: u32::MAX,
+            start_time: 1,
+            expected_exe: None,
+            job: None,
+        });
+        envelope
+    }
+
+    #[test]
+    fn a_second_process_holding_the_lock_is_busy_and_nothing_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let locks = LockManager::new(dir.path().join("locks"));
+        let path = dir.path().join("journal.json");
+        write(&path, &crashed_envelope(Vec::new())).unwrap();
+
+        // A second lock manager on the same root is what another process sees.
+        let other_process = LockManager::new(dir.path().join("locks"));
+        let held = other_process
+            .acquire_with_timeout(
+                LockResource::PluginInstall,
+                "plugin-install",
+                Duration::ZERO,
+                None,
+            )
+            .expect("the live operation takes the lock");
+        match decide::<TestState>(&locks, &LockResource::PluginInstall, &path, &NoContentProof) {
+            Decision::Busy(why) => assert!(!why.is_empty()),
+            other => panic!("a held lock is busy, got {other:?}"),
+        }
+        // Nothing was consumed: the journal is still there for the next start.
+        assert!(matches!(read::<TestState>(&path), JournalRead::Valid(_)));
+        drop(held);
+        assert!(matches!(
+            decide::<TestState>(&locks, &LockResource::PluginInstall, &path, &NoContentProof),
+            Decision::Act(_)
+        ));
+    }
+
+    #[test]
+    fn a_live_recorded_writer_makes_the_decision_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let locks = LockManager::new(dir.path().join("locks"));
+        let path = dir.path().join("journal.json");
+        let mut envelope = envelope();
+        envelope.writer = process_identity::capture_self();
+        write(&path, &envelope).unwrap();
+        match decide::<TestState>(&locks, &LockResource::PluginInstall, &path, &NoContentProof) {
+            Decision::Busy(why) => assert!(why.contains("still running"), "{why}"),
+            other => panic!("a live writer is busy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_journal_with_no_writer_needs_a_hand() {
+        let dir = tempfile::tempdir().unwrap();
+        let locks = LockManager::new(dir.path().join("locks"));
+        let path = dir.path().join("journal.json");
+        write(&path, &envelope()).unwrap();
+        assert!(matches!(
+            decide::<TestState>(&locks, &LockResource::PluginInstall, &path, &NoContentProof),
+            Decision::NeedsHand(_)
+        ));
+    }
+
+    #[test]
+    fn a_path_whose_marker_belongs_to_another_operation_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let locks = LockManager::new(dir.path().join("locks"));
+        let path = dir.path().join("journal.json");
+        let folder = dir.path().join("folder");
+        let marker = dir.path().join("marker.json");
+        std::fs::create_dir_all(&folder).unwrap();
+        write_marker(&marker, "another-operation").unwrap();
+
+        let mut envelope = crashed_envelope(vec![OwnedPath {
+            path: folder.clone(),
+            proof: PathProof::Marker { at: marker },
+        }]);
+        envelope.operation_id = "this-operation".into();
+        write(&path, &envelope).unwrap();
+
+        match decide::<TestState>(&locks, &LockResource::PluginInstall, &path, &NoContentProof) {
+            Decision::Act(capability) => {
+                assert!(capability.owned().is_empty(), "it is not ours to touch");
+                assert_eq!(capability.left_alone().len(), 1);
+                assert!(capability.left_alone()[0].1.contains("another operation"));
+            }
+            other => panic!("expected a capability with nothing to touch, got {other:?}"),
+        }
+        assert!(folder.is_dir(), "nothing was touched");
+    }
+
+    #[test]
+    fn the_capability_refuses_a_path_the_journal_did_not_prove() {
+        let dir = tempfile::tempdir().unwrap();
+        let locks = LockManager::new(dir.path().join("locks"));
+        let path = dir.path().join("journal.json");
+        let owned = dir.path().join("owned");
+        let unowned = dir.path().join("unowned");
+        let marker = dir.path().join("marker.json");
+        std::fs::create_dir_all(&unowned).unwrap();
+        let envelope = crashed_envelope(vec![OwnedPath {
+            path: owned.clone(),
+            proof: PathProof::Marker { at: marker.clone() },
+        }]);
+        write_marker(&marker, &envelope.operation_id).unwrap();
+        write(&path, &envelope).unwrap();
+
+        let capability =
+            match decide::<TestState>(&locks, &LockResource::PluginInstall, &path, &NoContentProof)
+            {
+                Decision::Act(capability) => capability,
+                other => panic!("expected a capability, got {other:?}"),
+            };
+        assert_eq!(capability.owned(), std::slice::from_ref(&owned));
+        let refused = capability
+            .remove_dir(&unowned)
+            .expect_err("a path the journal did not prove is refused");
+        assert_eq!(refused.code(), "ERR_RECOVERY_REFUSED");
+        assert!(unowned.is_dir(), "the refused path was not touched");
+        // And the proven path is accepted.
+        capability.remove_dir(&owned).unwrap();
+        capability.finish().unwrap();
+        assert!(
+            matches!(read::<TestState>(&path), JournalRead::Absent),
+            "finish deletes the journal, last"
+        );
+        assert!(
+            std::fs::symlink_metadata(&marker).is_err(),
+            "finish removes the marker too"
+        );
     }
 }

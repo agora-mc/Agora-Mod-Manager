@@ -1771,6 +1771,21 @@ impl PluginService {
         store::latest_checkpoint(&conn, plugin_id).ok().flatten()
     }
 
+    /// Finish or undo an install that a crash interrupted, for `agora plugin recover`
+    /// (MASTER_SPEC §32.11).
+    ///
+    /// `None` resolves every interrupted install the way the startup pass does. A person's answer to
+    /// one that needs a hand is [`install::InstallResolution::Restore`] (put the previous version
+    /// back, replacing what is in the plugin's folder now) or
+    /// [`install::InstallResolution::Discard`] (keep what is installed, drop the stashed copy).
+    pub fn recover_interrupted_installs(
+        &self,
+        plugin_id: Option<&PluginId>,
+        resolution: install::InstallResolution,
+    ) -> LauncherResult<Vec<(PluginId, install::InstallRecovery)>> {
+        install::resolve_installs(&self.inner.ctx, plugin_id, resolution)
+    }
+
     /// Put a plugin's stored data back to its most recent checkpoint.
     ///
     /// Never automatic, and deliberately so. Restoring after a failed

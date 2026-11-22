@@ -1726,6 +1726,34 @@ enum PluginCmd {
         )]
         allow_scripts: bool,
     },
+    /// Finish or undo an install that a crash cut short (MASTER_SPEC §32.11).
+    ///
+    /// With no id, recovers every plugin whose install was interrupted, doing only what the
+    /// journal proves is safe, and lists what needs a hand.
+    ///
+    /// A case that needs a hand is resolved by naming a direction. `--restore` puts the stashed
+    /// previous version back, replacing whatever is in the plugin's folder now. `--discard` keeps
+    /// what is installed and drops the stashed copy. Both need --yes, and both say what they will
+    /// do before they do it.
+    Recover {
+        /// Plugin id. Omit to recover every interrupted install the safe way.
+        id: Option<String>,
+        #[arg(
+            long,
+            requires = "id",
+            conflicts_with = "discard",
+            help = "Put the stashed previous version back, replacing what is in the plugin's folder now"
+        )]
+        restore: bool,
+        #[arg(
+            long,
+            requires = "id",
+            help = "Keep what is installed and drop the stashed previous version"
+        )]
+        discard: bool,
+        #[arg(long, help = "Confirm the direction given by --restore or --discard")]
+        yes: bool,
+    },
     /// Put a plugin's stored data back to the copy kept before its last
     /// data-shape change.
     ///
@@ -3849,6 +3877,84 @@ async fn run_plugin_command(
                         println!("Re-run with --yes to accept capabilities, and --allow-scripts to allow its code, once the person using this computer has agreed.");
                     }
                 }
+            }
+        }
+        PluginCmd::Recover {
+            id,
+            restore,
+            discard,
+            yes,
+        } => {
+            use agora_core::plugins::install::{InstallRecovery, InstallResolution};
+            let plugin_id = match id.as_deref() {
+                Some(raw) => Some(parse_plugin_id(raw)?),
+                None => None,
+            };
+            let resolution = if restore {
+                InstallResolution::Restore
+            } else if discard {
+                InstallResolution::Discard
+            } else {
+                InstallResolution::Automatic
+            };
+            if resolution != InstallResolution::Automatic && !yes {
+                let direction = if restore {
+                    "puts the stashed previous version back, replacing whatever is in the plugin's \
+                     folder now"
+                } else {
+                    "keeps what is installed and drops the stashed previous version, so going back \
+                     to it is no longer possible"
+                };
+                println!("This {direction}.");
+                println!(
+                    "Nothing was changed. Add --yes once the person using this computer has agreed."
+                );
+                std::process::exit(1);
+            }
+            let outcomes = service.recover_interrupted_installs(plugin_id.as_ref(), resolution)?;
+            let mut needs_hand = false;
+            if outcomes.is_empty() {
+                println!("No plugin install was interrupted.");
+            }
+            for (plugin, outcome) in &outcomes {
+                match outcome {
+                    InstallRecovery::None => {}
+                    InstallRecovery::Done(line) => println!("{line}"),
+                    InstallRecovery::NeedsHand(line) => {
+                        needs_hand = true;
+                        eprintln!("{line}");
+                    }
+                    InstallRecovery::Busy(line) => eprintln!("{line}"),
+                }
+                let _ = plugin;
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "outcomes": outcomes
+                            .iter()
+                            .map(|(plugin, outcome)| {
+                                let (state, line) = match outcome {
+                                    InstallRecovery::None => ("nothing", None),
+                                    InstallRecovery::Done(line) => ("done", Some(line.clone())),
+                                    InstallRecovery::NeedsHand(line) => {
+                                        ("needs-hand", Some(line.clone()))
+                                    }
+                                    InstallRecovery::Busy(line) => ("busy", Some(line.clone())),
+                                };
+                                serde_json::json!({
+                                    "plugin": plugin.as_str(),
+                                    "state": state,
+                                    "message": line,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    }))?
+                );
+            }
+            if needs_hand {
+                std::process::exit(1);
             }
         }
         PluginCmd::RestoreData { id, yes } => {
