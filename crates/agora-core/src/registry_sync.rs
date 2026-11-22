@@ -1102,13 +1102,21 @@ fn remove_staged_bundle(app_data_dir: &Path) {
 }
 
 /// Publish the staged bytes: one rename over the installed bundle.
+///
+/// The directory entry is flushed afterwards on Unix so the commit is durable,
+/// not merely reported. A directory that cannot be flushed is not an error: a
+/// rename is one journaled directory operation, so power loss leaves either the
+/// published bundle or the staged file the floor names, and the next open
+/// finishes either state.
 fn publish_staged_bundle(app_data_dir: &Path, staged: &Path) -> LauncherResult<()> {
     let bundle_path =
         paths::registry_bundle_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
     std::fs::rename(staged, &bundle_path).map_err(|error| LauncherError::Generic {
         code: "ERR_REGISTRY_WRITE".into(),
         message: format!("Could not publish the staged catalog bundle: {error}."),
-    })
+    })?;
+    let _ = sync_directory(bundle_path.parent().unwrap_or_else(|| Path::new(".")));
+    Ok(())
 }
 
 /// The message for a catalog the floor is above with nothing durable to finish
