@@ -2297,7 +2297,8 @@ fn forge_install_receipt_pins_processor_output_with_published_sha1() {
     // Produced set, derived exactly like the install path derives it.
     let install_profile: serde_json::Value = serde_json::from_str(INSTALL_PROFILE_JSON)
         .expect("real Forge install_profile.json must parse");
-    let produced = installed_profile::processor_output_coordinates(&install_profile, "client");
+    let produced = installed_profile::processor_output_coordinates(&install_profile, "client")
+        .expect("the real Forge install profile's client outputs resolve");
     assert!(
         produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:client"),
         "the installer parse must recognize the produced client jar, got: {produced:?}"

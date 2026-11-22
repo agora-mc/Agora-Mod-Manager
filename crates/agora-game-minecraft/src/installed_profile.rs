@@ -802,10 +802,15 @@ fn collect_unhashed_library_paths(libraries: &[crate::launch::Library]) -> Vec<S
 /// installed is the only reliable way to name those artifacts — collecting
 /// every `data` entry would also allow processor *inputs* and the other side's
 /// jars to be treated as outputs.
+///
+/// A processor only runs for the sides its `sides` array names; see
+/// [`processor_runs_on`]. Resolving a server-only processor's `{MC_UNPACKED}`
+/// through `data(...)["client"]` would name an artifact no client install ever
+/// produces.
 pub fn processor_output_coordinates(
     install_profile: &serde_json::Value,
     side: &str,
-) -> BTreeSet<String> {
+) -> Result<BTreeSet<String>, ProfileIssue> {
     fn collect(reference: &serde_json::Value, out: &mut BTreeSet<String>) {
         let Some(text) = reference.as_str() else {
             return;
@@ -825,6 +830,9 @@ pub fn processor_output_coordinates(
     let mut out = BTreeSet::new();
     if let Some(processors) = install_profile.get("processors").and_then(|v| v.as_array()) {
         for processor in processors {
+            if !processor_runs_on(processor, side)? {
+                continue;
+            }
             let Some(outputs) = processor.get("outputs").and_then(|v| v.as_object()) else {
                 continue;
             };
@@ -850,7 +858,40 @@ pub fn processor_output_coordinates(
             }
         }
     }
-    out
+    Ok(out)
+}
+
+/// Whether an installer processor runs for `side`.
+///
+/// `sides` is optional: absent (or null) means every side. When it is present
+/// it names the sides the processor runs on, and one that does not name `side`
+/// produces nothing for the install being done.
+///
+/// A `sides` that is present but is not an array of strings cannot be
+/// interpreted. Both guesses are wrong in a way that matters: "every side"
+/// trusts artifacts the other side's processors write, and "no side" drops
+/// outputs this install really produces. It is reported instead.
+fn processor_runs_on(processor: &serde_json::Value, side: &str) -> Result<bool, ProfileIssue> {
+    let sides = match processor.get("sides") {
+        None | Some(serde_json::Value::Null) => return Ok(true),
+        Some(sides) => sides,
+    };
+    let malformed = || {
+        let jar = processor
+            .get("jar")
+            .and_then(|jar| jar.as_str())
+            .unwrap_or("(no jar)");
+        ProfileIssue::corrupt(
+            None,
+            format!("Installer processor '{jar}' has a 'sides' that is not an array of strings: {sides}"),
+        )
+    };
+    let sides = sides.as_array().ok_or_else(malformed)?;
+    let mut names = Vec::with_capacity(sides.len());
+    for entry in sides {
+        names.push(entry.as_str().ok_or_else(malformed)?);
+    }
+    Ok(names.iter().any(|name| *name == side))
 }
 
 pub fn processor_outputs_from_installer_jar(
@@ -886,7 +927,7 @@ pub fn processor_outputs_from_installer_jar(
             format!("Installer's install_profile.json is invalid: {error}"),
         )
     })?;
-    Ok(processor_output_coordinates(&value, side))
+    processor_output_coordinates(&value, side)
 }
 
 fn receipt_produced_libraries(
@@ -1770,7 +1811,8 @@ mod tests {
             "../tests/fixtures/forge-1.21.1-52.1.21-install-profile.json"
         ))
         .expect("real Forge install_profile.json fixture is valid JSON");
-        let produced = processor_output_coordinates(&install_profile, "client");
+        let produced = processor_output_coordinates(&install_profile, "client")
+            .expect("client outputs resolve");
         assert!(
             produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:client"),
             "the patched client jar is a client processor output: {produced:?}"
@@ -1779,10 +1821,15 @@ mod tests {
             !produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:server"),
             "the server jar is not produced by a client install: {produced:?}"
         );
+        assert!(
+            !produced.contains("net.minecraft:client:1.21.1"),
+            "the {{MC_UNPACKED}} output belongs to a `sides: [\"server\"]` processor, so a client \
+             install never produces it: {produced:?}"
+        );
         assert_eq!(
             produced.len(),
-            4,
-            "exactly the four client-side processor outputs: {produced:?}"
+            3,
+            "exactly the three client-side processor outputs: {produced:?}"
         );
 
         // The real generated version.json has the patched client jar with a
@@ -1797,6 +1844,86 @@ mod tests {
         let path = Path::new("versions/forge-1.21.1-52.1.21/forge-1.21.1-52.1.21.json");
         validate_loader_profile(&info, path, "forge-1.21.1-52.1.21", "1.21.1", &produced)
             .expect("the real Forge profile's blank client URL is a client processor output");
+
+        // The other direction, on the same real profile: a server install does
+        // get the server-only {MC_UNPACKED} output the client set must not.
+        let server = processor_output_coordinates(&install_profile, "server")
+            .expect("server outputs resolve");
+        assert!(
+            server.contains("net.minecraft:server:1.21.1:unpacked"),
+            "a `sides: [\"server\"]` processor's output is a server output: {server:?}"
+        );
+        assert!(
+            server.contains("net.minecraftforge:forge:1.21.1-52.1.21:server"),
+            "a processor with no `sides` runs on every side: {server:?}"
+        );
+        assert!(
+            !server.contains("net.minecraftforge:forge:1.21.1-52.1.21:client"),
+            "the client jar is not a server output: {server:?}"
+        );
+        assert_eq!(
+            server.len(),
+            4,
+            "the four server-side processor outputs: {server:?}"
+        );
+    }
+
+    #[test]
+    fn processor_sides_are_optional_but_never_guessed() {
+        let with_sides = |sides: serde_json::Value| {
+            json!({
+                "processors": [{
+                    "jar": "net.minecraftforge:installertools:1.4.3",
+                    "sides": sides,
+                    "outputs": { "client": "[org.example:tool:2.0:client]" }
+                }]
+            })
+        };
+
+        // Absent, null and an empty array are all "no restriction" / "no side"
+        // as the installer reads them.
+        assert!(processor_output_coordinates(
+            &json!({
+                "processors": [{ "outputs": { "client": "[org.example:tool:2.0:client]" } }]
+            }),
+            "client"
+        )
+        .expect("absent sides means every side")
+        .contains("org.example:tool:2.0:client"));
+        assert!(
+            processor_output_coordinates(&with_sides(serde_json::Value::Null), "client")
+                .expect("null sides means every side")
+                .contains("org.example:tool:2.0:client")
+        );
+        assert!(
+            processor_output_coordinates(&with_sides(json!([])), "client")
+                .expect("an empty sides array is valid JSON")
+                .is_empty()
+        );
+
+        // A sides list that does not name the side being installed.
+        assert!(
+            processor_output_coordinates(&with_sides(json!(["server"])), "client")
+                .expect("a server-only processor is skipped, not an error")
+                .is_empty()
+        );
+
+        // Present but not an array of strings: reported, not guessed.
+        for malformed in [json!("client"), json!([1]), json!({"client": true})] {
+            let err = processor_output_coordinates(&with_sides(malformed.clone()), "client")
+                .expect_err("a malformed sides value must be reported");
+            assert_eq!(
+                err.kind,
+                ProfileIssueKind::CorruptProfile,
+                "{malformed} {err:?}"
+            );
+            assert!(
+                err.reasons
+                    .iter()
+                    .any(|reason| reason.contains("sides") && reason.contains("installertools")),
+                "the reason must name the processor and the field: {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -1824,7 +1951,8 @@ mod tests {
                 }
             }
         });
-        let produced = processor_output_coordinates(&install_profile, "client");
+        let produced = processor_output_coordinates(&install_profile, "client")
+            .expect("client outputs resolve");
         assert!(produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:client"));
         assert!(produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:server"));
         assert!(produced.contains("org.example:tool:2.0:client"));
@@ -1888,7 +2016,8 @@ mod tests {
                 }
             ]
         });
-        let produced = processor_output_coordinates(&install_profile, "client");
+        let produced = processor_output_coordinates(&install_profile, "client")
+            .expect("client outputs resolve");
         assert!(produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:client"));
         assert!(
             validate_loader_profile(&info, path, "forge-1.21.1-52.1.21", "1.21.1", &produced)
@@ -3334,7 +3463,7 @@ mod tests {
             "../tests/fixtures/forge-1.21.1-52.1.21-install-profile.json"
         ))
         .expect("real Forge install_profile.json fixture is valid JSON");
-        processor_output_coordinates(&install_profile, "client")
+        processor_output_coordinates(&install_profile, "client").expect("client outputs resolve")
     }
 
     /// The installer can exit 0 having left a truncated or wrong jar where the
