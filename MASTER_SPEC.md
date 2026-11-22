@@ -5642,6 +5642,12 @@ Mod files live in `content/objects` with its own sweep, and snapshots keep a sec
   wait, skips that round without deleting anything and without failing. A user-requested delete
   waits briefly before refusing. Acquire this lock after any instance, base or content-store locks,
   and acquire nothing while holding it.
+- A restore holds the instance-locations lock across its whole move: the rename, the live row's
+  insert and the trash record's removal are one critical section, so a pinning scan cannot read
+  the database before the insert and the trash after the cleanup and see the pin in neither. An
+  instance creating a pinned base holds the base's lock (first in that order) from choosing the
+  base until its pin's row is published, and re-reads the record under it, so a removal cannot
+  finish between those two moments undetected.
 - **Migration:** snapshot objects are moved in and re-hashed; mismatches are kept and reported;
   resumable.
 - `plugins/blobs` stays separate (a per-plugin key-value store, not content-addressed).
