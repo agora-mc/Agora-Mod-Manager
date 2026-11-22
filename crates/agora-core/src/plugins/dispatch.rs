@@ -839,6 +839,23 @@ fn read_capped(mut reader: impl std::io::Read, limit: usize) -> PluginResult<Vec
     Ok(body)
 }
 
+/// Map a fetch failure to the plugin-facing error code. Only the launcher's
+/// outbound-policy refusals are `NetworkDenied` (a permanent user setting, not
+/// retryable); a transport failure is `OperationFailed`, which the host offers
+/// to retry.
+fn fetch_error_code(error: &LauncherError) -> PluginErrorCode {
+    match error {
+        LauncherError::Generic { code, .. }
+            if code == "ERR_NETWORK_LOCKDOWN"
+                || code == "ERR_NETWORK_ENDPOINT_DISABLED"
+                || code.starts_with("ERR_NETWORK_HOST") =>
+        {
+            PluginErrorCode::NetworkDenied
+        }
+        _ => PluginErrorCode::OperationFailed,
+    }
+}
+
 fn net_fetch_json(
     cx: &DispatchContext<'_>,
     args: &serde_json::Value,
@@ -873,17 +890,7 @@ fn net_fetch_json(
     )
     .map_err(|e| {
         let message = e.to_string();
-        let code = match &e {
-            LauncherError::Generic { code, .. }
-                if code == "ERR_NETWORK_LOCKDOWN"
-                    || code == "ERR_NETWORK_ENDPOINT_DISABLED"
-                    || code.starts_with("ERR_NETWORK_HOST") =>
-            {
-                PluginErrorCode::NetworkDenied
-            }
-            _ => PluginErrorCode::NetworkDenied,
-        };
-        PluginError::new(code, message)
+        PluginError::new(fetch_error_code(&e), message)
     })?;
 
     let status = response.status().as_u16();
@@ -1109,6 +1116,45 @@ mod tests {
             too_large.served, 17,
             "it reads at most one byte past the limit, not the whole body"
         );
+    }
+
+    #[test]
+    fn a_transient_fetch_failure_is_retryable_not_a_policy_denial() {
+        // A DNS/TLS/connection failure is not the launcher refusing the request
+        // by policy. It must be reported as an operation failure so the host
+        // offers Retry; NetworkDenied means "a user setting blocks this".
+        for error in [
+            LauncherError::NetworkOffline,
+            LauncherError::Generic {
+                code: "ERR_TOO_MANY_REDIRECTS".into(),
+                message: "too many redirects".into(),
+            },
+        ] {
+            let code = fetch_error_code(&error);
+            assert_eq!(
+                code,
+                PluginErrorCode::OperationFailed,
+                "a transient fetch failure was reported as {code:?}"
+            );
+            assert!(code.is_retryable(), "a transient failure must offer Retry");
+        }
+
+        // Policy refusals keep the non-retryable code.
+        for code in [
+            "ERR_NETWORK_LOCKDOWN",
+            "ERR_NETWORK_ENDPOINT_DISABLED",
+            "ERR_NETWORK_HOST_NOT_DECLARED",
+        ] {
+            let error = LauncherError::Generic {
+                code: code.into(),
+                message: "blocked".into(),
+            };
+            assert_eq!(
+                fetch_error_code(&error),
+                PluginErrorCode::NetworkDenied,
+                "{code} is a policy refusal"
+            );
+        }
     }
 
     #[test]
