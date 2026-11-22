@@ -585,6 +585,8 @@ fn base_folder_present(dir: &Path) -> bool {
     )
 }
 
+/// Build a base for `install`: the folder every instance of it shares.
+#[allow(clippy::too_many_arguments)]
 pub fn build_base(
     paths: &AppPaths,
     install: &IdentifiedInstall,
