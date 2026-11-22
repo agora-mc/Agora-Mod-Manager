@@ -165,9 +165,11 @@ python scripts/check_architecture.py && python scripts/check_docs.py && python s
 
 `check_architecture.py` fails on a new `static`, `thread_local!`, `OnceLock`, `LazyLock` or
 `task_local!` item in the non-test code of `agora-core` or `agora-game-minecraft` unless it is on
-[`scripts/process_state_allowlist.json`](process_state_allowlist.json) with a category and the
-reason it has to be process-wide. A test seam belongs on `Ctx` (MASTER_SPEC §32.9), so a hook
-reaches exactly the operations run with that context, on any thread.
+[`scripts/process_state_allowlist.json`](../scripts/process_state_allowlist.json) with a category
+and the reason it has to be process-wide. A static inside a function is keyed by that function, so
+a second `static` beside an allowed one is a new item, not the same entry. A test seam belongs on
+`Ctx` (MASTER_SPEC §32.9), so a hook reaches exactly the operations run with that context, on any
+thread; every test that installs a seam asserts the seam counted a hit.
 
 Rust:
 
