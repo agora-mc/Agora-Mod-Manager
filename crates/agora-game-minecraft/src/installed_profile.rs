@@ -898,11 +898,12 @@ pub fn patched_game_jar_coordinate(
     maven_coordinate(text).map(Some).ok_or_else(|| {
         ProfileIssue::corrupt(
             None,
-            format!("Installer data 'PATCHED' for the {side} side is not a Maven coordinate: {text}"),
+            format!(
+                "Installer data 'PATCHED' for the {side} side is not a Maven coordinate: {text}"
+            ),
         )
     })
 }
-
 
 /// Whether an installer processor runs for `side`.
 ///
@@ -1563,11 +1564,10 @@ fn validate_maven_receipt(
 /// * `source_sha256` â€” SHA-256 hex digest of the curated installer ZIP.
 /// * `installer_url` â€” Download URL of the curated installer.
 /// * `exit_status` â€” Exit code of the installer process. Must be 0.
-/// * `produced_libraries` â€” Coordinates the installer wrote that the profile
-///   links with a blank URL (see [`processor_output_coordinates`]).
-/// * `patched_artifact` â€” Coordinate of the side's patched game jar, if the
-///   installer wrote one (see [`patched_game_jar_coordinate`]). It is pinned
-///   even though the profile does not list it.
+/// * `artifacts` â€” What the installer wrote under `libraries/` for the client
+///   side (see [`installer_side_artifacts_from_jar`]): the coordinates the
+///   profile links with a blank URL, and the patched game jar it does not list
+///   at all. Both are pinned from disk.
 ///
 /// # Returns
 ///
@@ -1581,8 +1581,7 @@ pub fn create_receipt_for_installed_profile(
     source_sha256: &str,
     source_url: &str,
     exit_status: i32,
-    produced_libraries: &BTreeSet<String>,
-    patched_artifact: Option<&str>,
+    artifacts: &InstallerSideArtifacts,
 ) -> Result<InstalledProfileReceipt, ProfileIssue> {
     // 0. Reject non-zero exit status before any hashing or I/O.
     if exit_status != 0 {
@@ -1642,7 +1641,7 @@ pub fn create_receipt_for_installed_profile(
         &profile_path,
         &profile_id,
         &tuple.minecraft_version,
-        produced_libraries,
+        &artifacts.libraries,
     )?;
 
     // 6. Enumerate library paths the receipt must pin from disk:
@@ -1666,7 +1665,7 @@ pub fn create_receipt_for_installed_profile(
             .collect();
     let mut published_sha1: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for lib in &loader_version.libraries {
-        if !produced_libraries.contains(&lib.name) {
+        if !artifacts.libraries.contains(&lib.name) {
             continue;
         }
         // A non-blank URL means the artifact is downloadable, so it needs
@@ -1698,7 +1697,7 @@ pub fn create_receipt_for_installed_profile(
     // would ever name or verify the file. Pin it like the blank-URL outputs
     // above, so adoption refuses a truncated or altered jar by name instead of
     // leaving the launch to fail in the loader's bootstrap.
-    if let Some(patched) = patched_artifact {
+    if let Some(patched) = artifacts.patched.as_deref() {
         let descriptor = parse_maven_descriptor(patched).map_err(|_| {
             ProfileIssue::corrupt(
                 Some(profile_path.clone()),
@@ -2182,6 +2181,61 @@ mod tests {
                 &BTreeSet::new(),
             )
             .expect("the real NeoForge profile has no blank URL and needs no produced libraries");
+        }
+    }
+
+    /// The catalog's `version_json_sha256` is the SHA-256 of the *normalized*
+    /// `version.json` an installer ships (`stable_version_json`: keys sorted
+    /// recursively, `time`/`releaseTime` dropped, compact separators), not of
+    /// the raw bytes. The real extracted files must hash to the catalog's
+    /// value, or the pin describes something else than what installers write.
+    #[test]
+    fn version_json_sha256_is_the_normalized_version_json_of_each_installer() {
+        for (loader, mc_version, loader_version, fixture) in [
+            (
+                "forge",
+                "26.3",
+                "66.1.5",
+                include_str!("../tests/fixtures/forge-26.3-66.1.5-version.json"),
+            ),
+            (
+                "forge",
+                "1.21.1",
+                "52.1.21",
+                include_str!("../tests/fixtures/forge-1.21.1-52.1.21-version.json"),
+            ),
+            (
+                "neoforge",
+                "26.3",
+                "26.3.0.102",
+                include_str!("../tests/fixtures/neoforge-26.3.0.102-version.json"),
+            ),
+            (
+                "neoforge",
+                "1.21.1",
+                "21.1.228",
+                include_str!("../tests/fixtures/neoforge-21.1.228-version.json"),
+            ),
+        ] {
+            let entry = crate::loader_manifests::find_entry(loader, mc_version, loader_version)
+                .unwrap_or_else(|| panic!("the catalog lists {loader} {loader_version}"));
+            let pinned = entry
+                .version_json_sha256
+                .as_deref()
+                .unwrap_or_else(|| panic!("{loader} {loader_version} pins its version.json"));
+            let version: serde_json::Value =
+                serde_json::from_str(fixture).expect("the extracted version.json is JSON");
+            assert_eq!(
+                stable_profile_hash(&version),
+                pinned,
+                "{loader} {loader_version}: the catalog pins the normalized version.json"
+            );
+            assert_ne!(
+                sha256_hex(fixture.as_bytes()),
+                pinned,
+                "{loader} {loader_version}: the raw file's digest is not what the catalog pins, so \
+                 the pin can only be checked after normalization"
+            );
         }
     }
 
@@ -3602,8 +3656,7 @@ mod tests {
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "https://maven.minecraftforge.net/forge.jar",
                 0,
-                &BTreeSet::new(),
-                None,
+                &InstallerSideArtifacts::default(),
             )
             .expect("a blank published digest is no hash to check");
 
@@ -3643,8 +3696,7 @@ mod tests {
             installer_sha,
             "https://maven.minecraftforge.net/forge.jar",
             0,
-            &BTreeSet::new(),
-            None,
+            &InstallerSideArtifacts::default(),
         )
         .expect("create_receipt should succeed");
 
@@ -3684,8 +3736,7 @@ mod tests {
             installer_sha,
             "https://maven.neoforged.net/neoforge.jar",
             0,
-            &BTreeSet::new(),
-            None,
+            &InstallerSideArtifacts::default(),
         )
         .expect("create_receipt for neoforge should succeed");
 
@@ -3709,8 +3760,7 @@ mod tests {
             "sha",
             "https://example.com/forge.jar",
             0,
-            &BTreeSet::new(),
-            None,
+            &InstallerSideArtifacts::default(),
         )
         .expect_err("should fail when generated library is missing");
 
@@ -3753,8 +3803,7 @@ mod tests {
             "sha",
             "https://example.com/forge.jar",
             0,
-            &BTreeSet::new(),
-            None,
+            &InstallerSideArtifacts::default(),
         )
         .expect_err("should reject traversal path");
 
@@ -3789,8 +3838,7 @@ mod tests {
             installer_sha,
             "https://maven.minecraftforge.net/forge.jar",
             0,
-            &BTreeSet::new(),
-            None,
+            &InstallerSideArtifacts::default(),
         )
         .expect("create_receipt should succeed");
 
@@ -3836,8 +3884,7 @@ mod tests {
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "https://maven.minecraftforge.net/forge.jar",
             0,
-            &BTreeSet::new(),
-            None,
+            &InstallerSideArtifacts::default(),
         )
         .expect("create_receipt should succeed");
 
@@ -3904,8 +3951,10 @@ mod tests {
             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-installer.jar",
             0,
-            &real_forge_produced(),
-            None,
+            &InstallerSideArtifacts {
+                libraries: real_forge_produced(),
+                patched: None,
+            },
         )
         .expect_err("a truncated processor output must not be pinned");
 
@@ -3950,8 +3999,10 @@ mod tests {
             "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
             "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-installer.jar",
             0,
-            &real_forge_produced(),
-            None,
+            &InstallerSideArtifacts {
+                libraries: real_forge_produced(),
+                patched: None,
+            },
         )
         .expect("bytes that match the published SHA-1 are pinned");
 
@@ -3984,8 +4035,10 @@ mod tests {
                 "9999999999999999999999999999999999999999999999999999999999999999",
                 "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-installer.jar",
                 0,
-                &real_forge_produced(),
-                None,
+                &InstallerSideArtifacts {
+                libraries: real_forge_produced(),
+                patched: None,
+            },
             )
             .unwrap_or_else(|err| panic!("a blank published digest is no hash to check: {err:?}"));
 
@@ -4042,9 +4095,9 @@ mod tests {
         );
         fix.write_profile("forge-26.3-66.1.5", &version);
 
-        let lib = fix.minecraft_dir.join(
-            "libraries/net/minecraftforge/forge/26.3-66.1.5/forge-26.3-66.1.5-client.jar",
-        );
+        let lib = fix
+            .minecraft_dir
+            .join("libraries/net/minecraftforge/forge/26.3-66.1.5/forge-26.3-66.1.5-client.jar");
         fs::create_dir_all(lib.parent().expect("library dir")).expect("create lib dir");
         fs::write(&lib, bytes).expect("write processor output");
         (fix, tuple, version)
@@ -4071,8 +4124,10 @@ mod tests {
             "4ba54a1bc216ad12dde032eecb999cb3c617b1d0c92ad67add4b6531f45e58b4",
             "https://maven.minecraftforge.net/net/minecraftforge/forge/26.3-66.1.5/forge-26.3-66.1.5-installer.jar",
             0,
-            &produced,
-            None,
+            &InstallerSideArtifacts {
+                libraries: produced,
+                patched: None,
+            },
         )
         .expect("a Forge 26.3 client install pins its client jar");
 
@@ -4171,8 +4226,10 @@ mod tests {
                 installer_sha,
                 "https://maven.neoforged.net/releases/net/neoforged/neoforge/installer.jar",
                 0,
-                &produced,
-                Some(&patched),
+                &InstallerSideArtifacts {
+                libraries: produced,
+                patched: Some(patched),
+            },
             )
             .unwrap_or_else(|err| {
                 panic!("a NeoForge {loader_version} install pins its jar: {err:?}")
@@ -4217,22 +4274,33 @@ mod tests {
             installer_sha,
             &entry.source_url,
             0,
-            &produced,
-            Some(&patched_coordinate),
+            &InstallerSideArtifacts {
+                libraries: produced,
+                patched: Some(patched_coordinate),
+            },
         )
         .expect("the install pins the patched jar");
 
-        adopt_installed_profile(&fix.minecraft_dir, &fix.receipts_root, &tuple, installer_sha)
-            .expect("the jar the receipt pinned is intact");
+        adopt_installed_profile(
+            &fix.minecraft_dir,
+            &fix.receipts_root,
+            &tuple,
+            installer_sha,
+        )
+        .expect("the jar the receipt pinned is intact");
 
-        let patched = fix.minecraft_dir.join(
-            "libraries/net/neoforged/neoforge/21.1.228/neoforge-21.1.228-client.jar",
-        );
+        let patched = fix
+            .minecraft_dir
+            .join("libraries/net/neoforged/neoforge/21.1.228/neoforge-21.1.228-client.jar");
         fs::write(&patched, b"trunc").expect("truncate the patched jar");
 
-        let err =
-            adopt_installed_profile(&fix.minecraft_dir, &fix.receipts_root, &tuple, installer_sha)
-                .expect_err("a truncated patched jar is not the jar the receipt pinned");
+        let err = adopt_installed_profile(
+            &fix.minecraft_dir,
+            &fix.receipts_root,
+            &tuple,
+            installer_sha,
+        )
+        .expect_err("a truncated patched jar is not the jar the receipt pinned");
         assert_eq!(err.kind, ProfileIssueKind::CorruptProfile, "{err:?}");
         let text = err.reasons.join(" ");
         assert!(
@@ -4280,8 +4348,7 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "https://maven.minecraftforge.net/forge.jar",
             1, // non-zero exit
-            &BTreeSet::new(),
-            None,
+            &InstallerSideArtifacts::default(),
         )
         .expect_err("should reject non-zero exit");
 
@@ -4323,8 +4390,7 @@ mod tests {
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "https://maven.minecraftforge.net/forge.jar",
             -1,
-            &BTreeSet::new(),
-            None,
+            &InstallerSideArtifacts::default(),
         )
         .expect_err("should reject negative exit");
 

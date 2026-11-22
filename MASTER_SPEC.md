@@ -4950,12 +4950,24 @@ hosts. Unobfuscated Minecraft releases starting with 26.1 can omit mappings.
 
 Agora checks each library jar against its repository's `.jar.sha512`,
 `.jar.sha256` or `.jar.sha1`, in that order. A missing sidecar permits trying
-the next one. A malformed or mismatched hash stops the install. If all three
-are missing, the player must explicitly allow the download and Agora names
-the jar. The receipt binds the installed profile to the exact library bytes
-for future launches. Agora's direct launcher reuses libraries accepted
-without a sidecar from the installed files. Old profile-byte receipts
-need a loader repair to populate the new receipt.
+the next one. A malformed or mismatched hash stops the install. A profile that
+carries the library's own `sha1`/`sha256` (Fabric's do; Quilt's carry none) is
+checked against that as well, and a profile digest counts as a published hash
+when no sidecar is served. If nothing is published at all, the player must
+explicitly allow the download and Agora names the jar. The receipt binds the
+installed profile to the exact library bytes for future launches. Agora's
+direct launcher reuses libraries accepted without a sidecar from the installed
+files. Old profile-byte receipts need a loader repair to populate the new
+receipt.
+
+An installer also writes artifacts that no generated profile lists. NeoForge's
+processors declare no `outputs`: they write the side's patched game jar to
+`--output {PATCHED}`, and NeoForge's own launcher finds it by scanning the
+directory named in `-DlibraryDirectory`, so no launch classpath entry ever
+names or checks the file. The receipt pins it (`data.PATCHED[side]`), and
+adoption verifies a pinned artifact the profile does not list — a truncated or
+altered jar is refused there, naming the file and the digest the receipt
+pinned.
 
 **Threat model.** Pinning protects users from a file changing *after* Agora pinned
 it, and from tampering between upstream and the user. It cannot judge a

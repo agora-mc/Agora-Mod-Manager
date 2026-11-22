@@ -660,7 +660,7 @@ impl LoaderService {
         for (name, artifact) in jars {
             let (bytes, published) = crate::loader_download::download_maven_library(
                 clients,
-                &artifact.url,
+                &artifact,
                 allow_unverified_loader,
             )
             .await?;
@@ -751,8 +751,7 @@ impl LoaderService {
                 loader_manifests::strip_sha_prefix(&entry.sha256),
                 &entry.source_url,
                 installer_result.exit_code,
-                &artifacts.libraries,
-                artifacts.patched.as_deref(),
+                &artifacts,
             )
             .map_err(|issue| LauncherError::Generic {
                 code: "ERR_PROFILE_CORRUPT".into(),

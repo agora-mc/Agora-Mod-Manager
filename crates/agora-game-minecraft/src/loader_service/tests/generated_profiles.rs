@@ -5,7 +5,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 const FABRIC_PROFILE: &str = include_str!("../../../tests/fixtures/fabric-1.21.1-0.20.1.json");
+const FABRIC_263_PROFILE: &str = include_str!("../../../tests/fixtures/fabric-26.3-0.20.1.json");
 const QUILT_PROFILE: &[u8] = include_bytes!("../../../tests/fixtures/quilt-1.21.1-0.30.1.json");
+const QUILT_263_PROFILE: &[u8] =
+    include_bytes!("../../../tests/fixtures/quilt-26.3-0.31.0-beta.6.json");
 const JAR: &[u8] = b"invented library bytes";
 
 #[derive(Clone, Copy)]
@@ -60,34 +63,53 @@ pub(super) async fn respond(mut socket: TcpStream, profile: &[u8], reply: MavenR
     socket.write_all(body).await.unwrap();
 }
 
+/// Which receipt map a successful install should have pinned every library in:
+/// `Curated` when a hash the source published was checked, `Generated` when the
+/// bytes were accepted only because the user allowed an unhashed download.
+#[derive(Clone, Copy)]
+enum PinKind {
+    Curated,
+    Generated,
+}
+
 async fn create(profile: Value, reply: MavenReply, allow_unverified: bool) -> LauncherResult<()> {
     create_for(
+        "1.21.1",
         "fabric",
         "0.20.1",
         serde_json::to_vec(&profile).unwrap(),
         reply,
         allow_unverified,
+        PinKind::Curated,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_for(
+    mc_version: &str,
     loader: &str,
     loader_version: &str,
     profile: Vec<u8>,
     reply: MavenReply,
     allow_unverified: bool,
+    expect_pins: PinKind,
 ) -> LauncherResult<()> {
     let temp = tempfile::tempdir().unwrap();
     let ctx = crate::testing_context(temp.path().to_owned());
     let manifest_path = ctx.paths.instance_manifest("test-instance").unwrap();
     std::fs::create_dir_all(ctx.paths.instances_root()).unwrap();
     agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
-    let base = ctx.paths.minecraft_runtime_root().join("versions/1.21.1");
+    let base = ctx
+        .paths
+        .minecraft_runtime_root()
+        .join(format!("versions/{mc_version}"));
     std::fs::create_dir_all(&base).unwrap();
     std::fs::write(
-        base.join("1.21.1.json"),
-        br#"{"id":"1.21.1","mainClass":"invented.game.Main","type":"release","libraries":[]}"#,
+        base.join(format!("{mc_version}.json")),
+        format!(
+            r#"{{"id":"{mc_version}","mainClass":"invented.game.Main","type":"release","libraries":[]}}"#
+        ),
     )
     .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -102,7 +124,7 @@ async fn create_for(
     });
     let request = serde_json::from_value(json!({
         "name": "Test Instance", "instance_id": "test-instance",
-        "minecraft_version": "1.21.1", "loader": loader, "loader_version": loader_version
+        "minecraft_version": mc_version, "loader": loader, "loader_version": loader_version
     }))
     .unwrap();
     let client = reqwest::Client::builder()
@@ -128,18 +150,27 @@ async fn create_for(
         let tuple = LoaderTuple {
             loader: loader.into(),
             loader_version: loader_version.into(),
-            minecraft_version: "1.21.1".into(),
+            minecraft_version: mc_version.into(),
         };
         let receipt = installed_profile::read_receipt(&ctx.paths.loader_receipts(), &tuple)
             .unwrap()
             .unwrap();
-        let pins = if matches!(reply, MavenReply::Missing) {
-            &receipt.generated_artifact_sha256
-        } else {
-            &receipt.curated_artifact_sha256
+        let (pins, others) = match expect_pins {
+            PinKind::Curated => (
+                &receipt.curated_artifact_sha256,
+                &receipt.generated_artifact_sha256,
+            ),
+            PinKind::Generated => (
+                &receipt.generated_artifact_sha256,
+                &receipt.curated_artifact_sha256,
+            ),
         };
         assert!(!pins.is_empty());
         assert_eq!(Some(pins.len()), library_count);
+        assert!(
+            others.is_empty(),
+            "every library took the path this test is about: {others:?}"
+        );
         for (path, sha256) in pins {
             assert_eq!(
                 std::fs::read(root.join("libraries").join(path)).unwrap(),
@@ -153,18 +184,69 @@ async fn create_for(
     result.map(|_| ())
 }
 
+/// Publish the digests of the bytes the test server serves for every library.
+///
+/// The real 1–2 MB Maven jars cannot be fixtures, so the captured profile's
+/// digests describe jars the test never sees. A test about the structural,
+/// sidecar or receipt paths replaces them with digests of its invented jar;
+/// the digests themselves are exercised by
+/// [`refuses_bytes_that_contradict_the_sha256_the_profile_publishes`].
+fn publish_served_digests(profile: &mut Value, bytes: &[u8]) {
+    for library in profile["libraries"].as_array_mut().unwrap() {
+        library["sha1"] = json!(sha1_hex(bytes));
+        library["sha256"] = json!(sha256_hex(bytes));
+        library["sha512"] = json!(sha512_hex(bytes));
+        library["size"] = json!(bytes.len());
+    }
+}
+
+/// A profile from a meta server that published no library digests at all: the
+/// shape Quilt's profiles have. The sidecar tests need a library with nothing
+/// published, and the captured Fabric profiles do publish digests.
+fn without_library_digests(profile: &mut Value) {
+    for library in profile["libraries"].as_array_mut().unwrap() {
+        for field in ["sha1", "sha256", "sha512", "size"] {
+            library.as_object_mut().unwrap().remove(field);
+        }
+    }
+}
+
+/// The captured Fabric profile as the local Maven responder describes it.
+///
+/// The responder serves [`JAR`] for every library, so a reply that publishes a
+/// sidecar needs a profile whose digests describe those bytes. `Missing` is a
+/// source that published nothing: its profile carries no digest either, or the
+/// test would no longer be about an unhashed download.
+pub(super) fn served_fabric_profile(reply: MavenReply) -> Vec<u8> {
+    let mut profile = fabric_profile();
+    if matches!(reply, MavenReply::Missing) {
+        without_library_digests(&mut profile);
+    } else {
+        publish_served_digests(&mut profile, JAR);
+    }
+    serde_json::to_vec(&profile).unwrap()
+}
+
 fn fabric_profile() -> Value {
     serde_json::from_str(FABRIC_PROFILE).unwrap()
 }
 
+fn fabric_263_profile() -> Value {
+    serde_json::from_str(FABRIC_263_PROFILE).unwrap()
+}
+
 #[tokio::test]
 async fn creates_fabric_instance_from_captured_profile() {
+    let mut profile = fabric_profile();
+    publish_served_digests(&mut profile, JAR);
     create_for(
+        "1.21.1",
         "fabric",
         "0.20.1",
-        FABRIC_PROFILE.as_bytes().to_vec(),
+        serde_json::to_vec(&profile).unwrap(),
         MavenReply::Match,
         false,
+        PinKind::Curated,
     )
     .await
     .unwrap();
@@ -174,7 +256,122 @@ async fn creates_fabric_instance_from_captured_profile() {
 async fn creates_fabric_instance_after_asm_update() {
     let mut profile = fabric_profile();
     profile["libraries"][0]["name"] = json!("org.ow2.asm:asm:9.10.2");
+    publish_served_digests(&mut profile, JAR);
     create(profile, MavenReply::Match, false).await.unwrap();
+}
+
+/// Every loader at 26.3, from the real generated profile: no mappings artifact
+/// (26.1 and later are unobfuscated), and the libraries carry digests.
+#[tokio::test]
+async fn creates_fabric_instance_from_captured_263_profile() {
+    let mut profile = fabric_263_profile();
+    assert!(
+        !profile["libraries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|library| library["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("net.fabricmc:intermediary"))),
+        "an unobfuscated release's profile carries no mappings artifact"
+    );
+    publish_served_digests(&mut profile, JAR);
+    create_for(
+        "26.3",
+        "fabric",
+        "0.20.1",
+        serde_json::to_vec(&profile).unwrap(),
+        MavenReply::Match,
+        false,
+        PinKind::Curated,
+    )
+    .await
+    .unwrap();
+}
+
+/// The real Quilt 26.3 profile publishes no digest for any library, so a
+/// library with no sidecar either is the case the override exists for: the
+/// install names the jar and stops, and takes the user's word only when they
+/// give it.
+#[tokio::test]
+async fn creates_quilt_instance_from_captured_263_profile() {
+    let refused = create_for(
+        "26.3",
+        "quilt",
+        "0.31.0-beta.6",
+        QUILT_263_PROFILE.to_vec(),
+        MavenReply::Missing,
+        false,
+        PinKind::Generated,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.to_string().contains("has no published hash"),
+        "{refused}"
+    );
+    assert!(
+        refused
+            .to_string()
+            .contains("sponge-mixin-0.17.4+mixin.0.8.7.jar"),
+        "the refusal must name the jar: {refused}"
+    );
+
+    create_for(
+        "26.3",
+        "quilt",
+        "0.31.0-beta.6",
+        QUILT_263_PROFILE.to_vec(),
+        MavenReply::Missing,
+        true,
+        PinKind::Generated,
+    )
+    .await
+    .unwrap();
+
+    create_for(
+        "26.3",
+        "quilt",
+        "0.31.0-beta.6",
+        QUILT_263_PROFILE.to_vec(),
+        MavenReply::Match,
+        false,
+        PinKind::Curated,
+    )
+    .await
+    .unwrap();
+}
+
+/// Fabric publishes a SHA-256 on each library, which is the strongest digest
+/// the profile itself carries. Bytes that contradict it are refused, and the
+/// missing-checksum override does not reach them: it is for a source that
+/// published nothing, not for one whose own digest disagrees with its bytes.
+#[tokio::test]
+async fn refuses_bytes_that_contradict_the_sha256_the_profile_publishes() {
+    // The captured profile's digests describe the real jars; the server serves
+    // this test's invented bytes and no sidecar.
+    for allow_unverified in [false, true] {
+        let error = create_for(
+            "26.3",
+            "fabric",
+            "0.20.1",
+            serde_json::to_vec(&fabric_263_profile()).unwrap(),
+            MavenReply::Missing,
+            allow_unverified,
+            PinKind::Curated,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error.code().as_str(), "ERR_HASH_MISMATCH"),
+            "an override cannot accept bytes its own profile contradicts: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("SHA-256")
+                && error.to_string().contains("maven.fabricmc.net"),
+            "the refusal names the digest kind and the jar: {error}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -229,16 +426,28 @@ async fn rejects_strongest_published_checksum_on_mismatch() {
 
 #[tokio::test]
 async fn missing_checksums_require_an_explicit_override() {
-    let missing = create(fabric_profile(), MavenReply::Missing, false)
+    // A source that published nothing: no sidecar, and a profile without the
+    // library's own digests (which the captured Fabric profiles do carry).
+    let mut profile = fabric_profile();
+    without_library_digests(&mut profile);
+    let missing = create(profile.clone(), MavenReply::Missing, false)
         .await
         .unwrap_err();
     assert!(
         missing.to_string().contains("no published hash"),
         "{missing}"
     );
-    create(fabric_profile(), MavenReply::Missing, true)
-        .await
-        .unwrap();
+    create_for(
+        "1.21.1",
+        "fabric",
+        "0.20.1",
+        serde_json::to_vec(&profile).unwrap(),
+        MavenReply::Missing,
+        true,
+        PinKind::Generated,
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -254,19 +463,23 @@ async fn refuses_malformed_present_checksum() {
 
 #[tokio::test]
 async fn uses_weaker_published_checksums_only_on_not_found() {
+    let mut profile = fabric_profile();
+    without_library_digests(&mut profile);
     for reply in [MavenReply::Sha256, MavenReply::Sha1] {
-        create(fabric_profile(), reply, false).await.unwrap();
+        create(profile.clone(), reply, false).await.unwrap();
     }
 }
 
 #[tokio::test]
 async fn creates_quilt_instance_from_captured_profile() {
     create_for(
+        "1.21.1",
         "quilt",
         "0.30.1",
         QUILT_PROFILE.to_vec(),
         MavenReply::Match,
         false,
+        PinKind::Curated,
     )
     .await
     .unwrap();
@@ -313,11 +526,13 @@ async fn refuses_invalid_quilt_libraries() {
             libraries.remove(index);
         }
         let err = create_for(
+            "1.21.1",
             "quilt",
             "0.30.1",
             serde_json::to_vec(&profile).unwrap(),
             MavenReply::Match,
             true,
+            PinKind::Curated,
         )
         .await
         .unwrap_err();

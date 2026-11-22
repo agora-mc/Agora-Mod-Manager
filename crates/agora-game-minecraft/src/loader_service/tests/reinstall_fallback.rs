@@ -61,9 +61,10 @@ async fn spawn_fabric_maven(
 ) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
+    let profile = super::generated_profiles::served_fabric_profile(reply);
     let server = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
-            super::generated_profiles::respond(socket, FABRIC_PROFILE.as_bytes(), reply).await;
+            super::generated_profiles::respond(socket, &profile, reply).await;
         }
     });
     (origin, server)

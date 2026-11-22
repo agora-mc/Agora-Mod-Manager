@@ -26,7 +26,11 @@ const FABRIC_JVM_ARGUMENTS: &[&str] = &[
     "-XX:-UseBASE64Intrinsics",
     "-DFabricMcEmu= net.minecraft.client.main.Main ",
 ];
-const QUILT_JVM_ARGUMENTS: &[&str] = &[];
+// Quilt's 0.30.1 / 1.21.1 profile carried no JVM arguments; its 0.31.0-beta.6 /
+// 26.3 profile carries the same two HotSpot flags Fabric's does, and no
+// emulation argument. Anything else is still refused.
+const QUILT_JVM_ARGUMENTS: &[&str] =
+    &["-XX:+UnlockDiagnosticVMOptions", "-XX:-UseBASE64Intrinsics"];
 const GAME_ARGUMENTS: &[&str] = &[];
 
 fn invalid(message: impl Into<String>) -> LauncherError {

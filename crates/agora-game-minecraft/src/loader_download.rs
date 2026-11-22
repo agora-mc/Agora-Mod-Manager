@@ -1,6 +1,7 @@
 //! Downloads from the loader catalog's allowlist. Installer jars use
 //! catalog pins, and generated profile libraries use Maven checksums.
 
+use crate::launch::LibraryArtifact;
 use crate::loader_manifests;
 use agora_core::download::{sha1_hex, sha256_hex, sha512_hex};
 use agora_core::error::{LauncherError, LauncherResult};
@@ -105,13 +106,19 @@ async fn profile_response_bytes(
     Ok(Some(bytes))
 }
 
-/// Use the strongest published checksum. Only a 404 permits trying a weaker
-/// checksum or accepting an explicit missing-checksum override.
+/// Download one library of a generated loader profile and check it against
+/// every hash its source published: the repository's `.jar.sha512`,
+/// `.jar.sha256` or `.jar.sha1` sidecars (strongest first), and the digests
+/// the profile itself carries on the library.
+///
+/// Only a sidecar 404 permits trying a weaker one, falling back to the
+/// profile's own digests, or accepting an explicit missing-checksum override.
 pub(crate) async fn download_maven_library(
     clients: &HttpClients,
-    url: &str,
+    artifact: &LibraryArtifact,
     allow_unverified: bool,
 ) -> LauncherResult<(Vec<u8>, bool)> {
+    let url = artifact.url.trim();
     let algorithms = [
         ("sha512", "SHA-512", 128, sha512_hex as fn(&[u8]) -> String),
         ("sha256", "SHA-256", 64, sha256_hex),
@@ -148,6 +155,17 @@ pub(crate) async fn download_maven_library(
                 message: format!("{name} mismatch for {url}"),
             });
         }
+        verify_profile_digests(artifact, &bytes)?;
+        return Ok((bytes, true));
+    }
+
+    // No sidecar. A profile that carries the library's own SHA-256 (Fabric
+    // does; Quilt publishes nothing) has already published a hash for it, so
+    // the bytes are checked against that rather than treated as unhashed.
+    let (sha1, sha256) = declared_digests(artifact);
+    if sha1.is_some() || sha256.is_some() {
+        let bytes = download_bytes_with_clients(clients, url).await?;
+        verify_profile_digests(artifact, &bytes)?;
         return Ok((bytes, true));
     }
 
@@ -160,6 +178,54 @@ pub(crate) async fn download_maven_library(
         });
     }
     Ok((download_bytes_with_clients(clients, url).await?, false))
+}
+
+/// The non-blank digests a profile publishes for a library, as `(sha1, sha256)`.
+fn declared_digests(artifact: &LibraryArtifact) -> (Option<&str>, Option<&str>) {
+    fn non_blank(value: Option<&String>) -> Option<&str> {
+        value
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+    }
+    (
+        non_blank(artifact.sha1.as_ref()),
+        non_blank(artifact.sha256.as_ref()),
+    )
+}
+
+/// Check downloaded bytes against the digests the loader profile publishes.
+///
+/// These are the source's own published hashes, so a mismatch is never
+/// overridable: `--allow-unverified-loader` is about a source that published
+/// nothing, not about one whose digest disagrees with its bytes. A blank
+/// digest is not a hash — the same rule [`agora_core::artifact_hash`] applies
+/// to a blank published digest anywhere else.
+fn verify_profile_digests(artifact: &LibraryArtifact, bytes: &[u8]) -> LauncherResult<()> {
+    let (sha1, sha256) = declared_digests(artifact);
+    if sha1.is_none() && sha256.is_none() {
+        return Ok(());
+    }
+    agora_core::artifact_hash::verify_download(
+        bytes,
+        sha1,
+        sha256,
+        &[],
+        false,
+        &artifact.path,
+        None,
+    )
+    .map(|_| ())
+    .map_err(|error| match error {
+        LauncherError::HashMismatch => LauncherError::Generic {
+            code: "ERR_HASH_MISMATCH".into(),
+            message: format!(
+                "{} does not match the {} its loader profile publishes",
+                artifact.url,
+                if sha256.is_some() { "SHA-256" } else { "SHA-1" }
+            ),
+        },
+        other => other,
+    })
 }
 
 /// Download a loader file and verify its hash against the pinned value.
