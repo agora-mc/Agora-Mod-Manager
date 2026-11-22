@@ -196,6 +196,13 @@ impl AppPaths {
         self.root.join("registry.bundle.prev")
     }
 
+    /// A verified catalog bundle written durably before it is published over
+    /// [`Self::registry_bundle`]. Its presence after a crash is how an
+    /// interrupted install is finished instead of being lost.
+    pub fn registry_bundle_staged(&self) -> PathBuf {
+        self.root.join("registry.bundle.staged")
+    }
+
     /// The trust this client has learned from verified catalogs: introduced
     /// keys and revocations. It only ever grows.
     pub fn registry_trust_state(&self) -> PathBuf {
