@@ -23,7 +23,6 @@ use agora_game_api::crash::{
 };
 use agora_plugin_host::QuickJsHost;
 use rusqlite::Connection;
-use tempfile::TempDir;
 
 const GAME: &str = "invented-game";
 const PLUGIN: &str = "test.autofind";
@@ -34,8 +33,12 @@ fn db() -> Connection {
     conn
 }
 
-fn test_ctx() -> (TempDir, Ctx) {
-    let tmp = tempfile::tempdir().unwrap();
+#[allow(dead_code)]
+#[path = "common/data_root.rs"]
+mod data_root;
+use data_root::DataRoot;
+fn test_ctx() -> (DataRoot, Ctx) {
+    let tmp = DataRoot::new();
     let ctx = Ctx::for_testing(tmp.path().to_path_buf());
     (tmp, ctx)
 }
@@ -173,7 +176,7 @@ fn log_bytes(rva: &str) -> Vec<u8> {
 }
 
 struct Fixture {
-    _tmp: TempDir,
+    _tmp: DataRoot,
     ctx: Ctx,
     conn: Connection,
     instance_dir: std::path::PathBuf,

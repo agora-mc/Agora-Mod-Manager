@@ -3,16 +3,80 @@
 //!
 //! `cargo test -p agora-core --lib import_bench -- --ignored --nocapture`
 //!
-//! Every timed run writes into a fresh root under `D:\Agora-bench\perfimport-data`, so nothing is
-//! deduplicated against an earlier run. The root is removed at the start of each run.
+//! This benchmark needs data that is deliberately not in the repository, so it reads two
+//! environment variables:
+//!
+//! - `AGORA_BENCH_MODS_ROOT` — folder holding the real MO2 `mods` subfolders named in [`SUBSET`].
+//! - `AGORA_BENCH_DATA_ROOT` — writable folder for the timed runs. Each run gets a fresh root
+//!   beneath it, so nothing is deduplicated against an earlier run; the root is removed at the
+//!   start of each run.
+//!
+//! If either variable is unset or empty, the test prints a reason and does nothing. Neither path
+//! is hard-coded here: the folders live on whoever's machine runs the benchmark.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::*;
 
-const MODS_ROOT: &str = r"D:\Skyrim-MO2-Salvage\MO2\mods";
-const DATA_ROOT: &str = r"D:\Agora-bench\perfimport-data";
+const MODS_ROOT_VAR: &str = "AGORA_BENCH_MODS_ROOT";
+const DATA_ROOT_VAR: &str = "AGORA_BENCH_DATA_ROOT";
+
+/// Resolve both benchmark roots from the environment. An unset or blank
+/// variable is a reason to skip, never a path to fall back to.
+fn configured_paths(lookup: impl Fn(&str) -> Option<String>) -> Result<(PathBuf, PathBuf), String> {
+    let read = |name: &str| {
+        lookup(name)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("set {name} to run this benchmark"))
+    };
+    Ok((
+        PathBuf::from(read(MODS_ROOT_VAR)?),
+        PathBuf::from(read(DATA_ROOT_VAR)?),
+    ))
+}
+
+/// The benchmark must not carry one developer's local paths into the repository.
+#[test]
+fn the_benchmark_reads_its_paths_from_the_environment() {
+    let source = include_str!("import_bench.rs");
+    // Assemble the needle so this test does not itself contain a local path.
+    let drive = char::from(b'D');
+    let local_prefix = format!("{drive}:\\");
+    assert!(
+        !source.contains(&local_prefix),
+        "the benchmark still hard-codes a local drive path"
+    );
+    for name in [MODS_ROOT_VAR, DATA_ROOT_VAR] {
+        assert!(source.contains(name), "{name} is not documented or read");
+    }
+
+    // Both variables are required: a blank one is treated as unset, and the
+    // reason names the variable so the skip is actionable.
+    for lookup in [
+        |_: &str| None,
+        |name: &str| (name == MODS_ROOT_VAR).then(|| "mods-root".into()),
+        |name: &str| (name == DATA_ROOT_VAR).then(|| "   ".into()),
+    ] {
+        let error = configured_paths(lookup).unwrap_err();
+        assert!(
+            error.contains(MODS_ROOT_VAR) || error.contains(DATA_ROOT_VAR),
+            "the skip reason should name the missing variable: {error}"
+        );
+    }
+
+    let (mods, data) = configured_paths(|name: &str| {
+        Some(match name {
+            MODS_ROOT_VAR => "mods-root".into(),
+            DATA_ROOT_VAR => "data-root".into(),
+            _ => String::new(),
+        })
+    })
+    .unwrap();
+    assert_eq!(mods, Path::new("mods-root"));
+    assert_eq!(data, Path::new("data-root"));
+}
 
 /// The fixed subset: 50,424 files and about 5.9 GB. Two mods of many small files (OStim
 /// animations), Nemesis (8,641 files), and two big ones (Darkend, Nature of the Wild Lands).
@@ -185,10 +249,15 @@ fn copy_only_pass(ctx: &Ctx, mods: &ModFiles, len: usize) -> Duration {
 }
 
 #[test]
-#[ignore = "times a real MO2 import: reads D:\\Skyrim-MO2-Salvage, writes D:\\Agora-bench\\perfimport-data"]
+#[ignore = "times a real MO2 import; needs AGORA_BENCH_MODS_ROOT and AGORA_BENCH_DATA_ROOT"]
 fn import_benchmark() {
-    let mods_root = Path::new(MODS_ROOT);
-    let data_root = Path::new(DATA_ROOT);
+    let (mods_root, data_root) = match configured_paths(|name| std::env::var(name).ok()) {
+        Ok(paths) => paths,
+        Err(reason) => {
+            eprintln!("skipping import_benchmark: {reason}");
+            return;
+        }
+    };
 
     // The subset, walked once. The walk is not part of the import.
     let walk_start = Instant::now();

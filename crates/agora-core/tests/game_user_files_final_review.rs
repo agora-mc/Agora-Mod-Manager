@@ -175,6 +175,60 @@ fn put(path: &PathBuf, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 
+/// A journaled path whose parent is a junction to a folder that has since been
+/// deleted cannot be resolved. The swap must refuse it and leave no journal,
+/// backup or instance copy behind. Junctions need no administrator rights.
+#[cfg(windows)]
+#[test]
+fn a_dangling_junction_above_a_journaled_file_refuses_the_swap() {
+    let h = TestHarness::new();
+    let def = test_skyrim_definition();
+
+    let parent = h.local_dir().join("Skyrim Special Edition");
+    let target = h.user_data_dir.path().join("junction-target");
+    std::fs::create_dir_all(h.local_dir()).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    junction::create(&target, &parent).unwrap();
+    put(&parent.join("Plugins.txt"), "*Base.esp");
+    assert!(parent.join("Plugins.txt").is_file());
+
+    // Delete the junction's target, leaving the journaled path's parent
+    // dangling. Nothing can say where the real file would be written.
+    std::fs::remove_dir_all(&target).unwrap();
+    assert!(
+        !parent.join("Plugins.txt").exists(),
+        "the junction is dangling"
+    );
+
+    let error = swap_in(
+        &h.ctx,
+        "dangling-junction",
+        &def,
+        &StoreId::steam(),
+        &h.running_from,
+    )
+    .expect_err("a swap through a dangling junction must be refused");
+
+    assert!(
+        !journal_path_of(&h, &def).exists(),
+        "no journal should survive a refused swap: {error}"
+    );
+    assert!(
+        !backup_dir_of(&h, &def).join("0").exists(),
+        "no backup should be written: {error}"
+    );
+    assert!(
+        !h.instance_dir("dangling-junction")
+            .join("user/Plugins.txt")
+            .exists(),
+        "no instance copy should be written: {error}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&parent).is_ok(),
+        "the junction itself must be left alone"
+    );
+}
+
 #[test]
 fn crash_between_overwrite_and_journal_update_loses_the_users_file() {
     let h = TestHarness::new();

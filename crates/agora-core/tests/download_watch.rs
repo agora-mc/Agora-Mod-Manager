@@ -17,7 +17,6 @@ use agora_core::download_watch::{
 use agora_core::game_registry::{DeclarativePackage, GameRegistry, PackageSource};
 use agora_core::settings::SettingsService;
 use agora_game_api::{ContentLayout, PackageDefinition, RelPath};
-use tempfile::TempDir;
 
 fn skyrim_layout() -> ContentLayout {
     ContentLayout {
@@ -37,8 +36,9 @@ fn skyrim_layout() -> ContentLayout {
     }
 }
 
-fn test_ctx() -> (TempDir, Ctx) {
-    let tmp = tempfile::tempdir().unwrap();
+use common::data_root::DataRoot;
+fn test_ctx() -> (DataRoot, Ctx) {
+    let tmp = DataRoot::new();
     let mut game = common::skyrim_definition();
     game.content_layout = Some(skyrim_layout());
     let package = PackageDefinition {

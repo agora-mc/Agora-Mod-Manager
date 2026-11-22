@@ -3,7 +3,6 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
-use tempfile::TempDir;
 
 use agora_core::content_store::{
     add_archive, add_folder, protect, remove_item, verify_all, verify_item, AddOutcome,
@@ -11,8 +10,12 @@ use agora_core::content_store::{
 };
 use agora_core::ctx::Ctx;
 
-fn test_ctx() -> (TempDir, Ctx) {
-    let tmp = tempfile::tempdir().unwrap();
+#[allow(dead_code)]
+#[path = "common/data_root.rs"]
+mod data_root;
+use data_root::DataRoot;
+fn test_ctx() -> (DataRoot, Ctx) {
+    let tmp = DataRoot::new();
     let ctx = Ctx::for_testing(tmp.path().to_path_buf());
     (tmp, ctx)
 }
@@ -96,6 +99,31 @@ fn assert_store_empty(ctx: &Ctx) {
         let count = std::fs::read_dir(&items).unwrap().count();
         assert_eq!(count, 0, "items directory should be empty");
     }
+}
+
+/// A test root that held a content object must disappear when the test drops
+/// it. The object is protected (a deny-delete ACE on Windows), so a plain
+/// `TempDir` leaves the whole tree behind on volumes that honour the ACE.
+#[test]
+fn dropping_a_test_root_with_a_stored_object_leaves_no_folder() {
+    let (tmp, ctx) = test_ctx();
+    let root = tmp.path().to_path_buf();
+    let work = tempfile::tempdir().unwrap();
+    let folder = work.path().join("mod");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("file.txt"), b"stored bytes").unwrap();
+    let outcome = add_folder(&ctx, &folder, Some("LeakCheck")).unwrap();
+    let item = outcome.item();
+    let sha = &item.files[0].sha256;
+    let object = ctx.paths.content_object_path(sha);
+    assert_eq!(protect::protection(&object).unwrap(), Protection::Protected);
+
+    drop(ctx);
+    drop(tmp);
+    assert!(
+        !root.exists(),
+        "the test root with a protected object was left behind"
+    );
 }
 
 // ---------------------------------------------------------------------------
