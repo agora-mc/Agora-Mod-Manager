@@ -5489,8 +5489,9 @@ before and after.
 - **Fail closed on reads** (32.13): only "not found" means absent.
 - **Risk class decides who builds it.** Slices that touch trust, crash recovery or concurrency, or
   delete or overwrite user files (32.4, 32.7, 32.8, the settings cache in 32.9, 32.11, 32.13), are
-  built by the escalation coder (Sonnet, owner's yes each time) with the design rule in the first
-  brief, and reviewed by Codex Sol until clean. Each such slice ships with a corpus of damaged or
+  briefed with the design rule up front (not just the symptom), coded by the everyday coder and
+  reviewed by Codex Sol ("fit to merge?", one write, review, edit, re-review cycle); if the coder
+  fails the slice, Sol codes it, and if Sol fails too the slice is rethought with the owner. Each such slice ships with a corpus of damaged or
   interrupted fixtures asserting refuse-and-report, never silence or a crash.
 
 ### 32.2 Order
