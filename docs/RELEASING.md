@@ -378,8 +378,11 @@ a remembered descendant cannot sign the bundle that revokes its ancestor.
 Each operation (install, sync, open, status, digest, recovery) reads the log
 once and computes its trust from that one read, using the snapshot for every
 decision in it, including the cached stamp, the rollback floor and delta
-verification. A sync reads it either for the status of a recent check or, once,
-under the `RegistryUpdate` lock, and never re-reads it to describe its own
+verification. The only second read is the guard an install takes on the same
+file immediately before it appends a record, so the append builds on exactly
+what the operation read; an install that appends nothing does not take it. A
+sync reads the log either for the status of a recent check or, once, under the
+`RegistryUpdate` lock, and never re-reads it to describe its own
 install.
 
 A missing or empty state file means nothing is remembered yet. A state file that
