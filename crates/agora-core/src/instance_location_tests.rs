@@ -488,6 +488,50 @@ fn base_removal_keeps_base_when_state_db_metadata_fails() {
         .contains("metadata unavailable"));
 }
 
+#[test]
+fn base_removal_still_reads_recently_deleted_when_the_state_db_is_missing() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    pinned_instance(&ctx, "pinned", base_id);
+    let entry = game_instance::delete(&ctx, "pinned")
+        .unwrap()
+        .trash_entry_id
+        .unwrap();
+    let db = ctx.paths.local_state_db();
+    let removal = game_base::remove_base_with(
+        &ctx.paths,
+        base_id,
+        || {},
+        |path| {
+            if path == db {
+                // A database that was never created means no live pins; the
+                // Recently-deleted scan is independent and must still run.
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            } else {
+                std::fs::metadata(path)
+            }
+        },
+    );
+    assert!(
+        matches!(&removal, Err(BaseError::InUse { instances }) if instances == &vec!["pinned".to_string()]),
+        "a missing database is no live pins, not no pins at all: {removal:?}"
+    );
+    assert!(
+        base_dir.join("game.exe").is_file(),
+        "the base pinned by a restorable entry is kept"
+    );
+    assert!(ctx.paths.base_manifest_path(base_id).is_file());
+    assert!(
+        ctx.paths
+            .recently_deleted_games_root()
+            .join(&entry)
+            .join("instance/tracked.txt")
+            .is_file(),
+        "the entry is untouched"
+    );
+}
+
 fn retention_fixture(ctx: &Ctx) -> PathBuf {
     let dir = instance(ctx, "retention", None);
     for i in 0..7 {

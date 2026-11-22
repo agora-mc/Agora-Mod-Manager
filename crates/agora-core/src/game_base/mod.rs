@@ -1653,38 +1653,40 @@ fn instances_pinning_base_with(
             "cannot tell which instances use base {base_id}, so it is kept: {e}"
         ))
     };
+    // No live database means no live pins ever were created here, but that is not
+    // "nothing pins this base": a Recently-deleted entry is an independent source
+    // and is scanned below either way.
     let db_path = paths.local_state_db();
+    let mut instances = Vec::new();
     match metadata(&db_path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // No state database means no instances were ever created here.
-            return Ok(Vec::new());
+        Ok(_) => {
+            let conn = rusqlite::Connection::open(&db_path).map_err(|e| unreadable(&e))?;
+            let mut stmt = conn
+                .prepare("SELECT instance_id, base_json FROM game_instances")
+                .map_err(|e| unreadable(&e))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| unreadable(&e))?;
+            for row in rows {
+                let (instance_id, base_json) = row.map_err(|e| unreadable(&e))?;
+                let base_ref: agora_game_api::BaseReference = serde_json::from_str(&base_json)
+                    .map_err(|e| unreadable(&format!("instance {instance_id}: {e}")))?;
+                if matches!(&base_ref, agora_game_api::BaseReference::Pinned { id, .. } if id == base_id) {
+                    instances.push(instance_id);
+                }
+            }
         }
-        // A failed lookup is not an absent database. Without this, an error would be read as
-        // "no instances", the base would be deleted, and a later restore would lose its files.
+        // A failed lookup other than absence is not an empty database. Without this,
+        // an error would be read as "no instances", the base would be deleted, and a
+        // later restore would lose its files.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(unreadable(&format!(
                 "cannot inspect {}: {error}",
                 db_path.display()
             )));
-        }
-    }
-    let conn = rusqlite::Connection::open(&db_path).map_err(|e| unreadable(&e))?;
-    let mut stmt = conn
-        .prepare("SELECT instance_id, base_json FROM game_instances")
-        .map_err(|e| unreadable(&e))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|e| unreadable(&e))?;
-    let mut instances = Vec::new();
-    for row in rows {
-        let (instance_id, base_json) = row.map_err(|e| unreadable(&e))?;
-        let base_ref: agora_game_api::BaseReference = serde_json::from_str(&base_json)
-            .map_err(|e| unreadable(&format!("instance {instance_id}: {e}")))?;
-        if matches!(&base_ref, agora_game_api::BaseReference::Pinned { id, .. } if id == base_id) {
-            instances.push(instance_id);
         }
     }
     // The caller holds InstanceLocations across both reads through the deletion: an instance
