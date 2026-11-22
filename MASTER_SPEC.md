@@ -4970,6 +4970,12 @@ adoption verifies a pinned artifact the profile does not list — a truncated or
 altered jar is refused there, naming the file and the digest the receipt
 pinned.
 
+The pin is the file as the installer left it, and the installer's own successful
+exit is the only check at that moment: a jar already truncated when the receipt
+is first written becomes the baseline. A receipt written before this pin existed
+carries none, so an existing NeoForge install gains the check at adoption only
+after a reinstall or `agora instance repair-loader` rewrites its receipt.
+
 **Threat model.** Pinning protects users from a file changing *after* Agora pinned
 it, and from tampering between upstream and the user. It cannot judge a
 malicious *new* version: a new version is pinned unreviewed, as every launcher

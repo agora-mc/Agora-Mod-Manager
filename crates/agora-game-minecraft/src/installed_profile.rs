@@ -211,6 +211,16 @@ pub struct InstalledProfileReceipt {
     /// created artifacts (Forge/NeoForge), or Maven jars from a repository
     /// with no published checksum that the player explicitly accepted.
     /// These paths may be adopted locally but cannot be downloaded at launch.
+    ///
+    /// It also holds an installer's patched game jar that no generated profile
+    /// lists (NeoForge's `data.PATCHED[side]`, which its launcher finds by
+    /// scanning the library directory). The digest is the file as the
+    /// installer left it: the installer's own successful exit is the only
+    /// check at that moment, so a jar already truncated when the receipt is
+    /// first written becomes the baseline, and reinstalling the loader is what
+    /// replaces it. A receipt written before this pin existed carries none —
+    /// an existing install gains the check at adoption after a reinstall or
+    /// `instance repair-loader`, not before.
     #[serde(default, deserialize_with = "deserialize_nullable_hash_map")]
     pub generated_artifact_sha256: BTreeMap<String, String>,
     /// Map of relative Maven paths to SHA-256 hex digests for loader library
