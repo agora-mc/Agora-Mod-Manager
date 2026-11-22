@@ -2289,8 +2289,17 @@ fn forge_install_receipt_pins_processor_output_with_published_sha1() {
     // The receipt checks a processor output against the SHA-1 the profile
     // publishes for it, so the published digest has to describe these bytes.
     // (The real 28 MB patched jar cannot be a fixture; what this test is about
-    // is that a matching output is pinned, not the digest itself.)
-    profile["libraries"][1]["downloads"]["artifact"]["sha1"] =
+    // is that a matching output is pinned, not the digest itself.) Find the
+    // library by its Maven coordinate: an index would write the digest into
+    // whichever library happened to sit there if the fixture were ever
+    // reordered.
+    let client_library = profile["libraries"]
+        .as_array_mut()
+        .expect("the real Forge profile lists libraries")
+        .iter_mut()
+        .find(|library| library["name"] == "net.minecraftforge:forge:1.21.1-52.1.21:client")
+        .expect("the real Forge profile lists the patched client jar");
+    client_library["downloads"]["artifact"]["sha1"] =
         serde_json::Value::String(sha1_hex(client_jar_bytes));
     write_installed_version_json(&minecraft_dir, &profile_id, &profile);
 
