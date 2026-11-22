@@ -931,6 +931,8 @@ See `docs/plugins/publishing.md` for what the signature does and does not prove.
 
 Both exit non-zero without `--yes`, having changed nothing.
 
+An install settles an unresolved journal before it writes its own, so this matters outside startup too: `plugin install` (and `plugin update`, and the same install through the app) takes the plugin-install lock, finishes or undoes an interrupted install of that plugin through the same decision the startup pass uses, and only then begins. A journal is never overwritten. When the journal it finds needs a hand, the install refuses — nothing is changed, the journal and the stashed copy are kept — and the refusal names `agora plugin recover <ID>` as the way out. What the install settled first is written to the plugin's own log, so `plugin log <ID>` answers "why is this version here?".
+
 `plugin enable` and `plugin disable` change only the installed plugin's enabled state. `plugin remove` removes the plugin and its log while keeping plugin data by default; add `--purge-data` only when that separate data-removal decision is intended. Removing a development plugin never deletes its source folder. `plugin log` reads the requested number of recent lines, defaulting to 200. `plugin disable-all` is the recovery path: it stops and disables every currently enabled plugin without removing installations or stored data.
 
 ### Launching

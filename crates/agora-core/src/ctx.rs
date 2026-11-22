@@ -843,6 +843,14 @@ impl CoreContext {
         }
         crate::process_identity::check(identity)
     }
+
+    /// The process table this context's liveness questions are answered from: the real one in
+    /// production, or the stand-in a test installed.
+    pub fn process_view(&self) -> std::sync::Arc<dyn crate::process_identity::ProcessView> {
+        self.test_seams
+            .process_view()
+            .unwrap_or_else(|| std::sync::Arc::new(crate::process_identity::OsProcesses))
+    }
 }
 
 impl std::fmt::Debug for CoreContext {

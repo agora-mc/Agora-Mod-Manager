@@ -930,7 +930,22 @@ impl InstallJournal {
     ///
     /// Called before anything moves: a crash after this point is recoverable.
     pub fn start(&self, paths: &crate::app_paths::AppPaths) -> LauncherResult<()> {
-        crate::recovery::write(&install_journal_path(paths, &self.id()?), self)?;
+        let path = install_journal_path(paths, &self.id()?);
+        // A journal is never overwritten: one already there belongs to an install that did not
+        // finish, and writing over it would strand whatever that install had already moved
+        // (MASTER_SPEC §32.11). The caller settles it first — `settle_before_install` — and only
+        // an absent journal lets a new install begin.
+        if !matches!(
+            crate::recovery::read::<PluginInstallState>(&path),
+            crate::recovery::JournalRead::Absent
+        ) {
+            return Err(io_error(format!(
+                "{} is already there: an earlier install left a journal Agora has to settle before \
+                 it can start another one. Nothing was changed.",
+                path.display()
+            )));
+        }
+        crate::recovery::write(&path, self)?;
         if self.had_files {
             crate::recovery::write_marker(
                 &install_marker_path(paths, &self.id()?),
@@ -1215,6 +1230,55 @@ pub fn resolve_installs(
         out.push((id, outcome));
     }
     Ok(out)
+}
+
+/// Finish or undo an unresolved install journal for `id` before a new install writes its own
+/// (MASTER_SPEC §32.11).
+///
+/// A launcher that is already open checks for an unresolved journal as soon as it holds the
+/// plugin-install lock, before it acts: an install cut short by a crash is finished or undone
+/// through the same decision and the same capability the startup pass uses, and only then does the
+/// new install write its journal. A journal is never overwritten — writing one over an unresolved
+/// one would strand whatever the crashed install had already moved.
+///
+/// Returns the line to show when recovery did something, `None` when there was nothing to recover,
+/// and an error that refuses the install when the journal needs a person.
+pub fn settle_before_install(
+    conn: &rusqlite::Connection,
+    paths: &crate::app_paths::AppPaths,
+    id: &PluginId,
+    lock: &crate::lock_manager::LockGuard,
+    view: &dyn crate::process_identity::ProcessView,
+) -> LauncherResult<Option<String>> {
+    use crate::recovery::{decide_holding, Decision};
+    let destination = package_dir(&paths.plugin_packages_root(), id);
+    let proof = PackageFolderProof {
+        plugin_id: id.as_str().to_string(),
+        destination,
+    };
+    let refusal = |why: &str| LauncherError::Generic {
+        code: "ERR_PLUGIN_IO".into(),
+        message: format!(
+            "Plugin {id} was not installed: an earlier install of it did not finish, and Agora \
+             cannot settle it by itself. {why} Run `agora plugin recover {id}` to see what it \
+             needs, then try the install again."
+        ),
+    };
+    match decide_holding::<PluginInstallState>(
+        lock,
+        &crate::lock_manager::LockResource::PluginInstall,
+        &install_journal_path(paths, id),
+        &proof,
+        view,
+    ) {
+        Decision::Nothing => Ok(None),
+        Decision::Busy(why) | Decision::NeedsHand(why) => Err(refusal(&why)),
+        Decision::Act(capability) => match apply(*capability, conn, paths, id) {
+            InstallRecovery::Done(line) => Ok(Some(line)),
+            InstallRecovery::None => Ok(None),
+            InstallRecovery::NeedsHand(line) | InstallRecovery::Busy(line) => Err(refusal(&line)),
+        },
+    }
 }
 
 /// Resolve one plugin's interrupted install.
@@ -2368,6 +2432,131 @@ mod tests {
         assert!(
             readable_version(&destination).as_deref() == Some("1.0.0"),
             "the previous version is back: {warnings:?}"
+        );
+    }
+
+    /// A journal is never overwritten: starting an install where one already is refuses, and
+    /// leaves the journal exactly as it was.
+    #[test]
+    fn an_install_never_overwrites_a_journal_that_is_already_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::app_paths::AppPaths::from_root(tmp.path().join("data"));
+        paths.create_required_dirs().unwrap();
+        crashed_install(&paths, "acme.one", Some("1.0.0"), true, "2.0.0");
+        let id = PluginId::parse("acme.one").unwrap();
+        let journal = install_journal_path(&paths, &id);
+        let before = std::fs::read(&journal).unwrap();
+
+        let second =
+            InstallJournal::begin(&paths, &id, true, Some("2.0.0".into()), "3.0.0".into()).unwrap();
+        let error = second
+            .start(&paths)
+            .expect_err("a journal already there is not overwritten");
+        assert_eq!(error.code(), "ERR_PLUGIN_IO");
+        assert_eq!(
+            std::fs::read(&journal).unwrap(),
+            before,
+            "the journal that was there is untouched"
+        );
+    }
+
+    /// The bug the second-process check fixes: an install killed after it extracted its new files
+    /// leaves v1 stranded in the rollback folder; a second, already-open process that then installs
+    /// the same plugin used to write its own journal over that one, and v1 was gone. It now settles
+    /// the earlier journal first — the previous version is back before anything new is written
+    /// (MASTER_SPEC §32.11).
+    #[test]
+    fn an_install_settles_the_journal_a_crash_left_before_it_writes_its_own() {
+        use crate::plugins::service::PluginService;
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::ctx::CoreContext::for_testing(tmp.path().join("data"));
+        ctx.paths.create_required_dirs().unwrap();
+        crate::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+        let service = PluginService::headless(
+            ctx.clone(),
+            std::sync::Arc::new(agora_plugin_host::QuickJsHost::new()),
+        );
+        let id = PluginId::parse("acme.one").unwrap();
+
+        // v1 installs, then v2 is cut short after it extracted its files: v1 is in the rollback
+        // folder and the package folder holds v2.
+        service
+            .install_package_bytes(&installable_package("1.0.0"), true)
+            .expect("the first version installs");
+        ctx.test_seams
+            .set_install_crash(Some(InstallCrashPoint::Extracted));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = service.install_package_bytes(&installable_package("2.0.0"), true);
+        }));
+        ctx.test_seams.set_install_crash(None);
+        assert!(crashed.is_err(), "the seam cut the install short");
+        // The process that wrote it is gone: this test's own process did the crashing, so the
+        // journal's writer is repointed at a pid the system does not have.
+        writer_is_gone(&ctx.paths, "acme.one");
+        let destination = package_dir(&ctx.paths.plugin_packages_root(), &id);
+        let rollback = ctx.paths.plugin_rollback_root().join("acme.one");
+        assert!(rollback.is_dir(), "v1 is stashed: {:?}", rollback);
+        let journal = install_journal_path(&ctx.paths, &id);
+        assert!(journal.exists(), "the journal is there to be settled");
+
+        // The same process starts another install (a second, already-open launcher does exactly
+        // this in its own process): the journal from the crash is settled first.
+        service
+            .install_package_bytes(&installable_package("3.0.0"), true)
+            .expect("the second install");
+
+        assert_eq!(
+            readable_version(&destination).as_deref(),
+            Some("3.0.0"),
+            "the requested version is in place"
+        );
+        assert!(
+            !rollback.exists(),
+            "the stashed copy from the crashed install was not left behind"
+        );
+        assert!(
+            !journal.exists(),
+            "the crashed journal was not overwritten; it was settled and then replaced"
+        );
+    }
+
+    /// A journal that needs a hand refuses the install instead of being overwritten by a new one,
+    /// and says which command resolves it.
+    #[test]
+    fn an_install_refuses_when_the_journal_it_finds_needs_a_hand() {
+        use crate::plugins::service::PluginService;
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::ctx::CoreContext::for_testing(tmp.path().join("data"));
+        ctx.paths.create_required_dirs().unwrap();
+        crate::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+        let service = PluginService::headless(
+            ctx.clone(),
+            std::sync::Arc::new(agora_plugin_host::QuickJsHost::new()),
+        );
+        service
+            .install_package_bytes(&installable_package("1.0.0"), true)
+            .expect("the first version installs");
+        let id = PluginId::parse("acme.one").unwrap();
+
+        // An older Agora's rollback folder: a stashed copy with no journal that explains it.
+        crashed_install(&ctx.paths, "acme.one", Some("1.0.0"), true, "2.0.0");
+        let journal = install_journal_path(&ctx.paths, &id);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+        value["writer"] = serde_json::Value::Null;
+        std::fs::write(&journal, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let error = service
+            .install_package_bytes(&installable_package("2.0.0"), true)
+            .expect_err("an unresolved journal refuses the install");
+        let message = error.to_string();
+        assert!(
+            message.contains("agora plugin recover acme.one"),
+            "the refusal names the way out: {message}"
+        );
+        assert!(
+            journal.exists() && ctx.paths.plugin_rollback_root().join("acme.one").is_dir(),
+            "the journal it refused to settle was kept"
         );
     }
 

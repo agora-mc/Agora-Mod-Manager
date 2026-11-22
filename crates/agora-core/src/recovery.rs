@@ -595,7 +595,7 @@ impl ContentProof for NoContentProof {
 
 /// What [`decide`] found, and the only things a recovery handler may do next.
 #[derive(Debug)]
-pub enum Decision<S> {
+pub enum Decision<'a, S> {
     /// No journal: the operation was not started, or it finished. Nothing to do, nothing to report.
     Nothing,
     /// The operation's lock is held right now — another Agora may be in the middle of it. A held
@@ -605,7 +605,7 @@ pub enum Decision<S> {
     /// do. Nothing was touched, and the journal is kept for diagnosis.
     NeedsHand(String),
     /// Recovery may act, through the capability, on exactly the paths the journal proved it owns.
-    Act(Box<RecoveryCapability<S>>),
+    Act(Box<RecoveryCapability<'a, S>>),
 }
 
 /// Decide what to do about one operation's journal (MASTER_SPEC §32.11).
@@ -632,7 +632,7 @@ pub fn decide<S: JournalState>(
     journal_path: &Path,
     proof: &dyn ContentProof,
     view: &dyn crate::process_identity::ProcessView,
-) -> Decision<S> {
+) -> Decision<'static, S> {
     let lock = match locks.acquire_with_timeout_typed(
         resource.clone(),
         RECOVERY_OPERATION,
@@ -647,11 +647,79 @@ pub fn decide<S: JournalState>(
         // is not a lock name): nothing was learned about any holder.
         Err(LockRefusal::Unavailable(error)) => return Decision::NeedsHand(error.to_string()),
     };
+    match examine(resource, journal_path, proof, view) {
+        Examined::Nothing => Decision::Nothing,
+        Examined::Busy(why) => Decision::Busy(why),
+        Examined::NeedsHand(why) => Decision::NeedsHand(why),
+        Examined::Ready(ready) => Decision::Act(Box::new(RecoveryCapability::under(
+            LockHold::Owned(lock),
+            journal_path,
+            ready,
+        ))),
+    }
+}
 
+/// [`decide`] for a caller that already holds the operation's lock.
+///
+/// A running operation asks this before it starts its own work — after taking the lock, before it
+/// writes anything — so an unresolved journal from a crash is finished or undone first, instead of
+/// being overwritten by the new journal. It cannot answer [`Decision::Busy`]: the lock is already
+/// this caller's, so nobody else is in the middle of the same operation.
+pub fn decide_holding<'a, S: JournalState>(
+    lock: &'a LockGuard,
+    resource: &LockResource,
+    journal_path: &Path,
+    proof: &dyn ContentProof,
+    view: &dyn crate::process_identity::ProcessView,
+) -> Decision<'a, S> {
+    match examine(resource, journal_path, proof, view) {
+        Examined::Nothing => Decision::Nothing,
+        // This caller holds the lock, so no live writer can be working on the same operation:
+        // the record contradicts the lock, which is a hand, not permission.
+        Examined::Busy(why) => Decision::NeedsHand(format!(
+            "{why} This Agora holds the operation's lock, so the journal's record of its writer \
+             does not agree with the lock; nothing was changed and the journal was kept."
+        )),
+        Examined::NeedsHand(why) => Decision::NeedsHand(why),
+        Examined::Ready(ready) => Decision::Act(Box::new(RecoveryCapability::under(
+            LockHold::Borrowed(lock),
+            journal_path,
+            ready,
+        ))),
+    }
+}
+
+/// What one examination of a journal found, before it is wrapped in a capability.
+enum Examined<S> {
+    Nothing,
+    /// The recorded writer is still running. For a caller that took the lock this is
+    /// [`Decision::Busy`]; a caller that already held it treats it as a hand, because its own lock
+    /// rules out a live writer and the record therefore contradicts itself.
+    Busy(String),
+    NeedsHand(String),
+    Ready(Ready<S>),
+}
+
+/// A journal that may be acted on, with what the examination verified.
+struct Ready<S> {
+    journal: Box<Journal<S>>,
+    owned: Vec<VerifiedPath>,
+    left_alone: Vec<(PathBuf, String)>,
+    markers: Vec<PathBuf>,
+}
+
+/// Read and validate one journal, check its writer and prove each path it claims. Nothing is
+/// touched; the lock is the caller's business (see [`decide`] and [`decide_holding`]).
+fn examine<S: JournalState>(
+    resource: &LockResource,
+    journal_path: &Path,
+    proof: &dyn ContentProof,
+    view: &dyn crate::process_identity::ProcessView,
+) -> Examined<S> {
     let journal = match read::<S>(journal_path) {
-        JournalRead::Absent => return Decision::Nothing,
+        JournalRead::Absent => return Examined::Nothing,
         JournalRead::Unusable(problem) => {
-            return Decision::NeedsHand(format!(
+            return Examined::NeedsHand(format!(
                 "A journal for this operation is at {} and {problem}, so Agora cannot tell what it \
                  changed. Nothing was changed; the journal was kept so it can be looked at.",
                 journal_path.display()
@@ -663,7 +731,7 @@ pub fn decide<S: JournalState>(
 
     if let Ok(name) = resource.lock_name() {
         if envelope.lock != name {
-            return Decision::NeedsHand(format!(
+            return Examined::NeedsHand(format!(
                 "The journal (operation {}) says it was written under the '{}' lock, not '{}'. \
                  Nothing was changed; the journal was kept.",
                 envelope.operation_id, envelope.lock, name
@@ -677,13 +745,13 @@ pub fn decide<S: JournalState>(
                 Some(writer) => writer.pid.to_string(),
                 None => "unknown".to_string(),
             };
-            return Decision::Busy(format!(
+            return Examined::Busy(format!(
                 "The process that wrote the journal (pid {pid}) is still running, so the operation \
                  may still be going. Nothing was changed."
             ));
         }
         WriterLiveness::CantTell(reason) => {
-            return Decision::NeedsHand(format!(
+            return Examined::NeedsHand(format!(
                 "The journal cannot say whether the operation is still running: {reason}. Nothing \
                  was changed; the journal was kept."
             ))
@@ -706,7 +774,7 @@ pub fn decide<S: JournalState>(
                     continue;
                 }
                 MarkerVerdict::CantTell(why) => {
-                    return Decision::NeedsHand(format!(
+                    return Examined::NeedsHand(format!(
                         "A path this journal owns cannot be checked: {why}. Nothing was changed; \
                          the journal was kept."
                     ))
@@ -719,7 +787,7 @@ pub fn decide<S: JournalState>(
                     continue;
                 }
                 ProofResult::CantTell(why) => {
-                    return Decision::NeedsHand(format!(
+                    return Examined::NeedsHand(format!(
                         "A path this journal owns cannot be checked: {why}. Nothing was changed; \
                          the journal was kept."
                     ))
@@ -732,7 +800,7 @@ pub fn decide<S: JournalState>(
         let identity = match path_identity(&entry.path) {
             Ok(identity) => identity,
             Err(error) => {
-                return Decision::NeedsHand(format!(
+                return Examined::NeedsHand(format!(
                     "A path this journal owns cannot be identified, so Agora cannot tell later \
                      whether it is still the same one: {error}. Nothing was changed; the journal \
                      was kept."
@@ -746,14 +814,12 @@ pub fn decide<S: JournalState>(
         });
     }
 
-    Decision::Act(Box::new(RecoveryCapability {
-        lock,
-        journal_path: journal_path.to_path_buf(),
+    Examined::Ready(Ready {
         journal,
         owned,
         left_alone,
         markers,
-    }))
+    })
 }
 
 /// What a marker file says about ownership.
@@ -819,9 +885,9 @@ fn marker_verdict(at: &Path, operation_id: &str) -> MarkerVerdict {
 /// `&mut self`: an action that succeeded updates what is recorded for the path it moved, so the
 /// next action is checked against the state this capability itself left.
 #[derive(Debug)]
-pub struct RecoveryCapability<S> {
+pub struct RecoveryCapability<'a, S> {
     /// Held for the capability's whole life; dropped last.
-    lock: LockGuard,
+    lock: LockHold<'a>,
     /// The journal this capability was issued from, deleted by [`Self::finish`].
     journal_path: PathBuf,
     /// The journal as it was read and validated: the one read the decision made.
@@ -835,7 +901,27 @@ pub struct RecoveryCapability<S> {
     markers: Vec<PathBuf>,
 }
 
-impl<S> RecoveryCapability<S> {
+/// The lock a capability acts under: one it took itself, or the one a caller already held when it
+/// asked ([`decide_holding`]) — a running operation asks under its own lock before it acts.
+#[derive(Debug)]
+enum LockHold<'a> {
+    Owned(LockGuard),
+    Borrowed(&'a LockGuard),
+}
+
+impl<'a, S> RecoveryCapability<'a, S> {
+    /// The capability for one examined journal, under `hold`.
+    fn under(hold: LockHold<'a>, journal_path: &Path, ready: Ready<S>) -> Self {
+        RecoveryCapability {
+            lock: hold,
+            journal_path: journal_path.to_path_buf(),
+            journal: ready.journal,
+            owned: ready.owned,
+            left_alone: ready.left_alone,
+            markers: ready.markers,
+        }
+    }
+
     /// The id of the operation this capability was issued for.
     pub fn operation_id(&self) -> &str {
         &self.journal.envelope.operation_id
@@ -872,9 +958,12 @@ impl<S> RecoveryCapability<S> {
         &self.left_alone
     }
 
-    /// The lock this capability holds, for a call that must pass it on rather than re-take it.
+    /// The lock this capability acts under, for a call that must pass it on rather than re-take it.
     pub fn lock(&self) -> &LockGuard {
-        &self.lock
+        match &self.lock {
+            LockHold::Owned(lock) => lock,
+            LockHold::Borrowed(lock) => lock,
+        }
     }
 
     /// Where the journal this capability came from lives.

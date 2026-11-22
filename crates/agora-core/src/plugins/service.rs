@@ -1565,6 +1565,29 @@ impl PluginService {
             "plugin-install",
         )?;
 
+        // An install cut short by a crash is settled before this one writes anything: a journal is
+        // never overwritten, and a previous version stranded in the rollback folder would otherwise
+        // stay there under a new journal (MASTER_SPEC §32.11). This is the same decision and the
+        // same capability the startup pass uses, so an already-open launcher behaves exactly like
+        // one that has just started.
+        let settled = install::settle_before_install(
+            &self.inner.conn()?,
+            &self.inner.ctx.paths,
+            &manifest.id,
+            &_install_lock,
+            &*self.inner.ctx.process_view(),
+        )?;
+        if let Some(line) = &settled {
+            // The user asked for an install; what recovery did first goes to the plugin's own log,
+            // where "why did it come back as this version?" is answerable.
+            logs::append(
+                &self.inner.logs_root,
+                &manifest.id,
+                agora_plugin_api::protocol::LogLevel::Info,
+                line,
+            );
+        }
+
         let had_files = destination.exists();
         // The journal is written before anything moves, so a crash from here on is recoverable
         // (MASTER_SPEC §32.11). It says which paths this install owns and how each is proven, and
