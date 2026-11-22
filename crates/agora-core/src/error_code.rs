@@ -129,8 +129,11 @@ error_codes! {
     EmptyBatch = "ERR_EMPTY_BATCH", Install, 1;
     Export = "ERR_EXPORT", Install, 1;
     ExportCopy = "ERR_EXPORT_COPY", Install, 1;
+    ExportDestNotEmpty = "ERR_EXPORT_DEST_NOT_EMPTY", Install, 1;
+    ExportDestOverlapsInstance = "ERR_EXPORT_DEST_OVERLAPS_INSTANCE", Install, 1;
     ExportEntry = "ERR_EXPORT_ENTRY", Install, 1;
     ExportFilename = "ERR_EXPORT_FILENAME", Install, 1;
+    ExportFtype = "ERR_EXPORT_FTYPE", Install, 1;
     ExportInstallerHash = "ERR_EXPORT_INSTALLER_HASH", Install, 1;
     ExportInstallerMetadata = "ERR_EXPORT_INSTALLER_METADATA", Install, 1;
     ExportMkdir = "ERR_EXPORT_MKDIR", Install, 1;
@@ -593,44 +596,82 @@ error_codes! {
     OfficialPluginTree = "ERR_OFFICIAL_PLUGIN_TREE", Plugins, 1;
     OfficialPluginUnknown = "ERR_OFFICIAL_PLUGIN_UNKNOWN", Plugins, 1;
     PluginsUnavailable = "ERR_PLUGINS_UNAVAILABLE", Plugins, 1;
+    PluginCancelled = "ERR_PLUGIN_CANCELLED", Plugins, 1;
+    PluginCapabilitydenied = "ERR_PLUGIN_CAPABILITYDENIED", Plugins, 1;
     PluginCapabilityDenied = "ERR_PLUGIN_CAPABILITY_DENIED", Plugins, 1;
+    PluginConflict = "ERR_PLUGIN_CONFLICT", Plugins, 1;
     PluginConsentRequired = "ERR_PLUGIN_CONSENT_REQUIRED", Plugins, 1;
     PluginDeactivate = "ERR_PLUGIN_DEACTIVATE", Plugins, 1;
+    PluginDependencycycle = "ERR_PLUGIN_DEPENDENCYCYCLE", Plugins, 1;
     PluginDisabled = "ERR_PLUGIN_DISABLED", Plugins, 1;
+    PluginDuplicatecontribution = "ERR_PLUGIN_DUPLICATECONTRIBUTION", Plugins, 1;
     PluginIdInvalid = "ERR_PLUGIN_ID_INVALID", Plugins, 1;
     PluginIdTaken = "ERR_PLUGIN_ID_TAKEN", Plugins, 1;
     PluginIncompatible = "ERR_PLUGIN_INCOMPATIBLE", Plugins, 1;
+    PluginIncompatibleapi = "ERR_PLUGIN_INCOMPATIBLEAPI", Plugins, 1;
+    PluginInternal = "ERR_PLUGIN_INTERNAL", Plugins, 1;
+    PluginInvalidarguments = "ERR_PLUGIN_INVALIDARGUMENTS", Plugins, 1;
+    PluginInvalidmanifest = "ERR_PLUGIN_INVALIDMANIFEST", Plugins, 1;
+    PluginInvalidpackage = "ERR_PLUGIN_INVALIDPACKAGE", Plugins, 1;
+    PluginInvalidresponse = "ERR_PLUGIN_INVALIDRESPONSE", Plugins, 1;
     PluginIo = "ERR_PLUGIN_IO", Plugins, 1;
     PluginNeeded = "ERR_PLUGIN_NEEDED", Plugins, 1;
+    PluginNetworkdenied = "ERR_PLUGIN_NETWORKDENIED", Plugins, 1;
+    PluginNotactivated = "ERR_PLUGIN_NOTACTIVATED", Plugins, 1;
     PluginNotFound = "ERR_PLUGIN_NOT_FOUND", Plugins, 1;
     PluginNoCheckpoint = "ERR_PLUGIN_NO_CHECKPOINT", Plugins, 1;
     PluginNoCode = "ERR_PLUGIN_NO_CODE", Plugins, 1;
+    PluginOperationfailed = "ERR_PLUGIN_OPERATIONFAILED", Plugins, 1;
     PluginPackageInvalid = "ERR_PLUGIN_PACKAGE_INVALID", Plugins, 1;
     PluginPreviewChanged = "ERR_PLUGIN_PREVIEW_CHANGED", Plugins, 1;
     PluginPublisherChanged = "ERR_PLUGIN_PUBLISHER_CHANGED", Plugins, 1;
     PluginRepairConflict = "ERR_PLUGIN_REPAIR_CONFLICT", Plugins, 1;
     PluginRepairInvalid = "ERR_PLUGIN_REPAIR_INVALID", Plugins, 1;
     PluginRepairStale = "ERR_PLUGIN_REPAIR_STALE", Plugins, 1;
+    PluginResourceexhausted = "ERR_PLUGIN_RESOURCEEXHAUSTED", Plugins, 1;
+    PluginScripterror = "ERR_PLUGIN_SCRIPTERROR", Plugins, 1;
     PluginSettingInvalid = "ERR_PLUGIN_SETTING_INVALID", Plugins, 1;
     PluginSettingUnknown = "ERR_PLUGIN_SETTING_UNKNOWN", Plugins, 1;
     PluginStorageIo = "ERR_PLUGIN_STORAGE_IO", Plugins, 1;
     PluginStorageKey = "ERR_PLUGIN_STORAGE_KEY", Plugins, 1;
     PluginStorageQuota = "ERR_PLUGIN_STORAGE_QUOTA", Plugins, 1;
     PluginSurfaceUnknown = "ERR_PLUGIN_SURFACE_UNKNOWN", Plugins, 1;
+    PluginTimeout = "ERR_PLUGIN_TIMEOUT", Plugins, 1;
+    PluginUnknownmethod = "ERR_PLUGIN_UNKNOWNMETHOD", Plugins, 1;
+    PluginUnresolveddependency = "ERR_PLUGIN_UNRESOLVEDDEPENDENCY", Plugins, 1;
     PluginUpdateNone = "ERR_PLUGIN_UPDATE_NONE", Plugins, 1;
     PluginUpdateRefused = "ERR_PLUGIN_UPDATE_REFUSED", Plugins, 1;
     ProvidersUnavailable = "ERR_PROVIDERS_UNAVAILABLE", Plugins, 1;
+    ProviderCancelled = "ERR_PROVIDER_CANCELLED", Plugins, 1;
+    ProviderCapabilitydenied = "ERR_PROVIDER_CAPABILITYDENIED", Plugins, 1;
+    ProviderConflict = "ERR_PROVIDER_CONFLICT", Plugins, 1;
+    ProviderDependencycycle = "ERR_PROVIDER_DEPENDENCYCYCLE", Plugins, 1;
     ProviderDisabled = "ERR_PROVIDER_DISABLED", Plugins, 1;
+    ProviderDuplicatecontribution = "ERR_PROVIDER_DUPLICATECONTRIBUTION", Plugins, 1;
+    ProviderIncompatibleapi = "ERR_PROVIDER_INCOMPATIBLEAPI", Plugins, 1;
+    ProviderInternal = "ERR_PROVIDER_INTERNAL", Plugins, 1;
+    ProviderInvalidarguments = "ERR_PROVIDER_INVALIDARGUMENTS", Plugins, 1;
+    ProviderInvalidmanifest = "ERR_PROVIDER_INVALIDMANIFEST", Plugins, 1;
+    ProviderInvalidpackage = "ERR_PROVIDER_INVALIDPACKAGE", Plugins, 1;
+    ProviderInvalidresponse = "ERR_PROVIDER_INVALIDRESPONSE", Plugins, 1;
     ProviderItem = "ERR_PROVIDER_ITEM", Plugins, 1;
+    ProviderNetworkdenied = "ERR_PROVIDER_NETWORKDENIED", Plugins, 1;
+    ProviderNotactivated = "ERR_PROVIDER_NOTACTIVATED", Plugins, 1;
     ProviderNoDetail = "ERR_PROVIDER_NO_DETAIL", Plugins, 1;
+    ProviderOperationfailed = "ERR_PROVIDER_OPERATIONFAILED", Plugins, 1;
     ProviderPackChanged = "ERR_PROVIDER_PACK_CHANGED", Plugins, 1;
     ProviderPackIdentifier = "ERR_PROVIDER_PACK_IDENTIFIER", Plugins, 1;
     ProviderPackPath = "ERR_PROVIDER_PACK_PATH", Plugins, 1;
     ProviderPlanInvalid = "ERR_PROVIDER_PLAN_INVALID", Plugins, 1;
+    ProviderResourceexhausted = "ERR_PROVIDER_RESOURCEEXHAUSTED", Plugins, 1;
     ProviderResponse = "ERR_PROVIDER_RESPONSE", Plugins, 1;
+    ProviderScripterror = "ERR_PROVIDER_SCRIPTERROR", Plugins, 1;
     ProviderTask = "ERR_PROVIDER_TASK", Plugins, 1;
+    ProviderTimeout = "ERR_PROVIDER_TIMEOUT", Plugins, 1;
     ProviderUnavailable = "ERR_PROVIDER_UNAVAILABLE", Plugins, 1;
     ProviderUnknown = "ERR_PROVIDER_UNKNOWN", Plugins, 1;
+    ProviderUnknownmethod = "ERR_PROVIDER_UNKNOWNMETHOD", Plugins, 1;
+    ProviderUnresolveddependency = "ERR_PROVIDER_UNRESOLVEDDEPENDENCY", Plugins, 1;
     // ---- Games ----
     AdoptedGeneratedLibMissing = "ERR_ADOPTED_GENERATED_LIB_MISSING", Games, 1;
     ArgumentQuotes = "ERR_ARGUMENT_QUOTES", Games, 1;
@@ -838,4 +879,64 @@ error_codes! {
     TestNetworkOff = "ERR_TEST_NETWORK_OFF", Other, 1;
     UserDecisionRequired = "ERR_USER_DECISION_REQUIRED", Other, 71;
     WindowSize = "ERR_WINDOW_SIZE", Other, 1;
+}
+
+impl ErrorCode {
+    /// The code a plugin error kind reports: `ERR_PLUGIN_<KIND>`.
+    ///
+    /// The spellings are the ones `format!("ERR_PLUGIN_{:?}", kind).to_uppercase()`
+    /// produced before this mapping existed, so no emitted code changed. The
+    /// `match` is exhaustive: a new kind stops this compiling until its row is
+    /// declared, which is what a `format!` string could not do.
+    pub const fn for_plugin_error(kind: agora_plugin_api::error::PluginErrorCode) -> Self {
+        use agora_plugin_api::error::PluginErrorCode as Kind;
+        match kind {
+            Kind::InvalidManifest => ErrorCode::PluginInvalidmanifest,
+            Kind::InvalidPackage => ErrorCode::PluginInvalidpackage,
+            Kind::IncompatibleApi => ErrorCode::PluginIncompatibleapi,
+            Kind::UnresolvedDependency => ErrorCode::PluginUnresolveddependency,
+            Kind::DependencyCycle => ErrorCode::PluginDependencycycle,
+            Kind::DuplicateContribution => ErrorCode::PluginDuplicatecontribution,
+            Kind::CapabilityDenied => ErrorCode::PluginCapabilitydenied,
+            Kind::UnknownMethod => ErrorCode::PluginUnknownmethod,
+            Kind::InvalidArguments => ErrorCode::PluginInvalidarguments,
+            Kind::NotActivated => ErrorCode::PluginNotactivated,
+            Kind::ScriptError => ErrorCode::PluginScripterror,
+            Kind::Timeout => ErrorCode::PluginTimeout,
+            Kind::Cancelled => ErrorCode::PluginCancelled,
+            Kind::ResourceExhausted => ErrorCode::PluginResourceexhausted,
+            Kind::NetworkDenied => ErrorCode::PluginNetworkdenied,
+            Kind::Conflict => ErrorCode::PluginConflict,
+            Kind::OperationFailed => ErrorCode::PluginOperationfailed,
+            Kind::Internal => ErrorCode::PluginInternal,
+            Kind::InvalidResponse => ErrorCode::PluginInvalidresponse,
+        }
+    }
+
+    /// The code a content provider reports for a plugin error kind:
+    /// `ERR_PROVIDER_<KIND>`, with the same spellings as the plugin family.
+    pub const fn for_provider_error(kind: agora_plugin_api::error::PluginErrorCode) -> Self {
+        use agora_plugin_api::error::PluginErrorCode as Kind;
+        match kind {
+            Kind::InvalidManifest => ErrorCode::ProviderInvalidmanifest,
+            Kind::InvalidPackage => ErrorCode::ProviderInvalidpackage,
+            Kind::IncompatibleApi => ErrorCode::ProviderIncompatibleapi,
+            Kind::UnresolvedDependency => ErrorCode::ProviderUnresolveddependency,
+            Kind::DependencyCycle => ErrorCode::ProviderDependencycycle,
+            Kind::DuplicateContribution => ErrorCode::ProviderDuplicatecontribution,
+            Kind::CapabilityDenied => ErrorCode::ProviderCapabilitydenied,
+            Kind::UnknownMethod => ErrorCode::ProviderUnknownmethod,
+            Kind::InvalidArguments => ErrorCode::ProviderInvalidarguments,
+            Kind::NotActivated => ErrorCode::ProviderNotactivated,
+            Kind::ScriptError => ErrorCode::ProviderScripterror,
+            Kind::Timeout => ErrorCode::ProviderTimeout,
+            Kind::Cancelled => ErrorCode::ProviderCancelled,
+            Kind::ResourceExhausted => ErrorCode::ProviderResourceexhausted,
+            Kind::NetworkDenied => ErrorCode::ProviderNetworkdenied,
+            Kind::Conflict => ErrorCode::ProviderConflict,
+            Kind::OperationFailed => ErrorCode::ProviderOperationfailed,
+            Kind::Internal => ErrorCode::ProviderInternal,
+            Kind::InvalidResponse => ErrorCode::ProviderInvalidresponse,
+        }
+    }
 }

@@ -102,10 +102,10 @@ fn parse_id(raw: &str) -> LauncherResult<PluginId> {
 }
 
 fn from_plugin_error(error: agora_plugin_api::PluginError) -> LauncherError {
-    LauncherError::Generic {
-        code: format!("ERR_PLUGIN_{:?}", error.code).to_uppercase(),
-        message: error.message,
-    }
+    LauncherError::generic(
+        agora_core::error_code::ErrorCode::for_plugin_error(error.code),
+        error.message,
+    )
 }
 
 // ---------------------------------------------------------------------------
