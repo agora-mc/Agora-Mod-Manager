@@ -17,6 +17,7 @@ use crate::game_deploy::DeployMode;
 use crate::game_discovery::DiscoveryReport;
 use crate::game_launch::{LaunchError, LaunchRoots, Launcher, PreparedLaunch, SystemLauncher};
 use crate::game_registry::{IdentifiedInstall, RuntimeResolution};
+use crate::instance_runtime::{may_mutate, BusyCause, MayMutate};
 
 mod clone;
 mod session;
@@ -1006,12 +1007,16 @@ pub fn delete_with_options(
             "a tool is running for instance '{id}'; wait for it to finish, then try again"
         )));
     }
-    let _guard = crate::instance_runtime::InstanceGuard::for_mutation(ctx, id, "delete").map_err(
-        |error| match error.code().as_str() {
-            "ERR_INSTANCE_RUNNING" => InstanceError::Running(id.to_string()),
-            _ => InstanceError::Other(error.to_string()),
-        },
-    )?;
+    let _guard = match may_mutate(ctx, id, "delete") {
+        MayMutate::Yes(guard) => guard,
+        MayMutate::Busy {
+            cause: BusyCause::Game,
+            ..
+        } => return Err(InstanceError::Running(id.to_string())),
+        MayMutate::Busy { error, .. } | MayMutate::CantTell { error } => {
+            return Err(InstanceError::Other(error.to_string()))
+        }
+    };
 
     let db_path = ctx.paths.local_state_db();
     let conn = crate::db::local_state_connection(&db_path)
@@ -1243,12 +1248,16 @@ pub fn rename(ctx: &Ctx, id: &str, name: &str) -> Result<(), InstanceError> {
     // The manifest is rewritten whole, so this takes the same guard every other writer of it
     // takes: a deploy or a delete in flight is waited for rather than overwritten, and a game
     // that is using the instance is refused.
-    let _guard = crate::instance_runtime::InstanceGuard::for_mutation(ctx, id, "rename").map_err(
-        |error| match error.code().as_str() {
-            "ERR_INSTANCE_RUNNING" => InstanceError::Running(id.to_string()),
-            _ => InstanceError::Other(error.to_string()),
-        },
-    )?;
+    let _guard = match may_mutate(ctx, id, "rename") {
+        MayMutate::Yes(guard) => guard,
+        MayMutate::Busy {
+            cause: BusyCause::Game,
+            ..
+        } => return Err(InstanceError::Running(id.to_string())),
+        MayMutate::Busy { error, .. } | MayMutate::CantTell { error } => {
+            return Err(InstanceError::Other(error.to_string()))
+        }
+    };
     let db_path = ctx.paths.local_state_db();
     let conn = crate::db::local_state_connection(&db_path)
         .map_err(|e| InstanceError::Other(e.to_string()))?;

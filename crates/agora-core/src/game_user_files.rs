@@ -13,8 +13,8 @@
 use std::path::{Path, PathBuf};
 
 use agora_game_api::{
-    fold_path_case, GameDefinition, GameId, GamePath, RelPath, StoreId, UserDataLocation,
-    UserFileMapping, UserFileStrategy,
+    fold_path_case, probe, GameDefinition, GameId, GamePath, Probe, RelPath, StoreId,
+    UserDataLocation, UserFileMapping, UserFileStrategy,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -870,6 +870,12 @@ pub fn is_session_running(journal: &Journal) -> bool {
     if session_running_apart_from_starting(journal) {
         return true;
     }
+    starting_launcher_verifies(journal)
+}
+
+/// Whether the launcher that swapped these files in is still alive. It is the only record of a
+/// launch that has not spawned the game yet, so it says "starting", not "a game is running".
+fn starting_launcher_verifies(journal: &Journal) -> bool {
     journal
         .starting_launcher
         .as_ref()
@@ -893,7 +899,10 @@ fn session_running_apart_from_starting(journal: &Journal) -> bool {
             return true;
         }
     }
-    if journal.running_from.exists() {
+    // Anything but a proven-absent folder may have a process running from it. The scan compares
+    // process executables, so it does not need the folder to be readable — and skipping it on a
+    // probe that could not tell would be the same error-read-as-absent bug as `exists()`.
+    if !matches!(probe(&journal.running_from), Probe::Absent) {
         let procs = crate::game_launch::processes_running_from(&journal.running_from);
         if !procs.is_empty() {
             return true;
@@ -1012,9 +1021,9 @@ pub fn swap_in_locked(
         .paths
         .user_files_journal_path(definition.id.as_str(), store.as_str());
 
-    // 1. If a journal exists, check if running.
-    if journal_path.exists() {
-        let text = std::fs::read_to_string(&journal_path)?;
+    // 1. If a journal exists, check if running. A journal that cannot be examined is not "no
+    // journal": it may record a live session, and swapping in over one would lose its files.
+    if let Some(text) = read_journal(&journal_path)? {
         let existing: Journal = serde_json::from_str(&text)?;
         if is_session_running(&existing) {
             let store_display = match store.as_str() {
@@ -2343,6 +2352,10 @@ pub fn status(
 pub struct SessionDetails {
     pub instance: String,
     pub running: bool,
+    /// The launcher that swapped these files in is alive and has not recorded the game's process:
+    /// a launch that never finished starting. Something holds the session, but nothing proves a
+    /// game is running, so a refusal must not tell the player to close one.
+    pub starting: bool,
     pub created_at: String,
     pub running_from: PathBuf,
     pub processes: Vec<ProcessIdentity>,
@@ -2359,31 +2372,58 @@ pub fn details(
     let journal_path = ctx
         .paths
         .user_files_journal_path(game.as_str(), store.as_str());
-    if !journal_path.exists() {
+    let Some(text) = read_journal(&journal_path)? else {
         return Ok(None);
-    }
-    let text = std::fs::read_to_string(&journal_path).map_err(|e| {
-        UserFilesError::Other(format!(
-            "the user-files journal {} cannot be read: {e}",
-            journal_path.display()
-        ))
-    })?;
+    };
     let journal: Journal = serde_json::from_str(&text).map_err(|e| {
         UserFilesError::Other(format!(
             "the user-files journal {} cannot be read: {e}",
             journal_path.display()
         ))
     })?;
-    let running = is_session_running(&journal);
+    let running_apart_from_starting = session_running_apart_from_starting(&journal);
+    // A launch the player cannot close: only the launcher that was about to spawn the game is still
+    // alive, and nothing in the journal records the game itself.
+    let starting = !running_apart_from_starting && starting_launcher_verifies(&journal);
     Ok(Some(SessionDetails {
         instance: journal.instance_id,
-        running,
+        running: running_apart_from_starting || starting,
+        starting,
         created_at: journal.created_at,
         running_from: journal.running_from,
         processes: journal.processes,
         starting_launcher: journal.starting_launcher,
         spawning: journal.spawning,
     }))
+}
+
+/// The journal's text, when there is one.
+///
+/// [`probe`] decides, not `Path::exists`: `exists()` is false for an access denial or a Windows
+/// sharing violation too, and reading that as "no journal" is what let the activity answer say
+/// `Idle` — and a mutation proceed — while a session's records could not be examined
+/// (MASTER_SPEC §32.13).
+fn read_journal(path: &Path) -> Result<Option<String>, UserFilesError> {
+    journal_text(probe(path), path)
+}
+
+/// What a probe of the journal path means: absent, or the journal's text. Only `Absent` is "no
+/// session"; `CantTell` is an error, because whether a session is running is then unknown.
+fn journal_text(probe_answer: Probe, path: &Path) -> Result<Option<String>, UserFilesError> {
+    match probe_answer {
+        Probe::Absent => Ok(None),
+        Probe::Present(_) => std::fs::read_to_string(path).map(Some).map_err(|error| {
+            UserFilesError::Other(format!(
+                "the user-files journal {} cannot be read: {error}",
+                path.display()
+            ))
+        }),
+        Probe::CantTell(error) => Err(UserFilesError::Other(format!(
+            "the user-files journal {} cannot be examined ({error}), so whether a session is \
+             running cannot be told",
+            path.display()
+        ))),
+    }
 }
 
 /// List active/recoverable user-file sessions across all games, optionally filtered.
@@ -2671,5 +2711,32 @@ mod tests {
                 "the replaced file did not keep its mode"
             );
         }
+    }
+
+    /// `exists()` is false for an access denial and a Windows sharing violation too, so a journal
+    /// that cannot be examined used to read as "no session" and the activity answer said `Idle`.
+    /// The decision itself is tested with the probe value, so every platform covers it without
+    /// needing a filesystem that lies.
+    #[test]
+    fn a_journal_that_cannot_be_examined_is_an_error_not_an_absent_journal() {
+        let path = Path::new("user-files/skyrim-se_steam/journal.json");
+        let error = super::journal_text(
+            agora_game_api::Probe::CantTell(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            )),
+            path,
+        )
+        .expect_err("a journal that cannot be examined must be an error");
+        assert!(
+            error.to_string().contains("cannot be examined"),
+            "the error must say the journal could not be examined: {error}"
+        );
+        assert!(
+            matches!(
+                super::journal_text(agora_game_api::Probe::Absent, path),
+                Ok(None)
+            ),
+            "only an absent journal is no session"
+        );
     }
 }

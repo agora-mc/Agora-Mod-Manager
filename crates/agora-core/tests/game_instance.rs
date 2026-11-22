@@ -505,9 +505,15 @@ fn delete_refuses_while_the_instances_session_is_starting_or_running() {
 
     std::fs::write(&journal_path, serde_json::to_vec(&journal(true)).unwrap()).unwrap();
     let starting = delete(&ctx, &rec.instance_id).unwrap_err();
+    // A launch that has not recorded its game is not a game the player can close: the refusal has
+    // to say what to do about the launch state, not claim the game is running.
     assert!(
-        matches!(starting, InstanceError::Running(_)),
-        "a launch that had swapped its files in was not running: {starting:?}"
+        starting.to_string().contains("clear the launch state"),
+        "a starting launch was refused without the guidance: {starting:?}"
+    );
+    assert!(
+        !matches!(starting, InstanceError::Running(_)),
+        "a starting launch is not a running game: {starting:?}"
     );
     assert!(get(&ctx, &rec.instance_id).unwrap().is_some());
 
