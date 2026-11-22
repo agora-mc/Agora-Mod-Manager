@@ -830,6 +830,8 @@ error_codes! {
     MigrationRejected = "ERR_MIGRATION_REJECTED", Recovery, 1;
     MigrationState = "ERR_MIGRATION_STATE", Recovery, 1;
     MigrationUnresolvable = "ERR_MIGRATION_UNRESOLVABLE", Recovery, 1;
+    RecoveryJournal = "ERR_RECOVERY_JOURNAL", Recovery, 1;
+    RecoveryRefused = "ERR_RECOVERY_REFUSED", Recovery, 1;
     // ---- Other ----
     AppDataDir = "ERR_APP_DATA_DIR", Other, 1;
     AppPaths = "ERR_APP_PATHS", Other, 1;

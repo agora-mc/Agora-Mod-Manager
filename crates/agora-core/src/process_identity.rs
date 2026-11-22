@@ -104,6 +104,18 @@ pub fn capture_self() -> Option<ProcessIdentity> {
 // ---------------------------------------------------------------------------
 // Verify
 // ---------------------------------------------------------------------------
+/// How many processes the OS listed on a full refresh of the process table.
+///
+/// This exists for one question: a single-process refresh that found nothing cannot tell "that
+/// process is gone" from "the process table could not be read". Zero processes is not a machine
+/// with nothing running; it is a table that gave no answer, so a caller that would otherwise
+/// conclude a recorded process is dead must treat it as "could not tell" instead.
+pub fn listed_processes() -> usize {
+    let mut system = System::new();
+    system.refresh_processes();
+    system.processes().len()
+}
+
 /// Verify that the OS process identified by `identity` is still alive and
 /// matches the captured identity on every available attribute.
 ///

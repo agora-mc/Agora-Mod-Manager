@@ -98,6 +98,7 @@ pub mod process_job;
 pub mod process_session_manager;
 pub mod providers;
 pub mod ranking;
+pub mod recovery;
 pub mod registry;
 pub mod registry_bundle;
 pub mod registry_sync;
