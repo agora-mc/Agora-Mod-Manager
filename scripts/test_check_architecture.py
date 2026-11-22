@@ -194,6 +194,25 @@ class GamePackageCoreBudgetTests(unittest.TestCase):
         self.assertEqual(self.check(), 1)
 
 
+class TestOnlyModuleFileTests(unittest.TestCase):
+    """A file its parent declares `#[cfg(test)] mod name;` is test code in full."""
+
+    def test_a_test_only_module_file_is_recognised_and_a_production_one_is_not(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "store"
+            root.mkdir()
+            (root / "mod.rs").write_text(
+                "#[cfg(test)]\nmod bench;\npub mod place;\n// #[cfg(test)] mod place;\n",
+                encoding="utf-8",
+            )
+            (root / "bench.rs").write_text('fn f() { std::env::var("X").ok(); }\n', encoding="utf-8")
+            (root / "place.rs").write_text("fn g() {}\n", encoding="utf-8")
+            self.assertTrue(architecture.is_test_only_module_file(root / "bench.rs"))
+            # A commented-out declaration does not make a production module test-only.
+            self.assertFalse(architecture.is_test_only_module_file(root / "place.rs"))
+            self.assertFalse(architecture.is_test_only_module_file(root / "mod.rs"))
+
+
 class FailClosedReadBudgetTests(unittest.TestCase):
     """MASTER_SPEC §32.13: error-read-as-absent sites are counted and may only go down."""
 
