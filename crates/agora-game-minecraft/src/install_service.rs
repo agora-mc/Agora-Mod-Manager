@@ -624,21 +624,12 @@ impl InstallService {
             &bytes,
             expected_sha1,
             expected_sha256,
+            expected_sha512,
             &expectations,
             accept_hash_confirmation,
             filename,
             version,
         )?;
-        // The strongest hash the source published is checked as well as the
-        // SHA-1, so a SHA-1 collision cannot stand in for the real file.
-        if let Some(published) = expected_sha512
-            .map(|h| h.trim().to_lowercase())
-            .filter(|h| !h.is_empty())
-        {
-            if agora_core::download::sha512_hex(&bytes) != published {
-                return Err(LauncherError::HashMismatch);
-            }
-        }
         let installed_sha256 = check.sha256;
         let hash_verified = check.verified;
         let content_type = if content_type.is_empty() {

@@ -1864,7 +1864,7 @@ fn no_leftover_pin_enforcement() {
 // ---------------------------------------------------------------------------
 
 use agora_game_minecraft::installed_profile::{
-    self, LoaderSourceKind, LoaderTuple, ProfileIssueKind,
+    self, InstallerSideArtifacts, LoaderSourceKind, LoaderTuple, ProfileIssueKind,
 };
 
 /// Minimal base version JSON for adoption tests.
@@ -2321,7 +2321,10 @@ fn forge_install_receipt_pins_processor_output_with_published_sha1() {
         source_sha256,
         "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-installer.jar",
         0,
-        &produced,
+        &InstallerSideArtifacts {
+            libraries: produced,
+            patched: None,
+        },
     )
     .expect("Forge 1.21.1 receipt creation (incl. adoption proof) must succeed");
 

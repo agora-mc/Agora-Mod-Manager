@@ -67,7 +67,10 @@ pub struct LoaderEntry {
     pub sha256: String,
     pub file_name: String,
     pub file_type: String,
-    /// SHA-256 of the version.json embedded inside an installer JAR.
+    /// SHA-256 of the *normalized* version.json embedded inside an installer
+    /// JAR (`agora_core::download::stable_version_json`: keys sorted, `time`
+    /// and `releaseTime` dropped), not of the raw member. Nothing verifies it
+    /// at install time yet; the installers' own SHA-256 covers the jar.
     #[serde(default)]
     pub version_json_sha256: Option<String>,
     /// Install profile spec version (0 for legacy, 1+ for modern).

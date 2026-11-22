@@ -150,6 +150,9 @@ pub struct Library {
     /// SHA-256 carried directly in pinned Fabric/Quilt profile metadata.
     #[serde(default)]
     pub sha256: Option<String>,
+    /// SHA-512 carried directly in pinned Fabric/Quilt profile metadata.
+    #[serde(default)]
+    pub sha512: Option<String>,
     #[serde(default)]
     pub size: Option<i64>,
     #[serde(default)]
@@ -184,6 +187,9 @@ pub struct LibraryArtifact {
     /// SHA-256 carried directly in pinned Fabric/Quilt profile metadata.
     #[serde(default)]
     pub sha256: Option<String>,
+    /// SHA-512 carried directly in pinned Fabric/Quilt profile metadata.
+    #[serde(default)]
+    pub sha512: Option<String>,
     #[serde(default)]
     pub size: Option<i64>,
 }

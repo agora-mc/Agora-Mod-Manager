@@ -211,6 +211,16 @@ pub struct InstalledProfileReceipt {
     /// created artifacts (Forge/NeoForge), or Maven jars from a repository
     /// with no published checksum that the player explicitly accepted.
     /// These paths may be adopted locally but cannot be downloaded at launch.
+    ///
+    /// It also holds an installer's patched game jar that no generated profile
+    /// lists (NeoForge's `data.PATCHED[side]`, which its launcher finds by
+    /// scanning the library directory). The digest is the file as the
+    /// installer left it: the installer's own successful exit is the only
+    /// check at that moment, so a jar already truncated when the receipt is
+    /// first written becomes the baseline, and reinstalling the loader is what
+    /// replaces it. A receipt written before this pin existed carries none —
+    /// an existing install gains the check at adoption after a reinstall or
+    /// `instance repair-loader`, not before.
     #[serde(default, deserialize_with = "deserialize_nullable_hash_map")]
     pub generated_artifact_sha256: BTreeMap<String, String>,
     /// Map of relative Maven paths to SHA-256 hex digests for loader library
@@ -801,25 +811,15 @@ fn collect_unhashed_library_paths(libraries: &[crate::launch::Library]) -> Vec<S
 /// [`processor_runs_on`]. Resolving a server-only processor's `{MC_UNPACKED}`
 /// through `data(...)["client"]` would name an artifact no client install ever
 /// produces.
+///
+/// An artifact an installer writes without listing it in an `outputs` map is
+/// [`patched_game_jar_coordinate`]'s job, not this function's: the two are
+/// treated differently because only a profile library can carry a download URL
+/// that this set allows to be blank.
 pub fn processor_output_coordinates(
     install_profile: &serde_json::Value,
     side: &str,
 ) -> Result<BTreeSet<String>, ProfileIssue> {
-    fn collect(reference: &serde_json::Value, out: &mut BTreeSet<String>) {
-        let Some(text) = reference.as_str() else {
-            return;
-        };
-        let text = text.trim();
-        let inner = text
-            .strip_prefix('[')
-            .and_then(|value| value.strip_suffix(']'))
-            .unwrap_or(text);
-        let coordinate = inner.split('@').next().unwrap_or(inner).trim();
-        if coordinate.matches(':').count() >= 2 {
-            out.insert(coordinate.to_string());
-        }
-    }
-
     let data = install_profile.get("data").and_then(|v| v.as_object());
     let mut out = BTreeSet::new();
     if let Some(processors) = install_profile.get("processors").and_then(|v| v.as_array()) {
@@ -833,7 +833,7 @@ pub fn processor_output_coordinates(
             for (key, value) in outputs {
                 // A literal bracketed coordinate in an output is already the
                 // answer; some installer versions use that form directly.
-                collect(value, &mut out);
+                collect_coordinate(value, &mut out);
                 // Placeholder keys/values (e.g. `{PATCHED}`) resolve through
                 // `data` for the installed side only.
                 for reference in [key.as_str(), value.as_str().unwrap_or_default()] {
@@ -845,7 +845,7 @@ pub fn processor_output_coordinates(
                     };
                     if let Some(entry) = data.and_then(|data| data.get(name)) {
                         if let Some(side_value) = entry.get(side) {
-                            collect(side_value, &mut out);
+                            collect_coordinate(side_value, &mut out);
                         }
                     }
                 }
@@ -853,6 +853,66 @@ pub fn processor_output_coordinates(
         }
     }
     Ok(out)
+}
+
+/// The Maven coordinate a `data` reference names, if it names one.
+fn maven_coordinate(reference: &str) -> Option<String> {
+    let text = reference.trim();
+    let inner = text
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(text);
+    let coordinate = inner.split('@').next().unwrap_or(inner).trim();
+    (coordinate.matches(':').count() >= 2).then(|| coordinate.to_string())
+}
+
+fn collect_coordinate(reference: &serde_json::Value, out: &mut BTreeSet<String>) {
+    let Some(text) = reference.as_str() else {
+        return;
+    };
+    if let Some(coordinate) = maven_coordinate(text) {
+        out.insert(coordinate);
+    }
+}
+
+/// The patched game jar an installer writes for `side`, if it writes one.
+///
+/// The installer reaches that file through the `{PATCHED}` placeholder
+/// (`--output {PATCHED}`) and names it only in `data.PATCHED[side]`. Every
+/// NeoForge processor declares no `outputs` map at all, and the generated
+/// profile does not list the jar either — NeoForge's own launcher finds it by
+/// scanning the directory in its `-DlibraryDirectory` argument — so this is
+/// the only name the artifact has, and the only way an install can pin its
+/// bytes.
+///
+/// `None` means the installer does not patch this side. An entry that is
+/// present but is not a coordinate is reported rather than dropped: it names a
+/// file the launch needs.
+pub fn patched_game_jar_coordinate(
+    install_profile: &serde_json::Value,
+    side: &str,
+) -> Result<Option<String>, ProfileIssue> {
+    let Some(patched) = install_profile
+        .get("data")
+        .and_then(|data| data.get("PATCHED"))
+        .and_then(|entry| entry.get(side))
+    else {
+        return Ok(None);
+    };
+    let text = patched.as_str().ok_or_else(|| {
+        ProfileIssue::corrupt(
+            None,
+            format!("Installer data 'PATCHED' for the {side} side is not a string: {patched}"),
+        )
+    })?;
+    maven_coordinate(text).map(Some).ok_or_else(|| {
+        ProfileIssue::corrupt(
+            None,
+            format!(
+                "Installer data 'PATCHED' for the {side} side is not a Maven coordinate: {text}"
+            ),
+        )
+    })
 }
 
 /// Whether an installer processor runs for `side`.
@@ -889,10 +949,35 @@ fn processor_runs_on(processor: &serde_json::Value, side: &str) -> Result<bool, 
     Ok(names.contains(&side))
 }
 
-pub fn processor_outputs_from_installer_jar(
+/// What an installer writes under `libraries/` for one side.
+///
+/// The two halves are treated differently by a receipt: [`libraries`] are
+/// coordinates an `outputs` map names, which a generated profile links with a
+/// blank URL, and [`patched`] is the patched game jar the profile does not
+/// list at all.
+///
+/// [`libraries`]: Self::libraries
+/// [`patched`]: Self::patched
+#[derive(Debug, Clone, Default)]
+pub struct InstallerSideArtifacts {
+    pub libraries: BTreeSet<String>,
+    pub patched: Option<String>,
+}
+
+/// Read an installer JAR's `install_profile.json` and collect what it writes
+/// under `libraries/` for `side`.
+pub fn installer_side_artifacts_from_jar(
     jar: &[u8],
     side: &str,
-) -> Result<BTreeSet<String>, ProfileIssue> {
+) -> Result<InstallerSideArtifacts, ProfileIssue> {
+    let install_profile = install_profile_from_jar(jar)?;
+    Ok(InstallerSideArtifacts {
+        libraries: processor_output_coordinates(&install_profile, side)?,
+        patched: patched_game_jar_coordinate(&install_profile, side)?,
+    })
+}
+
+fn install_profile_from_jar(jar: &[u8]) -> Result<serde_json::Value, ProfileIssue> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(jar)).map_err(|error| {
         ProfileIssue::corrupt(None, format!("Installer is not a readable JAR: {error}"))
     })?;
@@ -916,13 +1001,12 @@ pub fn processor_outputs_from_installer_jar(
     entry.read_to_end(&mut bytes).map_err(|error| {
         ProfileIssue::corrupt(None, format!("Cannot read install_profile.json: {error}"))
     })?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+    serde_json::from_slice(&bytes).map_err(|error| {
         ProfileIssue::corrupt(
             None,
             format!("Installer's install_profile.json is invalid: {error}"),
         )
-    })?;
-    processor_output_coordinates(&value, side)
+    })
 }
 
 fn receipt_produced_libraries(
@@ -947,6 +1031,77 @@ fn receipt_produced_libraries(
 // ---------------------------------------------------------------------------
 // Stable profile hash
 // ---------------------------------------------------------------------------
+
+/// Verify every artifact the receipt pins that the loader profile does not
+/// list as a library.
+///
+/// A profile's libraries are what the launch materializes, and materializing a
+/// receipt-pinned library checks it against the receipt. An artifact the
+/// profile never lists is different: NeoForge's patched client jar is written
+/// under `libraries/` and found by NeoForge's own launcher scanning the
+/// directory named in `-DlibraryDirectory`, so no launch stage ever opens it
+/// holding a hash. Checking it here is what turns a truncated or altered jar
+/// into a refusal that names the file, instead of a bootstrap failure inside
+/// the game.
+///
+/// Only the receipt-pinned artifacts are read, so this costs one bounded read
+/// per such artifact and nothing for a profile that has none.
+fn verify_pinned_unlisted_artifacts(
+    minecraft_dir: &Path,
+    libraries: &[crate::launch::Library],
+    receipt: &InstalledProfileReceipt,
+) -> Result<(), ProfileIssue> {
+    let listed: BTreeSet<String> = libraries
+        .iter()
+        .filter_map(|library| parse_maven_descriptor(&library.name).ok())
+        .map(|descriptor| descriptor.to_relative_path())
+        .collect();
+    for (relative, expected) in receipt
+        .generated_artifact_sha256
+        .iter()
+        .chain(receipt.curated_artifact_sha256.iter())
+    {
+        if listed.contains(relative) {
+            continue;
+        }
+        if is_unsafe_relative_path(relative) {
+            return Err(ProfileIssue::corrupt(
+                None,
+                format!("Receipt pins an unsafe artifact path: '{relative}'"),
+            ));
+        }
+        let path = minecraft_dir.join("libraries").join(relative);
+        let repair = "Reinstall the loader to repair it.";
+        let metadata = std::fs::metadata(&path).map_err(|error| {
+            let reason = format!(
+                "The installer output '{relative}' is unreadable, and the receipt pins its \
+                 SHA-256: {error}. {repair}"
+            );
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ProfileIssue::missing(Some(path.clone()), reason)
+            } else {
+                ProfileIssue::corrupt(Some(path.clone()), reason)
+            }
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(ProfileIssue::corrupt(
+                Some(path.clone()),
+                format!("The installer output '{relative}' is not a regular file. {repair}"),
+            ));
+        }
+        let actual = file_sha256_hex(&path, MAX_GENERATED_LIBRARY_SIZE)?;
+        if !actual.eq_ignore_ascii_case(expected.trim()) {
+            return Err(ProfileIssue::corrupt(
+                Some(path),
+                format!(
+                    "The installer output '{relative}' does not match the SHA-256 its receipt \
+                     pins: the receipt says {expected}, the file on disk is {actual}. {repair}"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Compute the stable hash of a profile JSON value.
 ///
@@ -1282,6 +1437,16 @@ pub fn adopt_installed_profile(
                                 || rcpt.curated_artifact_sha256.contains_key(path.as_str())
                         })
                         .collect();
+                    // A pinned artifact the profile does not list is verified
+                    // here, because nothing later will: the launch only checks
+                    // what it puts on the classpath, and NeoForge's patched
+                    // client jar gets there by its own launcher scanning the
+                    // library directory.
+                    verify_pinned_unlisted_artifacts(
+                        minecraft_dir,
+                        &loader_version.libraries,
+                        rcpt,
+                    )?;
                 }
                 Err(reasons) => {
                     // Receipt exists but doesn't match â†’ unsupported.
@@ -1409,6 +1574,10 @@ fn validate_maven_receipt(
 /// * `source_sha256` â€” SHA-256 hex digest of the curated installer ZIP.
 /// * `installer_url` â€” Download URL of the curated installer.
 /// * `exit_status` â€” Exit code of the installer process. Must be 0.
+/// * `artifacts` â€” What the installer wrote under `libraries/` for the client
+///   side (see [`installer_side_artifacts_from_jar`]): the coordinates the
+///   profile links with a blank URL, and the patched game jar it does not list
+///   at all. Both are pinned from disk.
 ///
 /// # Returns
 ///
@@ -1422,7 +1591,7 @@ pub fn create_receipt_for_installed_profile(
     source_sha256: &str,
     source_url: &str,
     exit_status: i32,
-    produced_libraries: &BTreeSet<String>,
+    artifacts: &InstallerSideArtifacts,
 ) -> Result<InstalledProfileReceipt, ProfileIssue> {
     // 0. Reject non-zero exit status before any hashing or I/O.
     if exit_status != 0 {
@@ -1482,14 +1651,15 @@ pub fn create_receipt_for_installed_profile(
         &profile_path,
         &profile_id,
         &tuple.minecraft_version,
-        produced_libraries,
+        &artifacts.libraries,
     )?;
 
     // 6. Enumerate library paths the receipt must pin from disk:
-    //    every library without an upstream hash, and every installer
-    //    processor output with a blank download URL — a processor output
-    //    is only ever created locally, so it can never be downloaded at
-    //    launch. Pinning it here gives adoption and the launch planner the
+    //    every library without an upstream hash, every installer
+    //    processor output with a blank download URL, and every artifact the
+    //    install wrote that the profile does not list at all — a processor
+    //    output is only ever created locally, so it can never be downloaded
+    //    at launch. Pinning it here gives adoption and the launch planner the
     //    SHA-256 they need to trust the artifact, and fails fast if the
     //    installer did not actually produce it.
     //
@@ -1505,7 +1675,7 @@ pub fn create_receipt_for_installed_profile(
             .collect();
     let mut published_sha1: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for lib in &loader_version.libraries {
-        if !produced_libraries.contains(&lib.name) {
+        if !artifacts.libraries.contains(&lib.name) {
             continue;
         }
         // A non-blank URL means the artifact is downloadable, so it needs
@@ -1529,6 +1699,22 @@ pub fn create_receipt_for_installed_profile(
             );
             pinned_paths.insert(relative_path);
         }
+    }
+
+    // An artifact the installer wrote that the profile does not list at all —
+    // NeoForge's patched client jar, which its launcher finds on disk — has no
+    // library entry to allow a blank URL for, and nothing else in the launch
+    // would ever name or verify the file. Pin it like the blank-URL outputs
+    // above, so adoption refuses a truncated or altered jar by name instead of
+    // leaving the launch to fail in the loader's bootstrap.
+    if let Some(patched) = artifacts.patched.as_deref() {
+        let descriptor = parse_maven_descriptor(patched).map_err(|_| {
+            ProfileIssue::corrupt(
+                Some(profile_path.clone()),
+                format!("The installer's patched game jar '{patched}' is not a Maven coordinate"),
+            )
+        })?;
+        pinned_paths.insert(descriptor.to_relative_path());
     }
 
     // 7. For each pinned library, verify the file under .minecraft/libraries.
@@ -1863,6 +2049,206 @@ mod tests {
         );
     }
 
+    /// The real Forge 26.3-66.1.5 installer. Its processors name their output
+    /// files by placeholder (`outputs: {"{PATCHED}": "{PATCHED_SHA}"}`) and
+    /// carry `sides`, so the same rules as 1.21.1 apply to the current shape.
+    #[test]
+    fn real_forge_263_client_install_produces_the_patched_client_jar_only() {
+        let install_profile: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/forge-26.3-66.1.5-install-profile.json"
+        ))
+        .expect("real Forge 26.3 install_profile.json fixture is valid JSON");
+        let client = processor_output_coordinates(&install_profile, "client")
+            .expect("client outputs resolve");
+        assert_eq!(
+            client.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["net.minecraftforge:forge:26.3-66.1.5:client"],
+            "a client install produces the patched client jar and nothing else: {client:?}"
+        );
+        let server = processor_output_coordinates(&install_profile, "server")
+            .expect("server outputs resolve");
+        assert!(
+            server.contains("net.minecraftforge:forge:26.3-66.1.5:server"),
+            "the server patched jar is a server output: {server:?}"
+        );
+        assert!(
+            server.contains("net.minecraft:server:26.3:unpacked"),
+            "the {{MC_UNPACKED}} output belongs to a `sides: [\"server\"]` processor: {server:?}"
+        );
+        assert!(
+            !server.contains("net.minecraftforge:forge:26.3-66.1.5:client"),
+            "the client jar is not a server output: {server:?}"
+        );
+
+        // Upstream names the profile `26.3-forge-66.1.5`; Agora promotes it to
+        // `derive_profile_id`'s `forge-26.3-66.1.5` (normalize_forge_profile),
+        // which is the profile the structural validation sees.
+        let mut version: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/forge-26.3-66.1.5-version.json"
+        ))
+        .expect("real Forge 26.3 version.json fixture is valid JSON");
+        assert_eq!(
+            version["id"], "26.3-forge-66.1.5",
+            "the installer still names its own profile; that is what the promotion renames"
+        );
+        version["id"] = serde_json::Value::String("forge-26.3-66.1.5".into());
+        let info: VersionInfo = serde_json::from_value(version).expect("VersionInfo");
+        let path = Path::new("versions/forge-26.3-66.1.5/forge-26.3-66.1.5.json");
+        validate_loader_profile(&info, path, "forge-26.3-66.1.5", "26.3", &client)
+            .expect("the real Forge 26.3 profile's blank client URL is a client processor output");
+    }
+
+    /// Both real NeoForge installers. NeoForge's processors declare no
+    /// `outputs` at all: the patched game jar is named only by
+    /// `data.PATCHED`, which is why nothing in the profile ever mentions it.
+    #[test]
+    fn real_neoforge_installs_declare_no_outputs_and_the_patched_jar_is_not_a_library() {
+        for (install_profile, version_json, mc_version, loader_version, client, server) in [
+            (
+                include_str!("../tests/fixtures/neoforge-21.1.228-install-profile.json"),
+                include_str!("../tests/fixtures/neoforge-21.1.228-version.json"),
+                "1.21.1",
+                "21.1.228",
+                "net.neoforged:neoforge:21.1.228:client",
+                "net.neoforged:neoforge:21.1.228:server",
+            ),
+            (
+                include_str!("../tests/fixtures/neoforge-26.3.0.102-install-profile.json"),
+                include_str!("../tests/fixtures/neoforge-26.3.0.102-version.json"),
+                "26.3",
+                "26.3.0.102",
+                "net.neoforged:minecraft-client-patched:26.3.0.102",
+                "net.neoforged:minecraft-server-patched:26.3.0.102",
+            ),
+        ] {
+            let install_profile: serde_json::Value =
+                serde_json::from_str(install_profile).expect("a NeoForge install_profile is JSON");
+            for processor in install_profile["processors"]
+                .as_array()
+                .expect("the installer lists processors")
+            {
+                assert!(
+                    processor.get("outputs").is_none(),
+                    "NeoForge {loader_version} names no processor outputs, which is why the \
+                     receipt has to read data.PATCHED instead: {processor}"
+                );
+            }
+            for side in ["client", "server"] {
+                let produced = processor_output_coordinates(&install_profile, side)
+                    .expect("NeoForge's processors resolve");
+                assert!(
+                    produced.is_empty(),
+                    "a {side} install's outputs map names nothing: {produced:?}"
+                );
+            }
+            assert_eq!(
+                patched_game_jar_coordinate(&install_profile, "client")
+                    .expect("the client patched jar resolves"),
+                Some(client.to_string()),
+                "data.PATCHED.client names the artifact no profile library names"
+            );
+            assert_eq!(
+                patched_game_jar_coordinate(&install_profile, "server")
+                    .expect("the server patched jar resolves"),
+                Some(server.to_string()),
+                "and the server entry names the other side's jar, which a client install never \
+                 writes"
+            );
+
+            let patched = install_profile["data"]["PATCHED"]["client"]
+                .as_str()
+                .expect("data.PATCHED.client is a string")
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string();
+            assert_eq!(
+                patched, client,
+                "data.PATCHED names the same artifact the client install writes"
+            );
+            let version_json: serde_json::Value =
+                serde_json::from_str(version_json).expect("a NeoForge version.json is JSON");
+            let info: VersionInfo = serde_json::from_value(version_json).expect("VersionInfo");
+            assert_eq!(
+                info.id,
+                derive_profile_id(&LoaderTuple {
+                    loader: "neoforge".to_string(),
+                    minecraft_version: mc_version.to_string(),
+                    loader_version: loader_version.to_string(),
+                }),
+                "the generated profile already carries Agora's profile id"
+            );
+            assert!(
+                !info.libraries.iter().any(|library| library.name == patched),
+                "the patched client jar {patched} is not a library of the profile, so neither \
+                 adoption nor the launch plan can name it"
+            );
+            let path = format!("versions/{}/{}.json", info.id, info.id);
+            validate_loader_profile(
+                &info,
+                Path::new(&path),
+                &info.id,
+                mc_version,
+                &BTreeSet::new(),
+            )
+            .expect("the real NeoForge profile has no blank URL and needs no produced libraries");
+        }
+    }
+
+    /// The catalog's `version_json_sha256` is the SHA-256 of the *normalized*
+    /// `version.json` an installer ships (`stable_version_json`: keys sorted
+    /// recursively, `time`/`releaseTime` dropped, compact separators), not of
+    /// the raw bytes. The real extracted files must hash to the catalog's
+    /// value, or the pin describes something else than what installers write.
+    #[test]
+    fn version_json_sha256_is_the_normalized_version_json_of_each_installer() {
+        for (loader, mc_version, loader_version, fixture) in [
+            (
+                "forge",
+                "26.3",
+                "66.1.5",
+                include_str!("../tests/fixtures/forge-26.3-66.1.5-version.json"),
+            ),
+            (
+                "forge",
+                "1.21.1",
+                "52.1.21",
+                include_str!("../tests/fixtures/forge-1.21.1-52.1.21-version.json"),
+            ),
+            (
+                "neoforge",
+                "26.3",
+                "26.3.0.102",
+                include_str!("../tests/fixtures/neoforge-26.3.0.102-version.json"),
+            ),
+            (
+                "neoforge",
+                "1.21.1",
+                "21.1.228",
+                include_str!("../tests/fixtures/neoforge-21.1.228-version.json"),
+            ),
+        ] {
+            let entry = crate::loader_manifests::find_entry(loader, mc_version, loader_version)
+                .unwrap_or_else(|| panic!("the catalog lists {loader} {loader_version}"));
+            let pinned = entry
+                .version_json_sha256
+                .as_deref()
+                .unwrap_or_else(|| panic!("{loader} {loader_version} pins its version.json"));
+            let version: serde_json::Value =
+                serde_json::from_str(fixture).expect("the extracted version.json is JSON");
+            assert_eq!(
+                stable_profile_hash(&version),
+                pinned,
+                "{loader} {loader_version}: the catalog pins the normalized version.json"
+            );
+            assert_ne!(
+                sha256_hex(fixture.as_bytes()),
+                pinned,
+                "{loader} {loader_version}: the raw file's digest is not what the catalog pins, so \
+                 the pin can only be checked after normalization"
+            );
+        }
+    }
+
     #[test]
     fn processor_sides_are_optional_but_never_guessed() {
         let with_sides = |sides: serde_json::Value| {
@@ -1960,7 +2346,7 @@ mod tests {
     }
 
     #[test]
-    fn processor_outputs_are_read_from_the_installer_jar() {
+    fn installer_side_artifacts_are_read_from_the_installer_jar() {
         let mut bytes = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
@@ -1968,15 +2354,30 @@ mod tests {
             writer.start_file("install_profile.json", options).unwrap();
             std::io::Write::write_all(
                 &mut writer,
-                br#"{"processors":[{"outputs":{"client":"[net.minecraftforge:forge:1.21.1-52.1.21:client]"}}],"data":{}}"#,
+                br#"{"processors":[{"outputs":{"client":"[net.minecraftforge:forge:1.21.1-52.1.21:client]"}}],"data":{"PATCHED":{"client":"[net.minecraftforge:forge:1.21.1-52.1.21:client]","server":"[net.minecraftforge:forge:1.21.1-52.1.21:server]"}}}"#,
             )
             .unwrap();
             writer.finish().unwrap();
         }
-        let produced = processor_outputs_from_installer_jar(&bytes, "client").unwrap();
-        assert!(produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:client"));
+        let artifacts = installer_side_artifacts_from_jar(&bytes, "client").unwrap();
+        assert!(artifacts
+            .libraries
+            .contains("net.minecraftforge:forge:1.21.1-52.1.21:client"));
+        assert_eq!(
+            artifacts.patched.as_deref(),
+            Some("net.minecraftforge:forge:1.21.1-52.1.21:client"),
+            "the side's patched jar is read beside the outputs map"
+        );
+        assert_eq!(
+            installer_side_artifacts_from_jar(&bytes, "server")
+                .unwrap()
+                .patched
+                .as_deref(),
+            Some("net.minecraftforge:forge:1.21.1-52.1.21:server"),
+            "each side gets its own patched jar"
+        );
 
-        let err = processor_outputs_from_installer_jar(b"not a zip", "client").unwrap_err();
+        let err = installer_side_artifacts_from_jar(b"not a zip", "client").unwrap_err();
         assert!(
             err.reasons
                 .iter()
@@ -3265,7 +3666,7 @@ mod tests {
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "https://maven.minecraftforge.net/forge.jar",
                 0,
-                &BTreeSet::new(),
+                &InstallerSideArtifacts::default(),
             )
             .expect("a blank published digest is no hash to check");
 
@@ -3305,7 +3706,7 @@ mod tests {
             installer_sha,
             "https://maven.minecraftforge.net/forge.jar",
             0,
-            &BTreeSet::new(),
+            &InstallerSideArtifacts::default(),
         )
         .expect("create_receipt should succeed");
 
@@ -3345,7 +3746,7 @@ mod tests {
             installer_sha,
             "https://maven.neoforged.net/neoforge.jar",
             0,
-            &BTreeSet::new(),
+            &InstallerSideArtifacts::default(),
         )
         .expect("create_receipt for neoforge should succeed");
 
@@ -3369,7 +3770,7 @@ mod tests {
             "sha",
             "https://example.com/forge.jar",
             0,
-            &BTreeSet::new(),
+            &InstallerSideArtifacts::default(),
         )
         .expect_err("should fail when generated library is missing");
 
@@ -3412,7 +3813,7 @@ mod tests {
             "sha",
             "https://example.com/forge.jar",
             0,
-            &BTreeSet::new(),
+            &InstallerSideArtifacts::default(),
         )
         .expect_err("should reject traversal path");
 
@@ -3447,7 +3848,7 @@ mod tests {
             installer_sha,
             "https://maven.minecraftforge.net/forge.jar",
             0,
-            &BTreeSet::new(),
+            &InstallerSideArtifacts::default(),
         )
         .expect("create_receipt should succeed");
 
@@ -3493,7 +3894,7 @@ mod tests {
             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "https://maven.minecraftforge.net/forge.jar",
             0,
-            &BTreeSet::new(),
+            &InstallerSideArtifacts::default(),
         )
         .expect("create_receipt should succeed");
 
@@ -3560,7 +3961,10 @@ mod tests {
             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-installer.jar",
             0,
-            &real_forge_produced(),
+            &InstallerSideArtifacts {
+                libraries: real_forge_produced(),
+                patched: None,
+            },
         )
         .expect_err("a truncated processor output must not be pinned");
 
@@ -3605,7 +4009,10 @@ mod tests {
             "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
             "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-installer.jar",
             0,
-            &real_forge_produced(),
+            &InstallerSideArtifacts {
+                libraries: real_forge_produced(),
+                patched: None,
+            },
         )
         .expect("bytes that match the published SHA-1 are pinned");
 
@@ -3638,7 +4045,10 @@ mod tests {
                 "9999999999999999999999999999999999999999999999999999999999999999",
                 "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-installer.jar",
                 0,
-                &real_forge_produced(),
+                &InstallerSideArtifacts {
+                libraries: real_forge_produced(),
+                patched: None,
+            },
             )
             .unwrap_or_else(|err| panic!("a blank published digest is no hash to check: {err:?}"));
 
@@ -3649,6 +4059,276 @@ mod tests {
                 "the artifact is still pinned from disk"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // create_receipt_for_installed_profile — the current Forge and NeoForge
+    // installer shapes
+    // -----------------------------------------------------------------------
+
+    /// Set the SHA-1 the profile publishes for the library with `coordinate`.
+    /// Found by coordinate rather than by index: an index would write the
+    /// digest into whichever library happened to sit there if the real fixture
+    /// were ever reordered.
+    fn publish_sha1(version: &mut serde_json::Value, coordinate: &str, sha1: &str) {
+        let library = version["libraries"]
+            .as_array_mut()
+            .expect("the profile lists libraries")
+            .iter_mut()
+            .find(|library| library["name"] == coordinate)
+            .unwrap_or_else(|| panic!("the profile lists {coordinate}"));
+        library["downloads"]["artifact"]["sha1"] = serde_json::Value::String(sha1.to_string());
+    }
+
+    /// The real Forge 26.3-66.1.5 profile, and a jar under `libraries/`
+    /// holding `bytes` where its blank-URL patched client jar belongs.
+    fn real_forge_263_fixture(bytes: &[u8]) -> (TempFixture, LoaderTuple, serde_json::Value) {
+        let fix = TempFixture::new();
+        let tuple = LoaderTuple {
+            loader: "forge".to_string(),
+            minecraft_version: "26.3".to_string(),
+            loader_version: "66.1.5".to_string(),
+        };
+        fix.write_base("26.3");
+        let mut version: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/forge-26.3-66.1.5-version.json"
+        ))
+        .expect("real Forge 26.3 version.json fixture is valid JSON");
+        version["id"] = serde_json::Value::String("forge-26.3-66.1.5".into());
+        // The real profile publishes the SHA-1 of the real 28 MB jar, which
+        // cannot be a fixture. What this test is about is that a matching
+        // output is pinned at all, so publish the digest of these bytes.
+        publish_sha1(
+            &mut version,
+            "net.minecraftforge:forge:26.3-66.1.5:client",
+            &sha1_hex(bytes),
+        );
+        fix.write_profile("forge-26.3-66.1.5", &version);
+
+        let lib = fix
+            .minecraft_dir
+            .join("libraries/net/minecraftforge/forge/26.3-66.1.5/forge-26.3-66.1.5-client.jar");
+        fs::create_dir_all(lib.parent().expect("library dir")).expect("create lib dir");
+        fs::write(&lib, bytes).expect("write processor output");
+        (fix, tuple, version)
+    }
+
+    /// The client jar a real Forge 26.3 install writes is pinned by the
+    /// receipt, and nothing else is: the other 39 libraries are downloads with
+    /// their own published SHA-1.
+    #[test]
+    fn real_forge_263_install_pins_the_patched_client_jar() {
+        let bytes = b"the 26.3 installer's client jar bytes";
+        let (fix, tuple, _version) = real_forge_263_fixture(bytes);
+        let install_profile: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/forge-26.3-66.1.5-install-profile.json"
+        ))
+        .expect("real Forge 26.3 install_profile.json fixture is valid JSON");
+        let produced = processor_output_coordinates(&install_profile, "client")
+            .expect("client outputs resolve");
+
+        let receipt = create_receipt_for_installed_profile(
+            &fix.minecraft_dir,
+            &fix.receipts_root,
+            &tuple,
+            "4ba54a1bc216ad12dde032eecb999cb3c617b1d0c92ad67add4b6531f45e58b4",
+            "https://maven.minecraftforge.net/net/minecraftforge/forge/26.3-66.1.5/forge-26.3-66.1.5-installer.jar",
+            0,
+            &InstallerSideArtifacts {
+                libraries: produced,
+                patched: None,
+            },
+        )
+        .expect("a Forge 26.3 client install pins its client jar");
+
+        assert_eq!(
+            receipt.generated_artifact_sha256,
+            BTreeMap::from([(
+                "net/minecraftforge/forge/26.3-66.1.5/forge-26.3-66.1.5-client.jar".to_string(),
+                sha256_hex(bytes),
+            )]),
+            "exactly the one local artifact, pinned to the bytes on disk"
+        );
+    }
+
+    /// The real NeoForge 21.1.228 profile, and the jar the installer leaves at
+    /// the coordinate `data.PATCHED.client` names.
+    fn real_neoforge_fixture(
+        loader_version: &str,
+        bytes: &[u8],
+    ) -> (TempFixture, LoaderTuple, serde_json::Value) {
+        let (version_fixture, patched_path) = match loader_version {
+            "21.1.228" => (
+                include_str!("../tests/fixtures/neoforge-21.1.228-version.json"),
+                "net/neoforged/neoforge/21.1.228/neoforge-21.1.228-client.jar",
+            ),
+            "26.3.0.102" => (
+                include_str!("../tests/fixtures/neoforge-26.3.0.102-version.json"),
+                "net/neoforged/minecraft-client-patched/26.3.0.102/minecraft-client-patched-26.3.0.102.jar",
+            ),
+            other => panic!("no NeoForge fixture for {other}"),
+        };
+        let mc_version = if loader_version == "21.1.228" {
+            "1.21.1"
+        } else {
+            "26.3"
+        };
+        let fix = TempFixture::new();
+        let tuple = LoaderTuple {
+            loader: "neoforge".to_string(),
+            minecraft_version: mc_version.to_string(),
+            loader_version: loader_version.to_string(),
+        };
+        fix.write_base(mc_version);
+        let version: serde_json::Value =
+            serde_json::from_str(version_fixture).expect("a NeoForge version.json is JSON");
+        let profile_id = derive_profile_id(&tuple);
+        fix.write_profile(&profile_id, &version);
+
+        let patched = fix.minecraft_dir.join("libraries").join(patched_path);
+        fs::create_dir_all(patched.parent().expect("library dir")).expect("create lib dir");
+        fs::write(&patched, bytes).expect("write patched jar");
+        (fix, tuple, version)
+    }
+
+    /// The NeoForge installers declare no processor `outputs`, and the
+    /// generated profile does not list the patched client jar either: its
+    /// launcher finds the jar by scanning `-DlibraryDirectory`. Nothing else
+    /// names the file, so the receipt is the only place its bytes can be
+    /// pinned, and an install has to pin it.
+    #[test]
+    fn a_neoforge_install_pins_the_patched_client_jar_its_launcher_finds() {
+        for (installer_sha, install_profile, loader_version, patched_path) in [
+            (
+                "5123d7ae23492a512bc6418a6da5d3c765c8346c0558b64a0e1bb47234b87fe9",
+                include_str!("../tests/fixtures/neoforge-21.1.228-install-profile.json"),
+                "21.1.228",
+                "net/neoforged/neoforge/21.1.228/neoforge-21.1.228-client.jar",
+            ),
+            (
+                "e26e42b0414da4f68840835b4d637928b971a01852b32b6424747290f84e9f1c",
+                include_str!("../tests/fixtures/neoforge-26.3.0.102-install-profile.json"),
+                "26.3.0.102",
+                "net/neoforged/minecraft-client-patched/26.3.0.102/minecraft-client-patched-26.3.0.102.jar",
+            ),
+        ] {
+            let bytes = b"the patched client jar";
+            let (fix, tuple, _version) = real_neoforge_fixture(loader_version, bytes);
+            let install_profile: serde_json::Value = serde_json::from_str(install_profile)
+                .expect("a NeoForge install_profile.json is JSON");
+            // A client install runs only the processors that name every side or
+            // the client. NeoForge's declare no outputs at all, so the patched
+            // jar is the one artifact it writes.
+            let produced = processor_output_coordinates(&install_profile, "client")
+                .expect("client install artifacts resolve");
+            assert!(
+                produced.is_empty(),
+                "NeoForge names no processor outputs: {produced:?}"
+            );
+            let patched = patched_game_jar_coordinate(&install_profile, "client")
+                .expect("the patched jar resolves")
+                .expect("a client install patches the client side");
+
+            let receipt = create_receipt_for_installed_profile(
+                &fix.minecraft_dir,
+                &fix.receipts_root,
+                &tuple,
+                installer_sha,
+                "https://maven.neoforged.net/releases/net/neoforged/neoforge/installer.jar",
+                0,
+                &InstallerSideArtifacts {
+                libraries: produced,
+                patched: Some(patched),
+            },
+            )
+            .unwrap_or_else(|err| {
+                panic!("a NeoForge {loader_version} install pins its jar: {err:?}")
+            });
+
+            assert_eq!(
+                receipt.generated_artifact_sha256,
+                BTreeMap::from([(patched_path.to_string(), sha256_hex(bytes))]),
+                "the receipt pins the patched client jar, which no library names"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // adopt_installed_profile — the pinned patched jar the profile omits
+    // -----------------------------------------------------------------------
+
+    /// The installer can exit 0 having left a truncated patched jar. Nothing
+    /// in the launch would notice — the jar is not on the classpath, NeoForge's
+    /// launcher finds it by scanning the library directory — so adoption has
+    /// to refuse it, and name it.
+    #[test]
+    fn a_truncated_neoforge_patched_jar_is_refused_at_adoption() {
+        let bytes = b"the patched client jar";
+        let (fix, tuple, _version) = real_neoforge_fixture("21.1.228", bytes);
+        let entry = crate::loader_manifests::find_entry("neoforge", "1.21.1", "21.1.228")
+            .expect("the catalog lists NeoForge 21.1.228");
+        let installer_sha = crate::loader_manifests::strip_sha_prefix(&entry.sha256);
+        let install_profile: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/neoforge-21.1.228-install-profile.json"
+        ))
+        .expect("real NeoForge install_profile.json fixture is valid JSON");
+        let produced = processor_output_coordinates(&install_profile, "client")
+            .expect("client install artifacts resolve");
+        let patched_coordinate = patched_game_jar_coordinate(&install_profile, "client")
+            .expect("the patched jar resolves")
+            .expect("a client install patches the client side");
+        create_receipt_for_installed_profile(
+            &fix.minecraft_dir,
+            &fix.receipts_root,
+            &tuple,
+            installer_sha,
+            &entry.source_url,
+            0,
+            &InstallerSideArtifacts {
+                libraries: produced,
+                patched: Some(patched_coordinate),
+            },
+        )
+        .expect("the install pins the patched jar");
+
+        adopt_installed_profile(
+            &fix.minecraft_dir,
+            &fix.receipts_root,
+            &tuple,
+            installer_sha,
+        )
+        .expect("the jar the receipt pinned is intact");
+
+        let patched = fix
+            .minecraft_dir
+            .join("libraries/net/neoforged/neoforge/21.1.228/neoforge-21.1.228-client.jar");
+        fs::write(&patched, b"trunc").expect("truncate the patched jar");
+
+        let err = adopt_installed_profile(
+            &fix.minecraft_dir,
+            &fix.receipts_root,
+            &tuple,
+            installer_sha,
+        )
+        .expect_err("a truncated patched jar is not the jar the receipt pinned");
+        assert_eq!(err.kind, ProfileIssueKind::CorruptProfile, "{err:?}");
+        let text = err.reasons.join(" ");
+        assert!(
+            text.contains("net/neoforged/neoforge/21.1.228/neoforge-21.1.228-client.jar"),
+            "the reason must name the artifact: {text}"
+        );
+        assert!(
+            text.contains(&sha256_hex(bytes)),
+            "the reason must name the pinned SHA-256: {text}"
+        );
+        assert!(
+            text.contains(&sha256_hex(b"trunc")),
+            "the reason must name the digest of the bytes found: {text}"
+        );
+        assert!(
+            text.contains("Reinstall the loader"),
+            "the reason must name the way out: {text}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3678,7 +4358,7 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "https://maven.minecraftforge.net/forge.jar",
             1, // non-zero exit
-            &BTreeSet::new(),
+            &InstallerSideArtifacts::default(),
         )
         .expect_err("should reject non-zero exit");
 
@@ -3720,7 +4400,7 @@ mod tests {
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "https://maven.minecraftforge.net/forge.jar",
             -1,
-            &BTreeSet::new(),
+            &InstallerSideArtifacts::default(),
         )
         .expect_err("should reject negative exit");
 
