@@ -32,7 +32,7 @@
 use crate::app_paths::AppPaths;
 use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
-use crate::lock_manager::{LockGuard, LockResource};
+use crate::lock_manager::{LockGuard, LockRefusal, LockResource};
 use crate::process_identity::{self, ProcessIdentity};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -381,7 +381,8 @@ pub enum MayMutate {
         error: LauncherError,
     },
     /// A record that answers the question could not be read, or a launch was recorded with no
-    /// process identity to verify. Nothing is known, so nothing may change.
+    /// process identity to verify, or the instance lock could not be taken for a reason other
+    /// than someone holding it. Nothing is known, so nothing may change.
     CantTell { error: LauncherError },
 }
 
@@ -426,7 +427,7 @@ impl MayMutate {
 /// checks come first so a running game is refused at once instead of after a 30-second wait.
 pub fn may_mutate(ctx: &Ctx, instance_id: &str, operation: &str) -> MayMutate {
     decide(ctx, instance_id, operation, false, |resource, operation| {
-        ctx.lock_manager.acquire(resource, operation)
+        ctx.lock_manager.acquire_typed(resource, operation)
     })
 }
 
@@ -435,7 +436,7 @@ pub fn may_mutate(ctx: &Ctx, instance_id: &str, operation: &str) -> MayMutate {
 /// once, whatever the user allowed.
 pub fn may_mutate_while_running(ctx: &Ctx, instance_id: &str, operation: &str) -> MayMutate {
     decide(ctx, instance_id, operation, true, |resource, operation| {
-        ctx.lock_manager.acquire(resource, operation)
+        ctx.lock_manager.acquire_typed(resource, operation)
     })
 }
 
@@ -450,7 +451,7 @@ fn may_mutate_within(
 ) -> MayMutate {
     decide(ctx, instance_id, operation, false, |resource, operation| {
         ctx.lock_manager
-            .acquire_with_timeout(resource, operation, wait, None)
+            .acquire_with_timeout_typed(resource, operation, wait, None)
     })
 }
 
@@ -459,7 +460,7 @@ fn decide(
     instance_id: &str,
     operation: &str,
     allow_while_running: bool,
-    acquire: impl FnOnce(LockResource, &str) -> LauncherResult<LockGuard>,
+    acquire: impl FnOnce(LockResource, &str) -> Result<LockGuard, LockRefusal>,
 ) -> MayMutate {
     if !allow_while_running {
         if let Some(refusal) = refusal(liveness_answer(ctx, instance_id)) {
@@ -468,14 +469,17 @@ fn decide(
     }
     let lock = match acquire(LockResource::Instance(instance_id.to_string()), operation) {
         Ok(lock) => lock,
-        // The lock is not ours: another operation holds it, the wait was cancelled, or it could
-        // not be taken at all. A change may not proceed either way.
-        Err(error) => {
+        // A held lock is busy: something is using the instance and the change has to wait.
+        Err(LockRefusal::Held(error)) => {
             return MayMutate::Busy {
                 cause: BusyCause::Lock,
                 error,
             }
         }
+        // The lock could not be asked for at all (a lock directory that is not a directory, a
+        // name that is not a lock name, a cancelled wait): nothing was learned about any holder,
+        // so the answer is can't-tell, not "busy".
+        Err(LockRefusal::Unavailable(error)) => return MayMutate::CantTell { error },
     };
     if !allow_while_running {
         if let Some(refusal) = refusal(liveness_answer(ctx, instance_id)) {
@@ -655,16 +659,17 @@ impl InstanceGuard {
         }
         let lock = match ctx
             .lock_manager
-            .acquire_async(LockResource::Instance(instance_id.to_string()), operation)
+            .acquire_async_typed(LockResource::Instance(instance_id.to_string()), operation)
             .await
         {
             Ok(lock) => lock,
-            Err(error) => {
+            Err(LockRefusal::Held(error)) => {
                 return MayMutate::Busy {
                     cause: BusyCause::Lock,
                     error,
                 }
             }
+            Err(LockRefusal::Unavailable(error)) => return MayMutate::CantTell { error },
         };
         if !allow_while_running {
             if let Some(refusal) = refusal(liveness_answer(ctx, instance_id)) {
@@ -982,6 +987,27 @@ mod tests {
             }
             other => panic!("a held lock must be busy: {other:?}"),
         }
+    }
+
+    /// A lock that cannot be taken for a reason other than "someone holds it" is can't-tell: it
+    /// is unknown whether another operation holds it, so a change may not proceed — and it must
+    /// not be reported as busy, which would say a holder exists.
+    #[test]
+    fn a_lock_that_cannot_be_taken_is_cant_tell() {
+        let (ctx, _tmp) = guard_ctx();
+        // The lock file's place is a directory, so opening the lock file fails with an I/O error.
+        let lock_path = ctx.paths.instance_lock("demo").unwrap();
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        fs::create_dir(&lock_path).unwrap();
+
+        let refusal = match may_mutate(&ctx, "demo", "test") {
+            MayMutate::CantTell { error } => error,
+            other => panic!("a lock that cannot be taken must be can't-tell: {other:?}"),
+        };
+        assert_eq!(refusal.code(), "ERR_LOCK_IO");
+        // The legacy wrapper keeps the code the UI matches on.
+        let error = InstanceGuard::for_mutation(&ctx, "demo", "test").unwrap_err();
+        assert_eq!(error.code(), "ERR_LOCK_IO");
     }
 
     /// A live game is Busy(Game), and the code the callers translate is unchanged.

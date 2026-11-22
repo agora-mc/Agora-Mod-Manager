@@ -88,7 +88,7 @@ This ensures the core owns the **interface and policy** while the adapter provid
 | Rendering plugin views | React | A plugin returns a `ViewModel` — data, never markup — and React draws it with Agora's own components. There is deliberately no HTML string to hand to `dangerouslySetInnerHTML` |
 | Plugin themes | React | Applies the semantic tokens a theme declares. A theme names a token, never arbitrary CSS |
 | Asking whether a path is there | `agora-game-api` (`probe`) | `Present(kind)` / `Absent` / `CantTell`, never `exists()`. Only "not found" is absent; a link is reported as a link, and a probe result is never permission to write — mutations resolve their destination and keep its identity (MASTER_SPEC §32.13) |
-| May this process change an instance? | `agora-core` (`instance_runtime::may_mutate`) | One typed answer: `Yes(guard)`, `Busy` (the game, or another Agora operation holding the lock) or `CantTell` (an unreadable lease, session or store, or an indeterminate launch). `InstanceGuard::for_mutation*` keep their codes for the UI; no caller compares them to decide whether a change may proceed. The override is `may_mutate_while_running`, which still takes the lock |
+| May this process change an instance? | `agora-core` (`instance_runtime::may_mutate`) | One typed answer: `Yes(guard)`, `Busy` (the game, or another Agora operation holding the lock) or `CantTell` (an unreadable lease, session or store, an indeterminate launch, or a lock that could not be taken at all — `LockManager` says `Held` or `Unavailable`, so no caller infers "busy" from an error code). `InstanceGuard::for_mutation*` keep their codes for the UI. The override is `may_mutate_while_running`, which still takes the lock |
 
 ## Dependency Direction
 
