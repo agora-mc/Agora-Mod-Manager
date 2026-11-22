@@ -913,7 +913,7 @@ fn a_base_build_holds_its_lock_between_the_rename_and_the_record() {
     };
     let base_id = make_base_id(runtime);
 
-    agora_core::game_base::set_base_build_pause_after_rename(Some(&root));
+    let pause = agora_core::game_base::pause_base_build_after_rename(&root);
     let build_paths = paths.clone();
     let build_install = install.clone();
     let build_root = root.clone();
@@ -932,7 +932,7 @@ fn a_base_build_holds_its_lock_between_the_rename_and_the_record() {
     // Wait for the build to reach the rename, where it holds the base lock.
     let mut reached = false;
     for _ in 0..600 {
-        if agora_core::game_base::base_build_pause_reached() {
+        if pause.reached() {
             reached = true;
             break;
         }
@@ -946,7 +946,7 @@ fn a_base_build_holds_its_lock_between_the_rename_and_the_record() {
         Duration::from_millis(100),
         None,
     );
-    agora_core::game_base::set_base_build_pause_after_rename(None);
+    pause.release();
     let outcome = handle.join().unwrap().expect("the base build succeeds");
 
     assert!(reached, "the base build never reached its rename");
@@ -966,6 +966,7 @@ fn a_base_build_holds_its_lock_between_the_rename_and_the_record() {
         .expect("the base lock is released when the build finishes");
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn a_rebuild_refuses_when_an_instance_moves_to_trash_before_the_pin_recheck() {
     use agora_core::ctx::CoreContext;
@@ -992,7 +993,7 @@ fn a_rebuild_refuses_when_an_instance_moves_to_trash_before_the_pin_recheck() {
     // A damaged record makes the next build replace the still-marked stale folder.
     std::fs::write(paths.base_manifest_path(&base_id), "{ not json").unwrap();
 
-    agora_core::game_base::set_base_build_pause_before_pin_recheck(Some(&root));
+    let pause = agora_core::game_base::pause_base_build_before_pin_recheck(&root);
     let build_paths = paths.clone();
     let build_install = install.clone();
     let build_root = root.clone();
@@ -1010,14 +1011,14 @@ fn a_rebuild_refuses_when_an_instance_moves_to_trash_before_the_pin_recheck() {
 
     let mut reached = false;
     for _ in 0..600 {
-        if agora_core::game_base::base_build_pause_before_pin_recheck_reached() {
+        if pause.reached() {
             reached = true;
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     if !reached {
-        agora_core::game_base::set_base_build_pause_before_pin_recheck(None);
+        pause.release();
         panic!(
             "the build never reached the early pinning check: {:?}",
             handle.join().unwrap()
@@ -1073,7 +1074,7 @@ fn a_rebuild_refuses_when_an_instance_moves_to_trash_before_the_pin_recheck() {
     )
     .unwrap();
 
-    agora_core::game_base::set_base_build_pause_before_pin_recheck(None);
+    pause.release();
     let outcome = handle.join().unwrap();
     assert!(
         outcome.as_ref().is_err_and(|error| {
@@ -1111,9 +1112,11 @@ fn a_rebuild_keeps_the_base_when_the_locked_record_read_fails() {
 
     // A damaged record lets the build pass its early check and head for a rebuild;
     // while it is parked past that check, swap the record for one that cannot be
-    // read at all.
+    // read at all. The directory reads as present to `symlink_metadata` on both
+    // Windows and Linux, while opening it as a file fails for every user,
+    // including a Linux root — exactly the "exists but cannot be read" shape.
     std::fs::write(paths.base_manifest_path(&base_id), "{ not json").unwrap();
-    agora_core::game_base::set_base_build_pause_before_pin_recheck(Some(&root));
+    let pause = agora_core::game_base::pause_base_build_before_pin_recheck(&root);
     let build_paths = paths.clone();
     let build_install = install.clone();
     let build_root = root.clone();
@@ -1130,18 +1133,22 @@ fn a_rebuild_keeps_the_base_when_the_locked_record_read_fails() {
     });
     let mut reached = false;
     for _ in 0..600 {
-        if agora_core::game_base::base_build_pause_before_pin_recheck_reached() {
+        if pause.reached() {
             reached = true;
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(reached, "the build never reached its early check");
+    assert!(
+        reached,
+        "the build never reached its early pinning check; the pause is per-test, \
+         so another test cannot have released it"
+    );
     let manifest_path = paths.base_manifest_path(&base_id);
     std::fs::remove_file(&manifest_path).unwrap();
     std::fs::create_dir(&manifest_path).unwrap();
 
-    agora_core::game_base::set_base_build_pause_before_pin_recheck(None);
+    pause.release();
     let outcome = handle.join().unwrap();
     assert!(
         outcome
