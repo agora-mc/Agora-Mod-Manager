@@ -1733,8 +1733,10 @@ enum PluginCmd {
     ///
     /// A case that needs a hand is resolved by naming a direction. `--restore` puts the stashed
     /// previous version back, replacing whatever is in the plugin's folder now. `--discard` keeps
-    /// what is installed and drops the stashed copy. Both need --yes, and both say what they will
-    /// do before they do it.
+    /// what is installed and drops the stashed copy; it refuses when the stashed copy is the only
+    /// usable one there is. `--keep-aside` deletes nothing: it moves the stashed copy to a named
+    /// folder and clears the journal, which is the way out when neither copy can be read. All
+    /// three need --yes, and all three say what they will do before they do it.
     Recover {
         /// Plugin id. Omit to recover every interrupted install the safe way.
         id: Option<String>,
@@ -1742,16 +1744,27 @@ enum PluginCmd {
             long,
             requires = "id",
             conflicts_with = "discard",
+            conflicts_with = "keep_aside",
             help = "Put the stashed previous version back, replacing what is in the plugin's folder now"
         )]
         restore: bool,
         #[arg(
             long,
             requires = "id",
+            conflicts_with = "keep_aside",
             help = "Keep what is installed and drop the stashed previous version"
         )]
         discard: bool,
-        #[arg(long, help = "Confirm the direction given by --restore or --discard")]
+        #[arg(
+            long,
+            requires = "id",
+            help = "Keep both copies: move the stashed one to a `.kept` folder and clear the journal"
+        )]
+        keep_aside: bool,
+        #[arg(
+            long,
+            help = "Confirm the direction given by --restore, --discard or --keep-aside"
+        )]
         yes: bool,
     },
     /// Put a plugin's stored data back to the copy kept before its last
@@ -3883,6 +3896,7 @@ async fn run_plugin_command(
             id,
             restore,
             discard,
+            keep_aside,
             yes,
         } => {
             use agora_core::plugins::install::{InstallRecovery, InstallResolution};
@@ -3894,6 +3908,8 @@ async fn run_plugin_command(
                 InstallResolution::Restore
             } else if discard {
                 InstallResolution::Discard
+            } else if keep_aside {
+                InstallResolution::KeepAside
             } else {
                 InstallResolution::Automatic
             };
@@ -3901,9 +3917,12 @@ async fn run_plugin_command(
                 let direction = if restore {
                     "puts the stashed previous version back, replacing whatever is in the plugin's \
                      folder now"
-                } else {
+                } else if discard {
                     "keeps what is installed and drops the stashed previous version, so going back \
                      to it is no longer possible"
+                } else {
+                    "moves the stashed copy to a `.kept` folder beside it and clears the journal, so \
+                     nothing is deleted"
                 };
                 println!("This {direction}.");
                 println!(

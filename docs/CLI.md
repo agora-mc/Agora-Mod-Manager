@@ -789,6 +789,7 @@ agora plugin restore-data <PLUGIN_ID> [--yes]
 agora plugin recover [PLUGIN_ID]
 agora plugin recover <PLUGIN_ID> --restore --yes
 agora plugin recover <PLUGIN_ID> --discard --yes
+agora plugin recover <PLUGIN_ID> --keep-aside --yes
 agora plugin log <PLUGIN_ID> --lines 200
 agora plugin disable-all
 agora plugin run <PLUGIN_ID> <COMMAND> [--args <JSON>]
@@ -926,10 +927,11 @@ See `docs/plugins/publishing.md` for what the signature does and does not prove.
 
 `plugin recover [ID]` is the way out of a plugin install that a crash cut short (MASTER_SPEC §32.11). Every install writes a journal saying which folders it may touch and how far it got, and the next start finishes or undoes it by itself when that is safe. With no id, `recover` does the same for every interrupted install and lists anything that needs a hand. A case that needs a hand — a package folder whose `agora-plugin.json` cannot be read, a stashed copy from an older Agora that wrote no journal, a journal this build cannot read — is resolved only by naming a direction, and each says what it will do before it does it:
 
-- `--restore --yes` puts the stashed previous version back. **Risk:** whatever is in the plugin's folder now is replaced, including a newer version that could not be read.
-- `--discard --yes` keeps what is installed and drops the stashed copy. **Risk:** the previous version is gone, so going back to it is no longer possible.
+- `--restore --yes` puts the stashed previous version back. **Risk:** whatever is in the plugin's folder now is replaced, including a newer version that could not be read. When the install had reached its commit witness, the database record is put back with the files, so the record and the files name the same version; if the record cannot be put back (a package the record cannot be rebuilt from, or a plugin you removed since), `--restore` says so instead of leaving the two disagreeing.
+- `--discard --yes` keeps what is installed and drops the stashed copy. **Risk:** the previous version is gone, so going back to it is no longer possible. It refuses when the stashed copy is the only usable one — the plugin's folder is missing, or its `agora-plugin.json` cannot be read or names another plugin — and says which of those it is.
+- `--keep-aside --yes` deletes nothing. The stashed copy is moved to `<PLUGIN_ID>.kept` beside it, the plugin's folder is left exactly as it is, and the journal and its marker are cleared, so a case nothing else can settle stops blocking every start with both copies still there. This is the option that always works, including when neither copy can be read.
 
-Both exit non-zero without `--yes`, having changed nothing.
+All three exit non-zero without `--yes`, having changed nothing.
 
 An install settles an unresolved journal before it writes its own, so this matters outside startup too: `plugin install` (and `plugin update`, and the same install through the app) takes the plugin-install lock, finishes or undoes an interrupted install of that plugin through the same decision the startup pass uses, and only then begins. A journal is never overwritten. When the journal it finds needs a hand, the install refuses — nothing is changed, the journal and the stashed copy are kept — and the refusal names `agora plugin recover <ID>` as the way out. What the install settled first is written to the plugin's own log, so `plugin log <ID>` answers "why is this version here?".
 
