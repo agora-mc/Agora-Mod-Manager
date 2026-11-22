@@ -13,6 +13,7 @@ use crate::registry_bundle::{
     self, BundleError, CatalogHeader, KeyCertificate, KeyRevocation, RegistryKeyRole,
     RegistryTrust, VerifiedBundle,
 };
+use agora_game_api::probe::{probe, Probe};
 use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1080,6 +1081,98 @@ fn staged_bundle_path(app_data_dir: &Path) -> LauncherResult<PathBuf> {
     paths::registry_bundle_staged_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)
 }
 
+/// Whether something is at `path`, or a report that it could not be told.
+///
+/// `Path::exists` answers `false` for an access denial, a Windows sharing violation or a path that
+/// runs through a regular file, so "the catalog is not there" and "the catalog could not be
+/// examined" were the same answer — and the first lets an open say "no catalog" while the second
+/// must be a report (MASTER_SPEC §32.13). Only [`Probe::Absent`] is absent here.
+fn path_present(path: &Path, what: &str) -> LauncherResult<bool> {
+    let answer = probe_answer(path);
+    match answer {
+        Probe::Present(_) => Ok(true),
+        Probe::Absent => Ok(false),
+        Probe::CantTell(error) => Err(cant_tell_error(path, what, &error)),
+    }
+}
+
+/// [`probe`], with a test-only way to make one path unreadable.
+fn probe_answer(path: &Path) -> Probe {
+    #[cfg(test)]
+    if let Some(error) = injected_probe_failure(path) {
+        return Probe::CantTell(error);
+    }
+    probe(path)
+}
+
+fn cant_tell_error(path: &Path, what: &str, error: &std::io::Error) -> LauncherError {
+    LauncherError::Generic {
+        code: "ERR_REGISTRY_UNREADABLE".into(),
+        message: format!(
+            "Could not tell whether {what} at {} is there ({error}), so the catalog cannot be used \
+             this run.",
+            path.display()
+        ),
+    }
+}
+
+/// The catalog files an operation has to work with, each probed: whether a
+/// catalog is installed, whether bytes that would become one are staged, and the
+/// paths to name in a message or a warning.
+struct CatalogFiles {
+    bundle: PathBuf,
+    bundle_present: bool,
+    staged_present: bool,
+}
+
+/// Probe the installed bundle and the staged bytes beside it. A path that cannot
+/// be examined is an error, never "absent".
+fn catalog_files(app_data_dir: &Path, bundle_path: PathBuf) -> LauncherResult<CatalogFiles> {
+    let staged = staged_bundle_path(app_data_dir)?;
+    let bundle_present = path_present(&bundle_path, "the catalog bundle")?;
+    let staged_present = path_present(&staged, "the staged catalog bundle")?;
+    Ok(CatalogFiles {
+        bundle: bundle_path,
+        bundle_present,
+        staged_present,
+    })
+}
+
+#[cfg(test)]
+fn probe_failures() -> &'static Mutex<Vec<PathBuf>> {
+    static FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Test-only: make a probe of this exact path answer can't-tell, as a permission
+/// denial or a sharing violation would.
+#[cfg(test)]
+fn injected_probe_failure(path: &Path) -> Option<std::io::Error> {
+    let paths = probe_failures().lock().ok()?;
+    paths
+        .iter()
+        .any(|injected| injected == path)
+        .then(|| std::io::Error::other("injected probe failure"))
+}
+
+#[cfg(test)]
+struct ProbeFailureGuard(PathBuf);
+
+#[cfg(test)]
+impl Drop for ProbeFailureGuard {
+    fn drop(&mut self) {
+        if let Ok(mut paths) = probe_failures().lock() {
+            paths.retain(|path| path != &self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+fn fail_probes_of(path: &Path) -> ProbeFailureGuard {
+    probe_failures().lock().unwrap().push(path.to_path_buf());
+    ProbeFailureGuard(path.to_path_buf())
+}
+
 /// Write the verified candidate durably beside the bundle, before anything
 /// refers to it.
 ///
@@ -2039,10 +2132,15 @@ pub fn verify_cached_registry_with_trust(
         Ok(path) => path,
         Err(_) => return CachedRegistryIntegrity::Absent,
     };
-    let staged_exists = staged_bundle_path(app_data_dir)
-        .map(|path| path.exists())
-        .unwrap_or(false);
-    if bundle_path.exists() || staged_exists {
+    let files = match catalog_files(app_data_dir, bundle_path) {
+        Ok(files) => files,
+        Err(error) => {
+            return CachedRegistryIntegrity::Error(format!(
+                "{error} The catalog will not be used this run."
+            ))
+        }
+    };
+    if files.bundle_present || files.staged_present {
         // A log that cannot be trusted is not the bundle's fault: report it, and
         // neither recover from the previous copy nor move the bundle aside.
         return match TrustSnapshot::load(app_data_dir, compiled) {
@@ -2054,10 +2152,18 @@ pub fn verify_cached_registry_with_trust(
                         "{error} The catalog will not be used this run."
                     ));
                 }
-                if !bundle_path.exists() {
+                let installed = match path_present(&files.bundle, "the catalog bundle") {
+                    Ok(installed) => installed,
+                    Err(error) => {
+                        return CachedRegistryIntegrity::Error(format!(
+                            "{error} The catalog will not be used this run."
+                        ))
+                    }
+                };
+                if !installed {
                     return CachedRegistryIntegrity::Absent;
                 }
-                verify_bundle_file(app_data_dir, &bundle_path, &trust)
+                verify_bundle_file(app_data_dir, &files.bundle, &trust)
             }
             Err(error) => CachedRegistryIntegrity::Error(format!(
                 "{error} The catalog will not be used this run."
@@ -2221,7 +2327,9 @@ fn finish_staged_publication_locked(
 ) -> LauncherResult<Option<String>> {
     let floor = read_floor_file(app_data_dir)?;
     let staged = staged_bundle_path(app_data_dir)?;
-    if !staged.exists() {
+    // A staged path that cannot be examined is a report, not "nothing staged",
+    // and the file is left exactly as it is (MASTER_SPEC §32.13).
+    if !path_present(&staged, "the staged catalog bundle")? {
         // Nothing to finish. A floor that is above an installed catalog which
         // still verifies has no bytes to finish it with: refuse rather than open
         // the older catalog this client already replaced. An installed catalog
@@ -2385,18 +2493,16 @@ pub fn verified_registry_digest(
 ) -> LauncherResult<Option<String>> {
     let bundle_path =
         paths::registry_bundle_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
-    let staged_exists = staged_bundle_path(app_data_dir)
-        .map(|path| path.exists())
-        .unwrap_or(false);
-    if bundle_path.exists() || staged_exists {
+    let files = catalog_files(app_data_dir, bundle_path)?;
+    if files.bundle_present || files.staged_present {
         let trust = &TrustSnapshot::load(app_data_dir, compiled)?;
         // Finish a publication a crash interrupted before the digest is taken, so
         // the digest describes the catalog this client accepted.
         let _warning = finish_staged_publication(app_data_dir, trust)?;
-        if !bundle_path.exists() {
+        if !path_present(&files.bundle, "the catalog bundle")? {
             return Ok(None);
         }
-        let header = load_header(&bundle_path, trust).map_err(|error| LauncherError::Generic {
+        let header = load_header(&files.bundle, trust).map_err(|error| LauncherError::Generic {
             code: "ERR_REGISTRY_SIGNATURE_INVALID".into(),
             message: format!("The catalog bundle could not be used: {error}."),
         })?;
@@ -2408,7 +2514,7 @@ pub fn verified_registry_digest(
                 message: floor_stale_message(),
             });
         }
-        ensure_database(app_data_dir, &bundle_path, &header, None, trust)?;
+        ensure_database(app_data_dir, &files.bundle, &header, None, trust)?;
         return Ok(Some(header.db_sha256.to_ascii_lowercase()));
     }
 
@@ -2821,11 +2927,11 @@ pub fn open_verified_registry_with_trust(
     let bundle_path =
         paths::registry_bundle_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
     // A staged bundle counts as a catalog in the making: a publication may have
-    // failed after the installed bundle was removed or before it existed.
-    let staged_exists = staged_bundle_path(app_data_dir)
-        .map(|path| path.exists())
-        .unwrap_or(false);
-    if bundle_path.exists() || staged_exists {
+    // failed after the installed bundle was removed or before it existed. Both
+    // answers are probed, because a catalog that cannot be examined is not an
+    // absent one.
+    let files = catalog_files(app_data_dir, bundle_path)?;
+    if files.bundle_present || files.staged_present {
         // One snapshot for the open and for any recovery it triggers. A log that
         // cannot be trusted refuses the open, whatever the bundle looks like.
         let snapshot = TrustSnapshot::load(app_data_dir, compiled)?;
@@ -2835,22 +2941,22 @@ pub fn open_verified_registry_with_trust(
         // staged file that cannot be used while this one can is a warning, not a
         // refusal: it is kept, and the caller says so once.
         let warning = finish_staged_publication(app_data_dir, &snapshot)?;
-        if !bundle_path.exists() {
+        if !path_present(&files.bundle, "the catalog bundle")? {
             // Nothing pending could be finished: there is no catalog to open.
             return Err(LauncherError::RegistryMissing);
         }
-        let first = open_bundle_once(app_data_dir, &bundle_path, &snapshot);
+        let first = open_bundle_once(app_data_dir, &files.bundle, &snapshot);
         // A crash between installing the bundle and extracting the database
         // (or a damaged current bundle) is recoverable from the previous copy.
         let recovered = first.is_err()
             && matches!(
-                verify_bundle_file(app_data_dir, &bundle_path, &snapshot),
+                verify_bundle_file(app_data_dir, &files.bundle, &snapshot),
                 CachedRegistryIntegrity::Verified
                     | CachedRegistryIntegrity::Stale(_)
                     | CachedRegistryIntegrity::Recovered(_)
             );
         let mut registry = if recovered {
-            open_bundle_once(app_data_dir, &bundle_path, &snapshot)?
+            open_bundle_once(app_data_dir, &files.bundle, &snapshot)?
         } else {
             first?
         };
@@ -4814,6 +4920,71 @@ mod tests {
             fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
             first,
             "the older catalog must not be replaced or opened through this state"
+        );
+    }
+
+    /// The conversion itself (MASTER_SPEC §32.13): an operating-system error on a
+    /// path is can't-tell, and the check it replaced answered "absent" for the
+    /// same error. An interior NUL is invalid on every platform, so this runs
+    /// everywhere.
+    #[test]
+    fn a_metadata_error_is_cant_tell_not_absent() {
+        let path = Path::new("invalid\0path");
+        assert!(
+            !path.exists(),
+            "the check this replaced read the metadata error as absence"
+        );
+        let error = path_present(path, "the catalog bundle").unwrap_err();
+        assert_eq!(error.code(), "ERR_REGISTRY_UNREADABLE", "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Could not tell whether the catalog bundle"),
+            "the refusal says what could not be told: {error}"
+        );
+    }
+
+    /// A staged path that cannot be examined is reported, never read as "nothing
+    /// staged": `exists()` said absent for it, so the open used to ignore bytes
+    /// that might have been the publication the floor names. The file is kept —
+    /// nothing is deleted on a can't-tell.
+    #[test]
+    fn a_staged_path_that_cannot_be_examined_is_reported_and_kept() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(232);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db_with_built_at("2026-11-15T12:00:00+00:00");
+        let header = header_for(
+            &key,
+            &payload,
+            "2026-11-15T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&key, &header, &payload),
+            &trust,
+            "first",
+        )
+        .unwrap();
+        let staged = paths::registry_bundle_staged_path(dir.path()).unwrap();
+        fs::write(&staged, b"not a bundle").unwrap();
+
+        let _failure = fail_probes_of(&staged);
+        let error = open_verified_registry_with_trust(dir.path(), &trust)
+            .err()
+            .expect("a staged path that cannot be examined must be reported");
+        assert_eq!(error.code(), "ERR_REGISTRY_UNREADABLE", "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Could not tell whether the staged catalog bundle"),
+            "the refusal names the staged file: {error}"
+        );
+        assert_eq!(
+            fs::read(&staged).unwrap(),
+            b"not a bundle",
+            "a can't-tell never deletes the file it could not examine"
         );
     }
 
