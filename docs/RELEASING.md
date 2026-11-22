@@ -375,10 +375,12 @@ remembered key is trusted only while every key in its certificate chain is
 unrevoked, so revoking a recovery key also retires every key it certified, and
 a remembered descendant cannot sign the bundle that revokes its ancestor.
 
-Each operation (install, sync, open, status, digest, recovery) computes its
-trust once, from the compiled keys plus the log, and uses that one snapshot for
-every decision in it, including the cached stamp, the rollback floor and delta
-verification.
+Each operation (install, sync, open, status, digest, recovery) reads the log
+once and computes its trust from that one read, using the snapshot for every
+decision in it, including the cached stamp, the rollback floor and delta
+verification. A sync reads it either for the status of a recent check or, once,
+under the `RegistryUpdate` lock, and never re-reads it to describe its own
+install.
 
 A missing or empty state file means nothing is remembered yet. A state file that
 cannot be read, is damaged (a record cut short, a line cut in the middle), or

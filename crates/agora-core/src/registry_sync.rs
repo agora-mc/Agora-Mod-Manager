@@ -6111,15 +6111,25 @@ v1 key deadbeef deadbeef deadbeef deadbeef
     #[tokio::test]
     async fn a_sync_that_installs_reads_the_trust_log_once() {
         let (dir, ls_path, locks) = setup_sync_env();
-        let key = test_key(204);
-        let trust = RegistryTrust::with_key(test_public(&key));
+        let primary = test_key(204);
+        let recovery = test_key(208);
+        let fresh = test_key(209);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&primary)),
+        ]);
         let payload = sample_db_with_built_at("2026-11-18T02:00:00+00:00");
-        let header = header_for(
-            &key,
+        let mut header = header_for(
+            &primary,
             &payload,
             "2026-11-18T02:00:00+00:00",
             "2099-01-01T00:00:00+00:00",
         );
+        // The candidate teaches a key, so it appends a record to the log: the
+        // case that used to re-read the log to describe its own install.
+        header
+            .certificates
+            .push(certificate(&recovery, &test_public(&fresh)));
         let recorded = r#"[
             {
                 "tag_name": "registry-2026-11-18",
@@ -6130,7 +6140,7 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         ]"#;
         let transport =
             FakeRegistryTransport::from_pages(vec![(1, release_json_to_list(recorded))]);
-        transport.push_asset_ok(3001, signed_bundle(&key, &header, &payload));
+        transport.push_asset_ok(3001, signed_bundle(&primary, &header, &payload));
 
         reset_trust_log_reads(dir.path());
         let status = check_and_download_update_inner(
@@ -6148,6 +6158,12 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         .await
         .unwrap();
         assert!(status.has_cached_db, "{status:?}");
+        assert!(
+            fs::read_to_string(paths::registry_trust_state_path(dir.path()).unwrap())
+                .unwrap()
+                .contains("v1 record"),
+            "the candidate changed the log, so a re-read would have been taken"
+        );
         assert_eq!(
             trust_log_reads(dir.path()),
             1,
