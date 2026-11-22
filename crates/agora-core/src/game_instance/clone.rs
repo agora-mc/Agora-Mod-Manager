@@ -15,7 +15,7 @@ use crate::game_instance::{
     self, check_id_exists, generate_instance_id_from_name, GameInstanceManifest, InstanceError,
 };
 use crate::game_saves::{self, SavesError, SavesState, STATE_FILE};
-use crate::instance_runtime::InstanceGuard;
+use crate::instance_runtime::{BusyCause, MayMutate};
 use crate::save_backup::{copy_save_files, BACKUP_DIR};
 
 /// What a clone is asked to take from its source.
@@ -143,14 +143,18 @@ pub fn clone_instance(
     game_saves::checked_metadata(&source_manifest_path, &source_dir)?;
     // A running game is writing the files a clone would copy. The shared guard
     // takes the instance lock and checks the one "is this game running" answer;
-    // it fails at once rather than waiting out the lock.
-    let _guard =
-        InstanceGuard::for_mutation(ctx, source_id, "clone").map_err(|error| {
-            match error.code().as_str() {
-                "ERR_INSTANCE_RUNNING" => InstanceError::Running(source_id.to_string()),
-                _ => InstanceError::Other(error.to_string()),
-            }
-        })?;
+    // it fails at once rather than waiting out the lock. The typed answer says
+    // which refusal this is, so nothing here compares error codes.
+    let _guard = match crate::instance_runtime::may_mutate(ctx, source_id, "clone") {
+        MayMutate::Yes(guard) => guard,
+        MayMutate::Busy {
+            cause: BusyCause::Game,
+            ..
+        } => return Err(InstanceError::Running(source_id.to_string())),
+        MayMutate::Busy { error, .. } | MayMutate::CantTell { error } => {
+            return Err(InstanceError::Other(error.to_string()))
+        }
+    };
     game_saves::checked_metadata(&source_manifest_path, &source_dir)?;
     let source_manifest = game_instance::get_manifest(ctx, source_id)?;
     let store = store_of(ctx, source_id)?;

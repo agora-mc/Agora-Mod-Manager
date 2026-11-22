@@ -21,7 +21,7 @@ use crate::ctx::Ctx;
 use crate::error::LauncherError;
 use crate::game_plugins::PluginListError;
 use crate::game_user_files::{self, Journal};
-use crate::instance_runtime::InstanceGuard;
+use crate::instance_runtime::{BusyCause, InstanceGuard, MayMutate};
 use crate::lock_manager::{LockGuard, LockResource};
 
 const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
@@ -754,23 +754,6 @@ pub fn unset_value_locked(
     )
 }
 
-fn guard_for(
-    ctx: &Ctx,
-    instance_id: &str,
-    operation: &str,
-    allow_while_running: bool,
-) -> Result<InstanceGuard, IniError> {
-    if allow_while_running {
-        Ok(InstanceGuard::for_mutation_while_running(
-            ctx,
-            instance_id,
-            operation,
-        )?)
-    } else {
-        Ok(InstanceGuard::for_mutation(ctx, instance_id, operation)?)
-    }
-}
-
 /// A refused guard for an INI edit, translated back to the INI-specific answer when the
 /// user-files journal can say which it is: a live session, or one that must be restored.
 pub(crate) fn guard_for_ini(
@@ -780,17 +763,25 @@ pub(crate) fn guard_for_ini(
     store: &StoreId,
     allow_while_running: bool,
 ) -> Result<InstanceGuard, IniError> {
-    match guard_for(ctx, instance_id, "ini-edit", allow_while_running) {
-        Ok(guard) => Ok(guard),
-        Err(IniError::Lock(error))
-            if !allow_while_running && error.code() == "ERR_INSTANCE_RUNNING" =>
-        {
-            match refuse_during_session(ctx, definition, store) {
-                Ok(()) => Err(IniError::Lock(error)),
-                Err(specific) => Err(specific),
-            }
-        }
-        Err(error) => Err(error),
+    if allow_while_running {
+        // The user's explicit answer to a running game: only the lock can refuse here.
+        return Ok(InstanceGuard::for_mutation_while_running(
+            ctx,
+            instance_id,
+            "ini-edit",
+        )?);
+    }
+    // The one liveness decision, matched by cause instead of by error code.
+    match crate::instance_runtime::may_mutate(ctx, instance_id, "ini-edit") {
+        MayMutate::Yes(guard) => Ok(guard),
+        MayMutate::Busy {
+            cause: BusyCause::Game,
+            error,
+        } => match refuse_during_session(ctx, definition, store) {
+            Ok(()) => Err(IniError::Lock(error)),
+            Err(specific) => Err(specific),
+        },
+        MayMutate::Busy { error, .. } | MayMutate::CantTell { error } => Err(IniError::Lock(error)),
     }
 }
 
