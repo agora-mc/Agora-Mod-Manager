@@ -1864,7 +1864,7 @@ fn no_leftover_pin_enforcement() {
 // ---------------------------------------------------------------------------
 
 use agora_game_minecraft::installed_profile::{
-    self, LoaderSourceKind, LoaderTuple, ProfileIssueKind,
+    self, InstallerSideArtifacts, LoaderSourceKind, LoaderTuple, ProfileIssueKind,
 };
 
 /// Minimal base version JSON for adoption tests.
@@ -2278,18 +2278,36 @@ fn forge_install_receipt_pins_processor_output_with_published_sha1() {
     let mut profile: serde_json::Value =
         serde_json::from_str(VERSION_JSON).expect("real Forge version.json must parse");
     profile["id"] = serde_json::Value::String(profile_id.clone());
-    write_installed_version_json(&minecraft_dir, &profile_id, &profile);
 
     // The patcher output the installer just produced on disk.
     let client_jar_rel = "net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-client.jar";
     let client_jar = minecraft_dir.join("libraries").join(client_jar_rel);
     std::fs::create_dir_all(client_jar.parent().unwrap()).unwrap();
-    std::fs::write(&client_jar, b"patched client jar bytes").unwrap();
+    let client_jar_bytes = b"patched client jar bytes";
+    std::fs::write(&client_jar, client_jar_bytes).unwrap();
+
+    // The receipt checks a processor output against the SHA-1 the profile
+    // publishes for it, so the published digest has to describe these bytes.
+    // (The real 28 MB patched jar cannot be a fixture; what this test is about
+    // is that a matching output is pinned, not the digest itself.) Find the
+    // library by its Maven coordinate: an index would write the digest into
+    // whichever library happened to sit there if the fixture were ever
+    // reordered.
+    let client_library = profile["libraries"]
+        .as_array_mut()
+        .expect("the real Forge profile lists libraries")
+        .iter_mut()
+        .find(|library| library["name"] == "net.minecraftforge:forge:1.21.1-52.1.21:client")
+        .expect("the real Forge profile lists the patched client jar");
+    client_library["downloads"]["artifact"]["sha1"] =
+        serde_json::Value::String(sha1_hex(client_jar_bytes));
+    write_installed_version_json(&minecraft_dir, &profile_id, &profile);
 
     // Produced set, derived exactly like the install path derives it.
     let install_profile: serde_json::Value = serde_json::from_str(INSTALL_PROFILE_JSON)
         .expect("real Forge install_profile.json must parse");
-    let produced = installed_profile::processor_output_coordinates(&install_profile, "client");
+    let produced = installed_profile::processor_output_coordinates(&install_profile, "client")
+        .expect("the real Forge install profile's client outputs resolve");
     assert!(
         produced.contains("net.minecraftforge:forge:1.21.1-52.1.21:client"),
         "the installer parse must recognize the produced client jar, got: {produced:?}"
@@ -2303,7 +2321,10 @@ fn forge_install_receipt_pins_processor_output_with_published_sha1() {
         source_sha256,
         "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-installer.jar",
         0,
-        &produced,
+        &InstallerSideArtifacts {
+            libraries: produced,
+            patched: None,
+        },
     )
     .expect("Forge 1.21.1 receipt creation (incl. adoption proof) must succeed");
 

@@ -361,6 +361,11 @@ fn a_deploy_that_fails_midway_returns_the_error_and_leaves_no_deployment() {
     };
     let object = f.ctx.paths.content_object_path(sha256);
     let saved = std::fs::read(&object).unwrap();
+    // A stored object is protected (a Windows deny ACE includes DELETE), and
+    // production removes it only after unprotecting it. Do the same here:
+    // without it the setup works on volumes that ignore the ACE and fails with
+    // PermissionDenied on ones that honour it.
+    agora_core::content_store::protect::unprotect(&object).unwrap();
     std::fs::remove_file(&object).unwrap();
 
     let err = deploy(&f.ctx, &id, &f.def, DeployMode::Links).unwrap_err();

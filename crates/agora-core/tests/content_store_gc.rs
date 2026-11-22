@@ -11,10 +11,13 @@ use agora_game_api::{
     BaseReference, GameId, InstallId, Layer, LayerId, LayerSource, LayerStack, RelPath,
 };
 use sha2::{Digest, Sha256};
-use tempfile::TempDir;
 
-fn test_ctx() -> (TempDir, Ctx) {
-    let tmp = tempfile::tempdir().unwrap();
+#[allow(dead_code)]
+#[path = "common/data_root.rs"]
+mod data_root;
+use data_root::DataRoot;
+fn test_ctx() -> (DataRoot, Ctx) {
+    let tmp = DataRoot::new();
     let ctx = Ctx::for_testing(tmp.path().to_path_buf());
     (tmp, ctx)
 }

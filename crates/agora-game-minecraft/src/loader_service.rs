@@ -660,7 +660,7 @@ impl LoaderService {
         for (name, artifact) in jars {
             let (bytes, published) = crate::loader_download::download_maven_library(
                 clients,
-                &artifact.url,
+                &artifact,
                 allow_unverified_loader,
             )
             .await?;
@@ -739,7 +739,7 @@ impl LoaderService {
                 });
             }
             normalize_forge_profile(minecraft_root, tuple)?;
-            let produced = installed_profile::processor_outputs_from_installer_jar(data, "client")
+            let artifacts = installed_profile::installer_side_artifacts_from_jar(data, "client")
                 .map_err(|issue| LauncherError::Generic {
                     code: "ERR_PROFILE_CORRUPT".into(),
                     message: issue.reasons.join("; "),
@@ -751,7 +751,7 @@ impl LoaderService {
                 loader_manifests::strip_sha_prefix(&entry.sha256),
                 &entry.source_url,
                 installer_result.exit_code,
-                &produced,
+                &artifacts,
             )
             .map_err(|issue| LauncherError::Generic {
                 code: "ERR_PROFILE_CORRUPT".into(),

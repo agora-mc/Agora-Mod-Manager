@@ -2411,7 +2411,7 @@ ead_latest_crash,
 ead_mod_manifest, enable_mod, search_knowledge_base) per E2 superset.
 - Add the MCP Bearer token (section 10.0 number 2) per user re-decision.
 - Delete the unused crates/agora-core/src/catalog/ trait + ModrinthSource impl (zero callers) -- was speculative design from a prior planning iteration.
-- Delete the unused crates/agora-core/src/ctx.rs Ctx struct + state.rs AppState re-export (zero callers) -- replaced by ad-hoc per-module DB connection patterns; a proper Ctx struct may be reintroduced when finishing the v1 refactor.
+- ~~Delete the unused `ctx.rs` Ctx struct~~ (superseded: `CoreContext`/`Ctx` is now the central context; see 32.9).
 
 ---
 
@@ -4950,12 +4950,31 @@ hosts. Unobfuscated Minecraft releases starting with 26.1 can omit mappings.
 
 Agora checks each library jar against its repository's `.jar.sha512`,
 `.jar.sha256` or `.jar.sha1`, in that order. A missing sidecar permits trying
-the next one. A malformed or mismatched hash stops the install. If all three
-are missing, the player must explicitly allow the download and Agora names
-the jar. The receipt binds the installed profile to the exact library bytes
-for future launches. Agora's direct launcher reuses libraries accepted
-without a sidecar from the installed files. Old profile-byte receipts
-need a loader repair to populate the new receipt.
+the next one. A malformed or mismatched hash stops the install. A profile that
+carries the library's own `sha1`, `sha256` and `sha512` (Fabric publishes all
+three; Quilt's carry none) is checked against every one of them, whether the
+digest sits on the library entry or on its `downloads.artifact`, and a profile
+digest counts as a published hash when no sidecar is served. If nothing is
+published at all, the player must explicitly allow the download and Agora names
+the jar. The receipt binds the installed profile to the exact library bytes for
+future launches. Agora's direct launcher reuses libraries accepted without a
+sidecar from the installed files. Old profile-byte receipts need a loader repair
+to populate the new receipt.
+
+An installer also writes artifacts that no generated profile lists. NeoForge's
+processors declare no `outputs`: they write the side's patched game jar to
+`--output {PATCHED}`, and NeoForge's own launcher finds it by scanning the
+directory named in `-DlibraryDirectory`, so no launch classpath entry ever
+names or checks the file. The receipt pins it (`data.PATCHED[side]`), and
+adoption verifies a pinned artifact the profile does not list — a truncated or
+altered jar is refused there, naming the file and the digest the receipt
+pinned.
+
+The pin is the file as the installer left it, and the installer's own successful
+exit is the only check at that moment: a jar already truncated when the receipt
+is first written becomes the baseline. A receipt written before this pin existed
+carries none, so an existing NeoForge install gains the check at adoption only
+after a reinstall or `agora instance repair-loader` rewrites its receipt.
 
 **Threat model.** Pinning protects users from a file changing *after* Agora pinned
 it, and from tampering between upstream and the user. It cannot judge a
@@ -5507,7 +5526,19 @@ before and after.
 | C2 | Every other instance writer moves onto staged apply; launcher import gets its own protocol (32.4) | after C1 |
 | C3 | Settings cache (32.9) | after A2, parallel |
 | D1 | Typed errors at every branch site; recovery functions move onto the envelope one at a time (32.10, 32.11) | after C2 |
+| D2 | Catalog trust edges: a recovery key introduced, used and revoked in one bundle; no fall back to compiled keys on an unreadable log; the floor after a failed swap; partial-append and read-once tests | parallel, any time |
+| E0 | `ctx.db` as the only way into the local database (32.9) | after D1, before E1 |
 | E1 | Thin adapters: move code out of `main.rs` and `commands.rs` (32.6) | last |
+| F1 | `GameHost` (section 26): the Minecraft package reaches core's shared services through it | after E1 |
+
+**Homes for review follow-ups (2026-11-21), so nothing waits in a backlog:** the "needs a hand"
+ways out for existing states (refused imports, conflict archives, quarantines, a pending import at
+launch) ship in D1 with the journal each belongs to; the desktop-versus-CLI launcher-import race is
+closed by C2's import protocol; a typed "held by someone" versus "could not check" lock answer lands
+with the A2 liveness work; small cleanups and test infrastructure (a plain `cargo test` CI job among
+them) run as one batch in parallel. Deliberately not done: deleting `registry.trust` by hand forgets
+revocations (the user's own override), and retiring a compiled recovery root (none is planned; it
+needs historical-log authentication when one is).
 
 **Database migrations are serial.** Steps that add one (B2, B3, C3) take the next schema number in
 this order, one at a time.

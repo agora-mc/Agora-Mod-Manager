@@ -2455,7 +2455,8 @@ fn print_table(columns: &[&str], rows: &[Vec<String>]) {
 ///  13   registry missing / corrupt / schema
 ///  20   network offline
 ///  21   download / registry download
-///  30   integrity security (hash, untrusted source, zip bomb, override)
+///  30   integrity security (hash, zip bomb, override, Maven descriptor)
+///  31   untrusted source
 ///  34   disk full
 ///  40   authentication
 ///  50   feature disabled
@@ -2463,66 +2464,32 @@ fn print_table(columns: &[&str], rows: &[Vec<String>]) {
 ///  61   version / loader resolution
 ///  62   Java runtime
 ///  70   dependency / placeholder
+///  71   a decision is needed (migration conflict, user decision)
+///  72   migration failed
 ///  80   MCP rate-limit
 ///  81   MCP denied
 ///  82   MCP unauthorized
 ///  90–94  network policy / privacy
 /// 100+  process errors
+///
+/// The exit code follows the error's machine code, not its Rust variant. Code
+/// that adds context to a typed error wraps it in `LauncherError::Generic`
+/// with the same code (`LoaderService`'s reinstall reason does), and a
+/// classified failure must not become an unclassified exit code just because
+/// it was explained. One declaration per code, in `agora_core::error_code`, is
+/// what keeps the two forms from drifting apart.
 fn exit_code_from_launcher_error(err: &agora_core::error::LauncherError) -> i32 {
-    use agora_core::error::LauncherError;
-    match err {
-        LauncherError::NetworkOffline | LauncherError::NetworkUnavailable { .. } => 20,
-        LauncherError::RegistryDownloadFailed => 21,
-        LauncherError::RegistrySignatureInvalid => 13,
-        LauncherError::SchemaTooNew => 13,
-        LauncherError::ZipBomb => 30,
-        LauncherError::OverrideSecurityViolation => 30,
-        LauncherError::HashMismatch => 30,
-        LauncherError::HashConfirmationRequired(_) => 30,
-        LauncherError::UntrustedSource => 31,
-        LauncherError::DiskFull => 34,
-        LauncherError::AuthExpired => 40,
-        LauncherError::AuthRequired | LauncherError::MsaAuthRequired => 40,
-        LauncherError::ModrinthDisabled => 50,
-        LauncherError::InstanceLocked => 11,
-        LauncherError::SandboxUnavailable => 50,
-        LauncherError::MojangNotFound => 60,
-        LauncherError::LaunchFailed => 61,
-        LauncherError::GameCrash => 7,
-        LauncherError::LocalStateFailed => 10,
-        LauncherError::InstanceCreateFailed => 12,
-        LauncherError::ProfileWriteFailed => 60,
-        LauncherError::RegistryMissing => 13,
-        LauncherError::UnsupportedLoader => 61,
-        LauncherError::VersionNotFound => 61,
-        LauncherError::GameVersionNotFound => 61,
-        LauncherError::LoaderProfileNotFound => 61,
-        LauncherError::ProfileMissing(..) => 11,
-        LauncherError::ProfileUnsupportedMetadata(..) => 11,
-        LauncherError::ProfileCorrupt(..) => 11,
-        LauncherError::JavaIncompatible => 62,
-        LauncherError::JavaRuntimeMissing { .. } => 62,
-        LauncherError::JavaRuntimeCatalogMissing { .. } => 62,
-        LauncherError::UnresolvedPlaceholder => 70,
-        LauncherError::DependencyMissing => 70,
-        LauncherError::McpTooManyRequests => 80,
-        LauncherError::McpDenied => 81,
-        LauncherError::McpUnauthorized => 82,
-        LauncherError::NetworkMojangMetadataDisabled => 90,
-        LauncherError::NetworkMojangContentDisabled => 91,
-        LauncherError::NetworkLoaderDisabled => 92,
-        LauncherError::NetworkMsaDisabled => 93,
-        LauncherError::NetworkJavaDisabled => 94,
-        LauncherError::JavaRuntimeCancelled { .. } => 62,
-        LauncherError::JavaRuntimeDownloadDisabled { .. } => 94,
-        LauncherError::MavenDescriptor => 30,
-        LauncherError::MigrationConflict { .. } => 71,
-        LauncherError::MigrationFailed { .. } => 72,
-        LauncherError::ProcessCaptureFailed { .. } => 100,
-        LauncherError::ProcessStale { .. } => 101,
-        LauncherError::UserDecisionRequired => 71,
-        LauncherError::Generic { .. } => 1,
-    }
+    exit_code_for_code(&err.code())
+}
+
+/// The exit code that belongs to a machine-readable error code, or 1 for a
+/// code the registry does not declare.
+///
+/// The number lives beside the code in `agora_core::error_code`, which is also
+/// what [`agora_core::error::LauncherError::code`] reports: one declaration, so
+/// a code cannot be classified in one place and unclassified in another.
+fn exit_code_for_code(code: &str) -> i32 {
+    agora_core::error_code::ErrorCode::from_code(code).map_or(1, |code| code.exit_code())
 }
 
 /// Map any error to a stable exit code.  If the error wraps a `LauncherError`
@@ -15873,6 +15840,7 @@ fn run_content_share(
 #[cfg(test)]
 mod tests {
     use super::describe_loadout_change;
+    use super::exit_code_for_code;
     use super::exit_code_from_error;
     use super::exit_code_from_launcher_error;
     use super::launch_refusal_hint;
@@ -16272,6 +16240,325 @@ mod tests {
         }
         .into();
         assert_eq!(exit_code_from_error(&err), 1);
+    }
+
+    /// Every typed variant, the exit code it belongs to, and the `Generic` a
+    /// caller builds by wrapping it with extra context. A wrapped error must
+    /// keep the exit code of the error it wrapped: the reinstall reason
+    /// `LoaderService` prepends used to turn exit 92 (loader downloads
+    /// disabled) into 1.
+    #[test]
+    fn every_error_code_maps_to_the_same_exit_code_wrapped_or_not() {
+        fn issue() -> agora_core::error::ProfileIssue {
+            agora_core::error::ProfileIssue::corrupt(None, "test profile issue")
+        }
+        fn confirmation() -> Box<agora_core::error::HashConfirmation> {
+            Box::new(agora_core::error::HashConfirmation {
+                file: "sodium.jar".into(),
+                release: None,
+                expected: "0".repeat(64),
+                actual: "1".repeat(64),
+                expected_from: agora_core::artifact_hash::HashOrigin::CuratorPin,
+                also_unmet: Box::new([]),
+            })
+        }
+
+        let typed: Vec<(&str, LauncherError, i32)> = vec![
+            ("NetworkOffline", LauncherError::NetworkOffline, 20),
+            (
+                "NetworkUnavailable",
+                LauncherError::NetworkUnavailable {
+                    action: "download the catalog".into(),
+                },
+                20,
+            ),
+            (
+                "RegistryDownloadFailed",
+                LauncherError::RegistryDownloadFailed,
+                21,
+            ),
+            (
+                "RegistrySignatureInvalid",
+                LauncherError::RegistrySignatureInvalid,
+                13,
+            ),
+            ("SchemaTooNew", LauncherError::SchemaTooNew, 13),
+            ("ZipBomb", LauncherError::ZipBomb, 30),
+            (
+                "OverrideSecurityViolation",
+                LauncherError::OverrideSecurityViolation,
+                30,
+            ),
+            ("HashMismatch", LauncherError::HashMismatch, 30),
+            (
+                "HashConfirmationRequired",
+                LauncherError::HashConfirmationRequired(confirmation()),
+                30,
+            ),
+            ("UntrustedSource", LauncherError::UntrustedSource, 31),
+            ("DiskFull", LauncherError::DiskFull, 34),
+            ("AuthExpired", LauncherError::AuthExpired, 40),
+            ("AuthRequired", LauncherError::AuthRequired, 40),
+            ("MsaAuthRequired", LauncherError::MsaAuthRequired, 40),
+            ("ModrinthDisabled", LauncherError::ModrinthDisabled, 50),
+            ("InstanceLocked", LauncherError::InstanceLocked, 11),
+            ("SandboxUnavailable", LauncherError::SandboxUnavailable, 50),
+            ("MojangNotFound", LauncherError::MojangNotFound, 60),
+            ("LaunchFailed", LauncherError::LaunchFailed, 61),
+            ("GameCrash", LauncherError::GameCrash, 7),
+            ("LocalStateFailed", LauncherError::LocalStateFailed, 10),
+            (
+                "InstanceCreateFailed",
+                LauncherError::InstanceCreateFailed,
+                12,
+            ),
+            ("ProfileWriteFailed", LauncherError::ProfileWriteFailed, 60),
+            ("RegistryMissing", LauncherError::RegistryMissing, 13),
+            ("UnsupportedLoader", LauncherError::UnsupportedLoader, 61),
+            ("VersionNotFound", LauncherError::VersionNotFound, 61),
+            (
+                "GameVersionNotFound",
+                LauncherError::GameVersionNotFound,
+                61,
+            ),
+            (
+                "LoaderProfileNotFound",
+                LauncherError::LoaderProfileNotFound,
+                61,
+            ),
+            ("ProfileMissing", LauncherError::ProfileMissing(issue()), 11),
+            (
+                "ProfileUnsupportedMetadata",
+                LauncherError::ProfileUnsupportedMetadata(issue()),
+                11,
+            ),
+            ("ProfileCorrupt", LauncherError::ProfileCorrupt(issue()), 11),
+            ("JavaIncompatible", LauncherError::JavaIncompatible, 62),
+            (
+                "JavaRuntimeMissing",
+                LauncherError::JavaRuntimeMissing {
+                    major: 21,
+                    component: "java-runtime-delta".into(),
+                },
+                62,
+            ),
+            (
+                "JavaRuntimeCatalogMissing",
+                LauncherError::JavaRuntimeCatalogMissing {
+                    major: 21,
+                    os: "windows".into(),
+                    arch: "x64".into(),
+                },
+                62,
+            ),
+            (
+                "UnresolvedPlaceholder",
+                LauncherError::UnresolvedPlaceholder,
+                70,
+            ),
+            ("DependencyMissing", LauncherError::DependencyMissing, 70),
+            ("McpTooManyRequests", LauncherError::McpTooManyRequests, 80),
+            ("McpDenied", LauncherError::McpDenied, 81),
+            ("McpUnauthorized", LauncherError::McpUnauthorized, 82),
+            (
+                "NetworkMojangMetadataDisabled",
+                LauncherError::NetworkMojangMetadataDisabled,
+                90,
+            ),
+            (
+                "NetworkMojangContentDisabled",
+                LauncherError::NetworkMojangContentDisabled,
+                91,
+            ),
+            (
+                "NetworkLoaderDisabled",
+                LauncherError::NetworkLoaderDisabled,
+                92,
+            ),
+            ("NetworkMsaDisabled", LauncherError::NetworkMsaDisabled, 93),
+            (
+                "NetworkJavaDisabled",
+                LauncherError::NetworkJavaDisabled,
+                94,
+            ),
+            (
+                "JavaRuntimeCancelled",
+                LauncherError::JavaRuntimeCancelled {
+                    major: 21,
+                    component: "java-runtime-delta".into(),
+                },
+                62,
+            ),
+            (
+                "JavaRuntimeDownloadDisabled",
+                LauncherError::JavaRuntimeDownloadDisabled {
+                    major: 21,
+                    component: "java-runtime-delta".into(),
+                },
+                94,
+            ),
+            ("MavenDescriptor", LauncherError::MavenDescriptor, 30),
+            (
+                "MigrationConflict",
+                LauncherError::MigrationConflict {
+                    message: "conflict".into(),
+                },
+                71,
+            ),
+            (
+                "MigrationFailed",
+                LauncherError::MigrationFailed {
+                    message: "failed".into(),
+                },
+                72,
+            ),
+            (
+                "ProcessCaptureFailed",
+                LauncherError::ProcessCaptureFailed {
+                    pid: 42,
+                    detail: "detail".into(),
+                },
+                100,
+            ),
+            (
+                "ProcessStale",
+                LauncherError::ProcessStale {
+                    pid: 42,
+                    detail: "detail".into(),
+                },
+                101,
+            ),
+            (
+                "UserDecisionRequired",
+                LauncherError::UserDecisionRequired,
+                71,
+            ),
+        ];
+
+        for (name, error, expected) in typed {
+            let code = error.code();
+            assert_eq!(
+                exit_code_from_launcher_error(&error),
+                expected,
+                "{name} ({code}) must exit {expected}"
+            );
+            assert_eq!(
+                exit_code_for_code(&code),
+                expected,
+                "{code} must be in the exit-code table as {expected}"
+            );
+            let wrapped = LauncherError::Generic {
+                code: code.clone(),
+                message: format!(
+                    "existing install could not be verified; reinstall failed: {error}"
+                ),
+            };
+            assert_eq!(
+                exit_code_from_launcher_error(&wrapped),
+                expected,
+                "a Generic carrying {code} must exit like {name}"
+            );
+        }
+
+        // A code the table does not classify is still unclassified.
+        assert_eq!(
+            exit_code_from_launcher_error(&LauncherError::Generic {
+                code: "ERR_NOT_A_CODE".into(),
+                message: "x".into(),
+            }),
+            1
+        );
+    }
+
+    /// The exit-code table as it stood before `agora_core::error_code` held it,
+    /// kept as the reference the registry must keep matching: every code the
+    /// CLI classified, and 1 for everything else.
+    fn pre_registry_exit_table(code: &str) -> i32 {
+        match code {
+            "ERR_NETWORK_OFFLINE" => 20,
+            "ERR_REGISTRY_DOWNLOAD_FAILED" => 21,
+            "ERR_REGISTRY_SIGNATURE_INVALID" => 13,
+            "ERR_SCHEMA_TOO_NEW" => 13,
+            "ERR_ZIP_BOMB" => 30,
+            "ERR_OVERRIDE_SECURITY_VIOLATION" => 30,
+            "ERR_HASH_MISMATCH" => 30,
+            "ERR_HASH_CONFIRMATION_REQUIRED" => 30,
+            "ERR_UNTRUSTED_SOURCE" => 31,
+            "ERR_DISKFULL" => 34,
+            "ERR_AUTH_EXPIRED" => 40,
+            "ERR_AUTH_REQUIRED" => 40,
+            "ERR_MSA_AUTH_REQUIRED" => 40,
+            "ERR_MODRINTH_DISABLED" => 50,
+            "ERR_INSTANCE_LOCKED" => 11,
+            "ERR_SANDBOX_UNAVAILABLE" => 50,
+            "ERR_MOJANG_NOT_FOUND" => 60,
+            "ERR_LAUNCH_FAILED" => 61,
+            "ERR_GAME_CRASH" => 7,
+            "ERR_LOCAL_STATE_FAILED" => 10,
+            "ERR_INSTANCE_CREATE_FAILED" => 12,
+            "ERR_PROFILE_WRITE_FAILED" => 60,
+            "ERR_REGISTRY_MISSING" => 13,
+            "ERR_UNSUPPORTED_LOADER" => 61,
+            "ERR_VERSION_NOT_FOUND" => 61,
+            "ERR_GAME_VERSION_NOT_FOUND" => 61,
+            "ERR_LOADER_PROFILE_NOT_FOUND" => 61,
+            "ERR_PROFILE_MISSING" => 11,
+            "ERR_PROFILE_UNSUPPORTED_METADATA" => 11,
+            "ERR_PROFILE_CORRUPT" => 11,
+            "ERR_JAVA_INCOMPATIBLE" => 62,
+            "ERR_JAVA_RUNTIME_MISSING" => 62,
+            "ERR_JAVA_RUNTIME_CATALOG_MISSING" => 62,
+            "ERR_UNRESOLVED_PLACEHOLDER" => 70,
+            "ERR_DEPENDENCY_MISSING" => 70,
+            "ERR_MCP_TOO_MANY_REQUESTS" => 80,
+            "ERR_MCP_DENIED" => 81,
+            "ERR_MCP_UNAUTHORIZED" => 82,
+            "ERR_NETWORK_MOJANG_METADATA_DISABLED" => 90,
+            "ERR_NETWORK_MOJANG_CONTENT_DISABLED" => 91,
+            "ERR_NETWORK_LOADER_DISABLED" => 92,
+            "ERR_NETWORK_MSA_DISABLED" => 93,
+            "ERR_NETWORK_JAVA_DISABLED" => 94,
+            "ERR_JAVA_RUNTIME_CANCELLED" => 62,
+            "ERR_JAVA_RUNTIME_DOWNLOAD_DISABLED" => 94,
+            "ERR_MAVEN_DESCRIPTOR" => 30,
+            "ERR_MIGRATION_CONFLICT" => 71,
+            "ERR_MIGRATION_FAILED" => 72,
+            "ERR_PROCESS_CAPTURE_FAILED" => 100,
+            "ERR_PROCESS_STALE" => 101,
+            "ERR_USER_DECISION_REQUIRED" => 71,
+            _ => 1,
+        }
+    }
+
+    /// No code may change exit code by moving into the registry: every declared
+    /// code answers exactly what the table answered before, and a code the
+    /// table classified is still classified (and vice versa).
+    #[test]
+    fn every_declared_code_keeps_its_pre_registry_exit_code() {
+        for code in agora_core::error_code::ALL {
+            assert_eq!(
+                exit_code_for_code(code.as_str()),
+                pre_registry_exit_table(code.as_str()),
+                "{} ({:?}) exits differently than before the registry",
+                code.as_str(),
+                code.area(),
+            );
+        }
+
+        // The old table classified 51 codes. If the registry stops declaring one
+        // of them the loop above cannot notice, so the count is pinned too.
+        let classified = agora_core::error_code::ALL
+            .iter()
+            .filter(|code| pre_registry_exit_table(code.as_str()) != 1)
+            .count();
+        assert_eq!(
+            classified, 51,
+            "the old table classified 51 codes; the registry declares {classified} of them"
+        );
+
+        // A string no declaration holds is still unclassified, not a new code.
+        assert_eq!(exit_code_for_code("ERR_NOT_A_CODE"), 1);
+        assert!(agora_core::error_code::ErrorCode::from_code("ERR_NOT_A_CODE").is_none());
     }
 
     #[test]

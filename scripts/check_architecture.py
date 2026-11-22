@@ -18,6 +18,9 @@ Checks:
 10. Live instance reads use the canonical manifest loader
 11. Game API depends only on serde, serde_json, semver, thiserror and regex (all dependency sections)
 12. Core must not reference the future Minecraft package's modules or crate
+13. Game packages' remaining agora-core references stay within a budget that only shrinks
+14. Fail-closed reads (error-read-as-absent sites) in recovery, trust, lease, GC and staging
+    code stay within a budget that only shrinks (MASTER_SPEC §32.13)
 """
 
 import json
@@ -665,10 +668,311 @@ def check_game_package_core_budget() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 14. Fail-closed reads: error-read-as-absent sites may only go down
+# ---------------------------------------------------------------------------
+# MASTER_SPEC §32.13. Most late review findings were one class of bug: an error
+# read as "nothing there" (`.exists()`, `.ok()`, `unwrap_or_default()` on a
+# read). In recovery, trust, lease, garbage-collection and staging code those
+# patterns decide whether user data may be deleted or overwritten, so they are
+# counted per file and may only fall: a lower count must be written back, the
+# same rule as the game-package budget above.
+#
+# What the count is, exactly: the three patterns, matched textually in the
+# file's production code.
+#
+# - Comments and the insides of string and char literals are blanked before
+#   counting, so `// p.exists()` and a `".ok()"` message string count nothing.
+# - Only the item a `#[cfg(test)]` attribute applies to is blanked: an inline
+#   `mod tests { ... }` with its braces, a `#[cfg(test)] mod helper;`
+#   declaration line, or a `#[cfg(test)] fn ...` test-only helper. Everything
+#   after it is still counted — a test-module declaration early in a file must
+#   not hide the production code below it. An attribute inside a parameter list
+#   (`fn present(#[cfg(test)] _c: usize, p: &Path)`) applies to that parameter
+#   alone, so only the attribute is blanked.
+# - Whitespace inside a call is allowed (`p.exists ()`, `.ok ( )`).
+#
+# The count is deliberately textual: telling a filesystem result from a parse
+# result needs types, and a count that needs a compiler is not a count any
+# contributor can run. It may therefore count a harmless site, which a slice can
+# remove or leave, but it does not miss one.
+#
+# The list is the modules the spec names: recovery (`startup_recovery`, the
+# journals and their passes, `backup`), trust (the signed registry and plugin
+# signatures), leases and locks (the runtime lease, the recorded process, the OS
+# lock, the session ledger), garbage collection (`snapshot`, `game_base`,
+# Recently deleted) and staging (`game_user_files`, `game_tool_swap`, plugin
+# installs, `content_store`). The authority for the list is MASTER_SPEC §32.13;
+# a slice that converts a whole module adds it here, and one that splits a file
+# moves its entry.
+FAIL_CLOSED_READ_BUDGET = REPO_ROOT / "scripts" / "fail_closed_read_budget.json"
+FAIL_CLOSED_READ_PATTERNS = (
+    re.compile(r"\.exists\s*\(\s*\)"),
+    re.compile(r"\.ok\s*\(\s*\)"),
+    re.compile(r"\.unwrap_or_default\s*\(\s*\)"),
+)
+# A `#[cfg(test)]` attribute, with any spacing.
+CFG_TEST_ATTRIBUTE = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+# An attribute group, e.g. `#[allow(clippy::too_many_lines)]` on the same item.
+ATTRIBUTE = re.compile(r"#\s*!?\s*\[[^\]]*\]")
+
+
+def blank_rust_noise(source: str) -> str:
+    """Comments and the insides of string/char literals replaced by spaces.
+
+    Line structure is kept, so the result lines up with the input. What is left
+    cannot contain a pattern that only appears in a comment or a message string.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(source):
+        pair = source[index : index + 2]
+        if pair == "//":
+            end = source.find("\n", index)
+            end = len(source) if end == -1 else end
+            out.append(" " * (end - index))
+            index = end
+        elif pair == "/*":
+            # Rust block comments nest.
+            depth = 0
+            end = index
+            while end < len(source):
+                if source[end : end + 2] == "/*":
+                    depth += 1
+                    end += 2
+                elif source[end : end + 2] == "*/":
+                    depth -= 1
+                    end += 2
+                    if depth == 0:
+                        break
+                else:
+                    end += 1
+            out.append("".join("\n" if c == "\n" else " " for c in source[index:end]))
+            index = end
+        elif source[index] == "r" and re.match(r'r#*"', source[index:]):
+            # A raw string: r"..." or r#"..."#, closed by a quote and its hashes.
+            hashes = re.match(r'r(#*)"', source[index:]).group(1)
+            close = '"' + hashes
+            end = source.find(close, index + len(hashes) + 2)
+            end = len(source) if end == -1 else end + len(close)
+            out.append("".join("\n" if c == "\n" else " " for c in source[index:end]))
+            index = end
+        elif source[index] == '"':
+            end = index + 1
+            while end < len(source):
+                if source[end] == "\\":
+                    end += 2
+                elif source[end] == '"':
+                    end += 1
+                    break
+                else:
+                    end += 1
+            out.append("".join("\n" if c == "\n" else " " for c in source[index:end]))
+            index = end
+        elif source[index] == "'" and source[index + 1 : index + 2] != "":
+            # A char literal ('x', '\n', '\\', '\u{..}') or a lifetime ('a). Only a
+            # literal closes on its own quote, so a lifetime is left alone.
+            if source[index + 1] == "\\":
+                close = source.find("'", index + 2)
+            else:
+                close = index + 2 if source[index + 2 : index + 3] == "'" else -1
+            if close == -1:
+                out.append(source[index])
+                index += 1
+            else:
+                out.append(" " * (close + 1 - index))
+                index = close + 1
+        else:
+            out.append(source[index])
+            index += 1
+    return "".join(out)
+
+
+def item_end(source: str, start: int) -> int | None:
+    """One past the end of the item starting at `start`: its `;` or its brace block."""
+    brace = source.find("{", start)
+    semicolon = source.find(";", start)
+    if semicolon != -1 and (brace == -1 or semicolon < brace):
+        return semicolon + 1
+    if brace == -1:
+        return None
+    depth = 0
+    for index in range(brace, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return None
+
+
+def inside_parentheses(source: str, position: int) -> bool:
+    """Whether `position` sits inside a `(` that is still open — a parameter list.
+
+    An attribute there applies to the parameter it precedes, not to the item after the list.
+    """
+    stack: list[str] = []
+    for char in source[:position]:
+        if char in "([{":
+            stack.append(char)
+        elif char in ")]}" and stack:
+            stack.pop()
+    return stack[-1:] == ["("]
+
+
+def blank_test_items(source: str) -> str:
+    """Blank what a `#[cfg(test)]` attribute applies to, and only that.
+
+    A test module sits in the middle of some files (`content_store/mod.rs` declares one before its
+    production code), so dropping everything from the first test attribute to the end of the file
+    would hide real sites. Each attribute is followed to its own item instead.
+    """
+    while True:
+        match = CFG_TEST_ATTRIBUTE.search(source)
+        if not match:
+            return source
+        if inside_parentheses(source, match.start()):
+            # `fn present(#[cfg(test)] _c: usize, p: &Path) -> bool { p.exists() }`: the attribute
+            # applies to the parameter only, so blank it alone and keep counting the body.
+            source = (
+                source[: match.start()]
+                + " " * (match.end() - match.start())
+                + source[match.end() :]
+            )
+            continue
+        cursor = match.end()
+        while True:
+            whitespace = len(source[cursor:]) - len(source[cursor:].lstrip())
+            cursor += whitespace
+            further = ATTRIBUTE.match(source, cursor)
+            if not further:
+                break
+            cursor = further.end()
+        end = item_end(source, cursor)
+        if end is None:
+            # Nothing that looks like an item follows: blank the attribute only, so the count
+            # still sees whatever comes next.
+            end = match.end()
+        source = (
+            source[: match.start()]
+            + "".join("\n" if c == "\n" else " " for c in source[match.start() : end])
+            + source[end:]
+        )
+
+
+def count_fail_closed_reads(source: str) -> int:
+    """Error-read-as-absent sites in one Rust file, comments and test items excluded."""
+    cleaned = blank_test_items(blank_rust_noise(source))
+    return sum(len(pattern.findall(cleaned)) for pattern in FAIL_CLOSED_READ_PATTERNS)
+
+
+def count_fail_closed_reads_in(path: Path) -> int:
+    return count_fail_closed_reads(path.read_text(encoding="utf-8", errors="replace"))
+
+
+def is_test_only_module_file(path: Path) -> bool:
+    """True when the module that declares `path` declares it `#[cfg(test)] mod name;`.
+
+    Such a file is test code in full (a benchmark or fixture module), so the
+    production count skips it. The declaring module is the sibling `mod.rs`,
+    `lib.rs` or `main.rs`, or the parent directory's `<dir>.rs`.
+    """
+    stem = path.stem
+    if stem in ("mod", "lib", "main"):
+        return False
+    candidates = [path.parent / name for name in ("mod.rs", "lib.rs", "main.rs")]
+    candidates.append(path.parent.parent / f"{path.parent.name}.rs")
+    declaration = re.compile(
+        r"#\[cfg\(test\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+" + re.escape(stem) + r"\s*;"
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            text = blank_rust_noise(candidate.read_text(encoding="utf-8", errors="replace"))
+            if declaration.search(text):
+                return True
+    return False
+
+
+def check_fail_closed_reads() -> None:
+    try:
+        budget = json.loads(FAIL_CLOSED_READ_BUDGET.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        err(f"{FAIL_CLOSED_READ_BUDGET.name} is missing: the fail-closed read budget is checked in")
+        return
+    except (OSError, ValueError) as exc:
+        err(f"Cannot read {FAIL_CLOSED_READ_BUDGET.name}: {exc}")
+        return
+    files = budget.get("files", {})
+    directories = budget.get("directories", {})
+    problems: list[str] = []
+    report: list[str] = []
+
+    def compare(relative: str, count: int, allowed: int) -> None:
+        if count > allowed:
+            problems.append(
+                f"  {relative}: {count} error-read-as-absent sites, budget {allowed}; "
+                "this budget only shrinks. Use probe() or match the error instead"
+            )
+        elif count < allowed:
+            problems.append(
+                f"  {relative}: {count} error-read-as-absent sites, below the budget of "
+                f"{allowed}; lower it to {count} in {FAIL_CLOSED_READ_BUDGET.name}"
+            )
+        else:
+            report.append(f"{relative} {count}")
+
+    for relative, allowed in sorted(files.items()):
+        path = REPO_ROOT / relative
+        if not path.is_file():
+            problems.append(f"  {relative}: budgeted but not found; correct or remove the entry")
+            continue
+        if not isinstance(allowed, int):
+            problems.append(f"  {relative}: budget must be a whole number, not {allowed!r}")
+            continue
+        compare(relative, count_fail_closed_reads_in(path), allowed)
+    for relative, expected in sorted(directories.items()):
+        root = REPO_ROOT / relative
+        if not root.is_dir():
+            problems.append(f"  {relative}/: budgeted directory not found")
+            continue
+        if not isinstance(expected, dict):
+            problems.append(f"  {relative}/: budget must map each file to its count")
+            continue
+        # Every Rust file below the directory, not just the ones beside it: a
+        # recovery module that grows a subdirectory must be counted, not skipped.
+        present = {
+            path.relative_to(root).as_posix(): path
+            for path in sorted(root.rglob("*.rs"))
+            if not is_test_only_module_file(path)
+        }
+        for name in sorted(set(present) - set(expected)):
+            problems.append(
+                f"  {relative}/{name}: not in the budget "
+                f"({count_fail_closed_reads_in(present[name])} sites); add its count to "
+                f"{FAIL_CLOSED_READ_BUDGET.name}"
+            )
+        for name, allowed in sorted(expected.items()):
+            if name not in present:
+                problems.append(f"  {relative}/{name}: budgeted but not found")
+            elif not isinstance(allowed, int):
+                problems.append(f"  {relative}/{name}: budget must be a whole number")
+            else:
+                compare(f"{relative}/{name}", count_fail_closed_reads_in(present[name]), allowed)
+
+    if problems:
+        err("Fail-closed reads in recovery, trust, lease, GC and staging code (MASTER_SPEC §32.13)")
+        for problem in problems:
+            print(problem, file=sys.stderr)
+    elif report:
+        print(f"OK: fail-closed reads within budget in {len(report)} files")
+    else:
+        print("OK: no fail-closed read budget to check")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> int:
-    print("=== Architecture Boundary Checks ===\n")
 
     print("--- 1. Raw reqwest::Client in desktop ---")
     check_reqwest_desktop()
@@ -719,6 +1023,10 @@ def main() -> int:
 
     print("\n--- 13. Game packages' agora-core budget ---")
     check_game_package_core_budget()
+    print()
+
+    print("--- 14. Fail-closed reads in recovery, trust, lease, GC and staging code ---")
+    check_fail_closed_reads()
     print()
 
     if EXIT_CODE == 0:

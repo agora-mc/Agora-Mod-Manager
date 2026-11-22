@@ -447,7 +447,7 @@ agora instance wrapper <INSTANCE_ID> "mangohud --dlsym"
 
 `instance create` can set Java up front: `--jvm-memory-mb <MB>` gives the heap a fixed size and makes the memory choice manual, `--jvm-gc` picks `auto` (the default), `low_latency`, `high_efficiency` or `manual`, `--jvm-custom-args "<ARGS>"` adds raw JVM flags, and `--jvm-always-pre-touch true|false` switches heap pre-touching. `--template <TEMPLATE_ID>` starts the instance from a saved template's files and JVM settings (see [Templates](#templates)).
 
-Fabric and Quilt instance creation checks the generated client profile and verifies every library against its Maven repository's strongest published checksum. Run `agora instance repair-loader <ID>` to update an older installation that still has a profile-byte receipt. Both commands accept `--allow-unverified-loader` when a repository publishes no checksum for a library. Agora names each such file on stderr. A mismatch or invalid profile stops the operation.
+Fabric and Quilt instance creation checks the generated client profile and verifies every library against its Maven repository's strongest published checksum. Run `agora instance repair-loader <ID>` to update an older installation that still has a profile-byte receipt. Both commands accept `--allow-unverified-loader` when a repository publishes no checksum for a library. Agora names each such file on stderr. A mismatch or invalid profile stops the operation. Forge and NeoForge installs also pin the jars their installers write — Forge's patched client jar, and NeoForge's, which its profile never lists — and a launch checks them against the receipt, refusing a truncated or altered file by name. That pin is the file as the installer left it, so a jar already truncated when the receipt is written becomes the baseline, and an existing install gains the check only after a reinstall or `agora instance repair-loader` rewrites its receipt.
 
 Clone flags can omit saves (`--no-saves`), mods (`--no-mods`), resource packs (`--no-resource-packs`), shader packs (`--no-shader-packs`), screenshots (`--no-screenshots`), configuration (`--no-config`), `servers.dat` (`--no-servers`), or options (`--no-options`). `--hard-links` and `--sym-links` change filesystem behavior and should be used only when the destination and source relationship is understood.
 
@@ -1116,6 +1116,10 @@ The CLI maps many core failures to stable semantic ranges.
 | `100+` | Process identity or process-state failure |
 
 Scripts should still inspect structured error output because several distinct errors share a range.
+
+The exit code follows the error's machine-readable code, not the shape it is carried in. An error that is wrapped to add context keeps the exit code of the code it carries: `agora loader install` for a profile whose adoption failed and whose heal is refused by the loader-download setting still exits `92` (the reinstall reason is in the message), rather than falling back to `1`. A code the table does not classify is `1`.
+
+Every machine code, its exit code and its area are declared once, in `agora-core`'s `error_code` module; this page and the CLI read that declaration rather than keeping a table of their own.
 
 `agora doctor` prints its whole report (human or `--json`) and exits `0` when the local database is healthy or not created yet. It exits `10` when it finds damage, a store it cannot read, a database written by a newer Agora, or a saved account list that needs `agora auth repair`. The JSON report always includes `problems: true` or `false`, so a script can read the reason without parsing the message.
 

@@ -192,3 +192,177 @@ class GamePackageCoreBudgetTests(unittest.TestCase):
     def test_entry_for_a_missing_package_fails(self):
         self.write(1, budget={"agora-game-test": 1, "agora-game-gone": 5})
         self.assertEqual(self.check(), 1)
+
+
+class TestOnlyModuleFileTests(unittest.TestCase):
+    """A file its parent declares `#[cfg(test)] mod name;` is test code in full."""
+
+    def test_a_test_only_module_file_is_recognised_and_a_production_one_is_not(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "store"
+            root.mkdir()
+            (root / "mod.rs").write_text(
+                "#[cfg(test)]\nmod bench;\npub mod place;\n// #[cfg(test)] mod place;\n",
+                encoding="utf-8",
+            )
+            (root / "bench.rs").write_text('fn f() { std::env::var("X").ok(); }\n', encoding="utf-8")
+            (root / "place.rs").write_text("fn g() {}\n", encoding="utf-8")
+            self.assertTrue(architecture.is_test_only_module_file(root / "bench.rs"))
+            # A commented-out declaration does not make a production module test-only.
+            self.assertFalse(architecture.is_test_only_module_file(root / "place.rs"))
+            self.assertFalse(architecture.is_test_only_module_file(root / "mod.rs"))
+
+
+class FailClosedReadBudgetTests(unittest.TestCase):
+    """MASTER_SPEC §32.13: error-read-as-absent sites are counted and may only go down."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        (self.root / "crates/agora-core/src").mkdir(parents=True)
+        self.budget = self.root / "scripts" / "fail_closed_read_budget.json"
+        self.budget.parent.mkdir()
+        for name, value in {
+            "REPO_ROOT": self.root,
+            "FAIL_CLOSED_READ_BUDGET": self.budget,
+            "EXIT_CODE": 0,
+        }.items():
+            patcher = patch.object(architecture, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def write(self, relative: str, source: str) -> Path:
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+        return path
+
+    def budget_of(self, files=None, directories=None) -> None:
+        self.budget.write_text(
+            json.dumps({"files": files or {}, "directories": directories or {}}),
+            encoding="utf-8",
+        )
+
+    def check(self) -> int:
+        architecture.EXIT_CODE = 0
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            architecture.check_fail_closed_reads()
+        return architecture.EXIT_CODE
+
+    def test_comments_and_test_modules_do_not_count(self):
+        source = (
+            "fn a(p: &Path) -> bool { p.exists() }\n"
+            "// p.exists() in a line comment does not count\n"
+            "/* nor do these: p.exists() .ok() */\n"
+            "fn b(text: &str) -> u32 { text.parse().ok().unwrap_or_default() }\n"
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    fn t(p: &Path) { assert!(p.exists()); }\n"
+            "}\n"
+        )
+        self.assertEqual(architecture.count_fail_closed_reads(source), 3)
+
+    def test_a_test_module_declaration_does_not_hide_the_code_after_it(self):
+        # content_store/mod.rs declares `#[cfg(test)] mod import_bench;` early, then keeps going.
+        source = (
+            "mod convert;\n"
+            "#[cfg(test)]\n"
+            "mod import_bench;\n"
+            "pub fn place(p: &Path) -> bool { p.exists() }\n"
+        )
+        self.assertEqual(architecture.count_fail_closed_reads(source), 1)
+
+    def test_string_literals_do_not_count(self):
+        source = (
+            'fn a() -> &\'static str { "p.exists() and text.parse().ok()" }\n'
+            'const B: &str = r#"a raw string mentioning .exists() and .unwrap_or_default()"#;\n'
+            "fn b() -> char { '(' }\n"
+        )
+        self.assertEqual(architecture.count_fail_closed_reads(source), 0)
+
+    def test_an_inline_test_module_is_skipped_but_the_code_after_it_is_not(self):
+        source = (
+            "fn a(p: &Path) -> bool { p.exists() }\n"
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    fn t(p: &Path) { assert!(p.exists()); let _ = \"}\".parse::<u8>().ok(); }\n"
+            "}\n"
+            "fn b(p: &Path) -> bool { p.exists() }\n"
+        )
+        self.assertEqual(architecture.count_fail_closed_reads(source), 2)
+
+    def test_a_test_only_helper_function_is_skipped(self):
+        source = (
+            "#[cfg(test)]\n"
+            "fn helper(p: &Path) -> bool { p.exists() }\n"
+            "fn production(p: &Path) -> bool { p.exists() }\n"
+        )
+        self.assertEqual(architecture.count_fail_closed_reads(source), 1)
+
+    def test_an_attribute_on_a_parameter_does_not_hide_the_function_body(self):
+        # The attribute applies to `_c` alone; the body is production code and still counted.
+        source = "fn present(#[cfg(test)] _c: usize, p: &Path) -> bool { p.exists() }\n"
+        self.assertEqual(architecture.count_fail_closed_reads(source), 1)
+
+    def test_whitespace_inside_the_call_is_counted(self):
+        source = "fn a(p: &Path) -> bool { p.exists () } fn b(t: &str) { t.parse::<u8>().ok ( ) ; }\n"
+        self.assertEqual(architecture.count_fail_closed_reads(source), 2)
+
+    def test_a_nested_file_in_a_counted_directory_needs_its_own_number(self):
+        self.write("crates/agora-core/src/content_store/mod.rs", "fn a() {}\n")
+        self.write(
+            "crates/agora-core/src/content_store/recovery/inner.rs",
+            "fn a(p: &Path) -> bool { p.exists() }\n",
+        )
+        self.budget_of(
+            directories={"crates/agora-core/src/content_store": {"mod.rs": 0}}
+        )
+        self.assertEqual(self.check(), 1)
+        self.budget_of(
+            directories={
+                "crates/agora-core/src/content_store": {
+                    "mod.rs": 0,
+                    "recovery/inner.rs": 1,
+                }
+            }
+        )
+        self.assertEqual(self.check(), 0)
+
+    def test_at_budget_passes(self):
+        self.write("crates/agora-core/src/lkg.rs", "fn a(p: &Path) -> bool { p.exists() }\n")
+        self.budget_of(files={"crates/agora-core/src/lkg.rs": 1})
+        self.assertEqual(self.check(), 0)
+
+    def test_one_more_site_than_the_budget_fails(self):
+        self.write(
+            "crates/agora-core/src/lkg.rs",
+            "fn a(p: &Path) -> bool { p.exists() }\nfn b(p: &Path) -> bool { p.exists() }\n",
+        )
+        self.budget_of(files={"crates/agora-core/src/lkg.rs": 1})
+        self.assertEqual(self.check(), 1)
+
+    def test_a_fix_below_the_budget_fails_until_the_number_is_written_back(self):
+        self.write("crates/agora-core/src/lkg.rs", "fn a(p: &Path) -> bool { p.exists() }\n")
+        self.budget_of(files={"crates/agora-core/src/lkg.rs": 3})
+        self.assertEqual(self.check(), 1)
+
+    def test_a_budgeted_file_that_is_gone_fails(self):
+        self.budget_of(files={"crates/agora-core/src/gone.rs": 0})
+        self.assertEqual(self.check(), 1)
+
+    def test_a_missing_budget_file_fails(self):
+        self.assertEqual(self.check(), 1)
+
+    def test_every_file_in_a_counted_directory_needs_its_own_number(self):
+        self.write("crates/agora-core/src/content_store/mod.rs", "fn a() {}\n")
+        self.write(
+            "crates/agora-core/src/content_store/place.rs",
+            "fn a(p: &Path) -> bool { p.exists() }\n",
+        )
+        budget = {"crates/agora-core/src/content_store": {"mod.rs": 0}}
+        self.budget_of(directories=budget)
+        self.assertEqual(self.check(), 1)
+        budget["crates/agora-core/src/content_store"]["place.rs"] = 1
+        self.budget_of(directories=budget)
+        self.assertEqual(self.check(), 0)

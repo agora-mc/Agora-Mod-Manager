@@ -746,6 +746,32 @@ fn delete_refuses_a_running_instance_whose_manifest_lacks_a_runtime_identity() {
         .exists());
 }
 
+/// A delete with a launch recorded but never finished is can't-tell: it refuses, and it must not
+/// call the instance running, because there is no game for the player to close. This is the
+/// branch the five callers used to reach by comparing `ERR_INSTANCE_RUNNING`.
+#[test]
+fn delete_refuses_an_indeterminate_launch_without_calling_it_running() {
+    let f = Fixture::new();
+    write_instance(&f.ctx, &manifest("grounded-1", "Grounded"));
+    agora_core::instance_runtime::publish_starting(&f.ctx.paths, "grounded-1")
+        .expect("a starting lease");
+
+    let error = game_instance::delete(&f.ctx, "grounded-1").expect_err("an unfinished launch");
+    match error {
+        InstanceError::Other(message) => assert!(
+            message.contains("not possible to tell"),
+            "the refusal must say it could not tell, not that it is running: {message}"
+        ),
+        other => panic!("an unfinished launch was not can't-tell: {other:?}"),
+    }
+    assert!(
+        game_instance::get(&f.ctx, "grounded-1")
+            .expect("a read")
+            .is_some(),
+        "nothing may be deleted"
+    );
+}
+
 #[test]
 fn clone_checks_for_a_running_game_after_it_holds_the_lock() {
     use agora_core::lock_manager::LockResource;
