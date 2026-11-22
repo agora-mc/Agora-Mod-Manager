@@ -14,7 +14,7 @@
     "crates/agora-core/src/plugins/store.rs": 5,
     "crates/agora-core/src/process_identity.rs": 2,
     "crates/agora-core/src/registry_bundle.rs": 7,
-    "crates/agora-core/src/registry_sync.rs": 46,
+    "crates/agora-core/src/registry_sync.rs": 43,
     "crates/agora-core/src/session_ledger.rs": 25,
     "crates/agora-core/src/snapshot.rs": 60,
     "crates/agora-core/src/startup_recovery.rs": 0,
