@@ -108,16 +108,22 @@ pub fn promotes_to_lkg(outcome: &LaunchOutcome) -> bool {
     matches!(outcome, LaunchOutcome::Success)
 }
 
-/// Read an instance's LKG pointer. Missing files produce the default state;
-/// malformed state is surfaced so callers never overwrite recovery metadata
-/// they could not understand.
+/// Read an instance's LKG pointer. Only a genuinely absent pointer produces the
+/// default state; a read or parse failure is surfaced so callers never evict
+/// recovery data they could not understand.
 pub fn read_lkg_state(instance_dir: &Path) -> Result<LkgState, String> {
     let path = instance_dir.join("lkg.json");
-    if !path.is_file() {
-        return Ok(LkgState::default());
-    }
-    let text =
-        std::fs::read_to_string(&path).map_err(|e| format!("failed to read LKG state: {e}"))?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        // Only a pointer that is not there means nothing was ever promoted. A path
+        // that exists but cannot be read (permissions, something else sitting on
+        // the name) must never be read as an empty recovery pointer, or retention
+        // would treat the last-known-good snapshot as an ordinary expendable one.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LkgState::default())
+        }
+        Err(error) => return Err(format!("failed to read LKG state: {error}")),
+    };
     serde_json::from_str(&text).map_err(|e| format!("failed to parse LKG state: {e}"))
 }
 
@@ -1077,6 +1083,41 @@ mod tests {
         let only = create_test_snapshot(dir, "pre-launch");
         run_retention(dir).unwrap();
         assert_eq!(remaining_ids(dir), vec![only]);
+    }
+
+    #[test]
+    fn a_recovery_pointer_that_cannot_be_read_stops_the_retention_round() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        // The oldest snapshot is promoted to the recovery pointer; with an empty
+        // pointer it counts as an ordinary automatic one and is evicted past the
+        // keep-5 window, so the read failing is observable either way.
+        let promoted = create_test_snapshot(dir, "pre-launch-0");
+        record_launch_outcome(dir, Some(&promoted), "launch-1", LaunchOutcome::Success).unwrap();
+        for i in 1..7 {
+            create_test_snapshot(dir, &format!("pre-launch-{i}"));
+        }
+
+        // Simulate a failing read: something exists at the pointer's path, but
+        // it cannot be read as the state file.
+        std::fs::remove_file(dir.join("lkg.json")).unwrap();
+        std::fs::create_dir(dir.join("lkg.json")).unwrap();
+
+        let result = run_retention(dir);
+        assert!(
+            result.as_ref().is_err_and(|error| error.contains("failed to read LKG state")),
+            "a failed recovery-pointer read must skip the round with a reason, not evict a blank state: {result:?}"
+        );
+        let remaining = remaining_ids(dir);
+        assert_eq!(
+            remaining.len(),
+            7,
+            "a skipped round keeps everything, including the recovery pointer's snapshot"
+        );
+        assert!(
+            remaining.contains(&promoted),
+            "the last-known-good snapshot is kept"
+        );
     }
 
     #[test]
