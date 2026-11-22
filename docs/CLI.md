@@ -1119,6 +1119,8 @@ Scripts should still inspect structured error output because several distinct er
 
 The exit code follows the error's machine-readable code, not the shape it is carried in. An error that is wrapped to add context keeps the exit code of the code it carries: `agora loader install` for a profile whose adoption failed and whose heal is refused by the loader-download setting still exits `92` (the reinstall reason is in the message), rather than falling back to `1`. A code the table does not classify is `1`.
 
+Every machine code, its exit code and its area are declared once, in `agora-core`'s `error_code` module; this page and the CLI read that declaration rather than keeping a table of their own.
+
 `agora doctor` prints its whole report (human or `--json`) and exits `0` when the local database is healthy or not created yet. It exits `10` when it finds damage, a store it cannot read, a database written by a newer Agora, or a saved account list that needs `agora auth repair`. The JSON report always includes `problems: true` or `false`, so a script can read the reason without parsing the message.
 
 Most ordinary lookups for a nonexistent instance currently return generic exit code `1`, not `11`.

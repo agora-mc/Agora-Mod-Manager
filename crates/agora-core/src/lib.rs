@@ -35,6 +35,7 @@ pub mod dependency_ops;
 pub mod download;
 pub mod download_watch;
 pub mod error;
+pub mod error_code;
 pub mod event_sink;
 pub mod game_base;
 pub mod game_conditions;
