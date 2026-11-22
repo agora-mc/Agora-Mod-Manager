@@ -865,6 +865,12 @@ pub fn is_session_running(journal: &Journal) -> bool {
     if session_running_apart_from_starting(journal) {
         return true;
     }
+    starting_launcher_verifies(journal)
+}
+
+/// Whether the launcher that swapped these files in is still alive. It is the only record of a
+/// launch that has not spawned the game yet, so it says "starting", not "a game is running".
+fn starting_launcher_verifies(journal: &Journal) -> bool {
     journal
         .starting_launcher
         .as_ref()
@@ -2340,6 +2346,10 @@ pub fn status(
 pub struct SessionDetails {
     pub instance: String,
     pub running: bool,
+    /// The launcher that swapped these files in is alive and has not recorded the game's process:
+    /// a launch that never finished starting. Something holds the session, but nothing proves a
+    /// game is running, so a refusal must not tell the player to close one.
+    pub starting: bool,
     pub created_at: String,
     pub running_from: PathBuf,
     pub processes: Vec<ProcessIdentity>,
@@ -2365,10 +2375,14 @@ pub fn details(
             journal_path.display()
         ))
     })?;
-    let running = is_session_running(&journal);
+    let running_apart_from_starting = session_running_apart_from_starting(&journal);
+    // A launch the player cannot close: only the launcher that was about to spawn the game is still
+    // alive, and nothing in the journal records the game itself.
+    let starting = !running_apart_from_starting && starting_launcher_verifies(&journal);
     Ok(Some(SessionDetails {
         instance: journal.instance_id,
-        running,
+        running: running_apart_from_starting || starting,
+        starting,
         created_at: journal.created_at,
         running_from: journal.running_from,
         processes: journal.processes,

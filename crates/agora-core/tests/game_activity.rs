@@ -259,22 +259,29 @@ fn a_save_restore_refuses_when_the_session_store_cannot_be_read() {
 }
 
 /// A `SavesChoice` is not needed for the activity answer; the instance's own record and manifest
-/// name the game and store. This pins the one core entry point the four callers share.
+/// name the game and store. This pins the one core entry point the four callers share, including
+/// the step from a launch that is only recorded as starting to one whose process is verified.
 #[test]
-fn the_activity_answer_is_idle_with_no_records_and_running_with_a_live_lease() {
+fn the_activity_answer_is_idle_then_starting_then_running() {
+    use agora_core::instance_runtime::{
+        game_activity, publish_running, publish_starting, GameActivity,
+    };
+
     let h = Harness::new();
     h.make_instance("demo");
 
+    assert_eq!(game_activity(&h.ctx, "demo"), GameActivity::Idle);
+
+    let generation = publish_starting(&h.ctx.paths, "demo").unwrap();
     assert_eq!(
-        agora_core::instance_runtime::game_activity(&h.ctx, "demo"),
-        agora_core::instance_runtime::GameActivity::Idle
+        game_activity(&h.ctx, "demo"),
+        GameActivity::Starting,
+        "an unverified launch is not a game the player can close"
     );
 
-    let _generation = agora_core::instance_runtime::publish_starting(&h.ctx.paths, "demo").unwrap();
-    assert_eq!(
-        agora_core::instance_runtime::game_activity(&h.ctx, "demo"),
-        agora_core::instance_runtime::GameActivity::Running
-    );
+    let identity = agora_core::process_identity::capture(std::process::id()).unwrap();
+    publish_running(&h.ctx.paths, "demo", &generation, identity).unwrap();
+    assert_eq!(game_activity(&h.ctx, "demo"), GameActivity::Running);
 }
 
 /// A journal the process cannot examine is not an absent journal: `exists()` is also false for an

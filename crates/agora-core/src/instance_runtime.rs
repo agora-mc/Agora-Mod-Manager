@@ -242,6 +242,20 @@ pub fn game_has_record(paths: &AppPaths, instance_id: &str) -> bool {
     !matches!(read(paths, instance_id), Ok(None))
 }
 
+/// What to do about a launch that was recorded but never verified. The same words reach the player
+/// from the `ERR_INSTANCE_LAUNCH_INDETERMINATE` refusal, from [`game_activity`]'s can't-tell answer
+/// and from [`ensure_game_not_running`], so the instruction cannot drift between them.
+const INDETERMINATE_GUIDANCE: &str =
+    "Make sure the game is closed, then clear the launch state for this instance and try again.";
+
+/// The whole indeterminate refusal for an instance: what was seen, and what to do about it.
+fn indeterminate_message(instance_id: &str) -> String {
+    format!(
+        "A launch of '{instance_id}' was recorded but never finished starting, so it is not \
+         possible to tell whether Minecraft is running. {INDETERMINATE_GUIDANCE}"
+    )
+}
+
 /// Establish that no game is using this instance.
 ///
 /// Call while holding the instance lock, before any mutation.
@@ -271,11 +285,7 @@ pub fn check_idle(paths: &AppPaths, instance_id: &str) -> LauncherResult<()> {
         (RuntimeState::Running, None) | (RuntimeState::Starting, _) => {
             Err(LauncherError::Generic {
                 code: "ERR_INSTANCE_LAUNCH_INDETERMINATE".into(),
-                message: format!(
-                    "A launch of '{instance_id}' was recorded but never finished starting, so it \
-                     is not possible to tell whether Minecraft is running. Make sure the game is \
-                     closed, then clear the launch state for this instance and try again."
-                ),
+                message: indeterminate_message(instance_id),
             })
         }
     }
@@ -284,8 +294,12 @@ pub fn check_idle(paths: &AppPaths, instance_id: &str) -> LauncherResult<()> {
 /// What is known about whether an instance's game is using it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GameActivity {
-    /// A live game, a launch between the swap and the spawn, or a view/wrap of the instance.
+    /// A verified live game, or a view/wrap of the instance.
     Running,
+    /// A launch was recorded but never verified: the files may be swapped in and the process that
+    /// was starting the game has not recorded it. Something holds the instance, but no game is
+    /// proven to be running — so a refusal must not tell the player to close one.
+    Starting,
     /// Nothing says a game is using it.
     Idle,
     /// A record that answers the question cannot be read. The risky action must refuse.
@@ -311,9 +325,9 @@ pub fn game_activity(ctx: &Ctx, instance_id: &str) -> GameActivity {
                 return GameActivity::Running;
             }
             // A launch with nothing to verify was recorded but never finished starting. It blocks
-            // mutation exactly as `check_idle` says it must.
+            // mutation exactly as `check_idle` says it must, but there is no game to close.
             (RuntimeState::Running, None) | (RuntimeState::Starting, _) => {
-                return GameActivity::Running;
+                return GameActivity::Starting;
             }
             _ => {}
         },
@@ -326,7 +340,11 @@ pub fn game_activity(ctx: &Ctx, instance_id: &str) -> GameActivity {
         Ok(Some((game, store))) => match crate::game_user_files::details(ctx, &game, &store) {
             Err(error) => return GameActivity::CouldNotTell(error.to_string()),
             Ok(Some(details)) if details.instance == instance_id && details.running => {
-                return GameActivity::Running;
+                return if details.starting {
+                    GameActivity::Starting
+                } else {
+                    GameActivity::Running
+                };
             }
             _ => {}
         },
@@ -344,17 +362,21 @@ pub fn game_activity(ctx: &Ctx, instance_id: &str) -> GameActivity {
 }
 
 /// Refuse a change while the instance's game may be using it. `action` completes the sentence
-/// "close the game before ...". Only proven idle passes: running and "could not tell" both refuse.
+/// "close the game before ...". Only proven idle passes: running, starting and "could not tell"
+/// all refuse.
 ///
-/// The wording covers a launch that is only recorded as starting: `game_activity` cannot tell that
-/// apart from a running game (a `Starting` lease, or a `Running` one with no identity to verify,
-/// is [`GameActivity::Running`]), so the refusal says "running or still starting" rather than
-/// claiming a game the player could close.
+/// The refusal says what the player can do about it: a verified game gets "close the game", while a
+/// launch that never finished starting gets the [`INDETERMINATE_GUIDANCE`] the
+/// `ERR_INSTANCE_LAUNCH_INDETERMINATE` error gives, because there is no game to close.
 pub fn ensure_game_not_running(ctx: &Ctx, instance_id: &str, action: &str) -> Result<(), String> {
     match game_activity(ctx, instance_id) {
         GameActivity::Idle => Ok(()),
         GameActivity::Running => Err(format!(
-            "'{instance_id}' is running or still starting; close the game before {action}"
+            "'{instance_id}' is running; close the game before {action}"
+        )),
+        GameActivity::Starting => Err(format!(
+            "{} Refusing to {action}.",
+            indeterminate_message(instance_id)
         )),
         GameActivity::CouldNotTell(reason) => Err(format!(
             "could not tell whether '{instance_id}' is running ({reason}); refusing to {action}"
@@ -552,17 +574,13 @@ fn lease_answer(paths: &AppPaths, instance_id: &str) -> Liveness {
         (RuntimeState::Running, None) | (RuntimeState::Starting, _) => {
             Liveness::CantTell(LauncherError::Generic {
                 code: "ERR_INSTANCE_LAUNCH_INDETERMINATE".into(),
-                message: format!(
-                    "A launch of '{instance_id}' was recorded but never finished starting, so it \
-                     is not possible to tell whether Minecraft is running. Make sure the game is \
-                     closed, then clear the launch state for this instance and try again."
-                ),
+                message: indeterminate_message(instance_id),
             })
         }
     }
 }
 
-/// The game-activity half of the answer: [`game_activity`] as Busy or can't-tell.
+/// The game-activity half of the answer: [`game_activity`] as Busy, can't-tell or free.
 fn activity_answer(ctx: &Ctx, instance_id: &str) -> Liveness {
     match game_activity(ctx, instance_id) {
         GameActivity::Idle => Liveness::Free,
@@ -571,6 +589,12 @@ fn activity_answer(ctx: &Ctx, instance_id: &str) -> Liveness {
             message: format!(
                 "The game is running in '{instance_id}'; close it before changing this instance."
             ),
+        }),
+        // Nothing proves a game is running, so this is not "busy with a game": it is a launch
+        // that has to be resolved by hand, the same answer the lease gives for that state.
+        GameActivity::Starting => Liveness::CantTell(LauncherError::Generic {
+            code: "ERR_INSTANCE_LAUNCH_INDETERMINATE".into(),
+            message: indeterminate_message(instance_id),
         }),
         GameActivity::CouldNotTell(reason) => Liveness::CantTell(LauncherError::Generic {
             code: "ERR_INSTANCE_LAUNCH_INDETERMINATE".into(),
@@ -1046,21 +1070,108 @@ mod tests {
         }
     }
 
-    /// A launch that recorded no game identity is only *starting* as far as anyone knows, so the
-    /// refusal must not tell the player a game is running and to close it.
+    /// A launch that never finished starting is not a game the player can close: the refusal has to
+    /// carry the `ERR_INSTANCE_LAUNCH_INDETERMINATE` guidance instead.
     #[test]
-    fn a_starting_launch_is_refused_without_claiming_a_game_is_running() {
+    fn a_launch_that_never_finished_starting_gets_the_indeterminate_guidance() {
         let (ctx, _tmp) = guard_ctx();
         publish_starting(&ctx.paths, "demo").unwrap();
 
         let refusal = ensure_game_not_running(&ctx, "demo", "take a snapshot").unwrap_err();
         assert!(
-            refusal.contains("still starting"),
-            "the refusal must allow for a launch that is only starting: {refusal}"
+            refusal.contains("clear the launch state"),
+            "an unfinished launch gets the indeterminate guidance: {refusal}"
         );
         assert!(
-            refusal.contains("before take a snapshot"),
+            !refusal.contains("close the game"),
+            "there is no game to close: {refusal}"
+        );
+        assert!(
+            refusal.contains("take a snapshot"),
             "the refusal still names the action: {refusal}"
+        );
+    }
+
+    /// A verified live game keeps the instruction a player can follow: close it.
+    #[test]
+    fn a_verified_live_game_is_refused_with_close_the_game() {
+        let (ctx, _tmp) = guard_ctx();
+        let identity = process_identity::capture(std::process::id()).unwrap();
+        let generation = publish_starting(&ctx.paths, "demo").unwrap();
+        publish_running(&ctx.paths, "demo", &generation, identity).unwrap();
+
+        let refusal = ensure_game_not_running(&ctx, "demo", "take a snapshot").unwrap_err();
+        assert!(
+            refusal.contains("close the game"),
+            "a live game gets the instruction it can follow: {refusal}"
+        );
+        assert!(
+            !refusal.contains("clear the launch state"),
+            "a live game does not need the launch-state guidance: {refusal}"
+        );
+    }
+
+    /// Write the instance's user-files journal: the processes the session recorded, and the launcher
+    /// that swapped the files in when there is one. `running_from` does not exist, so the process
+    /// scan has nothing to look at and the recorded identities decide.
+    fn write_session_journal(
+        ctx: &Ctx,
+        processes: Vec<ProcessIdentity>,
+        starting_launcher: Option<ProcessIdentity>,
+    ) {
+        let journal = ctx.paths.user_files_journal_path("skyrim-se", "steam");
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        let mut record = serde_json::json!({
+            "game": "skyrim-se",
+            "store": "steam",
+            "instance_id": "demo",
+            "created_at": "2026-01-01T00:00:00Z",
+            "running_from": ctx.paths.instance_dir("demo").unwrap().join("no-such-folder"),
+            "processes": processes,
+            "files": [],
+        });
+        if let Some(launcher) = starting_launcher {
+            record["starting_launcher"] = serde_json::to_value(launcher).unwrap();
+        }
+        std::fs::write(&journal, serde_json::to_vec(&record).unwrap()).unwrap();
+    }
+
+    /// A journal whose only live process is the launcher that has not recorded its game yet: the
+    /// launch holds the session, but nothing proves a game is running.
+    #[test]
+    fn a_journal_with_only_a_live_starting_launcher_is_not_a_running_game() {
+        let (ctx, _tmp) = guard_ctx();
+        write_generic_instance(&ctx, "demo", "skyrim-se", "steam");
+        let launcher = process_identity::capture(std::process::id()).unwrap();
+        write_session_journal(&ctx, Vec::new(), Some(launcher));
+
+        let refusal = ensure_game_not_running(&ctx, "demo", "take a snapshot").unwrap_err();
+        assert!(
+            refusal.contains("clear the launch state"),
+            "an unfinished launch gets the indeterminate guidance: {refusal}"
+        );
+        assert!(
+            !refusal.contains("close the game"),
+            "there is no game to close: {refusal}"
+        );
+    }
+
+    /// A journal with the game's own live process is a verified live game, not a starting one.
+    #[test]
+    fn a_journal_with_a_live_game_process_is_a_running_game() {
+        let (ctx, _tmp) = guard_ctx();
+        write_generic_instance(&ctx, "demo", "skyrim-se", "steam");
+        let game = process_identity::capture(std::process::id()).unwrap();
+        write_session_journal(&ctx, vec![game], None);
+
+        let refusal = ensure_game_not_running(&ctx, "demo", "take a snapshot").unwrap_err();
+        assert!(
+            refusal.contains("close the game"),
+            "a live game gets the instruction it can follow: {refusal}"
+        );
+        assert!(
+            !refusal.contains("clear the launch state"),
+            "a live game does not need the launch-state guidance: {refusal}"
         );
     }
 
