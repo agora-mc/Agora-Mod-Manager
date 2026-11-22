@@ -1141,6 +1141,18 @@ fn staged_unusable_message(staged: &Path, reason: &str) -> LauncherError {
     ))
 }
 
+/// The same file, reported once instead of refusing: the installed catalog is
+/// usable, so an unusable staged file is a warning that names the file, why it
+/// was not used and how to clear it.
+fn staged_unusable_warning(staged: &Path, reason: &str) -> String {
+    format!(
+        "The catalog bundle staged at {} could not be used ({reason}). It has been kept for \
+         diagnosis and was not opened; the installed catalog was used instead. Sync the catalog, \
+         or delete that staged file, to clear it.",
+        staged.display()
+    )
+}
+
 #[cfg(test)]
 fn floor_write_failures() -> &'static Mutex<Vec<PathBuf>> {
     static FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
@@ -2180,7 +2192,10 @@ fn floor_stale_message() -> String {
 /// exactly as it is and the open decides from what is on disk — so an opener can
 /// never publish a staged file that a later install replaced, and never deletes
 /// one mid-sequence.
-fn finish_staged_publication(app_data_dir: &Path, trust: &TrustSnapshot) -> LauncherResult<()> {
+fn finish_staged_publication(
+    app_data_dir: &Path,
+    trust: &TrustSnapshot,
+) -> LauncherResult<Option<String>> {
     let locks = LockManager::new(app_data_dir.join("locks"));
     let Ok(_guard) = locks.acquire_with_timeout(
         crate::lock_manager::LockResource::RegistryUpdate,
@@ -2191,16 +2206,19 @@ fn finish_staged_publication(app_data_dir: &Path, trust: &TrustSnapshot) -> Laun
         // Another process is publishing. Its staged file is its own; this open
         // opens what verifies (or refuses with the state's own message) without
         // touching anything.
-        return Ok(());
+        return Ok(None);
     };
     finish_staged_publication_locked(app_data_dir, trust)
 }
 
 /// [`finish_staged_publication`] with the lock already held.
+///
+/// Returns the one warning this step may owe the caller: a staged file that
+/// cannot be used while a usable installed catalog is what gets opened.
 fn finish_staged_publication_locked(
     app_data_dir: &Path,
     trust: &TrustSnapshot,
-) -> LauncherResult<()> {
+) -> LauncherResult<Option<String>> {
     let floor = read_floor_file(app_data_dir)?;
     let staged = staged_bundle_path(app_data_dir)?;
     if !staged.exists() {
@@ -2224,22 +2242,35 @@ fn finish_staged_publication_locked(
                 return Err(floor_unfinished_message(&floor));
             }
         }
-        return Ok(());
+        return Ok(None);
     }
-    let header = load_header(&staged, trust)
-        .map_err(|error| staged_unusable_message(&staged, &error.to_string()))?;
+    let header = match load_header(&staged, trust) {
+        Ok(header) => header,
+        Err(error) => {
+            return unusable_staged(
+                app_data_dir,
+                trust,
+                floor.as_ref(),
+                &staged,
+                &error.to_string(),
+            )
+        }
+    };
     match compare_stamps(floor.as_ref(), &header.built_at, &header.db_sha256)? {
         StampOrder::Older => {
             // Older than a catalog this client accepted: an abandoned staged
             // file from an install that a later one superseded.
             remove_staged_bundle(app_data_dir);
-            return Ok(());
+            return Ok(None);
         }
         StampOrder::EqualDifferentBytes => {
-            return Err(staged_unusable_message(
+            return unusable_staged(
+                app_data_dir,
+                trust,
+                floor.as_ref(),
                 &staged,
                 "its signed stamp is the stamp the rollback floor records, over different bytes",
-            ));
+            );
         }
         // At or above the floor: the publication that was interrupted.
         StampOrder::EqualSameBytes | StampOrder::Newer => {}
@@ -2247,7 +2278,45 @@ fn finish_staged_publication_locked(
     // The floor names the catalog before the catalog carries it, as in the
     // install: a crash between these two writes is finished by the next open.
     raise_floor(app_data_dir, &header.built_at, &header.db_sha256)?;
-    publish_staged_bundle(app_data_dir, &staged)
+    publish_staged_bundle(app_data_dir, &staged)?;
+    Ok(None)
+}
+
+/// A staged file this client cannot publish. It never replaces the catalog, so
+/// it only refuses the open when there is nothing else to open: with an
+/// installed catalog that verifies and satisfies the floor, that catalog is
+/// opened, the staged file is kept for diagnosis, and the reason is returned
+/// once as a warning instead of blocking the launcher.
+fn unusable_staged(
+    app_data_dir: &Path,
+    trust: &TrustSnapshot,
+    floor: Option<&CachedStamp>,
+    staged: &Path,
+    reason: &str,
+) -> LauncherResult<Option<String>> {
+    if installed_is_usable(app_data_dir, trust, floor) {
+        return Ok(Some(staged_unusable_warning(staged, reason)));
+    }
+    Err(staged_unusable_message(staged, reason))
+}
+
+/// Whether the installed bundle verifies and is at or above the floor. This is
+/// what makes a staged file that cannot be used harmless.
+fn installed_is_usable(
+    app_data_dir: &Path,
+    trust: &TrustSnapshot,
+    floor: Option<&CachedStamp>,
+) -> bool {
+    let Some(installed) = read_cached_stamp(app_data_dir, trust) else {
+        return false;
+    };
+    let Some(floor) = floor else {
+        return true;
+    };
+    match (parse_utc(&floor.built_at), parse_utc(&installed.built_at)) {
+        (Some(floor), Some(installed)) => installed >= floor,
+        _ => false,
+    }
 }
 
 /// The signed build stamp and payload hash of the cached catalog, for the
@@ -2323,7 +2392,7 @@ pub fn verified_registry_digest(
         let trust = &TrustSnapshot::load(app_data_dir, compiled)?;
         // Finish a publication a crash interrupted before the digest is taken, so
         // the digest describes the catalog this client accepted.
-        finish_staged_publication(app_data_dir, trust)?;
+        let _warning = finish_staged_publication(app_data_dir, trust)?;
         if !bundle_path.exists() {
             return Ok(None);
         }
@@ -2694,6 +2763,9 @@ fn parse_utc(raw: &str) -> Option<DateTime<Utc>> {
 pub struct VerifiedRegistry {
     conn: Option<rusqlite::Connection>,
     freshness: RegistryFreshness,
+    /// Things worth saying once about the state this catalog was opened in: an
+    /// unusable staged bundle that was kept rather than opened, for example.
+    warnings: Vec<String>,
 }
 
 impl VerifiedRegistry {
@@ -2705,6 +2777,12 @@ impl VerifiedRegistry {
 
     pub fn freshness(&self) -> &RegistryFreshness {
         &self.freshness
+    }
+
+    /// Warnings about the state the catalog was opened in. Each is said once,
+    /// here, and none of them refuses the open.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// Refuse to act on a catalog past its signed expiry. Reading and browsing
@@ -2753,26 +2831,33 @@ pub fn open_verified_registry_with_trust(
         let snapshot = TrustSnapshot::load(app_data_dir, compiled)?;
         // A publication a crash interrupted is finished from the staged bytes
         // before anything is opened: the floor may already be above the bundle
-        // on disk, and the older catalog must not be opened in its place.
-        finish_staged_publication(app_data_dir, &snapshot)?;
+        // on disk, and the older catalog must not be opened in its place. A
+        // staged file that cannot be used while this one can is a warning, not a
+        // refusal: it is kept, and the caller says so once.
+        let warning = finish_staged_publication(app_data_dir, &snapshot)?;
         if !bundle_path.exists() {
             // Nothing pending could be finished: there is no catalog to open.
             return Err(LauncherError::RegistryMissing);
         }
         let first = open_bundle_once(app_data_dir, &bundle_path, &snapshot);
-        if first.is_ok() {
-            return first;
-        }
         // A crash between installing the bundle and extracting the database
         // (or a damaged current bundle) is recoverable from the previous copy.
-        match verify_bundle_file(app_data_dir, &bundle_path, &snapshot) {
-            CachedRegistryIntegrity::Verified
-            | CachedRegistryIntegrity::Stale(_)
-            | CachedRegistryIntegrity::Recovered(_) => {
-                return open_bundle_once(app_data_dir, &bundle_path, &snapshot)
-            }
-            _ => return first,
+        let recovered = first.is_err()
+            && matches!(
+                verify_bundle_file(app_data_dir, &bundle_path, &snapshot),
+                CachedRegistryIntegrity::Verified
+                    | CachedRegistryIntegrity::Stale(_)
+                    | CachedRegistryIntegrity::Recovered(_)
+            );
+        let mut registry = if recovered {
+            open_bundle_once(app_data_dir, &bundle_path, &snapshot)?
+        } else {
+            first?
+        };
+        if let Some(warning) = warning {
+            registry.warnings.push(warning);
         }
+        return Ok(registry);
     }
 
     // A debug-only test fixture: `Ctx::for_testing` may open a hand-built
@@ -2790,6 +2875,7 @@ pub fn open_verified_registry_with_trust(
             return Ok(VerifiedRegistry {
                 conn: Some(conn),
                 freshness: RegistryFreshness::default(),
+                warnings: Vec::new(),
             });
         }
     }
@@ -2821,6 +2907,7 @@ fn open_bundle_once(
     Ok(VerifiedRegistry {
         conn: Some(conn),
         freshness: RegistryFreshness::from_header(&header),
+        warnings: Vec::new(),
     })
 }
 
@@ -4727,6 +4814,50 @@ mod tests {
             fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
             first,
             "the older catalog must not be replaced or opened through this state"
+        );
+    }
+
+    /// A staged file that cannot be used does not block an open when the
+    /// installed catalog verifies and satisfies the floor: the installed catalog
+    /// opens, the staged file is kept for diagnosis, and the reason is reported
+    /// once — naming the file, why it was not used and how to clear it.
+    #[test]
+    fn a_corrupt_staged_bundle_does_not_block_a_good_installed_catalog() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(231);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db_with_built_at("2026-11-15T12:00:00+00:00");
+        let header = header_for(
+            &key,
+            &payload,
+            "2026-11-15T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let installed = signed_bundle(&key, &header, &payload);
+        install_bundle_bytes_checked(dir.path(), &installed, &trust, "first").unwrap();
+
+        let staged = paths::registry_bundle_staged_path(dir.path()).unwrap();
+        fs::write(&staged, b"not a bundle").unwrap();
+
+        let registry = open_verified_registry_with_trust(dir.path(), &trust)
+            .expect("a corrupt staged file must not block a good installed catalog");
+        let warnings = registry.warnings().join("\n");
+        assert!(
+            warnings.contains(&staged.display().to_string())
+                && warnings.contains("kept for diagnosis")
+                && warnings.contains("Sync"),
+            "the warning names the file, what happened and how to clear it: {warnings}"
+        );
+        drop(registry);
+        assert_eq!(
+            fs::read(&staged).unwrap(),
+            b"not a bundle",
+            "the staged file is kept for diagnosis, not deleted"
+        );
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            installed,
+            "the installed catalog is what was opened"
         );
     }
 

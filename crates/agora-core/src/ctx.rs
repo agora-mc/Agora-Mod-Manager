@@ -538,6 +538,9 @@ impl CoreContext {
                 &registry_trust,
             ) {
                 Ok(registry) => {
+                    // Said once, here: an unusable staged bundle that was kept
+                    // rather than opened does not refuse the catalog.
+                    warnings.extend(registry.warnings().iter().cloned());
                     let conn = registry.into_connection();
                     let version: Result<i64, _> = conn.query_row(
                         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
