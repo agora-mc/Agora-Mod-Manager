@@ -30,6 +30,22 @@ import {
 import { activeHealthWarnings, loadHealthPreferences } from './healthPreferences';
 
 // ---------------------------------------------------------------------------
+// Error classification
+// ---------------------------------------------------------------------------
+
+/** Whether a launch failure means the Microsoft sign-in itself is the problem,
+ *  so the health report shown before launch no longer applies. */
+export function releasesHealthDialog(code: string | null): boolean {
+  return code === 'ERR_MSA_AUTH_REQUIRED' || code === 'ERR_MSA_LOGIN_EXPIRED';
+}
+
+/** Only the backend's structured `ERR_PROCESS_STALE` code means a kill found a
+ *  process that no longer matches; message text is not proof of that. */
+export function isStaleProcessError(error: unknown): boolean {
+  return parseLauncherError(error).code === 'ERR_PROCESS_STALE';
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -661,8 +677,7 @@ export function useProcessController(beforeLaunch?: (instanceId: string) => Prom
         return null;
       } catch (e) {
         const parsed = parseLauncherError(e);
-        const releaseHealthDialog = parsed.code === 'ERR_MSA_AUTH_REQUIRED'
-          || parsed.code === 'ERR_MSA_AUTH_EXPIRED';
+        const releaseHealthDialog = releasesHealthDialog(parsed.code);
         setState((prev) => ({
           ...prev,
           phase: 'failed',
@@ -697,7 +712,7 @@ export function useProcessController(beforeLaunch?: (instanceId: string) => Prom
       // ERR_PROCESS_STALE means the process identity no longer matches —
       // the backend already detached the stale record.  Treat as idle
       // rather than stuck in a retry loop.
-      if (msg.includes('ERR_PROCESS_STALE') || msg.includes('stale')) {
+      if (isStaleProcessError(e)) {
         setState((prev) => ({
           ...prev,
           phase: 'idle',
