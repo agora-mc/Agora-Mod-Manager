@@ -414,61 +414,23 @@ pub enum WriterLiveness {
 /// and nothing else — it never clears a lease, never removes a file and never writes a record.
 ///
 /// A question about who owns something must not change the answer, which is why the mutation path's
-/// stale-lease clearing ([`crate::instance_runtime`]) is deliberately not reused here.
-pub fn writer_liveness(writer: Option<&ProcessIdentity>) -> WriterLiveness {
+/// stale-lease clearing ([`crate::instance_runtime`]) is deliberately not reused here. `view` is
+/// the process table the answer comes from; production passes
+/// [`OsProcesses`](crate::process_identity::OsProcesses), and a test passes a stand-in so each
+/// source of "could not tell" can be made to happen (MASTER_SPEC §32.13).
+pub fn writer_liveness(
+    writer: Option<&ProcessIdentity>,
+    view: &dyn crate::process_identity::ProcessView,
+) -> WriterLiveness {
     let Some(identity) = writer else {
         return WriterLiveness::CantTell("the journal records no writing process".into());
     };
-    // An identity with no pid or no start time was never captured from a running process, so
-    // nothing can be looked up and nothing is proven by its absence.
-    if identity.pid == 0 || identity.start_time == 0 {
-        return WriterLiveness::CantTell(format!(
-            "the recorded process (pid {}) has no usable identity",
-            identity.pid
-        ));
+    match process_identity::check_with(identity, view) {
+        process_identity::ProcessCheck::Alive => WriterLiveness::Alive,
+        process_identity::ProcessCheck::Gone => WriterLiveness::Gone,
+        // Never read as gone: an answer the OS did not give is not proof that the writer stopped.
+        process_identity::ProcessCheck::CantTell(why) => WriterLiveness::CantTell(why),
     }
-    // A process in a job object is alive while the job still holds members: the parent exits and
-    // the work continues in the group.
-    if let Some(job) = identity.job.as_deref() {
-        if crate::process_job::active(job) > 0 {
-            return WriterLiveness::Alive;
-        }
-    }
-    let answer = process_identity::verify(identity);
-    liveness_from(answer, || process_table_answered(identity.pid))
-}
-
-/// The liveness answer from a process-table check, with the "the table gave no answer" case kept
-/// separate from "the process is gone".
-///
-/// `os_lists_processes` answers whether the operating system listed *any* process on a full
-/// refresh. An empty table is not a table that proved anything: a refresh that returned nothing
-/// must never be read as "the writer is gone", because recovery that concludes "gone" deletes or
-/// rewrites the user's files.
-fn liveness_from(
-    answer: LauncherResult<()>,
-    os_lists_processes: impl FnOnce() -> bool,
-) -> WriterLiveness {
-    match answer {
-        Ok(()) => WriterLiveness::Alive,
-        // `verify` reports every case as stale, including a process table it could not refresh.
-        Err(LauncherError::ProcessStale { detail, .. }) => {
-            if os_lists_processes() {
-                WriterLiveness::Gone
-            } else {
-                WriterLiveness::CantTell(format!(
-                    "the system process list could not be read, so a recorded process cannot be \
-                     shown to be gone ({detail})"
-                ))
-            }
-        }
-        Err(error) => WriterLiveness::CantTell(error.to_string()),
-    }
-}
-
-/// Whether the operating system listed any process besides none at all.
-fn process_table_answered(_pid: u32) -> bool {
-    process_identity::listed_processes() > 0
 }
 
 // ---------------------------------------------------------------------------
@@ -541,12 +503,14 @@ pub enum Decision<S> {
 ///
 /// The lock manager rather than the whole context: the decision uses nothing else, and the one
 /// startup pass that recovers plugin installs runs inside `CoreContext::initialize`, before the
-/// context it is building exists.
+/// context it is building exists. `view` is the process table the writer's liveness is read from,
+/// so a test can make each "could not tell" happen.
 pub fn decide<S: JournalState>(
     locks: &LockManager,
     resource: &LockResource,
     journal_path: &Path,
     proof: &dyn ContentProof,
+    view: &dyn crate::process_identity::ProcessView,
 ) -> Decision<S> {
     let lock = match locks.acquire_with_timeout_typed(
         resource.clone(),
@@ -585,7 +549,7 @@ pub fn decide<S: JournalState>(
         }
     }
 
-    match writer_liveness(envelope.writer.as_ref()) {
+    match writer_liveness(envelope.writer.as_ref(), view) {
         WriterLiveness::Alive => {
             let pid = match envelope.writer.as_ref() {
                 Some(writer) => writer.pid.to_string(),
@@ -965,34 +929,153 @@ mod tests {
         assert_eq!(names, vec!["journal.json".to_string()]);
     }
 
+    /// A process table a test writes the answers of, so every "could not tell" has a source the
+    /// test can make happen (MASTER_SPEC §32.13).
+    struct StandInTable {
+        answer: process_identity::Lookup,
+        table_readable: bool,
+        job: Result<usize, String>,
+    }
+
+    impl StandInTable {
+        /// A table that was read and does not list the pid.
+        fn without_the_pid() -> Self {
+            Self {
+                answer: process_identity::Lookup::Absent,
+                table_readable: true,
+                job: Ok(0),
+            }
+        }
+
+        /// A table that lists `start_time` for the pid.
+        fn listing(start_time: u64) -> Self {
+            Self {
+                answer: process_identity::Lookup::Found {
+                    start_time,
+                    exe: None,
+                    zombie: false,
+                    exited: false,
+                },
+                table_readable: true,
+                job: Ok(0),
+            }
+        }
+    }
+
+    impl process_identity::ProcessView for StandInTable {
+        fn lookup(&self, _pid: u32) -> process_identity::Lookup {
+            self.answer.clone()
+        }
+        fn table_answered(&self) -> bool {
+            self.table_readable
+        }
+        fn job_members(&self, _job: &str) -> Result<usize, String> {
+            self.job.clone()
+        }
+    }
+
+    /// An identity that a stand-in table can be asked about.
+    fn recorded_writer() -> ProcessIdentity {
+        ProcessIdentity {
+            pid: 4242,
+            start_time: 1_700_000_000,
+            expected_exe: None,
+            job: None,
+        }
+    }
+
+    #[test]
+    fn a_failed_lookup_of_the_recorded_pid_is_never_proof_that_the_writer_is_gone() {
+        let table = StandInTable {
+            answer: process_identity::Lookup::CantTell(
+                "the process table could not be read".into(),
+            ),
+            ..StandInTable::without_the_pid()
+        };
+        let answer = writer_liveness(Some(&recorded_writer()), &table);
+        assert!(
+            matches!(answer, WriterLiveness::CantTell(_)),
+            "a lookup that failed must not read as gone, got {answer:?}"
+        );
+    }
+
     #[test]
     fn an_empty_process_table_is_not_proof_that_the_writer_is_gone() {
-        let stale = || LauncherError::ProcessStale {
-            pid: 7,
-            detail: "Process no longer exists in the OS process table".into(),
+        let table = StandInTable {
+            table_readable: false,
+            ..StandInTable::without_the_pid()
         };
-        assert_eq!(liveness_from(Err(stale()), || true), WriterLiveness::Gone);
-        match liveness_from(Err(stale()), || false) {
-            WriterLiveness::CantTell(_) => {}
-            other => panic!("an unreadable process table must not read as gone, got {other:?}"),
-        }
+        let answer = writer_liveness(Some(&recorded_writer()), &table);
+        assert!(
+            matches!(answer, WriterLiveness::CantTell(_)),
+            "an unreadable process table must not read as gone, got {answer:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_job_query_is_never_proof_that_the_writer_is_gone() {
+        let mut writer = recorded_writer();
+        writer.job = Some("agora-launch-1".into());
+        let table = StandInTable {
+            job: Err("the job object could not be opened".into()),
+            ..StandInTable::without_the_pid()
+        };
+        let answer = writer_liveness(Some(&writer), &table);
+        assert!(
+            matches!(answer, WriterLiveness::CantTell(_)),
+            "a job query that failed must not read as gone, got {answer:?}"
+        );
+    }
+
+    #[test]
+    fn a_pid_that_is_not_in_a_table_that_was_read_is_gone() {
+        let table = StandInTable::without_the_pid();
+        assert_eq!(
+            writer_liveness(Some(&recorded_writer()), &table),
+            WriterLiveness::Gone
+        );
+    }
+
+    #[test]
+    fn a_reused_pid_is_gone() {
+        let table = StandInTable::listing(1_700_000_555);
+        assert_eq!(
+            writer_liveness(Some(&recorded_writer()), &table),
+            WriterLiveness::Gone
+        );
+    }
+
+    #[test]
+    fn the_same_pid_and_start_time_is_alive() {
+        let table = StandInTable::listing(1_700_000_000);
+        assert_eq!(
+            writer_liveness(Some(&recorded_writer()), &table),
+            WriterLiveness::Alive
+        );
     }
 
     #[test]
     fn an_identity_that_was_never_captured_is_not_checked_at_all() {
         let mut identity = process_identity::capture_self().expect("the test process is readable");
         identity.start_time = 0;
+        let table = StandInTable::without_the_pid();
         assert!(matches!(
-            writer_liveness(Some(&identity)),
+            writer_liveness(Some(&identity), &table),
             WriterLiveness::CantTell(_)
         ));
-        assert!(matches!(writer_liveness(None), WriterLiveness::CantTell(_)));
+        assert!(matches!(
+            writer_liveness(None, &table),
+            WriterLiveness::CantTell(_)
+        ));
     }
 
     #[test]
     fn the_live_test_process_is_alive() {
         let identity = process_identity::capture_self().expect("the test process is readable");
-        assert_eq!(writer_liveness(Some(&identity)), WriterLiveness::Alive);
+        assert_eq!(
+            writer_liveness(Some(&identity), &process_identity::OsProcesses),
+            WriterLiveness::Alive
+        );
     }
 
     // -- the decision and the capability ------------------------------------
@@ -1027,7 +1110,13 @@ mod tests {
                 None,
             )
             .expect("the live operation takes the lock");
-        match decide::<TestState>(&locks, &LockResource::PluginInstall, &path, &NoContentProof) {
+        match decide::<TestState>(
+            &locks,
+            &LockResource::PluginInstall,
+            &path,
+            &NoContentProof,
+            &StandInTable::without_the_pid(),
+        ) {
             Decision::Busy(why) => assert!(!why.is_empty()),
             other => panic!("a held lock is busy, got {other:?}"),
         }
@@ -1035,7 +1124,13 @@ mod tests {
         assert!(matches!(read::<TestState>(&path), JournalRead::Valid(_)));
         drop(held);
         assert!(matches!(
-            decide::<TestState>(&locks, &LockResource::PluginInstall, &path, &NoContentProof),
+            decide::<TestState>(
+                &locks,
+                &LockResource::PluginInstall,
+                &path,
+                &NoContentProof,
+                &StandInTable::without_the_pid()
+            ),
             Decision::Act(_)
         ));
     }
@@ -1048,7 +1143,14 @@ mod tests {
         let mut envelope = envelope();
         envelope.writer = process_identity::capture_self();
         write(&path, &envelope).unwrap();
-        match decide::<TestState>(&locks, &LockResource::PluginInstall, &path, &NoContentProof) {
+        // The real process table: this test process is the writer, and it is alive.
+        match decide::<TestState>(
+            &locks,
+            &LockResource::PluginInstall,
+            &path,
+            &NoContentProof,
+            &process_identity::OsProcesses,
+        ) {
             Decision::Busy(why) => assert!(why.contains("still running"), "{why}"),
             other => panic!("a live writer is busy, got {other:?}"),
         }
@@ -1061,9 +1163,51 @@ mod tests {
         let path = dir.path().join("journal.json");
         write(&path, &envelope()).unwrap();
         assert!(matches!(
-            decide::<TestState>(&locks, &LockResource::PluginInstall, &path, &NoContentProof),
+            decide::<TestState>(
+                &locks,
+                &LockResource::PluginInstall,
+                &path,
+                &NoContentProof,
+                &StandInTable::without_the_pid()
+            ),
             Decision::NeedsHand(_)
         ));
+    }
+
+    /// A recorded writer the OS will not answer about is a person's decision, not permission:
+    /// recovery must not read "could not tell" as "gone" and act (MASTER_SPEC §32.13).
+    #[test]
+    fn a_writer_that_cannot_be_checked_needs_a_hand_and_nothing_is_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let locks = LockManager::new(dir.path().join("locks"));
+        let path = dir.path().join("journal.json");
+        let folder = dir.path().join("folder");
+        let marker = dir.path().join("marker.json");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut envelope = crashed_envelope(vec![OwnedPath {
+            path: folder.clone(),
+            proof: PathProof::Marker { at: marker.clone() },
+        }]);
+        envelope.operation_id = "op-1".into();
+        write_marker(&marker, &envelope.operation_id).unwrap();
+        write(&path, &envelope).unwrap();
+
+        let table = StandInTable {
+            answer: process_identity::Lookup::CantTell("the table could not be read".into()),
+            ..StandInTable::without_the_pid()
+        };
+        match decide::<TestState>(
+            &locks,
+            &LockResource::PluginInstall,
+            &path,
+            &NoContentProof,
+            &table,
+        ) {
+            Decision::NeedsHand(why) => assert!(why.contains("cannot say whether"), "{why}"),
+            other => panic!("a writer that cannot be checked needs a hand, got {other:?}"),
+        }
+        assert!(folder.is_dir(), "nothing was touched");
+        assert!(matches!(read::<TestState>(&path), JournalRead::Valid(_)));
     }
 
     #[test]
@@ -1083,7 +1227,13 @@ mod tests {
         envelope.operation_id = "this-operation".into();
         write(&path, &envelope).unwrap();
 
-        match decide::<TestState>(&locks, &LockResource::PluginInstall, &path, &NoContentProof) {
+        match decide::<TestState>(
+            &locks,
+            &LockResource::PluginInstall,
+            &path,
+            &NoContentProof,
+            &StandInTable::without_the_pid(),
+        ) {
             Decision::Act(capability) => {
                 assert!(capability.owned().is_empty(), "it is not ours to touch");
                 assert_eq!(capability.left_alone().len(), 1);
@@ -1110,12 +1260,16 @@ mod tests {
         write_marker(&marker, &envelope.operation_id).unwrap();
         write(&path, &envelope).unwrap();
 
-        let capability =
-            match decide::<TestState>(&locks, &LockResource::PluginInstall, &path, &NoContentProof)
-            {
-                Decision::Act(capability) => capability,
-                other => panic!("expected a capability, got {other:?}"),
-            };
+        let capability = match decide::<TestState>(
+            &locks,
+            &LockResource::PluginInstall,
+            &path,
+            &NoContentProof,
+            &StandInTable::without_the_pid(),
+        ) {
+            Decision::Act(capability) => capability,
+            other => panic!("expected a capability, got {other:?}"),
+        };
         assert_eq!(capability.owned(), std::slice::from_ref(&owned));
         let refused = capability
             .remove_dir(&unowned)

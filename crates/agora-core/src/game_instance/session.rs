@@ -14,7 +14,7 @@ use sysinfo::{Pid, System};
 use crate::ctx::Ctx;
 use crate::game_instance::{self, InstanceError};
 use crate::game_user_files;
-use crate::process_identity::{self, ProcessIdentity};
+use crate::process_identity::{self, ProcessCheck, ProcessIdentity};
 use crate::process_job;
 
 /// How long a stop waits for the processes it ended to actually go.
@@ -324,10 +324,12 @@ fn stop_journal_session(
         .filter_map(|identity| identity.job.as_deref())
         .collect();
     let in_jobs: usize = jobs.iter().map(|job| process_job::active(job)).sum();
+    // A process whose liveness cannot be checked may still be running, so it counts here: the
+    // refusal this guards says "Agora did not start this", which a failed lookup cannot support.
     let alive: Vec<&ProcessIdentity> = details
         .processes
         .iter()
-        .filter(|identity| process_identity::verify(identity).is_ok())
+        .filter(|identity| !matches!(process_identity::check(identity), ProcessCheck::Gone))
         .collect();
     if in_jobs == 0 && alive.is_empty() {
         return Err(InstanceError::NotStartedByAgora(instance_id.to_string()));
@@ -392,7 +394,7 @@ fn terminate_tree(roots: &[&ProcessIdentity]) -> usize {
 
     let mut queue: Vec<Pid> = roots
         .iter()
-        .filter(|identity| process_identity::verify(identity).is_ok())
+        .filter(|identity| process_identity::check(identity) == ProcessCheck::Alive)
         .map(|identity| Pid::from_u32(identity.pid))
         .collect();
 
@@ -441,10 +443,17 @@ fn wait_until_gone(
 ) -> Result<(), InstanceError> {
     let deadline = Instant::now() + timeout;
     loop {
+        // Only a process proven gone counts as ended: one that cannot be checked may still be
+        // running, so the wait goes on until the deadline (and says so). The same holds for a job
+        // whose members could not be counted: a job query that failed is not an empty job.
         if roots
             .iter()
-            .all(|identity| process_identity::verify(identity).is_err())
-            && jobs.iter().all(|job| process_job::active(job) == 0)
+            .all(|identity| process_identity::check(identity) == ProcessCheck::Gone)
+            && jobs.iter().all(|job| {
+                process_job::members(job)
+                    .map(|count| count == 0)
+                    .unwrap_or(false)
+            })
         {
             return Ok(());
         }

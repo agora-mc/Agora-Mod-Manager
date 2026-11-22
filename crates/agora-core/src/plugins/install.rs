@@ -1082,6 +1082,17 @@ pub fn recover_interrupted_installs(
     conn: &rusqlite::Connection,
     paths: &crate::app_paths::AppPaths,
 ) -> LauncherResult<Vec<String>> {
+    recover_interrupted_installs_with(conn, paths, &crate::process_identity::OsProcesses)
+}
+
+/// [`recover_interrupted_installs`], with the process table a journal's recorded writer is checked
+/// against. Production passes the real one; a test passes a stand-in so an answer the OS did not
+/// give can be made to happen (MASTER_SPEC §32.13).
+pub fn recover_interrupted_installs_with(
+    conn: &rusqlite::Connection,
+    paths: &crate::app_paths::AppPaths,
+    view: &dyn crate::process_identity::ProcessView,
+) -> LauncherResult<Vec<String>> {
     let rollback_root = paths.plugin_rollback_root();
     let interrupted = interrupted_installs(&rollback_root)?;
     if interrupted.is_empty() {
@@ -1091,7 +1102,7 @@ pub fn recover_interrupted_installs(
     let mut warnings = Vec::new();
     for (id, has_journal) in interrupted {
         let outcome = if has_journal {
-            recover_one(&locks, conn, paths, &id)
+            recover_one(&locks, conn, paths, &id, view)
         } else {
             // A stash from an Agora that wrote no journal: nothing says which install made it or
             // whether that install finished, so the explicit commands are the way out.
@@ -1128,9 +1139,16 @@ pub fn resolve_installs(
             .map(|(id, _)| id)
             .collect(),
     };
+    // The process table this context asks, so a test can make a "could not tell" happen on the
+    // explicit-command path too (MASTER_SPEC §32.13).
+    let seam = ctx.test_seams.process_view();
+    let view: &dyn crate::process_identity::ProcessView = match seam.as_deref() {
+        Some(view) => view,
+        None => &crate::process_identity::OsProcesses,
+    };
     let mut out = Vec::new();
     for id in ids {
-        let outcome = resolve_interrupted_install(&conn, &ctx.paths, &id, resolution)?;
+        let outcome = resolve_interrupted_install(&conn, &ctx.paths, &id, resolution, view)?;
         out.push((id, outcome));
     }
     Ok(out)
@@ -1147,6 +1165,7 @@ pub fn resolve_interrupted_install(
     paths: &crate::app_paths::AppPaths,
     id: &PluginId,
     resolution: InstallResolution,
+    view: &dyn crate::process_identity::ProcessView,
 ) -> LauncherResult<InstallRecovery> {
     let rollback = paths.plugin_rollback_root().join(id.as_str());
     let destination = package_dir(&paths.plugin_packages_root(), id);
@@ -1162,7 +1181,7 @@ pub fn resolve_interrupted_install(
                 _ => legacy_stash(id),
             });
         }
-        return Ok(recover_one(&locks, conn, paths, id));
+        return Ok(recover_one(&locks, conn, paths, id, view));
     }
     // A person asked for this one: wait for a live install to let go (the caller is an explicit
     // command, not a startup pass), then do exactly what they asked.
@@ -1322,6 +1341,7 @@ fn recover_one(
     conn: &rusqlite::Connection,
     paths: &crate::app_paths::AppPaths,
     id: &PluginId,
+    view: &dyn crate::process_identity::ProcessView,
 ) -> InstallRecovery {
     use crate::recovery::{decide, Decision};
     let destination = package_dir(&paths.plugin_packages_root(), id);
@@ -1334,6 +1354,7 @@ fn recover_one(
         &crate::lock_manager::LockResource::PluginInstall,
         &install_journal_path(paths, id),
         &proof,
+        view,
     );
     match decision {
         Decision::Nothing => InstallRecovery::None,

@@ -1664,11 +1664,15 @@ fn upgrade_delegated_lease(ctx: &Ctx, instance_id: &str, game_dir: &Path) {
         return;
     };
     if lease.identity.as_ref().is_some_and(|identity| {
-        process_identity::verify(identity).is_ok()
-            && identity
-                .expected_exe
-                .as_deref()
-                .is_some_and(|exe| exe.to_ascii_lowercase().contains("java"))
+        // "May still be running" keeps the lease as it is: an answer the OS did not give is not
+        // evidence that this identity is stale (MASTER_SPEC §32.13).
+        !matches!(
+            process_identity::check(identity),
+            process_identity::ProcessCheck::Gone
+        ) && identity
+            .expected_exe
+            .as_deref()
+            .is_some_and(|exe| exe.to_ascii_lowercase().contains("java"))
     }) {
         return;
     }

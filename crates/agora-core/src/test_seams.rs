@@ -55,6 +55,11 @@ struct Seams {
     /// killed process leaves them.
     #[cfg(debug_assertions)]
     install_crash: Mutex<Option<crate::plugins::install::InstallCrashPoint>>,
+    /// The process table a liveness question is answered from, so every source of "could not tell"
+    /// can be made to happen in a test (MASTER_SPEC §32.13).
+    process_view: Mutex<Option<Arc<dyn crate::process_identity::ProcessView>>>,
+    process_view_installed: AtomicBool,
+    process_view_hits: AtomicUsize,
 }
 
 /// Lock a slot, taking the value back from a panic that left it poisoned: a seam is test state, and
@@ -93,6 +98,47 @@ impl TestSeams {
     /// How many times an installed volume stand-in was read with this context.
     pub fn volume_hits(&self) -> usize {
         self.0.volume_hits.load(Ordering::Relaxed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Process table
+// ---------------------------------------------------------------------------
+
+impl TestSeams {
+    /// Stand in for the process table this context's liveness questions are answered from, or
+    /// clear it.
+    ///
+    /// The seam exists because every "could not tell" the process check can return needs a source
+    /// a test can make happen: a failed lookup of the recorded pid, a table that lists nothing, a
+    /// job query that fails (MASTER_SPEC §32.13).
+    pub fn set_process_view(&self, view: Option<Arc<dyn crate::process_identity::ProcessView>>) {
+        let installed = view.is_some();
+        *slot(&self.0.process_view) = view;
+        self.0
+            .process_view_installed
+            .store(installed, Ordering::Release);
+    }
+
+    /// The process table stand-in of this context, empty in production.
+    ///
+    /// One atomic load when none is installed; the lock is taken only when a test installed one,
+    /// which also counts the hit. A test asserts that count went up: a seam the code never
+    /// consulted is a dead seam, not a passing test.
+    pub(crate) fn process_view(&self) -> Option<Arc<dyn crate::process_identity::ProcessView>> {
+        if !self.0.process_view_installed.load(Ordering::Acquire) {
+            return None;
+        }
+        let view = slot(&self.0.process_view).clone();
+        if view.is_some() {
+            self.0.process_view_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        view
+    }
+
+    /// How many times an installed process-table stand-in was read with this context.
+    pub fn process_view_hits(&self) -> usize {
+        self.0.process_view_hits.load(Ordering::Relaxed)
     }
 }
 

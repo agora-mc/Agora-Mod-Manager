@@ -145,11 +145,13 @@ pub fn capture_identity(pid: u32) -> LauncherResult<ProcessIdentity> {
     process_identity::capture(pid)
 }
 
-/// Verify that the captured identity still matches the live OS process.
+/// What the OS says about a captured identity: alive, gone, or that it could not tell.
 ///
 /// This is a pure, synchronous helper intended to be called **outside** the
 /// AppState async mutex.  Pass the [`ProcessIdentity`] you snapshotted from
-/// state and re‑check session freshness after re‑acquiring the lock.
-pub fn verify_identity(identity: &ProcessIdentity) -> LauncherResult<()> {
-    process_identity::verify(identity)
+/// state and re‑check session freshness after re‑acquiring the lock. A caller
+/// must read `CantTell` as "may still be running", never as gone
+/// (MASTER_SPEC §32.13).
+pub fn check_identity(identity: &ProcessIdentity) -> process_identity::ProcessCheck {
+    process_identity::check(identity)
 }

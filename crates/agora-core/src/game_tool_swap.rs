@@ -756,10 +756,9 @@ pub fn recover_store_unlocked(
     // may have died between the spawn and recording the process, so a tool may be running that
     // no record can prove dead. That is a needs-a-hand case, never an automatic restore.
     if journal.spawning
-        && !journal
-            .processes
-            .iter()
-            .any(|process| crate::process_identity::verify(process).is_err())
+        && !journal.processes.iter().any(|process| {
+            crate::process_identity::check(process) == crate::process_identity::ProcessCheck::Gone
+        })
     {
         return Err(SwapError::Stuck(format!(
             "the swap journal {} says a tool was spawning for instance {} and records no provably \
@@ -777,17 +776,20 @@ pub fn recover_store_unlocked(
     Ok(Some(journal))
 }
 
-/// Whether a process the swap recorded is still alive. An external tool runs from outside the
-/// install folder, so the install-folder scan alone would miss it.
+/// Whether a process the swap recorded may still be running. An external tool runs from outside
+/// the install folder, so the install-folder scan alone would miss it. A process whose liveness
+/// cannot be checked counts: refusing a restore is recoverable, restoring under a live tool is not.
 fn recorded_process_running(
     journal: &SwapJournal,
 ) -> Option<&crate::process_identity::ProcessIdentity> {
     journal.processes.iter().find(|process| {
-        crate::process_identity::verify(process).is_ok()
-            || process
-                .job
-                .as_deref()
-                .is_some_and(|job| crate::process_job::active(job) > 0)
+        !matches!(
+            crate::process_identity::check(process),
+            crate::process_identity::ProcessCheck::Gone
+        ) || process
+            .job
+            .as_deref()
+            .is_some_and(|job| crate::process_job::active(job) > 0)
     })
 }
 

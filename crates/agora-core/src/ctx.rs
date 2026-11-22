@@ -827,6 +827,22 @@ impl CoreContext {
     pub fn http_clients(&self) -> &HttpClients {
         &self.http_clients
     }
+
+    /// What the OS says about a recorded process identity (MASTER_SPEC §32.13).
+    ///
+    /// Every liveness question goes through here rather than calling
+    /// [`crate::process_identity::check`] directly, so a test can make each source of "could not
+    /// tell" happen — a failed lookup, an unreadable table, a failed job query — through the seam
+    /// this context carries, without a seam that changes what production does.
+    pub fn process_check(
+        &self,
+        identity: &crate::process_identity::ProcessIdentity,
+    ) -> crate::process_identity::ProcessCheck {
+        if let Some(view) = self.test_seams.process_view() {
+            return crate::process_identity::check_with(identity, &*view);
+        }
+        crate::process_identity::check(identity)
+    }
 }
 
 impl std::fmt::Debug for CoreContext {

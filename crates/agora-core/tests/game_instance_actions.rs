@@ -437,7 +437,7 @@ fn stop_ends_agoras_process_tree_and_not_an_unrelated_process() {
         "the session was not added to the play time: {stopped:?}"
     );
     assert!(
-        process_identity::verify(&identity).is_err(),
+        process_identity::check(&identity) == process_identity::ProcessCheck::Gone,
         "the stopped game is still alive"
     );
     if let Some((pid, start_time)) = child {
@@ -453,7 +453,7 @@ fn stop_ends_agoras_process_tree_and_not_an_unrelated_process() {
         "the normal session end did not run (the journal is still there)"
     );
     assert!(
-        process_identity::verify(&innocent_identity).is_ok(),
+        process_identity::check(&innocent_identity) == process_identity::ProcessCheck::Alive,
         "a process Agora did not start was killed"
     );
 
@@ -979,9 +979,21 @@ fn stop_ends_the_game_after_its_launcher_has_exited() {
     let mut launched = launch_loader_that_exits();
     let (game_pid, game_start) = ping_started_by(launched.pid());
     let _ = launched.child.wait();
-    assert!(
-        process_identity::verify(&launched.identity).is_err(),
+    // The loader itself has exited (its pid is either gone or an exited process the OS still
+    // lists), but the job it made still holds the game it started. So the same identity reads
+    // gone without the job and alive with it: callers must end the job rather than signal a pid
+    // that may belong to someone else (MASTER_SPEC §32.13).
+    let mut loader_only = launched.identity.clone();
+    loader_only.job = None;
+    assert_eq!(
+        process_identity::check(&loader_only),
+        process_identity::ProcessCheck::Gone,
         "the loader is meant to have exited"
+    );
+    assert_eq!(
+        process_identity::check(&launched.identity),
+        process_identity::ProcessCheck::Alive,
+        "the job the loader made still holds the game"
     );
     assert!(is_alive(game_pid, game_start), "the game must outlive it");
     assert!(
@@ -1011,7 +1023,7 @@ fn stop_ends_the_game_after_its_launcher_has_exited() {
         "play time not recorded: {stopped:?}"
     );
     assert!(
-        process_identity::verify(&innocent_identity).is_ok(),
+        process_identity::check(&innocent_identity) == process_identity::ProcessCheck::Alive,
         "a process outside the job was ended"
     );
     let _ = innocent.kill();
@@ -1036,7 +1048,7 @@ fn a_recorded_job_cannot_reach_a_process_that_merely_reuses_a_pid() {
     let result = game_instance::stop(&f.ctx, "grounded-1", &definition());
     assert!(result.is_err(), "{result:?}");
     assert!(
-        process_identity::verify(&stranger_identity).is_ok(),
+        process_identity::check(&stranger_identity) == process_identity::ProcessCheck::Alive,
         "a process whose pid was reused was ended"
     );
     let _ = stranger.kill();

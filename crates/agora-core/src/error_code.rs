@@ -355,6 +355,7 @@ error_codes! {
     PluginsLock = "ERR_PLUGINS_LOCK", GuardAndLocks, 1;
     ProcessCaptureFailed = "ERR_PROCESS_CAPTURE_FAILED", GuardAndLocks, 100;
     ProcessStale = "ERR_PROCESS_STALE", GuardAndLocks, 101;
+    ProcessUnchecked = "ERR_PROCESS_UNCHECKED", GuardAndLocks, 1;
     RuntimeLease = "ERR_RUNTIME_LEASE", GuardAndLocks, 1;
     RuntimeLeaseUnreadable = "ERR_RUNTIME_LEASE_UNREADABLE", GuardAndLocks, 1;
     SessionAlreadyExists = "ERR_SESSION_ALREADY_EXISTS", GuardAndLocks, 1;
