@@ -2181,6 +2181,26 @@ fn floor_stale_message() -> String {
 /// never publish a staged file that a later install replaced, and never deletes
 /// one mid-sequence.
 fn finish_staged_publication(app_data_dir: &Path, trust: &TrustSnapshot) -> LauncherResult<()> {
+    let locks = LockManager::new(app_data_dir.join("locks"));
+    let Ok(_guard) = locks.acquire_with_timeout(
+        crate::lock_manager::LockResource::RegistryUpdate,
+        "registry-open-recovery",
+        Duration::ZERO,
+        None,
+    ) else {
+        // Another process is publishing. Its staged file is its own; this open
+        // opens what verifies (or refuses with the state's own message) without
+        // touching anything.
+        return Ok(());
+    };
+    finish_staged_publication_locked(app_data_dir, trust)
+}
+
+/// [`finish_staged_publication`] with the lock already held.
+fn finish_staged_publication_locked(
+    app_data_dir: &Path,
+    trust: &TrustSnapshot,
+) -> LauncherResult<()> {
     let floor = read_floor_file(app_data_dir)?;
     let staged = staged_bundle_path(app_data_dir)?;
     if !staged.exists() {
@@ -4949,6 +4969,142 @@ mod tests {
         )
         .expect_err("a bundle older than the floor is refused");
         assert_eq!(error.code(), "ERR_REGISTRY_ROLLBACK", "{error}");
+    }
+
+    /// Finishing a publication writes files an installer owns for its whole
+    /// sequence, so an open that finds the registry-update lock taken leaves the
+    /// staged file exactly as it is and decides from what is on disk.
+    #[test]
+    fn an_open_while_an_install_holds_the_lock_leaves_the_staged_file_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(226);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let first_payload = sample_db_with_built_at("2026-11-15T12:00:00+00:00");
+        let first_header = header_for(
+            &key,
+            &first_payload,
+            "2026-11-15T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let first = signed_bundle(&key, &first_header, &first_payload);
+        install_bundle_bytes_checked(dir.path(), &first, &trust, "first").unwrap();
+
+        // An installer between its staging write and its floor write.
+        let second_payload = sample_db_with_built_at("2026-11-17T12:00:00+00:00");
+        let second_header = header_for(
+            &key,
+            &second_payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let second = signed_bundle(&key, &second_header, &second_payload);
+        let staged = paths::registry_bundle_staged_path(dir.path()).unwrap();
+        fs::write(&staged, &second).unwrap();
+        let installer = LockManager::new(dir.path().join("locks"));
+        let guard = installer
+            .acquire(
+                crate::lock_manager::LockResource::RegistryUpdate,
+                "test-install",
+            )
+            .unwrap();
+
+        // The open must not wait for the installer, publish its bytes, or drop
+        // them: it opens what verifies and touches nothing.
+        assert!(open_verified_registry_with_trust(dir.path(), &trust).is_ok());
+        assert_eq!(
+            fs::read(&staged).unwrap(),
+            second,
+            "the installer's staged file is left alone"
+        );
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            first,
+            "nothing is published while another process installs"
+        );
+        assert_eq!(
+            read_floor_file(dir.path()).unwrap().unwrap().built_at,
+            "2026-11-15T12:00:00+00:00"
+        );
+
+        // Once the installer releases the lock, the publication is finished.
+        drop(guard);
+        assert!(open_verified_registry_with_trust(dir.path(), &trust).is_ok());
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            second
+        );
+        assert!(!staged.exists());
+    }
+
+    /// An open cannot take a publication over from a process that is running
+    /// one: with the lock held, it neither publishes nor deletes the staged
+    /// bytes, and refuses the state it cannot repair rather than opening a
+    /// catalog whose signer is revoked.
+    #[test]
+    fn an_open_while_an_install_holds_the_lock_does_not_publish() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let recovery = test_key(227);
+        let old = test_key(228);
+        let new = test_key(229);
+        let trust = RegistryTrust::with_roles([
+            (RegistryKeyRole::Recovery, test_public(&recovery)),
+            (RegistryKeyRole::Primary, test_public(&old)),
+        ]);
+        let first_payload = sample_db_with_built_at("2026-11-15T12:00:00+00:00");
+        let first_header = header_for(
+            &old,
+            &first_payload,
+            "2026-11-15T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&old, &first_header, &first_payload),
+            &trust,
+            "first",
+        )
+        .unwrap();
+        let second_payload = sample_db_with_built_at("2026-11-17T12:00:00+00:00");
+        let mut second_header = header_for(
+            &new,
+            &second_payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        second_header
+            .certificates
+            .push(certificate(&recovery, &test_public(&new)));
+        second_header.revocations.push(revocation(&recovery, &old));
+        let second = signed_bundle(&new, &second_header, &second_payload);
+        crash_at(dir.path(), CrashPoint::BytesStaged);
+        install_bundle_bytes_checked(dir.path(), &second, &trust, "second")
+            .expect_err("the injected crash stops the install");
+
+        let staged = paths::registry_bundle_staged_path(dir.path()).unwrap();
+        let installer = LockManager::new(dir.path().join("locks"));
+        let guard = installer
+            .acquire(
+                crate::lock_manager::LockResource::RegistryUpdate,
+                "test-install",
+            )
+            .unwrap();
+        let error = open_verified_registry_with_trust(dir.path(), &trust)
+            .err()
+            .expect("an opener must not publish another process's staged bundle");
+        assert_eq!(
+            error.code(),
+            "ERR_REGISTRY_SIGNATURE_INVALID",
+            "the installed catalog's signer is revoked and the staged rotation is not this open's to publish: {error}"
+        );
+        assert_eq!(
+            fs::read(&staged).unwrap(),
+            second,
+            "the staged file is left for its installer"
+        );
+
+        drop(guard);
+        assert!(open_verified_registry_with_trust(dir.path(), &trust).is_ok());
+        assert!(!staged.exists());
     }
 
     /// An open publishes only what is on disk while it holds the lock: a staged
