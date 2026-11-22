@@ -13,7 +13,7 @@ use agora_core::game_discovery::{DiscoveredInstall, InstallCapabilities};
 use agora_core::game_instance::{self, GameInstanceManifest};
 use agora_core::game_registry::{GameRegistry, IdentifiedInstall, RuntimeResolution};
 use agora_core::game_tool_copy::CopyKind;
-use agora_core::game_tool_swap::{self as swap, SwapJournal, VolumeSeam};
+use agora_core::game_tool_swap::{self as swap, SwapJournal};
 use agora_core::lock_manager::{LockManager, LockResource};
 use agora_core::startup_recovery::{run_at_startup, StartupRecoveryReport};
 use agora_game_api::{
@@ -335,26 +335,6 @@ fn names(dir: &Path) -> Vec<String> {
     out
 }
 
-/// Hold the seam that says the copy is on the install's volume for the whole test. It belongs to
-/// the fixture's context, so no other test's swap sees it.
-struct SwapSeam(agora_core::ctx::CoreContext);
-
-impl SwapSeam {
-    fn same_volume(ctx: &agora_core::ctx::CoreContext) -> Self {
-        ctx.test_seams.set_volume_seam(Some(VolumeSeam {
-            same_volume: Some(true),
-            free_bytes: Some(u64::MAX),
-        }));
-        SwapSeam(ctx.clone())
-    }
-}
-
-impl Drop for SwapSeam {
-    fn drop(&mut self) {
-        self.0.test_seams.set_volume_seam(None);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tool swaps
 // ---------------------------------------------------------------------------
@@ -365,8 +345,6 @@ impl Drop for SwapSeam {
 #[test]
 fn the_startup_pass_puts_back_an_interrupted_tool_swap() {
     let f = swap_fixture();
-    // The seam belongs to the fixture's context: installed once it exists.
-    let _seam = SwapSeam::same_volume(&f.ctx);
     let before = snapshot(&real_data(&f));
     crash_after(&f, 6, CopyKind::Kept, "crash");
     assert!(journal_file(&f).exists());
@@ -399,8 +377,6 @@ fn the_startup_pass_puts_back_an_interrupted_tool_swap() {
 #[test]
 fn the_startup_pass_leaves_a_swap_alone_while_another_process_holds_its_lock() {
     let f = swap_fixture();
-    // The seam belongs to the fixture's context: installed once it exists.
-    let _seam = SwapSeam::same_volume(&f.ctx);
     let before = snapshot(&real_data(&f));
     let journal = crash_after(&f, 6, CopyKind::Kept, "live");
 
@@ -456,8 +432,6 @@ fn the_startup_pass_leaves_a_swap_alone_while_another_process_holds_its_lock() {
 #[test]
 fn a_swap_journal_that_needs_a_hand_is_reported_not_raised() {
     let f = swap_fixture();
-    // The seam belongs to the fixture's context: installed once it exists.
-    let _seam = SwapSeam::same_volume(&f.ctx);
     let victim = f._tmp.path().join("victim");
     std::fs::create_dir_all(&victim).unwrap();
     std::fs::write(victim.join("keep.txt"), b"keep").unwrap();

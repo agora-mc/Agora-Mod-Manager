@@ -2880,20 +2880,48 @@ fn path_key(path: &str) -> String {
     fold_path_case(path)
 }
 
-/// Stop the in-place update here if the context's test seam asks for it. The seam belongs to the
-/// context, so it reaches the update wherever the operation runs.
-fn update_fault_point(ctx: &Ctx) -> Result<(), DeployError> {
-    if ctx.test_seams.in_place_fault_point() {
-        return Err(DeployError::Other(
-            "injected stop during an in-place update".into(),
-        ));
-    }
-    Ok(())
+/// One in-place update's claim on the context's armed test stop, and the record of whether it
+/// stopped this update.
+///
+/// The stop is claimed from the context by the update that runs, so it cannot be spent by another
+/// update sharing the context: two instances updated at once on clones of one context each get
+/// their own, and an update that fails for its own reasons does not discard its farm because some
+/// other update was stopped.
+struct InPlaceStop {
+    /// Changes still to make before the armed stop fires; `None` when nothing is armed for this
+    /// update, which is always the case in production.
+    changes_left: Option<usize>,
+    /// Whether this update stopped at the seam.
+    stopped: bool,
 }
 
-/// Whether the seam stopped the update that just failed. Clears the flag.
-fn take_simulated_stop(ctx: &Ctx) -> bool {
-    ctx.test_seams.take_in_place_stop()
+impl InPlaceStop {
+    /// Claim the context's armed stop for this update. One atomic load when nothing is armed.
+    fn claim(ctx: &Ctx) -> Self {
+        Self {
+            changes_left: ctx.test_seams.claim_update_fault(),
+            stopped: false,
+        }
+    }
+
+    /// Stop the update here if it claims a stop at this change.
+    fn fault_point(&mut self, ctx: &Ctx) -> Result<(), DeployError> {
+        match self.changes_left {
+            Some(0) => {
+                self.changes_left = None;
+                self.stopped = true;
+                ctx.test_seams.note_update_stop();
+                Err(DeployError::Other(
+                    "injected stop during an in-place update".into(),
+                ))
+            }
+            Some(remaining) => {
+                self.changes_left = Some(remaining - 1);
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
 }
 
 /// The changes an in-place update makes to a farm: the recorded files it keeps (by path key), the
@@ -3123,10 +3151,13 @@ fn apply_in_place(
     // The record is set aside before the first change. From here, a stop leaves the marker behind.
     std::fs::rename(&record_path, &marker)?;
 
-    match apply_marked(ctx, deployment_dir, update) {
+    // This update's own claim on the context's armed test stop: an update that was not stopped
+    // discards its half-done farm even when another update sharing the context was.
+    let mut stop = InPlaceStop::claim(ctx);
+    match apply_marked(ctx, deployment_dir, update, &mut stop) {
         Ok(applied) => Ok(applied),
         Err(err) => {
-            if !take_simulated_stop(ctx) {
+            if !stop.stopped {
                 // Best effort: if this fails the marker is still there, and the next deploy discards it.
                 let _ = discard_untrusted_farm(deployment_dir);
             }
@@ -3141,6 +3172,7 @@ fn apply_marked(
     ctx: &Ctx,
     deployment_dir: &Path,
     update: InPlaceUpdate,
+    stop: &mut InPlaceStop,
 ) -> Result<InPlaceApplied, DeployError> {
     let game_dir = deployment_dir.join("game");
     let record_path = deployment_dir.join("deployment.json");
@@ -3157,10 +3189,10 @@ fn apply_marked(
     } = update;
 
     for rel in &remove {
-        update_fault_point(ctx)?;
+        stop.fault_point(ctx)?;
         remove_farm_file(&game_dir, rel)?;
     }
-    update_fault_point(ctx)?;
+    stop.fault_point(ctx)?;
     let placed = place_files(ctx, &place, &game_dir)?;
     remove_emptied_folders(&game_dir, &remove);
 

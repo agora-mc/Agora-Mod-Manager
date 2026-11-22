@@ -2057,7 +2057,6 @@ fn a_swap_whose_costs_were_not_acknowledged_is_refused_by_core_and_touches_nothi
     let mut tool = writes_or_fails("nemesis");
     tool.uses_install_path = true;
     let f = swap_fixture(vec![tool]);
-    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let install = install_dir(&f);
     let before = snapshot(&real_data(&f));
     let entries_before = names(&install);
@@ -2824,17 +2823,24 @@ static SWAP_SPAWN_MARK: Mutex<()> = Mutex::new(());
 
 /// The volume the swap tests pretend to be on. It is installed on the test's own context, so a
 /// parallel test's swap cannot see it and no lock is needed.
-struct SwapTest(VolumeSeam);
+///
+/// Dropping it checks the seam was consulted: a test that installs a stand-in the code never reads
+/// is a dead seam, and passing silently would hide exactly the regression these tests exist for.
+struct SwapTest {
+    seam: VolumeSeam,
+    armed: Option<(CoreContext, usize)>,
+}
 
 impl SwapTest {
     /// Arm the seam on the context the operation runs with.
-    fn arm(self, ctx: &CoreContext) -> Self {
-        ctx.test_seams.set_volume_seam(Some(self.0));
+    fn arm(mut self, ctx: &CoreContext) -> Self {
+        ctx.test_seams.set_volume_seam(Some(self.seam));
+        self.armed = Some((ctx.clone(), ctx.test_seams.volume_hits()));
         self
     }
 
     fn with(seam: VolumeSeam) -> Self {
-        Self(seam)
+        Self { seam, armed: None }
     }
 
     /// The copy is kept on the install's volume: the normal case.
@@ -2851,6 +2857,22 @@ impl SwapTest {
             same_volume: Some(false),
             free_bytes: None,
         })
+    }
+}
+
+impl Drop for SwapTest {
+    fn drop(&mut self) {
+        // A failing test is already unwinding; a second panic here would abort the run.
+        if std::thread::panicking() {
+            return;
+        }
+        let Some((ctx, before)) = self.armed.take() else {
+            return;
+        };
+        assert!(
+            ctx.test_seams.volume_hits() > before,
+            "the volume stand-in was installed but never consulted: a dead seam"
+        );
     }
 }
 
@@ -3358,7 +3380,6 @@ fn a_crash_on_another_volume_is_put_back_and_the_per_run_copy_is_deleted() {
 
 fn crash_case(step: u8, kind: CopyKind) {
     let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
-    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let install = install_dir(&f);
     let before = snapshot(&real_data(&f));
     crash_after(&f, step, kind, "crash");
@@ -3376,7 +3397,6 @@ fn crash_case(step: u8, kind: CopyKind) {
 
 fn crash_case_on_other_volume(step: u8) {
     let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
-    let _swap = SwapTest::different_volume().arm(&f.ctx);
     let install = install_dir(&f);
     let before = snapshot(&real_data(&f));
     crash_after(&f, step, CopyKind::PerRun, "crashpr");
@@ -3410,7 +3430,6 @@ fn a_crashed_swap_is_put_back_by_a_run_before_it_starts() {
 #[test]
 fn a_journal_whose_copy_points_at_a_victim_folder_stops_recovery_and_touches_nothing() {
     let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
-    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let victim = f._tmp.path().join("victim");
     std::fs::create_dir_all(&victim).unwrap();
     std::fs::write(victim.join("keep.txt"), b"keep").unwrap();
@@ -3436,7 +3455,6 @@ fn a_journal_whose_copy_points_at_a_victim_folder_stops_recovery_and_touches_not
 #[test]
 fn a_copy_without_a_matching_marker_stops_recovery_before_anything_moves() {
     let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
-    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let journal = journal_of(&f, "stranger", CopyKind::Kept);
     swap::write_journal(&f.ctx, &journal).unwrap();
     std::fs::rename(real_data(&f), aside_named(&f, "stranger")).unwrap();
@@ -4406,7 +4424,6 @@ fn a_tool_that_overwrites_a_file_in_another_mod_is_still_refused_under_links() {
         ),
         "Data/Tool/Tool.exe",
     )]);
-    let _swap = SwapTest::same_volume().arm(&f.ctx);
     f.add_mod("Owner mod", &[("Data/Tool/Tool.exe", cmd.as_slice())]);
     let other = f.add_mod("Other mod", &[("Data/Other/x.txt", b"keep")]);
     let before = f.content_bytes(&other, "Data/Other/x.txt");
@@ -7484,7 +7501,6 @@ fn ask_mode_never_runs_unasked() {
 #[test]
 fn recovery_waits_for_an_external_tool_the_swap_recorded() {
     let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
-    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let mut busy = Command::new(r"C:\Windows\System32\cmd.exe")
         .args(["/c", "ping", "-n", "60", "127.0.0.1"])
         .stdout(Stdio::null())

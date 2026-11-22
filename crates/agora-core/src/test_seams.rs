@@ -27,14 +27,24 @@ pub struct TestSeams(Arc<Seams>);
 
 /// The seam slots. Every slot is empty in production; a seam is read under a short lock (or an
 /// atomic for the counters), which is far below the cost of the I/O each one sits beside.
+///
+/// Each installed hook also has an adjacent atomic saying it is installed, so the check a
+/// production operation makes on every pass is one atomic load and no lock.
 #[derive(Default)]
 struct Seams {
     volume: Mutex<Option<VolumeSeam>>,
+    volume_installed: AtomicBool,
+    volume_hits: AtomicUsize,
     run_hook: Mutex<Option<RunHook>>,
+    run_hook_installed: AtomicBool,
+    run_hook_hits: AtomicUsize,
     write_fault: Mutex<Option<WriteFaultHook>>,
+    write_fault_installed: AtomicBool,
+    write_fault_hits: AtomicUsize,
     plan_calls: AtomicUsize,
-    in_place_fault: Mutex<Option<usize>>,
-    in_place_stopped: AtomicBool,
+    update_fault: Mutex<Option<usize>>,
+    update_fault_armed: AtomicBool,
+    update_stops: AtomicUsize,
     #[cfg(debug_assertions)]
     base_build_pauses: Mutex<Vec<Arc<BaseBuildPause>>>,
     #[cfg(debug_assertions)]
@@ -57,11 +67,28 @@ impl TestSeams {
     /// Stand in for the volume check and the free space of this context's operations, or clear it.
     pub fn set_volume_seam(&self, seam: Option<VolumeSeam>) {
         *slot(&self.0.volume) = seam;
+        self.0
+            .volume_installed
+            .store(seam.is_some(), Ordering::Release);
     }
 
     /// The volume stand-in of this context, empty in production.
+    ///
+    /// One atomic load when no stand-in is installed; the lock is taken only when a test installed
+    /// one, which also counts the hit. A test asserts that count went up: an installation the code
+    /// never consulted is a dead seam, not a passing test.
     pub(crate) fn volume_seam(&self) -> VolumeSeam {
-        slot(&self.0.volume).unwrap_or_default()
+        if !self.0.volume_installed.load(Ordering::Acquire) {
+            return VolumeSeam::default();
+        }
+        let seam = slot(&self.0.volume).unwrap_or_default();
+        self.0.volume_hits.fetch_add(1, Ordering::Relaxed);
+        seam
+    }
+
+    /// How many times an installed volume stand-in was read with this context.
+    pub fn volume_hits(&self) -> usize {
+        self.0.volume_hits.load(Ordering::Relaxed)
     }
 }
 
@@ -72,7 +99,11 @@ impl TestSeams {
 impl TestSeams {
     /// Install the hook that fires at the swap's windows, or clear it.
     pub fn set_run_hook(&self, hook: Option<RunHook>) {
+        let installed = hook.is_some();
         *slot(&self.0.run_hook) = hook;
+        self.0
+            .run_hook_installed
+            .store(installed, Ordering::Release);
     }
 
     /// Clear the run hook.
@@ -82,7 +113,11 @@ impl TestSeams {
 
     /// Install the hook that makes chosen journal writes fail, or clear it.
     pub fn set_write_fault_hook(&self, hook: Option<WriteFaultHook>) {
+        let installed = hook.is_some();
         *slot(&self.0.write_fault) = hook;
+        self.0
+            .write_fault_installed
+            .store(installed, Ordering::Release);
     }
 
     /// Clear the journal write-fault hook.
@@ -90,16 +125,42 @@ impl TestSeams {
         self.set_write_fault_hook(None);
     }
 
-    /// The run hook of this context, cloned out so a hook may install or clear one.
+    /// The run hook of this context, cloned out so a hook may install or clear one. One atomic load
+    /// when none is installed, and every time the hook is handed out counts one hit.
     pub(crate) fn run_hook(&self) -> Option<RunHook> {
-        slot(&self.0.run_hook).clone()
+        if !self.0.run_hook_installed.load(Ordering::Acquire) {
+            return None;
+        }
+        let hook = slot(&self.0.run_hook).clone();
+        if hook.is_some() {
+            self.0.run_hook_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        hook
+    }
+
+    /// How many times an installed run hook fired with this context.
+    pub fn run_hook_hits(&self) -> usize {
+        self.0.run_hook_hits.load(Ordering::Relaxed)
     }
 
     /// Whether a journal write to `path` fails right now. `false` unless this context's test
-    /// installed a fault hook that names the path.
+    /// installed a fault hook that names the path. One atomic load when none is installed; a write
+    /// the hook fails counts one hit.
     pub fn write_fault_fires(&self, path: &Path) -> bool {
+        if !self.0.write_fault_installed.load(Ordering::Acquire) {
+            return false;
+        }
         let hook = slot(&self.0.write_fault).clone();
-        hook.is_some_and(|hook| hook(path))
+        let fires = hook.is_some_and(|hook| hook(path));
+        if fires {
+            self.0.write_fault_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        fires
+    }
+
+    /// How many journal writes an installed fault hook made fail with this context.
+    pub fn write_fault_hits(&self) -> usize {
+        self.0.write_fault_hits.load(Ordering::Relaxed)
     }
 }
 
@@ -123,29 +184,36 @@ impl TestSeams {
     /// has made `changes` changes to the farm and leaves its marker behind, as a process stop
     /// would. `None` turns the seam off.
     pub fn set_update_fault_after(&self, changes: Option<usize>) {
-        *slot(&self.0.in_place_fault) = changes;
+        *slot(&self.0.update_fault) = changes;
+        self.0
+            .update_fault_armed
+            .store(changes.is_some(), Ordering::Release);
     }
 
-    /// Whether this is the point to stop an in-place update, counting one change down.
-    pub(crate) fn in_place_fault_point(&self) -> bool {
-        let mut left = slot(&self.0.in_place_fault);
-        match *left {
-            Some(0) => {
-                *left = None;
-                self.0.in_place_stopped.store(true, Ordering::SeqCst);
-                true
-            }
-            Some(remaining) => {
-                *left = Some(remaining - 1);
-                false
-            }
-            None => false,
+    /// Take the armed stop for one in-place update.
+    ///
+    /// The update that claims it is the only one the stop can reach: a second update run on a
+    /// clone of the same context gets `None`, so one update's stops can never be spent by another
+    /// (two instances updated at once share the context, not the stop).
+    pub(crate) fn claim_update_fault(&self) -> Option<usize> {
+        if !self.0.update_fault_armed.load(Ordering::Acquire) {
+            return None;
         }
+        let claimed = slot(&self.0.update_fault).take();
+        if claimed.is_none() {
+            self.0.update_fault_armed.store(false, Ordering::Release);
+        }
+        claimed
     }
 
-    /// Whether the seam stopped the update that just failed. Clears the flag.
-    pub(crate) fn take_in_place_stop(&self) -> bool {
-        self.0.in_place_stopped.swap(false, Ordering::SeqCst)
+    /// Count one stop the armed fault made.
+    pub(crate) fn note_update_stop(&self) {
+        self.0.update_stops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many in-place updates the armed fault stopped with this context.
+    pub fn update_stops(&self) -> usize {
+        self.0.update_stops.load(Ordering::Relaxed)
     }
 }
 

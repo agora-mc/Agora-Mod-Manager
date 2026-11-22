@@ -2032,7 +2032,13 @@ fn f1e_late_merge_failure_cleans_up_and_retry_succeeds() {
 
 /// The free-space stand-in, installed on the fixture's own context: a seam belongs to the context
 /// it is installed on, so a parallel test's import cannot see it.
-struct VolumeSeamGuard(agora_core::ctx::CoreContext);
+///
+/// Dropping it checks the stand-in was consulted: an import that never reads it would pass while
+/// testing nothing.
+struct VolumeSeamGuard {
+    ctx: agora_core::ctx::CoreContext,
+    hits_before: usize,
+}
 
 impl VolumeSeamGuard {
     fn set(ctx: &agora_core::ctx::CoreContext, free_bytes: u64) -> Self {
@@ -2041,13 +2047,24 @@ impl VolumeSeamGuard {
                 same_volume: None,
                 free_bytes: Some(free_bytes),
             }));
-        Self(ctx.clone())
+        Self {
+            ctx: ctx.clone(),
+            hits_before: ctx.test_seams.volume_hits(),
+        }
     }
 }
 
 impl Drop for VolumeSeamGuard {
     fn drop(&mut self) {
-        self.0.test_seams.set_volume_seam(None);
+        self.ctx.test_seams.set_volume_seam(None);
+        // A failing test is already unwinding; a second panic here would abort the run.
+        if std::thread::panicking() {
+            return;
+        }
+        assert!(
+            self.ctx.test_seams.volume_hits() > self.hits_before,
+            "the free-space stand-in was installed but never consulted: a dead seam"
+        );
     }
 }
 

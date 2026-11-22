@@ -358,6 +358,9 @@ fn deploy_and_launch_timings() {
     let ((planned, t_plan), plans_plan) = plans_during(&ctx, || {
         timed(|| plan(&ctx, &id_a, &def, DeployMode::Links).unwrap())
     });
+    // A step that was meant to plan and did not would print a fast time and count zero plans; the
+    // table would read as a measurement of nothing.
+    assert!(plans_plan > 0, "the plan step ran no planner");
     let planned_files = planned.files.len();
 
     // First link deploy: builds the farm.
@@ -424,6 +427,10 @@ fn deploy_and_launch_timings() {
     assert!(
         matches!(outcome_inc, DeployOutcome::Built { .. }),
         "{outcome_inc:?}"
+    );
+    assert!(
+        plans_inc > 0,
+        "the in-place update step ran no planner; the row would measure nothing"
     );
     let (_, t_undeploy) = timed(|| undeploy(&ctx, &id_a).unwrap());
     let (outcome_full, t_full) = timed(|| deploy(&ctx, &id_a, &def, DeployMode::Links).unwrap());

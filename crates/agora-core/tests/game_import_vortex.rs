@@ -1386,6 +1386,7 @@ fn an_import_that_cannot_fit_is_refused_after_stating_the_bytes() {
     assert!(plan.bytes > 0);
     assert!(plan.fits, "the real disk has room");
 
+    let hits_before = f.ctx.test_seams.volume_hits();
     f.ctx
         .test_seams
         .set_volume_seam(Some(agora_core::game_tool_swap::VolumeSeam {
@@ -1403,6 +1404,10 @@ fn an_import_that_cannot_fit_is_refused_after_stating_the_bytes() {
     )
     .expect_err("one byte cannot hold the merge");
     f.ctx.test_seams.set_volume_seam(None);
+    assert!(
+        f.ctx.test_seams.volume_hits() > hits_before,
+        "the free-space stand-in was installed but never consulted"
+    );
     assert!(
         matches!(error, ImportError::NotEnoughSpace { .. }),
         "{error}"
@@ -1576,6 +1581,7 @@ fn preflight_counts_the_shared_mods_once_and_copied_saves_once_per_profile() {
         plan.bytes,
         plan.plans[0].bytes + ini_bytes + b"SAVE ONE".len() as u64
     );
+    let hits_before = f.ctx.test_seams.volume_hits();
     f.ctx
         .test_seams
         .set_volume_seam(Some(agora_core::game_tool_swap::VolumeSeam {
@@ -1585,6 +1591,10 @@ fn preflight_counts_the_shared_mods_once_and_copied_saves_once_per_profile() {
     let error = vortex::run(&f.ctx, &f.inventory, &request, Default::default(), &|_| {})
         .expect_err("the single-profile import also checks the requested saves before copying");
     f.ctx.test_seams.set_volume_seam(None);
+    assert!(
+        f.ctx.test_seams.volume_hits() > hits_before,
+        "the free-space stand-in was installed but never consulted"
+    );
     assert!(matches!(error, ImportError::NotEnoughSpace { needed, .. } if needed == plan.bytes));
     assert!(agora_core::game_instance::list(&f.ctx).unwrap().is_empty());
 }
