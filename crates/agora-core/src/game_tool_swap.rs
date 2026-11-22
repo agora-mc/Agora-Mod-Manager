@@ -25,7 +25,6 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use agora_game_api::fold_path_case;
 use agora_game_api::{BaseReference, GameDefinition};
@@ -130,30 +129,13 @@ pub struct SwapLocation {
     pub store: String,
 }
 
-/// A test seam: overrides the volume check and the free space for every swap in this process, until
-/// it is set back to `None`. Production never sets it.
+/// A test seam: stands in for the volume check and the free space of the context it is installed
+/// on, until it is set back to `None`. Production never sets it.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VolumeSeam {
     pub same_volume: Option<bool>,
     pub free_bytes: Option<u64>,
-}
-
-static SEAM: Mutex<Option<VolumeSeam>> = Mutex::new(None);
-
-/// Set or clear the volume seam (see [`VolumeSeam`]). Tests that set it must run one at a time.
-#[doc(hidden)]
-pub fn set_volume_seam(seam: Option<VolumeSeam>) {
-    if let Ok(mut guard) = SEAM.lock() {
-        *guard = seam;
-    }
-}
-
-fn seam() -> VolumeSeam {
-    SEAM.lock()
-        .ok()
-        .and_then(|guard| *guard)
-        .unwrap_or_default()
 }
 
 /// Where in a swap run the test hook fires.
@@ -173,67 +155,31 @@ pub enum RunHookPoint {
     BeforeSpawningMark,
 }
 
+/// The hook a test installs on a context to see the swap's windows.
 #[doc(hidden)]
-type RunHook = std::sync::Arc<dyn Fn(&Ctx, Option<&SwapJournal>, RunHookPoint) + Send + Sync>;
+pub type RunHook = std::sync::Arc<dyn Fn(&Ctx, Option<&SwapJournal>, RunHookPoint) + Send + Sync>;
 
-// Each test seam is thread-local: a hook fires only on the thread that set it, and parallel
-// tests in one process (`cargo test` runs tests as threads) each keep their own hook. A single
-// global slot let one test's hook overwrite another's, so a hook a test relied on never fired.
-thread_local! {
-    static RUN_HOOK: std::cell::RefCell<Option<RunHook>> = const { std::cell::RefCell::new(None) };
-    static WRITE_FAULT_HOOK: std::cell::RefCell<Option<WriteFaultHook>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Set or clear the run hook (a test seam; production never sets it). The hook fires only on the
-/// thread that sets it. Tests that set it must still run their tool runs on this thread.
+/// A test seam that makes journal writes fail: the hook returns `true` for a journal path whose
+/// write should fail.
 #[doc(hidden)]
-pub fn set_run_hook(hook: Option<RunHook>) {
-    RUN_HOOK.with(|slot| *slot.borrow_mut() = hook);
-}
+pub type WriteFaultHook = std::sync::Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 
-/// Clear this thread's run hook. Another thread's hook is untouched.
-#[doc(hidden)]
-pub fn clear_run_hook() {
-    RUN_HOOK.with(|slot| *slot.borrow_mut() = None);
-}
-
-/// Fire the run hook at `point`, when a test on this thread set one. `journal` is the swap
+/// Fire the run hook of `ctx` at `point`, when a test installed one on it. `journal` is the swap
 /// journal of the run, when the run has one (the links and VFS paths have only the user-files
-/// session journal). Production never sets a hook, so this does nothing.
+/// session journal). Production never installs a hook, so this does nothing.
 #[doc(hidden)]
 pub fn run_hook(ctx: &Ctx, journal: Option<&SwapJournal>, point: RunHookPoint) {
-    // Clone out of the cell before calling, so a hook may itself set or clear hooks.
-    let hook = RUN_HOOK.with(|slot| slot.borrow().clone());
+    let hook = ctx.test_seams.run_hook();
     if let Some(hook) = hook {
         hook(ctx, journal, point);
     }
 }
 
-/// A test seam that makes journal writes fail: the hook returns `true` for a journal path
-/// whose write should fail. Thread-local, like the run hook.
+/// Whether a journal write to `path` fails right now (a test installed a fault hook on `seams`
+/// that names the path). Production never installs a hook, so this is always `false`.
 #[doc(hidden)]
-type WriteFaultHook = std::sync::Arc<dyn Fn(&Path) -> bool + Send + Sync>;
-
-/// Set or clear the journal write-fault hook (a test seam; production never sets it). The hook
-/// fires only on the thread that sets it.
-#[doc(hidden)]
-pub fn set_write_fault_hook(hook: Option<WriteFaultHook>) {
-    WRITE_FAULT_HOOK.with(|slot| *slot.borrow_mut() = hook);
-}
-
-/// Clear this thread's write-fault hook.
-#[doc(hidden)]
-pub fn clear_write_fault_hook() {
-    WRITE_FAULT_HOOK.with(|slot| *slot.borrow_mut() = None);
-}
-
-/// Whether a journal write to `path` fails right now (a test on this thread set a fault hook
-/// that names the path). Production never sets a hook, so this is always `false`.
-#[doc(hidden)]
-pub fn write_fault_fires(path: &Path) -> bool {
-    let hook = WRITE_FAULT_HOOK.with(|slot| slot.borrow().clone());
-    hook.is_some_and(|hook| hook(path))
+pub fn write_fault_fires(seams: &crate::test_seams::TestSeams, path: &Path) -> bool {
+    seams.write_fault_fires(path)
 }
 
 /// The journal file of one game and store.
@@ -245,9 +191,9 @@ pub fn journal_path(ctx: &Ctx, game: &str, store: &str) -> PathBuf {
 /// appears under its final name only once they are.
 pub fn write_journal(ctx: &Ctx, journal: &SwapJournal) -> Result<(), SwapError> {
     let path = journal_path(ctx, &journal.game, &journal.store);
-    // Test seam only: `write_fault_fires` is false unless a test on this thread installed a
-    // fault hook, so production writes never fail here.
-    if write_fault_fires(&path) {
+    // Test seam only: `write_fault_fires` is false unless the context's test installed a fault
+    // hook, so production writes never fail here.
+    if write_fault_fires(&ctx.test_seams, &path) {
         return Err(SwapError::Io(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "journal write fault injected by the test hook",
@@ -408,8 +354,8 @@ fn volume_key(path: &Path) -> Option<String> {
 
 /// Whether two paths are on the same volume. An unknown volume is treated as a different one, which
 /// is the choice that always works (a per-run copy needs no rename across volumes).
-pub fn same_volume(a: &Path, b: &Path) -> bool {
-    if let Some(same) = seam().same_volume {
+pub fn same_volume(seams: &crate::test_seams::TestSeams, a: &Path, b: &Path) -> bool {
+    if let Some(same) = seams.volume_seam().same_volume {
         return same;
     }
     match (volume_key(a), volume_key(b)) {
@@ -420,8 +366,8 @@ pub fn same_volume(a: &Path, b: &Path) -> bool {
 
 /// The free bytes available to this user on the volume of `path`, or `None` when they cannot be read.
 #[cfg(windows)]
-pub fn available_bytes(path: &Path) -> Option<u64> {
-    if let Some(free) = seam().free_bytes {
+pub fn available_bytes(seams: &crate::test_seams::TestSeams, path: &Path) -> Option<u64> {
+    if let Some(free) = seams.volume_seam().free_bytes {
         return Some(free);
     }
     use std::os::windows::ffi::OsStrExt;
@@ -446,8 +392,8 @@ pub fn available_bytes(path: &Path) -> Option<u64> {
 }
 
 #[cfg(not(windows))]
-pub fn available_bytes(path: &Path) -> Option<u64> {
-    seam().free_bytes.filter(|_| path.exists())
+pub fn available_bytes(seams: &crate::test_seams::TestSeams, path: &Path) -> Option<u64> {
+    seams.volume_seam().free_bytes.filter(|_| path.exists())
 }
 
 /// Bytes in words for a message: "12.4 GB", "830 MB", "512 bytes".
@@ -529,6 +475,7 @@ pub struct SpaceNeed {
 /// link, is missing, or the aside name is taken; a program runs from the install folder; or the copy's
 /// volume lacks the space for what must be copied. Nothing is changed in any case.
 pub fn preflight(
+    seams: &crate::test_seams::TestSeams,
     install_dir: &Path,
     real_data: &Path,
     aside: &Path,
@@ -560,7 +507,7 @@ pub fn preflight(
             processes_list(&procs)
         )));
     }
-    match available_bytes(&space.folder) {
+    match available_bytes(seams, &space.folder) {
         None => Err(SwapError::Refused(format!(
             "Agora could not read the free space on {}, so it will not copy Data there. Nothing was changed.",
             space.folder.display()

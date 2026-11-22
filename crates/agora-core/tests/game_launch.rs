@@ -11,6 +11,7 @@ use agora_core::game_discovery::{DiscoveredInstall, InstallCapabilities};
 use agora_core::game_launch::{launch, processes_running_from, wait_for_exit};
 use agora_core::game_launch::{prepare_base_launch, resolve_recipe, LaunchError, LaunchRoots};
 use agora_core::game_registry::{IdentifiedInstall, RuntimeResolution};
+use agora_core::test_seams::TestSeams;
 use agora_game_api::{
     DeploymentStrategy, GameDefinition, GameId, GamePath, InstallId, InstallKind, LaunchRecipe,
     LaunchValue, RelPath, RuntimeIdentity, StoreId, StoreIdentifier, UserDataLocation,
@@ -368,6 +369,7 @@ fn prepare_base_launch_no_recipe() {
         BaseMode::Copied,
         Some(&base_root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -417,6 +419,7 @@ fn prepare_base_launch_damaged_refusal_and_launch_anyway() {
         BaseMode::Copied,
         Some(&base_root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -489,6 +492,7 @@ fn prepare_base_launch_steam_env_only_for_steam() {
         BaseMode::Copied,
         Some(&base_root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -520,6 +524,7 @@ fn prepare_base_launch_steam_env_only_for_steam() {
         BaseMode::Copied,
         Some(&base_root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -589,6 +594,7 @@ fn launch_and_watch_standin_process() {
         BaseMode::Copied,
         Some(&base_root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -688,6 +694,7 @@ fn only_a_process_started_after_launch_counts_as_relaunched_outside() {
         BaseMode::Copied,
         Some(&tmp.path().join("AgoraBases")),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();

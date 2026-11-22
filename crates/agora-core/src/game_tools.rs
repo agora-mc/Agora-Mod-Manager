@@ -3839,7 +3839,13 @@ fn run_by_swap(
     let dir = tool_dir(&instance_dir, tool_id.as_str());
     let staging = dir.join(format!("staging-{run}"));
 
-    game_tool_swap::preflight(&install, &real_data, &aside, &copy.space_need())?;
+    game_tool_swap::preflight(
+        &ctx.test_seams,
+        &install,
+        &real_data,
+        &aside,
+        &copy.space_need(),
+    )?;
     let fingerprint = input_fingerprint_scoped(ctx, instance_id, definition, tool, scope_item)?;
 
     // The game/store user-files lock keys this whole operation: both journals the run writes (the

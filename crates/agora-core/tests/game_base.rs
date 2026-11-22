@@ -10,6 +10,7 @@ use agora_core::game_base::{
 };
 use agora_core::game_discovery::{DiscoveredInstall, InstallKind};
 use agora_core::game_registry::{IdentifiedInstall, RuntimeResolution};
+use agora_core::test_seams::TestSeams;
 use agora_game_api::{
     DeploymentStrategy, FrameworkDefinition, FrameworkDetection, FrameworkId,
     FrameworkVersionSource, GameDefinition, GameId, InstallCapabilities, InstallId, RelPath,
@@ -311,6 +312,7 @@ fn linked_and_copied_base_build_and_snapshot_rule() {
         BaseMode::Linked,
         Some(&base_root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .expect("build linked base succeeds");
@@ -358,6 +360,7 @@ fn linked_and_copied_base_build_and_snapshot_rule() {
         BaseMode::Linked,
         Some(&base_root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .expect("rebuild succeeds");
@@ -399,6 +402,7 @@ fn linked_and_copied_base_build_and_snapshot_rule() {
         BaseMode::Copied,
         Some(&base_root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .expect("build copied base succeeds");
@@ -454,6 +458,7 @@ fn in_place_store_patch_and_store_update_by_replacement() {
         BaseMode::Linked,
         Some(&base_root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -530,6 +535,7 @@ fn modified_time_set_back_detection() {
         BaseMode::Copied,
         Some(&base_root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -599,6 +605,7 @@ fn missing_file_and_unexpected_file_detection() {
         BaseMode::Copied,
         Some(&base_root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -683,6 +690,7 @@ fn junction_in_source_is_skipped() {
         BaseMode::Copied,
         Some(&base_root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -740,6 +748,7 @@ fn remove_base_deletes_folder_and_manifest_leaves_source_intact() {
         BaseMode::Linked,
         Some(&base_root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -814,6 +823,7 @@ fn a_tampered_manifest_can_never_make_remove_delete_the_install() {
         BaseMode::Linked,
         Some(&root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -865,6 +875,7 @@ fn an_interrupted_build_does_not_brick_its_base_id() {
         BaseMode::Copied,
         Some(&root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -881,6 +892,7 @@ fn an_interrupted_build_does_not_brick_its_base_id() {
         BaseMode::Copied,
         Some(&root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -913,10 +925,13 @@ fn a_base_build_holds_its_lock_between_the_rename_and_the_record() {
     };
     let base_id = make_base_id(runtime);
 
-    let pause = agora_core::game_base::pause_base_build_after_rename(&root);
+    // The pause belongs to the seams the build below is run with: this test's own.
+    let seams = TestSeams::default();
+    let pause = seams.pause_base_build_after_rename(&root);
     let build_paths = paths.clone();
     let build_install = install.clone();
     let build_root = root.clone();
+    let build_seams = seams.clone();
     let handle = std::thread::spawn(move || {
         build_base(
             &build_paths,
@@ -925,6 +940,7 @@ fn a_base_build_holds_its_lock_between_the_rename_and_the_record() {
             BaseMode::Linked,
             Some(&build_root),
             BuildOptions::default(),
+            &build_seams,
             &|_| {},
         )
     });
@@ -983,6 +999,7 @@ fn a_rebuild_refuses_when_an_instance_moves_to_trash_before_the_pin_recheck() {
         BaseMode::Linked,
         Some(&root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -993,10 +1010,13 @@ fn a_rebuild_refuses_when_an_instance_moves_to_trash_before_the_pin_recheck() {
     // A damaged record makes the next build replace the still-marked stale folder.
     std::fs::write(paths.base_manifest_path(&base_id), "{ not json").unwrap();
 
-    let pause = agora_core::game_base::pause_base_build_before_pin_recheck(&root);
+    // The pause belongs to the seams the build below is run with: this test's own.
+    let seams = TestSeams::default();
+    let pause = seams.pause_base_build_before_pin_recheck(&root);
     let build_paths = paths.clone();
     let build_install = install.clone();
     let build_root = root.clone();
+    let build_seams = seams.clone();
     let handle = std::thread::spawn(move || {
         build_base(
             &build_paths,
@@ -1005,6 +1025,7 @@ fn a_rebuild_refuses_when_an_instance_moves_to_trash_before_the_pin_recheck() {
             BaseMode::Linked,
             Some(&build_root),
             BuildOptions::default(),
+            &build_seams,
             &|_| {},
         )
     });
@@ -1102,6 +1123,7 @@ fn a_rebuild_keeps_the_base_when_the_locked_record_read_fails() {
         BaseMode::Linked,
         Some(&root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -1116,10 +1138,13 @@ fn a_rebuild_keeps_the_base_when_the_locked_record_read_fails() {
     // Windows and Linux, while opening it as a file fails for every user,
     // including a Linux root — exactly the "exists but cannot be read" shape.
     std::fs::write(paths.base_manifest_path(&base_id), "{ not json").unwrap();
-    let pause = agora_core::game_base::pause_base_build_before_pin_recheck(&root);
+    // The pause belongs to the seams the build below is run with: this test's own.
+    let seams = TestSeams::default();
+    let pause = seams.pause_base_build_before_pin_recheck(&root);
     let build_paths = paths.clone();
     let build_install = install.clone();
     let build_root = root.clone();
+    let build_seams = seams.clone();
     let handle = std::thread::spawn(move || {
         build_base(
             &build_paths,
@@ -1128,6 +1153,7 @@ fn a_rebuild_keeps_the_base_when_the_locked_record_read_fails() {
             BaseMode::Linked,
             Some(&build_root),
             BuildOptions::default(),
+            &build_seams,
             &|_| {},
         )
     });
@@ -1181,6 +1207,7 @@ fn a_rebuild_refuses_while_instance_locations_are_locked() {
         BaseMode::Linked,
         Some(&root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -1197,6 +1224,7 @@ fn a_rebuild_refuses_while_instance_locations_are_locked() {
         BaseMode::Linked,
         Some(&root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     );
     drop(held);
@@ -1231,6 +1259,7 @@ fn base_removal_cannot_remove_a_base_an_instance_create_is_choosing() {
         BaseMode::Linked,
         None,
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -1241,7 +1270,8 @@ fn base_removal_cannot_remove_a_base_an_instance_create_is_choosing() {
     let ctx = CoreContext::for_testing(tmp.path().join("data"));
     agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
 
-    game_instance::set_create_pause_before_publishing_pin(Some(&base_id));
+    ctx.test_seams
+        .set_create_pause_before_publishing_pin(Some(&base_id));
     let create_ctx = ctx.clone();
     let create_install = install.clone();
     let create_definition = test_definition();
@@ -1258,7 +1288,7 @@ fn base_removal_cannot_remove_a_base_an_instance_create_is_choosing() {
     });
     let mut reached = false;
     for _ in 0..600 {
-        if game_instance::create_pause_before_publishing_pin_reached() {
+        if ctx.test_seams.create_pause_before_publishing_pin_reached() {
             reached = true;
             break;
         }
@@ -1284,7 +1314,7 @@ fn base_removal_cannot_remove_a_base_an_instance_create_is_choosing() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    game_instance::set_create_pause_before_publishing_pin(None);
+    ctx.test_seams.set_create_pause_before_publishing_pin(None);
     let created = create.join().unwrap().expect("the create completes");
 
     assert!(
@@ -1357,6 +1387,7 @@ fn build_base_refuses_declared_write_matching_linked_file() {
         BaseMode::Linked,
         Some(&base_root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap_err();
@@ -1400,6 +1431,7 @@ fn declared_writes_in_verification() {
         BaseMode::Copied,
         Some(&base_root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -1533,6 +1565,7 @@ fn excluded_paths_in_build_and_verify() {
         BuildOptions {
             include_excluded: false,
         },
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -1593,6 +1626,7 @@ fn excluded_paths_in_build_and_verify() {
         BuildOptions {
             include_excluded: true,
         },
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -1630,6 +1664,7 @@ fn a_copied_base_is_not_answered_by_a_linked_one() {
             mode,
             Some(&root),
             BuildOptions::default(),
+            &TestSeams::default(),
             &|_| {},
         )
         .unwrap()
@@ -1674,6 +1709,7 @@ fn an_unfiltered_base_is_its_own_base_and_verifies_what_it_recorded() {
         BaseMode::Copied,
         Some(&root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -1686,6 +1722,7 @@ fn an_unfiltered_base_is_its_own_base_and_verifies_what_it_recorded() {
         BuildOptions {
             include_excluded: true,
         },
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -1743,6 +1780,7 @@ fn a_write_through_a_hardlink_is_never_excused_and_names_the_store() {
         BaseMode::Linked,
         Some(&root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -2022,6 +2060,7 @@ fn install_size_is_what_a_copied_base_holds_and_errors_when_unreadable() {
         BaseMode::Copied,
         Some(&tmp.path().join("bases_root")),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -2089,6 +2128,7 @@ fn building_over_a_damaged_record_replaces_its_stale_folder_instead_of_failing_w
         BaseMode::Copied,
         Some(&root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -2102,6 +2142,7 @@ fn building_over_a_damaged_record_replaces_its_stale_folder_instead_of_failing_w
         BaseMode::Copied,
         Some(&root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap_or_else(|e| panic!("a build over a damaged record must not fail: {e}"));
@@ -2127,6 +2168,7 @@ fn a_tampered_record_cannot_point_removal_at_a_folder_in_someone_elses_agorabase
         BaseMode::Copied,
         Some(&root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -2166,6 +2208,7 @@ fn build_in_other_root(tmp: &TempDir, build: &str) -> (AppPaths, std::path::Path
         BaseMode::Copied,
         Some(&root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -2213,6 +2256,7 @@ fn a_root_is_registered_once_however_often_it_is_built_into() {
             mode,
             Some(&root),
             BuildOptions::default(),
+            &TestSeams::default(),
             &|_| {},
         )
         .unwrap();
@@ -2263,6 +2307,7 @@ fn a_framework_marker_brings_its_required_files_even_from_an_excluded_path() {
         BaseMode::Copied,
         Some(&tmp.path().join("AgoraBases")),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -2294,6 +2339,7 @@ fn a_framework_missing_a_required_file_is_recorded_as_incomplete() {
         BaseMode::Copied,
         Some(&tmp.path().join("AgoraBases")),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -2318,6 +2364,7 @@ fn repairing_a_framework_copies_required_files_into_an_existing_base() {
         BaseMode::Copied,
         Some(&tmp.path().join("AgoraBases")),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -2361,6 +2408,7 @@ fn repairing_says_when_the_source_install_lacks_the_files_too() {
         BaseMode::Copied,
         Some(&tmp.path().join("AgoraBases")),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -2410,6 +2458,7 @@ fn a_framework_with_no_scripts_reports_every_required_file_missing() {
         BaseMode::Copied,
         Some(&tmp.path().join("AgoraBases")),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -2435,6 +2484,7 @@ fn repairing_restores_every_script_from_an_install_that_has_them() {
         BaseMode::Copied,
         Some(&tmp.path().join("AgoraBases")),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -2470,6 +2520,7 @@ fn repairing_reports_exactly_the_scripts_the_source_install_lacks() {
         BaseMode::Copied,
         Some(&tmp.path().join("AgoraBases")),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -2499,6 +2550,7 @@ fn repairing_a_framework_replaces_a_recorded_file_that_is_missing_or_wrong() {
         BaseMode::Copied,
         Some(&tmp.path().join("AgoraBases")),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -2531,6 +2583,7 @@ fn repairing_refuses_a_base_that_is_its_own_source_and_leaves_the_file_alone() {
         BaseMode::Copied,
         Some(&tmp.path().join("AgoraBases")),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -2571,6 +2624,7 @@ fn a_base_build_keeps_a_folder_its_marker_does_not_claim() {
         BaseMode::Copied,
         Some(&root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap();
@@ -2587,6 +2641,7 @@ fn a_base_build_keeps_a_folder_its_marker_does_not_claim() {
         BaseMode::Copied,
         Some(&root),
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .expect("the build replaces its own folder");

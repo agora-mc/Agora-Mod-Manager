@@ -10,13 +10,12 @@
 #![cfg(windows)]
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use agora_core::ctx::CoreContext;
 use agora_core::event_sink::CancellationToken;
 use agora_core::game_base::BaseMode;
-use agora_core::game_deploy::PLAN_CALLS;
+
 use agora_core::game_discovery::{DiscoveredInstall, InstallCapabilities};
 use agora_core::game_instance::{create, launch_checks, GameInstanceRecord};
 use agora_core::game_launch::{LaunchError, LaunchedGame, Launcher, PreparedLaunch};
@@ -298,9 +297,9 @@ fn launch_checks_plan_the_instance_twice_however_many_tool_outputs_it_has() {
         assert!(outcome.promoted, "{outcome:?}");
     }
 
-    let before = PLAN_CALLS.load(Ordering::Relaxed);
+    let before = ctx.test_seams.plan_calls();
     let checks = launch_checks(&ctx, &inst, &def).expect("the launch checks run");
-    let planned = PLAN_CALLS.load(Ordering::Relaxed) - before;
+    let planned = ctx.test_seams.plan_calls() - before;
     // One plan for the framework check (the instance's own mode), and one Links plan shared by the
     // load order and both tool outputs.
     assert_eq!(planned, 2, "launch_checks planned {planned} times");
@@ -313,17 +312,17 @@ fn launch_checks_plan_the_instance_twice_however_many_tool_outputs_it_has() {
 
     // The Tools tab asks for the same list: its staleness checks read one Links plan for all the
     // outputs, not one per output.
-    let before = PLAN_CALLS.load(Ordering::Relaxed);
+    let before = ctx.test_seams.plan_calls();
     let states = game_tools::list(&ctx, &id, &def).expect("the tool list");
-    let planned = PLAN_CALLS.load(Ordering::Relaxed) - before;
+    let planned = ctx.test_seams.plan_calls() - before;
     assert_eq!(planned, 1, "game_tools::list planned {planned} times");
     assert_eq!(states.len(), 2);
 
     // What the Tools tab's command asks for: the list and its conflict warnings from the same plan.
-    let before = PLAN_CALLS.load(Ordering::Relaxed);
+    let before = ctx.test_seams.plan_calls();
     let (states, findings) =
         game_tools::list_and_findings(&ctx, &id, &def).expect("the list and findings");
-    let planned = PLAN_CALLS.load(Ordering::Relaxed) - before;
+    let planned = ctx.test_seams.plan_calls() - before;
     assert_eq!(
         planned, 1,
         "game_tools::list_and_findings planned {planned} times"

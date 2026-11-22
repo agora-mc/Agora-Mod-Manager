@@ -13,7 +13,7 @@ use agora_core::game_discovery::{DiscoveredInstall, InstallCapabilities};
 use agora_core::game_instance::{self, GameInstanceManifest};
 use agora_core::game_registry::{GameRegistry, IdentifiedInstall, RuntimeResolution};
 use agora_core::game_tool_copy::CopyKind;
-use agora_core::game_tool_swap::{self as swap, SwapJournal, VolumeSeam};
+use agora_core::game_tool_swap::{self as swap, SwapJournal};
 use agora_core::lock_manager::{LockManager, LockResource};
 use agora_core::startup_recovery::{run_at_startup, StartupRecoveryReport};
 use agora_game_api::{
@@ -335,25 +335,6 @@ fn names(dir: &Path) -> Vec<String> {
     out
 }
 
-/// Hold the seam that says the copy is on the install's volume for the whole test.
-struct SwapSeam;
-
-impl SwapSeam {
-    fn same_volume() -> Self {
-        swap::set_volume_seam(Some(VolumeSeam {
-            same_volume: Some(true),
-            free_bytes: Some(u64::MAX),
-        }));
-        SwapSeam
-    }
-}
-
-impl Drop for SwapSeam {
-    fn drop(&mut self) {
-        swap::set_volume_seam(None);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tool swaps
 // ---------------------------------------------------------------------------
@@ -363,7 +344,6 @@ impl Drop for SwapSeam {
 /// says what it did.
 #[test]
 fn the_startup_pass_puts_back_an_interrupted_tool_swap() {
-    let _seam = SwapSeam::same_volume();
     let f = swap_fixture();
     let before = snapshot(&real_data(&f));
     crash_after(&f, 6, CopyKind::Kept, "crash");
@@ -396,7 +376,6 @@ fn the_startup_pass_puts_back_an_interrupted_tool_swap() {
 /// live operation, so the startup pass leaves it completely alone and reports that it did.
 #[test]
 fn the_startup_pass_leaves_a_swap_alone_while_another_process_holds_its_lock() {
-    let _seam = SwapSeam::same_volume();
     let f = swap_fixture();
     let before = snapshot(&real_data(&f));
     let journal = crash_after(&f, 6, CopyKind::Kept, "live");
@@ -452,7 +431,6 @@ fn the_startup_pass_leaves_a_swap_alone_while_another_process_holds_its_lock() {
 /// and changes nothing — it does not raise, and it does not touch the folder it points at.
 #[test]
 fn a_swap_journal_that_needs_a_hand_is_reported_not_raised() {
-    let _seam = SwapSeam::same_volume();
     let f = swap_fixture();
     let victim = f._tmp.path().join("victim");
     std::fs::create_dir_all(&victim).unwrap();

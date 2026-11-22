@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Arc;
 
 /// Expected schema version for the mutable local SQLite database.
 /// Migrations are applied sequentially on startup.
@@ -33,6 +33,33 @@ pub struct LocalStateOpenOptions {
     pub accept_newer_schema: bool,
     /// Migrate even when the pre-migration backup could not be written.
     pub accept_missing_backup: bool,
+    /// Test-only: run once the startup lock of *this* database is taken, before anything reads
+    /// or writes it. Integration tests cannot use `cfg(test)` in a library, so this is a runtime
+    /// hook. It is passed in with the other startup choices, so two initializers — in one process
+    /// or two — each carry their own and neither replaces the other. Production passes `None`.
+    #[doc(hidden)]
+    pub startup_lock_hook: Option<StartupLockHook>,
+}
+
+/// The test-only hook [`LocalStateOpenOptions::startup_lock_hook`] runs.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct StartupLockHook(Arc<dyn Fn(&Path) + Send + Sync>);
+
+impl StartupLockHook {
+    pub fn new(hook: impl Fn(&Path) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(hook))
+    }
+
+    fn fire(&self, db_path: &Path) {
+        (self.0)(db_path);
+    }
+}
+
+impl std::fmt::Debug for StartupLockHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StartupLockHook(..)")
+    }
 }
 
 /// What startup did to the local database, for the adapter to tell the player.
@@ -73,44 +100,6 @@ pub struct NewerSchemaKept {
     pub supported: i64,
     /// Where the newer database was moved. It is never deleted.
     pub kept_at: PathBuf,
-}
-
-/// Test-only hook, run once immediately after the startup lock is acquired for `db_path`.
-/// Integration tests cannot use `cfg(test)` in a library, so this is a runtime hook; it is a no-op
-/// for every other database, and removes itself after the first matching call so only one of
-/// that database's initializers pauses. Path scoping keeps parallel tests from firing each
-/// other's hook.
-#[doc(hidden)]
-pub fn set_startup_lock_hook(db_path: &std::path::Path, hook: Box<dyn Fn() + Send>) {
-    let slot = STARTUP_LOCK_HOOK.get_or_init(|| Mutex::new(None));
-    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = Some((db_path.to_path_buf(), hook));
-}
-
-#[doc(hidden)]
-pub fn clear_startup_lock_hook() {
-    let slot = STARTUP_LOCK_HOOK.get_or_init(|| Mutex::new(None));
-    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = None;
-}
-
-type StartupLockHook = (std::path::PathBuf, Box<dyn Fn() + Send>);
-
-static STARTUP_LOCK_HOOK: OnceLock<Mutex<Option<StartupLockHook>>> = OnceLock::new();
-
-fn notify_startup_locked(db_path: &std::path::Path) {
-    let Some(hook) = STARTUP_LOCK_HOOK.get().and_then(|slot| {
-        let mut guard = slot.lock().ok()?;
-        let matches = guard.as_ref().is_some_and(|(path, _)| path == db_path);
-        if matches {
-            guard.take().map(|(_, hook)| hook)
-        } else {
-            None
-        }
-    }) else {
-        return;
-    };
-    hook();
 }
 
 /// Open a read-write connection to the local state database.
@@ -204,7 +193,10 @@ pub fn init_local_state_db_with(
         .map_err(|error| {
             anyhow::anyhow!("Could not lock the local database for startup: {error}")
         })?;
-    notify_startup_locked(db_path);
+    // Test seam only: production passes no hook, so this does nothing.
+    if let Some(hook) = &options.startup_lock_hook {
+        hook.fire(db_path);
+    }
 
     let mut report = LocalStateStartupReport::default();
 

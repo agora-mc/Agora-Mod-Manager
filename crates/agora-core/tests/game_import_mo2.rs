@@ -2030,21 +2030,41 @@ fn f1e_late_merge_failure_cleans_up_and_retry_succeeds() {
     assert_eq!(retry.loadouts, profiles);
 }
 
-struct VolumeSeamGuard;
+/// The free-space stand-in, installed on the fixture's own context: a seam belongs to the context
+/// it is installed on, so a parallel test's import cannot see it.
+///
+/// Dropping it checks the stand-in was consulted: an import that never reads it would pass while
+/// testing nothing.
+struct VolumeSeamGuard {
+    ctx: agora_core::ctx::CoreContext,
+    hits_before: usize,
+}
 
 impl VolumeSeamGuard {
-    fn set(free_bytes: u64) -> Self {
-        agora_core::game_tool_swap::set_volume_seam(Some(agora_core::game_tool_swap::VolumeSeam {
-            same_volume: None,
-            free_bytes: Some(free_bytes),
-        }));
-        Self
+    fn set(ctx: &agora_core::ctx::CoreContext, free_bytes: u64) -> Self {
+        ctx.test_seams
+            .set_volume_seam(Some(agora_core::game_tool_swap::VolumeSeam {
+                same_volume: None,
+                free_bytes: Some(free_bytes),
+            }));
+        Self {
+            ctx: ctx.clone(),
+            hits_before: ctx.test_seams.volume_hits(),
+        }
     }
 }
 
 impl Drop for VolumeSeamGuard {
     fn drop(&mut self) {
-        agora_core::game_tool_swap::set_volume_seam(None);
+        self.ctx.test_seams.set_volume_seam(None);
+        // A failing test is already unwinding; a second panic here would abort the run.
+        if std::thread::panicking() {
+            return;
+        }
+        assert!(
+            self.ctx.test_seams.volume_hits() > self.hits_before,
+            "the free-space stand-in was installed but never consulted: a dead seam"
+        );
     }
 }
 
@@ -2187,7 +2207,7 @@ fn f1f_single_profile_run_checks_free_space_before_copying() {
     assert!(needed > 1);
 
     {
-        let _guard = VolumeSeamGuard::set(needed - 1);
+        let _guard = VolumeSeamGuard::set(&f.ctx, needed - 1);
         let err = game_import::run(&f.ctx, &f.inventory, &req, RunOptions::default(), &|_| {})
             .expect_err("single-profile run must refuse when disk space is short by 1 byte");
         assert!(
@@ -2206,7 +2226,7 @@ fn f1f_single_profile_run_checks_free_space_before_copying() {
     );
 
     {
-        let _guard = VolumeSeamGuard::set(needed);
+        let _guard = VolumeSeamGuard::set(&f.ctx, needed);
         game_import::run(&f.ctx, &f.inventory, &req, RunOptions::default(), &|_| {})
             .expect("single-profile run succeeds when exact bytes fit");
     }

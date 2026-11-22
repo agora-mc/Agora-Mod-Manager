@@ -14,8 +14,8 @@ use agora_core::ctx::CoreContext;
 use agora_core::game_base::{get_file_identity, BaseManifest, BaseMode, FileIdentity};
 use agora_core::game_deploy::{
     add_content, deploy, deployment_dir, move_content, remove_content, set_content_enabled,
-    set_content_own_copy, set_update_fault_after, undeploy, DeployError, DeployMode, DeployOutcome,
-    DeploymentRecord, Placement,
+    set_content_own_copy, undeploy, DeployError, DeployMode, DeployOutcome, DeploymentRecord,
+    Placement,
 };
 use agora_core::game_discovery::{DiscoveredInstall, InstallCapabilities};
 use agora_core::game_instance::{create, get_manifest, GameInstanceRecord};
@@ -686,10 +686,16 @@ fn a_stop_part_way_leaves_a_marker_and_the_next_deploy_builds_the_farm_again() {
 
     // Removing B removes two files and places one. The stop comes after the first removal.
     both(&f, |ctx, id| remove_content(ctx, id, &b).unwrap());
-    set_update_fault_after(Some(1));
+    let stops_before = f.ctx.test_seams.update_stops();
+    set_update_fault_after_on(&f.ctx, Some(1));
     let err = deploy(&f.ctx, &f.x, &f.def, DeployMode::Links).unwrap_err();
-    set_update_fault_after(None);
+    set_update_fault_after_on(&f.ctx, None);
     assert!(matches!(err, DeployError::Other(_)), "{err:?}");
+    assert_eq!(
+        f.ctx.test_seams.update_stops(),
+        stops_before + 1,
+        "the armed stop never reached the update"
+    );
 
     // The stop leaves the record set aside, the marker in its place, and the farm part updated.
     let folder = deployment_folder(&f, &f.x);
@@ -790,4 +796,156 @@ fn a_record_of_another_instance_is_refused_and_its_farm_is_left_alone() {
         "{err:?}"
     );
     assert!(folder_x.join("game").join("Data/a/one.txt").exists());
+}
+
+/// A stop seam armed on a context reaches the update that context runs, even when the operation
+/// was handed to another thread with a clone of the context.
+#[test]
+fn an_in_place_update_stop_armed_on_the_context_fires_on_another_thread() {
+    let f = fixture();
+    let a = item(
+        &f,
+        "ModA",
+        &[("Data/a/one.txt", b"a1"), ("Data/common.txt", b"from A")],
+    );
+    let b = item(
+        &f,
+        "ModB",
+        &[("Data/b/one.txt", b"b1"), ("Data/common.txt", b"from B")],
+    );
+    both(&f, |ctx, id| add_content(ctx, id, &a, None, None).unwrap());
+    both(&f, |ctx, id| add_content(ctx, id, &b, None, None).unwrap());
+    deploy_and_check(&f, DeployMode::Links);
+
+    // Removing B removes two files and places one. The stop comes after the first removal.
+    both(&f, |ctx, id| remove_content(ctx, id, &b).unwrap());
+    // Armed on the context the update runs with: it must fire whichever thread that is.
+    set_update_fault_after_on(&f.ctx, Some(1));
+    let stops_before = f.ctx.test_seams.update_stops();
+    let ctx = f.ctx.clone();
+    let id = f.x.clone();
+    let def = f.def.clone();
+    let err = std::thread::spawn(move || deploy(&ctx, &id, &def, DeployMode::Links))
+        .join()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(err, DeployError::Other(_)), "{err:?}");
+    assert_eq!(
+        f.ctx.test_seams.update_stops(),
+        stops_before + 1,
+        "the armed stop never reached the update on the other thread"
+    );
+
+    // The stop leaves the record set aside and the marker in its place, as a crash would.
+    let folder = deployment_folder(&f, &f.x);
+    assert!(folder.join("deployment.json.updating").exists());
+    assert!(!folder.join("deployment.json").exists());
+}
+
+/// A stop armed on a context belongs to the update that claims it: a second in-place update on a
+/// clone of the same context neither spends the first one's changes nor is stopped by them.
+///
+/// Two instances of one base share a context, as the adapters do. Each update makes exactly one
+/// change here (it only places files), so an arm of one change is spent by the first update and the
+/// second must run to completion, marker and all.
+#[test]
+fn a_stop_armed_on_the_context_belongs_to_one_update_not_its_clone() {
+    let f = fixture();
+    let a = item(&f, "ModA", &[("Data/a/one.txt", b"a1")]);
+    both(&f, |ctx, id| add_content(ctx, id, &a, None, None).unwrap());
+    deploy_and_check(&f, DeployMode::Links);
+
+    // A second item on both instances: the next deploy of each updates its farm in place, placing
+    // one file and removing none, which is one stop point.
+    let c = item(&f, "ModC", &[("Data/c/one.txt", b"c1")]);
+    both(&f, |ctx, id| add_content(ctx, id, &c, None, None).unwrap());
+    set_update_fault_after_on(&f.ctx, Some(1));
+    let stops_before = f.ctx.test_seams.update_stops();
+
+    // `x` claims the arm with its context, spends the change and finishes: one change was asked
+    // for, so a stop at the only stop point would be at the second change.
+    let outcome_x = deploy(&f.ctx, &f.x, &f.def, DeployMode::Links).unwrap();
+    assert!(
+        matches!(outcome_x, DeployOutcome::Built { .. }),
+        "{outcome_x:?}"
+    );
+
+    // `y` runs on a clone of the same context, on another thread: it claims nothing, so it neither
+    // spends `x`'s arm nor is stopped by what is left of it.
+    let ctx = f.ctx.clone();
+    let y = f.y.clone();
+    let def = f.def.clone();
+    let outcome_y = std::thread::spawn(move || deploy(&ctx, &y, &def, DeployMode::Links))
+        .join()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(outcome_y, DeployOutcome::Built { .. }),
+        "{outcome_y:?}"
+    );
+
+    assert_eq!(
+        f.ctx.test_seams.update_stops(),
+        stops_before,
+        "an update was stopped by a stop it never claimed"
+    );
+    for id in [&f.x, &f.y] {
+        let folder = deployment_folder(&f, id);
+        assert!(
+            !folder.join("deployment.json.updating").exists(),
+            "{id} was left half updated though nothing asked it to stop"
+        );
+        assert!(
+            folder.join("deployment.json").exists(),
+            "{id} has no record"
+        );
+        assert_eq!(farm_bytes(&f, id, "Data/c/one.txt"), b"c1");
+    }
+}
+
+/// The planner count belongs to the context that planned: a context that has not planned reads 0,
+/// whatever another context did.
+#[test]
+fn the_planner_count_belongs_to_the_context_that_planned() {
+    let a = fixture();
+    let item_a = item(&a, "ModA", &[("Data/a/one.txt", b"a1")]);
+    both(&a, |ctx, id| {
+        add_content(ctx, id, &item_a, None, None).unwrap()
+    });
+
+    let b = fixture();
+    let item_b = item(&b, "ModA", &[("Data/a/one.txt", b"a1")]);
+    both(&b, |ctx, id| {
+        add_content(ctx, id, &item_b, None, None).unwrap()
+    });
+
+    deploy(&a.ctx, &a.x, &a.def, DeployMode::Links).unwrap();
+    assert!(
+        planner_count(&a.ctx) > 0,
+        "the context that deployed counted no plan"
+    );
+    assert_eq!(
+        planner_count(&b.ctx),
+        0,
+        "a context that has not planned counted another context's plans"
+    );
+
+    deploy(&b.ctx, &b.x, &b.def, DeployMode::Links).unwrap();
+    assert!(planner_count(&b.ctx) > 0, "b's own plan was not counted");
+    let a_count = planner_count(&a.ctx);
+    assert_eq!(
+        planner_count(&a.ctx),
+        a_count,
+        "another context's deploy changed this context's count"
+    );
+}
+
+/// Arm the in-place stop seam on the context the update will run with.
+fn set_update_fault_after_on(ctx: &CoreContext, changes: Option<usize>) {
+    ctx.test_seams.set_update_fault_after(changes);
+}
+
+/// How many times the planner ran with this context.
+fn planner_count(ctx: &CoreContext) -> usize {
+    ctx.test_seams.plan_calls()
 }

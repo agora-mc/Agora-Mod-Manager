@@ -800,10 +800,14 @@ fn sync_directory(dir: &Path) {
 #[cfg(not(unix))]
 fn sync_directory(_dir: &Path) {}
 
-fn write_journal(journal_path: &Path, journal: &Journal) -> Result<(), UserFilesError> {
-    // Test seam only: `write_fault_fires` is false unless a test on this thread installed a
-    // fault hook, so production writes never fail here.
-    if crate::game_tool_swap::write_fault_fires(journal_path) {
+fn write_journal(
+    seams: &crate::test_seams::TestSeams,
+    journal_path: &Path,
+    journal: &Journal,
+) -> Result<(), UserFilesError> {
+    // Test seam only: `write_fault_fires` is false unless the context's test installed a fault
+    // hook, so production writes never fail here.
+    if seams.write_fault_fires(journal_path) {
         return Err(UserFilesError::Io(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "journal write fault injected by the test hook",
@@ -830,6 +834,7 @@ fn write_journal(journal_path: &Path, journal: &Journal) -> Result<(), UserFiles
 /// later launch refuse. `swap_in` disarms the guard when it hands the launch back to its caller,
 /// which then owns clearing the mark through `record_process` or `finish_starting_launch`.
 struct StartingMarkGuard<'a> {
+    seams: &'a crate::test_seams::TestSeams,
     journal_path: &'a Path,
     finished: bool,
 }
@@ -848,7 +853,7 @@ impl Drop for StartingMarkGuard<'_> {
         if journal.starting_launcher.is_some() {
             journal.starting_launcher = None;
             journal.spawning = false;
-            let _ = write_journal(self.journal_path, &journal);
+            let _ = write_journal(self.seams, self.journal_path, &journal);
         }
     }
 }
@@ -1155,8 +1160,9 @@ pub fn swap_in_locked(
         files: journal_files,
     };
 
-    write_journal(&journal_path, &journal)?;
+    write_journal(&ctx.test_seams, &journal_path, &journal)?;
     let mut starting_mark = StartingMarkGuard {
+        seams: &ctx.test_seams,
         journal_path: &journal_path,
         finished: false,
     };
@@ -1184,7 +1190,7 @@ pub fn swap_in_locked(
                 journal.files[i].state = Some(FileState::BackingUp);
                 journal.files[i].restored = false;
                 journal.files[i].real_resolved_path = resolved_path_for(&real_path);
-                write_journal(&journal_path, &journal)?;
+                write_journal(&ctx.test_seams, &journal_path, &journal)?;
 
                 // Copy to a temp name, make it durable, verify it, and only then give it the final
                 // name. A torn copy never becomes the backup restore trusts.
@@ -1213,7 +1219,7 @@ pub fn swap_in_locked(
 
                 journal.files[i].backup_path = Some(final_backup);
                 journal.files[i].state = Some(FileState::BackedUp);
-                write_journal(&journal_path, &journal)?;
+                write_journal(&ctx.test_seams, &journal_path, &journal)?;
 
                 let instance_bytes = if instance_copy_path.exists() {
                     Some(std::fs::read(&instance_copy_path)?)
@@ -1230,7 +1236,7 @@ pub fn swap_in_locked(
                 journal.files[i].written_sha256 = written_hash;
                 journal.files[i].swapped = true;
                 journal.files[i].state = Some(FileState::Swapped);
-                write_journal(&journal_path, &journal)?;
+                write_journal(&ctx.test_seams, &journal_path, &journal)?;
 
                 if let Some(instance_bytes) = instance_bytes {
                     write_user_file(&real_path, &instance_bytes)?;
@@ -1259,7 +1265,7 @@ pub fn swap_in_locked(
                 journal.files[i].state = Some(FileState::BackingUp);
                 journal.files[i].restored = false;
                 journal.files[i].real_resolved_path = resolved_path_for(&real_path);
-                write_journal(&journal_path, &journal)?;
+                write_journal(&ctx.test_seams, &journal_path, &journal)?;
 
                 if let Some(instance_bytes) = instance_bytes {
                     if let Some(parent) = real_path.parent() {
@@ -1270,7 +1276,7 @@ pub fn swap_in_locked(
 
                 journal.files[i].swapped = true;
                 journal.files[i].state = Some(FileState::Swapped);
-                write_journal(&journal_path, &journal)?;
+                write_journal(&ctx.test_seams, &journal_path, &journal)?;
             }
         }
         Ok(())
@@ -1735,7 +1741,7 @@ pub fn finish_starting_locked(
     if journal.starting_launcher.is_some() {
         journal.starting_launcher = None;
         journal.spawning = false;
-        write_journal(&journal_path, &journal)?;
+        write_journal(&ctx.test_seams, &journal_path, &journal)?;
     }
     Ok(())
 }
@@ -1783,7 +1789,7 @@ pub fn finish_starting_launch_locked(
     }
     journal.starting_launcher = None;
     journal.spawning = false;
-    write_journal(&journal_path, &journal)?;
+    write_journal(&ctx.test_seams, &journal_path, &journal)?;
     Ok(())
 }
 
@@ -2104,7 +2110,7 @@ fn restore_journal_internal(
             }
             let _ = std::fs::remove_file(entry.destination.backup.with_extension("tmp"));
             journal.files[entry.index].restored = true;
-            write_journal(&journal_path, &journal)?;
+            write_journal(&ctx.test_seams, &journal_path, &journal)?;
             restored_files.push(RestoredFile {
                 real_path: entry.destination.real.clone(),
                 instance_path: entry.instance_path.clone(),
@@ -2138,7 +2144,7 @@ fn restore_journal_internal(
             }
             let _ = std::fs::remove_file(entry.destination.backup.with_extension("tmp"));
             journal.files[entry.index].restored = true;
-            write_journal(&journal_path, &journal)?;
+            write_journal(&ctx.test_seams, &journal_path, &journal)?;
             continue;
         }
 
@@ -2210,7 +2216,7 @@ fn restore_journal_internal(
         // Record the entry before its backup can go, so a stop from here on does not restore it a
         // second time.
         journal.files[entry.index].restored = true;
-        write_journal(&journal_path, &journal)?;
+        write_journal(&ctx.test_seams, &journal_path, &journal)?;
         let _ = std::fs::remove_file(&entry.destination.backup);
         let _ = std::fs::remove_file(entry.destination.backup.with_extension("tmp"));
 
@@ -2283,7 +2289,7 @@ pub fn record_process_locked(
     // the spawn is recorded, so the spawning window is over.
     journal.starting_launcher = None;
     journal.spawning = false;
-    write_journal(&journal_path, &journal)?;
+    write_journal(&ctx.test_seams, &journal_path, &journal)?;
     Ok(())
 }
 
@@ -2306,7 +2312,7 @@ pub fn mark_spawning_locked(
     let mut journal: Journal = serde_json::from_str(&text)?;
     if !journal.spawning {
         journal.spawning = true;
-        write_journal(&journal_path, &journal)?;
+        write_journal(&ctx.test_seams, &journal_path, &journal)?;
     }
     Ok(())
 }

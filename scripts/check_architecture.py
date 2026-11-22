@@ -19,7 +19,9 @@ Checks:
 11. Game API depends only on serde, serde_json, semver, thiserror and regex (all dependency sections)
 12. Core must not reference the future Minecraft package's modules or crate
 13. Game packages' remaining agora-core references stay within a budget that only shrinks
-14. Fail-closed reads (error-read-as-absent sites) in recovery, trust, lease, GC and staging
+14. Process-wide state (`static`, `thread_local!`, `OnceLock`, `LazyLock`, `task_local!`) in
+    non-test code of core and the Minecraft package is on a checked-in allowlist
+15. Fail-closed reads (error-read-as-absent sites) in recovery, trust, lease, GC and staging
     code stay within a budget that only shrinks (MASTER_SPEC §32.13)
 """
 
@@ -668,7 +670,119 @@ def check_game_package_core_budget() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 14. Fail-closed reads: error-read-as-absent sites may only go down
+# 14. Process-wide state in core and the Minecraft package is on the allowlist
+# ---------------------------------------------------------------------------
+# MASTER_SPEC §32.9: a test seam lives on `Ctx` (or is passed in), because a
+# process-wide `static` lets one test's hook catch another test's code, and a
+# `thread_local!` cannot reach code the operation runs on another thread.
+# Configuration is moving onto `Ctx` too. What is left is written down with the
+# reason it really has to be process-wide: a guard that is one per process by
+# definition, a cache, a counter, or configuration that has not moved yet.
+PROCESS_STATE_ALLOWLIST = REPO_ROOT / "scripts" / "process_state_allowlist.json"
+
+# The item kinds §32.9 names: a `static` (which is also how `OnceLock` and
+# `LazyLock` state is declared, and what each `thread_local!`/`task_local!` block
+# holds), wherever it sits: at module level, inside a function body, or in a
+# `thread_local!`/`task_local!` block.
+PROCESS_STATE_ITEM = re.compile(r"(?<!')\bstatic\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)")
+# The items a function-local static can sit in. A `;` before the `{` means a
+# declaration without a body (a trait method), which owns nothing.
+ENCLOSING_ITEM = re.compile(r"\b(?:fn|mod)\s+([A-Za-z_][A-Za-z0-9_]*)[^{;]*\{")
+
+
+def process_state_items(root: Path) -> list[tuple[Path, int, str, str]]:
+    """Process-wide items in the non-test code under `root`, as (file, line, name, owner).
+
+    `owner` is the `fn`/`mod` an item sits inside (the innermost one), or `""` at
+    module level. A static inside a function is keyed by that function, so a
+    fifth `static RE` beside four existing ones in one file does not read as an
+    entry that is already allowed.
+
+    Test code is skipped through the shared scanner: only the item a
+    `#[cfg(test)]` attribute applies to is blanked, so production code after a
+    test helper is still counted.
+    """
+    items: list[tuple[Path, int, str, str]] = []
+    for path in sorted(root.rglob("*.rs")):
+        try:
+            source = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        cleaned = blank_test_items(blank_rust_noise(source))
+        owners = [
+            (match.start(), item_end(cleaned, match.start()), match.group(1))
+            for match in ENCLOSING_ITEM.finditer(cleaned)
+        ]
+        for match in PROCESS_STATE_ITEM.finditer(cleaned):
+            owner = ""
+            owner_start = -1
+            for start, end, name in owners:
+                if end is not None and start < match.start() < end and start > owner_start:
+                    owner, owner_start = name, start
+            line = cleaned.count("\n", 0, match.start()) + 1
+            items.append((path, line, match.group(1), owner))
+    return items
+
+
+def check_process_state_allowlisted() -> None:
+    try:
+        allowlist = json.loads(PROCESS_STATE_ALLOWLIST.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        allowlist = {}
+    except (OSError, ValueError) as exc:
+        err(f"Cannot read {PROCESS_STATE_ALLOWLIST.name}: {exc}")
+        return
+    found: set[str] = set()
+    for root in (CORE_SRC, MC_SRC):
+        for path, _line, name, owner in process_state_items(root):
+            relative = path.relative_to(REPO_ROOT).as_posix()
+            # A static inside a function is keyed by that function, so a fifth
+            # `static RE` in the same file cannot pass as an existing entry.
+            key = f"{relative}::{owner}::{name}" if owner else f"{relative}::{name}"
+            # A name declared twice in one owner (rare) gets its own numbered entry.
+            count = 1
+            while key in found:
+                count += 1
+                key = f"{relative}::{owner}::{name}#{count}" if owner else f"{relative}::{name}#{count}"
+            found.add(key)
+    unknown = sorted(found - set(allowlist))
+    stale = sorted(set(allowlist) - set(found))
+    bad_entry = sorted(
+        key
+        for key, entry in allowlist.items()
+        if key in found
+        and (
+            entry.get("category") not in {"config", "guard", "cache", "counter", "constant"}
+            or not entry.get("why")
+        )
+    )
+    if unknown or stale or bad_entry:
+        err("Process-wide state in agora-core / agora-game-minecraft (MASTER_SPEC §32.9)")
+        for key in unknown:
+            print(
+                f"  {key}: a static or thread-local that is not on the allowlist. A test "
+                "seam belongs on `Ctx` (or is passed in), and configuration is moving there "
+                f"too. Add it to {PROCESS_STATE_ALLOWLIST.name} with a category "
+                "(config|guard|cache|counter|constant) and the reason it is process-wide",
+                file=sys.stderr,
+            )
+        for key in stale:
+            print(f"  {key}: allowlisted but no longer found; remove the entry", file=sys.stderr)
+        for key in bad_entry:
+            print(
+                f"  {key}: allowlist entry needs a category "
+                "(config|guard|cache|counter|constant) and a `why`",
+                file=sys.stderr,
+            )
+    else:
+        print(
+            f"OK: {len(found)} process-wide items in core and the Minecraft package, "
+            "each allowlisted"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 15. Fail-closed reads: error-read-as-absent sites may only go down
 # ---------------------------------------------------------------------------
 # MASTER_SPEC §32.13. Most late review findings were one class of bug: an error
 # read as "nothing there" (`.exists()`, `.ok()`, `unwrap_or_default()` on a
@@ -1025,7 +1139,11 @@ def main() -> int:
     check_game_package_core_budget()
     print()
 
-    print("--- 14. Fail-closed reads in recovery, trust, lease, GC and staging code ---")
+    print("--- 14. Process-wide state is on the allowlist ---")
+    check_process_state_allowlisted()
+    print()
+
+    print("--- 15. Fail-closed reads in recovery, trust, lease, GC and staging code ---")
     check_fail_closed_reads()
     print()
 

@@ -21,9 +21,7 @@ use std::time::{Duration, Instant};
 
 use agora_core::ctx::CoreContext;
 use agora_core::game_base::BaseMode;
-use agora_core::game_deploy::{
-    add_content, deploy, plan, undeploy, DeployMode, DeployOutcome, PLAN_CALLS,
-};
+use agora_core::game_deploy::{add_content, deploy, plan, undeploy, DeployMode, DeployOutcome};
 use agora_core::game_discovery::{DiscoveredInstall, DiscoveryReport, InstallCapabilities};
 use agora_core::game_instance::{create, prepare_launch_with, GameInstanceRecord, LaunchOptions};
 use agora_core::game_launch::{LaunchError, LaunchedGame, Launcher, PreparedLaunch};
@@ -35,7 +33,6 @@ use agora_game_api::{
     LaunchRecipe, LaunchValue, PackageDefinition, RelPath, RuntimeIdentity, StoreId,
     StoreIdentifier,
 };
-use std::sync::atomic::Ordering;
 
 use common::data_root::DataRoot;
 
@@ -221,10 +218,10 @@ fn timed<T>(f: impl FnOnce() -> T) -> (T, Duration) {
     (out, start.elapsed())
 }
 
-fn plans_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
-    let before = PLAN_CALLS.load(Ordering::Relaxed);
+fn plans_during<T>(ctx: &CoreContext, f: impl FnOnce() -> T) -> (T, usize) {
+    let before = ctx.test_seams.plan_calls();
     let out = f();
-    (out, PLAN_CALLS.load(Ordering::Relaxed) - before)
+    (out, ctx.test_seams.plan_calls() - before)
 }
 
 fn secs(d: Duration) -> String {
@@ -358,8 +355,12 @@ fn deploy_and_launch_timings() {
     });
 
     let id_a = inst_a.instance_id.clone();
-    let ((planned, t_plan), plans_plan) =
-        plans_during(|| timed(|| plan(&ctx, &id_a, &def, DeployMode::Links).unwrap()));
+    let ((planned, t_plan), plans_plan) = plans_during(&ctx, || {
+        timed(|| plan(&ctx, &id_a, &def, DeployMode::Links).unwrap())
+    });
+    // A step that was meant to plan and did not would print a fast time and count zero plans; the
+    // table would read as a measurement of nothing.
+    assert!(plans_plan > 0, "the plan step ran no planner");
     let planned_files = planned.files.len();
 
     // First link deploy: builds the farm.
@@ -377,7 +378,7 @@ fn deploy_and_launch_timings() {
     let launcher = NoStart;
 
     // Launch preparation on the up-to-date deployment (the common case).
-    let (prep_same, plans_same) = plans_during(|| {
+    let (prep_same, plans_same) = plans_during(&ctx, || {
         timed(|| {
             prepare_launch_with(&ctx, &id_a, &def, options.clone(), &no_discovery, &launcher)
                 .expect("prepare launch on the deployed instance")
@@ -399,7 +400,7 @@ fn deploy_and_launch_timings() {
     for id in &item_ids {
         add_content(&ctx, &inst_b.instance_id, id, None, None).unwrap();
     }
-    let (prep_first, plans_first) = plans_during(|| {
+    let (prep_first, plans_first) = plans_during(&ctx, || {
         timed(|| {
             prepare_launch_with(
                 &ctx,
@@ -420,11 +421,16 @@ fn deploy_and_launch_timings() {
     let extra_files = env_usize("AGORA_BENCH_CHANGE_FILES", 150);
     let extra_id = add_item(&ctx, items, extra_files);
     add_content(&ctx, &id_a, &extra_id, None, None).unwrap();
-    let ((outcome_inc, t_inc), plans_inc) =
-        plans_during(|| timed(|| deploy(&ctx, &id_a, &def, DeployMode::Links).unwrap()));
+    let ((outcome_inc, t_inc), plans_inc) = plans_during(&ctx, || {
+        timed(|| deploy(&ctx, &id_a, &def, DeployMode::Links).unwrap())
+    });
     assert!(
         matches!(outcome_inc, DeployOutcome::Built { .. }),
         "{outcome_inc:?}"
+    );
+    assert!(
+        plans_inc > 0,
+        "the in-place update step ran no planner; the row would measure nothing"
     );
     let (_, t_undeploy) = timed(|| undeploy(&ctx, &id_a).unwrap());
     let (outcome_full, t_full) = timed(|| deploy(&ctx, &id_a, &def, DeployMode::Links).unwrap());

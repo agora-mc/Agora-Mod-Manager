@@ -112,6 +112,7 @@ pub mod snapshot_service;
 pub mod source_identify;
 pub mod startup_recovery;
 pub mod task_scheduler;
+pub mod test_seams;
 pub mod version_changelogs;
 pub mod version_match;
 

@@ -31,6 +31,7 @@ import fetch_loader_manifests
 import deploy_release_assets
 import catalog_delta
 import check_cli_coverage
+import check_architecture as cak
 import finalize_release_assets as fra
 import publish_updater_manifest as pum
 import refresh_loader_manifests
@@ -4660,6 +4661,138 @@ class TestDesktopUpdaterEndpoint(unittest.TestCase):
             with self.assertRaisesRegex(pum.UpdaterPublishError, "Refusing to replace newer"):
                 pum.publish_updater_manifest("agora-mc/Agora-Mod-Manager", "v0.9.4")
             pum.publish_updater_manifest("agora-mc/Agora-Mod-Manager", "v0.9.4", allow_downgrade=True)
+
+
+class TestProcessStateGuard(unittest.TestCase):
+    """MASTER_SPEC §32.9: process-wide state in core and the Minecraft package is allowlisted."""
+
+    SOURCE = """
+static PRODUCTION_CACHE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+thread_local! {
+    static IN_A_THREAD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+tokio::task_local! {
+    static IN_A_TASK: u32;
+}
+
+fn body() {
+    static IN_A_FUNCTION: u32 = 0;
+    static ONCE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    static LAZY: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| 0);
+}
+
+#[cfg(test)]
+static TEST_ONLY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn sample() {}
+
+static AFTER_A_TEST_HELPER: u32 = 0;
+
+#[cfg(test)]
+mod tests {
+    static IN_TESTS: u32 = 0;
+
+    #[test]
+    fn it_works() {
+        static IN_A_TEST_FUNCTION: u32 = 0;
+    }
+}
+"""
+
+    def _run(self, files, allowlist_entries):
+        """Run the check over `files` (name -> source) against an allowlist, return failure and stderr."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            core = root / "core"
+            minecraft = root / "minecraft"
+            core.mkdir()
+            minecraft.mkdir()
+            for name, source in files.items():
+                (core / name).write_text(source, encoding="utf-8")
+            allowlist = root / "allowlist.json"
+            allowlist.write_text(json.dumps(allowlist_entries), encoding="utf-8")
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(cak, "CORE_SRC", core),
+                mock.patch.object(cak, "MC_SRC", minecraft),
+                mock.patch.object(cak, "PROCESS_STATE_ALLOWLIST", allowlist),
+                mock.patch.object(cak, "REPO_ROOT", root),
+                mock.patch.object(cak, "EXIT_CODE", 0),
+                contextlib.redirect_stderr(stderr),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                cak.check_process_state_allowlisted()
+                failed = cak.EXIT_CODE
+        return failed, stderr.getvalue()
+
+    def test_every_kind_of_process_wide_item_is_found_and_test_code_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "module.rs").write_text(self.SOURCE, encoding="utf-8")
+            found = {
+                (name, owner) for _path, _line, name, owner in cak.process_state_items(root)
+            }
+        self.assertEqual(
+            found,
+            {
+                # A module-level static, and the two blocking-local macros.
+                ("PRODUCTION_CACHE", ""),
+                ("IN_A_THREAD", ""),
+                ("IN_A_TASK", ""),
+                # Function-local statics, including a `OnceLock` and a `LazyLock`.
+                ("IN_A_FUNCTION", "body"),
+                ("ONCE", "body"),
+                ("LAZY", "body"),
+                # Production code after a `#[cfg(test)] fn`, which is not skipped
+                # past the test item itself.
+                ("AFTER_A_TEST_HELPER", ""),
+            },
+        )
+
+    def test_an_unlisted_static_fails_the_check(self):
+        failed, stderr = self._run(
+            {"module.rs": self.SOURCE},
+            {
+                "core/module.rs::PRODUCTION_CACHE": {"category": "cache", "why": "kept"},
+                "core/module.rs::IN_A_THREAD": {"category": "cache", "why": "kept"},
+            },
+        )
+        self.assertEqual(failed, 1)
+        self.assertIn("core/module.rs::body::ONCE", stderr)
+        self.assertIn("core/module.rs::body::LAZY", stderr)
+        self.assertIn("core/module.rs::IN_A_TASK", stderr)
+        self.assertIn("core/module.rs::AFTER_A_TEST_HELPER", stderr)
+        for skipped in ("TEST_ONLY", "IN_TESTS", "IN_A_TEST_FUNCTION"):
+            self.assertNotIn(skipped, stderr)
+
+    def test_a_static_in_a_function_is_keyed_by_its_function(self):
+        source = (
+            "fn windows_user_re() {\n"
+            "    static RE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();\n"
+            "}\n"
+            "\n"
+            "fn linux_home_re() {\n"
+            "    static RE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();\n"
+            "}\n"
+            "\n"
+            "fn macos_home_re() {\n"
+            "    static RE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();\n"
+            "}\n"
+        )
+        allowed = {
+            "core/module.rs::windows_user_re::RE": {"category": "cache", "why": "kept"},
+            "core/module.rs::linux_home_re::RE": {"category": "cache", "why": "kept"},
+        }
+        failed, stderr = self._run({"module.rs": source}, allowed)
+        self.assertEqual(failed, 1)
+        self.assertIn("module.rs::macos_home_re::RE", stderr)
+        # The two allowed ones are found under their own function, so they are
+        # not reported stale.
+        self.assertNotIn("windows_user_re::RE: allowlisted but no longer found", stderr)
+        self.assertNotIn("linux_home_re::RE: allowlisted but no longer found", stderr)
 
 
 if __name__ == "__main__":

@@ -2651,6 +2651,7 @@ async fn async_main() {
     let local_state_options = agora_core::db::LocalStateOpenOptions {
         accept_newer_schema: cli.fresh_database,
         accept_missing_backup: cli.migrate_without_backup,
+        ..Default::default()
     };
     let (ctx, warnings, _startup_report) =
         match agora_core::ctx::CoreContext::initialize_with_local_state_options(
@@ -7478,6 +7479,7 @@ async fn run_command(
                         base_mode,
                         None,
                         options,
+                        &ctx.test_seams,
                         &|p: agora_core::game_base::BuildProgress| {
                             // Hashing a large game takes a while; say so about once a second.
                             use std::sync::atomic::{AtomicU64, Ordering};

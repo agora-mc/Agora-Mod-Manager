@@ -400,30 +400,32 @@ fn two_concurrent_recoveries_restore_exactly_once() {
     std::fs::write(&path, b"this is not a sqlite database").unwrap();
 
     // A test hook holds the first initializer inside the critical section. The second cannot
-    // finish until it is released, whatever the scheduler does — no shared start barrier.
+    // finish until it is released, whatever the scheduler does — no shared start barrier. The
+    // hook is handed to the first initializer only, and fires once: it is passed in with the
+    // startup choices, so it is this open's hook and no other's.
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    agora_core::db::set_startup_lock_hook(
-        &path,
-        Box::new(move || {
+    // The hook may be shared, so its receiver sits behind a lock.
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let once = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let first_options = LocalStateOpenOptions {
+        startup_lock_hook: Some(agora_core::db::StartupLockHook::new(move |_path: &Path| {
+            if !once.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
             entered_tx.send(()).unwrap();
             release_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .recv_timeout(Duration::from_secs(30))
                 .expect("the test releases the first initializer");
-        }),
-    );
-    struct ClearHookOnDrop;
-    impl Drop for ClearHookOnDrop {
-        fn drop(&mut self) {
-            agora_core::db::clear_startup_lock_hook();
-        }
-    }
-    let _clear_hook = ClearHookOnDrop;
+        })),
+        ..LocalStateOpenOptions::default()
+    };
 
     let first_path = path.clone();
-    let first = thread::spawn(move || {
-        init_local_state_db_with(&first_path, &LocalStateOpenOptions::default()).unwrap()
-    });
+    let first =
+        thread::spawn(move || init_local_state_db_with(&first_path, &first_options).unwrap());
     entered_rx
         .recv_timeout(Duration::from_secs(30))
         .expect("the first initializer entered the critical section");
@@ -599,7 +601,7 @@ fn a_newer_version_is_refused_without_the_flag() {
         &path,
         &LocalStateOpenOptions {
             accept_newer_schema: true,
-            accept_missing_backup: false,
+            ..LocalStateOpenOptions::default()
         },
     )
     .unwrap();
@@ -632,6 +634,7 @@ fn a_backup_failure_stops_migration_unless_explicitly_overridden() {
         &LocalStateOpenOptions {
             accept_newer_schema: false,
             accept_missing_backup: true,
+            ..LocalStateOpenOptions::default()
         },
     )
     .unwrap();
@@ -717,4 +720,43 @@ fn quick_check_time_on_a_realistic_database() {
             started.elapsed()
         );
     }
+}
+
+/// A startup-lock hook belongs to the database open it was given to: two hooks, on two databases,
+/// each fire for their own open. (One process-wide slot could not describe two: the second
+/// installer replaced the first, so the first database's hook never fired.)
+#[test]
+fn a_startup_lock_hook_belongs_to_the_database_it_was_given_to() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let path_a = database_at(dir_a.path(), "local_state.db", LOCAL_STATE_SCHEMA_VERSION);
+    let path_b = database_at(dir_b.path(), "local_state.db", LOCAL_STATE_SCHEMA_VERSION);
+
+    let fired_a = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fired_b = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let options_for = |fired: &std::sync::Arc<std::sync::atomic::AtomicUsize>| {
+        let fired = fired.clone();
+        LocalStateOpenOptions {
+            startup_lock_hook: Some(agora_core::db::StartupLockHook::new(move |_path: &Path| {
+                fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })),
+            ..LocalStateOpenOptions::default()
+        }
+    };
+    let options_a = options_for(&fired_a);
+    let options_b = options_for(&fired_b);
+
+    init_local_state_db_with(&path_a, &options_a).expect("a opens");
+    init_local_state_db_with(&path_b, &options_b).expect("b opens");
+
+    assert_eq!(
+        fired_a.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the hook given to a never fired"
+    );
+    assert_eq!(
+        fired_b.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the hook given to b never fired"
+    );
 }

@@ -578,59 +578,6 @@ pub(super) fn try_lock_locations(ctx: &Ctx, operation: &str) -> Result<LockGuard
         .map_err(|error| err("ERR_INSTANCE_BUSY", error.to_string()))
 }
 
-/// Test seam for the window between a restore's rename and its database insert. Keyed by the
-/// id being restored, like the base build pauses; unrelated restores carry on.
-#[cfg(debug_assertions)]
-static PAUSE_RESTORE_AFTER_RENAME_AT: std::sync::Mutex<Option<String>> =
-    std::sync::Mutex::new(None);
-#[cfg(debug_assertions)]
-static RESTORE_RENAME_PAUSED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Test seam: make the next restore of `instance_id` pause right after its rename, until this is
-/// called with `None`. Off by default and absent from release builds.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn set_restore_pause_after_rename_for(instance_id: Option<&str>) {
-    let mut target = PAUSE_RESTORE_AFTER_RENAME_AT
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    *target = instance_id.map(str::to_string);
-    RESTORE_RENAME_PAUSED.store(false, std::sync::atomic::Ordering::SeqCst);
-}
-
-/// Whether a paused restore has reached its rename and is waiting.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn restore_pause_after_rename_reached() -> bool {
-    RESTORE_RENAME_PAUSED.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-#[cfg(debug_assertions)]
-fn pause_restore_after_rename_if_asked(instance_id: &str) {
-    let should_pause = PAUSE_RESTORE_AFTER_RENAME_AT
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .as_deref()
-        == Some(instance_id);
-    if !should_pause {
-        return;
-    }
-    RESTORE_RENAME_PAUSED.store(true, std::sync::atomic::Ordering::SeqCst);
-    loop {
-        let still_asked = PAUSE_RESTORE_AFTER_RENAME_AT
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_deref()
-            == Some(instance_id);
-        if !still_asked {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    RESTORE_RENAME_PAUSED.store(false, std::sync::atomic::Ordering::SeqCst);
-}
-
 fn try_lock_instance(
     ctx: &Ctx,
     instance_id: &str,
@@ -948,7 +895,7 @@ pub fn restore(
     let moved = std::fs::rename(&source, &dest);
     if moved.is_ok() {
         #[cfg(debug_assertions)]
-        pause_restore_after_rename_if_asked(&new_id);
+        ctx.test_seams.restore_rename_pause_point(&new_id);
     }
     if let Err(e) = moved {
         let _ = std::fs::remove_file(&restoring_path);

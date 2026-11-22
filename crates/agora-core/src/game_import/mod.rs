@@ -1486,7 +1486,9 @@ fn run_inner(
     let plan = plan(ctx, inventory, request)?;
     if check_space {
         let needed = single_copy_bytes(&plan, request.copy_saves);
-        if let Some(free) = crate::game_tool_swap::available_bytes(&ctx.paths.content_root()) {
+        if let Some(free) =
+            crate::game_tool_swap::available_bytes(&ctx.test_seams, &ctx.paths.content_root())
+        {
             if needed > free {
                 return Err(ImportError::NotEnoughSpace { needed, free }.into());
             }
@@ -2045,7 +2047,8 @@ pub fn mo2_plan_profiles(
         plans.push(plan(ctx, inventory, &request)?);
     }
     let bytes = multi_copy_bytes(&plans, grouping, base.copy_saves);
-    let free_bytes = crate::game_tool_swap::available_bytes(&ctx.paths.content_root());
+    let free_bytes =
+        crate::game_tool_swap::available_bytes(&ctx.test_seams, &ctx.paths.content_root());
     let fits = free_bytes.is_none_or(|free| bytes <= free);
     let suggestion = profiles::suggest_grouping(&sets);
     let mut warnings = Vec::new();

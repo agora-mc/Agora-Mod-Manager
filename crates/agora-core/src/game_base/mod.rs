@@ -7,7 +7,6 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
 
 use agora_game_api::{
     fold_path_case, FrameworkDefinition, GameDefinition, InstallId, RuntimeIdentity, VolumeInfo,
@@ -517,114 +516,6 @@ pub fn install_size(
     Ok(entries.iter().map(|e| e.size).sum())
 }
 
-/// Test seam for the crash window between the base folder's rename into place and the write of its
-/// record. While paused, the build holds its base lock, so a test can check that another build of
-/// the same id cannot take it.
-///
-/// Each test registers its own pause, keyed by the base root it builds under (a fresh temporary
-/// folder). A single process-wide flag is not enough: plain `cargo test` runs a binary's tests
-/// as threads in one process, and the rebuild tests pause each other's builds if one registration
-/// replaces or clears another's.
-#[cfg(debug_assertions)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BaseBuildPauseKind {
-    AfterRename,
-    BeforePinRecheck,
-}
-
-#[cfg(debug_assertions)]
-struct BaseBuildPause {
-    kind: BaseBuildPauseKind,
-    root: PathBuf,
-    reached: std::sync::atomic::AtomicBool,
-}
-
-#[cfg(debug_assertions)]
-static BASE_BUILD_PAUSES: Mutex<Vec<std::sync::Arc<BaseBuildPause>>> = Mutex::new(Vec::new());
-
-/// A registered pause, returned by the two setters below. `reached` says the build
-/// arrived at its window and is waiting; `release` stops asking and lets it go.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub struct BaseBuildPauseHandle(std::sync::Arc<BaseBuildPause>);
-
-#[cfg(debug_assertions)]
-impl BaseBuildPauseHandle {
-    /// Whether the registered build has reached its pause and is waiting.
-    pub fn reached(&self) -> bool {
-        self.0.reached.load(Ordering::SeqCst)
-    }
-
-    /// Stop asking; the parked build, if any, continues from its pause.
-    pub fn release(&self) {
-        let mut pauses = BASE_BUILD_PAUSES
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        pauses.retain(|pause| !std::sync::Arc::ptr_eq(pause, &self.0));
-    }
-}
-
-#[cfg(debug_assertions)]
-fn register_base_build_pause(kind: BaseBuildPauseKind, base_root: &Path) -> BaseBuildPauseHandle {
-    let mut pauses = BASE_BUILD_PAUSES
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let pause = std::sync::Arc::new(BaseBuildPause {
-        kind,
-        root: base_root.to_path_buf(),
-        reached: std::sync::atomic::AtomicBool::new(false),
-    });
-    pauses.push(pause.clone());
-    BaseBuildPauseHandle(pause)
-}
-
-/// Test seam: make the next `build_base` under `base_root` stop right after it renames its folder
-/// into place, until the returned handle is released. Off by default and absent from release
-/// builds.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn pause_base_build_after_rename(base_root: &Path) -> BaseBuildPauseHandle {
-    register_base_build_pause(BaseBuildPauseKind::AfterRename, base_root)
-}
-
-#[cfg(debug_assertions)]
-fn pause_base_build_if_asked(kind: BaseBuildPauseKind, base_root: &Path) {
-    let pause = BASE_BUILD_PAUSES
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .iter()
-        .find(|pause| pause.kind == kind && pause.root == base_root)
-        .cloned();
-    let Some(pause) = pause else {
-        return;
-    };
-    // Reached stays true for this registration: a test whose build never arrived
-    // must assert it and fail loudly.
-    pause.reached.store(true, Ordering::SeqCst);
-    loop {
-        let still_asked = BASE_BUILD_PAUSES
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .iter()
-            .any(|registered| std::sync::Arc::ptr_eq(registered, &pause));
-        if !still_asked {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// Test seam: make the next `build_base` under `base_root` stop after its early pinning check
-/// of a damaged record and before its locked re-check, until the returned handle is released.
-/// While paused the build holds no lock, so a test can move an instance into Recently deleted
-/// and check that the re-check refuses the rebuild. Registered per test, like the rename pause,
-/// so unrelated builds — and rebuilds parked by other tests — carry on.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn pause_base_build_before_pin_recheck(base_root: &Path) -> BaseBuildPauseHandle {
-    register_base_build_pause(BaseBuildPauseKind::BeforePinRecheck, base_root)
-}
-
 /// The marker Agora writes into a base folder it built, so a rebuild only removes a folder it can
 /// prove is its own.
 const BASE_MARKER_FILE: &str = ".agora-base.json";
@@ -694,6 +585,8 @@ fn base_folder_present(dir: &Path) -> bool {
     )
 }
 
+/// Build a base for `install`: the folder every instance of it shares.
+#[allow(clippy::too_many_arguments)]
 pub fn build_base(
     paths: &AppPaths,
     install: &IdentifiedInstall,
@@ -701,6 +594,7 @@ pub fn build_base(
     mode: BaseMode,
     root_override: Option<&Path>,
     options: BuildOptions,
+    seams: &crate::test_seams::TestSeams,
     progress: &(dyn Fn(BuildProgress) + Send + Sync),
 ) -> Result<BuildOutcome, BaseError> {
     build_base_with_frameworks(
@@ -711,6 +605,7 @@ pub fn build_base(
         mode,
         root_override,
         options,
+        seams,
         progress,
     )
 }
@@ -729,6 +624,7 @@ pub fn build_base_with_frameworks(
     mode: BaseMode,
     root_override: Option<&Path>,
     options: BuildOptions,
+    seams: &crate::test_seams::TestSeams,
     progress: &(dyn Fn(BuildProgress) + Send + Sync),
 ) -> Result<BuildOutcome, BaseError> {
     // 1. Runtime must be Identified
@@ -861,7 +757,10 @@ pub fn build_base_with_frameworks(
     });
 
     #[cfg(debug_assertions)]
-    pause_base_build_if_asked(BaseBuildPauseKind::BeforePinRecheck, &base_root);
+    seams.base_build_pause_point(
+        crate::test_seams::BaseBuildPauseKind::BeforePinRecheck,
+        &base_root,
+    );
 
     // 3. Linked mode checks
     if mode == BaseMode::Linked {
@@ -1059,7 +958,10 @@ pub fn build_base_with_frameworks(
 
     guard.active = false;
     #[cfg(debug_assertions)]
-    pause_base_build_if_asked(BaseBuildPauseKind::AfterRename, &base_root);
+    seams.base_build_pause_point(
+        crate::test_seams::BaseBuildPauseKind::AfterRename,
+        &base_root,
+    );
 
     let created_unix_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_millis() as i64,

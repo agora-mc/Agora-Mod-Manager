@@ -460,7 +460,8 @@ fn base_removal_cannot_delete_a_base_a_restore_is_publishing() {
         .unwrap();
 
     // Park the restore in the window between its rename and its database insert.
-    trash::set_restore_pause_after_rename_for(Some("pinned"));
+    ctx.test_seams
+        .set_restore_pause_after_rename_for(Some("pinned"));
     let restore_ctx = ctx.clone();
     let restore_entry = entry.clone();
     let restore = std::thread::spawn(move || {
@@ -468,7 +469,7 @@ fn base_removal_cannot_delete_a_base_a_restore_is_publishing() {
     });
     let mut reached = false;
     for _ in 0..600 {
-        if trash::restore_pause_after_rename_reached() {
+        if ctx.test_seams.restore_pause_after_rename_reached() {
             reached = true;
             break;
         }
@@ -491,16 +492,20 @@ fn base_removal_cannot_delete_a_base_a_restore_is_publishing() {
     let removal = game_base::remove_base_with(
         &ctx.paths,
         base_id,
-        move || {
-            if !gate.swap(true, Ordering::SeqCst) {
-                trash::set_restore_pause_after_rename_for(None);
-                for _ in 0..600 {
-                    if !entry_dir.exists() {
-                        return;
+        {
+            // The seam to release belongs to this test's context, which the closure below takes.
+            let seams = ctx.test_seams.clone();
+            move || {
+                if !gate.swap(true, Ordering::SeqCst) {
+                    seams.set_restore_pause_after_rename_for(None);
+                    for _ in 0..600 {
+                        if !entry_dir.exists() {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
                     }
-                    std::thread::sleep(Duration::from_millis(10));
+                    panic!("the restore never tidied its entry");
                 }
-                panic!("the restore never tidied its entry");
             }
         },
         |path| std::fs::metadata(path),
@@ -508,7 +513,7 @@ fn base_removal_cannot_delete_a_base_a_restore_is_publishing() {
     if !fired.load(Ordering::SeqCst) {
         // The removal was kept back at the locations lock while the restore still
         // held it. Let the restore commit and publish its row.
-        trash::set_restore_pause_after_rename_for(None);
+        ctx.test_seams.set_restore_pause_after_rename_for(None);
     }
     restore.join().unwrap();
 

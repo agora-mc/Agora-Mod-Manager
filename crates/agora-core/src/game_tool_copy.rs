@@ -384,7 +384,8 @@ pub fn copy_plan(
     run: &str,
 ) -> Result<CopyPlan, SwapError> {
     let location = game_tool_swap::swap_location(ctx, instance_id)?;
-    let same_volume = game_tool_swap::same_volume(&location.install, &location.swap_dir);
+    let same_volume =
+        game_tool_swap::same_volume(&ctx.test_seams, &location.install, &location.swap_dir);
     let kind = if same_volume {
         CopyKind::Kept
     } else {
@@ -763,7 +764,7 @@ pub fn swap_costs(
         kept_copy_exists: plan.kept_copy_exists,
         copy_files: plan.to_copy.files,
         copy_bytes: plan.to_copy.bytes,
-        free_bytes: game_tool_swap::available_bytes(&plan.space_folder),
+        free_bytes: game_tool_swap::available_bytes(&ctx.test_seams, &plan.space_folder),
         steam_running: game_tool_swap::steam_running(),
     })
 }
