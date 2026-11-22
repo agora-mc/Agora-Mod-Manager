@@ -18,6 +18,7 @@ use agora_core::plugins::{
     Consent, NoopUiSink, OfficialCatalog, OfficialInstallState, OfficialStatus, PackageFetcher,
     PluginService, PluginStatus, RegistryTrust, UpdateOutcome, PLUGINS_EMERGENCY_STOP_SETTING,
 };
+use agora_core::plugins::install::PluginInstallState;
 use agora_core::registry_bundle::{self, CatalogHeader};
 use agora_game_api::{
     DeploymentStrategy, GameDefinition, GameId, PackageDefinition, StoreId, StoreIdentifier,
@@ -3119,6 +3120,38 @@ async fn a_differently_signed_update_is_flagged_and_asks_about_its_code_again() 
     );
 }
 
+/// The journal an install leaves when the process dies partway through it (MASTER_SPEC §32.11),
+/// and the worker that wrote it pointed at a process the system does not have: this test's process
+/// has not died, so its own identity would read as a live writer and recovery would leave the
+/// journal alone.
+fn crash_journal(world: &World, previous: Option<&str>, new: &str, state: PluginInstallState) {
+    use agora_core::plugins::install::{install_journal_path, InstallJournal};
+    let id = PluginId::parse(PLUGIN).unwrap();
+    let paths = world.paths();
+    let mut journal = InstallJournal::begin(
+        &paths,
+        &id,
+        previous.is_some(),
+        previous.map(str::to_string),
+        new.to_string(),
+    )
+    .unwrap();
+    journal.start(&paths).unwrap();
+    match state {
+        PluginInstallState::Starting => {}
+        PluginInstallState::Stashed => journal.advance(&paths, state).unwrap(),
+        PluginInstallState::Extracted => {
+            journal.advance(&paths, PluginInstallState::Stashed).unwrap();
+            journal.advance(&paths, PluginInstallState::Extracted).unwrap();
+        }
+    }
+    let path = install_journal_path(&paths, &id);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    value["writer"] = serde_json::json!({"pid": u32::MAX, "start_time": 1, "expected_exe": null});
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+}
+
 #[tokio::test]
 async fn a_crash_mid_install_restores_the_previous_version_at_startup() {
     let world = World::new();
@@ -3128,12 +3161,14 @@ async fn a_crash_mid_install_restores_the_previous_version_at_startup() {
         .unwrap();
 
     // The half-done state: the old files are in the rollback folder, the new
-    // ones are unpacked, but the record still names v1.
+    // ones are unpacked, but the record still names v1 — and the install's
+    // journal says how far it got.
     let installed = world.installed_dir();
     let rollback = world.paths().plugin_rollback_root().join(PLUGIN);
     std::fs::create_dir_all(rollback.parent().unwrap()).unwrap();
     std::fs::rename(&installed, &rollback).unwrap();
     agora_core::plugins::install::extract_package(&fixture_zip("2.0.0"), &installed).unwrap();
+    crash_journal(&world, Some("1.0.0"), "2.0.0", PluginInstallState::Extracted);
 
     let (ctx, warnings) = world.start();
     assert!(
@@ -3171,10 +3206,12 @@ async fn a_finished_install_left_in_the_rollback_folder_is_just_cleaned_up() {
         .install_package_bytes(&fixture_zip("2.0.0"), true)
         .unwrap();
 
-    // The record says v2 and v2 is on disk; only the stashed v1 is left.
+    // The record says v2 and v2 is on disk; only the stashed v1 and the journal
+    // the install had not deleted yet are left.
     let rollback = world.paths().plugin_rollback_root().join(PLUGIN);
     std::fs::create_dir_all(rollback.parent().unwrap()).unwrap();
     agora_core::plugins::install::extract_package(&fixture_zip("1.0.0"), &rollback).unwrap();
+    crash_journal(&world, Some("1.0.0"), "2.0.0", PluginInstallState::Extracted);
 
     let (ctx, _) = world.start();
     assert!(!rollback.exists());
@@ -3187,6 +3224,31 @@ async fn a_finished_install_left_in_the_rollback_folder_is_just_cleaned_up() {
         "2.0.0",
         "the finished install is kept"
     );
+}
+
+/// A stashed copy from an Agora that wrote no journal proves nothing about which install made it,
+/// so it is not recovered automatically: it is reported, and `agora plugin recover` resolves it.
+#[tokio::test]
+async fn a_stashed_copy_with_no_journal_needs_a_hand_at_startup() {
+    let world = World::new();
+    world
+        .service
+        .install_package_bytes(&fixture_zip("1.0.0"), true)
+        .unwrap();
+    let installed = world.installed_dir();
+    let rollback = world.paths().plugin_rollback_root().join(PLUGIN);
+    std::fs::create_dir_all(rollback.parent().unwrap()).unwrap();
+    std::fs::rename(&installed, &rollback).unwrap();
+
+    let (_ctx, warnings) = world.start();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("needs a hand") && w.contains("plugin recover")),
+        "the case is reported with its way out: {warnings:?}"
+    );
+    assert!(rollback.is_dir(), "nothing was touched");
+    assert!(!installed.exists(), "nothing was restored");
 }
 
 // ---------------------------------------------------------------------------
