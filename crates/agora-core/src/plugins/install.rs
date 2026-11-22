@@ -762,6 +762,60 @@ pub fn restore_rollback(rollback_dir: &Path, install_dir: &Path) -> LauncherResu
         .map_err(|e| io_error(format!("could not restore the previous version: {e}")))
 }
 
+/// Flush a freshly unpacked package — every file, then every directory — to the disk.
+///
+/// Unpacking writes through the OS cache, and a record saying a plugin is installed is only true
+/// if the files it names survive a power loss. This runs before the record is written, so a crash
+/// in the window leaves the previous version in place (and recoverable from the journal) rather
+/// than a record pointing at files that were never written.
+///
+/// Windows flushes a file's data through `FlushFileBuffers`, which needs a handle opened for
+/// writing; a directory is not flushed there, because the file system journals the entries. On
+/// Unix the directory itself is synced, because the directory is where a rename or an unlink
+/// becomes visible.
+pub fn flush_tree(root: &Path) -> LauncherResult<()> {
+    let entries = std::fs::read_dir(root)
+        .map_err(|e| io_error(format!("could not read {}: {e}", root.display())))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| io_error(format!("could not read {}: {e}", root.display())))?;
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|e| io_error(format!("could not examine {}: {e}", path.display())))?;
+        if kind.is_dir() {
+            flush_tree(&path)?;
+        } else if kind.is_file() {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.sync_all())
+                .map_err(|e| {
+                    io_error(format!(
+                        "could not flush {} to the disk: {e}",
+                        path.display()
+                    ))
+                })?;
+        }
+    }
+    #[cfg(unix)]
+    {
+        std::fs::File::open(root)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| {
+                io_error(format!(
+                    "could not flush {} to the disk: {e}",
+                    root.display()
+                ))
+            })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // The install journal (MASTER_SPEC §32.11)
 // ---------------------------------------------------------------------------
@@ -801,6 +855,12 @@ pub enum PluginInstallState {
     Stashed,
     /// The new version's files are in place; the record is not written yet.
     Extracted,
+    /// The commit witness: the new version's files are in place **and flushed to disk**, and the
+    /// database record naming them is committed. This is the one state that means "finished".
+    /// Recovery drops the stashed copy from here, and puts it back from any state before it —
+    /// decided by the witness, never by comparing version numbers, because a replacement can
+    /// legitimately carry the same version with different bytes.
+    Committed,
 }
 
 impl crate::recovery::JournalState for PluginInstallState {
@@ -1022,8 +1082,11 @@ pub enum InstallCrashPoint {
     Stashed,
     /// Right after the new version's files are in place, before the record is written.
     Extracted,
-    /// Right after the record is written, before the journal is finished.
+    /// Right after the record is written, before the new files are flushed.
     Recorded,
+    /// Right after the commit witness: files flushed, record committed, stashed copy not yet
+    /// dropped.
+    Committed,
 }
 
 /// Whether a test asked the install to stop here. A crash is a panic: the unwinding is what the
@@ -1405,28 +1468,37 @@ fn apply(
     }
     let destination = package_dir(&paths.plugin_packages_root(), id);
     let rollback = paths.plugin_rollback_root().join(id.as_str());
-    let record = match store::get(conn, id) {
-        Ok(record) => record,
-        Err(error) => {
-            return InstallRecovery::NeedsHand(format!(
-                "A plugin install needs a hand: the record for {id} could not be read ({error}). \
-                 Nothing was changed."
-            ))
-        }
-    };
-    // Finished: the record already names the version that is on disk. The stashed copy did not
-    // need to come back, so it was stale and is dropped. A package folder whose manifest cannot be
-    // read never reaches this point — the proof above refused it — so a file that cannot be read
-    // is never "not finished".
-    let finished = match (&record, folder_manifest(&destination)) {
-        (Some(record), FolderManifest::Readable { version, .. })
-            if !store::is_tombstone(record) =>
-        {
-            version == record.manifest.version.to_string()
-        }
-        _ => false,
-    };
+    // Which side of the commit the install reached is decided by the journal's own witness, never
+    // by comparing versions: a replacement can carry the same version with different bytes, and
+    // then only the witness can tell an install that finished from one that did not
+    // (MASTER_SPEC §32.11). `Committed` means the new files were flushed and the record naming
+    // them was committed, so the stashed copy is stale and is dropped; anything before it means the
+    // install did not finish, so the previous version goes back.
+    let finished = matches!(capability.state(), PluginInstallState::Committed);
     if finished {
+        // The witness says the record naming this install was committed. A record that is not
+        // there says the two have drifted apart — a restored database, or a record removed by
+        // something else — and dropping the only other copy of the plugin on that evidence is not
+        // recovery's call.
+        match store::get(conn, id) {
+            Ok(Some(record)) if !store::is_tombstone(&record) => {}
+            Ok(_) => {
+                return InstallRecovery::NeedsHand(format!(
+                    "A plugin install needs a hand: its journal says the install of {id} {} \
+                     finished and its record was written, but there is no record for it now. \
+                     Nothing was changed; the journal and the stashed copy were kept.",
+                    journal.new_version
+                ))
+            }
+            Err(error) => {
+                return InstallRecovery::NeedsHand(format!(
+                    "A plugin install needs a hand: its journal says the install of {id} {} \
+                     finished, but the record could not be read ({error}). Nothing was changed; \
+                     the journal and the stashed copy were kept.",
+                    journal.new_version
+                ))
+            }
+        }
         let dropped = match readable_version(&rollback) {
             Some(version) => format!(" ({version})"),
             None => String::new(),
@@ -2200,10 +2272,10 @@ mod tests {
         );
     }
 
-    /// A crash after the record was written: the new version is installed and recorded, so the
-    /// stashed copy is stale and is dropped, leaving the new version.
+    /// A crash after the commit witness was written: the new files were flushed and the record
+    /// naming them was committed, so the install finished and the stashed copy is stale.
     #[test]
-    fn a_crash_after_the_record_keeps_the_new_version() {
+    fn a_crash_after_the_commit_witness_keeps_the_new_version() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = crate::app_paths::AppPaths::from_root(tmp.path().join("data"));
         paths.create_required_dirs().unwrap();
@@ -2229,6 +2301,8 @@ mod tests {
             "2026-01-01T00:00:00Z",
         )
         .unwrap();
+        // The witness, written after the record commits and the files are flushed.
+        journal_state(&paths, "acme.one", PluginInstallState::Committed);
 
         let warnings = recover_interrupted_installs(&conn, &paths).unwrap();
 
@@ -2245,6 +2319,55 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("Finished the interrupted install")),
             "{warnings:?}"
+        );
+    }
+
+    /// The bug the witness replaces: a replacement carrying the *same* version with different
+    /// bytes, killed after extraction, used to look "finished" because the record's version and
+    /// the folder's matched — and the half-installed copy was kept. The witness says otherwise, so
+    /// the previous copy comes back (MASTER_SPEC §32.11).
+    #[test]
+    fn a_crash_after_extraction_restores_the_old_copy_when_the_version_is_the_same() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::app_paths::AppPaths::from_root(tmp.path().join("data"));
+        paths.create_required_dirs().unwrap();
+        crate::db::init_local_state_db(&paths.local_state_db()).unwrap();
+        let conn = crate::db::local_state_connection(&paths.local_state_db()).unwrap();
+        // Previous 1.0.0 stashed, new 1.0.0 being unpacked: same version, different bytes.
+        crashed_install(&paths, "acme.one", Some("1.0.0"), true, "1.0.0");
+        let destination = paths.plugin_packages_root().join("acme.one");
+        let rollback = paths.plugin_rollback_root().join("acme.one");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(
+            destination.join(MANIFEST_FILENAME),
+            manifest_json("acme.one"),
+        )
+        .unwrap();
+        std::fs::write(destination.join("bytes.txt"), b"new").unwrap();
+        std::fs::write(rollback.join("bytes.txt"), b"old").unwrap();
+        // The record still names the previous install, and the folder matches its version.
+        let manifest = PluginManifest::parse(&manifest_json("acme.one")).unwrap();
+        store::upsert(
+            &conn,
+            &manifest,
+            &grant_for(&manifest).unwrap(),
+            &PluginSource::Package,
+            &destination,
+            true,
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        journal_state(&paths, "acme.one", PluginInstallState::Extracted);
+
+        let warnings = recover_interrupted_installs(&conn, &paths).unwrap();
+
+        assert!(
+            std::fs::read(destination.join("bytes.txt")).ok().as_deref() == Some(b"old"),
+            "the previous copy is back, not the half-installed one: {warnings:?}"
+        );
+        assert!(
+            readable_version(&destination).as_deref() == Some("1.0.0"),
+            "the previous version is back: {warnings:?}"
         );
     }
 
@@ -2298,6 +2421,7 @@ mod tests {
             InstallCrashPoint::Stashed,
             InstallCrashPoint::Extracted,
             InstallCrashPoint::Recorded,
+            InstallCrashPoint::Committed,
         ];
         for point in points {
             let tmp = tempfile::tempdir().unwrap();
@@ -2395,6 +2519,17 @@ mod tests {
         });
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         path
+    }
+
+    /// Rewrite a crashed journal's state, as a process that got one step further would have left
+    /// it (the state is part of the same flattened document).
+    fn journal_state(paths: &crate::app_paths::AppPaths, id: &str, state: PluginInstallState) {
+        let plugin_id = PluginId::parse(id).unwrap();
+        let path = install_journal_path(paths, &plugin_id);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["state"] = serde_json::to_value(state).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
     }
 
     /// Two processes: while another Agora process holds the plugin-install lock (it is mid

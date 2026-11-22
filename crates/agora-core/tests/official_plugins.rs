@@ -3140,13 +3140,18 @@ fn crash_journal(world: &World, previous: Option<&str>, new: &str, state: Plugin
     match state {
         PluginInstallState::Starting => {}
         PluginInstallState::Stashed => journal.advance(&paths, state).unwrap(),
-        PluginInstallState::Extracted => {
+        PluginInstallState::Extracted | PluginInstallState::Committed => {
             journal
                 .advance(&paths, PluginInstallState::Stashed)
                 .unwrap();
             journal
                 .advance(&paths, PluginInstallState::Extracted)
                 .unwrap();
+            if state == PluginInstallState::Committed {
+                journal
+                    .advance(&paths, PluginInstallState::Committed)
+                    .unwrap();
+            }
         }
     }
     let path = install_journal_path(&paths, &id);
@@ -3215,8 +3220,8 @@ async fn a_finished_install_left_in_the_rollback_folder_is_just_cleaned_up() {
         .install_package_bytes(&fixture_zip("2.0.0"), true)
         .unwrap();
 
-    // The record says v2 and v2 is on disk; only the stashed v1 and the journal
-    // the install had not deleted yet are left.
+    // The record says v2, v2 is on disk, and the install wrote its commit witness; only the
+    // stashed v1 and the journal it had not deleted yet are left.
     let rollback = world.paths().plugin_rollback_root().join(PLUGIN);
     std::fs::create_dir_all(rollback.parent().unwrap()).unwrap();
     agora_core::plugins::install::extract_package(&fixture_zip("1.0.0"), &rollback).unwrap();
@@ -3224,7 +3229,7 @@ async fn a_finished_install_left_in_the_rollback_folder_is_just_cleaned_up() {
         &world,
         Some("1.0.0"),
         "2.0.0",
-        PluginInstallState::Extracted,
+        PluginInstallState::Committed,
     );
 
     let (ctx, _) = world.start();

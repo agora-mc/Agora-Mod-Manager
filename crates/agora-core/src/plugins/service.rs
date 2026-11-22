@@ -1619,6 +1619,20 @@ impl PluginService {
             }
         };
 
+        // The files must be on the disk before the record says they are installed, and before the
+        // stashed copy is dropped: a power loss after this point has to leave the new version
+        // whole, not a record pointing at files that never reached the disk.
+        if let Err(error) = install::flush_tree(&destination) {
+            if had_files {
+                let _ = std::fs::remove_dir_all(&destination);
+                install::restore_rollback(&rollback, &destination)?;
+            } else {
+                let _ = std::fs::remove_dir_all(&destination);
+            }
+            journal.discard(&self.inner.ctx.paths)?;
+            return Err(error);
+        }
+
         // Updating something the user had switched off must not switch it back
         // on. Only a first install defaults to enabled; a replacement inherits
         // the state the user chose, and a reinstall over a tombstone is a
@@ -1650,8 +1664,19 @@ impl PluginService {
             journal.discard(&self.inner.ctx.paths)?;
             return Err(error);
         }
-        let _ = std::fs::remove_dir_all(&rollback);
         install::crash_point(&self.inner.ctx, install::InstallCrashPoint::Recorded);
+        // The commit witness (MASTER_SPEC §32.11): the record is committed and the files are
+        // flushed, so this install is finished whatever a crash does next. Until this is written,
+        // recovery puts the previous version back; from here on it drops the stashed copy. It is
+        // the witness, not a version comparison, that decides — a replacement may carry the same
+        // version with different bytes.
+        journal.advance(
+            &self.inner.ctx.paths,
+            install::PluginInstallState::Committed,
+        )?;
+        install::crash_point(&self.inner.ctx, install::InstallCrashPoint::Committed);
+        // Only now is the stashed copy stale: recovery can no longer need it.
+        let _ = std::fs::remove_dir_all(&rollback);
         // The install is over: the journal goes last, so a crash before this point is still
         // recovered and a crash after it does nothing.
         journal.discard(&self.inner.ctx.paths)?;
