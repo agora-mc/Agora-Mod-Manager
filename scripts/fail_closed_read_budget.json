@@ -5,7 +5,7 @@
     "crates/agora-core/src/game_base/mod.rs": 17,
     "crates/agora-core/src/game_instance/trash.rs": 9,
     "crates/agora-core/src/game_tool_swap.rs": 16,
-    "crates/agora-core/src/game_user_files.rs": 23,
+    "crates/agora-core/src/game_user_files.rs": 20,
     "crates/agora-core/src/instance_runtime.rs": 0,
     "crates/agora-core/src/lkg.rs": 0,
     "crates/agora-core/src/lock_manager.rs": 5,

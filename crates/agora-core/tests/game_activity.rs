@@ -264,6 +264,7 @@ fn a_save_restore_refuses_when_the_session_store_cannot_be_read() {
 fn the_activity_answer_is_idle_with_no_records_and_running_with_a_live_lease() {
     let h = Harness::new();
     h.make_instance("demo");
+
     assert_eq!(
         agora_core::instance_runtime::game_activity(&h.ctx, "demo"),
         agora_core::instance_runtime::GameActivity::Idle
@@ -274,6 +275,74 @@ fn the_activity_answer_is_idle_with_no_records_and_running_with_a_live_lease() {
         agora_core::instance_runtime::game_activity(&h.ctx, "demo"),
         agora_core::instance_runtime::GameActivity::Running
     );
+}
+
+/// A journal the process cannot examine is not an absent journal: `exists()` is also false for an
+/// access denial, and reading that as "no session" lets a mutation proceed under a live game.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_user_files_journal_is_could_not_tell_not_idle() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let h = Harness::new();
+    h.make_instance("live");
+    let journal = h.ctx.paths.user_files_journal_path("skyrim-se", "steam");
+    put(&journal, b"{\"instance_id\":\"live\"}");
+    let folder = journal.parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let answer = agora_core::instance_runtime::game_activity(&h.ctx, "live");
+    // Restore before asserting, so a failure does not leave an unremovable folder behind.
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if std::fs::read_dir(&folder).is_ok() {
+        println!(
+            "skipping the unreadable-journal test: this account can read a 0o000 folder (root)"
+        );
+        return;
+    }
+    assert!(
+        matches!(
+            answer,
+            agora_core::instance_runtime::GameActivity::CouldNotTell(_)
+        ),
+        "an unreadable journal must be can't-tell, not idle: {answer:?}"
+    );
+}
+
+/// A journal replaced by a broken link is present and unreadable, not absent. Windows needs the
+/// symlink privilege to make one, so the test says it skipped rather than passing silently.
+#[test]
+fn a_journal_replaced_by_a_broken_link_is_could_not_tell_not_idle() {
+    let h = Harness::new();
+    h.make_instance("live");
+    let journal = h.ctx.paths.user_files_journal_path("skyrim-se", "steam");
+    std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    if let Err(error) = make_symlink(&h.user.path().join("nothing-is-here"), &journal) {
+        println!(
+            "skipping the broken-link journal test: this account cannot create links ({error})"
+        );
+        return;
+    }
+
+    let answer = agora_core::instance_runtime::game_activity(&h.ctx, "live");
+    assert!(
+        matches!(
+            answer,
+            agora_core::instance_runtime::GameActivity::CouldNotTell(_)
+        ),
+        "a broken link at the journal is can't-tell, not idle: {answer:?}"
+    );
+}
+
+fn make_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link)
+    }
 }
 
 /// Editing an INI under a live game is exactly what the one guard is for: the game rewrites the
