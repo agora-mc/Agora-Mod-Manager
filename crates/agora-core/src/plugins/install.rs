@@ -1373,16 +1373,17 @@ fn recover_one(
 /// Finish or undo one interrupted install, through the capability: only the paths the journal
 /// proved this operation owns are touched.
 fn apply(
-    capability: crate::recovery::RecoveryCapability<PluginInstallState>,
+    mut capability: crate::recovery::RecoveryCapability<PluginInstallState>,
     conn: &rusqlite::Connection,
     paths: &crate::app_paths::AppPaths,
     id: &PluginId,
 ) -> InstallRecovery {
-    let journal = match install_payload(&capability) {
+    let journal: InstallJournal = match capability.payload() {
         Ok(journal) => journal,
-        Err(why) => {
+        Err(error) => {
             return InstallRecovery::NeedsHand(format!(
-                "A plugin install needs a hand: {why}. Nothing was changed; the journal was kept."
+                "A plugin install needs a hand: its journal is not readable in a way this build \
+                 understands ({error}). Nothing was changed; the journal was kept."
             ))
         }
     };
@@ -1483,11 +1484,20 @@ fn apply(
     };
     let restoring = format!(" ({restoring})");
     match capability.restore(&rollback, &destination) {
-        Ok(()) => match capability.finish() {
-            Ok(()) => InstallRecovery::Done(format!(
-                "Recovered plugin {id} from an interrupted install; the previous version{restoring} \
-                 is back."
-            )),
+        Ok(aside) => match capability.finish() {
+            Ok(()) => {
+                let kept = match aside {
+                    Some(aside) => format!(
+                        " The copy that was there is kept at {}.",
+                        aside.display()
+                    ),
+                    None => String::new(),
+                };
+                InstallRecovery::Done(format!(
+                    "Recovered plugin {id} from an interrupted install; the previous \
+                     version{restoring} is back.{kept}"
+                ))
+            }
             Err(error) => InstallRecovery::NeedsHand(format!(
                 "Plugin {id} was put back, but its journal could not be removed ({error})."
             )),
@@ -1497,20 +1507,6 @@ fn apply(
              and `agora plugin recover {id}` tries again."
         )),
     }
-}
-
-/// The journal's own payload, read under the lock the capability holds.
-fn install_payload(
-    capability: &crate::recovery::RecoveryCapability<PluginInstallState>,
-) -> Result<InstallJournal, String> {
-    let bytes = std::fs::read(capability.journal_path())
-        .map_err(|error| format!("its journal could not be read ({error})"))?;
-    let journal: InstallJournal = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("its journal is not a complete install journal ({error})"))?;
-    if journal.envelope.operation_id != capability.operation_id() {
-        return Err("its journal changed while recovery held the lock".into());
-    }
-    Ok(journal)
 }
 
 /// The directory a package version is installed into.

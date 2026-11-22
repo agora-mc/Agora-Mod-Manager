@@ -32,6 +32,14 @@
 //! other path at runtime, with `ERR_RECOVERY_REFUSED`. A recovery handler therefore cannot delete a
 //! folder the journal did not name, which is the mistake that costs a user their files.
 //!
+//! The capability acts on what it *verified*, not on what the journal said a moment ago: before
+//! each action it re-checks the marker and the OS identity of the path (volume and file id on
+//! Windows, device and inode on Unix), so a folder removed and recreated under the same name, or a
+//! marker swapped for another operation's, is refused and reported. And
+//! [`restore`](RecoveryCapability::restore) never deletes what it replaces: the content is moved to
+//! a sibling named after the operation, then the stashed copy takes the path, so a restore that
+//! turns out to be wrong loses nothing.
+//!
 //! # What is deliberately not here yet
 //!
 //! Only the plugin install writes an envelope so far; the other journals move onto it one at a time
@@ -281,10 +289,35 @@ pub enum JournalRead<S> {
     /// its journal. Nothing to recover.
     Absent,
     /// A journal this build can act on, after its envelope was validated.
-    Valid(Box<Envelope<S>>),
+    Valid(Box<Journal<S>>),
     /// A journal is there, but not one this build can act on. Kept for diagnosis; the reason says
     /// which of the cases below it is.
     Unusable(JournalProblem),
+}
+
+/// A validated journal: the envelope every operation shares, plus the document as it was read.
+///
+/// The document is kept so a feature can read its own fields from the bytes that were already
+/// validated, rather than opening the file a second time — a second read is a second chance for
+/// the file to have changed since the decision.
+#[derive(Debug, Clone)]
+pub struct Journal<S> {
+    envelope: Envelope<S>,
+    document: serde_json::Value,
+}
+
+impl<S> Journal<S> {
+    /// The envelope the decision was made from.
+    pub fn envelope(&self) -> &Envelope<S> {
+        &self.envelope
+    }
+
+    /// This kind's own fields, read from the document the decision validated.
+    pub fn payload<T: DeserializeOwned>(&self) -> Result<T, JournalProblem> {
+        serde_json::from_value(self.document.clone()).map_err(|error| {
+            JournalProblem::Malformed(format!("its own fields are not readable ({error})"))
+        })
+    }
 }
 
 /// Why a journal that exists cannot be acted on. Each case is distinct because each is a different
@@ -370,7 +403,7 @@ pub fn read<S: JournalState>(path: &Path) -> JournalRead<S> {
             )))
         }
     }
-    let envelope: Envelope<S> = match serde_json::from_value(value) {
+    let envelope: Envelope<S> = match serde_json::from_value(value.clone()) {
         Ok(envelope) => envelope,
         Err(error) => {
             return JournalRead::Unusable(JournalProblem::Malformed(format!(
@@ -390,7 +423,10 @@ pub fn read<S: JournalState>(path: &Path) -> JournalRead<S> {
             path.display()
         )));
     }
-    JournalRead::Valid(Box::new(envelope))
+    JournalRead::Valid(Box::new(Journal {
+        envelope,
+        document: value,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +467,91 @@ pub fn writer_liveness(
         // Never read as gone: an answer the OS did not give is not proof that the writer stopped.
         process_identity::ProcessCheck::CantTell(why) => WriterLiveness::CantTell(why),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Verified identities
+// ---------------------------------------------------------------------------
+
+/// What the operating system said one path *is*, so recovery can tell later whether it is still
+/// the same folder (MASTER_SPEC §32.11).
+///
+/// A proof answers "is this the operation's?" when the decision is made. A path can still be
+/// swapped between the decision and the action — a folder deleted and another created in its place
+/// keeps the same name. Acting only on what the decision verified closes that window: the identity
+/// is read again immediately before anything is touched, and a path that is no longer the same one
+/// is refused and reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathIdentity {
+    /// The volume (or device) and file (or inode) the OS reported for the path.
+    File {
+        /// The volume serial (Windows) or device id (Unix).
+        volume: u64,
+        /// The file index (Windows) or inode (Unix).
+        file: u64,
+    },
+}
+
+/// What is at `path`: `Ok(None)` when nothing is, so a path that has never existed is not an
+/// error; `Err` when the OS would not say, which is never read as "nothing is there".
+fn path_identity(path: &Path) -> std::io::Result<Option<PathIdentity>> {
+    // Absent is an answer; anything else the OS refuses is "could not tell", never "nothing there".
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path)?;
+        Ok(Some(PathIdentity::File {
+            volume: metadata.dev(),
+            file: metadata.ino(),
+        }))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+        };
+        // A directory can only be opened by handle with backup semantics; the handle is what names
+        // the file on disk, whatever its name is now.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `file` is open for the call, and `info` is a valid out-parameter.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Some(PathIdentity::File {
+            volume: u64::from(info.dwVolumeSerialNumber),
+            file: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        }))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(std::io::Error::other(
+            "this platform reports no file identity".to_string(),
+        ))
+    }
+}
+
+/// A path whose proof matched when the decision was made, with what the OS said it was then.
+#[derive(Debug, Clone)]
+struct VerifiedPath {
+    path: PathBuf,
+    /// `None` when the path did not exist at decision time. A path that exists *now* but did not
+    /// then was not verified and is not acted on.
+    identity: Option<PathIdentity>,
+    /// The marker that proved it, when the proof was a marker: re-checked before every action, so a
+    /// marker removed or replaced in between refuses the action.
+    marker: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -527,7 +648,7 @@ pub fn decide<S: JournalState>(
         Err(LockRefusal::Unavailable(error)) => return Decision::NeedsHand(error.to_string()),
     };
 
-    let envelope = match read::<S>(journal_path) {
+    let journal = match read::<S>(journal_path) {
         JournalRead::Absent => return Decision::Nothing,
         JournalRead::Unusable(problem) => {
             return Decision::NeedsHand(format!(
@@ -536,8 +657,9 @@ pub fn decide<S: JournalState>(
                 journal_path.display()
             ))
         }
-        JournalRead::Valid(envelope) => envelope,
+        JournalRead::Valid(journal) => journal,
     };
+    let envelope = journal.envelope();
 
     if let Ok(name) = resource.lock_name() {
         if envelope.lock != name {
@@ -573,13 +695,16 @@ pub fn decide<S: JournalState>(
     let mut left_alone = Vec::new();
     let mut markers = Vec::new();
     for entry in &envelope.owned {
-        match &entry.proof {
+        let marker = match &entry.proof {
             PathProof::Marker { at } => match marker_verdict(at, &envelope.operation_id) {
                 MarkerVerdict::Ours => {
-                    owned.push(entry.path.clone());
                     markers.push(at.clone());
+                    Some(at.clone())
                 }
-                MarkerVerdict::NotOurs(why) => left_alone.push((entry.path.clone(), why)),
+                MarkerVerdict::NotOurs(why) => {
+                    left_alone.push((entry.path.clone(), why));
+                    continue;
+                }
                 MarkerVerdict::CantTell(why) => {
                     return Decision::NeedsHand(format!(
                         "A path this journal owns cannot be checked: {why}. Nothing was changed; \
@@ -588,8 +713,11 @@ pub fn decide<S: JournalState>(
                 }
             },
             PathProof::Content => match proof.prove(&entry.path) {
-                ProofResult::Proven => owned.push(entry.path.clone()),
-                ProofResult::NotOwned(why) => left_alone.push((entry.path.clone(), why)),
+                ProofResult::Proven => None,
+                ProofResult::NotOwned(why) => {
+                    left_alone.push((entry.path.clone(), why));
+                    continue;
+                }
                 ProofResult::CantTell(why) => {
                     return Decision::NeedsHand(format!(
                         "A path this journal owns cannot be checked: {why}. Nothing was changed; \
@@ -597,13 +725,31 @@ pub fn decide<S: JournalState>(
                     ))
                 }
             },
-        }
+        };
+        // What the path *is*, not only what the marker says: recovery re-checks this before it
+        // acts, so a folder swapped for another one between the decision and the action is
+        // refused rather than replaced (MASTER_SPEC §32.11).
+        let identity = match path_identity(&entry.path) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return Decision::NeedsHand(format!(
+                    "A path this journal owns cannot be identified, so Agora cannot tell later \
+                     whether it is still the same one: {error}. Nothing was changed; the journal \
+                     was kept."
+                ))
+            }
+        };
+        owned.push(VerifiedPath {
+            path: entry.path.clone(),
+            identity,
+            marker,
+        });
     }
 
     Decision::Act(Box::new(RecoveryCapability {
         lock,
         journal_path: journal_path.to_path_buf(),
-        envelope: *envelope,
+        journal,
         owned,
         left_alone,
         markers,
@@ -666,15 +812,23 @@ fn marker_verdict(at: &Path, operation_id: &str) -> MarkerVerdict {
 /// while recovery is under way, and its three operations refuse any path the journal did not prove.
 /// Recovery handlers act only through this: they cannot delete a folder the journal did not name,
 /// which is the mistake that costs a user their files.
+///
+/// Two more refusals sit inside it. Before each action the marker and the OS identity of the path
+/// are checked again, so a folder swapped for another one, or a marker replaced, between the
+/// decision and the action is refused rather than replaced. And the three operations take
+/// `&mut self`: an action that succeeded updates what is recorded for the path it moved, so the
+/// next action is checked against the state this capability itself left.
 #[derive(Debug)]
 pub struct RecoveryCapability<S> {
     /// Held for the capability's whole life; dropped last.
     lock: LockGuard,
     /// The journal this capability was issued from, deleted by [`Self::finish`].
     journal_path: PathBuf,
-    envelope: Envelope<S>,
-    /// The paths whose proof matched: the only paths the operations below accept.
-    owned: Vec<PathBuf>,
+    /// The journal as it was read and validated: the one read the decision made.
+    journal: Box<Journal<S>>,
+    /// The paths whose proof matched, with what the OS said they were then: the only paths the
+    /// operations below accept.
+    owned: Vec<VerifiedPath>,
     /// The paths whose proof did *not* match, with the reason. Never touched, always reported.
     left_alone: Vec<(PathBuf, String)>,
     /// The marker files this operation wrote; removed with the journal.
@@ -684,17 +838,32 @@ pub struct RecoveryCapability<S> {
 impl<S> RecoveryCapability<S> {
     /// The id of the operation this capability was issued for.
     pub fn operation_id(&self) -> &str {
-        &self.envelope.operation_id
+        &self.journal.envelope.operation_id
     }
 
     /// The state the journal recorded.
     pub fn state(&self) -> &S {
-        &self.envelope.state
+        &self.journal.envelope.state
+    }
+
+    /// This kind's own fields, read from the document the decision validated — never a second
+    /// read of the file, which could have changed since.
+    pub fn payload<T: DeserializeOwned>(&self) -> LauncherResult<T> {
+        self.journal.payload::<T>().map_err(|problem| {
+            journal_error(format!(
+                "the journal of operation {} is not readable in a way this build understands: \
+                 {problem}",
+                self.operation_id()
+            ))
+        })
     }
 
     /// The paths this operation proved it owns. These, and no others, are accepted below.
-    pub fn owned(&self) -> &[PathBuf] {
-        &self.owned
+    pub fn owned(&self) -> Vec<&Path> {
+        self.owned
+            .iter()
+            .map(|owned| owned.path.as_path())
+            .collect()
     }
 
     /// The paths the journal claimed but could not prove, with the reason: left alone, and to be
@@ -714,11 +883,17 @@ impl<S> RecoveryCapability<S> {
     }
 
     /// Remove an owned folder.
-    pub fn remove_dir(&self, path: &Path) -> LauncherResult<()> {
+    pub fn remove_dir(&mut self, path: &Path) -> LauncherResult<()> {
         self.require_owned(path)?;
         match std::fs::remove_dir_all(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => {
+                self.refresh(path)?;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.refresh(path)?;
+                Ok(())
+            }
             Err(error) => Err(journal_error(format!(
                 "could not remove {}: {error}",
                 path.display()
@@ -727,7 +902,7 @@ impl<S> RecoveryCapability<S> {
     }
 
     /// Rename between two owned paths.
-    pub fn rename(&self, from: &Path, to: &Path) -> LauncherResult<()> {
+    pub fn rename(&mut self, from: &Path, to: &Path) -> LauncherResult<()> {
         self.require_owned(from)?;
         self.require_owned(to)?;
         std::fs::rename(from, to).map_err(|error| {
@@ -736,27 +911,83 @@ impl<S> RecoveryCapability<S> {
                 from.display(),
                 to.display()
             ))
-        })
+        })?;
+        self.refresh(from)?;
+        self.refresh(to)?;
+        Ok(())
     }
 
-    /// Undo a stash: whatever is at `to` is removed and `from` takes its place. Both must be owned.
+    /// Undo a stash: `from` takes `to`'s place. Both must be owned.
+    ///
+    /// Whatever is at `to` is **moved aside**, never deleted: it is renamed to a sibling named
+    /// after this operation (`<name>.replaced-<operation id>`), so a restore that turns out to be
+    /// wrong leaves the user's files on disk and named rather than gone. If the stash cannot be put
+    /// in place afterwards, the content moved aside is put back. A restore therefore never leaves
+    /// the package folder missing: it either holds the stashed copy or holds exactly what it held
+    /// before.
     ///
     /// "Is something at `to`?" is answered from the metadata: a path that cannot be examined is an
     /// error, never "nothing there".
-    pub fn restore(&self, from: &Path, to: &Path) -> LauncherResult<()> {
+    pub fn restore(&mut self, from: &Path, to: &Path) -> LauncherResult<Option<PathBuf>> {
         self.require_owned(from)?;
         self.require_owned(to)?;
-        match std::fs::symlink_metadata(to) {
-            Ok(_) => self.remove_dir(to)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        let aside = match std::fs::symlink_metadata(to) {
+            Ok(_) => {
+                let name = to
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "folder".to_string());
+                let aside = to.with_file_name(format!(
+                    "{name}.replaced-{}",
+                    self.journal.envelope.operation_id
+                ));
+                // A folder already there is not merged into and not overwritten: what is in it is
+                // not something this operation can account for.
+                if std::fs::symlink_metadata(&aside).is_ok() {
+                    return Err(journal_error(format!(
+                        "{} is already there, so the content of {} was not moved aside and the \
+                         stashed copy was not put back. Nothing was changed.",
+                        aside.display(),
+                        to.display()
+                    )));
+                }
+                if let Err(error) = std::fs::rename(to, &aside) {
+                    return Err(journal_error(format!(
+                        "the content of {} could not be moved aside to {} ({error}), so the stashed \
+                         copy was not put back. Nothing was changed.",
+                        to.display(),
+                        aside.display()
+                    )));
+                }
+                Some(aside)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
                 return Err(journal_error(format!(
                     "could not examine {}: {error}",
                     to.display()
                 )))
             }
+        };
+        match std::fs::rename(from, to) {
+            Ok(()) => {
+                self.refresh(from)?;
+                self.refresh(to)?;
+                Ok(aside)
+            }
+            Err(error) => {
+                // Put the moved-aside content back, so a failed restore leaves the folder as it
+                // was rather than missing.
+                if let Some(aside) = &aside {
+                    let _ = std::fs::rename(aside, to);
+                }
+                Err(journal_error(format!(
+                    "could not put {} back in place of {} ({error}). Nothing was changed.",
+                    from.display(),
+                    to.display()
+                )))
+            }
         }
-        self.rename(from, to)
     }
 
     /// Finish the operation: remove the ownership markers, then delete the journal — last, so a
@@ -797,23 +1028,73 @@ impl<S> RecoveryCapability<S> {
     }
 
     /// Refuse a path the journal did not prove: the one thing a recovery handler cannot do.
+    ///
+    /// Two re-checks, because the decision was made a moment ago and the disk can have moved since:
+    /// a marker that no longer names this operation, and a path whose OS identity is not the one
+    /// verified. Either is a refusal, and nothing is touched.
     fn require_owned(&self, path: &Path) -> LauncherResult<()> {
-        if self
+        let Some(owned) = self
             .owned
             .iter()
-            .any(|owned| crate::game_tool_swap::same_path(owned, path))
-        {
-            return Ok(());
+            .find(|owned| crate::game_tool_swap::same_path(&owned.path, path))
+        else {
+            return Err(LauncherError::Generic {
+                code: "ERR_RECOVERY_REFUSED".into(),
+                message: format!(
+                    "Recovery for operation {} may only touch the paths its journal proves it \
+                     owns; {} is not one of them. Nothing was changed.",
+                    self.operation_id(),
+                    path.display()
+                ),
+            });
+        };
+        if let Some(marker) = &owned.marker {
+            match marker_verdict(marker, self.operation_id()) {
+                MarkerVerdict::Ours => {}
+                MarkerVerdict::NotOurs(why) => return Err(refused(why)),
+                MarkerVerdict::CantTell(why) => return Err(refused(why)),
+            }
         }
-        Err(LauncherError::Generic {
-            code: "ERR_RECOVERY_REFUSED".into(),
-            message: format!(
-                "Recovery for operation {} may only touch the paths its journal proves it owns; {} \
-                 is not one of them. Nothing was changed.",
-                self.envelope.operation_id,
+        let now = path_identity(path).map_err(|error| {
+            journal_error(format!(
+                "{} could not be identified any more: {error}. Nothing was changed.",
                 path.display()
-            ),
-        })
+            ))
+        })?;
+        match (owned.identity, now) {
+            // The same folder the decision verified, or a path that is still not there.
+            (Some(wanted), Some(found)) if wanted == found => Ok(()),
+            (Some(_), None) | (None, None) => Ok(()),
+            (None, Some(_)) => Err(refused(format!(
+                "{} did not exist when recovery decided what to do and is there now, so it is not \
+                 a path this recovery verified",
+                path.display()
+            ))),
+            (Some(_), Some(_)) => Err(refused(format!(
+                "{} is not the folder recovery verified: it was removed and another one created in \
+                 its place",
+                path.display()
+            ))),
+        }
+    }
+
+    /// Record what the OS says about `path` now, after this capability moved or removed it: a
+    /// successful action is verified against the state the capability itself left.
+    fn refresh(&mut self, path: &Path) -> LauncherResult<()> {
+        let identity = path_identity(path).map_err(|error| {
+            journal_error(format!(
+                "{} could not be identified after recovery changed it: {error}",
+                path.display()
+            ))
+        })?;
+        if let Some(owned) = self
+            .owned
+            .iter_mut()
+            .find(|owned| crate::game_tool_swap::same_path(&owned.path, path))
+        {
+            owned.identity = identity;
+        }
+        Ok(())
     }
 }
 
@@ -826,6 +1107,15 @@ fn journal_error(message: String) -> LauncherError {
     LauncherError::Generic {
         code: "ERR_RECOVERY_JOURNAL".into(),
         message,
+    }
+}
+
+/// Recovery refused to touch a path, with the reason: the path the journal did not prove, a marker
+/// that no longer matched, or a folder that is not the one the decision verified.
+fn refused(why: String) -> LauncherError {
+    LauncherError::Generic {
+        code: "ERR_RECOVERY_REFUSED".into(),
+        message: format!("Recovery refused to change a path: {why}. Nothing was changed."),
     }
 }
 
@@ -918,7 +1208,7 @@ mod tests {
         }];
         write(&path, &written).unwrap();
         match read::<TestState>(&path) {
-            JournalRead::Valid(read_back) => assert_eq!(*read_back, written),
+            JournalRead::Valid(read_back) => assert_eq!(*read_back.envelope(), written),
             other => panic!("expected the journal back, got {other:?}"),
         }
         // The temporary file it was built in is not left behind.
@@ -1079,6 +1369,16 @@ mod tests {
     }
 
     // -- the decision and the capability ------------------------------------
+
+    /// A proof that says every path is the operation's, for the tests about identity and restore
+    /// rather than about the content proof.
+    struct AnyContentProof;
+
+    impl ContentProof for AnyContentProof {
+        fn prove(&self, _path: &Path) -> ProofResult {
+            ProofResult::Proven
+        }
+    }
 
     /// An envelope whose writer provably no longer exists: what a crash leaves.
     fn crashed_envelope(owned: Vec<OwnedPath>) -> Envelope<TestState> {
@@ -1260,7 +1560,7 @@ mod tests {
         write_marker(&marker, &envelope.operation_id).unwrap();
         write(&path, &envelope).unwrap();
 
-        let capability = match decide::<TestState>(
+        let mut capability = match decide::<TestState>(
             &locks,
             &LockResource::PluginInstall,
             &path,
@@ -1270,7 +1570,7 @@ mod tests {
             Decision::Act(capability) => capability,
             other => panic!("expected a capability, got {other:?}"),
         };
-        assert_eq!(capability.owned(), std::slice::from_ref(&owned));
+        assert_eq!(capability.owned(), [&owned]);
         let refused = capability
             .remove_dir(&unowned)
             .expect_err("a path the journal did not prove is refused");
@@ -1286,6 +1586,233 @@ mod tests {
         assert!(
             std::fs::symlink_metadata(&marker).is_err(),
             "finish removes the marker too"
+        );
+    }
+
+    // -- the capability acts on what it verified (MASTER_SPEC §32.11) --------------------------
+
+    /// A folder removed and another created in its place keeps the same name but is not the folder
+    /// the decision verified. The capability must refuse it, and leave it alone.
+    #[test]
+    fn a_folder_swapped_after_the_decision_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let locks = LockManager::new(dir.path().join("locks"));
+        let path = dir.path().join("journal.json");
+        let owned = dir.path().join("owned");
+        let marker = dir.path().join("marker.json");
+        std::fs::create_dir_all(owned.join("ours")).unwrap();
+        let envelope = crashed_envelope(vec![OwnedPath {
+            path: owned.clone(),
+            proof: PathProof::Marker { at: marker.clone() },
+        }]);
+        write_marker(&marker, &envelope.operation_id).unwrap();
+        write(&path, &envelope).unwrap();
+
+        let mut capability = match decide::<TestState>(
+            &locks,
+            &LockResource::PluginInstall,
+            &path,
+            &NoContentProof,
+            &StandInTable::without_the_pid(),
+        ) {
+            Decision::Act(capability) => capability,
+            other => panic!("expected a capability, got {other:?}"),
+        };
+
+        // Between the decision and the action: the folder is replaced by another one with the same
+        // name.
+        std::fs::remove_dir_all(&owned).unwrap();
+        std::fs::create_dir_all(owned.join("someone-elses")).unwrap();
+
+        let refused = capability
+            .remove_dir(&owned)
+            .expect_err("a folder that is not the one verified is refused");
+        assert_eq!(refused.code(), "ERR_RECOVERY_REFUSED");
+        assert!(
+            owned.join("someone-elses").is_dir(),
+            "the folder that was not verified was touched"
+        );
+    }
+
+    /// A marker replaced after the decision is refused: the proof is re-checked, not remembered.
+    #[test]
+    fn a_marker_replaced_after_the_decision_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let locks = LockManager::new(dir.path().join("locks"));
+        let path = dir.path().join("journal.json");
+        let owned = dir.path().join("owned");
+        let marker = dir.path().join("marker.json");
+        std::fs::create_dir_all(&owned).unwrap();
+        let envelope = crashed_envelope(vec![OwnedPath {
+            path: owned.clone(),
+            proof: PathProof::Marker { at: marker.clone() },
+        }]);
+        write_marker(&marker, &envelope.operation_id).unwrap();
+        write(&path, &envelope).unwrap();
+
+        let mut capability = match decide::<TestState>(
+            &locks,
+            &LockResource::PluginInstall,
+            &path,
+            &NoContentProof,
+            &StandInTable::without_the_pid(),
+        ) {
+            Decision::Act(capability) => capability,
+            other => panic!("expected a capability, got {other:?}"),
+        };
+        write_marker(&marker, "another-operation").unwrap();
+
+        let refused = capability
+            .remove_dir(&owned)
+            .expect_err("a marker that no longer names this operation is refused");
+        assert_eq!(refused.code(), "ERR_RECOVERY_REFUSED");
+        assert!(owned.is_dir(), "nothing was touched");
+    }
+
+    /// A restore never deletes what it replaces: the content is moved to a named sibling, and the
+    /// stashed copy takes the path. A restore that turns out to be wrong loses nothing.
+    #[test]
+    fn a_restore_keeps_what_it_replaces_instead_of_deleting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let locks = LockManager::new(dir.path().join("locks"));
+        let path = dir.path().join("journal.json");
+        let stash = dir.path().join("stash");
+        let destination = dir.path().join("destination");
+        let marker = dir.path().join("marker.json");
+        std::fs::create_dir_all(stash.join("previous-version")).unwrap();
+        std::fs::create_dir_all(destination.join("half-installed")).unwrap();
+        let envelope = crashed_envelope(vec![
+            OwnedPath {
+                path: stash.clone(),
+                proof: PathProof::Marker { at: marker.clone() },
+            },
+            OwnedPath {
+                path: destination.clone(),
+                proof: PathProof::Content,
+            },
+        ]);
+        write_marker(&marker, &envelope.operation_id).unwrap();
+        write(&path, &envelope).unwrap();
+        let operation_id = envelope.operation_id.clone();
+
+        let mut capability = match decide::<TestState>(
+            &locks,
+            &LockResource::PluginInstall,
+            &path,
+            &AnyContentProof,
+            &StandInTable::without_the_pid(),
+        ) {
+            Decision::Act(capability) => capability,
+            other => panic!("expected a capability, got {other:?}"),
+        };
+
+        let aside = capability
+            .restore(&stash, &destination)
+            .expect("the restore")
+            .expect("content was there, so it was moved aside");
+        assert!(
+            destination.join("previous-version").is_dir(),
+            "the stashed copy is in place"
+        );
+        assert_eq!(
+            aside,
+            dir.path()
+                .join(format!("destination.replaced-{operation_id}")),
+            "the replaced content goes to a sibling named after the operation"
+        );
+        assert!(
+            aside.join("half-installed").is_dir(),
+            "the content that was there is kept, not deleted"
+        );
+    }
+
+    /// A kept-aside folder already there is not merged into or overwritten: the restore refuses
+    /// and nothing is moved.
+    #[test]
+    fn a_restore_refuses_when_the_kept_folder_is_already_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let locks = LockManager::new(dir.path().join("locks"));
+        let path = dir.path().join("journal.json");
+        let stash = dir.path().join("stash");
+        let destination = dir.path().join("destination");
+        let marker = dir.path().join("marker.json");
+        std::fs::create_dir_all(stash.join("previous-version")).unwrap();
+        std::fs::create_dir_all(destination.join("half-installed")).unwrap();
+        let envelope = crashed_envelope(vec![
+            OwnedPath {
+                path: stash.clone(),
+                proof: PathProof::Marker { at: marker.clone() },
+            },
+            OwnedPath {
+                path: destination.clone(),
+                proof: PathProof::Content,
+            },
+        ]);
+        write_marker(&marker, &envelope.operation_id).unwrap();
+        write(&path, &envelope).unwrap();
+        let aside = dir
+            .path()
+            .join(format!("destination.replaced-{}", envelope.operation_id));
+        std::fs::create_dir_all(aside.join("older-content")).unwrap();
+
+        let mut capability = match decide::<TestState>(
+            &locks,
+            &LockResource::PluginInstall,
+            &path,
+            &AnyContentProof,
+            &StandInTable::without_the_pid(),
+        ) {
+            Decision::Act(capability) => capability,
+            other => panic!("expected a capability, got {other:?}"),
+        };
+
+        let refused = capability
+            .restore(&stash, &destination)
+            .expect_err("a kept folder already there is not merged into");
+        assert_eq!(refused.code(), "ERR_RECOVERY_JOURNAL");
+        assert!(destination.join("half-installed").is_dir(), "nothing moved");
+        assert!(stash.join("previous-version").is_dir(), "nothing moved");
+        assert!(
+            aside.join("older-content").is_dir(),
+            "what was already in the kept folder is untouched"
+        );
+    }
+
+    /// The journal's own fields come from the document the decision validated, not a second read:
+    /// a file rewritten after the decision does not change what recovery acts on.
+    #[test]
+    fn the_payload_is_read_once_before_anything_is_decided() {
+        #[derive(Debug, serde::Deserialize)]
+        struct TestPayload {
+            new_version: String,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let locks = LockManager::new(dir.path().join("locks"));
+        let path = dir.path().join("journal.json");
+        let mut value = serde_json::to_value(crashed_envelope(Vec::new())).unwrap();
+        value["new_version"] = serde_json::json!("2.0.0");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let capability = match decide::<TestState>(
+            &locks,
+            &LockResource::PluginInstall,
+            &path,
+            &NoContentProof,
+            &StandInTable::without_the_pid(),
+        ) {
+            Decision::Act(capability) => capability,
+            other => panic!("expected a capability, got {other:?}"),
+        };
+
+        // The file changes underneath the handler: the decision's document is what it reads.
+        value["new_version"] = serde_json::json!("9.9.9");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let payload: TestPayload = capability.payload().expect("its own fields");
+        assert_eq!(
+            payload.new_version, "2.0.0",
+            "the payload was read again from a file that changed"
         );
     }
 }
