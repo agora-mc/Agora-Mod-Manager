@@ -29,8 +29,7 @@ pub use trash::{DeletedEntry, PurgeSummary, RestoreOutcome, TrashFn};
 /// Test seam: make the next create that pins `base_id` stop after choosing it,
 /// until [`set_create_pause_before_publishing_pin`] is called with `None`.
 #[cfg(debug_assertions)]
-static PAUSE_BEFORE_PIN_PUBLISH_AT: std::sync::Mutex<Option<String>> =
-    std::sync::Mutex::new(None);
+static PAUSE_BEFORE_PIN_PUBLISH_AT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 #[cfg(debug_assertions)]
 static PIN_PUBLISH_PAUSED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);

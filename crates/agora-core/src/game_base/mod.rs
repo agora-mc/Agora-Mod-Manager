@@ -1687,7 +1687,8 @@ fn instances_pinning_base_with(
                 let (instance_id, base_json) = row.map_err(|e| unreadable(&e))?;
                 let base_ref: agora_game_api::BaseReference = serde_json::from_str(&base_json)
                     .map_err(|e| unreadable(&format!("instance {instance_id}: {e}")))?;
-                if matches!(&base_ref, agora_game_api::BaseReference::Pinned { id, .. } if id == base_id) {
+                if matches!(&base_ref, agora_game_api::BaseReference::Pinned { id, .. } if id == base_id)
+                {
                     instances.push(instance_id);
                 }
             }

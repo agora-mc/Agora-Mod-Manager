@@ -536,11 +536,7 @@ fn base_removal_cannot_delete_a_base_a_restore_is_publishing() {
         .optional()
         .map_err(|e| panic!("row read failed: {e}"))
         .unwrap();
-    assert_eq!(
-        present,
-        Some(1),
-        "the restored instance's row is published"
-    );
+    assert_eq!(present, Some(1), "the restored instance's row is published");
 
     // Either the removal read the pair the dangerous way and had to refuse with
     // the pinning refusal, or it never got past the locations lock and the row
