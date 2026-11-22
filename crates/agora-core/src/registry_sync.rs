@@ -1834,11 +1834,11 @@ fn swap_error(error: LauncherError, trust_written: bool) -> LauncherError {
 /// no-op outside tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CrashPoint {
-    AfterTrust,
-    AfterStaging,
-    AfterPreviousCopy,
-    AfterFloor,
-    AfterPublish,
+    TrustWritten,
+    BytesStaged,
+    PreviousKept,
+    FloorRaised,
+    Published,
 }
 
 /// Test-only crash simulation: return an error at a chosen boundary *without*
@@ -1879,7 +1879,7 @@ fn crash_point(app_data_dir: &Path, point: CrashPoint) -> LauncherResult<()> {
     if take_crash_point(app_data_dir, point) {
         return Err(LauncherError::Generic {
             code: "ERR_REGISTRY_CRASH_INJECTED".into(),
-            message: format!("Injected crash after {point:?}."),
+            message: format!("Injected crash at {point:?}."),
         });
     }
     #[cfg(not(test))]
@@ -1922,7 +1922,7 @@ fn install_bundle_bytes_with(
     // statements were never written down could be replaced later by a bundle
     // that omits them.
     let trust_written = remember_bundle_trust(app_data_dir, &trust.log_text, &payload)?;
-    crash_point(app_data_dir, CrashPoint::AfterTrust)?;
+    crash_point(app_data_dir, CrashPoint::TrustWritten)?;
 
     // Stage the verified bytes durably beside the bundle. From here to the
     // publish a crash is recoverable: the floor will name these bytes.
@@ -1932,7 +1932,7 @@ fn install_bundle_bytes_with(
         remove_staged_bundle(app_data_dir);
         return Err(swap_error(error, trust_written));
     }
-    crash_point(app_data_dir, CrashPoint::AfterStaging)?;
+    crash_point(app_data_dir, CrashPoint::BytesStaged)?;
 
     // Keep the previous copy only when the current file looks like a bundle.
     // A corrupt current must not overwrite a good previous one.
@@ -1952,7 +1952,7 @@ fn install_bundle_bytes_with(
             }
         }
     }
-    crash_point(app_data_dir, CrashPoint::AfterPreviousCopy)?;
+    crash_point(app_data_dir, CrashPoint::PreviousKept)?;
 
     // The floor names the catalog before the catalog carries it: whatever
     // happens next, the client cannot fall back to the catalog it replaced, and
@@ -1962,12 +1962,12 @@ fn install_bundle_bytes_with(
     // raised), and neither case needs a guess here.
     raise_floor(app_data_dir, &header.built_at, &header.db_sha256)
         .map_err(|error| swap_error(error, trust_written))?;
-    crash_point(app_data_dir, CrashPoint::AfterFloor)?;
+    crash_point(app_data_dir, CrashPoint::FloorRaised)?;
 
     // COMMIT: one rename replaces the current bundle with the staged bytes.
     publish_staged_bundle(app_data_dir, &staged_bundle_path(app_data_dir)?)
         .map_err(|error| swap_error(error, trust_written))?;
-    crash_point(app_data_dir, CrashPoint::AfterPublish)?;
+    crash_point(app_data_dir, CrashPoint::Published)?;
 
     // Post-commit, best-effort. The signature lives inside the bundle now, so
     // an old sidecar would describe bytes that are no longer there.
@@ -4417,7 +4417,7 @@ mod tests {
             registry_floor_path(dir.path()).unwrap(),
             format!(
                 "2026-11-15T12:00:00+00:00 {}\n",
-                hex::encode(Sha256::digest(&sample_db_with_built_at(
+                hex::encode(Sha256::digest(sample_db_with_built_at(
                     "2026-11-15T12:00:00+00:00"
                 )))
             ),
@@ -4542,7 +4542,7 @@ mod tests {
             "2026-11-17T12:00:00+00:00",
             "2099-01-01T00:00:00+00:00",
         );
-        crash_at(dir.path(), CrashPoint::AfterFloor);
+        crash_at(dir.path(), CrashPoint::FloorRaised);
         install_bundle_bytes_checked(
             dir.path(),
             &signed_bundle(&key, &second_header, &second_payload),
@@ -4643,7 +4643,7 @@ mod tests {
             "2026-11-17T12:00:00+00:00",
             "2099-01-01T00:00:00+00:00",
         );
-        crash_at(dir.path(), CrashPoint::AfterFloor);
+        crash_at(dir.path(), CrashPoint::FloorRaised);
         install_bundle_bytes_checked(
             dir.path(),
             &signed_bundle(&key, &second_header, &second_payload),
@@ -4700,7 +4700,7 @@ mod tests {
             "2026-11-17T12:00:00+00:00",
             "2099-01-01T00:00:00+00:00",
         );
-        crash_at(dir.path(), CrashPoint::AfterFloor);
+        crash_at(dir.path(), CrashPoint::FloorRaised);
         install_bundle_bytes_checked(
             dir.path(),
             &signed_bundle(&key, &second_header, &second_payload),
@@ -4732,11 +4732,11 @@ mod tests {
     #[test]
     fn a_crash_at_each_step_is_finished_by_the_next_open() {
         for point in [
-            CrashPoint::AfterTrust,
-            CrashPoint::AfterStaging,
-            CrashPoint::AfterPreviousCopy,
-            CrashPoint::AfterFloor,
-            CrashPoint::AfterPublish,
+            CrashPoint::TrustWritten,
+            CrashPoint::BytesStaged,
+            CrashPoint::PreviousKept,
+            CrashPoint::FloorRaised,
+            CrashPoint::Published,
         ] {
             let dir = tempfile::TempDir::new().unwrap();
             let key = test_key(212);
@@ -4782,7 +4782,7 @@ mod tests {
             let committed = floor.as_deref() == Some("2026-11-17T12:00:00+00:00");
             assert_eq!(
                 committed,
-                matches!(point, CrashPoint::AfterFloor | CrashPoint::AfterPublish),
+                matches!(point, CrashPoint::FloorRaised | CrashPoint::Published),
                 "the floor is raised exactly at its step ({point:?})"
             );
 
@@ -4870,7 +4870,7 @@ mod tests {
             "2099-01-01T00:00:00+00:00",
         );
         revoking.revocations.push(revocation(&recovery, &stolen));
-        crash_at(dir.path(), CrashPoint::AfterTrust);
+        crash_at(dir.path(), CrashPoint::TrustWritten);
         install_bundle_bytes_checked(
             dir.path(),
             &signed_bundle(&replacement, &revoking, &newer),
