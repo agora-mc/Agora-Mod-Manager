@@ -9,3 +9,7 @@ packages/official/** text=auto eol=lf
 # Crash fixtures are parsed byte for byte, and tests build their CRLF variants
 # from the LF original. A CRLF checkout would hand them `\r\r\n`.
 crates/*/tests/crash_fixtures/** -text
+
+# Loader fixtures are upstream files kept byte for byte; a CRLF checkout would
+# hand the loader install tests a file upstream never published.
+crates/agora-game-minecraft/tests/fixtures/** -text
