@@ -863,18 +863,19 @@ pub fn processor_output_coordinates(
 
 /// Whether an installer processor runs for `side`.
 ///
-/// `sides` is optional: absent (or null) means every side. When it is present
-/// it names the sides the processor runs on, and one that does not name `side`
-/// produces nothing for the install being done.
+/// `sides` is optional: only an absent key means every side. When it is
+/// present it names the sides the processor runs on, and one that does not
+/// name `side` produces nothing for the install being done.
 ///
 /// A `sides` that is present but is not an array of strings cannot be
 /// interpreted. Both guesses are wrong in a way that matters: "every side"
 /// trusts artifacts the other side's processors write, and "no side" drops
-/// outputs this install really produces. It is reported instead.
+/// outputs this install really produces. It is reported instead — a JSON
+/// `null`, a string, a number or an array holding a non-string all count as
+/// malformed, since the installer writes "all sides" by leaving the key out.
 fn processor_runs_on(processor: &serde_json::Value, side: &str) -> Result<bool, ProfileIssue> {
-    let sides = match processor.get("sides") {
-        None | Some(serde_json::Value::Null) => return Ok(true),
-        Some(sides) => sides,
+    let Some(sides) = processor.get("sides") else {
+        return Ok(true);
     };
     let malformed = || {
         let jar = processor
@@ -1880,8 +1881,8 @@ mod tests {
             })
         };
 
-        // Absent, null and an empty array are all "no restriction" / "no side"
-        // as the installer reads them.
+        // Only an absent `sides` means "no restriction". Present-but-empty is a
+        // list that names no side, so the processor produces nothing.
         assert!(processor_output_coordinates(
             &json!({
                 "processors": [{ "outputs": { "client": "[org.example:tool:2.0:client]" } }]
@@ -1890,11 +1891,6 @@ mod tests {
         )
         .expect("absent sides means every side")
         .contains("org.example:tool:2.0:client"));
-        assert!(
-            processor_output_coordinates(&with_sides(serde_json::Value::Null), "client")
-                .expect("null sides means every side")
-                .contains("org.example:tool:2.0:client")
-        );
         assert!(
             processor_output_coordinates(&with_sides(json!([])), "client")
                 .expect("an empty sides array is valid JSON")
@@ -1908,8 +1904,18 @@ mod tests {
                 .is_empty()
         );
 
-        // Present but not an array of strings: reported, not guessed.
-        for malformed in [json!("client"), json!([1]), json!({"client": true})] {
+        // Present but not an array of strings: reported, not guessed. A JSON
+        // null is present, and the installer declares every side by leaving
+        // the key out, so null is malformed rather than "every side".
+        for malformed in [
+            serde_json::Value::Null,
+            json!("client"),
+            json!(1),
+            json!(true),
+            json!([1]),
+            json!(["client", null]),
+            json!({"client": true}),
+        ] {
             let err = processor_output_coordinates(&with_sides(malformed.clone()), "client")
                 .expect_err("a malformed sides value must be reported");
             assert_eq!(
