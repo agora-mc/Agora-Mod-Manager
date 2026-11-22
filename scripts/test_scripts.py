@@ -31,6 +31,7 @@ import fetch_loader_manifests
 import deploy_release_assets
 import catalog_delta
 import check_cli_coverage
+import check_architecture as cak
 import finalize_release_assets as fra
 import publish_updater_manifest as pum
 import refresh_loader_manifests
@@ -4660,6 +4661,75 @@ class TestDesktopUpdaterEndpoint(unittest.TestCase):
             with self.assertRaisesRegex(pum.UpdaterPublishError, "Refusing to replace newer"):
                 pum.publish_updater_manifest("agora-mc/Agora-Mod-Manager", "v0.9.4")
             pum.publish_updater_manifest("agora-mc/Agora-Mod-Manager", "v0.9.4", allow_downgrade=True)
+
+
+class TestProcessStateGuard(unittest.TestCase):
+    """MASTER_SPEC §32.9: process-wide state in core and the Minecraft package is allowlisted."""
+
+    SOURCE = """
+static PRODUCTION_CACHE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+thread_local! {
+    static IN_A_THREAD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn body() {
+    static IN_A_FUNCTION: u32 = 0;
+}
+
+#[cfg(test)]
+static TEST_ONLY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod tests {
+    static IN_TESTS: u32 = 0;
+
+    #[test]
+    fn it_works() {
+        static IN_A_TEST_FUNCTION: u32 = 0;
+    }
+}
+"""
+
+    def test_non_test_items_are_found_and_test_code_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "module.rs").write_text(self.SOURCE, encoding="utf-8")
+            names = sorted(name for _path, _line, name in cak.process_state_items(root))
+        self.assertEqual(names, ["IN_A_FUNCTION", "IN_A_THREAD", "PRODUCTION_CACHE"])
+
+    def test_an_unlisted_static_fails_the_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            core = root / "core"
+            minecraft = root / "minecraft"
+            core.mkdir()
+            minecraft.mkdir()
+            (core / "module.rs").write_text(self.SOURCE, encoding="utf-8")
+            allowlist = root / "allowlist.json"
+            allowlist.write_text(
+                json.dumps(
+                    {
+                        "core/module.rs::PRODUCTION_CACHE": {"category": "cache", "why": "kept"},
+                        "core/module.rs::IN_A_THREAD": {"category": "cache", "why": "kept"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(cak, "CORE_SRC", core),
+                mock.patch.object(cak, "MC_SRC", minecraft),
+                mock.patch.object(cak, "PROCESS_STATE_ALLOWLIST", allowlist),
+                mock.patch.object(cak, "REPO_ROOT", root),
+                mock.patch.object(cak, "EXIT_CODE", 0),
+                contextlib.redirect_stderr(stderr),
+            ):
+                cak.check_process_state_allowlisted()
+                failed = cak.EXIT_CODE
+        self.assertEqual(failed, 1)
+        self.assertIn("module.rs::IN_A_FUNCTION", stderr.getvalue())
+        self.assertNotIn("TEST_ONLY", stderr.getvalue())
 
 
 if __name__ == "__main__":

@@ -1,0 +1,222 @@
+{
+  "crates/agora-core/src/artifact_receipt.rs::RECEIPT_TEMP_COUNTER": {
+    "category": "counter",
+    "why": "one temp-name sequence for every receipt written in the process; a collision would be two writers choosing one path"
+  },
+  "crates/agora-core/src/auth.rs::CREDENTIAL_TEMP_COUNTER": {
+    "category": "counter",
+    "why": "one temp-name sequence for credential files, so two writes cannot pick the same temp name"
+  },
+  "crates/agora-core/src/auth.rs::DEVICE_KEY_LOCK": {
+    "category": "guard",
+    "why": "the device key is one file per process-wide credential store; the lock must span every caller"
+  },
+  "crates/agora-core/src/auth.rs::REFRESH_MUTEX": {
+    "category": "guard",
+    "why": "one token refresh at a time across the whole process, or two refreshes race and one is invalidated"
+  },
+  "crates/agora-core/src/catalog_install.rs::NEXT_SCRATCH": {
+    "category": "counter",
+    "why": "one scratch-folder sequence for every install in the process, so two installs never share a staging folder"
+  },
+  "crates/agora-core/src/connectivity.rs::GLOBAL": {
+    "category": "config",
+    "why": "the network reachability state is one per process, not one per context; it moves onto Ctx with the rest of the network configuration (§32.9)"
+  },
+  "crates/agora-core/src/db.rs::COUNTER": {
+    "category": "counter",
+    "why": "one unique stamp sequence for every database temp file in the process"
+  },
+  "crates/agora-core/src/game_base/mod.rs::BASE_ROOTS_LOCK": {
+    "category": "guard",
+    "why": "roots.json is read, changed and written; the lock serialises that across every context in the process"
+  },
+  "crates/agora-core/src/game_import/vortex_store.rs::PROCESS_LOCK": {
+    "category": "guard",
+    "why": "the Vortex store is one file per process user; the lock must span every importer, not one context"
+  },
+  "crates/agora-core/src/game_wrap.rs::STEP_DOWN_CHILD": {
+    "category": "guard",
+    "why": "the Linux signal handler needs the child pid in a plain atomic; a handler cannot reach a context"
+  },
+  "crates/agora-core/src/game_wrap.rs::STEP_DOWN_STOP": {
+    "category": "guard",
+    "why": "the Linux signal handler records that it forwarded a stop in a plain atomic; a handler cannot reach a context"
+  },
+  "crates/agora-core/src/github_ratelimit.rs::COOLDOWN_UNTIL": {
+    "category": "guard",
+    "why": "GitHub's rate limit is per process account, so the cooldown it hands us applies to every caller in the process"
+  },
+  "crates/agora-core/src/github_ratelimit.rs::GITHUB_CLIENT": {
+    "category": "cache",
+    "why": "one pre-built HTTP client for GitHub, kept so requests do not rebuild TLS state"
+  },
+  "crates/agora-core/src/github_ratelimit.rs::GITHUB_SEM": {
+    "category": "guard",
+    "why": "one semaphore bounds in-flight GitHub requests for the whole process, which is what the limit is about"
+  },
+  "crates/agora-core/src/governance_vote.rs::VOTE_MUTATION_LOCK": {
+    "category": "guard",
+    "why": "votes are one signed log per process; the lock keeps two writers from forking it"
+  },
+  "crates/agora-core/src/http_client.rs::PROXY": {
+    "category": "config",
+    "why": "the proxy applies to every client built in the process, including ones built outside a context; it moves onto Ctx with the rest of the network configuration (§32.9)"
+  },
+  "crates/agora-core/src/linux_view.rs::NATIVE": {
+    "category": "constant",
+    "why": "a stateless strategy value used as &'static; there is nothing per-context to carry"
+  },
+  "crates/agora-core/src/linux_view.rs::UNSUPPORTED": {
+    "category": "constant",
+    "why": "a stateless strategy value used as &'static; there is nothing per-context to carry"
+  },
+  "crates/agora-core/src/lock_manager.rs::PROGRAM_NAME": {
+    "category": "config",
+    "why": "the program name is stamped into every lock file of the process, which is how one process tells its locks from another's"
+  },
+  "crates/agora-core/src/log_sanitizer.rs::RE": {
+    "category": "cache",
+    "why": "a compiled regex, kept once rather than per log line"
+  },
+  "crates/agora-core/src/log_sanitizer.rs::RE#2": {
+    "category": "cache",
+    "why": "a compiled regex, kept once rather than per log line"
+  },
+  "crates/agora-core/src/log_sanitizer.rs::RE#3": {
+    "category": "cache",
+    "why": "a compiled regex, kept once rather than per log line"
+  },
+  "crates/agora-core/src/log_sanitizer.rs::RE#4": {
+    "category": "cache",
+    "why": "a compiled regex, kept once rather than per log line"
+  },
+  "crates/agora-core/src/network_gate.rs::SLOT": {
+    "category": "config",
+    "why": "the outbound policy every request is checked against, installed at startup; it moves onto Ctx with the rest of the network configuration (§32.9)"
+  },
+  "crates/agora-core/src/plugins/events.rs::CURRENT_ORIGIN": {
+    "category": "guard",
+    "why": "the plugin whose event is being dispatched, for permission checks; it is per thread because a plugin callback may not cross threads"
+  },
+  "crates/agora-core/src/process_job.rs::REGISTRY": {
+    "category": "cache",
+    "why": "the running-jobs registry of the process; a job is started by one adapter and read by another"
+  },
+  "crates/agora-core/src/registry_sync.rs::CACHE": {
+    "category": "cache",
+    "why": "a header cache for registry downloads, keyed by file path"
+  },
+  "crates/agora-core/src/registry_sync.rs::CACHE#2": {
+    "category": "cache",
+    "why": "a database-hash memo for registry downloads, keyed by file path"
+  },
+  "crates/agora-core/src/registry_sync.rs::COUNTER": {
+    "category": "counter",
+    "why": "one temp-path sequence for registry downloads in the process"
+  },
+  "crates/agora-core/src/save_backup.rs::NEXT_SEQUENCE": {
+    "category": "counter",
+    "why": "one backup sequence number so two backups written together get different names"
+  },
+  "crates/agora-core/src/settings_registry.rs::REPORTED": {
+    "category": "cache",
+    "why": "the set of settings problems already reported, so one bad value is not reported on every read"
+  },
+  "crates/agora-core/src/settings_registry.rs::REPORTED#2": {
+    "category": "cache",
+    "why": "the set of settings problems already reported, so one bad value is not reported on every read"
+  },
+  "crates/agora-core/src/snapshot.rs::SNAPSHOT_MARKER_LOCK": {
+    "category": "guard",
+    "why": "the snapshot marker is one file per folder; the lock spans every context in the process"
+  },
+  "crates/agora-game-minecraft/src/download_cache.rs::PINS": {
+    "category": "cache",
+    "why": "the download cache's reference counts, shared by every download in the process"
+  },
+  "crates/agora-game-minecraft/src/health.rs::HEALTH_CACHE": {
+    "category": "cache",
+    "why": "the install health check is expensive and shared by the page and the launch check"
+  },
+  "crates/agora-game-minecraft/src/health.rs::HEALTH_CACHE_WRITE_COUNTER": {
+    "category": "counter",
+    "why": "counts health cache writes so a reader can tell a cached answer from a fresh one"
+  },
+  "crates/agora-game-minecraft/src/installed_artifact.rs::TEMP_COUNTER": {
+    "category": "counter",
+    "why": "one temp-name sequence for artifact installation in the process"
+  },
+  "crates/agora-game-minecraft/src/installed_content.rs::CACHE_TEMP": {
+    "category": "counter",
+    "why": "one temp-name sequence for content cache files in the process"
+  },
+  "crates/agora-game-minecraft/src/launch_planner.rs::TEMP_COUNTER": {
+    "category": "counter",
+    "why": "one temp-name sequence for launch planning files in the process"
+  },
+  "crates/agora-game-minecraft/src/launch_service.rs::JAVA_DISCOVERY_CACHE": {
+    "category": "cache",
+    "why": "finding a Java runtime costs a scan of the disk; the answer is kept for a few minutes process-wide"
+  },
+  "crates/agora-game-minecraft/src/launch_service.rs::NEXT_SESSION_ID": {
+    "category": "counter",
+    "why": "one session-id sequence so two launches in the process cannot share an id"
+  },
+  "crates/agora-game-minecraft/src/launcher_profiles.rs::NEXT_TEMP_ID": {
+    "category": "counter",
+    "why": "one temp-id sequence for launcher profile writes in the process"
+  },
+  "crates/agora-game-minecraft/src/launcher_profiles.rs::PROFILE_WRITE_LOCK": {
+    "category": "guard",
+    "why": "launchers.json is one file the game also writes; the lock spans every context in the process"
+  },
+  "crates/agora-game-minecraft/src/loader_manifests.rs::CATALOG_OVERRIDE": {
+    "category": "config",
+    "why": "the active loader catalog override, set by the adapter; it moves onto Ctx with the rest of the configuration (§32.9)"
+  },
+  "crates/agora-game-minecraft/src/loader_manifests.rs::MANIFEST": {
+    "category": "cache",
+    "why": "the parsed loader catalog, kept once rather than re-parsing the file per use"
+  },
+  "crates/agora-game-minecraft/src/loader_manifests.rs::MC_VERSIONS_LIST": {
+    "category": "cache",
+    "why": "the Minecraft version list from the catalog, kept once rather than rebuilt per use"
+  },
+  "crates/agora-game-minecraft/src/memory_recommendation.rs::TOTAL_RAM_MB": {
+    "category": "cache",
+    "why": "the machine's total memory does not change during a run; reading it once avoids a probe per call"
+  },
+  "crates/agora-game-minecraft/src/mod_cache.rs::COUNTER": {
+    "category": "counter",
+    "why": "one temp-name sequence for mod cache files in the process"
+  },
+  "crates/agora-game-minecraft/src/msa.rs::MSA_REFRESH_MUTEX": {
+    "category": "guard",
+    "why": "one Microsoft token refresh at a time, or two refreshes race and one token is invalidated"
+  },
+  "crates/agora-game-minecraft/src/msa.rs::MSA_STORE_MUTEX": {
+    "category": "guard",
+    "why": "the account store is one file per user; the lock spans every caller in the process"
+  },
+  "crates/agora-game-minecraft/src/msa.rs::REPAIR_NEEDED": {
+    "category": "guard",
+    "why": "set from deep inside a read path that has no context, so the UI can ask for a sign-in again afterwards"
+  },
+  "crates/agora-game-minecraft/src/msa.rs::REPAIR_WARNED": {
+    "category": "cache",
+    "why": "says the repair warning was already logged, so it is said once rather than on every call"
+  },
+  "crates/agora-game-minecraft/src/package.rs::PACKAGE": {
+    "category": "cache",
+    "why": "the Minecraft package definition is built once and shared; nothing per-context differs"
+  },
+  "crates/agora-game-minecraft/src/runtime_manager.rs::TEMP_COUNTER": {
+    "category": "counter",
+    "why": "one temp-name sequence for runtime extraction in the process"
+  },
+  "crates/agora-game-minecraft/src/runtime_manager.rs::UNIQUE_COUNTER": {
+    "category": "counter",
+    "why": "one unique-name sequence for runtime folders in the process"
+  }
+}

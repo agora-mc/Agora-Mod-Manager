@@ -18,6 +18,9 @@ Checks:
 10. Live instance reads use the canonical manifest loader
 11. Game API depends only on serde, serde_json, semver, thiserror and regex (all dependency sections)
 12. Core must not reference the future Minecraft package's modules or crate
+13. A game package's remaining references to agora-core only shrink (a budget file)
+14. Process-wide state (`static`, `thread_local!`, `OnceLock`, `LazyLock`, `task_local!`) in
+    non-test code of core and the Minecraft package is on a checked-in allowlist
 """
 
 import json
@@ -665,6 +668,172 @@ def check_game_package_core_budget() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 14. Process-wide state in core and the Minecraft package is on the allowlist
+# ---------------------------------------------------------------------------
+# MASTER_SPEC §32.9: a test seam lives on `Ctx` (or is passed in), because a
+# process-wide `static` lets one test's hook catch another test's code, and a
+# `thread_local!` cannot reach code the operation runs on another thread.
+# Configuration is moving onto `Ctx` too. What is left is written down with the
+# reason it really has to be process-wide: a guard that is one per process by
+# definition, a cache, a counter, or configuration that has not moved yet.
+PROCESS_STATE_ALLOWLIST = REPO_ROOT / "scripts" / "process_state_allowlist.json"
+
+# The item kinds §32.9 names: a `static` (which is also how `OnceLock` and
+# `LazyLock` state is declared, and what each `thread_local!`/`task_local!`
+# block holds).
+PROCESS_STATE_ITEM = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?static\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)"
+)
+CFG_TEST_ATTRIBUTE = re.compile(r"^#\[cfg\((?:all\()?test[,)\]]")
+
+
+def _strip_code_comment(line: str) -> str:
+    """`line` without its literals or trailing comment, for brace counting.
+
+    Raw strings, byte strings and char literals can hold a brace (`'{'`), so
+    they go before the braces are counted.
+    """
+    line = re.sub(r'r#*"(\\.|[^"\\])*"#*', '""', line)
+    line = re.sub(r'b?"(\\.|[^"\\])*"', '""', line)
+    line = re.sub(r"b?'(\\.|[^'\\])'", "''", line)
+    return line.split("//", 1)[0]
+
+
+def process_state_items(root: Path) -> list[tuple[Path, int, str]]:
+    """Every process-wide item in the non-test code under `root`, as (file, line, name).
+
+    Test code is skipped: a `#[cfg(test)]` module or a `#[cfg(test)]` item is
+    compiled only into test builds, so it is not process state the product
+    carries. Items inside a function body count: a `static` declared in one is
+    every bit as process-wide as a top-level one.
+    """
+    items: list[tuple[Path, int, str]] = []
+    for path in sorted(root.rglob("*.rs")):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # A raw string can run over several lines and hold braces; keep the line
+        # count by replacing the newlines it swallowed.
+        text = re.sub(
+            r'r#*"(\\.|[^"\\])*"#*',
+            lambda match: '""' + "\n" * match.group(0).count("\n"),
+            text,
+            flags=re.S,
+        )
+        lines = text.splitlines()
+        depth = 0
+        # The depth a skipped test block sits at, when one is open.
+        test_block_depth = None
+        # A `#[cfg(test)]` attribute seen, its item not yet consumed.
+        awaiting_test_item = False
+        # A skipped test item whose declaration runs over several lines.
+        test_statement_depth = None
+        for number, line in enumerate(lines, start=1):
+            code = _strip_code_comment(line)
+            stripped = code.strip()
+            opens, closes = code.count("{"), code.count("}")
+            if test_block_depth is not None:
+                depth += opens - closes
+                if depth <= test_block_depth:
+                    test_block_depth = None
+                continue
+            if test_statement_depth is not None:
+                if opens > closes:
+                    # The item's body opened on a later line: skip the whole block.
+                    test_block_depth = depth
+                    depth += opens - closes
+                    if depth <= test_block_depth:
+                        test_block_depth = None
+                    test_statement_depth = None
+                    continue
+                depth += opens - closes
+                if stripped.endswith(";") and depth == test_statement_depth:
+                    test_statement_depth = None
+                continue
+            if CFG_TEST_ATTRIBUTE.match(stripped):
+                awaiting_test_item = True
+                continue
+            if awaiting_test_item:
+                if stripped.startswith("//") or (
+                    stripped.startswith("#[") and stripped.endswith("]")
+                ):
+                    continue  # doc comments and further attributes belong to the item
+                awaiting_test_item = False
+                if opens > closes:
+                    test_block_depth = depth
+                    depth += opens - closes
+                    if depth <= test_block_depth:
+                        test_block_depth = None
+                    continue
+                if stripped.endswith(";"):
+                    continue  # a one-line item
+                test_statement_depth = depth
+                depth += opens - closes
+                continue
+            item = PROCESS_STATE_ITEM.match(code)
+            if item:
+                items.append((path, number, item.group(1)))
+            depth += opens - closes
+    return items
+
+
+def check_process_state_allowlisted() -> None:
+    try:
+        allowlist = json.loads(PROCESS_STATE_ALLOWLIST.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        allowlist = {}
+    except (OSError, ValueError) as exc:
+        err(f"Cannot read {PROCESS_STATE_ALLOWLIST.name}: {exc}")
+        return
+    found: dict[str, dict[str, str]] = {}
+    for root in (CORE_SRC, MC_SRC):
+        for path, _line, name in process_state_items(root):
+            key = f"{path.relative_to(REPO_ROOT).as_posix()}::{name}"
+            # A file may declare one name twice (two caches in separate
+            # functions): each occurrence gets its own numbered entry.
+            count = 1
+            while key in found:
+                count += 1
+                key = f"{path.relative_to(REPO_ROOT).as_posix()}::{name}#{count}"
+            found[key] = {"category": name}
+    unknown = sorted(set(found) - set(allowlist))
+    stale = sorted(set(allowlist) - set(found))
+    bad_entry = sorted(
+        key
+        for key, entry in allowlist.items()
+        if key in found
+        and (
+            entry.get("category") not in {"config", "guard", "cache", "counter", "constant"}
+            or not entry.get("why")
+        )
+    )
+    if unknown or stale or bad_entry:
+        err("Process-wide state in agora-core / agora-game-minecraft (MASTER_SPEC §32.9)")
+        for key in unknown:
+            print(
+                f"  {key}: a static or thread-local that is not on the allowlist. A test "
+                "seam belongs on `Ctx` (or is passed in), and configuration is moving there "
+                f"too. Add it to {PROCESS_STATE_ALLOWLIST.name} with a category "
+                "(config|guard|cache|counter|constant) and the reason it is process-wide",
+                file=sys.stderr,
+            )
+        for key in stale:
+            print(f"  {key}: allowlisted but no longer found; remove the entry", file=sys.stderr)
+        for key in bad_entry:
+            print(
+                f"  {key}: allowlist entry needs a category "
+                "(config|guard|cache|counter|constant) and a `why`",
+                file=sys.stderr,
+            )
+    else:
+        print(
+            f"OK: {len(found)} process-wide items in core and the Minecraft package, "
+            "each allowlisted"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> int:
@@ -719,6 +888,10 @@ def main() -> int:
 
     print("\n--- 13. Game packages' agora-core budget ---")
     check_game_package_core_budget()
+    print()
+
+    print("--- 14. Process-wide state is on the allowlist ---")
+    check_process_state_allowlisted()
     print()
 
     if EXIT_CODE == 0:

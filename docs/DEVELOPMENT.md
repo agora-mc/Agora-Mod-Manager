@@ -163,6 +163,12 @@ Repository root, hermetic and fast:
 python scripts/check_architecture.py && python scripts/check_docs.py && python scripts/check_package_docs.py && python scripts/check_tauri_bindings.py --check && python scripts/check_cli_coverage.py
 ```
 
+`check_architecture.py` fails on a new `static`, `thread_local!`, `OnceLock`, `LazyLock` or
+`task_local!` item in the non-test code of `agora-core` or `agora-game-minecraft` unless it is on
+[`scripts/process_state_allowlist.json`](process_state_allowlist.json) with a category and the
+reason it has to be process-wide. A test seam belongs on `Ctx` (MASTER_SPEC §32.9), so a hook
+reaches exactly the operations run with that context, on any thread.
+
 Rust:
 
 ```bash
