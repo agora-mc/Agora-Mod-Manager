@@ -17,7 +17,7 @@
 //!   the current profile hash + curated installer SHA.
 
 use crate::launch::{merge_forge_version, parse_maven_descriptor, VersionInfo};
-use agora_core::download::{sha256_hex, stable_version_json};
+use agora_core::download::{sha1_hex, sha256_hex, stable_version_json};
 use agora_core::network;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -891,7 +891,7 @@ fn processor_runs_on(processor: &serde_json::Value, side: &str) -> Result<bool, 
     for entry in sides {
         names.push(entry.as_str().ok_or_else(malformed)?);
     }
-    Ok(names.iter().any(|name| *name == side))
+    Ok(names.contains(&side))
 }
 
 pub fn processor_outputs_from_installer_jar(
@@ -1638,7 +1638,7 @@ pub fn create_receipt_for_installed_profile(
         // Before these bytes become the trusted SHA-256 for this artifact,
         // check them against every SHA-1 the profile publishes for it.
         if let Some(published) = published_sha1.get(rel_path) {
-            let actual_sha1 = agora_core::download::sha1_hex(&data);
+            let actual_sha1 = sha1_hex(&data);
             for (library, expected) in published {
                 if !expected.eq_ignore_ascii_case(&actual_sha1) {
                     return Err(ProfileIssue::corrupt(
@@ -3497,7 +3497,7 @@ mod tests {
             "the reason must name the published SHA-1: {text}"
         );
         assert!(
-            text.contains(&agora_core::download::sha1_hex(bytes)),
+            text.contains(&sha1_hex(bytes)),
             "the reason must name the digest of the bytes found: {text}"
         );
         assert!(
@@ -3517,7 +3517,7 @@ mod tests {
         // Publish the digest of the bytes actually on disk, uppercased: hex is
         // case-insensitive.
         version["libraries"][1]["downloads"]["artifact"]["sha1"] =
-            serde_json::Value::String(agora_core::download::sha1_hex(bytes).to_uppercase());
+            serde_json::Value::String(sha1_hex(bytes).to_uppercase());
         fix.write_profile("forge-1.21.1-52.1.21", &version);
 
         let receipt = create_receipt_for_installed_profile(
@@ -3535,7 +3535,7 @@ mod tests {
             receipt
                 .generated_artifact_sha256
                 .get("net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-client.jar"),
-            Some(&agora_core::download::sha256_hex(bytes)),
+            Some(&sha256_hex(bytes)),
             "the receipt pins the SHA-256 of the bytes the SHA-1 matched"
         );
     }
