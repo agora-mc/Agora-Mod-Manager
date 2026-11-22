@@ -276,6 +276,33 @@ impl LockError {
     }
 }
 
+/// Why a lock was not acquired, in the two shapes a caller acts on differently.
+///
+/// A caller that must decide "is something still using this?" cannot decide it from the error
+/// code: a lock that could not be opened at all is not evidence that anyone holds it. This keeps
+/// the two apart, and carries the existing error so the codes the UI and the CLI match on do not
+/// change (`ERR_LOCK_TIMEOUT` for [`LockRefusal::Held`], `ERR_LOCK_IO` / `ERR_INVALID_LOCK` /
+/// `ERR_LOCK_CANCELLED` for [`LockRefusal::Unavailable`]).
+#[derive(Debug)]
+pub enum LockRefusal {
+    /// The lock is held, or was still held when the wait ran out. Waiting and retrying is the
+    /// answer, and something may be using the resource right now.
+    Held(LauncherError),
+    /// The lock could not be asked for or used at all: a name that is not a usable lock name, a
+    /// lock directory or file that cannot be made or opened, or an operating-system refusal.
+    /// Nothing is known about any holder.
+    Unavailable(LauncherError),
+}
+
+impl LockRefusal {
+    /// The refusal as the error the acquire functions have always returned.
+    pub fn into_launcher_error(self) -> LauncherError {
+        match self {
+            LockRefusal::Held(error) | LockRefusal::Unavailable(error) => error,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LockGuard
 // ---------------------------------------------------------------------------
@@ -534,6 +561,15 @@ impl LockManager {
         self.acquire_with_timeout(resource, operation, DEFAULT_ACQUIRE_TIMEOUT, None)
     }
 
+    /// [`Self::acquire`], saying whether the lock is held or could not be asked for at all.
+    pub fn acquire_typed(
+        &self,
+        resource: LockResource,
+        operation: &str,
+    ) -> Result<LockGuard, LockRefusal> {
+        self.acquire_with_timeout_typed(resource, operation, DEFAULT_ACQUIRE_TIMEOUT, None)
+    }
+
     /// Attempt to acquire a lock with a custom timeout, blocking the calling
     /// thread between attempts.
     pub fn acquire_with_timeout(
@@ -543,14 +579,32 @@ impl LockManager {
         timeout: Duration,
         cancel: Option<&CancellationToken>,
     ) -> LauncherResult<LockGuard> {
-        let (lock_name, lock_path, key) = self.prepare(&resource)?;
+        self.acquire_with_timeout_typed(resource, operation, timeout, cancel)
+            .map_err(LockRefusal::into_launcher_error)
+    }
+
+    /// [`Self::acquire_with_timeout`] with the typed answer.
+    ///
+    /// `Held` means someone has the lock (including this process, whose locks are not
+    /// re-entrant). Everything else — a resource whose lock name is not usable, a lock directory
+    /// or file that cannot be made or opened, a cancelled wait, an operating-system refusal — is
+    /// `Unavailable`: the lock was never taken and nothing was learned about any holder.
+    pub fn acquire_with_timeout_typed(
+        &self,
+        resource: LockResource,
+        operation: &str,
+        timeout: Duration,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<LockGuard, LockRefusal> {
+        let (lock_name, lock_path, key) =
+            self.prepare(&resource).map_err(LockRefusal::Unavailable)?;
         let deadline = Instant::now() + timeout;
         let mut delay = INITIAL_RETRY_DELAY;
 
         loop {
             if let Some(tok) = cancel {
                 if tok.is_cancelled() {
-                    return Err(Self::cancel_error(&lock_name));
+                    return Err(LockRefusal::Unavailable(Self::cancel_error(&lock_name)));
                 }
             }
 
@@ -560,14 +614,18 @@ impl LockManager {
                     let now = Instant::now();
                     if now >= deadline {
                         let local = self.held_operation(&key);
-                        return Err(timeout_error(&lock_name, timeout, meta, local));
+                        return Err(LockRefusal::Held(timeout_error(
+                            &lock_name, timeout, meta, local,
+                        )));
                     }
                     let remaining = deadline.saturating_duration_since(now);
                     std::thread::sleep(delay.min(remaining));
                     delay = (delay * 2).min(MAX_RETRY_DELAY);
                 }
                 Err(LockError::Io(e)) => {
-                    return Err(LockError::Io(e).into_launcher_error(&lock_name));
+                    return Err(LockRefusal::Unavailable(
+                        LockError::Io(e).into_launcher_error(&lock_name),
+                    ));
                 }
             }
         }
@@ -584,6 +642,16 @@ impl LockManager {
             .await
     }
 
+    /// [`Self::acquire_async`] with the typed answer.
+    pub async fn acquire_async_typed(
+        &self,
+        resource: LockResource,
+        operation: &str,
+    ) -> Result<LockGuard, LockRefusal> {
+        self.acquire_with_timeout_async_typed(resource, operation, DEFAULT_ACQUIRE_TIMEOUT, None)
+            .await
+    }
+
     /// Async counterpart of [`Self::acquire_with_timeout`].
     pub async fn acquire_with_timeout_async(
         &self,
@@ -592,14 +660,28 @@ impl LockManager {
         timeout: Duration,
         cancel: Option<&CancellationToken>,
     ) -> LauncherResult<LockGuard> {
-        let (lock_name, lock_path, key) = self.prepare(&resource)?;
+        self.acquire_with_timeout_async_typed(resource, operation, timeout, cancel)
+            .await
+            .map_err(LockRefusal::into_launcher_error)
+    }
+
+    /// Async counterpart of [`Self::acquire_with_timeout_typed`].
+    pub async fn acquire_with_timeout_async_typed(
+        &self,
+        resource: LockResource,
+        operation: &str,
+        timeout: Duration,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<LockGuard, LockRefusal> {
+        let (lock_name, lock_path, key) =
+            self.prepare(&resource).map_err(LockRefusal::Unavailable)?;
         let deadline = Instant::now() + timeout;
         let mut delay = INITIAL_RETRY_DELAY;
 
         loop {
             if let Some(tok) = cancel {
                 if tok.is_cancelled() {
-                    return Err(Self::cancel_error(&lock_name));
+                    return Err(LockRefusal::Unavailable(Self::cancel_error(&lock_name)));
                 }
             }
 
@@ -609,14 +691,18 @@ impl LockManager {
                     let now = Instant::now();
                     if now >= deadline {
                         let local = self.held_operation(&key);
-                        return Err(timeout_error(&lock_name, timeout, meta, local));
+                        return Err(LockRefusal::Held(timeout_error(
+                            &lock_name, timeout, meta, local,
+                        )));
                     }
                     let remaining = deadline.saturating_duration_since(now);
                     tokio::time::sleep(delay.min(remaining)).await;
                     delay = (delay * 2).min(MAX_RETRY_DELAY);
                 }
                 Err(LockError::Io(e)) => {
-                    return Err(LockError::Io(e).into_launcher_error(&lock_name));
+                    return Err(LockRefusal::Unavailable(
+                        LockError::Io(e).into_launcher_error(&lock_name),
+                    ));
                 }
             }
         }

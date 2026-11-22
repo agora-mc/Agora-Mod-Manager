@@ -44,7 +44,7 @@ use crate::game_tool_swap::{self, SwapError, SwapJournal};
 use crate::game_user_files::{self, UserFilesError};
 use crate::game_user_tools::UserTool;
 use crate::install_watch::{InstallChanges, InstallWatch};
-use crate::instance_runtime::InstanceGuard;
+use crate::instance_runtime::{BusyCause, InstanceGuard, MayMutate};
 
 /// Failed runs kept in `failed-<run>` folders, the newest first (MASTER_SPEC §26.9).
 pub const FAILED_RUNS_KEPT: usize = 3;
@@ -2495,19 +2495,22 @@ fn guard_for(
     allow_while_running: bool,
 ) -> Result<InstanceGuard, ToolError> {
     if allow_while_running {
-        Ok(InstanceGuard::for_mutation_while_running(
+        return Ok(InstanceGuard::for_mutation_while_running(
             ctx,
             instance_id,
             operation,
-        )?)
-    } else {
-        InstanceGuard::for_mutation(ctx, instance_id, operation).map_err(|error| {
-            if error.code() == "ERR_INSTANCE_RUNNING" {
-                ToolError::SessionRunning(instance_id.to_string())
-            } else {
-                ToolError::Lock(error)
-            }
-        })
+        )?);
+    }
+    // The one liveness decision, matched by cause instead of by error code.
+    match crate::instance_runtime::may_mutate(ctx, instance_id, operation) {
+        MayMutate::Yes(guard) => Ok(guard),
+        MayMutate::Busy {
+            cause: BusyCause::Game,
+            ..
+        } => Err(ToolError::SessionRunning(instance_id.to_string())),
+        MayMutate::Busy { error, .. } | MayMutate::CantTell { error } => {
+            Err(ToolError::Lock(error))
+        }
     }
 }
 

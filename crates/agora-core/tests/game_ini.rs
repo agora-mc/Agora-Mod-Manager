@@ -291,7 +291,8 @@ fn an_edit_is_refused_while_an_earlier_session_is_not_put_back() {
     h.write_real(REAL.as_bytes());
     h.start_session("inst-g", &def);
 
-    // The launch that swapped these files in is still going, so editing is refused as running.
+    // The launch that swapped these files in recorded no game: the edit is refused with the
+    // launch-state guidance, not by claiming a game is running.
     let err = game_ini::set_value(
         &h.ctx,
         "inst-g",
@@ -302,7 +303,10 @@ fn an_edit_is_refused_while_an_earlier_session_is_not_put_back() {
         "2",
     )
     .unwrap_err();
-    assert!(matches!(err, IniError::SessionRunning { .. }), "{err:?}");
+    assert!(
+        matches!(&err, IniError::Lock(inner) if inner.code() == "ERR_INSTANCE_LAUNCH_INDETERMINATE"),
+        "{err:?}"
+    );
 
     // An Agora that died after swapping leaves no launcher either: the session needs restoring.
     let journal_path = h

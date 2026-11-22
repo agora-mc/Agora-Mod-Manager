@@ -842,6 +842,12 @@ fn activity_is_running(ctx: &Ctx, instance_id: &str) -> Result<bool, String> {
     match crate::instance_runtime::game_activity(ctx, instance_id) {
         crate::instance_runtime::GameActivity::Idle => Ok(false),
         crate::instance_runtime::GameActivity::Running => Ok(true),
+        // A launch that never finished starting proves no game is running, but it does not prove
+        // one is gone either, so the restore refuses — and says why, instead of claiming a game the
+        // player could close.
+        crate::instance_runtime::GameActivity::Starting => Err(format!(
+            "a launch of '{instance_id}' was recorded but never finished starting"
+        )),
         crate::instance_runtime::GameActivity::CouldNotTell(reason) => Err(format!(
             "could not tell whether '{instance_id}' is running: {reason}"
         )),
