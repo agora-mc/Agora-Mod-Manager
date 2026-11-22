@@ -2322,6 +2322,7 @@ fn forge_install_receipt_pins_processor_output_with_published_sha1() {
         "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-installer.jar",
         0,
         &produced,
+        None,
     )
     .expect("Forge 1.21.1 receipt creation (incl. adoption proof) must succeed");
 
