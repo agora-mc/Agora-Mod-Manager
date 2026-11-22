@@ -10,7 +10,6 @@
 #![cfg(windows)]
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use agora_core::ctx::CoreContext;

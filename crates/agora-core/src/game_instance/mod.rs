@@ -26,58 +26,6 @@ pub use clone::{clone_instance, CloneOptions, ClonedInstance};
 pub use session::{end_session, stop, watch_session, SessionEnd, StopOutcome};
 pub use trash::{DeletedEntry, PurgeSummary, RestoreOutcome, TrashFn};
 
-/// Test seam: make the next create that pins `base_id` stop after choosing it,
-/// until [`set_create_pause_before_publishing_pin`] is called with `None`.
-#[cfg(debug_assertions)]
-static PAUSE_BEFORE_PIN_PUBLISH_AT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-#[cfg(debug_assertions)]
-static PIN_PUBLISH_PAUSED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Test seam for the window between a create choosing its pinned base and publishing its
-/// row. Off by default and absent from release builds.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn set_create_pause_before_publishing_pin(base_id: Option<&str>) {
-    let mut target = PAUSE_BEFORE_PIN_PUBLISH_AT
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    *target = base_id.map(str::to_string);
-    PIN_PUBLISH_PAUSED.store(false, std::sync::atomic::Ordering::SeqCst);
-}
-
-/// Whether a paused create has reached the window and is waiting.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn create_pause_before_publishing_pin_reached() -> bool {
-    PIN_PUBLISH_PAUSED.load(std::sync::atomic::Ordering::SeqCst)
-}
-
-#[cfg(debug_assertions)]
-fn pause_before_publishing_pin_if_asked(base_id: &str) {
-    let should_pause = PAUSE_BEFORE_PIN_PUBLISH_AT
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .as_deref()
-        == Some(base_id);
-    if !should_pause {
-        return;
-    }
-    PIN_PUBLISH_PAUSED.store(true, std::sync::atomic::Ordering::SeqCst);
-    loop {
-        let still_asked = PAUSE_BEFORE_PIN_PUBLISH_AT
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_deref()
-            == Some(base_id);
-        if !still_asked {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    PIN_PUBLISH_PAUSED.store(false, std::sync::atomic::Ordering::SeqCst);
-}
-
 /// A generic instance manifest stored at `<instances_root>/<id>/instance_manifest.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameInstanceManifest {
@@ -450,6 +398,7 @@ pub fn create_with_options(
             mode,
             None,
             options,
+            &ctx.test_seams,
             progress,
         )?;
         let manifest = outcome.manifest();
@@ -523,10 +472,11 @@ pub fn create_with_options(
 
     // Test seam for the window between choosing a pinned base and publishing this
     // instance's row (the pin). While paused, a test races a base removal against
-    // the create, exactly like the base build pauses.
+    // the create, exactly like the base build pauses. The seam belongs to the
+    // context, so it parks this create and no other.
     #[cfg(debug_assertions)]
     if let BaseReference::Pinned { id, .. } = &base_ref {
-        pause_before_publishing_pin_if_asked(id);
+        ctx.test_seams.create_pin_pause_point(id);
     }
 
     let instance_dir = ctx

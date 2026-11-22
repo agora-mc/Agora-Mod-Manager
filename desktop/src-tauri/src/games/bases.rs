@@ -278,6 +278,7 @@ pub async fn games_base_build(
             base_mode,
             None,
             BuildOptions { include_excluded },
+            &ctx.test_seams,
             &progress,
         );
         build_reply(result)

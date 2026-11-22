@@ -5,7 +5,6 @@
 //! (a move, then the order it shows) must plan once. The planner's call counter is process-wide,
 //! so this file holds one test only: nothing else in the binary runs beside it.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use agora_core::ctx::CoreContext;

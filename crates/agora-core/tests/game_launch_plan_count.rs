@@ -20,7 +20,6 @@ use agora_game_api::{
     LaunchRecipe, LaunchValue, LoadOrderDefinition, PackageDefinition, RelPath, RuntimeIdentity,
     StoreId, StoreIdentifier, UserDataLocation, UserFileMapping, UserFileStrategy,
 };
-use std::sync::atomic::Ordering;
 use tempfile::TempDir;
 
 struct Package(PackageDefinition);

@@ -15,6 +15,7 @@ use agora_core::game_launch::LaunchError;
 use agora_core::game_registry::{IdentifiedInstall, RuntimeResolution};
 use agora_core::game_user_files::Journal;
 use agora_core::process_identity;
+use agora_core::test_seams::TestSeams;
 use agora_game_api::{
     BaseReference, DeploymentStrategy, GameDefinition, GameId, GamePath, InstallId, InstallKind,
     LaunchRecipe, LaunchValue, RelPath, RuntimeIdentity, StoreId, StoreIdentifier,
@@ -843,6 +844,7 @@ fn building_over_a_damaged_record_an_instance_is_pinned_to_is_refused_and_keeps_
         BaseMode::Linked,
         None,
         BuildOptions::default(),
+        &TestSeams::default(),
         &|_| {},
     )
     .unwrap_err();
