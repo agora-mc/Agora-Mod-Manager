@@ -661,8 +661,10 @@ export function useProcessController(beforeLaunch?: (instanceId: string) => Prom
         return null;
       } catch (e) {
         const parsed = parseLauncherError(e);
-        const releaseHealthDialog = parsed.code === 'ERR_MSA_AUTH_REQUIRED'
-          || parsed.code === 'ERR_MSA_AUTH_EXPIRED';
+        // An expired Microsoft session is not its own code: `msa` clears
+        // credentials it cannot renew and the launch reports ERR_MSA_AUTH_REQUIRED,
+        // so this is the only sign-in failure to release the health dialog for.
+        const releaseHealthDialog = parsed.code === 'ERR_MSA_AUTH_REQUIRED';
         setState((prev) => ({
           ...prev,
           phase: 'failed',
