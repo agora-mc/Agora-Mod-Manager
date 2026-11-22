@@ -268,48 +268,52 @@ async fn check_and_download_update_inner(
         });
     }
     drop(conn);
-    // This snapshot only describes the cached catalog for the early status
-    // returns below. Nothing is decided with it: another process may change the
-    // log before we hold the lock, so the decisions use a snapshot taken under it.
-    let display_trust = &TrustSnapshot::load(app_data_dir, compiled)?;
     let cached_tag = get_cached_tag(local_state_path)?;
-    let cached = cached_catalog_summary_with_trust(app_data_dir, display_trust);
-    let has_cached_db = cached.is_some();
-    let cached_schema_version = cached.as_ref().and_then(|summary| summary.schema_version);
     let failed_tag = get_failed_update_tag(local_state_path)?;
 
-    if !force && has_cached_db && cached_tag.is_some() {
-        if let Some(failed_tag_name) = failed_tag.as_ref() {
-            if let Some(last_failure) = get_last_failure_time(local_state_path)? {
-                if now - last_failure < FAILED_UPDATE_RETRY_INTERVAL_SECS {
+    // A recent check can short-circuit without doing any work, and its status
+    // needs the cached catalog: that is the one read of the trust log for this
+    // operation. When the check has to look at the remote, the log is read once
+    // under the lock instead (never twice), because another process may change
+    // it while this one waits.
+    if !force && cached_tag.is_some() {
+        let display_trust = &TrustSnapshot::load(app_data_dir, compiled)?;
+        let cached = cached_catalog_summary_with_trust(app_data_dir, display_trust);
+        if let Some(cached) = cached {
+            let has_cached_db = true;
+            let cached_schema_version = cached.schema_version;
+            if let Some(failed_tag_name) = failed_tag.as_ref() {
+                if let Some(last_failure) = get_last_failure_time(local_state_path)? {
+                    if now - last_failure < FAILED_UPDATE_RETRY_INTERVAL_SECS {
+                        return Ok(RegistryStatus {
+                            has_cached_db,
+                            cached_tag,
+                            cached_schema_version,
+                            latest_tag: Some(failed_tag_name.clone()),
+                            update_available: true,
+                            checked: false,
+                            stale: cached.stale,
+                            expires_at: cached.expires_at,
+                            message: format!(
+                                "Catalog update to {failed_tag_name} failed recently; retrying soon."
+                            ),
+                        });
+                    }
+                }
+            } else if let Some(last_success) = get_last_success_time(local_state_path)? {
+                if now - last_success < UPDATE_CHECK_INTERVAL_SECS {
                     return Ok(RegistryStatus {
                         has_cached_db,
                         cached_tag,
                         cached_schema_version,
-                        latest_tag: Some(failed_tag_name.clone()),
-                        update_available: true,
+                        latest_tag: None,
+                        update_available: false,
                         checked: false,
-                        stale: cached.as_ref().is_some_and(|summary| summary.stale),
-                        expires_at: cached.and_then(|summary| summary.expires_at),
-                        message: format!(
-                            "Catalog update to {failed_tag_name} failed recently; retrying soon."
-                        ),
+                        stale: cached.stale,
+                        expires_at: cached.expires_at,
+                        message: "Catalog is up to date.".to_string(),
                     });
                 }
-            }
-        } else if let Some(last_success) = get_last_success_time(local_state_path)? {
-            if now - last_success < UPDATE_CHECK_INTERVAL_SECS {
-                return Ok(RegistryStatus {
-                    has_cached_db,
-                    cached_tag,
-                    cached_schema_version,
-                    latest_tag: None,
-                    update_available: false,
-                    checked: false,
-                    stale: cached.as_ref().is_some_and(|summary| summary.stale),
-                    expires_at: cached.and_then(|summary| summary.expires_at),
-                    message: "Catalog is up to date.".to_string(),
-                });
             }
         }
     }
@@ -323,8 +327,8 @@ async fn check_and_download_update_inner(
         )
         .await?;
     // The one snapshot for every decision in this check: loaded only now that
-    // the lock keeps other writers of the log and the bundle out. It is loaded
-    // again only if this check itself installs something.
+    // the lock keeps other writers of the log and the bundle out, and the only
+    // read of the log an installing check makes.
     let snapshot = TrustSnapshot::load(app_data_dir, compiled)?;
     let trust = &snapshot;
     // The cache and bookkeeping state are read again under the lock too: a
@@ -476,7 +480,7 @@ async fn check_and_download_update_inner(
     }
     .await;
 
-    let (schema_version, expires_at, changed, trust_changed) = match install_result {
+    let (schema_version, expires_at, changed, _trust_changed) = match install_result {
         Ok(ok) => ok,
         Err(error) => {
             // Bookkeeping must never mask the real failure or make a committed
@@ -494,14 +498,10 @@ async fn check_and_download_update_inner(
     }
 
     // An identical candidate skips extraction, and extraction can fail even
-    // after a real install. Report the actual readable-database state.
-    let after;
-    let trust = if trust_changed {
-        after = TrustSnapshot::load(app_data_dir, compiled)?;
-        &after
-    } else {
-        trust
-    };
+    // after a real install. Report the actual readable-database state, judged
+    // with the snapshot this check already took: the installed bundle verified
+    // against it a moment ago, so re-reading the log would only add a second
+    // read of one operation's state.
     let ready = cached_catalog_summary_with_trust(app_data_dir, trust).is_some();
     Ok(RegistryStatus {
         has_cached_db: ready,
@@ -841,6 +841,10 @@ fn load_remembered_trust(
             code: "ERR_REGISTRY_TRUST_STATE".into(),
             message: "Could not resolve the catalog trust state path.".into(),
         })?;
+    // Test-only: every operation reads the log here, once. A second read in one
+    // operation is what the counter catches.
+    #[cfg(test)]
+    count_trust_log_read(app_data_dir);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -950,11 +954,22 @@ impl TrustSnapshot {
 
 /// The durable rollback floor: the highest signed build stamp ever committed,
 /// with the payload hash of the bundle that carried it. It lives beside the
-/// remembered trust state and is raised only after a successful commit, so a
+/// remembered trust state. A candidate's stamp is written ahead of the swap (see
+/// [`write_pending_floor`]) and promoted here once the install completes, so a
 /// bundle that cannot be verified still cannot be used to argue that an older
-/// signed bundle is newer.
+/// signed bundle is newer, and a bundle that *was* accepted cannot be replayed
+/// after being lost.
 fn registry_floor_path(app_data_dir: &Path) -> LauncherResult<PathBuf> {
     Ok(app_data_dir.join("registry.floor"))
+}
+
+/// The write-ahead half of the floor: the stamp of a bundle this client has
+/// verified and is swapping in. It is written before the swap and promoted over
+/// `registry.floor` after it, so the stamp survives a floor write that fails
+/// afterwards and a swap whose new bundle is then lost. It normally exists only
+/// for the length of one install.
+fn registry_pending_floor_path(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join("registry.floor.pending")
 }
 
 fn floor_error(message: impl Into<String>) -> LauncherError {
@@ -964,36 +979,68 @@ fn floor_error(message: impl Into<String>) -> LauncherError {
     }
 }
 
-/// Read the durable floor. A missing file is an unset floor; an unreadable or
+/// Read one stamp file. A missing file is an unset stamp; an unreadable or
 /// malformed one is an error and must never be mistaken for "no floor", because
-/// that would drop rollback protection.
-fn read_floor_file(app_data_dir: &Path) -> LauncherResult<Option<CachedStamp>> {
-    let path = registry_floor_path(app_data_dir)?;
-    let text = match std::fs::read_to_string(&path) {
+/// that would drop rollback protection. `what` names the file in that error.
+fn read_stamp_file(path: &Path, what: &str) -> LauncherResult<Option<CachedStamp>> {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(floor_error(format!(
-                "Could not read the catalog rollback floor: {error}."
-            )))
-        }
+        Err(error) => return Err(floor_error(format!("Could not read the {what}: {error}."))),
     };
     let mut fields = text.split_whitespace();
     let built_at = fields
         .next()
-        .ok_or_else(|| floor_error("The catalog rollback floor is empty."))?
+        .ok_or_else(|| floor_error(format!("The {what} is empty.")))?
         .to_string();
     let db_sha256 = fields
         .next()
-        .ok_or_else(|| floor_error("The catalog rollback floor has no payload hash."))?
+        .ok_or_else(|| floor_error(format!("The {what} has no payload hash.")))?
         .to_string();
     if parse_utc(&built_at).is_none() || db_sha256.len() != 64 {
-        return Err(floor_error("The catalog rollback floor is malformed."));
+        return Err(floor_error(format!("The {what} is malformed.")));
     }
     Ok(Some(CachedStamp {
         built_at,
         db_sha256,
     }))
+}
+
+fn read_floor_file(app_data_dir: &Path) -> LauncherResult<Option<CachedStamp>> {
+    read_stamp_file(
+        &registry_floor_path(app_data_dir)?,
+        "catalog rollback floor",
+    )
+}
+
+fn read_pending_floor(app_data_dir: &Path) -> LauncherResult<Option<CachedStamp>> {
+    read_stamp_file(
+        &registry_pending_floor_path(app_data_dir),
+        "pending catalog rollback floor",
+    )
+}
+
+/// The higher of two stamps, by signed instant. Either may be absent.
+fn higher_stamp(
+    committed: Option<CachedStamp>,
+    pending: Option<CachedStamp>,
+) -> Option<CachedStamp> {
+    match (committed, pending) {
+        (Some(committed), Some(pending)) => {
+            let (Some(a), Some(b)) = (parse_utc(&committed.built_at), parse_utc(&pending.built_at))
+            else {
+                // Both were validated by `read_stamp_file`; keep the durable one.
+                return Some(committed);
+            };
+            if b > a {
+                Some(pending)
+            } else {
+                Some(committed)
+            }
+        }
+        (committed, None) => committed,
+        (None, pending) => pending,
+    }
 }
 
 /// Before any trust statement is appended, capture the verified baseline of a
@@ -1003,6 +1050,7 @@ fn read_floor_file(app_data_dir: &Path) -> LauncherResult<Option<CachedStamp>> {
 fn ensure_floor_baseline(app_data_dir: &Path, trust: &TrustSnapshot) -> LauncherResult<()> {
     // Reading first also fails closed on a malformed or unreadable floor.
     let _ = read_floor_file(app_data_dir)?;
+    let _ = read_pending_floor(app_data_dir)?;
     // Checkpoint the maximum, not just an unset floor: a previous post-swap
     // write may have failed and left the stored floor lagging the installed
     // bundle. `raise_floor` keeps the higher of the two.
@@ -1020,8 +1068,14 @@ fn durable_floor(
     trust: &TrustSnapshot,
 ) -> LauncherResult<Option<CachedStamp>> {
     // An unreadable or malformed floor is an error everywhere: treating it as
-    // unset would drop rollback protection on installs, opens and recovery.
-    if let Some(floor) = read_floor_file(app_data_dir)? {
+    // unset would drop rollback protection on installs, opens and recovery. The
+    // write-ahead half counts too: it names a bundle this client accepted, so a
+    // swap that failed after it was written cannot make the catalog it left
+    // behind look newer than it is.
+    if let Some(floor) = higher_stamp(
+        read_floor_file(app_data_dir)?,
+        read_pending_floor(app_data_dir)?,
+    ) {
         return Ok(Some(floor));
     }
     // Only a genuinely absent file migrates from the installed bundle.
@@ -1042,17 +1096,30 @@ fn durable_floor(
     }))
 }
 
-/// Raise the floor after a successful commit. An existing higher floor wins:
-/// the value is monotonic and never lowered by a replay or a recovery.
+/// Raise the floor to the highest stamp this client has accepted: the candidate,
+/// the committed floor and the write-ahead stamp. The value is monotonic and
+/// never lowered by a replay, a recovery or a failed swap.
 fn raise_floor(app_data_dir: &Path, built_at: &str, db_sha256: &str) -> LauncherResult<()> {
-    let candidate = parse_utc(built_at).ok_or_else(|| LauncherError::Generic {
-        code: "ERR_REGISTRY_STAMP_INVALID".into(),
-        message: format!("The committed catalog's build stamp `{built_at}` cannot be read."),
-    })?;
-    if let Some(current) = read_floor_file(app_data_dir)? {
-        if parse_utc(&current.built_at).is_some_and(|time| time >= candidate) {
-            return Ok(());
-        }
+    if parse_utc(built_at).is_none() {
+        return Err(LauncherError::Generic {
+            code: "ERR_REGISTRY_STAMP_INVALID".into(),
+            message: format!("The committed catalog's build stamp `{built_at}` cannot be read."),
+        });
+    }
+    let committed = read_floor_file(app_data_dir)?;
+    let candidate = Some(CachedStamp {
+        built_at: built_at.to_string(),
+        db_sha256: db_sha256.to_string(),
+    });
+    // The higher of the candidate and everything already recorded; promoting a
+    // write-ahead stamp happens here too, so the committed file never lags it.
+    let highest = higher_stamp(
+        higher_stamp(committed.clone(), candidate),
+        read_pending_floor(app_data_dir)?,
+    )
+    .expect("the candidate is a stamp");
+    if committed.as_ref() == Some(&highest) {
+        return Ok(());
     }
     let path = registry_floor_path(app_data_dir)?;
     // Test-only failure injection, keyed by data root so parallel tests with
@@ -1066,11 +1133,53 @@ fn raise_floor(app_data_dir: &Path, built_at: &str, db_sha256: &str) -> Launcher
             "Injected catalog rollback floor write failure.",
         ));
     }
-    write_atomic(&path, format!("{built_at} {db_sha256}\n").as_bytes()).map_err(|error| {
+    write_atomic(
+        &path,
+        format!("{} {}\n", highest.built_at, highest.db_sha256).as_bytes(),
+    )
+    .map_err(|error| {
         floor_error(format!(
             "Could not save the catalog rollback floor: {error}."
         ))
     })
+}
+
+/// Record the stamp of the bundle this install is swapping in, before the swap.
+///
+/// The floor must be durable *before* the catalog it names, otherwise a floor
+/// write that fails after the swap and a lost new bundle leave the client
+/// accepting an older bundle than one it already accepted. A failed write
+/// refuses the install with nothing swapped, which is the safe direction.
+fn write_pending_floor(app_data_dir: &Path, built_at: &str, db_sha256: &str) -> LauncherResult<()> {
+    if parse_utc(built_at).is_none() {
+        return Err(LauncherError::Generic {
+            code: "ERR_REGISTRY_STAMP_INVALID".into(),
+            message: format!("The candidate catalog's build stamp `{built_at}` cannot be read."),
+        });
+    }
+    let path = registry_pending_floor_path(app_data_dir);
+    #[cfg(test)]
+    if injected_pending_floor_write_failure(app_data_dir) {
+        return Err(floor_error(
+            "Injected pending catalog rollback floor write failure.",
+        ));
+    }
+    write_atomic(&path, format!("{built_at} {db_sha256}\n").as_bytes()).map_err(|error| {
+        floor_error(format!(
+            "Could not save the pending catalog rollback floor: {error}."
+        ))
+    })
+}
+
+/// Drop the write-ahead stamp. Best effort: a stamp that stays behind can only
+/// hold the floor at a value this client accepted, never lower it.
+fn clear_pending_floor(app_data_dir: &Path) {
+    let path = registry_pending_floor_path(app_data_dir);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
 }
 
 #[cfg(test)]
@@ -1106,6 +1215,43 @@ fn fail_floor_writes(app_data_dir: &Path) -> FloorWriteFailureGuard {
         .unwrap()
         .push(app_data_dir.to_path_buf());
     FloorWriteFailureGuard(app_data_dir.to_path_buf())
+}
+
+/// Test-only injection for the write-ahead floor write, keyed by data root:
+/// proves a failed write-ahead stamp refuses the install before the swap.
+#[cfg(test)]
+fn pending_floor_write_failures() -> &'static Mutex<Vec<PathBuf>> {
+    static FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn injected_pending_floor_write_failure(app_data_dir: &Path) -> bool {
+    pending_floor_write_failures()
+        .lock()
+        .map(|dirs| dirs.iter().any(|dir| dir == app_data_dir))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+struct PendingFloorWriteFailureGuard(PathBuf);
+
+#[cfg(test)]
+impl Drop for PendingFloorWriteFailureGuard {
+    fn drop(&mut self) {
+        if let Ok(mut dirs) = pending_floor_write_failures().lock() {
+            dirs.retain(|dir| dir != &self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+fn fail_pending_floor_writes(app_data_dir: &Path) -> PendingFloorWriteFailureGuard {
+    pending_floor_write_failures()
+        .lock()
+        .unwrap()
+        .push(app_data_dir.to_path_buf());
+    PendingFloorWriteFailureGuard(app_data_dir.to_path_buf())
 }
 
 /// The strongest baseline a replacement is compared against: the higher of the
@@ -1155,6 +1301,74 @@ fn fail_trust_writes(app_data_dir: &Path) -> TrustWriteFailureGuard {
         .unwrap()
         .push(app_data_dir.to_path_buf());
     TrustWriteFailureGuard(app_data_dir.to_path_buf())
+}
+
+/// Test-only count of trust-log reads per data root, so a test can prove that
+/// one operation decides from one snapshot instead of re-reading the log per
+/// decision. Keyed by data root so parallel tests cannot see each other.
+#[cfg(test)]
+fn trust_log_read_counts() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn count_trust_log_read(app_data_dir: &Path) {
+    if let Ok(mut counts) = trust_log_read_counts().lock() {
+        *counts.entry(app_data_dir.to_path_buf()).or_insert(0) += 1;
+    }
+}
+
+#[cfg(test)]
+fn trust_log_reads(app_data_dir: &Path) -> usize {
+    trust_log_read_counts()
+        .lock()
+        .map(|counts| counts.get(app_data_dir).copied().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn reset_trust_log_reads(app_data_dir: &Path) {
+    if let Ok(mut counts) = trust_log_read_counts().lock() {
+        counts.remove(app_data_dir);
+    }
+}
+
+/// Test-only failure injection for the *flush* of a write, keyed by the target
+/// path: the bytes reach the temporary file and the write fails before the
+/// rename, which is the partway case a whole-file replace cannot otherwise
+/// produce. The half-written temporary file is left behind, as a real flush
+/// error would.
+#[cfg(test)]
+fn sync_failures() -> &'static Mutex<Vec<PathBuf>> {
+    static FAILURES: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn injected_sync_failure(path: &Path) -> bool {
+    sync_failures()
+        .lock()
+        .map(|paths| paths.iter().any(|known| known == path))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+struct SyncFailureGuard(PathBuf);
+
+#[cfg(test)]
+impl Drop for SyncFailureGuard {
+    fn drop(&mut self) {
+        if let Ok(mut paths) = sync_failures().lock() {
+            paths.retain(|path| path != &self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+fn fail_sync_of(path: &Path) -> SyncFailureGuard {
+    sync_failures().lock().unwrap().push(path.to_path_buf());
+    SyncFailureGuard(path.to_path_buf())
 }
 
 /// Remember what a verified bundle taught, as one record.
@@ -1362,6 +1576,15 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::Write;
         let mut file = std::fs::File::create(&temp)?;
         file.write_all(bytes)?;
+        // Test-only: fail at the flush with the bytes already in the temporary
+        // file. The rename is never reached, so `path` keeps its old contents.
+        #[cfg(test)]
+        if injected_sync_failure(path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected flush failure",
+            ));
+        }
         file.sync_all()?;
     }
     match std::fs::rename(&temp, path) {
@@ -1630,9 +1853,11 @@ fn unchanged_candidate(
 /// rollback floor keeps the catalogue from being replayed.
 ///
 /// The bundle is one file, so it is replaced by one rename; the previous good
-/// bundle is copied to `registry.bundle.prev` first. The rollback floor is
-/// raised after the rename. The readable database is a derived copy that the
-/// next open can repair.
+/// bundle is copied to `registry.bundle.prev` first. The candidate's stamp is
+/// recorded in `registry.floor.pending` before the rename and promoted into
+/// `registry.floor` after it, so the floor is never behind a bundle this client
+/// already accepted, even when the promotion fails and the new bundle is lost.
+/// The readable database is a derived copy that the next open can repair.
 ///
 /// If a swap fails after a trust append, the catalog can be left offline: the
 /// verified revocation is kept while the bundle it revoked is still current.
@@ -1697,12 +1922,21 @@ fn install_bundle_bytes_with(
     // the swap is always safe and no revocation can be lost by a later failure.
     let trust_written = remember_bundle_trust(app_data_dir, &trust.log_text, &payload)?;
 
+    // The floor's write-ahead half: this client has verified the candidate and
+    // is about to swap it in, so its stamp must be durable before the bundle it
+    // names. A failed write refuses the install with nothing swapped.
+    write_pending_floor(app_data_dir, &header.built_at, &header.db_sha256)?;
+
     // Keep the previous copy only when the current file looks like a bundle.
     // A corrupt current must not overwrite a good previous one.
     if bundle_path.exists() {
         if let Ok(current) = std::fs::read(&bundle_path) {
             if registry_bundle::parse_bundle(&current).is_ok() {
                 write_atomic(&previous_path, &current).map_err(|error| {
+                    // Nothing was swapped, so the write-ahead stamp no longer
+                    // describes anything this client has: drop it rather than
+                    // holding the floor above the catalog still installed.
+                    clear_pending_floor(app_data_dir);
                     swap_error(
                         LauncherError::Generic {
                             code: "ERR_REGISTRY_WRITE".into(),
@@ -1717,6 +1951,10 @@ fn install_bundle_bytes_with(
 
     // COMMIT: one rename replaces the current bundle.
     write_atomic(&bundle_path, bundle_bytes).map_err(|error| {
+        // The rename failed, so the bundle named by the write-ahead stamp was
+        // never installed. Drop it: the committed floor still protects the
+        // catalog that is installed.
+        clear_pending_floor(app_data_dir);
         swap_error(
             LauncherError::Generic {
                 code: "ERR_REGISTRY_WRITE".into(),
@@ -1742,6 +1980,10 @@ fn install_bundle_bytes_with(
     );
     raise_floor(app_data_dir, &header.built_at, &header.db_sha256)
         .map_err(floor_after_swap_error)?;
+    // The stamp is in the committed floor now, so the write-ahead copy has done
+    // its job. A removal that fails is harmless: the reader takes the higher of
+    // the two, and both name this bundle.
+    clear_pending_floor(app_data_dir);
     Ok(trust_written)
 }
 
@@ -4193,6 +4435,137 @@ mod tests {
         );
     }
 
+    /// A floor write that fails after a successful swap must not make the
+    /// accepted stamp replayable later: the stamp this client already installed
+    /// is durable before the swap, so losing the new bundle cannot lose it.
+    #[test]
+    fn a_lost_bundle_after_a_failed_floor_write_does_not_reopen_an_older_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(194);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let first_payload = sample_db_with_built_at("2026-11-15T12:00:00+00:00");
+        let first_header = header_for(
+            &key,
+            &first_payload,
+            "2026-11-15T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let first = signed_bundle(&key, &first_header, &first_payload);
+        install_bundle_bytes_checked(dir.path(), &first, &trust, "first").unwrap();
+
+        let second_payload = sample_db_with_built_at("2026-11-17T12:00:00+00:00");
+        let second_header = header_for(
+            &key,
+            &second_payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let second = signed_bundle(&key, &second_header, &second_payload);
+        let floor_failure = fail_floor_writes(dir.path());
+        let error = install_bundle_bytes_checked(dir.path(), &second, &trust, "second")
+            .expect_err("the post-swap floor write must fail");
+        assert_eq!(error.code(), "ERR_REGISTRY_FLOOR");
+        drop(floor_failure);
+        let bundle_path = paths::registry_bundle_path(dir.path()).unwrap();
+        assert_eq!(fs::read(&bundle_path).unwrap(), second);
+
+        // The newer bundle is installed, then lost: a crashed disk, a cleared
+        // cache, a crash between the swap and the floor write.
+        fs::remove_file(&bundle_path).unwrap();
+
+        let error = install_bundle_bytes_checked(dir.path(), &first, &trust, "first again")
+            .expect_err("a bundle older than one already accepted must be refused");
+        assert_eq!(error.code(), "ERR_REGISTRY_ROLLBACK", "{error}");
+        assert!(
+            !bundle_path.exists(),
+            "a refused bundle must not be installed"
+        );
+    }
+
+    /// The write-ahead stamp is part of the floor's durability: a write that
+    /// fails refuses the install before the swap, with the catalog it replaced
+    /// still in place.
+    #[test]
+    fn a_pending_floor_write_failure_refuses_before_the_swap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(206);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let first_payload = sample_db_with_built_at("2026-11-15T12:00:00+00:00");
+        let first_header = header_for(
+            &key,
+            &first_payload,
+            "2026-11-15T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let first = signed_bundle(&key, &first_header, &first_payload);
+        install_bundle_bytes_checked(dir.path(), &first, &trust, "first").unwrap();
+
+        let second_payload = sample_db_with_built_at("2026-11-17T12:00:00+00:00");
+        let second_header = header_for(
+            &key,
+            &second_payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let second = signed_bundle(&key, &second_header, &second_payload);
+        let failure = fail_pending_floor_writes(dir.path());
+        let error = install_bundle_bytes_checked(dir.path(), &second, &trust, "second")
+            .expect_err("a failed write-ahead stamp must refuse the install");
+        assert_eq!(error.code(), "ERR_REGISTRY_FLOOR");
+        drop(failure);
+        assert_eq!(
+            fs::read(paths::registry_bundle_path(dir.path()).unwrap()).unwrap(),
+            first,
+            "nothing is swapped when the stamp cannot be recorded"
+        );
+    }
+
+    /// A swap that fails drops the write-ahead stamp, so the catalog it left
+    /// installed is not below the floor and still opens.
+    #[test]
+    fn a_failed_swap_does_not_leave_the_installed_catalog_below_the_floor() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(207);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let first_payload = sample_db_with_built_at("2026-11-15T12:00:00+00:00");
+        let first_header = header_for(
+            &key,
+            &first_payload,
+            "2026-11-15T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let first = signed_bundle(&key, &first_header, &first_payload);
+        install_bundle_bytes_checked(dir.path(), &first, &trust, "first").unwrap();
+
+        let second_payload = sample_db_with_built_at("2026-11-17T12:00:00+00:00");
+        let second_header = header_for(
+            &key,
+            &second_payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let second = signed_bundle(&key, &second_header, &second_payload);
+        let previous = paths::registry_bundle_previous_path(dir.path()).unwrap();
+        fs::create_dir_all(&previous).unwrap();
+        let error = install_bundle_bytes_checked(dir.path(), &second, &trust, "second")
+            .expect_err("the obstructed backup must fail the swap");
+        assert_eq!(error.code(), "ERR_REGISTRY_WRITE");
+        fs::remove_dir(&previous).unwrap();
+
+        assert!(
+            !registry_pending_floor_path(dir.path()).exists(),
+            "a failed swap must not leave its stamp behind"
+        );
+        assert_eq!(
+            read_floor_file(dir.path()).unwrap().unwrap().built_at,
+            "2026-11-15T12:00:00+00:00"
+        );
+        assert!(
+            open_verified_registry_with_trust(dir.path(), &trust).is_ok(),
+            "the installed catalog is not below the floor"
+        );
+    }
+
     /// A swap failure without a trust append must not claim a trust update.
     #[test]
     fn a_swap_failure_without_a_trust_append_says_trust_was_unchanged() {
@@ -5049,6 +5422,134 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         }
     }
 
+    /// The review's exact shape: one bundle introduces a recovery key, uses it
+    /// to sign a revocation, and retires it. The log must keep the certificate
+    /// that revocation needs, so re-reading the log authenticates it instead of
+    /// dropping an accepted revocation as unauthenticatable.
+    #[test]
+    fn a_recovery_key_used_and_revoked_in_one_bundle_keeps_its_revocation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = test_key(185);
+        let stolen = test_key(186);
+        let recovery = test_key(187);
+        let fresh = test_key(188);
+        let trust = rotation_trust(&primary, &stolen, &recovery);
+        let payload = sample_db();
+        let mut header = fresh_header(&primary, &payload);
+        header
+            .certificates
+            .push(recovery_certificate(&recovery, &test_public(&fresh)));
+        // The new recovery key revokes the stolen primary, and is retired in the
+        // same bundle by the compiled recovery root.
+        header.revocations.push(revocation(&fresh, &stolen));
+        header.revocations.push(revocation(&recovery, &fresh));
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&primary, &header, &payload),
+            &trust,
+            "rotation",
+        )
+        .unwrap();
+
+        let trust_path = paths::registry_trust_state_path(dir.path()).unwrap();
+        let log = fs::read_to_string(&trust_path).unwrap();
+        assert!(
+            log.contains(&registry_bundle::key_id_for_public_key(&test_public(
+                &fresh
+            ))),
+            "the log keeps the certificate the revocation needs: {log}"
+        );
+
+        // A reload must authenticate every statement and keep both revocations.
+        let reloaded = effective_trust(dir.path(), &trust).expect("the log must re-read");
+        let revoked = reloaded.revoked_ids();
+        for key in [&stolen, &fresh] {
+            assert!(
+                revoked.contains(&registry_bundle::key_id_for_public_key(&test_public(key))),
+                "the revocation stays in force after a reload: {log}"
+            );
+        }
+        let stale = fresh_header(&stolen, &payload);
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            signed_bundle(&stolen, &stale, &payload),
+        )
+        .unwrap();
+        assert_refused_as_untrusted_signer(dir.path(), &trust);
+    }
+
+    /// The same rotation split over two bundles: the certificate is taught by an
+    /// earlier record and the revocation signed by that key is recorded later.
+    /// Replay must carry the certificate across records, so the accepted
+    /// revocation is authenticable after a reload.
+    #[test]
+    fn a_revocation_signed_by_a_key_taught_in_an_earlier_record_survives() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = test_key(189);
+        let stolen = test_key(190);
+        let recovery = test_key(191);
+        let fresh = test_key(192);
+        let trust = rotation_trust(&primary, &stolen, &recovery);
+        let payload = sample_db();
+
+        let mut first = fresh_header(&primary, &payload);
+        first
+            .certificates
+            .push(recovery_certificate(&recovery, &test_public(&fresh)));
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&primary, &first, &payload),
+            &trust,
+            "first",
+        )
+        .unwrap();
+
+        let newer = sample_db_with_built_at("2026-11-18T12:00:00+00:00");
+        let mut second = header_for(
+            &primary,
+            &newer,
+            "2026-11-18T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        second.revocations.push(revocation(&fresh, &stolen));
+        second.revocations.push(revocation(&recovery, &fresh));
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&primary, &second, &newer),
+            &trust,
+            "second",
+        )
+        .unwrap();
+
+        let log =
+            fs::read_to_string(paths::registry_trust_state_path(dir.path()).unwrap()).unwrap();
+        assert_eq!(
+            log.matches("v1 record").count(),
+            2,
+            "each bundle is one record: {log}"
+        );
+        let reloaded = effective_trust(dir.path(), &trust).expect("the log must re-read");
+        let revoked = reloaded.revoked_ids();
+        for key in [&stolen, &fresh] {
+            assert!(
+                revoked.contains(&registry_bundle::key_id_for_public_key(&test_public(key))),
+                "a revocation signed by a key from an earlier record stays in force: {log}"
+            );
+        }
+        let stale = header_for(
+            &stolen,
+            &payload,
+            "2026-11-17T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            signed_bundle(&stolen, &stale, &payload),
+        )
+        .unwrap();
+        assert_refused_as_untrusted_signer(dir.path(), &trust);
+    }
+
     /// The log's order is not a security fact: a revocation line written before
     /// the line that introduces its signer still counts.
     #[test]
@@ -5112,6 +5613,53 @@ v1 key deadbeef deadbeef deadbeef deadbeef
             bundle_path.exists(),
             "a good bundle must not be moved aside"
         );
+    }
+
+    /// The refusal for an unreadable log must name the file and the way out,
+    /// and the status report carries the same reason instead of describing a
+    /// catalog built on the compiled keys alone.
+    #[test]
+    fn an_unreadable_trust_log_explains_itself_and_the_repair() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = test_key(193);
+        let trust = RegistryTrust::with_key(test_public(&primary));
+        let payload = sample_db();
+        let header = fresh_header(&primary, &payload);
+        fs::write(
+            paths::registry_bundle_path(dir.path()).unwrap(),
+            signed_bundle(&primary, &header, &payload),
+        )
+        .unwrap();
+        let trust_path = paths::registry_trust_state_path(dir.path()).unwrap();
+        fs::create_dir_all(&trust_path).unwrap();
+
+        let error = open_verified_registry_with_trust(dir.path(), &trust)
+            .err()
+            .expect("an unreadable log must not open the catalog");
+        assert_eq!(error.code(), "ERR_REGISTRY_TRUST_STATE");
+        let message = error.to_string();
+        for expected in [
+            "could not be read",
+            "weaker set of keys",
+            &trust_path.display().to_string(),
+            "remove",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the refusal must say `{expected}`: {message}"
+            );
+        }
+
+        // The status report fails closed with the same reason, rather than
+        // reporting a readable catalog that trusts the compiled keys.
+        let status = get_status_with_trust(dir.path(), &local_state_in(dir.path()), &trust);
+        assert!(!status.has_cached_db, "{status:?}");
+        assert!(status.message.contains("weaker set of keys"), "{status:?}");
+
+        // The documented override: removing the log starts over on the
+        // compiled keys.
+        fs::remove_dir(&trust_path).unwrap();
+        assert!(open_verified_registry_with_trust(dir.path(), &trust).is_ok());
     }
 
     /// A statement line that cannot be authenticated is an error, not an ignored
@@ -5460,6 +6008,199 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         .expect_err("a failed write must refuse the install");
         assert_eq!(error.code(), "ERR_REGISTRY_TRUST_STATE");
         assert_eq!(fs::read(&trust_path).unwrap(), before);
+    }
+
+    /// A flush error partway through appending a record leaves the log exactly
+    /// as it was: the record is written whole or not at all, so the next open
+    /// reads the earlier log and never a prefix of the new record.
+    #[test]
+    fn a_flush_error_partway_through_a_record_leaves_the_log_usable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = test_key(198);
+        let stolen = test_key(199);
+        let recovery = test_key(200);
+        let first_new = test_key(201);
+        let second_new = test_key(202);
+        let trust = rotation_trust(&primary, &stolen, &recovery);
+        let payload = sample_db();
+        let mut first = fresh_header(&primary, &payload);
+        first
+            .certificates
+            .push(certificate(&recovery, &test_public(&first_new)));
+        first.revocations.push(revocation(&recovery, &stolen));
+        install_bundle_bytes_checked(
+            dir.path(),
+            &signed_bundle(&primary, &first, &payload),
+            &trust,
+            "first",
+        )
+        .unwrap();
+        let trust_path = paths::registry_trust_state_path(dir.path()).unwrap();
+        let before = fs::read(&trust_path).unwrap();
+
+        let second_db = sample_db_with_built_at("2026-11-18T12:00:00+00:00");
+        let mut second = header_for(
+            &primary,
+            &second_db,
+            "2026-11-18T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        second
+            .certificates
+            .push(certificate(&recovery, &test_public(&second_new)));
+        let second_bundle = signed_bundle(&primary, &second, &second_db);
+
+        // The bytes reach the temporary file and the flush fails before the
+        // rename: the partway case a whole-file replace cannot otherwise leave.
+        let flush_failure = fail_sync_of(&trust_path);
+        let error = install_bundle_bytes_checked(dir.path(), &second_bundle, &trust, "second")
+            .expect_err("a failed flush must refuse the install");
+        assert_eq!(error.code(), "ERR_REGISTRY_TRUST_STATE");
+        assert!(
+            error.to_string().contains("could not be saved"),
+            "the refusal names the write: {error}"
+        );
+
+        // The finished log is untouched, so the earlier record still counts and
+        // no complete new record appeared.
+        assert_eq!(fs::read(&trust_path).unwrap(), before);
+        let log = fs::read_to_string(&trust_path).unwrap();
+        assert_eq!(log.matches("v1 record").count(), 1, "{log}");
+        assert!(!log.contains("v1 record 1\nv1 record"), "{log}");
+        let reloaded = effective_trust(dir.path(), &trust).expect("the earlier log still reads");
+        assert!(reloaded
+            .revoked_ids()
+            .contains(&registry_bundle::key_id_for_public_key(&test_public(
+                &stolen
+            ))));
+
+        // And once the flush works the same install goes through.
+        drop(flush_failure);
+        install_bundle_bytes_checked(dir.path(), &second_bundle, &trust, "second").unwrap();
+        assert_eq!(
+            fs::read_to_string(&trust_path)
+                .unwrap()
+                .matches("v1 record")
+                .count(),
+            2
+        );
+    }
+
+    /// One operation reads the trust log once, whatever it decides: an install
+    /// takes one snapshot for the whole of it.
+    #[test]
+    fn an_install_reads_the_trust_log_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = test_key(203);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db();
+        let header = fresh_header(&key, &payload);
+        let bundle = signed_bundle(&key, &header, &payload);
+        reset_trust_log_reads(dir.path());
+        install_bundle_bytes_checked(dir.path(), &bundle, &trust, "once").unwrap();
+        assert_eq!(
+            trust_log_reads(dir.path()),
+            1,
+            "an install decides from one snapshot"
+        );
+    }
+
+    /// A sync that has to look at the remote reads the trust log once, under the
+    /// lock: it neither reads it for the display first nor re-reads it after its
+    /// own install.
+    #[tokio::test]
+    async fn a_sync_that_installs_reads_the_trust_log_once() {
+        let (dir, ls_path, locks) = setup_sync_env();
+        let key = test_key(204);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db_with_built_at("2026-11-18T02:00:00+00:00");
+        let header = header_for(
+            &key,
+            &payload,
+            "2026-11-18T02:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        let recorded = r#"[
+            {
+                "tag_name": "registry-2026-11-18",
+                "draft": false,
+                "prerelease": false,
+                "assets": [{"id": 3001, "name": "registry.bundle"}]
+            }
+        ]"#;
+        let transport =
+            FakeRegistryTransport::from_pages(vec![(1, release_json_to_list(recorded))]);
+        transport.push_asset_ok(3001, signed_bundle(&key, &header, &payload));
+
+        reset_trust_log_reads(dir.path());
+        let status = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            true,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_000,
+        )
+        .await
+        .unwrap();
+        assert!(status.has_cached_db, "{status:?}");
+        assert_eq!(
+            trust_log_reads(dir.path()),
+            1,
+            "a sync that installs one bundle reads the log once"
+        );
+    }
+
+    /// A sync that a recent check short-circuits still reads the log once: the
+    /// one read serves the status it returns.
+    #[tokio::test]
+    async fn a_recently_checked_sync_reads_the_trust_log_once() {
+        let (dir, ls_path, locks) = setup_sync_env();
+        let key = test_key(205);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db_with_built_at("2026-11-18T02:00:00+00:00");
+        let header = header_for(
+            &key,
+            &payload,
+            "2026-11-18T02:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        install_bundle_bytes(
+            dir.path(),
+            &header,
+            &signed_bundle(&key, &header, &payload),
+            &trust,
+        )
+        .unwrap();
+        set_cached_tag(&ls_path, "registry-2026-11-18").unwrap();
+        set_last_success_time(&ls_path, 1_000_000).unwrap();
+        let transport = FakeRegistryTransport::from_pages(Vec::new());
+
+        reset_trust_log_reads(dir.path());
+        let status = check_and_download_update_inner(
+            dir.path(),
+            &ls_path,
+            false,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(status.message, "Catalog is up to date.", "{status:?}");
+        assert_eq!(
+            trust_log_reads(dir.path()),
+            1,
+            "a short-circuited sync reads the log once"
+        );
     }
 
     /// An empty log is "nothing remembered", not an error.
