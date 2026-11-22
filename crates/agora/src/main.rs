@@ -2455,7 +2455,8 @@ fn print_table(columns: &[&str], rows: &[Vec<String>]) {
 ///  13   registry missing / corrupt / schema
 ///  20   network offline
 ///  21   download / registry download
-///  30   integrity security (hash, untrusted source, zip bomb, override)
+///  30   integrity security (hash, zip bomb, override, Maven descriptor)
+///  31   untrusted source
 ///  34   disk full
 ///  40   authentication
 ///  50   feature disabled
@@ -2463,6 +2464,8 @@ fn print_table(columns: &[&str], rows: &[Vec<String>]) {
 ///  61   version / loader resolution
 ///  62   Java runtime
 ///  70   dependency / placeholder
+///  71   a decision is needed (migration conflict, user decision)
+///  72   migration failed
 ///  80   MCP rate-limit
 ///  81   MCP denied
 ///  82   MCP unauthorized
