@@ -510,7 +510,7 @@ fn base_removal_cannot_delete_a_base_a_restore_is_publishing() {
     restore.join().unwrap();
 
     assert!(
-        matches!(&removal, Err(_)),
+        removal.is_err(),
         "the removal must not delete a base while a restore is publishing its pin: {removal:?}"
     );
     assert!(
