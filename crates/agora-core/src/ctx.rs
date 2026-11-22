@@ -117,6 +117,10 @@ pub struct CoreContext {
     /// The keys this context trusts for the signed catalog, and (in tests) the
     /// debug-only permission to open an unsigned cache.
     pub registry_trust: crate::registry_bundle::RegistryTrust,
+    /// The test seams installed on this context (MASTER_SPEC §32.9). Clones share
+    /// them, so a hook reaches the operation wherever it runs; no other context
+    /// sees them. Empty in production, so each seam costs one cheap check.
+    pub test_seams: crate::test_seams::TestSeams,
 }
 
 /// The main context type alias — use `Ctx` throughout the codebase.
@@ -643,6 +647,7 @@ impl CoreContext {
             games,
             minecraft_snapshot_entries: Vec::new(),
             registry_trust: registry_trust.clone(),
+            test_seams: crate::test_seams::TestSeams::default(),
         };
         ctx.extensions.insert(behaviour_runtime);
 
@@ -693,6 +698,7 @@ impl CoreContext {
             games: Arc::new(crate::game_registry::GameRegistry::empty()),
             minecraft_snapshot_entries: Vec::new(),
             registry_trust: crate::registry_bundle::RegistryTrust::unverified_debug(),
+            test_seams: crate::test_seams::TestSeams::default(),
         }
     }
 
@@ -739,6 +745,12 @@ impl CoreContext {
     /// manager between service and test harness).
     pub fn with_process_session_manager(mut self, mgr: ProcessSessionManager) -> Self {
         self.process_session_manager = mgr;
+        self
+    }
+
+    /// Replace the test seams (e.g. to share a set with the handle a test arms).
+    pub fn with_test_seams(mut self, seams: crate::test_seams::TestSeams) -> Self {
+        self.test_seams = seams;
         self
     }
 

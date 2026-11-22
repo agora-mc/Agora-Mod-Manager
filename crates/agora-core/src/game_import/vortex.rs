@@ -3280,10 +3280,10 @@ fn copy_space(
                 })?;
             // The instance id is allocated later. Only the destination volume is needed here.
             let folder = crate::game_saves::own_folder(rule, "agora-import-preview")?;
-            if let Some(volume) = volumes
-                .iter_mut()
-                .find(|volume| volume.folder == folder || same_copy_volume(&volume.folder, &folder))
-            {
+            if let Some(volume) = volumes.iter_mut().find(|volume| {
+                volume.folder == folder
+                    || same_copy_volume(&ctx.test_seams, &volume.folder, &folder)
+            }) {
                 volume.bytes = volume.bytes.saturating_add(plan.saves.bytes);
             } else {
                 volumes.push(CopySpace {
@@ -3295,16 +3295,17 @@ fn copy_space(
         }
     }
     for volume in &mut volumes {
-        volume.free = crate::game_tool_swap::available_bytes(&volume.folder).or_else(|| {
-            let existing = volume.folder.ancestors().find(|path| path.is_dir())?;
-            fs2::available_space(existing).ok()
-        });
+        volume.free = crate::game_tool_swap::available_bytes(&ctx.test_seams, &volume.folder)
+            .or_else(|| {
+                let existing = volume.folder.ancestors().find(|path| path.is_dir())?;
+                fs2::available_space(existing).ok()
+            });
     }
     Ok(volumes)
 }
 
 #[cfg(unix)]
-fn same_copy_volume(a: &Path, b: &Path) -> bool {
+fn same_copy_volume(_seams: &crate::test_seams::TestSeams, a: &Path, b: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     let dev = |path: &Path| {
         path.ancestors()
@@ -3315,8 +3316,8 @@ fn same_copy_volume(a: &Path, b: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn same_copy_volume(a: &Path, b: &Path) -> bool {
-    crate::game_tool_swap::same_volume(a, b)
+fn same_copy_volume(seams: &crate::test_seams::TestSeams, a: &Path, b: &Path) -> bool {
+    crate::game_tool_swap::same_volume(seams, a, b)
 }
 
 /// What one profile's saves did.

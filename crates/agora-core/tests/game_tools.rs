@@ -1921,8 +1921,8 @@ fn a_failure_without_injection_never_offers_switching_to_links() {
 
 #[test]
 fn two_failed_swaps_do_not_offer_the_swap_again() {
-    let _swap = SwapTest::same_volume();
     let f = swap_fixture(vec![writes_or_fails("nemesis")]);
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
 
     f.run_as("nemesis", &failing(), CaptureMode::Swap).unwrap();
     let second = f.run_as("nemesis", &failing(), CaptureMode::Swap).unwrap();
@@ -2054,10 +2054,10 @@ fn a_run_by_a_tier_chosen_after_a_refusal_names_the_vfs_failure_in_its_reason() 
 
 #[test]
 fn a_swap_whose_costs_were_not_acknowledged_is_refused_by_core_and_touches_nothing() {
-    let _swap = SwapTest::same_volume();
     let mut tool = writes_or_fails("nemesis");
     tool.uses_install_path = true;
     let f = swap_fixture(vec![tool]);
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let install = install_dir(&f);
     let before = snapshot(&real_data(&f));
     let entries_before = names(&install);
@@ -2119,10 +2119,10 @@ fn the_acknowledgement_is_not_needed_by_the_other_captures() {
 
 #[test]
 fn a_swap_chosen_after_a_refusal_names_the_vfs_failure_in_its_reason() {
-    let _swap = SwapTest::same_volume();
     let mut tool = writes_or_fails("nemesis");
     tool.uses_install_path = true;
     let f = swap_fixture(vec![tool]);
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
 
     let out = game_tools::run_after_vfs_refusal(
         &f.ctx,
@@ -2818,23 +2818,23 @@ fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
     out
 }
 
-/// The volume seam is process-wide, so every swap test takes this lock, sets the seam it needs, and
-/// clears it when it ends.
-static SWAP_SEAM: Mutex<()> = Mutex::new(());
-
-/// The two swap-path spawning-mark tests arm thread-local hooks but share process-wide user-data
-/// and seam settings; run them one at a time so neither observes the other's fixture.
+/// The two swap-path spawning-mark tests arm hooks and run real processes; run them one at a time
+/// so neither observes the other's fixture.
 static SWAP_SPAWN_MARK: Mutex<()> = Mutex::new(());
 
-struct SwapTest {
-    _lock: MutexGuard<'static, ()>,
-}
+/// The volume the swap tests pretend to be on. It is installed on the test's own context, so a
+/// parallel test's swap cannot see it and no lock is needed.
+struct SwapTest(VolumeSeam);
 
 impl SwapTest {
+    /// Arm the seam on the context the operation runs with.
+    fn arm(self, ctx: &CoreContext) -> Self {
+        ctx.test_seams.set_volume_seam(Some(self.0));
+        self
+    }
+
     fn with(seam: VolumeSeam) -> Self {
-        let lock = SWAP_SEAM.lock().unwrap_or_else(|e| e.into_inner());
-        swap::set_volume_seam(Some(seam));
-        Self { _lock: lock }
+        Self(seam)
     }
 
     /// The copy is kept on the install's volume: the normal case.
@@ -2851,12 +2851,6 @@ impl SwapTest {
             same_volume: Some(false),
             free_bytes: None,
         })
-    }
-}
-
-impl Drop for SwapTest {
-    fn drop(&mut self) {
-        swap::set_volume_seam(None);
     }
 }
 
@@ -3073,8 +3067,8 @@ fn crash_after(f: &Fixture, step: u8, kind: CopyKind, run: &str) -> SwapJournal 
 
 #[test]
 fn a_swap_run_promotes_its_writes_and_the_real_data_is_byte_for_byte_unchanged() {
-    let _swap = SwapTest::same_volume();
     let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let install = install_dir(&f);
     let before = snapshot(&real_data(&f));
     let planned = planned_files(&f).len();
@@ -3118,11 +3112,11 @@ fn a_swap_run_promotes_its_writes_and_the_real_data_is_byte_for_byte_unchanged()
 
 #[test]
 fn a_second_run_copies_only_what_changed() {
-    let _swap = SwapTest::same_volume();
     let f = swap_fixture(vec![
         writes_mesh("first", "x.nif"),
         writes_mesh("second", "y.nif"),
     ]);
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let planned = planned_files(&f).len();
 
     let first = f
@@ -3151,8 +3145,8 @@ fn a_second_run_copies_only_what_changed() {
 
 #[test]
 fn a_tool_that_opens_a_file_for_writing_and_changes_nothing_produces_no_output() {
-    let _swap = SwapTest::same_volume();
     let f = swap_fixture(vec![opens_for_writing_only("nemesis")]);
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let before = snapshot(&real_data(&f));
 
     let outcome = f
@@ -3169,8 +3163,8 @@ fn a_tool_that_opens_a_file_for_writing_and_changes_nothing_produces_no_output()
 
 #[test]
 fn a_discarded_run_leaves_the_kept_copy_matching_the_plan_again() {
-    let _swap = SwapTest::same_volume();
     let f = swap_fixture(vec![writes_then_fails("nemesis")]);
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let before = snapshot(&real_data(&f));
 
     let outcome = f
@@ -3190,8 +3184,8 @@ fn a_discarded_run_leaves_the_kept_copy_matching_the_plan_again() {
 
 #[test]
 fn on_another_volume_a_copy_is_made_for_the_run_and_deleted_after_it() {
-    let _swap = SwapTest::different_volume();
     let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let _swap = SwapTest::different_volume().arm(&f.ctx);
     let install = install_dir(&f);
     let before = snapshot(&real_data(&f));
     let planned = planned_files(&f).len();
@@ -3220,11 +3214,12 @@ fn on_another_volume_a_copy_is_made_for_the_run_and_deleted_after_it() {
 
 #[test]
 fn a_swap_is_refused_before_anything_moves_when_the_copy_volume_lacks_space() {
+    let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
     let _swap = SwapTest::with(VolumeSeam {
         same_volume: Some(true),
         free_bytes: Some(1),
-    });
-    let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    })
+    .arm(&f.ctx);
     let before = snapshot(&real_data(&f));
 
     let result = f.run_as("nemesis", &swap_launcher(&f), CaptureMode::Swap);
@@ -3244,7 +3239,7 @@ fn a_swap_is_refused_before_anything_moves_when_the_copy_volume_lacks_space() {
 #[test]
 fn a_swap_is_refused_while_a_program_runs_from_the_install() {
     let f = fixture(vec![writes_real_data("nemesis")]);
-    let _swap = SwapTest::same_volume();
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let install = install_dir(&f);
     std::fs::copy(r"C:\Windows\System32\cmd.exe", install.join("busy.exe")).unwrap();
     let mut busy = Command::new(install.join("busy.exe"))
@@ -3275,8 +3270,8 @@ fn a_swap_is_refused_while_a_program_runs_from_the_install() {
 
 #[test]
 fn a_swap_is_refused_when_the_real_data_is_already_a_link() {
-    let _swap = SwapTest::same_volume();
     let f = fixture(vec![writes_real_data("nemesis")]);
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let install = install_dir(&f);
     let kept = install.join("Data.kept");
     std::fs::rename(real_data(&f), &kept).unwrap();
@@ -3309,7 +3304,7 @@ fn a_taken_aside_name_is_refused_before_anything_moves() {
         bytes: 0,
     };
 
-    let result = swap::preflight(&install, &real_data(&f), &aside, &space);
+    let result = swap::preflight(&f.ctx.test_seams, &install, &real_data(&f), &aside, &space);
 
     match result {
         Err(SwapError::Refused(message)) => {
@@ -3362,8 +3357,8 @@ fn a_crash_on_another_volume_is_put_back_and_the_per_run_copy_is_deleted() {
 }
 
 fn crash_case(step: u8, kind: CopyKind) {
-    let _swap = SwapTest::same_volume();
     let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let install = install_dir(&f);
     let before = snapshot(&real_data(&f));
     crash_after(&f, step, kind, "crash");
@@ -3380,8 +3375,8 @@ fn crash_case(step: u8, kind: CopyKind) {
 }
 
 fn crash_case_on_other_volume(step: u8) {
-    let _swap = SwapTest::different_volume();
     let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let _swap = SwapTest::different_volume().arm(&f.ctx);
     let install = install_dir(&f);
     let before = snapshot(&real_data(&f));
     crash_after(&f, step, CopyKind::PerRun, "crashpr");
@@ -3398,8 +3393,8 @@ fn crash_case_on_other_volume(step: u8) {
 
 #[test]
 fn a_crashed_swap_is_put_back_by_a_run_before_it_starts() {
-    let _swap = SwapTest::same_volume();
     let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let before = snapshot(&real_data(&f));
     crash_after(&f, 6, CopyKind::Kept, "crash");
 
@@ -3414,8 +3409,8 @@ fn a_crashed_swap_is_put_back_by_a_run_before_it_starts() {
 
 #[test]
 fn a_journal_whose_copy_points_at_a_victim_folder_stops_recovery_and_touches_nothing() {
-    let _swap = SwapTest::same_volume();
     let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let victim = f._tmp.path().join("victim");
     std::fs::create_dir_all(&victim).unwrap();
     std::fs::write(victim.join("keep.txt"), b"keep").unwrap();
@@ -3440,8 +3435,8 @@ fn a_journal_whose_copy_points_at_a_victim_folder_stops_recovery_and_touches_not
 
 #[test]
 fn a_copy_without_a_matching_marker_stops_recovery_before_anything_moves() {
-    let _swap = SwapTest::same_volume();
     let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let journal = journal_of(&f, "stranger", CopyKind::Kept);
     swap::write_journal(&f.ctx, &journal).unwrap();
     std::fs::rename(real_data(&f), aside_named(&f, "stranger")).unwrap();
@@ -3502,8 +3497,8 @@ fn a_version_1_junction_journal_is_refused_by_name_and_nothing_is_changed() {
 
 #[test]
 fn remove_copy_refuses_a_folder_without_the_marker_and_removes_a_kept_copy() {
-    let _swap = SwapTest::same_volume();
     let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     std::fs::create_dir_all(kept_copy(&f)).unwrap();
     std::fs::write(kept_copy(&f).join("stranger.txt"), b"not ours").unwrap();
 
@@ -3531,8 +3526,8 @@ fn remove_copy_refuses_a_folder_without_the_marker_and_removes_a_kept_copy() {
 
 #[test]
 fn deleting_an_instance_removes_its_swap_folder() {
-    let _swap = SwapTest::same_volume();
     let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let outcome = f
         .run_as("nemesis", &swap_launcher(&f), CaptureMode::Swap)
         .unwrap();
@@ -3548,13 +3543,13 @@ fn deleting_an_instance_removes_its_swap_folder() {
 #[test]
 #[ignore = "runs the 32-bit cmd.exe from SysWOW64 on a fake install; run with --ignored"]
 fn real_a_32_bit_tool_run_by_swap_promotes_its_write() {
-    let _swap = SwapTest::same_volume();
     let f = fixture_with_exe(
         vec![writes_real_data("nemesis")],
         false,
         false,
         r"C:\Windows\SysWOW64\cmd.exe",
     );
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let install = install_dir(&f);
     let before = snapshot(&real_data(&f));
     let launcher = StagingLauncher::new().with_env("AGORA_REAL", install.to_str().unwrap());
@@ -3577,16 +3572,6 @@ fn a_recovery_with_nothing_pending_changes_nothing() {
     assert_eq!(snapshot(&real_data(&f)), before);
 }
 
-/// Clears the run hook when dropped, so a panicking test cannot leak it into the next one on
-/// this thread. (The hook only fires on the thread that set it, so parallel tests are safe.)
-struct RunHookGuard;
-
-impl Drop for RunHookGuard {
-    fn drop(&mut self) {
-        swap::clear_run_hook();
-    }
-}
-
 /// A recovery started while a swap run is live — after the engage and before the spawn, and
 /// again during the post-exit capture — cannot act on the run: the run holds the game/store
 /// user-files lock for the whole operation, and the startup pass takes that same lock with no
@@ -3594,9 +3579,8 @@ impl Drop for RunHookGuard {
 /// normally, with the real Data byte for byte unchanged.
 #[test]
 fn a_startup_recovery_during_a_live_swap_run_leaves_the_operation_alone() {
-    let _swap = SwapTest::same_volume();
-    let _hook_guard = RunHookGuard;
     let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let install = install_dir(&f);
     let before = snapshot(&real_data(&f));
     let journal_path = journal_file(&f);
@@ -3604,41 +3588,43 @@ fn a_startup_recovery_during_a_live_swap_run_leaves_the_operation_alone() {
     let seen: Arc<Mutex<Vec<swap::RunHookPoint>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_hook = Arc::clone(&seen);
     let journal_path_hook = journal_path.clone();
-    swap::set_run_hook(Some(Arc::new(move |ctx, journal, point| {
-        let Some(journal) = journal else { return };
-        // The one startup pass, run from inside the live operation the way another Agora
-        // process runs it. It must not touch the run's journal, aside or copy.
-        let report = agora_core::startup_recovery::run_at_startup(ctx);
-        assert!(
-            report.actions.is_empty(),
-            "recovery acted on a live run at {point:?}: {report:?}"
-        );
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|w| w.contains("left alone") && w.contains("lock")),
-            "the skip is reported at {point:?}: {report:?}"
-        );
-        assert!(
-            journal_path_hook.exists(),
-            "the journal was removed under the live run at {point:?}"
-        );
-        assert!(
-            journal.aside.is_dir(),
-            "the real Data was put back under the live run at {point:?}"
-        );
-        assert!(
-            game_tool_copy::marker_matches(
-                &journal.real_data,
-                &journal.instance_id,
-                journal.copy_kind,
-                &journal.run
-            ),
-            "the copy was moved or discarded under the live run at {point:?}"
-        );
-        seen_hook.lock().unwrap().push(point);
-    })));
+    f.ctx
+        .test_seams
+        .set_run_hook(Some(Arc::new(move |ctx, journal, point| {
+            let Some(journal) = journal else { return };
+            // The one startup pass, run from inside the live operation the way another Agora
+            // process runs it. It must not touch the run's journal, aside or copy.
+            let report = agora_core::startup_recovery::run_at_startup(ctx);
+            assert!(
+                report.actions.is_empty(),
+                "recovery acted on a live run at {point:?}: {report:?}"
+            );
+            assert!(
+                report
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("left alone") && w.contains("lock")),
+                "the skip is reported at {point:?}: {report:?}"
+            );
+            assert!(
+                journal_path_hook.exists(),
+                "the journal was removed under the live run at {point:?}"
+            );
+            assert!(
+                journal.aside.is_dir(),
+                "the real Data was put back under the live run at {point:?}"
+            );
+            assert!(
+                game_tool_copy::marker_matches(
+                    &journal.real_data,
+                    &journal.instance_id,
+                    journal.copy_kind,
+                    &journal.run
+                ),
+                "the copy was moved or discarded under the live run at {point:?}"
+            );
+            seen_hook.lock().unwrap().push(point);
+        })));
 
     let outcome = f
         .run_as("nemesis", &swap_launcher(&f), CaptureMode::Swap)
@@ -3682,9 +3668,8 @@ fn a_startup_recovery_during_a_live_swap_run_leaves_the_operation_alone() {
 /// install folder, where the install scan cannot see it.
 #[test]
 fn a_swap_journal_from_the_spawn_window_needs_a_hand_not_an_automatic_restore() {
-    let _swap = SwapTest::same_volume();
-    let _hook_guard = RunHookGuard;
     let f = swap_fixture(Vec::new());
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     // An external tool: its exe lives outside the install, so the install-folder scan misses it.
     let outside = TempDir::new().unwrap();
     let external_exe = outside.path().join("ExternalTool.exe");
@@ -3701,25 +3686,27 @@ fn a_swap_journal_from_the_spawn_window_needs_a_hand_not_an_automatic_restore() 
     let saved = Arc::new(Mutex::new(None::<String>));
     let saved_hook = Arc::clone(&saved);
     let journal_hook = journal_file(&f);
-    swap::set_run_hook(Some(Arc::new(move |_ctx, _journal, point| {
-        if point != swap::RunHookPoint::AfterSpawnBeforeRecord {
-            return;
-        }
-        // The journal exactly as the production writer left it in the spawn window.
-        let text = std::fs::read_to_string(&journal_hook).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(
-            value["spawning"],
-            serde_json::json!(true),
-            "the writer must durably record the spawning state before the spawn: {text}"
-        );
-        assert_eq!(
-            value["processes"],
-            serde_json::json!([]),
-            "the process is not recorded yet in this window: {text}"
-        );
-        *saved_hook.lock().unwrap() = Some(text);
-    })));
+    f.ctx
+        .test_seams
+        .set_run_hook(Some(Arc::new(move |_ctx, _journal, point| {
+            if point != swap::RunHookPoint::AfterSpawnBeforeRecord {
+                return;
+            }
+            // The journal exactly as the production writer left it in the spawn window.
+            let text = std::fs::read_to_string(&journal_hook).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                value["spawning"],
+                serde_json::json!(true),
+                "the writer must durably record the spawning state before the spawn: {text}"
+            );
+            assert_eq!(
+                value["processes"],
+                serde_json::json!([]),
+                "the process is not recorded yet in this window: {text}"
+            );
+            *saved_hook.lock().unwrap() = Some(text);
+        })));
 
     let outcome = game_tools::run_user_tool(
         &f.ctx,
@@ -3795,7 +3782,6 @@ fn a_swap_journal_from_the_spawn_window_needs_a_hand_not_an_automatic_restore() 
 #[test]
 fn a_startup_recovery_during_a_links_run_post_exit_capture_leaves_the_session_alone() {
     let _user_data = UserData::new();
-    let _hook_guard = RunHookGuard;
     let f = fixture_with(vec![writes_or_fails("nemesis")], true, false);
     let user_root = std::env::var("AGORA_TEST_USER_DATA_ROOT").unwrap();
     let real = Path::new(&user_root)
@@ -3813,35 +3799,37 @@ fn a_startup_recovery_during_a_links_run_post_exit_capture_leaves_the_session_al
     let fired_hook = Arc::clone(&fired);
     let journal_hook = journal_path.clone();
     let real_hook = real.clone();
-    swap::set_run_hook(Some(Arc::new(move |ctx, _journal, point| {
-        if point != swap::RunHookPoint::LinksPostExitCapture {
-            return;
-        }
-        // The one startup pass, run from inside the live links run the way another Agora
-        // process runs it: it must leave the session completely alone and report the skip.
-        let report = agora_core::startup_recovery::run_at_startup(ctx);
-        assert!(
-            report.actions.is_empty(),
-            "recovery acted during the links run's post-exit capture: {report:?}"
-        );
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|w| w.contains("left alone") && w.contains("lock")),
-            "the skip is reported: {report:?}"
-        );
-        assert!(
-            journal_hook.exists(),
-            "the session journal was removed under the live run"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&real_hook).unwrap(),
-            "Instance copy\n",
-            "the user files were restored under the live run"
-        );
-        *fired_hook.lock().unwrap() = true;
-    })));
+    f.ctx
+        .test_seams
+        .set_run_hook(Some(Arc::new(move |ctx, _journal, point| {
+            if point != swap::RunHookPoint::LinksPostExitCapture {
+                return;
+            }
+            // The one startup pass, run from inside the live links run the way another Agora
+            // process runs it: it must leave the session completely alone and report the skip.
+            let report = agora_core::startup_recovery::run_at_startup(ctx);
+            assert!(
+                report.actions.is_empty(),
+                "recovery acted during the links run's post-exit capture: {report:?}"
+            );
+            assert!(
+                report
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("left alone") && w.contains("lock")),
+                "the skip is reported: {report:?}"
+            );
+            assert!(
+                journal_hook.exists(),
+                "the session journal was removed under the live run"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&real_hook).unwrap(),
+                "Instance copy\n",
+                "the user files were restored under the live run"
+            );
+            *fired_hook.lock().unwrap() = true;
+        })));
 
     let outcome = f
         .run_as("nemesis", &StagingLauncher::new(), CaptureMode::Links)
@@ -4389,7 +4377,6 @@ fn under_swap_a_tool_overwrites_a_file_in_its_own_mod_and_the_mod_and_real_data_
 
     // Under a swap every file is a copy, so the tool's own mod is copied with the rest and no layer is
     // copied separately (MASTER_SPEC §26.9, decision 9).
-    let _swap = SwapTest::same_volume();
     let out = f
         .run_as("owner", &StagingLauncher::new(), CaptureMode::Swap)
         .unwrap();
@@ -4419,6 +4406,7 @@ fn a_tool_that_overwrites_a_file_in_another_mod_is_still_refused_under_links() {
         ),
         "Data/Tool/Tool.exe",
     )]);
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     f.add_mod("Owner mod", &[("Data/Tool/Tool.exe", cmd.as_slice())]);
     let other = f.add_mod("Other mod", &[("Data/Other/x.txt", b"keep")]);
     let before = f.content_bytes(&other, "Data/Other/x.txt");
@@ -7495,8 +7483,8 @@ fn ask_mode_never_runs_unasked() {
 
 #[test]
 fn recovery_waits_for_an_external_tool_the_swap_recorded() {
-    let _swap = SwapTest::same_volume();
     let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let mut busy = Command::new(r"C:\Windows\System32\cmd.exe")
         .args(["/c", "ping", "-n", "60", "127.0.0.1"])
         .stdout(Stdio::null())
@@ -7528,15 +7516,6 @@ fn recovery_waits_for_an_external_tool_the_swap_recorded() {
     assert!(journal_file(&f).exists());
 }
 
-/// Clears the write-fault hook on drop, but only the one this thread installed.
-struct WriteFaultGuard;
-
-impl Drop for WriteFaultGuard {
-    fn drop(&mut self) {
-        swap::clear_write_fault_hook();
-    }
-}
-
 /// A launcher that counts how many times a process was actually started, so a test can prove a
 /// tool was never spawned.
 struct CountingLauncher {
@@ -7563,20 +7542,27 @@ impl Launcher for CountingLauncher {
 }
 
 /// Arm a one-shot write fault on one journal path from the run hook, at the moment the
-/// production writer is about to persist the "spawning" mark: the fault hook fires only on this
-/// thread, and only for the first write to that path (the spawning mark), so the undo that
-/// follows can persist its own journal updates.
-fn arm_fault_at_spawning_mark(fault_path: PathBuf, fired: Arc<Mutex<Vec<swap::RunHookPoint>>>) {
-    swap::set_run_hook(Some(Arc::new(move |_ctx, _journal, point| {
-        fired.lock().unwrap().push(point);
-        if point == swap::RunHookPoint::BeforeSpawningMark {
-            let fault_path = fault_path.clone();
-            let once = Arc::new(std::sync::atomic::AtomicBool::new(true));
-            swap::set_write_fault_hook(Some(Arc::new(move |p| {
-                *p == fault_path && once.swap(false, std::sync::atomic::Ordering::SeqCst)
-            })));
-        }
-    })));
+/// production writer is about to persist the "spawning" mark: the fault hook fires only for the
+/// first write to that path (the spawning mark), so the undo that follows can persist its own
+/// journal updates. Both hooks are installed on the context the run carries, so no other test
+/// sees them.
+fn arm_fault_at_spawning_mark(
+    ctx: &CoreContext,
+    fault_path: PathBuf,
+    fired: Arc<Mutex<Vec<swap::RunHookPoint>>>,
+) {
+    ctx.test_seams
+        .set_run_hook(Some(Arc::new(move |ctx, _journal, point| {
+            fired.lock().unwrap().push(point);
+            if point == swap::RunHookPoint::BeforeSpawningMark {
+                let fault_path = fault_path.clone();
+                let once = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                ctx.test_seams
+                    .set_write_fault_hook(Some(Arc::new(move |p: &Path| {
+                        *p == fault_path && once.swap(false, std::sync::atomic::Ordering::SeqCst)
+                    })));
+            }
+        })));
 }
 
 /// The spawning mark is persisted durably before every spawn. When that persist FAILS on the
@@ -7585,10 +7571,8 @@ fn arm_fault_at_spawning_mark(fault_path: PathBuf, fired: Arc<Mutex<Vec<swap::Ru
 #[test]
 fn a_failed_spawning_mark_on_the_swap_path_does_not_launch_the_tool() {
     let _mark_lock = SWAP_SPAWN_MARK.lock().unwrap_or_else(|e| e.into_inner());
-    let _swap = SwapTest::same_volume();
-    let _hook_guard = RunHookGuard;
-    let _fault_guard = WriteFaultGuard;
     let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let _swap = SwapTest::same_volume().arm(&f.ctx);
     let install = install_dir(&f);
     let before = snapshot(&real_data(&f));
     let journal_path = journal_file(&f);
@@ -7599,7 +7583,7 @@ fn a_failed_spawning_mark_on_the_swap_path_does_not_launch_the_tool() {
         spawns: Arc::clone(&spawns),
     };
     let fired = Arc::new(Mutex::new(Vec::new()));
-    arm_fault_at_spawning_mark(journal_path.clone(), Arc::clone(&fired));
+    arm_fault_at_spawning_mark(&f.ctx, journal_path.clone(), Arc::clone(&fired));
 
     let outcome = f.run_as("nemesis", &launcher, CaptureMode::Swap);
 
@@ -7644,9 +7628,6 @@ fn a_failed_spawning_mark_on_the_swap_path_does_not_launch_the_tool() {
 fn a_failed_user_files_spawning_mark_on_the_swap_path_does_not_launch_the_tool() {
     let _mark_lock = SWAP_SPAWN_MARK.lock().unwrap_or_else(|e| e.into_inner());
     let _user_data = UserData::new();
-    let _swap = SwapTest::same_volume();
-    let _hook_guard = RunHookGuard;
-    let _fault_guard = WriteFaultGuard;
     let f = fixture_with(vec![writes_and_deletes("nemesis")], true, false);
     let user_root = std::env::var("AGORA_TEST_USER_DATA_ROOT").unwrap();
     let real = Path::new(&user_root)
@@ -7668,7 +7649,7 @@ fn a_failed_user_files_spawning_mark_on_the_swap_path_does_not_launch_the_tool()
     };
     let fired = Arc::new(Mutex::new(Vec::new()));
     // The first mark (swap journal) succeeds; the second (user-files journal) fails.
-    arm_fault_at_spawning_mark(user_journal.clone(), Arc::clone(&fired));
+    arm_fault_at_spawning_mark(&f.ctx, user_journal.clone(), Arc::clone(&fired));
 
     let outcome = f.run_as("nemesis", &launcher, CaptureMode::Swap);
 
@@ -7715,8 +7696,6 @@ fn a_failed_user_files_spawning_mark_on_the_swap_path_does_not_launch_the_tool()
 fn a_failed_spawning_mark_on_the_links_path_does_not_launch_the_tool() {
     let _mark_lock = SWAP_SPAWN_MARK.lock().unwrap_or_else(|e| e.into_inner());
     let _user_data = UserData::new();
-    let _hook_guard = RunHookGuard;
-    let _fault_guard = WriteFaultGuard;
     let f = fixture_with(vec![writes_or_fails("nemesis")], true, false);
     let user_root = std::env::var("AGORA_TEST_USER_DATA_ROOT").unwrap();
     let real = Path::new(&user_root)
@@ -7736,7 +7715,7 @@ fn a_failed_spawning_mark_on_the_links_path_does_not_launch_the_tool() {
         spawns: Arc::clone(&spawns),
     };
     let fired = Arc::new(Mutex::new(Vec::new()));
-    arm_fault_at_spawning_mark(journal_path.clone(), Arc::clone(&fired));
+    arm_fault_at_spawning_mark(&f.ctx, journal_path.clone(), Arc::clone(&fired));
 
     let outcome = f.run_as("nemesis", &launcher, CaptureMode::Links);
 
@@ -7774,8 +7753,6 @@ fn a_failed_spawning_mark_on_the_links_path_does_not_launch_the_tool() {
 fn a_failed_spawning_mark_on_the_vfs_path_does_not_launch_the_tool() {
     let _mark_lock = SWAP_SPAWN_MARK.lock().unwrap_or_else(|e| e.into_inner());
     let _user_data = UserData::new();
-    let _hook_guard = RunHookGuard;
-    let _fault_guard = WriteFaultGuard;
     let f = fixture_with(vec![writes_or_fails("nemesis")], true, false);
     let user_root = std::env::var("AGORA_TEST_USER_DATA_ROOT").unwrap();
     let real = Path::new(&user_root)
@@ -7796,7 +7773,7 @@ fn a_failed_spawning_mark_on_the_vfs_path_does_not_launch_the_tool() {
         spawns: Arc::clone(&spawns),
     };
     let fired = Arc::new(Mutex::new(Vec::new()));
-    arm_fault_at_spawning_mark(journal_path.clone(), Arc::clone(&fired));
+    arm_fault_at_spawning_mark(&f.ctx, journal_path.clone(), Arc::clone(&fired));
 
     let outcome = f.run_as("nemesis", &launcher, CaptureMode::Vfs);
 
