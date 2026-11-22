@@ -1204,6 +1204,109 @@ fn a_rebuild_refuses_while_instance_locations_are_locked() {
     assert!(root.join(&base_id).join(".agora-base.json").is_file());
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn base_removal_cannot_remove_a_base_an_instance_create_is_choosing() {
+    use std::sync::mpsc;
+
+    use agora_core::ctx::CoreContext;
+    use agora_core::game_instance;
+    use rusqlite::OptionalExtension;
+
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("17"));
+    // Build the base first, so the create below chooses an existing base. Nothing
+    // pins it yet, so a removal that gets to decide in between would delete it.
+    let outcome = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+    let base_dir = paths.bases_dir().join(&base_id);
+    assert!(base_dir.join(".agora-base.json").is_file());
+
+    let ctx = CoreContext::for_testing(tmp.path().join("data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+
+    game_instance::set_create_pause_before_publishing_pin(Some(&base_id));
+    let create_ctx = ctx.clone();
+    let create_install = install.clone();
+    let create_definition = test_definition();
+    let create = std::thread::spawn(move || {
+        game_instance::create(
+            &create_ctx,
+            &create_install,
+            &create_definition,
+            "Chosen",
+            Some("chosen-instance".into()),
+            BaseMode::Linked,
+            &|_| {},
+        )
+    });
+    let mut reached = false;
+    for _ in 0..600 {
+        if game_instance::create_pause_before_publishing_pin_reached() {
+            reached = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(reached, "the create never chose its base");
+
+    // A removal gets to decide while the create's pin is still unpublished.
+    let removal_paths = ctx.paths.clone();
+    let removal_base = base_id.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let removal = std::thread::spawn(move || {
+        let result = remove_base(&removal_paths, &removal_base);
+        let _ = done_tx.send(());
+        result
+    });
+    // If nothing keeps the base, the removal finishes on its own (the bug). Under
+    // the fix it parks on the base's lock, held until the create publishes its pin.
+    for _ in 0..300 {
+        if done_rx.try_recv().is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    game_instance::set_create_pause_before_publishing_pin(None);
+    let created = create.join().unwrap().expect("the create completes");
+
+    assert!(
+        base_dir.join(".agora-base.json").is_file(),
+        "a base the new instance pins was removed from under it"
+    );
+    assert!(paths.base_manifest_path(&base_id).is_file());
+    let removal_outcome = removal.join().unwrap();
+    assert!(
+        matches!(&removal_outcome, Err(BaseError::InUse { instances }) if instances == &vec!["chosen-instance".to_string()]),
+        "the removal must find the pin once it can decide: {removal_outcome:?}"
+    );
+    assert!(
+        matches!(&created.base, agora_game_api::BaseReference::Pinned { ref id, .. } if id == &base_id),
+        "the created instance pins the base it chose: {:?}",
+        created.base
+    );
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let present: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM game_instances WHERE instance_id = 'chosen-instance'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .expect("row read failed");
+    assert_eq!(present, Some(1), "the created instance's row is published");
+}
+
 #[test]
 fn base_id_parts_never_start_or_end_with_a_dot() {
     for odd in ["1.", ".1", ".", "..", "...", "a..b."] {
