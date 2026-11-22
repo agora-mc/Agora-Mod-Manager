@@ -2667,14 +2667,62 @@ fn missing_artifact<T>(kind: &str, path: &Path) -> LauncherResult<T> {
     })
 }
 
+/// The digest a library publishes for its artifact, from either place it can
+/// publish one.
+///
+/// A generated profile may put the digest on the library entry (Fabric's do) or
+/// on `downloads.artifact`; one that uses both must not lose either, because
+/// the downloader treats a library with no digest as an unhashed download and
+/// `--allow-unverified-loader` would install bytes the profile contradicts.
+/// Two *different* digests of the same algorithm cannot both describe the file,
+/// so they are reported rather than resolved by picking one.
+fn merge_published_digest(
+    library_name: &str,
+    algorithm: &str,
+    artifact: Option<&str>,
+    library: Option<&str>,
+) -> LauncherResult<Option<String>> {
+    let non_blank = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_lowercase)
+    };
+    let from_artifact = non_blank(artifact);
+    let from_library = non_blank(library);
+    match (from_artifact, from_library) {
+        (Some(artifact), Some(library)) if artifact != library => Err(LauncherError::Generic {
+            code: "ERR_LOADER_PROFILE_STRUCTURE".into(),
+            message: format!(
+                "Library {library_name} publishes two different {algorithm} digests: \
+                 'downloads.artifact' says {artifact}, the library entry says {library}"
+            ),
+        }),
+        (Some(digest), _) | (None, Some(digest)) => Ok(Some(digest)),
+        (None, None) => Ok(None),
+    }
+}
+
 pub(crate) fn resolve_library_artifact(
     library: &launch::Library,
 ) -> LauncherResult<Option<launch::LibraryArtifact>> {
-    if let Some(artifact) = library
+    if let Some(mut artifact) = library
         .downloads
         .as_ref()
         .and_then(|downloads| downloads.artifact.clone())
     {
+        artifact.sha1 = merge_published_digest(
+            &library.name,
+            "SHA-1",
+            artifact.sha1.as_deref(),
+            library.sha1.as_deref(),
+        )?;
+        artifact.sha256 = merge_published_digest(
+            &library.name,
+            "SHA-256",
+            artifact.sha256.as_deref(),
+            library.sha256.as_deref(),
+        )?;
         return Ok(Some(artifact));
     }
     let Some(repository) = library.url.as_deref() else {
@@ -6365,6 +6413,62 @@ mod tests {
         assert_eq!(
             artifact.sha256.as_deref(),
             Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+    }
+
+    #[test]
+    fn resolve_library_artifact_keeps_a_digest_from_each_place() {
+        let lib = launch::Library {
+            name: "org.ow2.asm:asm:9.10.1".into(),
+            sha1: Some("cccccccccccccccccccccccccccccccccccccccc".into()),
+            sha256: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            downloads: Some(launch::LibraryDownloads {
+                artifact: Some(launch::LibraryArtifact {
+                    path: "org/ow2/asm/asm/9.10.1/asm-9.10.1.jar".into(),
+                    url: "https://maven.fabricmc.net/org/ow2/asm/asm/9.10.1/asm-9.10.1.jar".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let artifact = resolve_library_artifact(&lib).unwrap().unwrap();
+        assert_eq!(
+            artifact.sha1.as_deref(),
+            Some("cccccccccccccccccccccccccccccccccccccccc"),
+            "the library entry's SHA-1 survives an artifact that publishes none"
+        );
+        assert_eq!(
+            artifact.sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "and so does its SHA-256"
+        );
+    }
+
+    #[test]
+    fn resolve_library_artifact_refuses_two_different_digests_of_one_algorithm() {
+        let lib = launch::Library {
+            name: "org.ow2.asm:asm:9.10.1".into(),
+            sha256: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            downloads: Some(launch::LibraryDownloads {
+                artifact: Some(launch::LibraryArtifact {
+                    path: "org/ow2/asm/asm/9.10.1/asm-9.10.1.jar".into(),
+                    url: "https://maven.fabricmc.net/org/ow2/asm/asm/9.10.1/asm-9.10.1.jar".into(),
+                    sha256: Some(
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = resolve_library_artifact(&lib)
+            .expect_err("two published SHA-256s that disagree cannot both describe the file");
+        let text = error.to_string();
+        assert!(
+            text.contains("org.ow2.asm:asm:9.10.1") && text.contains("SHA-256"),
+            "the refusal names the library and the algorithm: {text}"
         );
     }
 

@@ -374,6 +374,64 @@ async fn refuses_bytes_that_contradict_the_sha256_the_profile_publishes() {
     }
 }
 
+/// A library may publish its digests in either place: on the library entry
+/// (Fabric's profile does) or on `downloads.artifact`. A profile that uses
+/// both must not lose the one that is not on the artifact — reading only the
+/// nested copy treats the library as unhashed and installs bytes the profile
+/// contradicts once the override is given.
+#[tokio::test]
+async fn a_library_with_digests_in_both_places_keeps_all_of_them() {
+    let mut profile = fabric_263_profile();
+    let coordinate = "org.ow2.asm:asm:9.10.1";
+    let path = "org/ow2/asm/asm/9.10.1/asm-9.10.1.jar";
+    let published = profile["libraries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|library| library["name"] == coordinate)
+        .and_then(|library| library["sha256"].as_str())
+        .unwrap_or_else(|| panic!("the captured profile publishes {coordinate}'s SHA-256"))
+        .to_string();
+    // Every other library publishes nothing, so the mixed one is the only
+    // library this install can refuse on.
+    without_library_digests(&mut profile);
+    let library = profile["libraries"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|library| library["name"] == coordinate)
+        .unwrap_or_else(|| panic!("the captured profile lists {coordinate}"));
+    library["sha256"] = json!(published);
+    // The same library, now also naming its artifact without digests there.
+    library["downloads"] = json!({
+        "artifact": {
+            "path": path,
+            "url": format!("https://maven.fabricmc.net/{path}")
+        }
+    });
+
+    let error = create_for(
+        "26.3",
+        "fabric",
+        "0.20.1",
+        serde_json::to_vec(&profile).unwrap(),
+        MavenReply::Missing,
+        true,
+        PinKind::Curated,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.code(),
+        "ERR_HASH_MISMATCH",
+        "the library entry's digest still describes the download: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("SHA-256") && error.to_string().contains("asm-9.10.1.jar"),
+        "the refusal names the digest kind and the jar: {error}"
+    );
+}
+
 #[tokio::test]
 async fn refuses_invalid_fabric_structure() {
     let mut host = fabric_profile();
