@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use agora_core::ctx::CoreContext;
 use agora_core::game_base::BaseMode;
-use agora_core::game_deploy::{add_content, DeployMode, PLAN_CALLS};
+use agora_core::game_deploy::{add_content, DeployMode};
 use agora_core::game_discovery::{DiscoveredInstall, DiscoveryReport, InstallCapabilities};
 use agora_core::game_instance::{create, prepare_launch_with, GameInstanceRecord, LaunchOptions};
 use agora_core::game_launch::{LaunchError, LaunchedGame, Launcher, PreparedLaunch};
@@ -248,7 +248,7 @@ fn plans_per_preparation(plugin_list: u8, links: bool, vfs: bool) -> (usize, usi
     };
     let mut counts = Vec::new();
     for _ in 0..2 {
-        let before = PLAN_CALLS.load(Ordering::Relaxed);
+        let before = ctx.test_seams.plan_calls();
         prepare_launch_with(
             &ctx,
             &inst.instance_id,
@@ -258,7 +258,7 @@ fn plans_per_preparation(plugin_list: u8, links: bool, vfs: bool) -> (usize, usi
             &launcher,
         )
         .expect("prepare launch");
-        counts.push(PLAN_CALLS.load(Ordering::Relaxed) - before);
+        counts.push(ctx.test_seams.plan_calls() - before);
     }
     (counts[0], counts[1])
 }

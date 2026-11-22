@@ -494,11 +494,6 @@ pub(crate) fn plan_would_be(
     )
 }
 
-/// How many times the planner has run in this process. A measurement hook for the benchmark and the
-/// launch test that count the plans one launch makes; the product never reads it.
-#[doc(hidden)]
-pub static PLAN_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 fn plan_inner(
     ctx: &Ctx,
     instance_id: &str,
@@ -508,7 +503,9 @@ fn plan_inner(
     would_be: Option<WouldBe<'_>>,
     render_views: bool,
 ) -> Result<DeploymentPlan, DeployError> {
-    PLAN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // A measurement for the benchmark and the launch tests, which count the plans one operation
+    // makes; the product never reads it. It belongs to the context, so a test counts its own.
+    ctx.test_seams.note_plan_call();
     let manifest = match &would_be {
         Some(w) => w.manifest.clone(),
         None => crate::game_instance::get_manifest(ctx, instance_id).map_err(|e| match e {
@@ -2883,43 +2880,20 @@ fn path_key(path: &str) -> String {
     fold_path_case(path)
 }
 
-thread_local! {
-    /// The test seam: how many more farm changes an in-place update on this thread may make before
-    /// it stops. `None` (the default) is no stop.
-    static UPDATE_FAULT_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-    /// Set when the seam stopped an update, so the update leaves its marker as a crash would.
-    static SIMULATED_STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Test seam for crash safety: the next in-place update on this thread stops once it has made
-/// `changes` changes to the farm, and leaves its marker behind, as a process stop would. `None`
-/// turns the seam off.
-#[doc(hidden)]
-pub fn set_update_fault_after(changes: Option<usize>) {
-    UPDATE_FAULT_AFTER.with(|cell| cell.set(changes));
-}
-
-/// Stop the in-place update here if the seam asks for it.
-fn update_fault_point() -> Result<(), DeployError> {
-    UPDATE_FAULT_AFTER.with(|cell| match cell.get() {
-        Some(0) => {
-            cell.set(None);
-            SIMULATED_STOP.with(|stopped| stopped.set(true));
-            Err(DeployError::Other(
-                "injected stop during an in-place update".into(),
-            ))
-        }
-        Some(left) => {
-            cell.set(Some(left - 1));
-            Ok(())
-        }
-        None => Ok(()),
-    })
+/// Stop the in-place update here if the context's test seam asks for it. The seam belongs to the
+/// context, so it reaches the update wherever the operation runs.
+fn update_fault_point(ctx: &Ctx) -> Result<(), DeployError> {
+    if ctx.test_seams.in_place_fault_point() {
+        return Err(DeployError::Other(
+            "injected stop during an in-place update".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Whether the seam stopped the update that just failed. Clears the flag.
-fn take_simulated_stop() -> bool {
-    SIMULATED_STOP.with(|stopped| stopped.replace(false))
+fn take_simulated_stop(ctx: &Ctx) -> bool {
+    ctx.test_seams.take_in_place_stop()
 }
 
 /// The changes an in-place update makes to a farm: the recorded files it keeps (by path key), the
@@ -3152,7 +3126,7 @@ fn apply_in_place(
     match apply_marked(ctx, deployment_dir, update) {
         Ok(applied) => Ok(applied),
         Err(err) => {
-            if !take_simulated_stop() {
+            if !take_simulated_stop(ctx) {
                 // Best effort: if this fails the marker is still there, and the next deploy discards it.
                 let _ = discard_untrusted_farm(deployment_dir);
             }
@@ -3183,10 +3157,10 @@ fn apply_marked(
     } = update;
 
     for rel in &remove {
-        update_fault_point()?;
+        update_fault_point(ctx)?;
         remove_farm_file(&game_dir, rel)?;
     }
-    update_fault_point()?;
+    update_fault_point(ctx)?;
     let placed = place_files(ctx, &place, &game_dir)?;
     remove_emptied_folders(&game_dir, &remove);
 

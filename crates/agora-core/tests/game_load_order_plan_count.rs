@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use agora_core::ctx::CoreContext;
 use agora_core::game_base::BaseMode;
-use agora_core::game_deploy::{add_content, PLAN_CALLS};
+use agora_core::game_deploy::add_content;
 use agora_core::game_discovery::{DiscoveredInstall, InstallCapabilities};
 use agora_core::game_instance::{create, GameInstanceRecord};
 use agora_core::game_load_order::{self as load_order, MoveTarget};
@@ -126,10 +126,10 @@ fn definition() -> GameDefinition {
     def
 }
 
-fn plans<T>(work: impl FnOnce() -> T) -> (T, usize) {
-    let before = PLAN_CALLS.load(Ordering::Relaxed);
+fn plans<T>(ctx: &CoreContext, work: impl FnOnce() -> T) -> (T, usize) {
+    let before = ctx.test_seams.plan_calls();
     let out = work();
-    (out, PLAN_CALLS.load(Ordering::Relaxed) - before)
+    (out, ctx.test_seams.plan_calls() - before)
 }
 
 #[test]
@@ -244,24 +244,24 @@ A1.esp
     };
 
     // The list view and its findings come from one order, so one plan.
-    let (order, n) = plans(|| load_order::order(&ctx, id, &def).unwrap());
+    let (order, n) = plans(&ctx, || load_order::order(&ctx, id, &def).unwrap());
     assert_eq!(n, 1, "list");
     assert!(!order.entries.is_empty());
     let findings = order.findings.clone();
     // The check alone is one plan too; a caller that wants both reads the findings off the order.
-    let (checked, n) = plans(|| load_order::check(&ctx, id, &def).unwrap());
+    let (checked, n) = plans(&ctx, || load_order::check(&ctx, id, &def).unwrap());
     assert_eq!(n, 1, "check on its own");
     assert_eq!(checked, findings);
 
     // A move and the order it returns share one plan (two before they were joined).
-    let ((report, after), n) = plans(|| {
+    let ((report, after), n) = plans(&ctx, || {
         load_order::move_plugin_and_order(&ctx, id, &def, "A1.esp", &MoveTarget::Position(1))
             .unwrap()
     });
     assert_eq!(n, 1, "move and order");
     assert!(report.written);
     assert_eq!(names(&after)[0], "A1.esp");
-    let (_, separate) = plans(|| {
+    let (_, separate) = plans(&ctx, || {
         load_order::move_plugin(&ctx, id, &def, "A1.esp", &MoveTarget::Position(2)).unwrap();
         load_order::order(&ctx, id, &def).unwrap()
     });
@@ -276,7 +276,9 @@ A1.esp
     assert_eq!(joined.findings, reread.findings);
 
     // A sort and the order it returns share one plan.
-    let ((sorted, _), n) = plans(|| load_order::sort_and_order(&ctx, id, &def, true).unwrap());
+    let ((sorted, _), n) = plans(&ctx, || {
+        load_order::sort_and_order(&ctx, id, &def, true).unwrap()
+    });
     assert_eq!(n, 1, "sort and order");
     assert!(!sorted.written, "a dry run writes nothing");
 }
