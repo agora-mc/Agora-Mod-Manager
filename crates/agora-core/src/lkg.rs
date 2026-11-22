@@ -584,9 +584,39 @@ pub fn run_retention(instance_dir: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     const TRACKED: &[&str] = &["mods", "config", "saves", "instance_manifest.json"];
+
+    /// An instance directory in the real layout, `<temp>/instances/<id>`, kept alive by the
+    /// temp dir it lives in.
+    ///
+    /// A bare `TempDir` must not be passed where an instance directory is expected:
+    /// `snapshot_app_root` walks from the instance directory to its parent, so a bare temp
+    /// folder resolves the app root — and with it the `locks/instance-locations.lock` and the
+    /// shared `snapshot-objects` store — to the *system* temp folder, which every test worker
+    /// shares. Under load, one worker's retention round then blocks another's past its short
+    /// wait, and the round reads as skipped. Through `path()` the tests keep addressing the
+    /// same directory they always did.
+    struct TempInstance {
+        _temp: TempDir,
+        dir: PathBuf,
+    }
+
+    fn temp_instance() -> TempInstance {
+        let root = TempDir::new().unwrap();
+        let dir = root.path().join("instances").join("lkg-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        TempInstance { _temp: root, dir }
+    }
+
+    impl TempInstance {
+        /// The instance directory, in the layout `snapshot_app_root` expects.
+        fn path(&self) -> &Path {
+            &self.dir
+        }
+    }
 
     fn create_test_snapshot(instance_dir: &Path, label: &str) -> String {
         std::fs::write(instance_dir.join("instance_manifest.json"), b"{}\n").unwrap();
@@ -690,7 +720,7 @@ mod tests {
 
     #[test]
     fn test_success_records_exact_snapshot_as_lkg() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_instance();
         let snapshot_id = create_test_snapshot(tmp.path(), "known-good");
         let state = record_launch_outcome(
             tmp.path(),
@@ -713,7 +743,7 @@ mod tests {
 
     #[test]
     fn test_failed_launch_does_not_replace_current_lkg() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_instance();
         let known_good = create_test_snapshot(tmp.path(), "known-good");
         record_launch_outcome(
             tmp.path(),
@@ -738,7 +768,7 @@ mod tests {
 
     #[test]
     fn test_cancelled_launch_preserves_current_lkg() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_instance();
         let known_good = create_test_snapshot(tmp.path(), "known-good");
         record_launch_outcome(
             tmp.path(),
@@ -763,13 +793,13 @@ mod tests {
 
     #[test]
     fn test_read_missing_lkg_state_returns_default() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_instance();
         assert_eq!(read_lkg_state(tmp.path()).unwrap(), LkgState::default());
     }
 
     #[test]
     fn test_success_without_snapshot_fails_closed() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_instance();
         let error = record_launch_outcome(tmp.path(), None, "launch-1", LaunchOutcome::Success)
             .unwrap_err();
         assert!(error.contains("snapshot id"));
@@ -778,7 +808,7 @@ mod tests {
 
     #[test]
     fn test_success_with_missing_snapshot_fails_closed() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_instance();
         let error = record_launch_outcome(
             tmp.path(),
             Some("missing"),
@@ -1019,7 +1049,7 @@ mod tests {
 
     #[test]
     fn manual_snapshot_survives_later_automatic_snapshots() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         let manual = create_test_snapshot_as(
             dir,
@@ -1038,7 +1068,7 @@ mod tests {
 
     #[test]
     fn migration_snapshot_survives_a_manual_snapshot() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         let migration = create_test_snapshot_as(
             dir,
@@ -1060,7 +1090,7 @@ mod tests {
 
     #[test]
     fn automatic_snapshots_keep_the_last_five() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         let mut created = Vec::new();
         for i in 0..8 {
@@ -1076,7 +1106,7 @@ mod tests {
 
     #[test]
     fn automatic_retention_with_zero_or_one_snapshot_deletes_nothing() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         run_retention(dir).unwrap();
         assert!(remaining_ids(dir).is_empty());
@@ -1087,7 +1117,7 @@ mod tests {
 
     #[test]
     fn a_recovery_pointer_that_cannot_be_read_stops_the_retention_round() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         // The oldest snapshot is promoted to the recovery pointer; with an empty
         // pointer it counts as an ordinary automatic one and is evicted past the
@@ -1122,7 +1152,7 @@ mod tests {
 
     #[test]
     fn fifteen_manual_snapshots_are_all_kept_by_retention() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         let manual: Vec<String> = (0..15)
             .map(|i| {
@@ -1143,7 +1173,7 @@ mod tests {
 
     #[test]
     fn manual_snapshots_never_count_toward_the_automatic_five() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         let manual = create_test_snapshot_as(dir, "mine", crate::snapshot::SnapshotOrigin::User);
         for i in 0..7 {
@@ -1157,7 +1187,7 @@ mod tests {
 
     #[test]
     fn loadout_undo_points_do_not_evict_install_restore_points() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         let installs: Vec<String> = (0..5)
             .map(|i| create_test_snapshot(dir, &format!("install-{i:016x}")))
@@ -1184,7 +1214,7 @@ mod tests {
 
     #[test]
     fn loadout_undo_keeps_only_the_newest_point_and_never_a_manual_one() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         let manual = create_test_snapshot_as(
             dir,
@@ -1317,7 +1347,7 @@ mod tests {
 
     #[test]
     fn run_retention_preserves_live_crash_doctor_snapshot() {
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let instance_dir = temp.path();
         let protected = create_test_snapshot(instance_dir, "crash-doctor-active");
         let _ = create_test_snapshot(instance_dir, "regular-old");
@@ -1340,7 +1370,7 @@ mod tests {
         // Labels are free text in the UI, so a person can type a pre-restore-
         // prefix. Pre-restore bucketing is by label only, so the manual
         // snapshot competes for the single undo slot and is evicted.
-        let temp = TempDir::new().unwrap();
+        let temp = temp_instance();
         let dir = temp.path();
         let manual = create_test_snapshot_as(
             dir,

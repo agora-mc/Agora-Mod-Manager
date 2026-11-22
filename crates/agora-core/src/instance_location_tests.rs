@@ -445,6 +445,9 @@ fn base_removal_cannot_race_a_restore_between_pinning_reads() {
     );
 }
 
+/// Paused through the restore's debug-only seam, so the test itself is debug-only: a
+/// release profile has no seam to arm and nothing to assert.
+#[cfg(debug_assertions)]
 #[test]
 fn base_removal_cannot_delete_a_base_a_restore_is_publishing() {
     let (dir, ctx) = fixture();

@@ -521,111 +521,108 @@ pub fn install_size(
 /// record. While paused, the build holds its base lock, so a test can check that another build of
 /// the same id cannot take it.
 ///
-/// Keyed by the base root rather than by a process-wide flag: `cargo test` runs a binary's tests in
-/// one process, and other tests build bases too. Only the build whose root the test passed in (a
-/// fresh temporary folder) pauses; every other build carries on.
+/// Each test registers its own pause, keyed by the base root it builds under (a fresh temporary
+/// folder). A single process-wide flag is not enough: plain `cargo test` runs a binary's tests
+/// as threads in one process, and the rebuild tests pause each other's builds if one registration
+/// replaces or clears another's.
 #[cfg(debug_assertions)]
-static PAUSE_AFTER_BASE_RENAME_AT: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BaseBuildPauseKind {
+    AfterRename,
+    BeforePinRecheck,
+}
+
 #[cfg(debug_assertions)]
-static BASE_RENAME_PAUSED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+struct BaseBuildPause {
+    kind: BaseBuildPauseKind,
+    root: PathBuf,
+    reached: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(debug_assertions)]
+static BASE_BUILD_PAUSES: Mutex<Vec<std::sync::Arc<BaseBuildPause>>> = Mutex::new(Vec::new());
+
+/// A registered pause, returned by the two setters below. `reached` says the build
+/// arrived at its window and is waiting; `release` stops asking and lets it go.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub struct BaseBuildPauseHandle(std::sync::Arc<BaseBuildPause>);
+
+#[cfg(debug_assertions)]
+impl BaseBuildPauseHandle {
+    /// Whether the registered build has reached its pause and is waiting.
+    pub fn reached(&self) -> bool {
+        self.0.reached.load(Ordering::SeqCst)
+    }
+
+    /// Stop asking; the parked build, if any, continues from its pause.
+    pub fn release(&self) {
+        let mut pauses = BASE_BUILD_PAUSES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        pauses.retain(|pause| !std::sync::Arc::ptr_eq(pause, &self.0));
+    }
+}
+
+#[cfg(debug_assertions)]
+fn register_base_build_pause(kind: BaseBuildPauseKind, base_root: &Path) -> BaseBuildPauseHandle {
+    let mut pauses = BASE_BUILD_PAUSES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let pause = std::sync::Arc::new(BaseBuildPause {
+        kind,
+        root: base_root.to_path_buf(),
+        reached: std::sync::atomic::AtomicBool::new(false),
+    });
+    pauses.push(pause.clone());
+    BaseBuildPauseHandle(pause)
+}
 
 /// Test seam: make the next `build_base` under `base_root` stop right after it renames its folder
-/// into place, until this is called with `None`. Off by default and absent from release builds.
+/// into place, until the returned handle is released. Off by default and absent from release
+/// builds.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
-pub fn set_base_build_pause_after_rename(base_root: Option<&Path>) {
-    let mut target = PAUSE_AFTER_BASE_RENAME_AT
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    *target = base_root.map(Path::to_path_buf);
-    BASE_RENAME_PAUSED.store(false, Ordering::SeqCst);
-}
-
-/// Whether a paused build has reached its rename and is waiting.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn base_build_pause_reached() -> bool {
-    BASE_RENAME_PAUSED.load(Ordering::SeqCst)
+pub fn pause_base_build_after_rename(base_root: &Path) -> BaseBuildPauseHandle {
+    register_base_build_pause(BaseBuildPauseKind::AfterRename, base_root)
 }
 
 #[cfg(debug_assertions)]
-fn pause_after_rename_if_asked(base_root: &Path) {
-    let should_pause = PAUSE_AFTER_BASE_RENAME_AT
+fn pause_base_build_if_asked(kind: BaseBuildPauseKind, base_root: &Path) {
+    let pause = BASE_BUILD_PAUSES
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .as_deref()
-        == Some(base_root);
-    if !should_pause {
+        .iter()
+        .find(|pause| pause.kind == kind && pause.root == base_root)
+        .cloned();
+    let Some(pause) = pause else {
         return;
-    }
-    BASE_RENAME_PAUSED.store(true, Ordering::SeqCst);
+    };
+    // Reached stays true for this registration: a test whose build never arrived
+    // must assert it and fail loudly.
+    pause.reached.store(true, Ordering::SeqCst);
     loop {
-        let still_asked = PAUSE_AFTER_BASE_RENAME_AT
+        let still_asked = BASE_BUILD_PAUSES
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .as_deref()
-            == Some(base_root);
+            .iter()
+            .any(|registered| std::sync::Arc::ptr_eq(registered, &pause));
         if !still_asked {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    BASE_RENAME_PAUSED.store(false, Ordering::SeqCst);
 }
 
-/// Test seam for the window between the early pinning check of a damaged record and the locked
-/// re-check before its stale folder is replaced. While paused the build holds no lock, so a test
-/// can move an instance into Recently deleted and check that the re-check refuses the rebuild.
-/// Keyed by the base root, like the rename pause, so unrelated builds carry on.
-#[cfg(debug_assertions)]
-static PAUSE_BEFORE_BASE_PIN_RECHECK_AT: Mutex<Option<PathBuf>> = Mutex::new(None);
-#[cfg(debug_assertions)]
-static BASE_PIN_RECHECK_PAUSED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Test seam: make the next `build_base` under `base_root` stop after its early pinning check,
-/// until this is called with `None`. Off by default and absent from release builds.
+/// Test seam: make the next `build_base` under `base_root` stop after its early pinning check
+/// of a damaged record and before its locked re-check, until the returned handle is released.
+/// While paused the build holds no lock, so a test can move an instance into Recently deleted
+/// and check that the re-check refuses the rebuild. Registered per test, like the rename pause,
+/// so unrelated builds — and rebuilds parked by other tests — carry on.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
-pub fn set_base_build_pause_before_pin_recheck(base_root: Option<&Path>) {
-    let mut target = PAUSE_BEFORE_BASE_PIN_RECHECK_AT
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    *target = base_root.map(Path::to_path_buf);
-    BASE_PIN_RECHECK_PAUSED.store(false, Ordering::SeqCst);
-}
-
-/// Whether a paused build has reached its early pinning check and is waiting.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn base_build_pause_before_pin_recheck_reached() -> bool {
-    BASE_PIN_RECHECK_PAUSED.load(Ordering::SeqCst)
-}
-
-#[cfg(debug_assertions)]
-fn pause_before_pin_recheck_if_asked(base_root: &Path) {
-    let should_pause = PAUSE_BEFORE_BASE_PIN_RECHECK_AT
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .as_deref()
-        == Some(base_root);
-    if !should_pause {
-        return;
-    }
-    BASE_PIN_RECHECK_PAUSED.store(true, Ordering::SeqCst);
-    loop {
-        let still_asked = PAUSE_BEFORE_BASE_PIN_RECHECK_AT
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_deref()
-            == Some(base_root);
-        if !still_asked {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    BASE_PIN_RECHECK_PAUSED.store(false, Ordering::SeqCst);
+pub fn pause_base_build_before_pin_recheck(base_root: &Path) -> BaseBuildPauseHandle {
+    register_base_build_pause(BaseBuildPauseKind::BeforePinRecheck, base_root)
 }
 
 /// The marker Agora writes into a base folder it built, so a rebuild only removes a folder it can
@@ -652,6 +649,49 @@ fn base_marker_matches(dir: &Path, base_id: &str) -> bool {
                 .map(|id| id == base_id)
         })
         .unwrap_or(false)
+}
+
+/// What the record for a base says, decided by attempting the real read. `Path::exists` is never
+/// the judge here: on Linux it answers "there" for a record nobody may read, and "gone" for a
+/// broken symlink, and either answer invites replacing or rewriting a base this build could not
+/// understand. Only a clean `NotFound` on the read is absence.
+#[derive(Debug)]
+enum BaseRecord {
+    /// Nothing is at the record's path.
+    Missing,
+    /// A record is there but is not a readable base record.
+    Damaged,
+    /// A healthy manifest.
+    Healthy(Box<BaseManifest>),
+}
+
+fn read_base_record(base_id: &str, manifest_path: &Path) -> Result<BaseRecord, BaseError> {
+    let text = match std::fs::read_to_string(manifest_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BaseRecord::Missing)
+        }
+        Err(error) => {
+            return Err(BaseError::Other(format!(
+                "the record of base {base_id} ({}) cannot be read: {error}",
+                manifest_path.display()
+            )))
+        }
+    };
+    match serde_json::from_str::<BaseManifest>(&text) {
+        Ok(manifest) => Ok(BaseRecord::Healthy(Box::new(manifest))),
+        Err(_) => Ok(BaseRecord::Damaged),
+    }
+}
+
+/// Whether something occupies the base folder's name. Only a clean `NotFound` means the folder is
+/// gone; a stat that fails any other way is "could not tell", which must not invite the staging
+/// rename over it — the rename then fails and reports instead.
+fn base_folder_present(dir: &Path) -> bool {
+    !matches!(
+        std::fs::symlink_metadata(dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
 }
 
 pub fn build_base(
@@ -712,31 +752,25 @@ pub fn build_base_with_frameworks(
     }
     let manifest_path = paths.base_manifest_path(&base_id);
 
-    // 2. Existing manifest -> return without touching anything. A record that is there but is not
+    // 2. Existing record -> return without touching anything. A record that is there but is not
     // a base record is damaged: the build replaces it (and the folder it left) once it is known
-    // that no instance is pinned to it. A record that cannot be read at all is an error, because
-    // a failed read of a healthy record must not be taken as permission to replace its base.
-    // Whether the record is damaged is judged again under the base lock below; the state here
-    // only decides whether hashing is worth it.
-    if manifest_path.exists() {
-        let content = std::fs::read_to_string(&manifest_path).map_err(|error| {
-            BaseError::Other(format!(
-                "the record of base {base_id} ({}) cannot be read: {error}",
-                manifest_path.display()
-            ))
-        })?;
-        match serde_json::from_str::<BaseManifest>(&content) {
-            Ok(manifest) => return Ok(BuildOutcome::Existing(manifest)),
-            Err(_) => {
-                let pinning = instances_pinning_base(paths, &base_id)?;
-                if !pinning.is_empty() {
-                    return Err(BaseError::Other(format!(
-                        "a damaged base with this id exists ({base_id}) and instance(s) {} are pinned to it, so it was not replaced. Remove those instances first.",
-                        pinning.join(", ")
-                    )));
-                }
+    // that no instance is pinned to it. A record that exists but cannot be read is an error,
+    // because a failed read of a healthy record must not be taken as permission to replace its
+    // base. Whether the record is damaged is judged again under the base lock below; the state
+    // here only decides whether hashing is worth it. Nothing here asks `exists()`, which on Linux
+    // says "there" for a file nobody may read: only a `NotFound` on the real read is absence.
+    match read_base_record(&base_id, &manifest_path)? {
+        BaseRecord::Healthy(manifest) => return Ok(BuildOutcome::Existing(*manifest)),
+        BaseRecord::Damaged => {
+            let pinning = instances_pinning_base(paths, &base_id)?;
+            if !pinning.is_empty() {
+                return Err(BaseError::Other(format!(
+                    "a damaged base with this id exists ({base_id}) and instance(s) {} are pinned to it, so it was not replaced. Remove those instances first.",
+                    pinning.join(", ")
+                )));
             }
         }
+        BaseRecord::Missing => {}
     }
 
     let source_dir = &install.discovered.location;
@@ -827,7 +861,7 @@ pub fn build_base_with_frameworks(
     });
 
     #[cfg(debug_assertions)]
-    pause_before_pin_recheck_if_asked(&base_root);
+    pause_base_build_if_asked(BaseBuildPauseKind::BeforePinRecheck, &base_root);
 
     // 3. Linked mode checks
     if mode == BaseMode::Linked {
@@ -943,27 +977,20 @@ pub fn build_base_with_frameworks(
             "build-base",
         )
         .map_err(|e| BaseError::Other(e.to_string()))?;
-    // Re-check the record under the lock, without a suppressed error: a failed read here
-    // must never be permission to fall through on a damage flag from before the lock, from
-    // a record that may be healthy by now. Healthy returns Existing; unreadable is an error
-    // that keeps the folder; still-damaged is judged from the record as it is right now.
+    // Re-check the record under the lock, by reading it: a record that exists but cannot be
+    // read (permissions, a foreign object on the name) is an error that keeps the folder —
+    // `exists()` would call it present but the old suppressed read treated it as damaged, a
+    // flag computed before the lock. Healthy returns Existing; still-damaged is judged from
+    // the record as it is right now.
     let mut damaged_record = false;
-    if manifest_path.exists() {
-        let content = std::fs::read_to_string(&manifest_path).map_err(|error| {
-            BaseError::Other(format!(
-                "the record of base {base_id} ({}) cannot be read: {error}",
-                manifest_path.display()
-            ))
-        })?;
-        match serde_json::from_str::<BaseManifest>(&content) {
-            Ok(manifest) => {
-                // The staging folder goes with the guard when this returns.
-                return Ok(BuildOutcome::Existing(manifest));
-            }
-            Err(_) => {
-                damaged_record = true;
-            }
+    let mut record_missing = false;
+    match read_base_record(&base_id, &manifest_path)? {
+        BaseRecord::Healthy(manifest) => {
+            // The staging folder goes with the guards when this returns.
+            return Ok(BuildOutcome::Existing(*manifest));
         }
+        BaseRecord::Damaged => damaged_record = true,
+        BaseRecord::Missing => record_missing = true,
     }
 
     // Only the path that replaces a base folder needs the locations lock: take it after Base, and
@@ -997,7 +1024,8 @@ pub fn build_base_with_frameworks(
     // only when its own marker says this build made it; anything else survives
     // under the stale name for the person to inspect.
     // A damaged record is no readable manifest either (the new manifest replaces it below).
-    if final_base_dir.exists() && (damaged_record || !manifest_path.exists()) {
+    // The folder is judged by `symlink_metadata`: only a clean `NotFound` says gone.
+    if base_folder_present(&final_base_dir) && (damaged_record || record_missing) {
         let stale = base_root.join(format!("{base_id}.stale-{unique}"));
         std::fs::rename(&final_base_dir, &stale)?;
         if base_marker_matches(&stale, &base_id) {
@@ -1007,22 +1035,31 @@ pub fn build_base_with_frameworks(
 
     // 6. Rename staging folder to <root>/<base_id>/
     if let Err(e) = std::fs::rename(&staging_dir, &final_base_dir) {
-        // If rename failed because another build won the race, delete staging and return Existing
-        if final_base_dir.exists() && manifest_path.exists() {
+        // If rename failed because another build won the race, its record is readable under
+        // the base lock this build holds: adopt it, drop the staging folder, return Existing.
+        // A record that cannot be read, or reads damaged, is not adopted — that is not
+        // proof the winner finished, and losing the race must not rebuild over anything.
+        let adoption = if base_folder_present(&final_base_dir) {
+            read_base_record(&base_id, &manifest_path)
+                .ok()
+                .and_then(|record| match record {
+                    BaseRecord::Healthy(manifest) => Some(*manifest),
+                    BaseRecord::Damaged | BaseRecord::Missing => None,
+                })
+        } else {
+            None
+        };
+        if let Some(manifest) = adoption {
             let _ = std::fs::remove_dir_all(&staging_dir);
             guard.active = false;
-            if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-                if let Ok(m) = serde_json::from_str::<BaseManifest>(&content) {
-                    return Ok(BuildOutcome::Existing(m));
-                }
-            }
+            return Ok(BuildOutcome::Existing(manifest));
         }
         return Err(BaseError::Io(e));
     }
 
     guard.active = false;
     #[cfg(debug_assertions)]
-    pause_after_rename_if_asked(&base_root);
+    pause_base_build_if_asked(BaseBuildPauseKind::AfterRename, &base_root);
 
     let created_unix_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_millis() as i64,
