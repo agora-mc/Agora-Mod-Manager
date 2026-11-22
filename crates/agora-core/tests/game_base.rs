@@ -1076,12 +1076,87 @@ fn a_rebuild_refuses_when_an_instance_moves_to_trash_before_the_pin_recheck() {
     agora_core::game_base::set_base_build_pause_before_pin_recheck(None);
     let outcome = handle.join().unwrap();
     assert!(
-        outcome.is_err(),
-        "the rebuild replaced a base pinned by a deleted instance: {outcome:?}"
+        outcome.as_ref().is_err_and(|error| {
+            let text = error.to_string();
+            text.contains("still use base") && text.contains("pinned-instance")
+        }),
+        "the rebuild must refuse with the pinning refusal, not any error: {outcome:?}"
     );
     assert!(
         stale.join(".agora-base.json").is_file(),
         "the stale folder of a still-pinned base is kept"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_rebuild_keeps_the_base_when_the_locked_record_read_fails() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("16"));
+    let root = tmp.path().join("AgoraBases");
+    let outcome = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        Some(&root),
+        BuildOptions::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+    let stale = root.join(&base_id);
+    assert!(stale.join(".agora-base.json").is_file());
+    let fresh_bytes = std::fs::read(stale.join("Game.exe")).unwrap();
+
+    // A damaged record lets the build pass its early check and head for a rebuild;
+    // while it is parked past that check, swap the record for one that cannot be
+    // read at all.
+    std::fs::write(paths.base_manifest_path(&base_id), "{ not json").unwrap();
+    agora_core::game_base::set_base_build_pause_before_pin_recheck(Some(&root));
+    let build_paths = paths.clone();
+    let build_install = install.clone();
+    let build_root = root.clone();
+    let handle = std::thread::spawn(move || {
+        build_base(
+            &build_paths,
+            &build_install,
+            &test_definition(),
+            BaseMode::Linked,
+            Some(&build_root),
+            BuildOptions::default(),
+            &|_| {},
+        )
+    });
+    let mut reached = false;
+    for _ in 0..600 {
+        if agora_core::game_base::base_build_pause_before_pin_recheck_reached() {
+            reached = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(reached, "the build never reached its early check");
+    let manifest_path = paths.base_manifest_path(&base_id);
+    std::fs::remove_file(&manifest_path).unwrap();
+    std::fs::create_dir(&manifest_path).unwrap();
+
+    agora_core::game_base::set_base_build_pause_before_pin_recheck(None);
+    let outcome = handle.join().unwrap();
+    assert!(
+        outcome
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("cannot be read")),
+        "a record that exists but cannot be read under the locks must keep the base folder, not rebuild over it: {outcome:?}"
+    );
+    assert!(
+        stale.join(".agora-base.json").is_file(),
+        "the stale folder is kept"
+    );
+    assert_eq!(
+        std::fs::read(stale.join("Game.exe")).unwrap(),
+        fresh_bytes,
+        "the folder's contents were not replaced"
     );
 }
 

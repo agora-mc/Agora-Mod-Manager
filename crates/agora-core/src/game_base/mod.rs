@@ -943,13 +943,28 @@ pub fn build_base_with_frameworks(
             "build-base",
         )
         .map_err(|e| BaseError::Other(e.to_string()))?;
+    // Re-check the record under the lock, without a suppressed error: a failed read here
+    // would be permission to reuse a damage flag computed before the lock, from a record
+    // that may be healthy by now. Healthy returns Existing; unreadable is an error that
+    // keeps the folder; still-damaged only falls through to the replacement below.
     if manifest_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-            if let Ok(manifest) = serde_json::from_str::<BaseManifest>(&content) {
+        let content = std::fs::read_to_string(&manifest_path).map_err(|error| {
+            BaseError::Other(format!(
+                "the record of base {base_id} ({}) cannot be read: {error}",
+                manifest_path.display()
+            ))
+        })?;
+        match serde_json::from_str::<BaseManifest>(&content) {
+            Ok(manifest) => {
                 // The staging folder goes with the guard when this returns.
                 return Ok(BuildOutcome::Existing(manifest));
             }
+            Err(_) => {
+                damaged_record = true;
+            }
         }
+    } else {
+        damaged_record = false;
     }
 
     // Only the path that replaces a base folder needs the locations lock: take it after Base, and
