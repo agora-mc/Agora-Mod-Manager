@@ -18,6 +18,9 @@ Checks:
 10. Live instance reads use the canonical manifest loader
 11. Game API depends only on serde, serde_json, semver, thiserror and regex (all dependency sections)
 12. Core must not reference the future Minecraft package's modules or crate
+13. Game packages' remaining agora-core references stay within a budget that only shrinks
+14. Fail-closed reads (error-read-as-absent sites) in recovery, trust, lease, GC and staging
+    code stay within a budget that only shrinks (MASTER_SPEC §32.13)
 """
 
 import json
@@ -665,10 +668,126 @@ def check_game_package_core_budget() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 14. Fail-closed reads: error-read-as-absent sites may only go down
+# ---------------------------------------------------------------------------
+# MASTER_SPEC §32.13. Most late review findings were one class of bug: an error
+# read as "nothing there" (`.exists()`, `.ok()`, `unwrap_or_default()` on a
+# read). In recovery, trust, lease, garbage-collection and staging code those
+# patterns decide whether user data may be deleted or overwritten, so they are
+# counted per file and may only fall: a lower count must be written back, the
+# same rule as the game-package budget above.
+#
+# What the count is, exactly: the three patterns, matched textually in the
+# file's production code. Comments are stripped, and a `#[cfg(test)] mod` block
+# is not counted — a test's `.exists()` is how it checks what the code did, not
+# a decision about user data. The count is deliberately textual: telling a
+# filesystem result from a parse result needs types, and a count that needs a
+# compiler is not a count any contributor can run. It may therefore count a
+# harmless site, which a slice can remove or leave, but it cannot miss one.
+#
+# The list is the modules the spec names: recovery (`startup_recovery`, the
+# journals and their passes), trust (the signed registry and plugin signatures),
+# leases and locks (the runtime lease, the recorded process, the OS lock, the
+# session ledger), garbage collection (`snapshot`, `game_base`, Recently
+# deleted) and staging (`game_user_files`, `game_tool_swap`, `content_store`).
+# The authority for the list is MASTER_SPEC §32.13; a slice that converts a
+# whole module adds it here, and one that splits a file moves its entry.
+FAIL_CLOSED_READ_BUDGET = REPO_ROOT / "scripts" / "fail_closed_read_budget.json"
+FAIL_CLOSED_READ_PATTERNS = (".exists()", ".ok()", ".unwrap_or_default()")
+# A top-level `#[cfg(test)]` on a module: everything from there on is test code.
+TEST_MODULE = re.compile(
+    r"^#\[cfg\(test\)\]\s*\n\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+", flags=re.M
+)
+
+
+def count_fail_closed_reads(source: str) -> int:
+    """Error-read-as-absent sites in one Rust file, comments and tests excluded."""
+    source = re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group().count("\n"), source, flags=re.S)
+    test_module = TEST_MODULE.search(source)
+    if test_module:
+        source = source[: test_module.start()]
+    production = "\n".join(line.split("//", 1)[0] for line in source.splitlines())
+    return sum(production.count(pattern) for pattern in FAIL_CLOSED_READ_PATTERNS)
+
+
+def count_fail_closed_reads_in(path: Path) -> int:
+    return count_fail_closed_reads(path.read_text(encoding="utf-8", errors="replace"))
+
+
+def check_fail_closed_reads() -> None:
+    try:
+        budget = json.loads(FAIL_CLOSED_READ_BUDGET.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        err(f"{FAIL_CLOSED_READ_BUDGET.name} is missing: the fail-closed read budget is checked in")
+        return
+    except (OSError, ValueError) as exc:
+        err(f"Cannot read {FAIL_CLOSED_READ_BUDGET.name}: {exc}")
+        return
+    files = budget.get("files", {})
+    directories = budget.get("directories", {})
+    problems: list[str] = []
+    report: list[str] = []
+
+    def compare(relative: str, count: int, allowed: int) -> None:
+        if count > allowed:
+            problems.append(
+                f"  {relative}: {count} error-read-as-absent sites, budget {allowed}; "
+                "this budget only shrinks. Use probe() or match the error instead"
+            )
+        elif count < allowed:
+            problems.append(
+                f"  {relative}: {count} error-read-as-absent sites, below the budget of "
+                f"{allowed}; lower it to {count} in {FAIL_CLOSED_READ_BUDGET.name}"
+            )
+        else:
+            report.append(f"{relative} {count}")
+
+    for relative, allowed in sorted(files.items()):
+        path = REPO_ROOT / relative
+        if not path.is_file():
+            problems.append(f"  {relative}: budgeted but not found; correct or remove the entry")
+            continue
+        if not isinstance(allowed, int):
+            problems.append(f"  {relative}: budget must be a whole number, not {allowed!r}")
+            continue
+        compare(relative, count_fail_closed_reads_in(path), allowed)
+    for relative, expected in sorted(directories.items()):
+        root = REPO_ROOT / relative
+        if not root.is_dir():
+            problems.append(f"  {relative}/: budgeted directory not found")
+            continue
+        if not isinstance(expected, dict):
+            problems.append(f"  {relative}/: budget must map each file to its count")
+            continue
+        present = {path.name: path for path in sorted(root.glob("*.rs"))}
+        for name in sorted(set(present) - set(expected)):
+            problems.append(
+                f"  {relative}/{name}: not in the budget "
+                f"({count_fail_closed_reads_in(present[name])} sites); add its count to "
+                f"{FAIL_CLOSED_READ_BUDGET.name}"
+            )
+        for name, allowed in sorted(expected.items()):
+            if name not in present:
+                problems.append(f"  {relative}/{name}: budgeted but not found")
+            elif not isinstance(allowed, int):
+                problems.append(f"  {relative}/{name}: budget must be a whole number")
+            else:
+                compare(f"{relative}/{name}", count_fail_closed_reads_in(present[name]), allowed)
+
+    if problems:
+        err("Fail-closed reads in recovery, trust, lease, GC and staging code (MASTER_SPEC §32.13)")
+        for problem in problems:
+            print(problem, file=sys.stderr)
+    elif report:
+        print(f"OK: fail-closed reads within budget in {len(report)} files")
+    else:
+        print("OK: no fail-closed read budget to check")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> int:
-    print("=== Architecture Boundary Checks ===\n")
 
     print("--- 1. Raw reqwest::Client in desktop ---")
     check_reqwest_desktop()
@@ -719,6 +838,10 @@ def main() -> int:
 
     print("\n--- 13. Game packages' agora-core budget ---")
     check_game_package_core_budget()
+    print()
+
+    print("--- 14. Fail-closed reads in recovery, trust, lease, GC and staging code ---")
+    check_fail_closed_reads()
     print()
 
     if EXIT_CODE == 0:

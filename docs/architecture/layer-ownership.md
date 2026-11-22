@@ -87,6 +87,8 @@ This ensures the core owns the **interface and policy** while the adapter provid
 | MCP HTTP from browser | **FORBIDDEN** | React must NOT call `localhost:39741` directly. All MCP operations go through the core dispatcher via Tauri IPC |
 | Rendering plugin views | React | A plugin returns a `ViewModel` — data, never markup — and React draws it with Agora's own components. There is deliberately no HTML string to hand to `dangerouslySetInnerHTML` |
 | Plugin themes | React | Applies the semantic tokens a theme declares. A theme names a token, never arbitrary CSS |
+| Asking whether a path is there | `agora-game-api` (`probe`) | `Present(kind)` / `Absent` / `CantTell`, never `exists()`. Only "not found" is absent; a link is reported as a link, and a probe result is never permission to write — mutations resolve their destination and keep its identity (MASTER_SPEC §32.13) |
+| May this process change an instance? | `agora-core` (`instance_runtime::may_mutate`) | One typed answer: `Yes(guard)`, `Busy` (the game, or another Agora operation holding the lock) or `CantTell` (an unreadable lease, session or store, or an indeterminate launch). `InstanceGuard::for_mutation*` keep their codes for the UI; no caller compares them to decide whether a change may proceed. The override is `may_mutate_while_running`, which still takes the lock |
 
 ## Dependency Direction
 
@@ -94,6 +96,12 @@ The game contract is in `agora-game-api`, below core and game packages. Core mus
 `agora-game-minecraft`; packages register into each context's `GameRegistry` through the contract. Until
 Phase 5, `agora-game-minecraft` may still use `agora-core` within a budget that only shrinks
 (`scripts/game_package_core_budget.json`). See [game API and manifest v3](game-api.md).
+
+Error-read-as-absent sites (`.exists()`, `.ok()`, `unwrap_or_default()` on a read) in recovery,
+trust, lease, garbage-collection and staging code are counted the same way, per file, in
+`scripts/fail_closed_read_budget.json`; adding one there fails the architecture check until the
+number is lowered somewhere else, and fixing one fails it until the lower number is written back
+(MASTER_SPEC §32.13).
 
 ```
 agora-plugin-api  ←  agora-core

@@ -192,3 +192,92 @@ class GamePackageCoreBudgetTests(unittest.TestCase):
     def test_entry_for_a_missing_package_fails(self):
         self.write(1, budget={"agora-game-test": 1, "agora-game-gone": 5})
         self.assertEqual(self.check(), 1)
+
+
+class FailClosedReadBudgetTests(unittest.TestCase):
+    """MASTER_SPEC §32.13: error-read-as-absent sites are counted and may only go down."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        (self.root / "crates/agora-core/src").mkdir(parents=True)
+        self.budget = self.root / "scripts" / "fail_closed_read_budget.json"
+        self.budget.parent.mkdir()
+        for name, value in {
+            "REPO_ROOT": self.root,
+            "FAIL_CLOSED_READ_BUDGET": self.budget,
+            "EXIT_CODE": 0,
+        }.items():
+            patcher = patch.object(architecture, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def write(self, relative: str, source: str) -> Path:
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+        return path
+
+    def budget_of(self, files=None, directories=None) -> None:
+        self.budget.write_text(
+            json.dumps({"files": files or {}, "directories": directories or {}}),
+            encoding="utf-8",
+        )
+
+    def check(self) -> int:
+        architecture.EXIT_CODE = 0
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            architecture.check_fail_closed_reads()
+        return architecture.EXIT_CODE
+
+    def test_comments_and_test_modules_do_not_count(self):
+        source = (
+            "fn a(p: &Path) -> bool { p.exists() }\n"
+            "// p.exists() in a line comment does not count\n"
+            "/* nor do these: p.exists() .ok() */\n"
+            "fn b(text: &str) -> u32 { text.parse().ok().unwrap_or_default() }\n"
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    fn t(p: &Path) { assert!(p.exists()); }\n"
+            "}\n"
+        )
+        self.assertEqual(architecture.count_fail_closed_reads(source), 3)
+
+    def test_at_budget_passes(self):
+        self.write("crates/agora-core/src/lkg.rs", "fn a(p: &Path) -> bool { p.exists() }\n")
+        self.budget_of(files={"crates/agora-core/src/lkg.rs": 1})
+        self.assertEqual(self.check(), 0)
+
+    def test_one_more_site_than_the_budget_fails(self):
+        self.write(
+            "crates/agora-core/src/lkg.rs",
+            "fn a(p: &Path) -> bool { p.exists() }\nfn b(p: &Path) -> bool { p.exists() }\n",
+        )
+        self.budget_of(files={"crates/agora-core/src/lkg.rs": 1})
+        self.assertEqual(self.check(), 1)
+
+    def test_a_fix_below_the_budget_fails_until_the_number_is_written_back(self):
+        self.write("crates/agora-core/src/lkg.rs", "fn a(p: &Path) -> bool { p.exists() }\n")
+        self.budget_of(files={"crates/agora-core/src/lkg.rs": 3})
+        self.assertEqual(self.check(), 1)
+
+    def test_a_budgeted_file_that_is_gone_fails(self):
+        self.budget_of(files={"crates/agora-core/src/gone.rs": 0})
+        self.assertEqual(self.check(), 1)
+
+    def test_a_missing_budget_file_fails(self):
+        self.assertEqual(self.check(), 1)
+
+    def test_every_file_in_a_counted_directory_needs_its_own_number(self):
+        self.write("crates/agora-core/src/content_store/mod.rs", "fn a() {}\n")
+        self.write(
+            "crates/agora-core/src/content_store/place.rs",
+            "fn a(p: &Path) -> bool { p.exists() }\n",
+        )
+        budget = {"crates/agora-core/src/content_store": {"mod.rs": 0}}
+        self.budget_of(directories=budget)
+        self.assertEqual(self.check(), 1)
+        budget["crates/agora-core/src/content_store"]["place.rs"] = 1
+        self.budget_of(directories=budget)
+        self.assertEqual(self.check(), 0)
