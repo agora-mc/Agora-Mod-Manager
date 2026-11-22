@@ -749,6 +749,29 @@ fn has_upstream_hash(lib: &crate::launch::Library) -> bool {
     false
 }
 
+/// Every SHA-1 a profile publishes for a library: the artifact download's and
+/// the library's own (Fabric/Quilt put it there).
+///
+/// A blank published digest is not a hash to check. `agora_core::artifact_hash`
+/// resolves a blank *published* digest to "the source published nothing" (only
+/// a blank *asserted* hash, from a curator, pack or earlier install, is an
+/// error), and this is the same kind of digest, so it yields nothing here.
+fn published_sha1s(lib: &crate::launch::Library) -> Vec<String> {
+    [
+        lib.sha1.as_deref(),
+        lib.downloads
+            .as_ref()
+            .and_then(|downloads| downloads.artifact.as_ref())
+            .and_then(|artifact| artifact.sha1.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .filter(|sha1| !sha1.is_empty())
+    .map(str::to_lowercase)
+    .collect()
+}
+
 /// Collect the relative Maven paths of libraries without upstream hashes.
 fn collect_unhashed_library_paths(libraries: &[crate::launch::Library]) -> Vec<String> {
     let mut paths = Vec::new();
@@ -1429,17 +1452,22 @@ pub fn create_receipt_for_installed_profile(
     // 6. Enumerate library paths the receipt must pin from disk:
     //    every library without an upstream hash, and every installer
     //    processor output with a blank download URL — a processor output
-    //    is only ever created locally (the installer verified its bytes
-    //    against the hashes it declared in install_profile.json), so it
-    //    can never be downloaded at launch even when the generated
-    //    version.json publishes a SHA-1 for it. Pinning it here gives
-    //    adoption and the launch planner the SHA-256 they need to trust
-    //    the artifact, and fails fast if the installer did not actually
-    //    produce it.
+    //    is only ever created locally, so it can never be downloaded at
+    //    launch. Pinning it here gives adoption and the launch planner the
+    //    SHA-256 they need to trust the artifact, and fails fast if the
+    //    installer did not actually produce it.
+    //
+    //    A processor output may still carry a published SHA-1 (the real
+    //    Forge 1.21.1 profile does), and it is the only digest in that case
+    //    that says whether the installer wrote the artifact the profile
+    //    describes: a processor can exit 0 having left a truncated jar.
+    //    Every published SHA-1 for a pinned path is therefore checked
+    //    against the bytes before they are pinned.
     let mut pinned_paths: BTreeSet<String> =
         collect_unhashed_library_paths(&loader_version.libraries)
             .into_iter()
             .collect();
+    let mut published_sha1: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for lib in &loader_version.libraries {
         if !produced_libraries.contains(&lib.name) {
             continue;
@@ -1456,7 +1484,14 @@ pub fn create_receipt_for_installed_profile(
             continue;
         }
         if let Ok(descriptor) = parse_maven_descriptor(&lib.name) {
-            pinned_paths.insert(descriptor.to_relative_path());
+            let relative_path = descriptor.to_relative_path();
+            let digests = published_sha1.entry(relative_path.clone()).or_default();
+            digests.extend(
+                published_sha1s(lib)
+                    .into_iter()
+                    .map(|sha1| (lib.name.clone(), sha1)),
+            );
+            pinned_paths.insert(relative_path);
         }
     }
 
@@ -1558,6 +1593,25 @@ pub fn create_receipt_for_installed_profile(
         }
 
         let sha = agora_core::download::sha256_hex(&data);
+
+        // Before these bytes become the trusted SHA-256 for this artifact,
+        // check them against every SHA-1 the profile publishes for it.
+        if let Some(published) = published_sha1.get(rel_path) {
+            let actual_sha1 = agora_core::download::sha1_hex(&data);
+            for (library, expected) in published {
+                if !expected.eq_ignore_ascii_case(&actual_sha1) {
+                    return Err(ProfileIssue::corrupt(
+                        Some(abs_path.clone()),
+                        format!(
+                            "Installer output '{library}' ({rel_path}) does not match the SHA-1 \
+                             its profile publishes: the profile says {expected}, the file on disk \
+                             is {actual_sha1}"
+                        ),
+                    ));
+                }
+            }
+        }
+
         generated_artifact_sha256.insert(rel_path.clone(), sha);
     }
 
@@ -3245,7 +3299,153 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // create_receipt_for_installed_profile â€” exit status check
+    // create_receipt_for_installed_profile — the profile's own SHA-1 for a
+    // processor output
+    // -----------------------------------------------------------------------
+
+    /// The real Forge 1.21.1-52.1.21 profile, and a jar under `libraries/`
+    /// holding `bytes`.
+    fn real_forge_fixture(bytes: &[u8]) -> (TempFixture, LoaderTuple, serde_json::Value) {
+        let fix = TempFixture::new();
+        let tuple = LoaderTuple {
+            loader: "forge".to_string(),
+            minecraft_version: "1.21.1".to_string(),
+            loader_version: "52.1.21".to_string(),
+        };
+        fix.write_base("1.21.1");
+        let mut version: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/forge-1.21.1-52.1.21-version.json"
+        ))
+        .expect("real Forge version.json fixture is valid JSON");
+        version["id"] = serde_json::Value::String("forge-1.21.1-52.1.21".into());
+        fix.write_profile("forge-1.21.1-52.1.21", &version);
+
+        let lib = fix.minecraft_dir.join(
+            "libraries/net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-client.jar",
+        );
+        fs::create_dir_all(lib.parent().expect("library dir")).expect("create lib dir");
+        fs::write(&lib, bytes).expect("write processor output");
+        (fix, tuple, version)
+    }
+
+    /// The client-side processor outputs the real Forge installer produces.
+    fn real_forge_produced() -> BTreeSet<String> {
+        let install_profile: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/forge-1.21.1-52.1.21-install-profile.json"
+        ))
+        .expect("real Forge install_profile.json fixture is valid JSON");
+        processor_output_coordinates(&install_profile, "client")
+    }
+
+    /// The installer can exit 0 having left a truncated or wrong jar where the
+    /// profile publishes a SHA-1. Pinning those bytes as the trusted SHA-256
+    /// would make the wrong artifact trusted forever, so a mismatch has to
+    /// fail before a receipt is written.
+    #[test]
+    fn a_processor_output_that_does_not_match_its_published_sha1_is_refused() {
+        let bytes = b"truncated installer output";
+        let (fix, tuple, _version) = real_forge_fixture(bytes);
+
+        let err = create_receipt_for_installed_profile(
+            &fix.minecraft_dir,
+            &fix.receipts_root,
+            &tuple,
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-installer.jar",
+            0,
+            &real_forge_produced(),
+        )
+        .expect_err("a truncated processor output must not be pinned");
+
+        assert_eq!(err.kind, ProfileIssueKind::CorruptProfile, "{err:?}");
+        let text = err.reasons.join(" ");
+        assert!(
+            text.contains("net.minecraftforge:forge:1.21.1-52.1.21:client"),
+            "the reason must name the library: {text}"
+        );
+        assert!(
+            text.contains("28f7acaa0e9b1c2d2a7bf52c07ae16133bd3da4e"),
+            "the reason must name the published SHA-1: {text}"
+        );
+        assert!(
+            text.contains(&agora_core::download::sha1_hex(bytes)),
+            "the reason must name the digest of the bytes found: {text}"
+        );
+        assert!(
+            read_receipt(&fix.receipts_root, &tuple)
+                .expect("reading receipts is not an error here")
+                .is_none(),
+            "no receipt may be written for bytes that failed their published SHA-1"
+        );
+    }
+
+    /// The same jar holding the bytes the profile publishes for it is pinned,
+    /// and a published digest is compared case-insensitively.
+    #[test]
+    fn a_processor_output_matching_its_published_sha1_is_pinned() {
+        let bytes = b"the installer's real bytes";
+        let (fix, tuple, mut version) = real_forge_fixture(bytes);
+        // Publish the digest of the bytes actually on disk, uppercased: hex is
+        // case-insensitive.
+        version["libraries"][1]["downloads"]["artifact"]["sha1"] =
+            serde_json::Value::String(agora_core::download::sha1_hex(bytes).to_uppercase());
+        fix.write_profile("forge-1.21.1-52.1.21", &version);
+
+        let receipt = create_receipt_for_installed_profile(
+            &fix.minecraft_dir,
+            &fix.receipts_root,
+            &tuple,
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-installer.jar",
+            0,
+            &real_forge_produced(),
+        )
+        .expect("bytes that match the published SHA-1 are pinned");
+
+        assert_eq!(
+            receipt
+                .generated_artifact_sha256
+                .get("net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-client.jar"),
+            Some(&agora_core::download::sha256_hex(bytes)),
+            "the receipt pins the SHA-256 of the bytes the SHA-1 matched"
+        );
+    }
+
+    /// A published SHA-1 that is present but blank is not a hash to check:
+    /// `agora_core::artifact_hash` treats a blank *published* digest as the
+    /// source having published nothing (only a blank *asserted* hash is an
+    /// error). The artifact is still pinned from disk, as before.
+    #[test]
+    fn a_blank_published_sha1_on_a_processor_output_pins_without_a_check() {
+        for blank in ["", "   "] {
+            let bytes = b"whatever the installer produced";
+            let (fix, tuple, mut version) = real_forge_fixture(bytes);
+            version["libraries"][1]["downloads"]["artifact"]["sha1"] =
+                serde_json::Value::String(blank.to_string());
+            fix.write_profile("forge-1.21.1-52.1.21", &version);
+
+            let receipt = create_receipt_for_installed_profile(
+                &fix.minecraft_dir,
+                &fix.receipts_root,
+                &tuple,
+                "9999999999999999999999999999999999999999999999999999999999999999",
+                "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-installer.jar",
+                0,
+                &real_forge_produced(),
+            )
+            .unwrap_or_else(|err| panic!("a blank published digest is no hash to check: {err:?}"));
+
+            assert!(
+                receipt.generated_artifact_sha256.contains_key(
+                    "net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-client.jar"
+                ),
+                "the artifact is still pinned from disk"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // create_receipt_for_installed_profile — exit status check
     // -----------------------------------------------------------------------
 
     #[test]

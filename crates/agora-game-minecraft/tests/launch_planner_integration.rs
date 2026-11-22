@@ -2278,13 +2278,21 @@ fn forge_install_receipt_pins_processor_output_with_published_sha1() {
     let mut profile: serde_json::Value =
         serde_json::from_str(VERSION_JSON).expect("real Forge version.json must parse");
     profile["id"] = serde_json::Value::String(profile_id.clone());
-    write_installed_version_json(&minecraft_dir, &profile_id, &profile);
 
     // The patcher output the installer just produced on disk.
     let client_jar_rel = "net/minecraftforge/forge/1.21.1-52.1.21/forge-1.21.1-52.1.21-client.jar";
     let client_jar = minecraft_dir.join("libraries").join(client_jar_rel);
     std::fs::create_dir_all(client_jar.parent().unwrap()).unwrap();
-    std::fs::write(&client_jar, b"patched client jar bytes").unwrap();
+    let client_jar_bytes = b"patched client jar bytes";
+    std::fs::write(&client_jar, client_jar_bytes).unwrap();
+
+    // The receipt checks a processor output against the SHA-1 the profile
+    // publishes for it, so the published digest has to describe these bytes.
+    // (The real 28 MB patched jar cannot be a fixture; what this test is about
+    // is that a matching output is pinned, not the digest itself.)
+    profile["libraries"][1]["downloads"]["artifact"]["sha1"] =
+        serde_json::Value::String(agora_core::download::sha1_hex(client_jar_bytes));
+    write_installed_version_json(&minecraft_dir, &profile_id, &profile);
 
     // Produced set, derived exactly like the install path derives it.
     let install_profile: serde_json::Value = serde_json::from_str(INSTALL_PROFILE_JSON)
