@@ -3,10 +3,13 @@
 
 use crate::launch::LibraryArtifact;
 use crate::loader_manifests;
-use agora_core::download::{sha1_hex, sha256_hex, sha512_hex};
-use agora_core::error::{LauncherError, LauncherResult};
-use agora_core::http_client::{self, ClientCategory, HttpClients};
-use agora_core::network::sanitized_url_for_log;
+use agora_core::{
+    artifact_hash::verify_download,
+    download::{sha1_hex, sha256_hex, sha512_hex},
+    error::{LauncherError, LauncherResult},
+    http_client::{self, ClientCategory, HttpClients},
+    network::sanitized_url_for_log,
+};
 
 #[cfg(test)]
 tokio::task_local! {
@@ -205,27 +208,19 @@ fn verify_profile_digests(artifact: &LibraryArtifact, bytes: &[u8]) -> LauncherR
     if sha1.is_none() && sha256.is_none() {
         return Ok(());
     }
-    agora_core::artifact_hash::verify_download(
-        bytes,
-        sha1,
-        sha256,
-        &[],
-        false,
-        &artifact.path,
-        None,
-    )
-    .map(|_| ())
-    .map_err(|error| match error {
-        LauncherError::HashMismatch => LauncherError::Generic {
-            code: "ERR_HASH_MISMATCH".into(),
-            message: format!(
-                "{} does not match the {} its loader profile publishes",
-                artifact.url,
-                if sha256.is_some() { "SHA-256" } else { "SHA-1" }
-            ),
-        },
-        other => other,
-    })
+    verify_download(bytes, sha1, sha256, &[], false, &artifact.path, None)
+        .map(|_| ())
+        .map_err(|error| match error {
+            LauncherError::HashMismatch => LauncherError::Generic {
+                code: "ERR_HASH_MISMATCH".into(),
+                message: format!(
+                    "{} does not match the {} its loader profile publishes",
+                    artifact.url,
+                    if sha256.is_some() { "SHA-256" } else { "SHA-1" }
+                ),
+            },
+            other => other,
+        })
 }
 
 /// Download a loader file and verify its hash against the pinned value.
