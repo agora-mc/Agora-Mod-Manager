@@ -215,10 +215,10 @@ A new or renamed Tauri command also needs `python scripts/check_tauri_bindings.p
   recovery, trust, lease, garbage-collection and staging modules (MASTER_SPEC §32.13). Adding one
   fails `check_architecture.py`; so does fixing one, until the lower number is written back. The
   count skips comments, string literals, and only the item a `#[cfg(test)]` attribute applies to
-  (an inline test module or a test-only helper) — code after a `#[cfg(test)] mod tests;`
-  declaration is still counted. It is textual: a file's number is the number of patterns, not a
-  compiler's opinion of them. A directory entry counts every `.rs` file below it, so a new
-  subdirectory needs its own entries.
+  (an inline test module or a test-only helper; on a function parameter, just the parameter) — code
+  after a `#[cfg(test)] mod tests;` declaration is still counted. It is textual: a file's number is
+  the number of patterns, not a compiler's opinion of them. A directory entry counts every `.rs`
+  file below it, so a new subdirectory needs its own entries.
 - A static export of `web/` built on Windows writes its segment-prefetch files into nested
   folders (`docs/__next.docs/__PAGE__.txt` instead of `docs/__next.docs.__PAGE__.txt`), so a
   local preview logs RSC prefetch 404s even though navigation still works. This is upstream

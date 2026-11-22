@@ -686,7 +686,9 @@ def check_game_package_core_budget() -> None:
 #   `mod tests { ... }` with its braces, a `#[cfg(test)] mod helper;`
 #   declaration line, or a `#[cfg(test)] fn ...` test-only helper. Everything
 #   after it is still counted — a test-module declaration early in a file must
-#   not hide the production code below it.
+#   not hide the production code below it. An attribute inside a parameter list
+#   (`fn present(#[cfg(test)] _c: usize, p: &Path)`) applies to that parameter
+#   alone, so only the attribute is blanked.
 # - Whitespace inside a call is allowed (`p.exists ()`, `.ok ( )`).
 #
 # The count is deliberately textual: telling a filesystem result from a parse
@@ -804,6 +806,20 @@ def item_end(source: str, start: int) -> int | None:
     return None
 
 
+def inside_parentheses(source: str, position: int) -> bool:
+    """Whether `position` sits inside a `(` that is still open — a parameter list.
+
+    An attribute there applies to the parameter it precedes, not to the item after the list.
+    """
+    stack: list[str] = []
+    for char in source[:position]:
+        if char in "([{":
+            stack.append(char)
+        elif char in ")]}" and stack:
+            stack.pop()
+    return stack[-1:] == ["("]
+
+
 def blank_test_items(source: str) -> str:
     """Blank what a `#[cfg(test)]` attribute applies to, and only that.
 
@@ -815,6 +831,15 @@ def blank_test_items(source: str) -> str:
         match = CFG_TEST_ATTRIBUTE.search(source)
         if not match:
             return source
+        if inside_parentheses(source, match.start()):
+            # `fn present(#[cfg(test)] _c: usize, p: &Path) -> bool { p.exists() }`: the attribute
+            # applies to the parameter only, so blank it alone and keep counting the body.
+            source = (
+                source[: match.start()]
+                + " " * (match.end() - match.start())
+                + source[match.end() :]
+            )
+            continue
         cursor = match.end()
         while True:
             whitespace = len(source[cursor:]) - len(source[cursor:].lstrip())

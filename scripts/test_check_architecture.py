@@ -281,6 +281,11 @@ class FailClosedReadBudgetTests(unittest.TestCase):
         )
         self.assertEqual(architecture.count_fail_closed_reads(source), 1)
 
+    def test_an_attribute_on_a_parameter_does_not_hide_the_function_body(self):
+        # The attribute applies to `_c` alone; the body is production code and still counted.
+        source = "fn present(#[cfg(test)] _c: usize, p: &Path) -> bool { p.exists() }\n"
+        self.assertEqual(architecture.count_fail_closed_reads(source), 1)
+
     def test_whitespace_inside_the_call_is_counted(self):
         source = "fn a(p: &Path) -> bool { p.exists () } fn b(t: &str) { t.parse::<u8>().ok ( ) ; }\n"
         self.assertEqual(architecture.count_fail_closed_reads(source), 2)

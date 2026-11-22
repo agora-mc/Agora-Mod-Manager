@@ -292,9 +292,12 @@ fn an_unreadable_user_files_journal_is_could_not_tell_not_idle() {
     std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
 
     let answer = agora_core::instance_runtime::game_activity(&h.ctx, "live");
+    // Ask while the folder is still 0o000: after the restore every account can read it, so a late
+    // check would always look readable and the test would skip instead of asserting anything.
+    let unreadable = std::fs::read_dir(&folder).is_err();
     // Restore before asserting, so a failure does not leave an unremovable folder behind.
     std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
-    if std::fs::read_dir(&folder).is_ok() {
+    if !unreadable {
         println!(
             "skipping the unreadable-journal test: this account can read a 0o000 folder (root)"
         );
