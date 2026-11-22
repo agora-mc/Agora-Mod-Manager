@@ -2719,7 +2719,7 @@ mod tests {
     ];
 
     fn make_instance(tmp: &TempDir) -> PathBuf {
-        let dir = tmp.path().join("instances").join("instance");
+        let dir = tmp.path().join("instance");
         fs::create_dir_all(dir.join("mods")).unwrap();
         fs::create_dir_all(dir.join("config")).unwrap();
         fs::create_dir_all(dir.join("resourcepacks")).unwrap();
@@ -2920,7 +2920,7 @@ mod tests {
 
         // Simulate a fresh machine: new instance directory that does not exist.
         let fresh_root = TempDir::new().unwrap();
-        let fresh_instance = fresh_root.path().join("instances").join("fresh-instance");
+        let fresh_instance = fresh_root.path().join("fresh-instance");
         // Import onto a path that does not yet exist.
         let imported = import_backup(&fresh_instance, &artifact).unwrap();
         assert_eq!(imported.id, snapshot.id);
@@ -2951,7 +2951,7 @@ mod tests {
         // so importing a file from another machine destroyed the world you
         // were playing.
         let tmp = TempDir::new().unwrap();
-        let instance = tmp.path().join("instances").join("instance");
+        let instance = tmp.path().join("instance");
         std::fs::create_dir_all(instance.join("mods")).unwrap();
         std::fs::write(instance.join("mods").join("mod-a.jar"), b"mod a v1").unwrap();
         let snapshot =
@@ -3073,7 +3073,7 @@ mod tests {
         };
 
         let fresh = TempDir::new().unwrap();
-        let fresh_instance = fresh.path().join("instances").join("victim");
+        let fresh_instance = fresh.path().join("victim");
         let error = import_backup(&fresh_instance, &tampered).unwrap_err();
         assert!(
             error.contains("unsafe")
@@ -3128,7 +3128,7 @@ mod tests {
         }
 
         let fresh = TempDir::new().unwrap();
-        let fresh_instance = fresh.path().join("instances").join("victim2");
+        let fresh_instance = fresh.path().join("victim2");
         let error = import_backup(&fresh_instance, &tampered_path).unwrap_err();
         assert!(
             error.contains("unexpected file") || error.contains("not listed"),
@@ -3186,7 +3186,7 @@ mod tests {
         }
 
         let fresh = TempDir::new().unwrap();
-        let fresh_instance = fresh.path().join("instances").join("victim3");
+        let fresh_instance = fresh.path().join("victim3");
         let error = import_backup(&fresh_instance, &tampered_path).unwrap_err();
         assert!(
             error.contains("hash mismatch"),
@@ -3216,7 +3216,7 @@ mod tests {
         let artifact = export_snapshot(&instance, &snapshot.id, &export_dir, TRACKED).unwrap();
 
         let fresh = TempDir::new().unwrap();
-        let fresh_instance = fresh.path().join("instances").join("fresh-with-saves");
+        let fresh_instance = fresh.path().join("fresh-with-saves");
         let imported = import_backup(&fresh_instance, &artifact).unwrap();
         crate::snapshot::restore_snapshot(&fresh_instance, &imported.id, TRACKED).unwrap();
         assert_eq!(
@@ -3229,7 +3229,7 @@ mod tests {
         let pre_artifact =
             export_snapshot(&instance, &pre_snapshot.id, &export_dir, TRACKED).unwrap();
         let fresh2 = TempDir::new().unwrap();
-        let fresh_instance2 = fresh2.path().join("instances").join("fresh-prelaunch");
+        let fresh_instance2 = fresh2.path().join("fresh-prelaunch");
         let imported2 = import_backup(&fresh_instance2, &pre_artifact).unwrap();
         crate::snapshot::restore_snapshot(&fresh_instance2, &imported2.id, TRACKED).unwrap();
         assert!(
