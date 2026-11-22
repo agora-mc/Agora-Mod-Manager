@@ -30,6 +30,11 @@
 //! link is `Present` with [`PresentKind::Symlink`], not `Absent`: replacing it would replace the
 //! link, and following it would act on a path nobody validated.
 //!
+//! This applies to the **final path component only**. Directories above it are resolved by the
+//! operating system on the way to the last component, as they are for every path operation; the
+//! probe neither checks nor refuses a link in the middle of a path. A caller that must not write
+//! through an intermediate link resolves its destination first (MASTER_SPEC §32.3).
+//!
 //! # One platform difference, and why it is safe
 //!
 //! Unix reports a path that runs through a regular file as `ENOTDIR`, so it is `CantTell`. Windows
@@ -67,16 +72,12 @@ pub enum PresentKind {
 impl Probe {
     /// Whether the path was absent. This is the only answer that may be read as "nothing there",
     /// and it is still not permission to create, replace or delete anything at the path.
+    ///
+    /// `CantTell` is `false` here, which is the safe direction: a caller that refuses unless this
+    /// is true refuses on an unknown. It deliberately loses the reason; match on the variants when
+    /// the difference between absent and could-not-tell matters.
     pub fn is_absent(&self) -> bool {
         matches!(self, Probe::Absent)
-    }
-
-    /// What is at the path, when anything is.
-    pub fn kind(&self) -> Option<PresentKind> {
-        match self {
-            Probe::Present(kind) => Some(*kind),
-            Probe::Absent | Probe::CantTell(_) => None,
-        }
     }
 }
 
