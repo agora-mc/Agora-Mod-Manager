@@ -357,6 +357,222 @@ pub fn ensure_game_not_running(ctx: &Ctx, instance_id: &str, action: &str) -> Re
     }
 }
 
+/// One typed answer to "may this process change instance X now?" (MASTER_SPEC §32.13).
+///
+/// The question used to have four differently shaped answers — an `InstanceGuard` or a
+/// `LauncherError` code, a [`GameActivity`], a lock error code and a boolean — so every caller
+/// compared code strings to tell "the game is running" from "a record could not be read". This is
+/// the one decision: [`may_mutate`] asks it, [`InstanceGuard::for_mutation`] and its siblings are
+/// this answer turned back into the guard-or-error the UI matches on, and a caller that needs to
+/// know *why* matches a variant instead of a string.
+///
+/// `CantTell` never permits a change: an unreadable lease, an unreadable user-files session or
+/// session store, and a launch that recorded nothing to verify all refuse.
+#[derive(Debug)]
+pub enum MayMutate {
+    /// Nothing is using the instance, and the caller holds its exclusive writer lock. Dropping the
+    /// guard releases the lock.
+    Yes(InstanceGuard),
+    /// Something is using it now. Wait for it to finish; a change would race it.
+    Busy {
+        cause: BusyCause,
+        /// The refusal as the existing callers' error codes describe it, so the UI keeps
+        /// `ERR_INSTANCE_RUNNING` / `ERR_LOCK_TIMEOUT` and their messages.
+        error: LauncherError,
+    },
+    /// A record that answers the question could not be read, or a launch was recorded with no
+    /// process identity to verify. Nothing is known, so nothing may change.
+    CantTell { error: LauncherError },
+}
+
+/// What is using the instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusyCause {
+    /// The instance's game: a live runtime lease, a live user-files session, or an open session
+    /// whose owner is alive.
+    Game,
+    /// Another Agora operation holding the instance's writer lock.
+    Lock,
+}
+
+/// The liveness half of the answer, before the lock is tried.
+enum Liveness {
+    /// Nothing says a game is using the instance.
+    Free,
+    /// The instance's game is using it.
+    Busy(LauncherError),
+    /// A record could not be read, or a launch has nothing to verify.
+    CantTell(LauncherError),
+}
+
+impl MayMutate {
+    /// This answer as the guard or error [`InstanceGuard`]'s functions have always returned.
+    ///
+    /// The codes and messages are unchanged on purpose: the desktop UI and the CLI match on them,
+    /// and this slice moves the decision, not the user-visible behaviour.
+    fn into_result(self) -> LauncherResult<InstanceGuard> {
+        match self {
+            MayMutate::Yes(guard) => Ok(guard),
+            MayMutate::Busy { error, .. } | MayMutate::CantTell { error } => Err(error),
+        }
+    }
+}
+
+/// May this process change `instance_id` now? Takes the instance's writer lock when it may.
+///
+/// One decision, in this order: the runtime lease, then the game's own session records, then the
+/// lock (waiting the lock manager's default), then the lease and the sessions again — a launch
+/// that was already in flight can have published its record while this call waited. The game
+/// checks come first so a running game is refused at once instead of after a 30-second wait.
+pub fn may_mutate(ctx: &Ctx, instance_id: &str, operation: &str) -> MayMutate {
+    decide(ctx, instance_id, operation, false, |resource, operation| {
+        ctx.lock_manager.acquire(resource, operation)
+    })
+}
+
+/// [`may_mutate`] with the user's explicit "change it while the game runs" answer (MASTER_SPEC
+/// §32.13 override). The lock is still taken: two Agora operations never change one instance at
+/// once, whatever the user allowed.
+pub fn may_mutate_while_running(ctx: &Ctx, instance_id: &str, operation: &str) -> MayMutate {
+    decide(ctx, instance_id, operation, true, |resource, operation| {
+        ctx.lock_manager.acquire(resource, operation)
+    })
+}
+
+/// [`may_mutate`] with a bounded lock wait. Test-only: the production entry points use the lock
+/// manager's default wait, and a test must not spend thirty seconds proving it.
+#[cfg(test)]
+fn may_mutate_within(
+    ctx: &Ctx,
+    instance_id: &str,
+    operation: &str,
+    wait: std::time::Duration,
+) -> MayMutate {
+    decide(ctx, instance_id, operation, false, |resource, operation| {
+        ctx.lock_manager
+            .acquire_with_timeout(resource, operation, wait, None)
+    })
+}
+
+fn decide(
+    ctx: &Ctx,
+    instance_id: &str,
+    operation: &str,
+    allow_while_running: bool,
+    acquire: impl FnOnce(LockResource, &str) -> LauncherResult<LockGuard>,
+) -> MayMutate {
+    if !allow_while_running {
+        if let Some(refusal) = refusal(liveness_answer(ctx, instance_id)) {
+            return refusal;
+        }
+    }
+    let lock = match acquire(LockResource::Instance(instance_id.to_string()), operation) {
+        Ok(lock) => lock,
+        // The lock is not ours: another operation holds it, the wait was cancelled, or it could
+        // not be taken at all. A change may not proceed either way.
+        Err(error) => {
+            return MayMutate::Busy {
+                cause: BusyCause::Lock,
+                error,
+            }
+        }
+    };
+    if !allow_while_running {
+        if let Some(refusal) = refusal(liveness_answer(ctx, instance_id)) {
+            return refusal;
+        }
+    }
+    MayMutate::Yes(InstanceGuard {
+        instance_id: instance_id.to_string(),
+        lock,
+        allow_while_running,
+    })
+}
+
+/// The liveness answer as a refusal, or `None` when a change may proceed.
+fn refusal(answer: Liveness) -> Option<MayMutate> {
+    match answer {
+        Liveness::Free => None,
+        Liveness::Busy(error) => Some(MayMutate::Busy {
+            cause: BusyCause::Game,
+            error,
+        }),
+        Liveness::CantTell(error) => Some(MayMutate::CantTell { error }),
+    }
+}
+
+/// The one liveness decision, answered by the records that exist.
+fn liveness_answer(ctx: &Ctx, instance_id: &str) -> Liveness {
+    match lease_answer(&ctx.paths, instance_id) {
+        Liveness::Free => activity_answer(ctx, instance_id),
+        refusal => refusal,
+    }
+}
+
+/// The runtime lease's half of the answer.
+///
+/// The lease is asked first because it is the record that keeps its own error codes — a live game
+/// is `ERR_INSTANCE_RUNNING` and a launch with nothing to verify is `ERR_INSTANCE_LAUNCH_INDETERMINATE`
+/// — and because those codes are what the UI shows.
+fn lease_answer(paths: &AppPaths, instance_id: &str) -> Liveness {
+    let lease = match read(paths, instance_id) {
+        Ok(Some(lease)) => lease,
+        Ok(None) => return Liveness::Free,
+        Err(error) => return Liveness::CantTell(error),
+    };
+    match (lease.state, &lease.identity) {
+        (RuntimeState::Running, Some(identity)) => {
+            if process_identity::verify(identity).is_ok() {
+                return Liveness::Busy(LauncherError::Generic {
+                    code: "ERR_INSTANCE_RUNNING".into(),
+                    message: format!(
+                        "Minecraft is still running for '{instance_id}' (pid {}). Close the game \
+                         before changing this instance.",
+                        identity.pid
+                    ),
+                });
+            }
+            // The recorded process is provably gone — pid, start time, and executable no longer
+            // match — so the lease is stale. If it cannot be released, nothing was proved.
+            match clear(paths, instance_id, Some(&lease.generation)) {
+                Ok(()) => Liveness::Free,
+                Err(error) => Liveness::CantTell(error),
+            }
+        }
+        // Recorded as running but with nothing to verify: the same indeterminate case as Starting.
+        (RuntimeState::Running, None) | (RuntimeState::Starting, _) => {
+            Liveness::CantTell(LauncherError::Generic {
+                code: "ERR_INSTANCE_LAUNCH_INDETERMINATE".into(),
+                message: format!(
+                    "A launch of '{instance_id}' was recorded but never finished starting, so it \
+                     is not possible to tell whether Minecraft is running. Make sure the game is \
+                     closed, then clear the launch state for this instance and try again."
+                ),
+            })
+        }
+    }
+}
+
+/// The game-activity half of the answer: [`game_activity`] as Busy or can't-tell.
+fn activity_answer(ctx: &Ctx, instance_id: &str) -> Liveness {
+    match game_activity(ctx, instance_id) {
+        GameActivity::Idle => Liveness::Free,
+        GameActivity::Running => Liveness::Busy(LauncherError::Generic {
+            code: "ERR_INSTANCE_RUNNING".into(),
+            message: format!(
+                "The game is running in '{instance_id}'; close it before changing this instance."
+            ),
+        }),
+        GameActivity::CouldNotTell(reason) => Liveness::CantTell(LauncherError::Generic {
+            code: "ERR_INSTANCE_LAUNCH_INDETERMINATE".into(),
+            message: format!(
+                "could not tell whether the game is running in '{instance_id}' ({reason}); \
+                 refusing to change this instance."
+            ),
+        }),
+    }
+}
+
 /// Permission to change an instance, from one place for every service.
 ///
 /// Holding this proves two things at once: this process has the instance's
@@ -371,6 +587,9 @@ pub fn ensure_game_not_running(ctx: &Ctx, instance_id: &str, action: &str) -> Re
 /// asking first turns a 30-second timeout into an immediate, named refusal.
 /// The check is repeated after the lock is taken, because a launch that was
 /// already in flight can have published its lease while this guard waited.
+///
+/// The decision behind it is [`may_mutate`]; these functions keep the
+/// guard-or-error shape and the error codes the UI matches on.
 #[derive(Debug)]
 pub struct InstanceGuard {
     instance_id: String,
@@ -384,9 +603,7 @@ impl InstanceGuard {
     /// Blocks while another Agora operation holds the lock (the default
     /// timeout). Use [`Self::for_mutation_async`] from async code.
     pub fn for_mutation(ctx: &Ctx, instance_id: &str, operation: &str) -> LauncherResult<Self> {
-        Self::take(ctx, instance_id, operation, false, |resource, operation| {
-            ctx.lock_manager.acquire(resource, operation)
-        })
+        may_mutate(ctx, instance_id, operation).into_result()
     }
 
     /// The explicit user override for the running-game check: take the lock and
@@ -397,9 +614,7 @@ impl InstanceGuard {
         instance_id: &str,
         operation: &str,
     ) -> LauncherResult<Self> {
-        Self::take(ctx, instance_id, operation, true, |resource, operation| {
-            ctx.lock_manager.acquire(resource, operation)
-        })
+        may_mutate_while_running(ctx, instance_id, operation).into_result()
     }
 
     /// Async counterpart of [`Self::for_mutation`]. The wait for a contested
@@ -409,7 +624,9 @@ impl InstanceGuard {
         instance_id: &str,
         operation: &str,
     ) -> LauncherResult<Self> {
-        Self::take_async(ctx, instance_id, operation, false).await
+        Self::take_async(ctx, instance_id, operation, false)
+            .await
+            .into_result()
     }
 
     /// Async counterpart of [`Self::for_mutation_while_running`].
@@ -418,47 +635,43 @@ impl InstanceGuard {
         instance_id: &str,
         operation: &str,
     ) -> LauncherResult<Self> {
-        Self::take_async(ctx, instance_id, operation, true).await
+        Self::take_async(ctx, instance_id, operation, true)
+            .await
+            .into_result()
     }
 
-    fn take(
-        ctx: &Ctx,
-        instance_id: &str,
-        operation: &str,
-        allow_while_running: bool,
-        acquire: impl FnOnce(LockResource, &str) -> LauncherResult<LockGuard>,
-    ) -> LauncherResult<Self> {
-        if !allow_while_running {
-            ensure_mutation_allowed(ctx, instance_id)?;
-        }
-        let lock = acquire(LockResource::Instance(instance_id.to_string()), operation)?;
-        if !allow_while_running {
-            ensure_mutation_allowed(ctx, instance_id)?;
-        }
-        Ok(Self {
-            instance_id: instance_id.to_string(),
-            lock,
-            allow_while_running,
-        })
-    }
-
+    /// The same decision as [`may_mutate`] with the lock wait awaited instead of blocking:
+    /// [`liveness_answer`] and [`refusal`] are shared, only the wait differs.
     async fn take_async(
         ctx: &Ctx,
         instance_id: &str,
         operation: &str,
         allow_while_running: bool,
-    ) -> LauncherResult<Self> {
+    ) -> MayMutate {
         if !allow_while_running {
-            ensure_mutation_allowed(ctx, instance_id)?;
+            if let Some(refusal) = refusal(liveness_answer(ctx, instance_id)) {
+                return refusal;
+            }
         }
-        let lock = ctx
+        let lock = match ctx
             .lock_manager
             .acquire_async(LockResource::Instance(instance_id.to_string()), operation)
-            .await?;
+            .await
+        {
+            Ok(lock) => lock,
+            Err(error) => {
+                return MayMutate::Busy {
+                    cause: BusyCause::Lock,
+                    error,
+                }
+            }
+        };
         if !allow_while_running {
-            ensure_mutation_allowed(ctx, instance_id)?;
+            if let Some(refusal) = refusal(liveness_answer(ctx, instance_id)) {
+                return refusal;
+            }
         }
-        Ok(Self {
+        MayMutate::Yes(InstanceGuard {
             instance_id: instance_id.to_string(),
             lock,
             allow_while_running,
@@ -479,29 +692,6 @@ impl InstanceGuard {
     /// The underlying lock path, for callers that pass it on.
     pub fn lock(&self) -> &LockGuard {
         &self.lock
-    }
-}
-
-fn ensure_mutation_allowed(ctx: &Ctx, instance_id: &str) -> LauncherResult<()> {
-    // The runtime lease first, because it is the record that keeps its own
-    // error codes: `ERR_INSTANCE_RUNNING` for a live game and
-    // `ERR_INSTANCE_LAUNCH_INDETERMINATE` for a launch with nothing to verify.
-    check_idle(&ctx.paths, instance_id)?;
-    match game_activity(ctx, instance_id) {
-        GameActivity::Idle => Ok(()),
-        GameActivity::Running => Err(LauncherError::Generic {
-            code: "ERR_INSTANCE_RUNNING".into(),
-            message: format!(
-                "The game is running in '{instance_id}'; close it before changing this instance."
-            ),
-        }),
-        GameActivity::CouldNotTell(reason) => Err(LauncherError::Generic {
-            code: "ERR_INSTANCE_LAUNCH_INDETERMINATE".into(),
-            message: format!(
-                "could not tell whether the game is running in '{instance_id}' ({reason}); \
-                 refusing to change this instance."
-            ),
-        }),
     }
 }
 
@@ -717,6 +907,149 @@ mod tests {
 
         let error = InstanceGuard::for_mutation(&ctx, "demo", "test").unwrap_err();
         assert_eq!(error.code(), "ERR_INSTANCE_RUNNING");
+    }
+
+    // ------------------------------------------------------------------
+    // MayMutate: one typed answer (MASTER_SPEC §32.13)
+    // ------------------------------------------------------------------
+
+    fn guard_ctx() -> (Ctx, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = Ctx::for_testing(tmp.path().to_path_buf());
+        init_test_state(&ctx);
+        (ctx, tmp)
+    }
+
+    /// Write a generic instance manifest whose base names `store`, so the instance has a
+    /// user-files journal keyed by it. The id and name are invented; no real user data is used.
+    fn write_generic_instance(ctx: &Ctx, id: &str, game: &str, store: &str) {
+        let game_id = agora_game_api::GameId::new(game).unwrap();
+        let manifest = crate::game_instance::GameInstanceManifest {
+            manifest_version: 1,
+            game: game_id.clone(),
+            instance_id: id.to_string(),
+            name: "Demo".to_string(),
+            runtime_identity: None,
+            base: agora_game_api::BaseReference::Pinned {
+                id: "base-1".to_string(),
+                runtime: agora_game_api::RuntimeIdentity {
+                    game: game_id,
+                    store: agora_game_api::StoreId::new(store).unwrap(),
+                    version: "1.0".to_string(),
+                    build: None,
+                },
+                mode: agora_game_api::BaseMode::Linked,
+            },
+            frameworks: Vec::new(),
+            layers: agora_game_api::LayerStack::default(),
+            deployment: None,
+            saves: crate::game_instance::SavesChoice::Shared,
+            save_scope: None,
+            imported_from: None,
+        };
+        let dir = ctx.paths.instance_dir(id).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("instance_manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_idle_instance_may_mutate() {
+        let (ctx, _tmp) = guard_ctx();
+        match may_mutate(&ctx, "demo", "test") {
+            MayMutate::Yes(guard) => assert_eq!(guard.instance_id(), "demo"),
+            other => panic!("an idle instance must be allowed: {other:?}"),
+        }
+    }
+
+    /// A held lock is Busy, not a grant and not can't-tell: the change has to wait, and the
+    /// existing `ERR_LOCK_TIMEOUT` answer is what the caller and the UI still see.
+    #[test]
+    fn a_held_instance_lock_is_busy() {
+        let (ctx, _tmp) = guard_ctx();
+        let holder = crate::lock_manager::LockManager::new(ctx.paths.locks_root().to_path_buf());
+        let _held = holder
+            .acquire(LockResource::Instance("demo".into()), "holder")
+            .unwrap();
+
+        match may_mutate_within(&ctx, "demo", "test", std::time::Duration::from_millis(150)) {
+            MayMutate::Busy { cause, error } => {
+                assert_eq!(cause, BusyCause::Lock);
+                assert_eq!(error.code(), "ERR_LOCK_TIMEOUT");
+            }
+            other => panic!("a held lock must be busy: {other:?}"),
+        }
+    }
+
+    /// A live game is Busy(Game), and the code the callers translate is unchanged.
+    #[test]
+    fn a_live_lease_is_busy_for_the_game() {
+        let (ctx, _tmp) = guard_ctx();
+        let identity = process_identity::capture(std::process::id()).unwrap();
+        let generation = publish_starting(&ctx.paths, "demo").unwrap();
+        publish_running(&ctx.paths, "demo", &generation, identity).unwrap();
+
+        match may_mutate(&ctx, "demo", "test") {
+            MayMutate::Busy { cause, error } => {
+                assert_eq!(cause, BusyCause::Game);
+                assert_eq!(error.code(), "ERR_INSTANCE_RUNNING");
+            }
+            other => panic!("a live game must be busy: {other:?}"),
+        }
+    }
+
+    /// A launch that recorded nothing to verify is can't-tell, not "idle" and not "running".
+    #[test]
+    fn an_indeterminate_launch_is_cant_tell() {
+        let (ctx, _tmp) = guard_ctx();
+        publish_starting(&ctx.paths, "demo").unwrap();
+
+        match may_mutate(&ctx, "demo", "test") {
+            MayMutate::CantTell { error } => {
+                assert_eq!(error.code(), "ERR_INSTANCE_LAUNCH_INDETERMINATE")
+            }
+            other => panic!("an unfinished launch must be can't-tell: {other:?}"),
+        }
+    }
+
+    /// A lease record that cannot be read is can't-tell, never a grant.
+    #[test]
+    fn an_unreadable_lease_is_cant_tell() {
+        let (ctx, _tmp) = guard_ctx();
+        let path = lease_path(&ctx.paths, "demo").unwrap();
+        fs::create_dir_all(&path).unwrap();
+
+        let refusal = match may_mutate(&ctx, "demo", "test") {
+            MayMutate::CantTell { error } => error,
+            other => panic!("an unreadable lease must be can't-tell: {other:?}"),
+        };
+        assert_eq!(refusal.code(), "ERR_RUNTIME_LEASE_UNREADABLE");
+        // One decision: the existing guard function refuses with the same error, not its own.
+        let error = InstanceGuard::for_mutation(&ctx, "demo", "test").unwrap_err();
+        assert_eq!(error.code(), refusal.code());
+    }
+
+    /// An unreadable user-files journal is a record that answers the question, so it is
+    /// can't-tell, not "no session".
+    #[test]
+    fn an_unreadable_user_files_journal_is_cant_tell() {
+        let (ctx, _tmp) = guard_ctx();
+        write_generic_instance(&ctx, "demo", "skyrim-se", "steam");
+        let journal = ctx.paths.user_files_journal_path("skyrim-se", "steam");
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        // A parse failure must not read as "no session": that is the class of bug this closes.
+        fs::write(&journal, b"{ this is not a journal").unwrap();
+
+        match may_mutate(&ctx, "demo", "test") {
+            MayMutate::CantTell { error } => assert!(
+                error.to_string().contains("journal"),
+                "the refusal must name the unreadable record: {error}"
+            ),
+            other => panic!("an unreadable journal must be can't-tell: {other:?}"),
+        }
     }
 
     #[test]
