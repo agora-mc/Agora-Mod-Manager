@@ -529,6 +529,16 @@ pub(crate) fn snapshot_objects_dir(instance_dir: &Path) -> PathBuf {
 /// that starts from an instance directory alone.
 fn snapshot_app_root(instance_dir: &Path) -> PathBuf {
     let instances_root = instance_dir.parent().unwrap_or(instance_dir);
+    debug_assert!(
+        instances_root
+            .file_name()
+            .is_some_and(|name| name == "instances"),
+        "snapshot instance folder '{}' must sit directly under an 'instances' folder, but its \
+         parent is '{}'; the shared object store and instance-location lock would otherwise be \
+         placed in the wrong root",
+        instance_dir.display(),
+        instances_root.display()
+    );
     if instances_root
         .file_name()
         .is_some_and(|name| name == "instances")
@@ -3245,8 +3255,20 @@ mod tests {
         super::write_snapshot_metadata_fingerprint(dir, id, fingerprint, TRACKED)
     }
 
+    #[test]
+    #[should_panic(expected = "must sit directly under an 'instances' folder")]
+    fn a_bare_folder_is_not_an_instance_directory() {
+        // A standalone directory is not a valid instance: in debug builds the
+        // app-root derivation must catch it instead of silently placing the
+        // shared object store in whatever parent this folder happens to have.
+        let tmp = TempDir::new().unwrap();
+        let _ = snapshot_app_root(tmp.path());
+    }
+
     fn make_instance(tmp: &TempDir) -> PathBuf {
-        let dir = tmp.path().join("instance");
+        // The real layout: `snapshot_app_root` expects the instance folder to
+        // sit directly under `instances/`, with the app root above that.
+        let dir = tmp.path().join("instances").join("instance");
         fs::create_dir_all(dir.join("mods")).unwrap();
         fs::create_dir_all(dir.join("config")).unwrap();
         fs::create_dir_all(dir.join("resourcepacks")).unwrap();
@@ -3296,7 +3318,7 @@ mod tests {
     #[test]
     fn review_invalid_blob_hash_is_kept_not_treated_as_unreferenced() {
         let tmp = TempDir::new().unwrap();
-        let a = tmp.path().join("inst-a");
+        let a = tmp.path().join("instances").join("inst-a");
         fs::create_dir_all(a.join("mods")).unwrap();
         assert!(
             super::blob_is_referenced_by_any_snapshot(&a, "not-a-sha256", list_snapshot_scan_dir),
@@ -3307,7 +3329,7 @@ mod tests {
     #[test]
     fn review_list_snapshots_refuses_when_snapshot_folder_metadata_fails() {
         let tmp = TempDir::new().unwrap();
-        let inst = tmp.path().join("inst");
+        let inst = tmp.path().join("instances").join("inst");
         fs::create_dir_all(&inst).unwrap();
         let snapshots = snapshots_dir(&inst);
         let error = super::list_snapshots_with(&inst, |path| {
@@ -3400,8 +3422,8 @@ mod tests {
     #[test]
     fn review_delete_keeps_shared_blob_when_another_manifest_is_unreadable() {
         let tmp = TempDir::new().unwrap();
-        let a = tmp.path().join("inst-a");
-        let b = tmp.path().join("inst-b");
+        let a = tmp.path().join("instances").join("inst-a");
+        let b = tmp.path().join("instances").join("inst-b");
         for dir in [&a, &b] {
             fs::create_dir_all(dir.join("mods")).unwrap();
             fs::write(dir.join("mods").join("shared.jar"), b"same bytes in both").unwrap();
@@ -3440,8 +3462,8 @@ mod tests {
     #[test]
     fn prune_unreferenced_objects_keeps_blobs_when_a_manifest_is_unreadable() {
         let tmp = TempDir::new().unwrap();
-        let a = tmp.path().join("inst-a");
-        let b = tmp.path().join("inst-b");
+        let a = tmp.path().join("instances").join("inst-a");
+        let b = tmp.path().join("instances").join("inst-b");
         for dir in [&a, &b] {
             fs::create_dir_all(dir.join("mods")).unwrap();
             fs::write(dir.join("mods").join("shared.jar"), b"same bytes in both").unwrap();
@@ -3465,7 +3487,7 @@ mod tests {
     #[test]
     fn delete_still_removes_blobs_nothing_references_and_ignores_helper_json() {
         let tmp = TempDir::new().unwrap();
-        let a = tmp.path().join("inst-a");
+        let a = tmp.path().join("instances").join("inst-a");
         fs::create_dir_all(a.join("mods")).unwrap();
         fs::write(a.join("mods").join("only.jar"), b"only here").unwrap();
         let snap = create_snapshot(&a, Some("a")).unwrap();

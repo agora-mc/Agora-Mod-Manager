@@ -715,7 +715,7 @@ mod tests {
     }
 
     fn setup_instance(tmp: &tempfile::TempDir, mod_files: &[&str]) -> std::path::PathBuf {
-        let dir = tmp.path().join("test-instance");
+        let dir = tmp.path().join("instances").join("test-instance");
         let mods = dir.join("mods");
         fs::create_dir_all(&mods).unwrap();
         for f in mod_files {
