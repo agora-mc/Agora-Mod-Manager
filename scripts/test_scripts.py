@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -4793,6 +4794,291 @@ mod tests {
         # not reported stale.
         self.assertNotIn("windows_user_re::RE: allowlisted but no longer found", stderr)
         self.assertNotIn("linux_home_re::RE: allowlisted but no longer found", stderr)
+
+
+class TestPathRuleGuard(unittest.TestCase):
+    """MASTER_SPEC §32.3: private path validators and hand-written comparisons may only go down."""
+
+    def _run(self, files: dict[str, str], budget: dict[str, Any], comparisons: tuple[str, ...]):
+        """Run the check over `files` (relative path -> source) with a budget, return failure and stderr."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, source in files.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(source, encoding="utf-8")
+            budget_file = root / "path_rules_budget.json"
+            budget_file.write_text(json.dumps(budget), encoding="utf-8")
+            (root / "crates" / "core").mkdir(parents=True, exist_ok=True)
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(cak, "PATH_VALIDATOR_ROOTS", (root,)),
+                mock.patch.object(cak, "PATH_COMPARISON_MODULES", comparisons),
+                mock.patch.object(cak, "PATH_RULES_BUDGET", budget_file),
+                mock.patch.object(cak, "REPO_ROOT", root),
+                mock.patch.object(cak, "EXIT_CODE", 0),
+                contextlib.redirect_stderr(stderr),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                cak.check_path_rules()
+                failed = cak.EXIT_CODE
+        return failed, stderr.getvalue()
+
+    def test_a_private_validator_outside_the_budget_fails_the_check(self):
+        source = (
+            "fn safe_relative(path: &str) -> bool {\n"
+            "    !path.split('/').any(|part| part == \"..\")\n"
+            "}\n"
+        )
+        failed, stderr = self._run(
+            {"crates/core/src/mod.rs": source}, {"validators": {}, "comparisons": {}}, ()
+        )
+        self.assertEqual(failed, 1)
+        self.assertIn("crates/core/src/mod.rs: 1 private path validator(s)", stderr)
+
+    def test_a_validator_that_reasons_about_escaping_is_counted_without_a_helpful_name(self):
+        source = (
+            "fn trip(path: &std::path::Path) -> bool {\n"
+            "    path.components().any(|part| matches!(part, ParentDir))\n"
+            "}\n"
+        )
+        failed, _stderr = self._run(
+            {"crates/core/src/mod.rs": source}, {"validators": {}, "comparisons": {}}, ()
+        )
+        self.assertEqual(failed, 1)
+
+    def test_a_private_link_helper_is_counted_as_a_path_validator(self):
+        # A link check decides whether a name may be used, which is the same decision as a path
+        # validator and must not be re-implemented: one rule lives in agora-game-api.
+        for name in ("is_reparse_point", "is_reparse_meta", "is_link_like", "check_symlink"):
+            source = (
+                f"fn {name}(path: &std::path::Path) -> bool {{\n"
+                "    std::fs::symlink_metadata(path)\n"
+                "        .map(|m| m.file_type().is_symlink())\n"
+                "        .unwrap_or(false)\n"
+                "}\n"
+            )
+            failed, stderr = self._run(
+                {"crates/core/src/mod.rs": source},
+                {"validators": {}, "comparisons": {}},
+                (),
+            )
+            self.assertEqual(failed, 1, f"{name} was not counted")
+            self.assertIn("crates/core/src/mod.rs: 1 private path validator(s)", stderr)
+
+    def test_a_test_fixture_that_names_a_validator_is_not_counted(self):
+        source = (
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    fn safe_zip_entry_name(name: &str) -> bool { !name.is_empty() }\n"
+            "}\n"
+        )
+        failed, _stderr = self._run(
+            {"crates/core/src/mod.rs": source}, {"validators": {}, "comparisons": {}}, ()
+        )
+        self.assertEqual(failed, 0)
+
+    def test_a_budget_must_match_exactly_in_both_directions(self):
+        source = "fn validate_entry_path(path: &str) -> bool { !path.is_empty() }\n"
+        loose, stderr = self._run(
+            {"crates/core/src/mod.rs": source},
+            {"validators": {"crates/core/src/mod.rs": 2}, "comparisons": {}},
+            (),
+        )
+        self.assertEqual(loose, 1)
+        self.assertIn("below the budget of 2", stderr)
+
+        grown, stderr = self._run(
+            {"crates/core/src/mod.rs": source + "\n" + source.replace("entry", "name")},
+            {"validators": {"crates/core/src/mod.rs": 1}, "comparisons": {}},
+            (),
+        )
+        self.assertEqual(grown, 1)
+        self.assertIn("budget 1", stderr)
+
+    def test_an_entry_whose_file_lost_its_validator_is_reported(self):
+        failed, stderr = self._run(
+            {"crates/core/src/mod.rs": "fn plain() {}\n"},
+            {"validators": {"crates/core/src/mod.rs": 1}, "comparisons": {}},
+            (),
+        )
+        self.assertEqual(failed, 1)
+        self.assertIn("budgeted but no path validator found", stderr)
+
+    def test_a_hand_written_comparison_in_a_recovery_module_is_counted(self):
+        source = (
+            "fn owned(recorded: &std::path::Path, asked: &std::path::Path) -> bool {\n"
+            "    match (recorded.canonicalize(), asked.canonicalize()) {\n"
+            "        (Ok(a), Ok(b)) => a == b,\n"
+            "        _ => false,\n"
+            "    }\n"
+            "}\n"
+        )
+        failed, stderr = self._run(
+            {"crates/core/src/recovery.rs": source},
+            {"validators": {}, "comparisons": {}},
+            ("crates/core/src/recovery.rs",),
+        )
+        self.assertEqual(failed, 1)
+        self.assertIn("2 hand-written path comparison(s) not in the budget", stderr)
+
+    def test_a_comparison_module_that_is_gone_is_reported(self):
+        failed, stderr = self._run(
+            {},
+            {"validators": {}, "comparisons": {}},
+            ("crates/core/src/recovery.rs",),
+        )
+        self.assertEqual(failed, 1)
+        self.assertIn("a counted module that is not there", stderr)
+
+    def test_a_free_canonicalize_call_is_counted(self):
+        # `canonicalize(x)`, not only `canonicalize()`: the free function is the same ingredient.
+        source = (
+            "fn real(path: &std::path::Path) -> Option<std::path::PathBuf> {\n"
+            "    std::fs::canonicalize(path).ok()\n"
+            "}\n"
+        )
+        failed, stderr = self._run(
+            {"crates/core/src/recovery.rs": source},
+            {"validators": {}, "comparisons": {}},
+            ("crates/core/src/recovery.rs",),
+        )
+        self.assertEqual(failed, 1)
+        self.assertIn("1 hand-written path comparison(s)", stderr)
+
+    def test_an_associated_components_call_is_counted(self):
+        source = (
+            "fn depth(path: &std::path::Path) -> usize {\n"
+            "    <std::path::Path as AsRef<std::path::Path>>::as_ref(path)\n"
+            "        .components()\n"
+            "        .count()\n"
+            "}\n"
+            "fn same(a: &std::path::Path, b: &std::path::Path) -> bool {\n"
+            "    std::path::Path::components(a).next() == std::path::Path::components(b).next()\n"
+            "}\n"
+        )
+        failed, stderr = self._run(
+            {"crates/core/src/recovery.rs": source},
+            {"validators": {}, "comparisons": {}},
+            ("crates/core/src/recovery.rs",),
+        )
+        self.assertEqual(failed, 1)
+        self.assertIn("3 hand-written path comparison(s)", stderr)
+
+    def test_a_comparator_imported_under_another_name_is_counted(self):
+        # `use ... as ...` is not a way out: the alias is the ingredient.
+        source = (
+            "use agora_game_api::fold_path_case as fold;\n"
+            "fn same(a: &str, b: &str) -> bool {\n"
+            "    fold(a) == fold(b)\n"
+            "}\n"
+        )
+        failed, stderr = self._run(
+            {"crates/core/src/recovery.rs": source},
+            {"validators": {}, "comparisons": {}},
+            ("crates/core/src/recovery.rs",),
+        )
+        self.assertEqual(failed, 1)
+        self.assertIn("2 hand-written path comparison(s)", stderr)
+
+    def test_a_validator_renamed_off_the_verb_list_is_found_by_its_body(self):
+        # Renaming is not a way out either: the body is what decides. Only identifiers can be
+        # markers — a rule spelled as `== ".."` is blanked with the rest of the literal — so these
+        # are the three identifiers a name or escaping decision is written with.
+        for body in (
+            "path.components().any(|part| matches!(part, ParentDir))",
+            "path.is_absolute() || path.has_root()",
+            "is_windows_device_name(stem)",
+        ):
+            source = f"fn trip(path: &std::path::Path, stem: &str) -> bool {{\n    {body}\n}}\n"
+            failed, _stderr = self._run(
+                {"crates/core/src/mod.rs": source}, {"validators": {}, "comparisons": {}}, ()
+            )
+            self.assertEqual(failed, 1, body)
+
+    def test_the_budget_baseline_is_the_branch_point_not_head(self):
+        # A pull request is many commits: code in one, budget in the next. HEAD only sees the
+        # last one, so the copy at the branch point is what the check compares against.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def git(*args):
+                subprocess.run(
+                    ["git", *args], cwd=root, check=True, capture_output=True, text=True
+                )
+
+            git("init", "-q", "-b", "master")
+            (root / "a.txt").write_text("one\n", encoding="utf-8")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "add", "a.txt")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base")
+            branch_point = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            git("update-ref", "refs/remotes/origin/master", branch_point)
+            (root / "a.txt").write_text("two\n", encoding="utf-8")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "raised")
+
+            with mock.patch.object(cak, "REPO_ROOT", root):
+                self.assertEqual(cak.budget_baseline_ref(), branch_point)
+                # And with no remote to ask, the parent of HEAD is the baseline.
+                git("update-ref", "-d", "refs/remotes/origin/master")
+                self.assertEqual(cak.budget_baseline_ref(), branch_point)
+
+    def test_a_budget_file_that_is_new_at_the_baseline_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def git(*args):
+                subprocess.run(
+                    ["git", *args], cwd=root, check=True, capture_output=True, text=True
+                )
+
+            git("init", "-q", "-b", "master")
+            (root / "a.txt").write_text("one\n", encoding="utf-8")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "add", "a.txt")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base")
+            budget_file = root / "path_rules_budget.json"
+            budget_file.write_text("{}", encoding="utf-8")
+            with mock.patch.object(cak, "REPO_ROOT", root), mock.patch.object(
+                cak, "PATH_RULES_BUDGET", budget_file
+            ):
+                self.assertIsNone(cak.committed_budget())
+
+    def test_a_raised_budget_fails_against_the_committed_baseline(self):
+        # Code and budget raised together in one commit is what this catches: the file agrees with
+        # the code, and the committed copy does not.
+        source = "fn validate_entry_path(path: &str) -> bool { !path.is_empty() }\n"
+        with mock.patch.object(
+            cak,
+            "committed_budget",
+            return_value={"rule": 1, "validators": {"crates/core/src/mod.rs": 1}},
+        ):
+            failed, stderr = self._run(
+                {"crates/core/src/mod.rs": source},
+                {"rule": 1, "validators": {"crates/core/src/mod.rs": 2}, "comparisons": {}},
+                (),
+            )
+        self.assertEqual(failed, 1)
+        self.assertIn("budget raised from 1 to 2", stderr)
+
+    def test_a_changed_counting_rule_re_takes_the_numbers(self):
+        # A rule change is a deliberate act with its own diff, so it may move the baseline once.
+        source = "fn validate_entry_path(path: &str) -> bool { !path.is_empty() }\n"
+        with mock.patch.object(
+            cak,
+            "committed_budget",
+            return_value={"rule": 1, "validators": {"crates/core/src/mod.rs": 1}},
+        ):
+            failed, _stderr = self._run(
+                {"crates/core/src/mod.rs": source},
+                {"rule": 2, "validators": {"crates/core/src/mod.rs": 1}, "comparisons": {}},
+                (),
+            )
+        self.assertEqual(failed, 0)
 
 
 if __name__ == "__main__":

@@ -398,11 +398,11 @@ pub fn sweep_instance_logs(
                     continue;
                 }
             };
-            if crate::content_store::is_reparse_point_or_symlink(&metadata) {
+            if crate::content_store::is_reparse_point_or_symlink(&path) {
                 report.skipped.push(SkippedLog {
                     source_id: (*source_id).to_string(),
                     name,
-                    reason: "a junction or symlink is never followed".to_string(),
+                    reason: "a link that points elsewhere is never followed".to_string(),
                     intentional: false,
                 });
                 continue;

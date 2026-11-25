@@ -117,9 +117,11 @@ fn io_err(code: &str, what: &str, error: std::io::Error) -> LauncherError {
 // Link-safe filesystem helpers
 // ---------------------------------------------------------------------------
 
-fn is_link(metadata: &std::fs::Metadata) -> bool {
-    // On Windows std reports junctions and directory symlinks as symlinks.
-    metadata.file_type().is_symlink()
+fn is_link(path: &Path) -> bool {
+    // One rule with the rest of Agora: a symbolic link, a junction and a mount point are links; a
+    // cloud placeholder or a deduplicated file is an ordinary file. std's `is_symlink` alone does
+    // not report a junction, which this used to miss.
+    agora_game_api::redirects_a_name(path)
 }
 
 fn remove_link(path: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
@@ -142,7 +144,7 @@ fn tree_size(root: &Path) -> std::io::Result<u64> {
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             let metadata = std::fs::symlink_metadata(entry.path())?;
-            if is_link(&metadata) {
+            if is_link(&entry.path()) {
                 continue;
             }
             if metadata.is_dir() {
@@ -197,7 +199,7 @@ fn detach_links(root: &Path) -> std::io::Result<Vec<RemovedLink>> {
                 let entry = entry?;
                 let path = entry.path();
                 let metadata = std::fs::symlink_metadata(&path)?;
-                if is_link(&metadata) {
+                if is_link(&path) {
                     #[cfg(windows)]
                     let (target, junction, is_dir) = {
                         use std::os::windows::fs::FileTypeExt;
@@ -237,7 +239,7 @@ fn detach_links(root: &Path) -> std::io::Result<Vec<RemovedLink>> {
 /// True when `path` exists and is a plain directory (not a link to one).
 fn is_plain_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
-        .map(|m| !is_link(&m) && m.is_dir())
+        .map(|m| !is_link(path) && m.is_dir())
         .unwrap_or(false)
 }
 

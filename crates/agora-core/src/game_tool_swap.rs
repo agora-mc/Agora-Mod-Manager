@@ -42,8 +42,6 @@ pub const ASIDE_PREFIX: &str = "Data.agora-aside-";
 pub const COPY_PREFIX: &str = "Data.agora-copy-";
 /// Journal version 2 (junction swaps were version 1; recovery refuses those).
 pub const JOURNAL_VERSION: u32 = 2;
-#[cfg(windows)]
-const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SwapError {
@@ -265,23 +263,11 @@ pub fn read_journal(path: &Path) -> Result<SwapJournal, SwapError> {
     }
 }
 
-/// Whether a path is a junction, symbolic link or other reparse point. A missing path is not one.
+/// Whether a path is a link that redirects a name, from the game contract: a symbolic link, a
+/// junction or a mount point. A cloud placeholder or a deduplicated file is an ordinary folder, and
+/// a missing path redirects nothing.
 pub fn is_reparse_point(path: &Path) -> bool {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => is_reparse_meta(&meta),
-        Err(_) => false,
-    }
-}
-
-#[cfg(windows)]
-fn is_reparse_meta(meta: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn is_reparse_meta(meta: &std::fs::Metadata) -> bool {
-    meta.file_type().is_symlink()
+    agora_game_api::redirects_a_name(path)
 }
 
 #[cfg(windows)]
@@ -292,18 +278,6 @@ fn link_target(link: &Path) -> Option<PathBuf> {
 #[cfg(not(windows))]
 fn link_target(link: &Path) -> Option<PathBuf> {
     std::fs::read_link(link).ok()
-}
-
-/// Compare two paths the way Windows does: case-insensitively, without the `\\?\` prefix.
-pub fn same_path(a: &Path, b: &Path) -> bool {
-    fn norm(p: &Path) -> String {
-        let s = p.to_string_lossy();
-        let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
-        let s = s.replace('/', "\\");
-        let s = s.trim_end_matches('\\');
-        fold_path_case(s)
-    }
-    norm(a) == norm(b)
 }
 
 /// What a path is, in words for a message.
@@ -332,7 +306,7 @@ fn count_files(dir: &Path) -> usize {
         .map(|entry| {
             let path = entry.path();
             match std::fs::symlink_metadata(&path) {
-                Ok(meta) if meta.is_dir() && !is_reparse_meta(&meta) => count_files(&path),
+                Ok(meta) if meta.is_dir() && !is_reparse_point(&path) => count_files(&path),
                 Ok(_) => 1,
                 Err(_) => 0,
             }
@@ -682,23 +656,23 @@ pub fn check_journal_shape(journal: &SwapJournal, loc: &SwapLocation) -> Result<
             journal.run
         ));
     }
-    if !same_path(&journal.install_dir, &loc.install) {
+    if !agora_game_api::same_spelling(&journal.install_dir, &loc.install) {
         return Err("its install folder is not the instance's install folder".into());
     }
-    if !same_path(&journal.real_data, &loc.install.join("Data")) {
+    if !agora_game_api::same_spelling(&journal.real_data, &loc.install.join("Data")) {
         return Err("its Data folder is not the install folder's Data".into());
     }
-    if !same_path(
+    if !agora_game_api::same_spelling(
         &journal.aside,
         &loc.install.join(format!("{ASIDE_PREFIX}{}", journal.run)),
     ) {
         return Err("its aside folder is not Data's sibling named for this run".into());
     }
-    if !same_path(&journal.swap_dir, &loc.swap_dir) {
+    if !agora_game_api::same_spelling(&journal.swap_dir, &loc.swap_dir) {
         return Err("its swap folder is not the instance's swap folder".into());
     }
     let expected = game_tool_copy::copy_dir_for(journal.copy_kind, loc, &journal.run);
-    if !same_path(&journal.copy_dir, &expected) {
+    if !agora_game_api::same_spelling(&journal.copy_dir, &expected) {
         return Err(format!(
             "its copy folder is not where a {} copy goes",
             journal.copy_kind.as_str()
@@ -947,13 +921,14 @@ pub(crate) fn instance_lock(instance_id: &str) -> LockResource {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn paths_compare_without_case_or_the_extended_prefix() {
-        assert!(same_path(
+        assert!(agora_game_api::same_spelling(
             Path::new(r"\\?\C:\Games\Data\"),
             Path::new(r"c:/games/data")
         ));
-        assert!(!same_path(
+        assert!(!agora_game_api::same_spelling(
             Path::new(r"C:\Games\Data"),
             Path::new(r"C:\Games\Data2")
         ));

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use agora_game_api::RelPath;
+use agora_game_api::{RelPath, StrictRelPath};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -386,121 +386,40 @@ pub(crate) fn now_unix_ms() -> i64 {
     }
 }
 
-/// Reserved DOS device names, per Microsoft's "Naming Files, Paths, and Namespaces"
-/// (<https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file>): `CON`, `PRN`, `AUX`,
-/// `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, and the superscript forms `COM¹`/`COM²`/`COM³` and
-/// `LPT¹`/`LPT²`/`LPT³`. `COM0` and `LPT0` are refused too: the same page shows `COM0` as a device
-/// symlink, and refusing a name Windows may route to a device is the safe direction.
+/// Reserved DOS device names: the game contract's rule, so a plugin and the content store refuse
+/// the same ones. See [`agora_game_api::is_windows_device_name`].
+pub use agora_game_api::is_windows_device_name;
+
+/// Whether `path` is a link that redirects a name, from the game contract: a symbolic link, a
+/// junction or a mount point. A cloud placeholder or a deduplicated file is an ordinary file, so a
+/// library that lives on OneDrive imports like any other.
 ///
-/// Windows ignores trailing spaces in a name, including before the extension (`aux .txt` is
-/// `AUX`), so they are trimmed before matching. The caller passes the part before the first dot.
-pub fn is_windows_device_name(stem: &str) -> bool {
-    let s = stem.trim_end_matches([' ', '.']).to_ascii_uppercase();
-    matches!(
-        s.as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM0"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "COM¹"
-            | "COM²"
-            | "COM³"
-            | "LPT0"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-            | "LPT¹"
-            | "LPT²"
-            | "LPT³"
-    )
+/// NOTE: an archive's *stored attributes* are not a path. A 7z entry carries the reparse-point bit
+/// and no tag, so an archive entry that claims one is refused as unclassifiable — see
+/// [`list_sevenz_entries`].
+pub(crate) fn is_reparse_point_or_symlink(path: &std::path::Path) -> bool {
+    agora_game_api::redirects_a_name(path)
 }
 
-pub(crate) fn is_reparse_point_or_symlink(metadata: &std::fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        (metadata.file_attributes() & 0x0000_0400) != 0
-    }
-    #[cfg(not(windows))]
-    {
-        metadata.file_type().is_symlink()
-    }
-}
-
-pub fn validate_entry_path(rel_str: &str) -> Result<RelPath, ContentError> {
-    let norm = rel_str.replace('\\', "/");
-
-    // Check empty or '.' components
-    for comp in norm.split('/') {
-        if comp.is_empty() {
-            return Err(ContentError::InvalidPath {
-                path: rel_str.to_string(),
-                reason: "contains empty component or trailing slash".into(),
-            });
-        }
-        if comp == "." {
-            return Err(ContentError::InvalidPath {
-                path: rel_str.to_string(),
-                reason: "contains '.' component".into(),
-            });
-        }
-        if comp == ".." {
-            return Err(ContentError::InvalidPath {
-                path: rel_str.to_string(),
-                reason: "contains '..' component".into(),
-            });
-        }
-        if comp.ends_with('.') || comp.ends_with(' ') {
-            return Err(ContentError::InvalidPath {
-                path: rel_str.to_string(),
-                reason: "component ends in '.' or space".into(),
-            });
-        }
-        if let Some(bad) = comp
-            .chars()
-            .find(|c| matches!(c, '?' | '*' | '"' | '<' | '>' | '|') || c.is_control())
-        {
-            return Err(ContentError::InvalidPath {
-                path: rel_str.to_string(),
-                reason: format!(
-                    "component '{comp}' contains {} which Windows cannot have in a file name",
-                    if bad.is_control() {
-                        format!("the control character U+{:04X}", u32::from(bad))
-                    } else {
-                        format!("'{bad}'")
-                    }
-                ),
-            });
-        }
-        let stem = comp.split('.').next().unwrap_or("");
-        if is_windows_device_name(stem) {
-            return Err(ContentError::InvalidPath {
-                path: rel_str.to_string(),
-                reason: format!("component '{comp}' uses Windows device name '{stem}'"),
-            });
-        }
-    }
-
-    RelPath::new(&norm).map_err(|e| ContentError::InvalidPath {
+/// The strict path rule the game contract owns: an archive entry becomes a file name only when
+/// something writes it, and the rule it is held to is [`agora_game_api::RelPath::strict`]. The
+/// result is the strict type, so an archive entry cannot reach a write without having been held to
+/// the rule.
+pub fn validate_entry_path(rel_str: &str) -> Result<StrictRelPath, ContentError> {
+    RelPath::strict(rel_str).map_err(|error| ContentError::InvalidPath {
         path: rel_str.to_string(),
-        reason: e.to_string(),
+        reason: error.reason().to_string(),
     })
+}
+
+/// Hold a path this layer already holds to the strict rule before anything writes it, reporting the
+/// value that fails rather than dropping it.
+pub fn strict_before_write(path: &RelPath) -> Result<StrictRelPath, ContentError> {
+    path.check_strict()
+        .map_err(|error| ContentError::InvalidPath {
+            path: path.to_string(),
+            reason: error.reason().to_string(),
+        })
 }
 
 /// The spelling NTFS compares names by: every Unicode letter folded, not just ASCII. Upper then
@@ -513,36 +432,19 @@ pub(crate) fn fold_case(name: &str) -> String {
         .collect()
 }
 
-pub fn validate_path_set(paths: &[RelPath]) -> Result<(), ContentError> {
-    if paths.is_empty() {
-        return Err(ContentError::EmptyItem);
-    }
-
-    let mut seen_lower = HashSet::with_capacity(paths.len());
-    for p in paths {
-        let lower = fold_case(p.as_str());
-        if !seen_lower.insert(lower) {
-            return Err(ContentError::InvalidPath {
-                path: p.to_string(),
-                reason: "equals another file's path case-insensitively".into(),
-            });
-        }
-    }
-
-    for p in paths {
-        let parts: Vec<&str> = p.as_str().split('/').collect();
-        for i in 1..parts.len() {
-            let prefix = fold_case(&parts[..i].join("/"));
-            if seen_lower.contains(&prefix) {
-                return Err(ContentError::InvalidPath {
-                    path: p.to_string(),
-                    reason: format!("prefix folder '{prefix}' matches another file"),
-                });
+/// Refuse a set of paths one case-insensitive disk cannot hold separately: the game contract's
+/// rule, so a plugin and the content store refuse the same sets.
+pub fn validate_path_set(paths: &[StrictRelPath]) -> Result<(), ContentError> {
+    agora_game_api::validate_path_set(paths).map_err(|error| {
+        let reason = error.reason();
+        match error {
+            agora_game_api::PathSetError::EmptySet => ContentError::EmptyItem,
+            agora_game_api::PathSetError::Collides { path }
+            | agora_game_api::PathSetError::FolderIsAFile { path, .. } => {
+                ContentError::InvalidPath { path, reason }
             }
         }
-    }
-
-    Ok(())
+    })
 }
 
 fn disk_free_space(path: &Path) -> Option<u64> {
@@ -758,7 +660,7 @@ fn write_manifest_atomic(paths: &AppPaths, item: &ContentItem) -> Result<(), Con
 // ---------------------------------------------------------------------------
 
 struct StagedEntry {
-    rel_path: RelPath,
+    rel_path: StrictRelPath,
     staged_path: PathBuf,
     size: u64,
     sha256: String,
@@ -795,7 +697,7 @@ struct ListedArchiveEntry {
     index: usize,
     /// The name exactly as the archive stores it (7z matches entries by this).
     name: String,
-    rel_path: RelPath,
+    rel_path: StrictRelPath,
     size: u64,
 }
 
@@ -867,13 +769,20 @@ fn list_sevenz_entries(archive_path: &Path) -> Result<Vec<ListedArchiveEntry>, C
         }
         if entry.has_windows_attributes {
             let attrs = entry.windows_attributes;
+            // An archive stores the reparse *attribute* and not the tag, so an entry that claims to
+            // be one cannot be classified: a link and a cloud placeholder look alike here, and a
+            // link would point outside the store. Unclassifiable is refused, and the message says
+            // which kind of entry to look for.
             let is_reparse_point = (attrs & 0x0400) != 0;
             let unix_mode = (attrs >> 16) as u16;
             let is_unix_symlink = (unix_mode & 0o170000) == 0o120000;
             if is_reparse_point || is_unix_symlink {
                 return Err(ContentError::InvalidPath {
                     path: entry.name.clone(),
-                    reason: "symlinks or reparse points are not allowed".into(),
+                    reason: "an archive entry that claims to be a link (a reparse point) is not \
+                             allowed: its tag is not stored, so it cannot be told from one that \
+                             redirects"
+                        .into(),
                 });
             }
         }
@@ -1091,7 +1000,7 @@ pub(crate) fn add_archive_replacing_locked(
         ArchiveFormat::SevenZ => {
             let listed = list_sevenz_entries(archive_path)?;
             let declared_total_size: u64 = listed.iter().map(|entry| entry.size).sum();
-            let validated_paths: Vec<RelPath> =
+            let validated_paths: Vec<StrictRelPath> =
                 listed.iter().map(|entry| entry.rel_path.clone()).collect();
             let file_names: Vec<String> = listed.iter().map(|entry| entry.name.clone()).collect();
 
@@ -1277,10 +1186,10 @@ pub(crate) fn collect_folder_files(
 
             let rel_str = entry_rel.to_string_lossy().replace('\\', "/");
 
-            if is_reparse_point_or_symlink(&meta) {
+            if is_reparse_point_or_symlink(&abs_path) {
                 return Err(ContentError::InvalidPath {
                     path: rel_str,
-                    reason: "symlinks or reparse points are not allowed".into(),
+                    reason: "a link that points elsewhere is not allowed in a stored folder".into(),
                 });
             }
 
@@ -1288,7 +1197,7 @@ pub(crate) fn collect_folder_files(
                 walk_dir(root, &entry_rel, collected)?;
             } else if meta.is_file() {
                 let rel_path = validate_entry_path(&rel_str)?;
-                collected.push((rel_path, abs_path));
+                collected.push((rel_path.into_rel_path(), abs_path));
             }
         }
         Ok(())
@@ -1339,10 +1248,10 @@ pub fn add_file(
             ContentError::Io(e)
         }
     })?;
-    if is_reparse_point_or_symlink(&meta) {
+    if is_reparse_point_or_symlink(file_path) {
         return Err(ContentError::InvalidPath {
             path: file_path.display().to_string(),
-            reason: "symlinks or reparse points are not allowed".into(),
+            reason: "a link that points elsewhere is not a file to store".into(),
         });
     }
     if !meta.is_file() {
@@ -1374,7 +1283,7 @@ pub fn add_file(
     add_collected(
         ctx,
         &item_name,
-        vec![(rel, file_path.to_path_buf())],
+        vec![(rel.into_rel_path(), file_path.to_path_buf())],
         source,
     )
 }
@@ -1394,7 +1303,10 @@ pub fn add_collected(
 
     clean_staging_dir(&ctx.paths);
 
-    let validated_paths: Vec<RelPath> = collected.iter().map(|(p, _)| p.clone()).collect();
+    let validated_paths: Vec<StrictRelPath> = collected
+        .iter()
+        .map(|(p, _)| strict_before_write(p))
+        .collect::<Result<_, _>>()?;
     validate_path_set(&validated_paths)?;
 
     // Untrusted sizes: check free disk space
@@ -1420,11 +1332,11 @@ pub fn add_collected(
         collected.len(),
         || vec![0u8; HASH_BUFFER_SIZE],
         |buf: &mut Vec<u8>, idx| -> Result<StagedEntry, ContentError> {
-            let (rel_path, abs_path) = &collected[idx];
+            let abs_path = &collected[idx].1;
             let staged_path = staging_dir.join(format!("obj_{idx}"));
             let (size, sha256) = copy_and_hash(abs_path, &staged_path, buf)?;
             Ok(StagedEntry {
-                rel_path: rel_path.clone(),
+                rel_path: validated_paths[idx].clone(),
                 staged_path,
                 size,
                 sha256,
@@ -1595,7 +1507,7 @@ fn finish_adding(
     for entry in staged_entries {
         total_size += entry.size;
         files.push(ContentFile {
-            path: entry.rel_path,
+            path: entry.rel_path.into_rel_path(),
             size: entry.size,
             sha256: entry.sha256,
         });
@@ -1980,7 +1892,11 @@ pub fn derive_item(
         total_size += size;
         present.insert(sha256.clone());
         paths.push(path.clone());
-        content_files.push(ContentFile { path, size, sha256 });
+        content_files.push(ContentFile {
+            path: path.into_rel_path(),
+            size,
+            sha256,
+        });
     }
     validate_path_set(&paths)?;
 

@@ -1091,7 +1091,7 @@ struct SaveEntry {
 /// reported, never silently counted as 0.
 fn sized_save(entry: SaveEntry, warnings: &mut Vec<String>) -> Option<u64> {
     match entry.metadata {
-        Ok(meta) if meta.is_file() && !content_store::is_reparse_point_or_symlink(&meta) => {
+        Ok(meta) if meta.is_file() && !content_store::is_reparse_point_or_symlink(&entry.path) => {
             Some(meta.len())
         }
         Ok(_) => None,
@@ -1155,7 +1155,7 @@ fn plan_saves(
     })?;
     let from = base.join(profile_id);
     match std::fs::symlink_metadata(&from) {
-        Ok(meta) if meta.is_dir() && !content_store::is_reparse_point_or_symlink(&meta) => {}
+        Ok(meta) if meta.is_dir() && !content_store::is_reparse_point_or_symlink(&from) => {}
         Ok(_) => {
             return Err(ImportError::Unreadable {
                 path: from,
@@ -1741,11 +1741,11 @@ fn plan_mods(
                 continue;
             }
             Ok(meta) => {
-                if !meta.is_dir() || content_store::is_reparse_point_or_symlink(&meta) {
+                if !meta.is_dir() || content_store::is_reparse_point_or_symlink(&path) {
                     problems.push(Problem {
                         line: None,
                         entry: entry.name.clone(),
-                        reason: "not a plain folder (a file, a link or a junction); skipped".into(),
+                        reason: "not a plain folder (a file or a link); skipped".into(),
                     });
                     continue;
                 }
@@ -1818,7 +1818,7 @@ fn size_mod_files(paths: &[(RelPath, PathBuf)]) -> Result<SizedModFiles, (String
     for (rel, abs) in paths {
         let meta =
             std::fs::symlink_metadata(abs).map_err(|error| (rel.as_str().to_string(), error))?;
-        if content_store::is_reparse_point_or_symlink(&meta) || !meta.is_file() {
+        if content_store::is_reparse_point_or_symlink(abs) || !meta.is_file() {
             return Err((
                 rel.as_str().to_string(),
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "not a plain file"),
@@ -3259,7 +3259,7 @@ fn copy_space(
                     path: path.clone(),
                     reason: error.to_string(),
                 })?;
-            if !meta.is_file() || content_store::is_reparse_point_or_symlink(&meta) {
+            if !meta.is_file() || content_store::is_reparse_point_or_symlink(path) {
                 return Err(ImportError::Unreadable {
                     path: path.clone(),
                     reason: "the INI is not a plain file".into(),
@@ -3409,7 +3409,7 @@ fn copy_save_files(
                 return Ok(false);
             }
             let meta = std::fs::symlink_metadata(path)?;
-            if !meta.is_file() || content_store::is_reparse_point_or_symlink(&meta) {
+            if !meta.is_file() || content_store::is_reparse_point_or_symlink(path) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "not a plain save file",

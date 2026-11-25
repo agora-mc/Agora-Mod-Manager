@@ -1374,7 +1374,7 @@ impl<'a, S> RecoveryCapability<'a, S> {
         let Some(owned) = self
             .owned
             .iter()
-            .find(|owned| crate::game_tool_swap::same_path(&owned.path, path))
+            .find(|owned| agora_game_api::same_spelling(&owned.path, path))
         else {
             return Err(LauncherError::Generic {
                 code: "ERR_RECOVERY_REFUSED".into(),
@@ -1436,7 +1436,7 @@ impl<'a, S> RecoveryCapability<'a, S> {
         if let Some(owned) = self
             .owned
             .iter_mut()
-            .find(|owned| crate::game_tool_swap::same_path(&owned.path, path))
+            .find(|owned| agora_game_api::same_spelling(&owned.path, path))
         {
             owned.identity = identity;
         }

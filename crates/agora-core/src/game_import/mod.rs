@@ -309,7 +309,7 @@ fn scan_dir(dir: &Path, depth: usize, found: &mut Vec<(PathBuf, String)>) {
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
-        if !meta.is_dir() || content_store::is_reparse_point_or_symlink(&meta) {
+        if !meta.is_dir() || content_store::is_reparse_point_or_symlink(&path) {
             continue;
         }
         let name = fold_path_case(&entry.file_name().to_string_lossy());
@@ -763,11 +763,11 @@ pub fn plan(
                 continue;
             }
             Ok(meta) => {
-                if !meta.is_dir() || content_store::is_reparse_point_or_symlink(&meta) {
+                if !meta.is_dir() || content_store::is_reparse_point_or_symlink(&path) {
                     problems.push(Problem {
                         line: Some(line.line),
                         entry: line.name.clone(),
-                        reason: "not a plain folder (a file, a link or a junction); skipped".into(),
+                        reason: "not a plain folder (a file or a link); skipped".into(),
                     });
                     continue;
                 }
@@ -2515,7 +2515,7 @@ pub fn mo2_run_profiles(
                                 let path = entry.path();
                                 let meta = std::fs::symlink_metadata(&path)
                                     .map_err(|e| saves_unreadable(&path, &e))?;
-                                if content_store::is_reparse_point_or_symlink(&meta)
+                                if content_store::is_reparse_point_or_symlink(&path)
                                     || !meta.is_file()
                                 {
                                     continue;

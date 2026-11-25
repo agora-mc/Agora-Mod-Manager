@@ -1598,20 +1598,9 @@ fn collect_files_recursive(root: &Path) -> std::io::Result<Vec<PathBuf>> {
 }
 
 fn is_symlink_or_reparse(path: &Path) -> bool {
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            return true;
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-            if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                return true;
-            }
-        }
-    }
-    false
+    // One rule with the rest of Agora: a link that redirects a name is refused, a cloud placeholder
+    // or a deduplicated file is an ordinary file.
+    agora_game_api::redirects_a_name(path)
 }
 
 fn remove_empty_parents(

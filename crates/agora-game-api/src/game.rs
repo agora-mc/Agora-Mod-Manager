@@ -1,6 +1,7 @@
 use crate::condition::{Condition, ConditionFacts, Truth};
-use crate::id::{FrameworkId, GameId, InstallId, LayerId, RelPath, StoreId, ToolId};
+use crate::id::{FrameworkId, GameId, InstallId, LayerId, StoreId, ToolId};
 use crate::package::GameContext;
+use crate::path::RelPath;
 use crate::scope::SnapshotScope;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

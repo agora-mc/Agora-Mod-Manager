@@ -2124,6 +2124,21 @@ fn is_plain_base_id_accepts_real_ids_and_refuses_hostile_ones() {
 }
 
 #[test]
+fn a_base_id_uses_the_one_device_name_rule() {
+    // The game contract's list is the one Agora's own writes are held to; a base folder is a folder
+    // like any other, so it is held to the same list rather than a shorter copy of it. These four
+    // are the names the shorter copy used to accept.
+    for bad in ["com0", "lpt0", "com\u{b9}", "lpt\u{b3}"] {
+        assert!(
+            !is_plain_base_id(bad),
+            "{bad:?} is a Windows device name, so it cannot name a base folder"
+        );
+    }
+    // An ordinary id that merely starts like one is still a folder.
+    assert!(is_plain_base_id("communications_steam_1.0_nobuild"));
+}
+
+#[test]
 fn install_size_is_what_a_copied_base_holds_and_errors_when_unreadable() {
     // The build dialog tells the user the Copied cost before building, so the size must equal the
     // bytes a Copied build holds, and an unreadable folder is an error, never 0.
@@ -2316,6 +2331,97 @@ fn build_in_other_root(tmp: &TempDir, build: &str) -> (AppPaths, std::path::Path
     )
     .unwrap();
     (paths, root, outcome.manifest().base_id.clone())
+}
+
+/// A link to a folder: a junction on Windows (no administrator rights needed), a symbolic link
+/// elsewhere. Panics when the link cannot be made, because a test that silently skips proves
+/// nothing.
+fn link_folder(link: &std::path::Path, target: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("cmd runs");
+        assert!(
+            status.status.success() && link.exists(),
+            "mklink /J failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).expect("the link is made");
+}
+
+#[test]
+fn a_record_that_names_the_base_through_a_link_removes_the_folder_it_resolved_to() {
+    // The record's `location` is a link to the base folder rather than the folder Agora made. That
+    // is one folder written another way, and ownership is decided on resolved identity, so the
+    // removal takes the folder it resolved to — once, at its real name — and not the link.
+    let tmp = TempDir::new().unwrap();
+    let (paths, root, base_id) = build_in_other_root(&tmp, "alias");
+    let real = root.join(&base_id);
+    std::fs::write(real.join("keep.txt"), b"keep me").unwrap();
+    let alias = tmp.path().join("alias");
+    link_folder(&alias, &real);
+
+    let manifest_path = paths.base_manifest_path(&base_id);
+    let mut manifest: agora_core::game_base::BaseManifest =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest.location = alias.clone();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    remove_base(&paths, &base_id).expect("the record names the base folder, through a link");
+    assert!(
+        !real.exists(),
+        "the folder the link resolved to is the one removed"
+    );
+    assert!(!manifest_path.exists(), "the record goes with it");
+    assert!(
+        std::fs::symlink_metadata(&alias).is_ok() && !alias.exists(),
+        "the link itself is left alone and dangles"
+    );
+}
+
+#[test]
+fn a_source_install_that_is_a_link_to_the_base_is_refused() {
+    // The base sits inside the install it was built from, but no spelling of the install path looks
+    // like the base's: only the resolved values show it. The check runs on those, so removing the
+    // base cannot delete the install that is pointed at it.
+    let tmp = TempDir::new().unwrap();
+    let (paths, root, base_id) = build_in_other_root(&tmp, "source-link");
+    let real = root.join(&base_id);
+    std::fs::write(real.join("keep.txt"), b"keep me").unwrap();
+    let install_link = tmp.path().join("install-link");
+    link_folder(&install_link, &real);
+
+    let manifest_path = paths.base_manifest_path(&base_id);
+    let mut manifest: agora_core::game_base::BaseManifest =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest.source_location = install_link.clone();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let error =
+        remove_base(&paths, &base_id).expect_err("the base is inside its own source install");
+    assert!(
+        error.to_string().contains("install it was built from"),
+        "the refusal says why: {error}"
+    );
+    assert_eq!(
+        std::fs::read(real.join("keep.txt")).unwrap(),
+        b"keep me",
+        "the base folder survives"
+    );
 }
 
 #[test]

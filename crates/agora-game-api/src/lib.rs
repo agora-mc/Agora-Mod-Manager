@@ -13,6 +13,7 @@ pub mod host;
 pub mod id;
 pub mod layer;
 pub mod package;
+pub mod path;
 pub mod probe;
 pub mod scope;
 
@@ -22,6 +23,7 @@ pub use host::*;
 pub use id::*;
 pub use layer::*;
 pub use package::*;
+pub use path::*;
 pub use probe::*;
 pub use scope::*;
 

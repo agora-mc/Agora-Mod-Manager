@@ -315,18 +315,13 @@ fn read_bounded_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, ProfileIssu
         ));
     }
 
-    // Symlink detection is best-effort (Rust's metadata follows symlinks on
-    // Unix). On Windows we can check reparse points.
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        // FILE_ATTRIBUTE_REPARSE_POINT = 0x400
-        if meta.file_attributes() & 0x400 != 0 {
-            return Err(ProfileIssue::corrupt(
-                Some(path.to_path_buf()),
-                "Path is a reparse point / symlink".to_string(),
-            ));
-        }
+    // One rule with the rest of Agora: a link that redirects a name is not the file its name says,
+    // and a cloud placeholder or a deduplicated file is that file.
+    if agora_game_api::redirects_a_name(path) {
+        return Err(ProfileIssue::corrupt(
+            Some(path.to_path_buf()),
+            "Path is a link: it redirects a name".to_string(),
+        ));
     }
 
     let mut file = std::fs::File::open(path).map_err(|e| {

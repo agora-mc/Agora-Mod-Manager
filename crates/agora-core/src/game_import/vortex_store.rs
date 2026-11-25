@@ -102,7 +102,7 @@ fn acquire_store_lock(store_dir: &Path) -> Result<std::fs::File, LockProbe> {
         #[cfg(not(windows))]
         Err(_) => return Err(LockProbe::Unknown),
     };
-    if !meta.is_file() || crate::content_store::is_reparse_point_or_symlink(&meta) {
+    if !meta.is_file() || crate::content_store::is_reparse_point_or_symlink(&lock) {
         return Err(LockProbe::Unknown);
     }
     lock_file(&lock)
@@ -297,7 +297,7 @@ pub fn read_store(store_dir: &Path) -> Result<VortexStore, VortexStoreError> {
         }
         Err(error) => return Err(unreadable(error.to_string())),
     };
-    if !metadata.is_dir() || crate::content_store::is_reparse_point_or_symlink(&metadata) {
+    if !metadata.is_dir() || crate::content_store::is_reparse_point_or_symlink(store_dir) {
         return Err(unreadable("expected a plain store directory".into()));
     }
     if !has_database_files(store_dir).map_err(|error| unreadable(error.to_string()))? {
@@ -388,11 +388,11 @@ fn has_database_files(dir: &Path) -> io::Result<bool> {
 /// Copy a store's files to `to`, leaving out every `LOCK`. LevelDB needs `CURRENT`, its manifest,
 /// its tables and its log; a link would let a copy reach outside the store, so it is refused.
 fn copy_store(from: &Path, to: &Path) -> io::Result<()> {
-    let check = |path: &Path, meta: &std::fs::Metadata| {
-        if crate::content_store::is_reparse_point_or_symlink(meta) {
+    let check = |path: &Path, _meta: &std::fs::Metadata| {
+        if crate::content_store::is_reparse_point_or_symlink(path) {
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{} is a link or reparse point", path.display()),
+                format!("{} is a link that points elsewhere", path.display()),
             ))
         } else {
             Ok(())
