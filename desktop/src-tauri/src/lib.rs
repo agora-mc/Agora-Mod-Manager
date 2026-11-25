@@ -252,6 +252,29 @@ fn show_recovery_notice(report: &agora_core::startup_recovery::StartupRecoveryRe
         .show();
 }
 
+/// What the player reads when startup cannot continue.
+///
+/// The whole chain, not its outermost line: a refused migration reports what it refused — the
+/// row, the id, both names — in the step that failed, and the outer messages only say that the
+/// step failed. A release build has no console, and the `setup` callback returning an error closes
+/// the window that was about to open, so this dialog is the only thing the player sees.
+fn fatal_startup_message(error: &dyn std::fmt::Display) -> String {
+    format!(
+        "Agora could not start because its local data could not be opened.\n\n{error:#}\n\n\
+         The message above names what needs attention; the log file has the rest."
+    )
+}
+
+/// Show a startup failure the player can read. Blocking: startup is over either way.
+fn show_fatal_startup_error(message: &str) {
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("Agora could not start")
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+}
+
 pub fn run() {
     agora_core::lock_manager::set_program_name("Agora app");
     // Minecraft is a game package; register it with core before any context
@@ -806,12 +829,16 @@ pub fn run() {
                         Some(maintenance_ctx)
                     }
                     Err(e) => {
-                        eprintln!("Failed to initialize core context: {e}");
+                        let message = fatal_startup_message(&e);
+                        eprintln!("{message}");
+                        show_fatal_startup_error(&message);
                         return Err(Box::new(e));
                     }
                 },
                 Err(e) => {
-                    eprintln!("Failed to resolve app data dir: {e}");
+                    let message = fatal_startup_message(&format!("Failed to resolve app data dir: {e}"));
+                    eprintln!("{message}");
+                    show_fatal_startup_error(&message);
                     return Err(format!("Failed to resolve app data dir: {e}").into());
                 }
             };
@@ -970,5 +997,36 @@ mod tests {
         let text = super::recovery_notice_text(&report).expect("a notice");
         assert!(text.contains("Put back the real Data folder of skyrim-se."));
         assert!(text.contains("A tool swap was not put back: needs a hand."));
+    }
+
+    /// A database the migration refuses stops startup, and the window that was about to open
+    /// closes with it: what the player reads is this dialog, so it has to carry the whole chain
+    /// the migration reported and not just "the step failed".
+    #[test]
+    fn the_startup_error_the_player_reads_names_the_rows_that_stopped_it() {
+        let error = anyhow::anyhow!(
+            "rows that would be given another game's instance when the instance tables are \
+             merged: instance_pack_gaps row 2 (instance 'skyrim-pack') has no user_instances row, \
+             and game_instances has an instance with that id ('Riften')"
+        )
+        .context(
+            "local_state.db migration v31 (one instance identity table) failed; version 30 is \
+             still recorded",
+        )
+        .context("Failed to initialize core context");
+
+        let message = super::fatal_startup_message(&error);
+        assert!(
+            message.contains("Agora could not start"),
+            "the dialog says what happened: {message}"
+        );
+        assert!(
+            message.contains("instance_pack_gaps row 2"),
+            "the dialog names the row: {message}"
+        );
+        assert!(
+            message.contains("Riften"),
+            "and the instance that would have taken it: {message}"
+        );
     }
 }
