@@ -1197,6 +1197,7 @@ mod tests {
         let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         upsert_instance(
             &conn,
+            crate::GAME_ID,
             &InstanceRow {
                 instance_id: instance_id.to_string(),
                 name: instance_id.to_string(),

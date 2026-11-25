@@ -334,8 +334,10 @@ fn delete_refuses_id_that_only_exists_in_user_instances_and_leaves_folder_alone(
 
     let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
     conn.execute(
-        "INSERT INTO user_instances (instance_id, name, minecraft_version, loader, loader_version)
-         VALUES ('mc-vanilla', 'Vanilla MC', '1.21', 'vanilla', '')",
+        "INSERT INTO instances (instance_id, game, name)
+         VALUES ('mc-vanilla', 'minecraft', 'Vanilla MC');
+         INSERT INTO minecraft_instances (instance_id, minecraft_version, loader, loader_version)
+         VALUES ('mc-vanilla', '1.21', 'vanilla', '')",
         [],
     )
     .unwrap();
@@ -743,7 +745,7 @@ fn an_unreadable_instance_row_keeps_its_base() {
 
     let conn = rusqlite::Connection::open(ctx.paths.local_state_db()).unwrap();
     conn.execute(
-        "UPDATE game_instances SET base_json = 'not json' WHERE instance_id = ?1",
+        "UPDATE game_instance_bases SET base_json = 'not json' WHERE instance_id = ?1",
         [&rec.instance_id],
     )
     .unwrap();
@@ -753,7 +755,7 @@ fn an_unreadable_instance_row_keeps_its_base() {
         "a base whose users cannot be read is kept"
     );
 
-    conn.execute("DROP TABLE game_instances", []).unwrap();
+    conn.execute("DROP TABLE game_instance_bases", []).unwrap();
     assert!(remove_base(&ctx.paths, &base_id).is_err());
     assert!(base_dir.exists());
 }
@@ -788,7 +790,9 @@ fn a_bad_chosen_id_is_refused_before_any_base_is_built() {
     remove_base(&ctx.paths, &base_id).unwrap();
     let conn = rusqlite::Connection::open(ctx.paths.local_state_db()).unwrap();
     conn.execute(
-        "INSERT INTO user_instances (instance_id, name, minecraft_version, loader, loader_version) VALUES ('taken', 'mc', '1.21', 'vanilla', '')",
+        "INSERT INTO instances (instance_id, game, name) VALUES ('taken', 'minecraft', 'mc');
+         INSERT INTO minecraft_instances (instance_id, minecraft_version, loader, loader_version)
+         VALUES ('taken', '1.21', 'vanilla', '')",
         [],
     )
     .unwrap();

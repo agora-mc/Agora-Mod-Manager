@@ -2456,6 +2456,7 @@ fn create_vanilla_instance(data_dir: &Path, instance_id: &str, version: &str) {
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     agora_core::db::upsert_instance(
         &conn,
+        "minecraft",
         &agora_core::models::InstanceRow {
             instance_id: instance_id.to_string(),
             name: instance_id.to_string(),
@@ -3659,6 +3660,7 @@ fn create_loader_instance(data_dir: &std::path::Path, id: &str, mod_names: &[&st
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     agora_core::db::upsert_instance(
         &conn,
+        "minecraft",
         &agora_core::models::InstanceRow {
             instance_id: id.to_string(),
             name: id.to_string(),

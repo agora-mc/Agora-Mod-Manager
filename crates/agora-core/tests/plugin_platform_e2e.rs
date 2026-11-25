@@ -301,9 +301,14 @@ fn a_real_plugin_supplies_every_platform_hook() {
     {
         let conn = agora_core::db::local_state_connection(&paths.local_state_db()).unwrap();
         conn.execute(
-            "INSERT INTO game_instances (instance_id, game, name, base_json, created_at)
-             VALUES ('e2e-1', ?1, 'Scripted', ?2, '2026-11-06T00:00:00Z')",
-            rusqlite::params![GAME, serde_json::to_string(&base).unwrap()],
+            "INSERT INTO instances (instance_id, game, name, created_at)
+             VALUES ('e2e-1', ?1, 'Scripted', '2026-11-06T00:00:00Z')",
+            rusqlite::params![GAME],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO game_instance_bases (instance_id, base_json) VALUES ('e2e-1', ?1)",
+            rusqlite::params![serde_json::to_string(&base).unwrap()],
         )
         .unwrap();
     }

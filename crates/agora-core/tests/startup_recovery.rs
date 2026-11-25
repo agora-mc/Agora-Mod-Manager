@@ -540,12 +540,19 @@ fn write_instance(ctx: &CoreContext, manifest: &GameInstanceManifest) -> PathBuf
     .unwrap();
     let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
     conn.execute(
-        "INSERT INTO game_instances (instance_id, game, name, base_json, created_at, total_play_ms)
-         VALUES (?1, ?2, ?3, ?4, '2026-11-06T00:00:00Z', 0)",
+        "INSERT INTO instances (instance_id, game, name, created_at, total_play_ms)
+         VALUES (?1, ?2, ?3, '2026-11-06T00:00:00Z', 0)",
         rusqlite::params![
             manifest.instance_id,
             manifest.game.as_str(),
             manifest.name,
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO game_instance_bases (instance_id, base_json) VALUES (?1, ?2)",
+        rusqlite::params![
+            manifest.instance_id,
             serde_json::to_string(&manifest.base).unwrap(),
         ],
     )

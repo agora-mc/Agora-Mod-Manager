@@ -253,15 +253,15 @@ fn trimming_history_removes_the_answers_of_the_rows_it_dropped() {
 fn deleting_an_instance_deletes_its_answers() {
     let conn = db();
     conn.execute(
-        "INSERT INTO game_instances (instance_id, game, name, base_json)
-         VALUES ('inst', 'demo-game', 'Demo', '{}')",
+        "INSERT INTO instances (instance_id, game, name) VALUES ('inst', 'demo-game', 'Demo');
+         INSERT INTO game_instance_bases (instance_id, base_json) VALUES ('inst', '{}')",
         [],
     )
     .unwrap();
     insert_session(&conn, "s1", "inst", "2026-01-01T00:00:00Z");
     store_answer(&conn, &answer("s1", "inst", "2026-01-01T00:01:00Z", "x")).unwrap();
 
-    conn.execute("DELETE FROM game_instances WHERE instance_id = 'inst'", [])
+    conn.execute("DELETE FROM instances WHERE instance_id = 'inst'", [])
         .unwrap();
     let answers: i64 = conn
         .query_row("SELECT COUNT(*) FROM session_answers", [], |row| row.get(0))

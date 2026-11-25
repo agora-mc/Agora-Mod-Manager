@@ -4298,7 +4298,7 @@ name=Dup Instance
         );
     }
 
-    /// A failed `game_instances` lookup ("could not tell") is not proof that a final directory
+    /// A failed `instances` lookup ("could not tell") is not proof that a final directory
     /// can be deleted. The table is renamed here to make every lookup fail deterministically.
     #[test]
     fn test_recover_interrupted_new_import_keeps_final_dir_when_db_lookup_fails() {
@@ -4334,7 +4334,7 @@ name=Dup Instance
         )
         .unwrap();
         connection
-            .execute_batch("ALTER TABLE user_instances RENAME TO user_instances_gone")
+            .execute_batch("ALTER TABLE minecraft_instances RENAME TO minecraft_instances_gone")
             .unwrap();
         drop(connection);
 
@@ -4402,7 +4402,7 @@ name=Dup Instance
     }
 
     /// A generic game instance can already own the final path of a `staging` job. Absence from
-    /// `user_instances` is not proof the import created it, so recovery must keep it.
+    /// `instances` is not proof the import created it, so recovery must keep it.
     #[test]
     fn test_recover_interrupted_keeps_a_final_dir_it_cannot_prove_it_created() {
         let ctx = test_ctx();

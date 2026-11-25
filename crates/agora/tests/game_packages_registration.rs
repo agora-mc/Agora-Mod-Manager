@@ -313,12 +313,12 @@ fn list_all_includes_minecraft_and_generic_game_instances() {
 
     let ctx = agora_core::ctx::Ctx::for_testing(tmp.path().to_path_buf()).with_games(registry);
 
-    // 1. Insert Minecraft instance directly into user_instances
+    // 1. Insert Minecraft instance directly into its two tables
     let conn = rusqlite::Connection::open(paths.local_state_db()).unwrap();
-    conn.execute(
-        "INSERT INTO user_instances (instance_id, name, minecraft_version, loader, loader_version)
-         VALUES ('mc-inst-1', 'My Minecraft', '1.20.1', 'fabric', '0.14.21')",
-        [],
+    conn.execute_batch(
+        "INSERT INTO instances (instance_id, game, name) VALUES ('mc-inst-1', 'minecraft', 'My Minecraft');
+         INSERT INTO minecraft_instances (instance_id, minecraft_version, loader, loader_version)
+         VALUES ('mc-inst-1', '1.20.1', 'fabric', '0.14.21');",
     )
     .unwrap();
 

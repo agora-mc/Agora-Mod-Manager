@@ -2217,6 +2217,7 @@ mod tests {
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
         agora_core::db::upsert_instance(
             &conn,
+            crate::GAME_ID,
             &crate::instance_service::prepare_row("inst", &request),
         )
         .unwrap();

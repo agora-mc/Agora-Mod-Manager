@@ -116,16 +116,23 @@ fn write_instance(ctx: &CoreContext, manifest: &GameInstanceManifest) -> PathBuf
     let conn =
         agora_core::db::local_state_connection(&ctx.paths.local_state_db()).expect("a connection");
     conn.execute(
-        "INSERT INTO game_instances (instance_id, game, name, base_json, created_at, last_launched_at)
-         VALUES (?1, ?2, ?3, ?4, datetime('now'), NULL)",
+        "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
+         VALUES (?1, ?2, ?3, datetime('now'), NULL)",
         rusqlite::params![
             &manifest.instance_id,
             manifest.game.as_str(),
-            &manifest.name,
-            serde_json::to_string(&manifest.base).expect("a base record")
+            &manifest.name
         ],
     )
     .expect("the instance row");
+    conn.execute(
+        "INSERT INTO game_instance_bases (instance_id, base_json) VALUES (?1, ?2)",
+        rusqlite::params![
+            &manifest.instance_id,
+            serde_json::to_string(&manifest.base).expect("a base record")
+        ],
+    )
+    .expect("the base record");
     dir
 }
 
@@ -518,7 +525,7 @@ fn delete_goes_to_recently_deleted_and_restore_puts_it_back() {
     let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db())
         .expect("a connection");
     conn.execute(
-        "UPDATE game_instances SET total_play_ms = 12345 WHERE instance_id = 'grounded-1'",
+        "UPDATE instances SET total_play_ms = 12345 WHERE instance_id = 'grounded-1'",
         [],
     )
     .expect("the play time");
@@ -845,8 +852,9 @@ fn a_delete_cut_off_before_the_row_went_can_still_be_restored() {
     let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db())
         .expect("a connection");
     conn.execute(
-        "INSERT INTO game_instances (instance_id, game, name, base_json, created_at, last_launched_at)
-         VALUES ('grounded-1', 'skyrim-se', 'Grounded', ?1, datetime('now'), NULL)",
+        "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
+         VALUES ('grounded-1', 'skyrim-se', 'Grounded', datetime('now'), NULL);
+         INSERT INTO game_instance_bases (instance_id, base_json) VALUES ('grounded-1', ?1)",
         [serde_json::to_string(&source.base).expect("a base")],
     )
     .expect("the stale row");
@@ -1211,8 +1219,9 @@ fn a_committed_restore_cut_off_before_tidy_is_tidied_without_rewriting() {
     let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db())
         .expect("a connection");
     conn.execute(
-        "INSERT INTO game_instances (instance_id, game, name, base_json, created_at, last_launched_at)
-         VALUES ('grounded-1', 'skyrim-se', 'Renamed', ?1, datetime('now'), NULL)",
+        "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
+         VALUES ('grounded-1', 'skyrim-se', 'Renamed', datetime('now'), NULL);
+         INSERT INTO game_instance_bases (instance_id, base_json) VALUES ('grounded-1', ?1)",
         [serde_json::to_string(&manifest("grounded-1", "Grounded").base).unwrap()],
     )
     .unwrap();
@@ -1250,7 +1259,7 @@ fn a_stale_restore_marker_does_not_claim_a_reused_destination() {
     let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db())
         .expect("a connection");
     conn.execute(
-        "DELETE FROM game_instances WHERE instance_id = 'target-id'",
+        "DELETE FROM instances WHERE instance_id = 'target-id'",
         [],
     )
     .unwrap();

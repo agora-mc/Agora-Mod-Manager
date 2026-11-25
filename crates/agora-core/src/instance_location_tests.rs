@@ -76,13 +76,14 @@ fn instance(ctx: &Ctx, id: &str, item: Option<&str>) -> PathBuf {
     fs::write(dir.join("tracked.txt"), b"shared snapshot bytes").unwrap();
     let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
     conn.execute(
-        "INSERT INTO game_instances (instance_id, game, name, base_json, created_at)
-         VALUES (?1, ?2, ?1, ?3, datetime('now'))",
-        rusqlite::params![
-            id,
-            manifest.game.as_str(),
-            serde_json::to_string(&manifest.base).unwrap()
-        ],
+        "INSERT INTO instances (instance_id, game, name, created_at)
+         VALUES (?1, ?2, ?1, datetime('now'))",
+        rusqlite::params![id, manifest.game.as_str()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO game_instance_bases (instance_id, base_json) VALUES (?1, ?2)",
+        rusqlite::params![id, serde_json::to_string(&manifest.base).unwrap()],
     )
     .unwrap();
     dir
@@ -383,13 +384,14 @@ fn pinned_instance(ctx: &Ctx, id: &str, base_id: &str) -> PathBuf {
     fs::write(dir.join("tracked.txt"), b"shared snapshot bytes").unwrap();
     let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
     conn.execute(
-        "INSERT INTO game_instances (instance_id, game, name, base_json, created_at)
-         VALUES (?1, ?2, ?1, ?3, datetime('now'))",
-        rusqlite::params![
-            id,
-            manifest.game.as_str(),
-            serde_json::to_string(&manifest.base).unwrap()
-        ],
+        "INSERT INTO instances (instance_id, game, name, created_at)
+         VALUES (?1, ?2, ?1, datetime('now'))",
+        rusqlite::params![id, manifest.game.as_str()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO game_instance_bases (instance_id, base_json) VALUES (?1, ?2)",
+        rusqlite::params![id, serde_json::to_string(&manifest.base).unwrap()],
     )
     .unwrap();
     dir
@@ -537,7 +539,7 @@ fn base_removal_cannot_delete_a_base_a_restore_is_publishing() {
     let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
     let present: Option<i64> = conn
         .query_row(
-            "SELECT 1 FROM game_instances WHERE instance_id = 'pinned'",
+            "SELECT 1 FROM game_instance_bases WHERE instance_id = 'pinned'",
             [],
             |row| row.get(0),
         )

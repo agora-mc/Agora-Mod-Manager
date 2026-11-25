@@ -1091,9 +1091,11 @@ mod tests {
         agora_core::db::init_local_state_db(&db).unwrap();
         let conn = agora_core::db::local_state_connection(&db).unwrap();
         conn.execute(
-            "INSERT INTO user_instances
-                (instance_id, name, minecraft_version, loader, loader_version, created_at)
-             VALUES ('inst', 'My Pack', '1.21', 'fabric', '0.16.0', '2026-01-01T00:00:00Z')",
+            "INSERT INTO instances (instance_id, game, name, created_at)
+             VALUES ('inst', 'minecraft', 'My Pack', '2026-01-01T00:00:00Z');
+             INSERT INTO minecraft_instances
+                (instance_id, minecraft_version, loader, loader_version)
+             VALUES ('inst', '1.21', 'fabric', '0.16.0')",
             [],
         )
         .unwrap();

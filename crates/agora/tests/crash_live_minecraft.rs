@@ -68,7 +68,7 @@ fn fixture() -> (tempfile::TempDir, CoreContext, String) {
     agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
     let instance_id = "example-instance".to_string();
     let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-    agora_core::db::upsert_instance(&conn, &instance_row(&instance_id)).unwrap();
+    agora_core::db::upsert_instance(&conn, "minecraft", &instance_row(&instance_id)).unwrap();
     drop(conn);
 
     let manifest_path = ctx.paths.instance_manifest(&instance_id).unwrap();

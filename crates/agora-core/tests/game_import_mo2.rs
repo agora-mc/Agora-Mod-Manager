@@ -1395,7 +1395,7 @@ fn a_half_made_instance_that_cannot_be_removed_is_reported_and_labelled_incomple
     // A trigger that refuses the row's deletion makes the removal fail with the row still listed.
     let conn = rusqlite::Connection::open(f.ctx.paths.local_state_db()).unwrap();
     conn.execute_batch(
-        "CREATE TRIGGER keep_rows BEFORE DELETE ON game_instances \
+        "CREATE TRIGGER keep_rows BEFORE DELETE ON instances \
          BEGIN SELECT RAISE(ABORT, 'row is pinned by the test'); END;",
     )
     .unwrap();

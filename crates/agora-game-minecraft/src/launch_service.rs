@@ -1861,7 +1861,7 @@ mod tests {
             total_play_ms: 0,
         };
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::upsert_instance(&conn, &row).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         let instance_dir = ctx.paths.instance_dir("gc-fixture").unwrap();
         std::fs::create_dir_all(&instance_dir).unwrap();
         let manifest = agora_core::models::InstanceManifest {

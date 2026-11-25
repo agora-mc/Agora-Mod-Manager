@@ -76,9 +76,14 @@ impl Harness {
         let conn =
             agora_core::db::local_state_connection(&self.ctx.paths.local_state_db()).unwrap();
         conn.execute(
-            "INSERT INTO game_instances (instance_id, game, name, base_json, created_at, last_launched_at)
-             VALUES (?1, ?2, ?3, ?4, datetime('now'), NULL)",
-            rusqlite::params![id, "skyrim-se", id, base_json],
+            "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
+             VALUES (?1, ?2, ?3, datetime('now'), NULL)",
+            rusqlite::params![id, "skyrim-se", id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO game_instance_bases (instance_id, base_json) VALUES (?1, ?2)",
+            rusqlite::params![id, base_json],
         )
         .unwrap();
     }

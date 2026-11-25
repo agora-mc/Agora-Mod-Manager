@@ -1270,7 +1270,7 @@ mod tests {
         let path = dir.path().join("local_state.db");
         agora_core::db::init_local_state_db(&path).expect("init db");
         // Open exactly as production does. `instance_update_cache` has an FK to
-        // `user_instances`, which SQLite only enforces with `foreign_keys = ON`;
+        // `instances`, which SQLite only enforces with `foreign_keys = ON`;
         // opening raw here would let a test pass against a constraint the real
         // app path would reject.
         let conn = agora_core::db::local_state_connection(&path).expect("open db");
@@ -1322,7 +1322,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        agora_core::db::upsert_instance(&conn, &row).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
 
         let updates = sample_updates();
         set_cached_instance_updates(&conn, &row.instance_id, &updates).unwrap();
@@ -1358,7 +1358,7 @@ mod tests {
                 import_source: None,
                 total_play_ms: 0,
             };
-            agora_core::db::upsert_instance(&conn, &row).unwrap();
+            agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
             set_cached_instance_updates(&conn, id, &sample_updates()).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -2027,7 +2027,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        agora_core::db::upsert_instance(&conn, &row).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         let mut updates = sample_updates();
         updates.push(UpdateInfo {
             needs_minecraft: Some("1.21.1".into()),
@@ -2110,7 +2110,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        agora_core::db::upsert_instance(&conn, &row).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         let mut updates = sample_updates();
         updates.push(UpdateInfo {
             uncertain: true,

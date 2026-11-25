@@ -2338,7 +2338,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        agora_core::db::upsert_instance(conn, &row).unwrap();
+        agora_core::db::upsert_instance(conn, crate::GAME_ID, &row).unwrap();
     }
 
     fn write(dir: &Path, rel: &str, bytes: &[u8]) {

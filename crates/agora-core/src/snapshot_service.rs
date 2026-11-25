@@ -233,7 +233,7 @@ impl SnapshotService {
     }
 
     /// A restore replaces `instance_manifest.json` wholesale, but the
-    /// `user_instances` row caches the Minecraft version, loader and locked
+    /// `minecraft_instances` row caches the Minecraft version, loader and locked
     /// flag the UI shows. Re-sync it from the restored manifest, or restoring
     /// a migration snapshot leaves the old version on screen while the game
     /// launches the restored one. Every user-facing restore (Snapshots tab,
@@ -475,7 +475,7 @@ mod tests {
             total_play_ms: 0,
         };
         let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        crate::db::upsert_instance(&conn, &row).unwrap();
+        crate::db::upsert_instance(&conn, "minecraft", &row).unwrap();
 
         // Snapshot the 26.2 state, then move the instance back to 26.1.2.
         write_manifest("26.2", "0.20.0", true);
@@ -544,7 +544,7 @@ mod tests {
             total_play_ms: 0,
         };
         let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        crate::db::upsert_instance(&conn, &row).unwrap();
+        crate::db::upsert_instance(&conn, "minecraft", &row).unwrap();
 
         // Snapshot an instance from elsewhere, then restore it here.
         write_manifest("another-instance", "Another", "26.2");

@@ -1075,11 +1075,15 @@ fn a_rebuild_refuses_when_an_instance_moves_to_trash_before_the_pin_recheck() {
     .unwrap();
     let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
     conn.execute(
-        "INSERT INTO game_instances (instance_id, game, name, base_json, created_at)
-         VALUES (?1, ?2, ?1, ?3, datetime('now'))",
+        "INSERT INTO instances (instance_id, game, name, created_at)
+         VALUES (?1, ?2, ?1, datetime('now'))",
+        rusqlite::params!["pinned-instance", manifest.game.as_str()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO game_instance_bases (instance_id, base_json) VALUES (?1, ?2)",
         rusqlite::params![
             "pinned-instance",
-            manifest.game.as_str(),
             serde_json::to_string(&base_ref).unwrap()
         ],
     )
@@ -1335,7 +1339,7 @@ fn base_removal_cannot_remove_a_base_an_instance_create_is_choosing() {
     let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
     let present: Option<i64> = conn
         .query_row(
-            "SELECT 1 FROM game_instances WHERE instance_id = 'chosen-instance'",
+            "SELECT 1 FROM game_instance_bases WHERE instance_id = 'chosen-instance'",
             [],
             |row| row.get(0),
         )

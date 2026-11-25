@@ -1896,6 +1896,13 @@ fn migrate_v17(conn: &Connection) -> anyhow::Result<()> {
     // Lifetime play time. `launch_history` is trimmed to its newest rows,
     // so the total has to live with the instance. Seeded from whatever
     // history survives, which is the best figure available.
+    //
+    // Replayed after v31 the table this seeds no longer exists (its rows are in `instances`
+    // by then and already carry the total), so the step does nothing rather than fail: the
+    // migration tests replay history over a migrated database.
+    if !table_exists(conn, "user_instances")? {
+        return Ok(());
+    }
     add_column_if_missing(
         conn,
         "user_instances",
@@ -3747,11 +3754,13 @@ mod tests {
             MigrationStep {
                 version: 1,
                 name: "good",
+                foreign_keys_off: false,
                 run: a_good_step,
             },
             MigrationStep {
                 version: 2,
                 name: "bad",
+                foreign_keys_off: false,
                 run: a_failing_step,
             },
         ];
@@ -4270,7 +4279,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        upsert_instance(&conn, &row).unwrap();
+        upsert_instance(&conn, "minecraft", &row).unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         let record = InstanceImportRecord {
             instance_id: row.instance_id.clone(),
@@ -4392,7 +4401,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        upsert_instance(&conn, &row).unwrap();
+        upsert_instance(&conn, "minecraft", &row).unwrap();
 
         // Set per-instance Java path
         update_instance_java(
@@ -4442,7 +4451,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        upsert_instance(&conn, &row).unwrap();
+        upsert_instance(&conn, "minecraft", &row).unwrap();
 
         let instances = list_instances(&conn).unwrap();
         let found = instances
@@ -4504,7 +4513,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        upsert_instance(&conn, &row).unwrap();
+        upsert_instance(&conn, "minecraft", &row).unwrap();
 
         let mut files = vec![
             InstancePackFile {
@@ -4560,7 +4569,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        upsert_instance(&conn, &row).unwrap();
+        upsert_instance(&conn, "minecraft", &row).unwrap();
         let files = vec![InstancePackFile {
             relative_path: "mods/a.jar".into(),
             sha256: "a".repeat(64),
@@ -4599,7 +4608,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        upsert_instance(&conn, &row).unwrap();
+        upsert_instance(&conn, "minecraft", &row).unwrap();
         let files = vec![InstancePackFile {
             relative_path: "mods/a.jar".into(),
             sha256: "a".repeat(64),
@@ -4650,7 +4659,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        upsert_instance(&conn, &row).unwrap();
+        upsert_instance(&conn, "minecraft", &row).unwrap();
         let files = vec![InstancePackFile {
             relative_path: "mods/a.jar".into(),
             sha256: "a".repeat(64),
@@ -4755,7 +4764,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        upsert_instance(&conn, &row).unwrap();
+        upsert_instance(&conn, "minecraft", &row).unwrap();
         let mut manifest: crate::models::InstanceManifest =
             serde_json::from_value(serde_json::json!({
                 "instance_id": "resync",
@@ -4773,7 +4782,12 @@ mod tests {
         );
         let (name, version, locked): (String, String, bool) = conn
             .query_row(
-                "SELECT name, minecraft_version, is_locked FROM user_instances WHERE instance_id = 'resync'",
+                "SELECT instances.name, minecraft_instances.minecraft_version,
+                        minecraft_instances.is_locked
+                   FROM instances
+                   JOIN minecraft_instances
+                     ON minecraft_instances.instance_id = instances.instance_id
+                  WHERE instances.instance_id = 'resync'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -4788,7 +4802,7 @@ mod tests {
         sync_instance_row_from_manifest(&conn, "resync", &manifest).unwrap();
         let name: String = conn
             .query_row(
-                "SELECT name FROM user_instances WHERE instance_id = 'resync'",
+                "SELECT name FROM instances WHERE instance_id = 'resync'",
                 [],
                 |r| r.get(0),
             )

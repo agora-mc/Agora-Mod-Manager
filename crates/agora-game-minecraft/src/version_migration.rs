@@ -2098,7 +2098,7 @@ mod tests {
         )
         .unwrap();
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::upsert_instance(&conn, &row).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
     }
 
     fn read_row(ctx: &Ctx, id: &str) -> InstanceRow {

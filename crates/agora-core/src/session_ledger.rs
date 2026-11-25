@@ -2412,17 +2412,18 @@ mod tests {
     #[test]
     fn deleting_an_instance_deletes_its_sessions_and_manifests() {
         let conn = db();
-        conn.execute(
-            "INSERT INTO user_instances
-                (instance_id, name, minecraft_version, loader, loader_version, created_at)
-             VALUES ('mc', 'Mc', '1.21', 'fabric', '0.15.0', '2026-01-01T00:00:00Z')",
-            [],
+        conn.execute_batch(
+            "INSERT INTO instances (instance_id, game, name, created_at)
+             VALUES ('mc', 'minecraft', 'Mc', '2026-01-01T00:00:00Z');
+             INSERT INTO minecraft_instances
+                (instance_id, minecraft_version, loader, loader_version)
+             VALUES ('mc', '1.21', 'fabric', '0.15.0');",
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO game_instances (instance_id, game, name, base_json)
-             VALUES ('skyrim', 'skyrim-se', 'Skyrim', '{}')",
-            [],
+        conn.execute_batch(
+            "INSERT INTO instances (instance_id, game, name)
+             VALUES ('skyrim', 'skyrim-se', 'Skyrim');
+             INSERT INTO game_instance_bases (instance_id, base_json) VALUES ('skyrim', '{}');",
         )
         .unwrap();
         begin(
@@ -2452,11 +2453,11 @@ mod tests {
         let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
 
         conn.execute(
-            "DELETE FROM game_instances WHERE instance_id = 'skyrim'",
+            "DELETE FROM instances WHERE instance_id = 'skyrim'",
             [],
         )
         .unwrap();
-        conn.execute("DELETE FROM user_instances WHERE instance_id = 'mc'", [])
+        conn.execute("DELETE FROM instances WHERE instance_id = 'mc'", [])
             .unwrap();
         assert_eq!(
             count("SELECT COUNT(*) FROM launch_history WHERE instance_id IN ('skyrim','mc')"),
@@ -2475,11 +2476,12 @@ mod tests {
     #[test]
     fn minecraft_history_rows_still_work_on_the_rebuilt_table() {
         let conn = db();
-        conn.execute(
-            "INSERT INTO user_instances
-                (instance_id, name, minecraft_version, loader, loader_version, created_at)
-             VALUES ('mc', 'Mc', '1.21', 'fabric', '0.15.0', '2026-01-01T00:00:00Z')",
-            [],
+        conn.execute_batch(
+            "INSERT INTO instances (instance_id, game, name, created_at)
+             VALUES ('mc', 'minecraft', 'Mc', '2026-01-01T00:00:00Z');
+             INSERT INTO minecraft_instances
+                (instance_id, minecraft_version, loader, loader_version)
+             VALUES ('mc', '1.21', 'fabric', '0.15.0');",
         )
         .unwrap();
         let row = crate::launch_history::begin_launch(

@@ -40,21 +40,19 @@ fn world() -> World {
 
     let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
     conn.execute(
-        "INSERT INTO user_instances (
-             instance_id, name, minecraft_version, loader, loader_version,
-             is_modpack, is_locked, last_launched_at,
-             jvm_memory_mb, jvm_gc, jvm_custom_args, jvm_always_pre_touch, created_at,
+        "INSERT INTO instances (instance_id, game, name, created_at)
+         VALUES (?1, 'minecraft', ?2, ?3)",
+        rusqlite::params![INSTANCE, "Skyblock", "2026-01-01T00:00:00Z"],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO minecraft_instances (
+             instance_id, minecraft_version, loader, loader_version,
+             is_modpack, is_locked, jvm_memory_mb, jvm_gc, jvm_custom_args, jvm_always_pre_touch,
              java_path, java_incompatible_override, icon_path, launch_mode_override,
              jvm_memory_mode
-         ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, NULL, 4096, 'auto', '', 0, ?6, NULL, 0, NULL, 'auto', 'auto')",
-        rusqlite::params![
-            INSTANCE,
-            "Skyblock",
-            "1.21.1",
-            "fabric",
-            "0.16.5",
-            "2026-01-01T00:00:00Z",
-        ],
+         ) VALUES (?1, ?2, ?3, ?4, 0, 0, 4096, 'auto', '', 0, NULL, 0, NULL, 'auto', 'auto')",
+        rusqlite::params![INSTANCE, "1.21.1", "fabric", "0.16.5"],
     )
     .unwrap();
 
