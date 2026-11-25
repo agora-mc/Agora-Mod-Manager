@@ -1313,3 +1313,83 @@ async fn a_partial_fetch_leaves_nothing_applied_and_keeps_fetched_objects() {
         .join(".agora_snapshots")
         .exists());
 }
+
+// -- declared snapshot folders (MASTER_SPEC §32.7) -----------------------------------------------
+
+/// A definition that declares folders of its own, beside the per-file state it names.
+fn definition_declaring(folders: &[&str]) -> GameDefinition {
+    let mut def = definition();
+    def.snapshot = Some(
+        agora_game_api::SnapshotScope::declared(folders, None).expect("the folders are usable"),
+    );
+    def
+}
+
+#[test]
+fn a_declared_snapshot_folder_is_captured_and_restored() {
+    let h = Harness::new();
+    let def = definition_declaring(&["characters"]);
+    let extras = h.dir().join("characters");
+    std::fs::create_dir_all(&extras).unwrap();
+    std::fs::write(extras.join("hero.sav"), b"level 1").unwrap();
+
+    let taken = game_snapshot::create(
+        &h.ctx,
+        &h.id,
+        &def,
+        Some("with characters"),
+        SnapshotOrigin::User,
+    )
+    .unwrap();
+    let captured: Vec<String> = snapshot::snapshot_file_entries(&h.dir(), &taken.id)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.relative_path)
+        .collect();
+    assert!(
+        captured.iter().any(|path| path == "characters/hero.sav"),
+        "the declared folder's file is in the snapshot: {captured:?}"
+    );
+
+    std::fs::write(extras.join("hero.sav"), b"level 9").unwrap();
+    game_snapshot::restore(&h.ctx, &h.id, &def, &taken.id, false).unwrap();
+    assert_eq!(
+        std::fs::read(extras.join("hero.sav")).unwrap(),
+        b"level 1",
+        "the declared folder is state a restore puts back"
+    );
+}
+
+#[test]
+fn a_declared_folder_that_is_missing_captures_nothing_rather_than_failing() {
+    let h = Harness::new();
+    let def = definition_declaring(&["not-written-yet"]);
+    let taken = game_snapshot::create(&h.ctx, &h.id, &def, None, SnapshotOrigin::User)
+        .expect("a folder the game has not written is nothing to capture");
+    let captured: Vec<String> = snapshot::snapshot_file_entries(&h.dir(), &taken.id)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.relative_path)
+        .collect();
+    assert!(
+        !captured
+            .iter()
+            .any(|path| path.starts_with("not-written-yet")),
+        "{captured:?}"
+    );
+}
+
+#[test]
+fn a_declared_folder_that_is_a_file_refuses_the_capture() {
+    let h = Harness::new();
+    let def = definition_declaring(&["characters"]);
+    // The instance has a file where the package declares a folder.
+    std::fs::write(h.dir().join("characters"), b"not a folder").unwrap();
+
+    let refused = game_snapshot::create(&h.ctx, &h.id, &def, None, SnapshotOrigin::User)
+        .expect_err("a file standing in for a declared folder is cannot-tell");
+    assert!(
+        refused.to_string().contains("is a file, not a folder"),
+        "{refused}"
+    );
+}

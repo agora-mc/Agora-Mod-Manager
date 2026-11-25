@@ -26,12 +26,20 @@ impl SnapshotService {
         Self { ctx }
     }
 
-    /// The folders the Minecraft package declared (MASTER_SPEC §32.7).
+    /// The folders the package of `instance_id`'s game declared (MASTER_SPEC §32.7).
     ///
-    /// Core holds no folder list of its own, so a registry whose Minecraft package declares no
-    /// snapshot scope captures and restores nothing and says why.
-    fn require_minecraft_entries(&self) -> LauncherResult<Vec<String>> {
-        let game = agora_game_api::GameId::minecraft();
+    /// Core holds no game's folder list: the instance's own game decides, so a generic game that
+    /// declares folders is captured and restored by the same rule as Minecraft. An instance with no
+    /// row in the identity table is a Minecraft one, the same rule the rest of this service uses. A
+    /// game that declares nothing, or is not installed, is refused with `ERR_SNAPSHOT_SCOPE` rather
+    /// than captured against an empty scope.
+    fn declared_scope(&self, instance_id: &str) -> LauncherResult<Vec<String>> {
+        let game = crate::game_instance::game_of(&self.ctx, instance_id)
+            .map_err(|error| LauncherError::Generic {
+                code: "ERR_LOCAL_STATE_FAILED".into(),
+                message: format!("cannot tell which game '{instance_id}' belongs to: {error}"),
+            })?
+            .unwrap_or_else(agora_game_api::GameId::minecraft);
         let declared = self
             .ctx
             .games
@@ -40,9 +48,11 @@ impl SnapshotService {
         let Some(scope) = declared else {
             return Err(LauncherError::Generic {
                 code: "ERR_SNAPSHOT_SCOPE".into(),
-                message: "no package declares the folders a Minecraft snapshot covers, so nothing \
-                          was captured or restored"
-                    .into(),
+                message: format!(
+                    "no package declares the folders a snapshot of a '{}' instance covers, so \
+                     nothing was captured or restored",
+                    game.as_str()
+                ),
             });
         };
         let entries: Vec<String> = scope
@@ -53,9 +63,11 @@ impl SnapshotService {
         if entries.is_empty() {
             return Err(LauncherError::Generic {
                 code: "ERR_SNAPSHOT_SCOPE".into(),
-                message: "the declared Minecraft snapshot scope is empty, so nothing was captured \
-                          or restored"
-                    .into(),
+                message: format!(
+                    "the snapshot scope declared for '{}' is empty, so nothing was captured or \
+                     restored",
+                    game.as_str()
+                ),
             });
         }
         Ok(entries)
@@ -101,7 +113,7 @@ impl SnapshotService {
             return Ok(snapshot);
         }
 
-        let declared = self.require_minecraft_entries()?;
+        let declared = self.declared_scope(instance_id)?;
         let entries: Vec<&str> = declared.iter().map(String::as_str).collect();
 
         let snapshot = snapshot::create_snapshot_with_origin(
@@ -170,7 +182,7 @@ impl SnapshotService {
             return Ok(outcome.outcome);
         }
 
-        let declared = self.require_minecraft_entries()?;
+        let declared = self.declared_scope(instance_id)?;
         let entries: Vec<&str> = declared.iter().map(String::as_str).collect();
         // A snapshot can carry another instance's manifest (an imported backup,
         // a clone's source). The restore replaces state, never identity.
@@ -456,6 +468,25 @@ mod tests {
         fs::create_dir_all(dir.join("saves").join("world")).unwrap();
         fs::write(dir.join("saves").join("world").join("level.dat"), b"world").unwrap();
         (guard, SnapshotService::new(ctx.clone()), ctx, instance_id)
+    }
+
+    /// The instance's own game decides the scope (MASTER_SPEC §32.7): a Minecraft instance and an
+    /// instance of a game whose package declares nothing are not treated the same, and the refusal
+    /// names the game it could not read a declaration from.
+    #[test]
+    fn a_game_that_declares_no_snapshot_folder_is_refused_by_its_own_name() {
+        let (_root, service, ctx, id) = service();
+        let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        conn.execute(
+            "INSERT INTO instances (instance_id, game, name) VALUES (?1, 'scope-game', 'demo')",
+            [&id],
+        )
+        .unwrap();
+
+        let refused = service
+            .create(&id, None)
+            .expect_err("no declaration, no snapshot");
+        assert!(refused.to_string().contains("scope-game"), "{refused}");
     }
 
     #[test]

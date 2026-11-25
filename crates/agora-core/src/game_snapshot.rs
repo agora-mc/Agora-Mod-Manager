@@ -161,14 +161,32 @@ fn declared_state_paths(definition: &GameDefinition) -> BTreeSet<String> {
     paths
 }
 
-/// Every file under `.agora_loadouts`, relative to the instance folder.
-fn loadout_state_paths(dir: &Path) -> Result<Vec<String>, String> {
+/// Every file under one folder, relative to the instance folder.
+///
+/// A folder that is not there is nothing to capture: a package declares what a snapshot owns, and a
+/// game that has not written that folder yet owns nothing there. A folder that cannot be read, or
+/// that is a file where the declaration names a folder, is cannot-tell and refuses the capture
+/// (MASTER_SPEC §32.13) — silently capturing nothing would restore the instance without it later.
+fn folder_state_paths(dir: &Path, folder: &str) -> Result<Vec<String>, String> {
     let mut paths = Vec::new();
-    let root = crate::loadout::loadouts_dir(dir);
-    if !root.is_dir() {
-        return Ok(paths);
+    let root = dir.join(Path::new(folder));
+    match std::fs::symlink_metadata(&root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(paths),
+        Err(error) => {
+            return Err(format!(
+                "cannot tell whether the declared snapshot folder '{}' is there: {error}",
+                root.display()
+            ))
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(format!(
+                "the declared snapshot folder '{folder}' is a file, not a folder, so this \
+                 instance's snapshots cannot be taken until that is sorted out"
+            ))
+        }
+        Ok(_) => {}
     }
-    let mut stack = vec![root.clone()];
+    let mut stack = vec![root];
     while let Some(folder) = stack.pop() {
         let entries = std::fs::read_dir(&folder)
             .map_err(|error| format!("cannot read {}: {error}", folder.display()))?;
@@ -200,6 +218,15 @@ fn loadout_state_paths(dir: &Path) -> Result<Vec<String>, String> {
     Ok(paths)
 }
 
+/// Every file under `.agora_loadouts`, relative to the instance folder.
+fn loadout_state_paths(dir: &Path) -> Result<Vec<String>, String> {
+    let root = crate::loadout::loadouts_dir(dir);
+    if root.is_dir() {
+        return folder_state_paths(dir, ".agora_loadouts");
+    }
+    Ok(Vec::new())
+}
+
 fn read_state_file(dir: &Path, relative: &str) -> Result<Option<Vec<u8>>, String> {
     let path = dir.join(Path::new(relative));
     match std::fs::read(&path) {
@@ -221,6 +248,15 @@ fn capture_files(
         .map_err(|e| e.to_string())?;
     let mut paths = declared_state_paths(definition);
     paths.extend(loadout_state_paths(&dir)?);
+    // The folders the game's package declares as snapshot state. A game that declares none keeps
+    // the per-file scope its definition implies.
+    for folder in definition
+        .snapshot
+        .iter()
+        .flat_map(|scope| scope.tracked.iter())
+    {
+        paths.extend(folder_state_paths(&dir, folder.as_str())?);
+    }
     let mut files = Vec::with_capacity(paths.len());
     for relative in paths {
         snapshot::validate_relative_path(&relative)?;
