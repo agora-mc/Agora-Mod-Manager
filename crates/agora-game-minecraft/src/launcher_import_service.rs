@@ -237,10 +237,14 @@ fn check_loader_supported(tuple: &LoaderTuple) -> (Option<LoaderTuple>, Vec<Stri
 }
 
 /// Validate a destination ID candidate and produce a safe unique ID.
+///
+/// `taken` answers for one id, because the identity table is shared (MASTER_SPEC §32.7): a
+/// Skyrim instance called `riften` owns that id even with no folder and no Minecraft row in
+/// sight, and asking a list of Minecraft instances would call it free until the write refused it.
 fn resolve_destination_id(
     candidate: &ImportCandidate,
     custom_name: Option<&str>,
-    existing_ids: &[String],
+    taken: impl Fn(&str) -> bool,
 ) -> String {
     let base = custom_name.unwrap_or(&candidate.display_name).to_string();
     let sanitized = agora_core::paths::sanitize_id(&base).to_ascii_lowercase();
@@ -248,13 +252,13 @@ fn resolve_destination_id(
         // Fall back to source_key if the name sanitizes to empty.
         return agora_core::paths::sanitize_id(&candidate.source_key);
     }
-    if !existing_ids.contains(&sanitized) {
+    if !taken(&sanitized) {
         return sanitized;
     }
     // Collision: append a suffix until unique.
     for i in 1..100 {
         let candidate_id = format!("{sanitized}-{i}");
-        if !existing_ids.contains(&candidate_id) {
+        if !taken(&candidate_id) {
             return candidate_id;
         }
     }
@@ -1145,24 +1149,23 @@ impl LauncherImportService {
                 .unwrap_or_else(|| candidate.display_name.clone());
             let sanitized = sanitize_settings(candidate, sel.preserve_settings);
 
-            // Check existing instances in DB for collision.
-            let existing_ids: Vec<String> = conn
-                .as_ref()
-                .and_then(|c| agora_core::db::list_instances(c).ok())
-                .map(|rows| rows.into_iter().map(|r| r.instance_id).collect())
-                .unwrap_or_default();
-
-            // Also account for IDs already claimed in this plan batch.
+            // Is an id free? Asked of `instances`, which every game writes, rather than of the
+            // Minecraft instances a list would show: another game's instance owns its id even
+            // with its folder offline. Ids this plan batch has already claimed are taken too,
+            // and a database that cannot answer counts as taken (a suffix, then the write's own
+            // refusal, rather than a plan that cannot be carried out).
+            let taken = |id: &str| {
+                used_ids.iter().any(|used| used == id)
+                    || conn.as_ref().is_some_and(|connection| {
+                        agora_core::db::instance_id_exists(connection, id).unwrap_or(true)
+                    })
+            };
+            // Also check existing instance names, so a new copy does not take another's.
             let existing_names: Vec<String> = conn
                 .as_ref()
                 .and_then(|c| agora_core::db::list_instances(c).ok())
                 .map(|rows| rows.into_iter().map(|r| r.name).collect())
                 .unwrap_or_default();
-            let all_used: Vec<String> = existing_ids
-                .iter()
-                .cloned()
-                .chain(used_ids.iter().cloned())
-                .collect();
 
             // Check provenance: has this source been imported before?
             let existing_import = conn.as_ref().and_then(|c| {
@@ -1239,11 +1242,11 @@ impl LauncherImportService {
                         "Agora copy was modified; offering a new copy instead of update"
                             .to_string(),
                     );
-                    let id = resolve_destination_id(candidate, Some(&requested_name), &all_used);
+                    let id = resolve_destination_id(candidate, Some(&requested_name), &taken);
                     (ItemAction::New, id, requested_name.clone(), None)
                 }
             } else {
-                let id = resolve_destination_id(candidate, Some(&requested_name), &all_used);
+                let id = resolve_destination_id(candidate, Some(&requested_name), &taken);
                 (ItemAction::New, id, requested_name.clone(), None)
             };
 
@@ -3064,22 +3067,48 @@ mod tests {
     #[test]
     fn test_resolve_destination_id_unique() {
         let c = make_candidate("My Instance");
-        let id = resolve_destination_id(&c, None, &[]);
+        let id = resolve_destination_id(&c, None, |_| false);
         assert_eq!(id, "my-instance");
     }
 
     #[test]
     fn test_resolve_destination_id_collision() {
         let c = make_candidate("My Instance");
-        let id = resolve_destination_id(&c, None, &["my-instance".to_string()]);
+        let id = resolve_destination_id(&c, None, |id| id == "my-instance");
         assert_eq!(id, "my-instance-1");
     }
 
     #[test]
     fn test_resolve_destination_id_custom_name() {
         let c = make_candidate("Original");
-        let id = resolve_destination_id(&c, Some("Custom"), &[]);
+        let id = resolve_destination_id(&c, Some("Custom"), |_| false);
         assert_eq!(id, "custom");
+    }
+
+    #[test]
+    fn a_skyrim_instance_owns_its_id_for_a_minecraft_import() {
+        // The planner asked `list_instances`, which lists Minecraft instances only, so an id a
+        // Skyrim instance owns read as free: the import was planned onto it and the write then
+        // refused it. The other game's folder need not exist for its id to be taken.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("local_state.db");
+        agora_core::db::init_local_state_db(&path).unwrap();
+        let conn = agora_core::db::local_state_connection(&path).unwrap();
+        conn.execute(
+            "INSERT INTO instances (instance_id, game, name, created_at)
+             VALUES ('riften', 'skyrim-se', 'Riften', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let candidate = make_candidate("Riften");
+        let id = resolve_destination_id(&candidate, Some("Riften"), |id| {
+            agora_core::db::instance_id_exists(&conn, id).unwrap_or(true)
+        });
+        assert_eq!(
+            id, "riften-1",
+            "an id another game owns is not free for a Minecraft import"
+        );
     }
 
     // --------------------------------------------------------------
