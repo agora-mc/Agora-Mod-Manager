@@ -260,6 +260,7 @@ fn definition(tools: &[ToolDefinition], user_files: bool, plugins: bool) -> Game
         );
     }
     GameDefinition {
+        snapshot: None,
         mo2_game_name: None,
         import_ids: Default::default(),
         session: Default::default(),

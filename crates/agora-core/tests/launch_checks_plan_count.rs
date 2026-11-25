@@ -119,6 +119,7 @@ fn writes_a_file(id: &str, file: &str) -> ToolDefinition {
 /// The test game: a plugin list (so the load order is checked), and the given tools.
 fn definition(tools: &[ToolDefinition]) -> GameDefinition {
     GameDefinition {
+        snapshot: None,
         mo2_game_name: None,
         import_ids: Default::default(),
         session: Default::default(),

@@ -44,12 +44,6 @@ impl GamePackage for TestPackage {
     fn definition(&self) -> &PackageDefinition {
         &self.0
     }
-
-    /// The Minecraft game declares the snapshot scope these fixtures model (MASTER_SPEC §32.7).
-    fn snapshot_scope(&self, game: &GameId) -> Option<agora_game_api::SnapshotScope> {
-        game.is_minecraft()
-            .then(|| agora_game_api::SnapshotScope::declared(MINECRAFT, None).unwrap())
-    }
 }
 
 /// A Minecraft game, registered so a Minecraft snapshot has the declaration core now reads.
@@ -65,6 +59,10 @@ fn minecraft_definition() -> GameDefinition {
     def.save_location = Vec::new();
     def.ini_checks = Vec::new();
     def.declared_writes = Vec::new();
+    def.snapshot = Some(
+        agora_game_api::SnapshotScope::declared(MINECRAFT, None)
+            .expect("the fixture's Minecraft scope is usable"),
+    );
     def
 }
 

@@ -4227,6 +4227,7 @@ mod placement_tests {
     #[test]
     fn precompiled_path_rules_answer_as_the_definition_does() {
         let definition = GameDefinition {
+            snapshot: None,
             mo2_game_name: None,
             import_ids: Default::default(),
             session: Default::default(),

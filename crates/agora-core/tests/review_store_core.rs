@@ -50,6 +50,7 @@ fn register_test_game_with_features(def: GameDefinition) -> Arc<GameRegistry> {
 
 fn make_test_definition() -> GameDefinition {
     GameDefinition {
+        snapshot: None,
         mo2_game_name: None,
         import_ids: Default::default(),
         session: Default::default(),

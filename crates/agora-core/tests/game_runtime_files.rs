@@ -100,6 +100,7 @@ fn write_plugin_list(s: &Setup, plugins: &[&str]) {
 
 fn make_test_definition() -> GameDefinition {
     GameDefinition {
+        snapshot: None,
         mo2_game_name: None,
         import_ids: Default::default(),
         session: Default::default(),

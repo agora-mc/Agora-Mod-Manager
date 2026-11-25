@@ -35,8 +35,8 @@ impl SnapshotService {
         let declared = self
             .ctx
             .games
-            .package_for(&game)
-            .and_then(|package| package.snapshot_scope(&game));
+            .game(&game)
+            .and_then(|definition| definition.snapshot.as_ref());
         let Some(scope) = declared else {
             return Err(LauncherError::Generic {
                 code: "ERR_SNAPSHOT_SCOPE".into(),
@@ -379,26 +379,16 @@ mod tests {
     /// A registry whose Minecraft package declares the scope these fixtures model, so the service
     /// reads the declaration the way a real package supplies it.
     fn registry() -> std::sync::Arc<crate::game_registry::GameRegistry> {
-        use crate::game_registry::{GameRegistry, PackageSource};
+        use crate::game_registry::{DeclarativePackage, GameRegistry, PackageSource};
         use agora_game_api::{
-            DeploymentStrategy, GameDefinition, GameId, GamePackage, PackageDefinition,
-            SnapshotScope,
+            DeploymentStrategy, GameDefinition, GameId, PackageDefinition, SnapshotScope,
         };
 
-        struct Declaring(PackageDefinition);
-
-        impl GamePackage for Declaring {
-            fn definition(&self) -> &PackageDefinition {
-                &self.0
-            }
-
-            fn snapshot_scope(&self, game: &GameId) -> Option<SnapshotScope> {
-                game.is_minecraft()
-                    .then(|| SnapshotScope::declared(TRACKED, Some(PRELAUNCH)).unwrap())
-            }
-        }
-
         let game = GameDefinition {
+            snapshot: Some(
+                SnapshotScope::declared(TRACKED, Some(PRELAUNCH))
+                    .expect("the fixture's Minecraft scope is usable"),
+            ),
             id: GameId::minecraft(),
             name: "Minecraft: Java Edition".into(),
             extends: None,
@@ -442,7 +432,7 @@ mod tests {
                 PackageSource::Compiled {
                     crate_name: "test".into(),
                 },
-                std::sync::Arc::new(Declaring(package)),
+                std::sync::Arc::new(DeclarativePackage(package)),
             )
             .unwrap();
         std::sync::Arc::new(builder.build())

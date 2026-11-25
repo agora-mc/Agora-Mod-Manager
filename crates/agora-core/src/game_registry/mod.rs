@@ -297,7 +297,7 @@ impl GameRegistryBuilder {
         // A declaration naming the root, `..` or an absolute path is refused here, when the
         // package loads, rather than when a snapshot is first taken or restored.
         for game in &def.games {
-            if let Some(scope) = package.snapshot_scope(&game.id) {
+            if let Some(scope) = &game.snapshot {
                 scope
                     .validate()
                     .map_err(|error| GameRegistryError::InvalidSnapshotScope {
@@ -1104,6 +1104,7 @@ pub mod test_support {
             game_templates: std::collections::BTreeMap::new(),
             behaviours: None,
             games: vec![GameDefinition {
+                snapshot: None,
                 mo2_game_name: None,
                 import_ids: Default::default(),
                 session: Default::default(),

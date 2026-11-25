@@ -693,6 +693,7 @@ mod tests {
 
     fn definition() -> GameDefinition {
         GameDefinition {
+            snapshot: None,
             mo2_game_name: None,
             import_ids: Default::default(),
             session: Default::default(),

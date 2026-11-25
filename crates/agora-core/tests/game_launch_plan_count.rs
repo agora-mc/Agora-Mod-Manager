@@ -58,6 +58,7 @@ impl Launcher for Launches {
 
 fn definition(plugin_list: u8) -> GameDefinition {
     let mut def = GameDefinition {
+        snapshot: None,
         mo2_game_name: None,
         import_ids: Default::default(),
         session: Default::default(),

@@ -42,6 +42,7 @@ fn make_package(
 
 fn dummy_game(id: &str, stores: Vec<(&str, &str)>) -> GameDefinition {
     GameDefinition {
+        snapshot: None,
         mo2_game_name: None,
         import_ids: Default::default(),
         session: Default::default(),
@@ -416,6 +417,7 @@ fn install_id_sanitizing_and_uniqueness() {
 fn spike_machine_skyrim_steam_and_gog_identification() {
     let mut builder = GameRegistry::builder();
     let skyrim_def = GameDefinition {
+        snapshot: None,
         mo2_game_name: None,
         import_ids: Default::default(),
         session: Default::default(),
@@ -579,6 +581,7 @@ fn spike_machine_skyrim_steam_and_gog_identification() {
 fn unreadable_executable_falls_back_to_store_record_and_nothing_usable_gives_unidentified() {
     let mut builder = GameRegistry::builder();
     let game = GameDefinition {
+        snapshot: None,
         mo2_game_name: None,
         import_ids: Default::default(),
         session: Default::default(),
@@ -1139,16 +1142,11 @@ fn the_repo_skyrim_package_keeps_its_vortex_import_id() {
 /// A package that declares a snapshot scope, valid or not.
 struct ScopePackage {
     definition: PackageDefinition,
-    scope: agora_game_api::SnapshotScope,
 }
 
 impl GamePackage for ScopePackage {
     fn definition(&self) -> &PackageDefinition {
         &self.definition
-    }
-
-    fn snapshot_scope(&self, _game: &GameId) -> Option<agora_game_api::SnapshotScope> {
-        Some(self.scope.clone())
     }
 }
 
@@ -1165,6 +1163,8 @@ fn scope(tracked: &[&str]) -> agora_game_api::SnapshotScope {
 
 fn register_with_scope(scope: agora_game_api::SnapshotScope) -> Result<(), GameRegistryError> {
     let mut builder = GameRegistry::builder();
+    let mut game = dummy_game("scope-game", vec![]);
+    game.snapshot = Some(scope);
     let definition = PackageDefinition {
         id: "test.scope".into(),
         version: semver::Version::new(0, 1, 0),
@@ -1172,7 +1172,7 @@ fn register_with_scope(scope: agora_game_api::SnapshotScope) -> Result<(), GameR
         parents: vec![],
         game_templates: BTreeMap::new(),
         behaviours: None,
-        games: vec![dummy_game("scope-game", vec![])],
+        games: vec![game],
         frameworks: vec![],
         tools: vec![],
     };
@@ -1180,7 +1180,7 @@ fn register_with_scope(scope: agora_game_api::SnapshotScope) -> Result<(), GameR
         PackageSource::Compiled {
             crate_name: "test".into(),
         },
-        Arc::new(ScopePackage { definition, scope }),
+        Arc::new(ScopePackage { definition }),
     )
 }
 

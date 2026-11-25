@@ -275,6 +275,7 @@ fn set_active_prefix(rule: &mut LoadOrderDefinition, prefix: String) {
 
 fn definition() -> GameDefinition {
     GameDefinition {
+        snapshot: None,
         mo2_game_name: None,
         import_ids: Default::default(),
         session: Default::default(),
