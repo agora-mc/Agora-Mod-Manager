@@ -1,6 +1,7 @@
 use crate::models::InstanceRow;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -327,7 +328,7 @@ pub fn init_local_state_db_with(
         }
     }
     if current < target {
-        run_migrations(&conn)?;
+        report.warnings.extend(run_migrations(&conn)?);
     }
     report.migrated_to = schema_version(&conn)?;
 
@@ -1086,14 +1087,17 @@ pub fn global_always_pre_touch(conn: &Connection) -> Option<bool> {
 /// Each step runs in its own transaction, which also records the step's
 /// version, so a failure leaves the last successful version recorded and the
 /// database usable. When no step is pending, nothing is executed at all.
-pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
+///
+/// Returns the warnings a caller should surface (see `run_migration_steps`); a caller that
+/// drops them loses a report, not data.
+pub fn run_migrations(conn: &Connection) -> anyhow::Result<Vec<String>> {
     run_migration_steps(conn, MIGRATIONS, LOCAL_STATE_SCHEMA_VERSION)
 }
 
 /// Apply migrations only up to `target`. Tests use this to build a database as
 /// an earlier release wrote it, then open it with [`init_local_state_db`].
 #[doc(hidden)]
-pub fn run_migrations_to(conn: &Connection, target: i64) -> anyhow::Result<()> {
+pub fn run_migrations_to(conn: &Connection, target: i64) -> anyhow::Result<Vec<String>> {
     run_migration_steps(conn, MIGRATIONS, target)
 }
 
@@ -1303,11 +1307,17 @@ const MIGRATIONS: &[MigrationStep] = &[
 /// two processes starting at once cannot apply the same step twice; inside an
 /// existing transaction it uses a savepoint instead. The version is re-read
 /// under that lock before running, which is what makes the second starter skip.
+///
+/// Returns what the caller should tell the player: today, the broken references a rebuilt step
+/// found in the database it arrived with. Those are reported and left alone (the protection is
+/// against orphans the step itself creates), and a step that stops to report them is still
+/// better than one that quietly keeps them.
 fn run_migration_steps(
     conn: &Connection,
     steps: &[MigrationStep],
     target: i64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
+    let mut notices = Vec::new();
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_version (
              version INTEGER PRIMARY KEY
@@ -1338,7 +1348,7 @@ fn run_migration_steps(
                 step.name
             );
         }
-        let broken_references = if step.foreign_keys_off {
+        let arrived_broken = if step.foreign_keys_off {
             // Recorded before the rebuild, so the check after it reports what this step broke
             // rather than a reference that was already broken when the database arrived.
             conn.execute_batch("PRAGMA foreign_keys = OFF")?;
@@ -1346,6 +1356,7 @@ fn run_migration_steps(
         } else {
             Vec::new()
         };
+        let mut broken_budget = broken_reference_budget(&arrived_broken);
         if standalone {
             conn.execute_batch("BEGIN IMMEDIATE")?;
         } else {
@@ -1364,11 +1375,13 @@ fn run_migration_steps(
             if step.foreign_keys_off {
                 // Inside the transaction, before the commit: a row whose parent this step did not
                 // create would otherwise be committed as an orphan.
-                let now = foreign_key_violations(conn)?;
-                let new: Vec<String> = now
-                    .into_iter()
-                    .filter(|violation| !broken_references.contains(violation))
-                    .collect();
+                let mut new = Vec::new();
+                for violation in foreign_key_violations(conn)? {
+                    match broken_budget.get_mut(&violation.table) {
+                        Some(left) if *left > 0 => *left -= 1,
+                        _ => new.push(violation.describe()),
+                    }
+                }
                 if !new.is_empty() {
                     anyhow::bail!(
                         "the rebuild left rows that point at no instance: {}",
@@ -1409,6 +1422,21 @@ fn run_migration_steps(
             Ok(applied) => {
                 if applied {
                     current = step.version;
+                    if !arrived_broken.is_empty() {
+                        notices.push(format!(
+                            "local_state.db already had {} row(s) that point at no instance when \
+                             migration v{} ({}) ran: {}. They were left alone rather than deleted; \
+                             delete or repair them by hand if they matter.",
+                            arrived_broken.len(),
+                            step.version,
+                            step.name,
+                            arrived_broken
+                                .iter()
+                                .map(BrokenReference::describe)
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        ));
+                    }
                 }
             }
             Err(error) => {
@@ -1419,30 +1447,60 @@ fn run_migration_steps(
             }
         }
     }
-    Ok(())
+    Ok(notices)
 }
 
-/// Every row that references a parent row which does not exist, one line each.
+/// A row that references a parent row which does not exist.
 ///
 /// `PRAGMA foreign_key_check` names the child table and the rowid, but not which instance is
-/// missing, so the parent table and key are added for a report a person can act on.
-fn foreign_key_violations(conn: &Connection) -> anyhow::Result<Vec<String>> {
+/// missing, so the parent table is kept for a report a person can act on.
+struct BrokenReference {
+    table: String,
+    rowid: Option<i64>,
+    parent: String,
+}
+
+impl BrokenReference {
+    fn describe(&self) -> String {
+        format!(
+            "{} row {} references {}",
+            self.table,
+            self.rowid
+                .map_or_else(|| "?".to_string(), |id| id.to_string()),
+            self.parent
+        )
+    }
+}
+
+/// Every row that references a parent row which does not exist.
+fn foreign_key_violations(conn: &Connection) -> anyhow::Result<Vec<BrokenReference>> {
     let mut stmt = conn.prepare("SELECT \"table\", rowid, parent FROM pragma_foreign_key_check")?;
     let rows = stmt.query_map([], |row| {
-        let table: String = row.get(0)?;
-        let rowid: Option<i64> = row.get(1)?;
-        let parent: String = row.get(2)?;
-        Ok(format!(
-            "{table} row {} references {parent}",
-            rowid.map_or_else(|| "?".to_string(), |id| id.to_string())
-        ))
+        Ok(BrokenReference {
+            table: row.get(0)?,
+            rowid: row.get(1)?,
+            parent: row.get(2)?,
+        })
     })?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
     }
-    out.sort();
+    out.sort_by(|a, b| (&a.table, a.rowid, &a.parent).cmp(&(&b.table, b.rowid, &b.parent)));
     Ok(out)
+}
+
+/// How many broken references each child table had, which is what survives a table rebuild.
+///
+/// The rebuild copies rows into new tables and may rename the parent, so a row's description
+/// before the step does not match its description after. Counting per child table does: a step
+/// that breaks a reference raises a table's count, and one that repairs an orphan lowers it.
+fn broken_reference_budget(violations: &[BrokenReference]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for violation in violations {
+        *counts.entry(violation.table.clone()).or_insert(0) += 1;
+    }
+    counts
 }
 
 /// Add a column only when it is missing, failing on a real ALTER error.

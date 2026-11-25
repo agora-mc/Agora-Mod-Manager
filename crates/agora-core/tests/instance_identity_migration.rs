@@ -9,7 +9,8 @@
 use std::path::{Path, PathBuf};
 
 use agora_core::db::{
-    init_local_state_db, local_state_connection, run_migrations_to, LOCAL_STATE_SCHEMA_VERSION,
+    init_local_state_db, init_local_state_db_with, local_state_connection, run_migrations_to,
+    LocalStateOpenOptions, LOCAL_STATE_SCHEMA_VERSION,
 };
 use rusqlite::Connection;
 
@@ -570,5 +571,68 @@ fn the_database_refuses_a_detail_row_that_contradicts_the_identity() {
     assert!(
         error.to_string().contains("minecraft"),
         "the refusal names the row that would be orphaned: {error}"
+    );
+}
+
+#[test]
+fn a_row_that_already_pointed_at_no_instance_is_reported_and_left_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = old_database(tmp.path());
+    // A database written while foreign keys were off can hold a row whose instance was never
+    // there. It arrives broken; the step must report it, not refuse the migration and not
+    // delete the row to make its own check pass.
+    let orphan_rowid: i64 = {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        conn.execute(
+            "INSERT INTO instance_pack_gaps (instance_id, filename, display_name, status)
+             VALUES ('instance-that-never-existed', 'c.jar', 'Sea', 'missing')",
+            [],
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT rowid FROM instance_pack_gaps
+              WHERE instance_id = 'instance-that-never-existed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    let report = init_local_state_db_with(&path, &LocalStateOpenOptions::default())
+        .expect("a reference that was already broken does not block the migration");
+
+    let conn = local_state_connection(&path).unwrap();
+    assert_eq!(
+        version(&conn),
+        LOCAL_STATE_SCHEMA_VERSION,
+        "the step ran: the old tables are gone and the identity table is there"
+    );
+    assert!(table_exists(&conn, "instances"));
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM instance_pack_gaps
+              WHERE instance_id = 'instance-that-never-existed'"
+        ),
+        1,
+        "the row is kept exactly as it arrived"
+    );
+
+    let warning = report
+        .warnings
+        .iter()
+        .find(|warning| warning.contains("point at no instance"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the report names the orphan instead of hiding it: {:?}",
+                report.warnings
+            )
+        });
+    assert!(warning.contains("1 row(s)"), "{warning}");
+    assert!(warning.contains("instance_pack_gaps"), "{warning}");
+    assert!(
+        warning.contains(&format!("row {orphan_rowid}")),
+        "the report names the row, not just the table: {warning}"
     );
 }
