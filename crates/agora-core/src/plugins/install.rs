@@ -798,9 +798,10 @@ pub(super) use journal::{
     check_for_interrupted_install, settle_before_install, uninstall, InstallJournal,
 };
 pub use journal::{
-    crash_point, install_journal_path, recover_interrupted_installs,
+    crash_point, direction, install_journal_path, journal_report, recover_interrupted_installs,
     recover_interrupted_installs_with, resolve_installs, resolve_installs_at_startup,
-    InstallCrashPoint, InstallRecovery, InstallResolution, PluginInstallState,
+    InstallCrashPoint, InstallDirection, InstallJournalReport, InstallRecovery, InstallResolution,
+    PluginInstallState,
 };
 
 /// The directory a package version is installed into.

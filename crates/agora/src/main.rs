@@ -2615,6 +2615,37 @@ async fn async_main() {
         Some(root) => agora_core::app_paths::AppPaths::from_root(root),
         None => agora_core::app_paths::AppPaths::platform_default(),
     };
+    // `agora doctor` reports on a database that may be corrupt or written by a
+    // newer Agora, so it must run before core initializes (and possibly repairs
+    // or refuses) anything. It also runs before the CLI log is opened: a
+    // command whose whole promise is "this changes nothing" writes no log.
+    if let Commands::Doctor = &cli.command {
+        match run_doctor(&paths, json) {
+            // Damage is reported on standard output (human or JSON); the exit
+            // code is the machine-readable part. Ten is the same local-state
+            // failure code a failing database command uses.
+            Ok(false) => std::process::exit(10),
+            Ok(true) => {}
+            Err(error) => {
+                let code = exit_code_from_error(&error);
+                if json {
+                    eprintln!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "error": error.to_string(),
+                            "exitCode": code,
+                        }))
+                        .unwrap()
+                    );
+                } else {
+                    eprintln!("Error: {error}");
+                }
+                std::process::exit(code);
+            }
+        }
+        return;
+    }
+
     let log_path = cli
         .log_file
         .clone()
@@ -2646,36 +2677,6 @@ async fn async_main() {
                 eprintln!("Error: {error}");
             }
             std::process::exit(code);
-        }
-        return;
-    }
-
-    // `agora doctor` reports on a database that may be corrupt or written by a
-    // newer Agora, so it must run before core initializes (and possibly repairs
-    // or refuses) anything.
-    if let Commands::Doctor = &cli.command {
-        match run_doctor(&paths, json) {
-            // Damage is reported on standard output (human or JSON); the exit
-            // code is the machine-readable part. Ten is the same local-state
-            // failure code a failing database command uses.
-            Ok(false) => std::process::exit(10),
-            Ok(true) => {}
-            Err(error) => {
-                let code = exit_code_from_error(&error);
-                if json {
-                    eprintln!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "error": error.to_string(),
-                            "exitCode": code,
-                        }))
-                        .unwrap()
-                    );
-                } else {
-                    eprintln!("Error: {error}");
-                }
-                std::process::exit(code);
-            }
         }
         return;
     }
@@ -2779,6 +2780,76 @@ async fn async_main() {
 /// Returns `false` when it found a problem (damage, an unreadable store, or a
 /// database from a newer Agora). The caller exits 10 in that case, keeping the
 /// whole report on standard output.
+/// The recovery section of `agora doctor`: one short block per unresolved crash journal.
+///
+/// Plain and short on purpose — a journal is the kind of thing a user meets while something is
+/// wrong, so the line says what the journal covers, what recovery would do, and what to run.
+fn print_recovery_report(report: &agora_core::recovery_report::RecoveryReport) {
+    use agora_core::recovery_report::RecoveryOutcome;
+    for note in &report.notes {
+        println!("{note}");
+    }
+    // A kind that could not be read may be hiding the journal that blocks startup, so it is said
+    // out loud. A kind with nothing in it yet is already covered by the note above.
+    let could_not_tell: Vec<_> = report
+        .not_searched
+        .iter()
+        .filter(|missing| missing.blocking)
+        .collect();
+    if report.entries.is_empty() && could_not_tell.is_empty() {
+        println!("Recovery journals: none");
+    } else {
+        if !report.entries.is_empty() {
+            match report.entries.len() {
+                1 => println!(
+                    "Recovery journal (1 found): what a start would do with it, read-only:"
+                ),
+                count => println!(
+                    "Recovery journals ({count} found): what a start would do with each, read-only:"
+                ),
+            }
+            for entry in &report.entries {
+                let decision = match entry.outcome {
+                    RecoveryOutcome::NothingToDo => "nothing to do",
+                    RecoveryOutcome::WouldFinish => "recovery would finish it",
+                    RecoveryOutcome::WouldUndo => "recovery would undo it",
+                    RecoveryOutcome::Busy => "busy: an operation may still be running",
+                    RecoveryOutcome::NeedsHand => "needs a hand",
+                    RecoveryOutcome::Undecided => "this build does not decide it yet",
+                };
+                let state = entry
+                    .state
+                    .as_deref()
+                    .map(|state| format!(", state {state}"))
+                    .unwrap_or_default();
+                println!(
+                    "- {} {}{state}: {decision}",
+                    entry.kind.as_str(),
+                    entry.resource
+                );
+                println!("  journal: {}", entry.path);
+                println!("  {}", entry.reason);
+                if let Some(command) = &entry.command {
+                    println!("  Resolve it now: `{command}`");
+                }
+            }
+        }
+        for missing in could_not_tell {
+            println!(
+                "Recovery journals of kind {}: could not tell — {}",
+                missing.kind.as_str(),
+                missing.reason
+            );
+        }
+    }
+    if report.needs_a_hand() {
+        println!(
+            "At least one journal needs a hand; a start will not settle it on its own. This \
+             report changed nothing."
+        );
+    }
+}
+
 fn run_doctor(paths: &agora_core::app_paths::AppPaths, json: bool) -> anyhow::Result<bool> {
     use agora_core::db::{inspect_local_state, LocalStateIntegrity};
     let info = inspect_local_state(&paths.local_state_db());
@@ -2792,10 +2863,17 @@ fn run_doctor(paths: &agora_core::app_paths::AppPaths, json: bool) -> anyhow::Re
         .is_some_and(|version| version > info.supported_version);
     // The database part of the report is core's, shared with the desktop's data health panel.
     let report = agora_core::db::local_state_report(&paths.local_state_db());
-    let problems = report.problems || account.needs_repair;
+    // What recovery would do about every unresolved crash journal, decided read-only: `doctor`
+    // runs before core initialises, so this is the one place a recovery that blocks startup can
+    // be explained without a start happening first (MASTER_SPEC §32.11).
+    let recovery = agora_core::recovery_report::report(paths);
+    // A journal a start cannot settle on its own is a problem with the local state, in exactly the
+    // sense this command already uses: it will not go away by itself, and someone has to act.
+    let problems = report.problems || account.needs_repair || recovery.needs_a_hand();
     if json {
         let mut out = serde_json::to_value(&report)?;
         out["problems"] = serde_json::json!(problems);
+        out["recovery"] = serde_json::to_value(&recovery)?;
         out["accountStore"] = serde_json::json!({
             "needsRepair": account.needs_repair,
             "corruptFile": account.corrupt_file,
@@ -2880,6 +2958,7 @@ fn run_doctor(paths: &agora_core::app_paths::AppPaths, json: bool) -> anyhow::Re
     } else {
         println!("Account store: ok");
     }
+    print_recovery_report(&recovery);
     if problems {
         println!(
             "Agora found problems with the local state (exit code 10). The report above \

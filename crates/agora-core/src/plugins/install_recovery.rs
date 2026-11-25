@@ -35,6 +35,21 @@ impl recovery::JournalState for PluginInstallState {
     const KIND: recovery::OperationKind = recovery::OperationKind::PluginInstall;
 }
 
+impl PluginInstallState {
+    /// This state's own name, exactly as the journal writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PluginInstallState::Starting => "starting",
+            PluginInstallState::Stashed => "stashed",
+            PluginInstallState::Extracted => "extracted",
+            PluginInstallState::Committed => "committed",
+            PluginInstallState::Restoring => "restoring",
+            PluginInstallState::Uninstalling => "uninstalling",
+            PluginInstallState::UninstallCommitted => "uninstall-committed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(in crate::plugins) struct InstallJournal {
     #[serde(flatten)]
@@ -596,12 +611,21 @@ fn interrupted_installs(conn: &Connection, paths: &AppPaths) -> LauncherResult<V
         let parsed = PluginId::parse(&id).map_err(|error| io_error(error.message))?;
         ids.insert(id, parsed);
     }
+    for id in legacy_journal_ids(paths)? {
+        ids.insert(id.to_string(), id);
+    }
+    Ok(ids.into_values().collect())
+}
+
+/// The journals an earlier build left in `plugins/previous/` — a stash folder or a `.json` — which
+/// the database does not know about. Read without a database, so the report can still list them
+/// when there is none.
+fn legacy_journal_ids(paths: &AppPaths) -> LauncherResult<Vec<PluginId>> {
     let rollback = paths.plugin_rollback_root();
+    let mut ids = std::collections::BTreeMap::new();
     let entries = match std::fs::read_dir(&rollback) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ids.into_values().collect())
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(file_error(&rollback, error)),
     };
     for entry in entries {
@@ -903,24 +927,39 @@ fn apply(
     resolution: InstallResolution,
     ctx: Option<&Ctx>,
 ) -> LauncherResult<String> {
-    if let Some((path, why)) = capability.left_alone().first() {
-        return Err(io_error(format!(
-            "{} could not be verified: {why}",
-            path.display()
-        )));
-    }
     let mut journal: InstallJournal = capability.payload()?;
     let id = journal.plugin_id.clone();
     let layout = journal.layout(paths)?;
+    // A path the decision could not prove is this operation's own comes first: it is the reason
+    // startup refuses, and the reason the report gives, in the same words.
+    refusal_to_touch_what_is_not_ours(capability.left_alone())?;
+    // The checks every recovery runs, shared with the read-only report so it can never promise
+    // something a start would refuse. For an install, the identities come from the capability,
+    // which re-checked each folder's marker and OS identity when the decision was made. An
+    // uninstall moves only its own stash — through the capability, in `apply_uninstall` — and its
+    // package folder is compared by identity, because an install that runs from a development
+    // source owns no folder there.
+    let occupancy = match &journal.change {
+        PackageChange::Install { .. } => Occupancy {
+            installed: capability.verified_identity(&layout.destination)?,
+            stashed: match &layout.rollback {
+                Some(path) => capability.verified_identity(path)?,
+                None => None,
+            },
+            dropping: match &layout.rollback {
+                Some(_) => capability.verified_identity(&layout.dropping)?,
+                None => None,
+            },
+        },
+        PackageChange::Uninstall { .. } => Occupancy::read(&layout)?,
+    };
+    refusal_to_act(&journal, &layout, &occupancy)?;
     let PackageChange::Install { new, new_version } = &journal.change else {
         return apply_uninstall(capability, conn, &journal, &layout, resolution, ctx);
     };
     let new = *new;
-    let installed = capability.verified_identity(&layout.destination)?;
-    let stashed = match &layout.rollback {
-        Some(path) => capability.verified_identity(path)?,
-        None => None,
-    };
+    let installed = occupancy.installed;
+    let stashed = occupancy.stashed;
     let staged = capability.verified_identity(&layout.staging)?;
     let aside = capability.verified_identity(&layout.aside)?;
     let cut = |point| {
@@ -931,17 +970,7 @@ fn apply(
     let mut state = *capability.state();
 
     if state == PluginInstallState::Committed {
-        require(
-            installed == Some(new),
-            "the committed package directory is missing",
-        )?;
-        verify_package(&layout.destination, &id, new_version)?;
-        let drop_started =
-            layout.rollback.is_some() && capability.verified_identity(&layout.dropping)?.is_some();
-        require(
-            !drop_started || stashed.is_none(),
-            "the stash and its deletion folder are both occupied",
-        )?;
+        let drop_started = layout.rollback.is_some() && occupancy.dropping.is_some();
         if resolution == InstallResolution::Restore {
             require(
                 !drop_started,
@@ -1009,22 +1038,6 @@ fn apply(
         resolution != InstallResolution::Discard,
         "only a committed install can discard its stash",
     )?;
-    if let (Some(old), Some(stash)) = (journal.old, &layout.rollback) {
-        require(
-            installed == Some(old) || stashed == Some(old),
-            "the previous package is missing",
-        )?;
-        let previous = journal
-            .previous
-            .as_ref()
-            .ok_or_else(|| io_error("there is no previous install record"))?;
-        let old_dir = if stashed.is_some() {
-            stash
-        } else {
-            &layout.destination
-        };
-        verify_package(old_dir, &id, &previous.record.version)?;
-    }
     if installed == Some(new) {
         capability.rename(&layout.destination, &layout.aside)?;
         if state == PluginInstallState::Restoring {
@@ -1095,23 +1108,13 @@ fn apply_uninstall(
         }
     };
     if let Some(aside) = &layout.rollback {
-        let installed = capability.verified_identity(&layout.destination)?;
         let moved = capability.verified_identity(aside)?;
         if committed {
-            require(
-                installed.is_none(),
-                "the uninstalled package still occupies the install directory",
-            )?;
             cut(InstallCrashPoint::UninstallDropStarted);
             capability.remove_dir(aside)?;
             cut(InstallCrashPoint::UninstallFilesDropped);
         } else if moved.is_some() {
             capability.rename(aside, &layout.destination)?;
-        } else {
-            require(
-                installed == journal.old,
-                "the package to restore is missing",
-            )?;
         }
         recovery::sync_parent(aside).map_err(|e| file_error(aside, e))?;
         recovery::sync_parent(&layout.destination)
@@ -1130,8 +1133,394 @@ fn apply_uninstall(
     })
 }
 
+/// Which way recovery would take a journal in `state`, for `agora doctor` (read-only).
+///
+/// The direction is the *feature's* knowledge, not the decision's: it is read from this kind's own
+/// state enum, and it must stay in step with [`apply`], which rolls forward from
+/// [`PluginInstallState::Committed`] and [`PluginInstallState::UninstallCommitted`] and puts the
+/// previous version back from every other state (a restore the writer had already recorded, or an
+/// install or uninstall that never reached its commit point).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallDirection {
+    /// Recovery finishes what the operation had already committed.
+    Finish,
+    /// Recovery puts back what the operation replaced.
+    Undo,
+}
+
+pub fn direction(state: PluginInstallState) -> InstallDirection {
+    match state {
+        PluginInstallState::Committed | PluginInstallState::UninstallCommitted => {
+            InstallDirection::Finish
+        }
+        PluginInstallState::Starting
+        | PluginInstallState::Stashed
+        | PluginInstallState::Extracted
+        | PluginInstallState::Restoring
+        | PluginInstallState::Uninstalling => InstallDirection::Undo,
+    }
+}
+
+/// One plugin-install journal as the read-only report sees it (MASTER_SPEC §32.11).
+/// What the operating system says is at each folder a recovery would move, when the refusal checks
+/// run. [`apply`] fills this from the capability (which re-checks each marker and identity);
+/// [`journal_report`] reads the same identities directly, having already decided.
+#[derive(Debug, Clone, Copy, Default)]
+struct Occupancy {
+    /// The package folder, `plugins/installed/<id>`.
+    installed: Option<PathIdentity>,
+    /// The retained previous version the operation moved aside.
+    stashed: Option<PathIdentity>,
+    /// Where the previous version is put while it is being dropped.
+    dropping: Option<PathIdentity>,
+}
+
+impl Occupancy {
+    /// Read the three folders a journal names, without touching anything.
+    fn read(layout: &Layout) -> LauncherResult<Self> {
+        let read =
+            |path: &Path| recovery::path_identity(path).map_err(|error| file_error(path, error));
+        Ok(Occupancy {
+            installed: read(&layout.destination)?,
+            stashed: match &layout.rollback {
+                Some(path) => read(path)?,
+                None => None,
+            },
+            dropping: match &layout.rollback {
+                Some(_) => read(&layout.dropping)?,
+                None => None,
+            },
+        })
+    }
+}
+
+/// Why recovery refuses to act on a journal whose own paths cannot be proven.
+///
+/// A path the decision could not prove is this operation's own is never moved: recovery may only
+/// touch what the journal proves it owns. It is checked before anything else, in [`apply`] and in
+/// [`journal_report`] alike, so a removed marker or a replaced folder gives the same answer on both
+/// sides.
+fn refusal_to_touch_what_is_not_ours(left_alone: &[(PathBuf, String)]) -> LauncherResult<()> {
+    match left_alone.first() {
+        Some((path, why)) => Err(io_error(format!(
+            "{} could not be verified: {why}",
+            path.display()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Why recovery refuses to act on this journal before it moves anything, with the reason a person
+/// reads the next time startup reports it.
+///
+/// This is the one place those checks live, and both callers use it: [`apply`] runs it before its
+/// first change, and [`journal_report`] runs it to say what a start would *really* do. Without it a
+/// report would promise "recovery would undo it" for a journal whose marker was removed or whose
+/// package is gone, and the start would refuse — the disagreement that makes a diagnostic useless.
+fn refusal_to_act(
+    journal: &InstallJournal,
+    layout: &Layout,
+    occupancy: &Occupancy,
+) -> LauncherResult<()> {
+    match &journal.change {
+        PackageChange::Install { new, new_version } => {
+            if journal.envelope.state == PluginInstallState::Committed {
+                require(
+                    occupancy.installed == Some(*new),
+                    "the committed package directory is missing",
+                )?;
+                verify_package(&layout.destination, &journal.plugin_id, new_version)?;
+                let drop_started = layout.rollback.is_some() && occupancy.dropping.is_some();
+                require(
+                    !drop_started || occupancy.stashed.is_none(),
+                    "the stash and its deletion folder are both occupied",
+                )?;
+            } else if let (Some(old), Some(stash)) = (journal.old, &layout.rollback) {
+                // Only a positive "nothing there" permits removing the destination, so both the
+                // folder and the stash are checked before anything is renamed.
+                require(
+                    occupancy.installed == Some(old) || occupancy.stashed == Some(old),
+                    "the previous package is missing",
+                )?;
+                let previous = journal
+                    .previous
+                    .as_ref()
+                    .ok_or_else(|| io_error("there is no previous install record"))?;
+                let old_dir = if occupancy.stashed.is_some() {
+                    stash
+                } else {
+                    &layout.destination
+                };
+                verify_package(old_dir, &journal.plugin_id, &previous.record.version)?;
+            }
+        }
+        PackageChange::Uninstall { .. } => {
+            if journal.envelope.state == PluginInstallState::UninstallCommitted {
+                require(
+                    occupancy.installed.is_none(),
+                    "the uninstalled package still occupies the install directory",
+                )?;
+            } else if occupancy.stashed.is_none() {
+                // Nothing was moved aside, so the package to put back must already be in place.
+                require(
+                    occupancy.installed == journal.old,
+                    "the package to restore is missing",
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One plugin-install journal as the read-only report sees it (MASTER_SPEC §32.11).
+#[derive(Debug, Clone)]
+pub struct InstallJournalReport {
+    /// The plugin the journal covers, exactly as the journal spells it: a row whose id is not a
+    /// plugin id is reported as that row rather than dropped from the listing.
+    pub plugin_id: String,
+    /// Where the journal is: the database row, or the file an older build left.
+    pub path: PathBuf,
+    /// This kind's own state, when the journal was readable.
+    pub state: Option<PluginInstallState>,
+    /// What recovery would do.
+    pub outcome: recovery::RecoveryOutcome,
+    /// Why, in a sentence — the same sentence a start would report.
+    pub reason: String,
+    /// The command that resolves this journal now, when there is one. A busy journal has none: the
+    /// operation it belongs to is still going, or may be, and the next start retries it.
+    pub command: Option<String>,
+}
+
+/// Every plugin-install journal this data root has, decided without touching anything.
+///
+/// The same journals the startup pass recovers from ([`interrupted_installs`]), each put through
+/// [`recovery::decide_readonly`] and then through [`refusal_to_act`] — the checks [`apply`] runs
+/// before it moves anything — so "would undo" and "would finish" here are what a start really does.
+/// Nothing is locked, written, renamed or deleted. A row that cannot be read or checked is reported
+/// as that row; the rest are still listed.
+///
+/// `conn` is the local database, read-only, or `None` when there is no database yet: the journals an
+/// earlier build left in `plugins/previous/` are then listed on their own, because they need none.
+pub fn journal_report(
+    conn: Option<&Connection>,
+    paths: &AppPaths,
+    view: &dyn ProcessView,
+) -> LauncherResult<Vec<InstallJournalReport>> {
+    let locks = LockManager::new(paths.locks_root());
+    let journals = match conn {
+        Some(conn) => stored_journals(conn, paths)?,
+        None => legacy_journal_ids(paths)?
+            .into_iter()
+            .map(StoredJournal::Ours)
+            .collect(),
+    };
+    let mut out = Vec::new();
+    for journal in journals {
+        let id = match journal {
+            StoredJournal::Ours(id) => id,
+            // One row this build cannot read is that row's answer, not the listing's.
+            StoredJournal::Unreadable { id, why } => {
+                out.push(InstallJournalReport {
+                    plugin_id: id.clone(),
+                    path: paths.local_state_db(),
+                    state: None,
+                    outcome: recovery::RecoveryOutcome::NeedsHand,
+                    reason: format!(
+                        "The journal's plugin id \"{id}\" is not a plugin id ({why}), so no \
+                         command can act on this row. It is reported as itself; the other journals \
+                         are still listed. Nothing was changed."
+                    ),
+                    command: None,
+                });
+                continue;
+            }
+        };
+        let legacy_only = match conn {
+            Some(conn) => journal_document(conn, &id)?.is_none(),
+            None => true,
+        };
+        let path = if legacy_only {
+            install_journal_path(paths, &id)
+        } else {
+            paths.local_state_db()
+        };
+        // One read of the journal: the state it carries, and the document the decision is made
+        // from, are the same bytes rather than two chances for the row to change in between.
+        let read = match conn {
+            Some(conn) => read_locked(conn, paths, &id),
+            None => JournalRead::Unusable(JournalProblem::Malformed(
+                "legacy journal or stash without a SQLite journal".into(),
+            )),
+        };
+        let state = match &read {
+            JournalRead::Valid(journal) => Some(journal.envelope().state),
+            _ => None,
+        };
+        let decision = recovery::decide_readonly(
+            &locks,
+            &LockResource::PluginInstall,
+            || read.clone(),
+            &NoContentProof,
+            view,
+        );
+        let (outcome, reason, command_works) = match decision {
+            recovery::ReadOnlyDecision::Nothing => (
+                recovery::RecoveryOutcome::NothingToDo,
+                "The journal is already settled: recovery has nothing to do.".to_string(),
+                true,
+            ),
+            recovery::ReadOnlyDecision::Busy(why) => (recovery::RecoveryOutcome::Busy, why, true),
+            recovery::ReadOnlyDecision::NeedsHand(why) => {
+                (recovery::RecoveryOutcome::NeedsHand, why, true)
+            }
+            recovery::ReadOnlyDecision::WouldAct(journal, left_alone) => {
+                match would_do(&journal, &left_alone, paths) {
+                    Ok(WouldDo::Act(direction, state)) => (
+                        match direction {
+                            InstallDirection::Finish => recovery::RecoveryOutcome::WouldFinish,
+                            InstallDirection::Undo => recovery::RecoveryOutcome::WouldUndo,
+                        },
+                        describe(direction, state),
+                        true,
+                    ),
+                    // The handler would refuse because a path cannot be proven to be this
+                    // operation's. No command overrides that, so the report offers none and says
+                    // what to check instead.
+                    Ok(WouldDo::NotOurs(why)) => (
+                        recovery::RecoveryOutcome::NeedsHand,
+                        format!(
+                            "{why} Check that path and the ownership marker it names: they must be \
+                             there and name this operation. There is no Agora command that \
+                             overrides this yet, and nothing was changed."
+                        ),
+                        false,
+                    ),
+                    // A package that is not where the journal says: the same reason startup gives,
+                    // and `agora plugin recover` is the way out of it.
+                    Ok(WouldDo::Refuses(why)) => (recovery::RecoveryOutcome::NeedsHand, why, true),
+                    Err(error) => (
+                        recovery::RecoveryOutcome::NeedsHand,
+                        error.to_string(),
+                        true,
+                    ),
+                }
+            }
+        };
+        let command = match outcome {
+            // A busy journal has no command: the next start retries it.
+            recovery::RecoveryOutcome::Busy | recovery::RecoveryOutcome::NothingToDo => None,
+            _ if !command_works => None,
+            // The explicit escape hatch for a journal and stash no database knows about.
+            _ if legacy_only => Some(format!("agora plugin recover {id} --keep-aside --yes")),
+            _ => Some(format!("agora plugin recover {id} --yes")),
+        };
+        out.push(InstallJournalReport {
+            plugin_id: id.to_string(),
+            path,
+            state,
+            outcome,
+            reason,
+            command,
+        });
+    }
+    Ok(out)
+}
+
+/// One journal the database holds, as far as its id can be read.
+enum StoredJournal {
+    /// A journal this build can name, so it can be read and decided.
+    Ours(PluginId),
+    /// A row whose plugin id this build cannot read, with the reason. Startup fails loudly on it
+    /// ([`interrupted_installs`]); the report lists it as itself and goes on.
+    Unreadable { id: String, why: String },
+}
+
+/// Every journal id the database holds, each one's own trouble with it, then the legacy ones.
+fn stored_journals(conn: &Connection, paths: &AppPaths) -> LauncherResult<Vec<StoredJournal>> {
+    let mut journals = std::collections::BTreeMap::new();
+    for id in store::journal_ids(conn)? {
+        let journal = match PluginId::parse(&id) {
+            Ok(parsed) => StoredJournal::Ours(parsed),
+            Err(error) => StoredJournal::Unreadable {
+                id: id.clone(),
+                why: error.message,
+            },
+        };
+        journals.insert(id, journal);
+    }
+    for id in legacy_journal_ids(paths)? {
+        journals.insert(id.to_string(), StoredJournal::Ours(id));
+    }
+    Ok(journals.into_values().collect())
+}
+
+/// What the handler would do with a journal the decision handed it.
+enum WouldDo {
+    /// It would act: the direction it takes, and the state it read.
+    Act(InstallDirection, PluginInstallState),
+    /// It refuses, because a path cannot be proven to be this operation's own.
+    NotOurs(String),
+    /// It refuses, because a package is not where the journal says it is.
+    Refuses(String),
+}
+
+/// What a start would do with a decided journal.
+///
+/// The payload comes from the document the decision validated, and the refusal checks run on the
+/// folders the journal names — the same ones, in the same order, that [`apply`] uses.
+fn would_do(
+    journal: &recovery::Journal<PluginInstallState>,
+    left_alone: &[(PathBuf, String)],
+    paths: &AppPaths,
+) -> LauncherResult<WouldDo> {
+    let payload: InstallJournal = journal
+        .payload()
+        .map_err(|problem| io_error(format!("its own fields are not readable: {problem}")))?;
+    if let Err(error) = refusal_to_touch_what_is_not_ours(left_alone) {
+        return Ok(WouldDo::NotOurs(error.to_string()));
+    }
+    let layout = payload.layout(paths)?;
+    let occupancy = Occupancy::read(&layout)?;
+    if let Err(error) = refusal_to_act(&payload, &layout, &occupancy) {
+        return Ok(WouldDo::Refuses(error.to_string()));
+    }
+    let state = payload.envelope.state;
+    Ok(WouldDo::Act(direction(state), state))
+}
+
+/// One sentence for what recovery would do, in that state's own words.
+fn describe(direction: InstallDirection, state: PluginInstallState) -> String {
+    match (direction, state) {
+        // A committed uninstall has no package to keep: it only has files to remove.
+        (InstallDirection::Finish, PluginInstallState::UninstallCommitted) => format!(
+            "The uninstall had committed (state \"{}\"), so recovery would finish removing the \
+             plugin's files.",
+            state.as_str()
+        ),
+        (InstallDirection::Finish, _) => format!(
+            "The operation had committed (state \"{}\"), so recovery would finish its cleanup and \
+             keep the version that is installed.",
+            state.as_str()
+        ),
+        (InstallDirection::Undo, PluginInstallState::Restoring) => format!(
+            "The restore had been recorded (state \"{}\"), so recovery would finish putting the \
+             previous package back.",
+            state.as_str()
+        ),
+        (InstallDirection::Undo, PluginInstallState::Uninstalling) => format!(
+            "The uninstall had not committed (state \"{}\"), so recovery would put the plugin's \
+             package back.",
+            state.as_str()
+        ),
+        (InstallDirection::Undo, _) => format!(
+            "The operation had not committed (state \"{}\"), so recovery would put the previous \
+             package back.",
+            state.as_str()
+        ),
+    }
+}
+
 fn delete_journal(conn: &Connection, journal: &InstallJournal) -> LauncherResult<()> {
-    // The row must be durably gone before its marker can be removed.
     conn.pragma_update(None, "synchronous", "FULL")
         .map_err(sql_error)?;
     let deleted = conn
