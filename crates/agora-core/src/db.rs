@@ -2762,10 +2762,15 @@ fn cross_namespace_orphans(conn: &Connection) -> anyhow::Result<Vec<String>> {
                 .optional()?;
             let Some(column) = column else { continue };
             // The row says one id; only the other namespace has an instance with it.
+            //
+            // `NOT EXISTS`, not `NOT IN`: SQLite allows a NULL in a TEXT primary key, and one
+            // NULL in the parent makes every `NOT IN (...)` comparison NULL, which would hide
+            // exactly the rows this scan exists to refuse.
             let sql = format!(
                 "SELECT c.rowid, c.{column}, o.name FROM {child} c
                    JOIN {other} o ON o.instance_id = c.{column}
-                  WHERE c.{column} NOT IN (SELECT instance_id FROM {parent})
+                  WHERE NOT EXISTS (SELECT 1 FROM {parent} p
+                                     WHERE p.instance_id = c.{column})
                   ORDER BY c.rowid",
                 column = quoted_identifier(&column),
                 child = quoted_identifier(&child),

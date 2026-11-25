@@ -681,3 +681,52 @@ fn a_row_that_belongs_to_the_other_namespace_stops_the_migration() {
     assert!(table_exists(&conn, "game_instances"));
     assert!(!table_exists(&conn, "instances"));
 }
+
+#[test]
+fn a_row_that_would_change_owner_is_found_beside_an_instance_with_no_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = old_database(tmp.path());
+    // A Minecraft instance row with no id at all: SQLite allows a NULL in a TEXT primary key,
+    // and a `NOT IN (SELECT instance_id ...)` is then NULL for every row, so the scan that looks
+    // for rows the merge would re-parent would find nothing and let the orphan below take the
+    // Skyrim instance as its parent.
+    let orphan_rowid: i64 = {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        conn.execute(
+            "INSERT INTO user_instances
+                 (instance_id, name, minecraft_version, loader, loader_version, created_at)
+             VALUES (NULL, 'Nameless', '1.21', 'fabric', '0.16.0', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO instance_pack_gaps (instance_id, filename, display_name, status)
+             VALUES ('skyrim-pack', 'c.jar', 'Sea', 'missing')",
+            [],
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT rowid FROM instance_pack_gaps WHERE instance_id = 'skyrim-pack'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    let error = init_local_state_db(&path)
+        .expect_err("a row that would change owner stops the migration");
+    let message = format!("{error:#}");
+    assert!(message.contains("instance_pack_gaps"), "{message}");
+    assert!(
+        message.contains(&format!("row {orphan_rowid}")),
+        "the report names the row: {message}"
+    );
+    assert!(message.contains("skyrim-pack"), "{message}");
+
+    // Nothing was changed.
+    let conn = local_state_connection(&path).unwrap();
+    assert_eq!(version(&conn), 30);
+    assert!(table_exists(&conn, "user_instances"));
+    assert!(!table_exists(&conn, "instances"));
+}
