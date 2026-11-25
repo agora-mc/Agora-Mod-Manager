@@ -426,6 +426,7 @@ fn base_removal_cannot_race_a_restore_between_pinning_reads() {
             }
         },
         |path| std::fs::metadata(path),
+        |path| std::fs::remove_file(path),
     );
     assert!(fired.load(Ordering::SeqCst), "the pause was reached");
     assert!(
@@ -511,6 +512,7 @@ fn base_removal_cannot_delete_a_base_a_restore_is_publishing() {
             }
         },
         |path| std::fs::metadata(path),
+        |path| std::fs::remove_file(path),
     );
     if !fired.load(Ordering::SeqCst) {
         // The removal was kept back at the locations lock while the restore still

@@ -812,6 +812,107 @@ fn built(tmp: &TempDir, build: Option<&str>) -> (AppPaths, std::path::PathBuf, I
 }
 
 #[test]
+fn a_removal_that_leaves_the_record_behind_is_an_error_and_publishes_no_pin() {
+    use agora_core::ctx::CoreContext;
+    use agora_core::game_base::remove_base_with;
+    use agora_core::game_instance;
+
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("23"));
+    let outcome = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+    let base_folder = paths.bases_dir().join(&base_id);
+    let manifest_path = paths.base_manifest_path(&base_id);
+    assert!(base_folder.is_dir());
+    assert!(manifest_path.is_file());
+
+    // The folder is deleted but the record is not: reporting success here is how a create came
+    // to pin a base whose files were gone. The record's deletion is injected so the test does
+    // not depend on what the operating system lets a file's permissions do.
+    let removal = remove_base_with(
+        &paths,
+        &base_id,
+        || {},
+        |path| std::fs::metadata(path),
+        |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the record is in use by another program",
+            ))
+        },
+    );
+    let error = removal.expect_err("a removal that leaves the record behind did not finish");
+    let message = format!("{error}");
+    assert!(
+        message.contains(&base_id),
+        "the error names the base: {message}"
+    );
+    assert!(
+        message.contains("record"),
+        "the error says what is left and how to clear it: {message}"
+    );
+    assert!(
+        message.contains("delete"),
+        "the error says how to clear it: {message}"
+    );
+    assert!(
+        !base_folder.exists(),
+        "the folder is gone, which is what the report has to admit"
+    );
+    assert!(
+        manifest_path.is_file(),
+        "the record is still there, so the base is still listed"
+    );
+
+    // A create cannot publish a pin to that base: it either refuses, or the base it pins is one
+    // whose folder and record are both there.
+    let ctx = CoreContext::for_testing(tmp.path().join("data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let created = game_instance::create(
+        &ctx,
+        &install,
+        &test_definition(),
+        "After failed removal",
+        Some("after-failed-removal".into()),
+        BaseMode::Linked,
+        &|_| {},
+    );
+    match created {
+        Ok(record) => {
+            if let agora_game_api::BaseReference::Pinned { id, .. } = &record.base {
+                let folder = ctx.paths.bases_dir().join(id);
+                assert!(
+                    folder.join(".agora-base.json").is_file(),
+                    "a pin to a base whose files are gone: {}",
+                    folder.display()
+                );
+            }
+        }
+        Err(_) => {
+            let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+            let rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM instances WHERE instance_id = 'after-failed-removal'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0, "a refused create publishes no row");
+        }
+    }
+}
+
+#[test]
 fn a_tampered_manifest_can_never_make_remove_delete_the_install() {
     let tmp = TempDir::new().unwrap();
     let (paths, install_dir, install) = built(&tmp, Some("7"));
