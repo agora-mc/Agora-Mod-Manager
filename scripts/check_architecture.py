@@ -1084,6 +1084,227 @@ def check_fail_closed_reads() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 16. Path rules and path comparison: one of each, counts that only go down
+# ---------------------------------------------------------------------------
+# MASTER_SPEC §32.3. Dozens of functions used to decide "is this a safe relative
+# path", and three comparators decided "is this the same path", each with its own
+# idea of case, separators and links. The strict rule and the comparison now live
+# in `crates/agora-game-api/src/path.rs`; this counts what is left outside it, so
+# the number can only fall.
+#
+# Two counts, per file:
+#
+# - `validators`: a function that decides whether a path or a name may be used,
+#   found by its name (`is_`/`validate_`/`check_`/`assert_`/`sanitize_`/
+#   `normalize_`/`normalise_`/`clean_`/`lexical_` with a path noun) or by its body
+#   (it reasons about `ParentDir`, `is_absolute` or `has_root`). A name heuristic
+#   counts a few harmless functions; that errs toward counting, and a slice that
+#   deletes or renames one lowers the number.
+# - `comparisons`: the ingredients of a hand-written comparison —
+#   `fold_path_case(`, `canonicalize()` and `.components()` — in the recovery,
+#   trust and staging modules the spec names (§32.13's list is the same set of
+#   modules). The comparison module itself has none.
+#
+# Test items are blanked before counting, on the same rules as §15 above, so a
+# test fixture that names a path validator is not a validator.
+PATH_RULES_BUDGET = REPO_ROOT / "scripts" / "path_rules_budget.json"
+PATH_OWNER_MODULE = "crates/agora-game-api/src/path.rs"
+PATH_VALIDATOR_ROOTS = (
+    CORE_SRC,
+    REPO_ROOT / "crates" / "agora-game-api" / "src",
+    MC_SRC,
+    REPO_ROOT / "crates" / "agora-game-creation" / "src",
+    REPO_ROOT / "crates" / "agora-plugin-api" / "src",
+    REPO_ROOT / "crates" / "agora-plugin-host" / "src",
+    CLI_SRC,
+    DESKTOP_SRC,
+)
+# A function definition, with its name.
+FUNCTION_NAME = re.compile(r"\bfn\s+([A-Za-z0-9_]+)\s*[(<]")
+PATH_VALIDATOR_VERB = re.compile(
+    r"^(is|validate|check|assert|safe|sanitize|normalize|normalise|clean|lexical)_"
+)
+PATH_VALIDATOR_NOUN = re.compile(
+    r"(path|entry|component|relative|filename|file_name|rel_path|name|folder)"
+)
+# Tokens a function that reasons about escaping has and a name check does not.
+PATH_VALIDATOR_BODY = ("ParentDir", "is_absolute", "has_root")
+PATH_COMPARISON_PATTERNS = (
+    re.compile(r"fold_path_case\s*\("),
+    re.compile(r"canonicalize\s*\(\s*\)"),
+    re.compile(r"\.components\s*\("),
+)
+# The recovery, trust, lease, GC and staging modules: the same set §15 counts, because they are
+# the modules whose decisions delete, overwrite or adopt user files.
+PATH_COMPARISON_MODULES = (
+    "crates/agora-core/src/artifact_hash.rs",
+    "crates/agora-core/src/backup.rs",
+    "crates/agora-core/src/db.rs",
+    "crates/agora-core/src/game_base/mod.rs",
+    "crates/agora-core/src/game_instance/trash.rs",
+    "crates/agora-core/src/game_tool_swap.rs",
+    "crates/agora-core/src/game_user_files.rs",
+    "crates/agora-core/src/instance_runtime.rs",
+    "crates/agora-core/src/lkg.rs",
+    "crates/agora-core/src/lock_manager.rs",
+    "crates/agora-core/src/plugins/install.rs",
+    "crates/agora-core/src/plugins/install_recovery.rs",
+    "crates/agora-core/src/plugins/store.rs",
+    "crates/agora-core/src/process_identity.rs",
+    "crates/agora-core/src/recovery.rs",
+    "crates/agora-core/src/recovery_report.rs",
+    "crates/agora-core/src/registry_bundle.rs",
+    "crates/agora-core/src/registry_sync.rs",
+    "crates/agora-core/src/session_ledger.rs",
+    "crates/agora-core/src/snapshot.rs",
+    "crates/agora-core/src/startup_recovery.rs",
+    "crates/agora-game-minecraft/src/launcher_import_service.rs",
+    "crates/agora-game-minecraft/src/recently_deleted.rs",
+    # The staged writes of the content store. They have none today, and a hand-written comparison
+    # appearing in one is exactly what this count is for.
+    "crates/agora-core/src/content_store/convert.rs",
+    "crates/agora-core/src/content_store/mod.rs",
+    "crates/agora-core/src/content_store/place.rs",
+    "crates/agora-core/src/content_store/protect.rs",
+    "crates/agora-core/src/content_store/rar.rs",
+)
+
+
+def path_validators(source: str) -> list[str]:
+    """The names of the functions in one Rust file that decide whether a path may be used."""
+    cleaned = blank_test_items(blank_rust_noise(source))
+    names: list[str] = []
+    for match in FUNCTION_NAME.finditer(cleaned):
+        end = item_end(cleaned, match.end())
+        if end is None:
+            continue
+        name = match.group(1)
+        body = cleaned[match.end() : end]
+        by_name = bool(PATH_VALIDATOR_VERB.match(name)) and bool(
+            PATH_VALIDATOR_NOUN.search(name)
+        )
+        by_body = any(marker in body for marker in PATH_VALIDATOR_BODY)
+        if by_name or by_body:
+            names.append(name)
+    return names
+
+
+def count_path_validators_in(path: Path) -> int:
+    return len(path_validators(path.read_text(encoding="utf-8", errors="replace")))
+
+
+def count_path_comparisons(source: str) -> int:
+    """Hand-written path comparisons in one Rust file, comments and test items excluded."""
+    cleaned = blank_test_items(blank_rust_noise(source))
+    return sum(len(pattern.findall(cleaned)) for pattern in PATH_COMPARISON_PATTERNS)
+
+
+def count_path_comparisons_in(path: Path) -> int:
+    return count_path_comparisons(path.read_text(encoding="utf-8", errors="replace"))
+
+
+def check_path_rules() -> None:
+    try:
+        budget = json.loads(PATH_RULES_BUDGET.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        err(f"{PATH_RULES_BUDGET.name} is missing: the path rule budget is checked in")
+        return
+    except (OSError, ValueError) as exc:
+        err(f"Cannot read {PATH_RULES_BUDGET.name}: {exc}")
+        return
+    validators = budget.get("validators", {})
+    comparisons = budget.get("comparisons", {})
+    problems: list[str] = []
+    report: list[str] = []
+
+    def compare(relative: str, count: int, allowed: int, what: str, hint: str) -> None:
+        if count > allowed:
+            problems.append(
+                f"  {relative}: {count} {what}, budget {allowed}; this budget only shrinks. "
+                f"{hint}"
+            )
+        elif count < allowed:
+            problems.append(
+                f"  {relative}: {count} {what}, below the budget of {allowed}; lower it to "
+                f"{count} in {PATH_RULES_BUDGET.name}"
+            )
+        else:
+            report.append(f"{relative} {count}")
+
+    found_validators = {}
+    for root in PATH_VALIDATOR_ROOTS:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*.rs")):
+            if is_test_only_module_file(path):
+                continue
+            relative = path.relative_to(REPO_ROOT).as_posix()
+            if relative == PATH_OWNER_MODULE:
+                continue
+            count = count_path_validators_in(path)
+            if count:
+                found_validators[relative] = count
+    for name in sorted(set(found_validators) - set(validators)):
+        problems.append(
+            f"  {name}: {found_validators[name]} private path validator(s) not in the budget; "
+            f"use agora_game_api::RelPath::strict, FileName or validate_path_set, or add its "
+            f"count to {PATH_RULES_BUDGET.name}"
+        )
+    for name in sorted(set(validators) - set(found_validators)):
+        problems.append(f"  {name}: budgeted but no path validator found; remove its entry")
+    for name in sorted(set(validators) & set(found_validators)):
+        allowed = validators[name]
+        if not isinstance(allowed, int):
+            problems.append(f"  {name}: budget must be a whole number, not {allowed!r}")
+        else:
+            compare(
+                name,
+                found_validators[name],
+                allowed,
+                "path validator(s)",
+                "Move it onto RelPath::strict or FileName and lower the budget",
+            )
+
+    found_comparisons = {}
+    for relative in PATH_COMPARISON_MODULES:
+        path = REPO_ROOT / relative
+        if not path.is_file():
+            problems.append(f"  {relative}: a counted module that is not there; correct the list")
+            continue
+        count = count_path_comparisons_in(path)
+        if count:
+            found_comparisons[relative] = count
+    for name in sorted(set(found_comparisons) - set(comparisons)):
+        problems.append(
+            f"  {name}: {found_comparisons[name]} hand-written path comparison(s) not in the "
+            f"budget; use agora_game_api::same_spelling, same_target or same_folder, or add its "
+            f"count to {PATH_RULES_BUDGET.name}"
+        )
+    for name in sorted(set(comparisons) - set(found_comparisons)):
+        problems.append(f"  {name}: budgeted but no path comparison found; remove its entry")
+    for name in sorted(set(comparisons) & set(found_comparisons)):
+        allowed = comparisons[name]
+        if not isinstance(allowed, int):
+            problems.append(f"  {name}: budget must be a whole number, not {allowed!r}")
+        else:
+            compare(
+                name,
+                found_comparisons[name],
+                allowed,
+                "hand-written path comparison(s)",
+                "Move it onto the game contract's comparison and lower the budget",
+            )
+
+    if problems:
+        err("Path rules and path comparison (MASTER_SPEC §32.3)")
+        for problem in problems:
+            print(problem, file=sys.stderr)
+    else:
+        total = sum(found_validators.values()) + sum(found_comparisons.values())
+        print(f"OK: {total} path rules left outside agora-game-api, within budget")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> int:
@@ -1145,6 +1366,10 @@ def main() -> int:
 
     print("--- 15. Fail-closed reads in recovery, trust, lease, GC and staging code ---")
     check_fail_closed_reads()
+    print()
+
+    print("--- 16. Path rules and path comparison ---")
+    check_path_rules()
     print()
 
     if EXIT_CODE == 0:

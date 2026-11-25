@@ -4795,5 +4795,122 @@ mod tests {
         self.assertNotIn("linux_home_re::RE: allowlisted but no longer found", stderr)
 
 
+class TestPathRuleGuard(unittest.TestCase):
+    """MASTER_SPEC §32.3: private path validators and hand-written comparisons may only go down."""
+
+    def _run(self, files: dict[str, str], budget: dict[str, Any], comparisons: tuple[str, ...]):
+        """Run the check over `files` (relative path -> source) with a budget, return failure and stderr."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, source in files.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(source, encoding="utf-8")
+            budget_file = root / "path_rules_budget.json"
+            budget_file.write_text(json.dumps(budget), encoding="utf-8")
+            (root / "crates" / "core").mkdir(parents=True, exist_ok=True)
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(cak, "PATH_VALIDATOR_ROOTS", (root,)),
+                mock.patch.object(cak, "PATH_COMPARISON_MODULES", comparisons),
+                mock.patch.object(cak, "PATH_RULES_BUDGET", budget_file),
+                mock.patch.object(cak, "REPO_ROOT", root),
+                mock.patch.object(cak, "EXIT_CODE", 0),
+                contextlib.redirect_stderr(stderr),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                cak.check_path_rules()
+                failed = cak.EXIT_CODE
+        return failed, stderr.getvalue()
+
+    def test_a_private_validator_outside_the_budget_fails_the_check(self):
+        source = (
+            "fn safe_relative(path: &str) -> bool {\n"
+            "    !path.split('/').any(|part| part == \"..\")\n"
+            "}\n"
+        )
+        failed, stderr = self._run(
+            {"crates/core/src/mod.rs": source}, {"validators": {}, "comparisons": {}}, ()
+        )
+        self.assertEqual(failed, 1)
+        self.assertIn("crates/core/src/mod.rs: 1 private path validator(s)", stderr)
+
+    def test_a_validator_that_reasons_about_escaping_is_counted_without_a_helpful_name(self):
+        source = (
+            "fn trip(path: &std::path::Path) -> bool {\n"
+            "    path.components().any(|part| matches!(part, ParentDir))\n"
+            "}\n"
+        )
+        failed, _stderr = self._run(
+            {"crates/core/src/mod.rs": source}, {"validators": {}, "comparisons": {}}, ()
+        )
+        self.assertEqual(failed, 1)
+
+    def test_a_test_fixture_that_names_a_validator_is_not_counted(self):
+        source = (
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    fn safe_zip_entry_name(name: &str) -> bool { !name.is_empty() }\n"
+            "}\n"
+        )
+        failed, _stderr = self._run(
+            {"crates/core/src/mod.rs": source}, {"validators": {}, "comparisons": {}}, ()
+        )
+        self.assertEqual(failed, 0)
+
+    def test_a_budget_must_match_exactly_in_both_directions(self):
+        source = "fn validate_entry_path(path: &str) -> bool { !path.is_empty() }\n"
+        loose, stderr = self._run(
+            {"crates/core/src/mod.rs": source},
+            {"validators": {"crates/core/src/mod.rs": 2}, "comparisons": {}},
+            (),
+        )
+        self.assertEqual(loose, 1)
+        self.assertIn("below the budget of 2", stderr)
+
+        grown, stderr = self._run(
+            {"crates/core/src/mod.rs": source + "\n" + source.replace("entry", "name")},
+            {"validators": {"crates/core/src/mod.rs": 1}, "comparisons": {}},
+            (),
+        )
+        self.assertEqual(grown, 1)
+        self.assertIn("budget 1", stderr)
+
+    def test_an_entry_whose_file_lost_its_validator_is_reported(self):
+        failed, stderr = self._run(
+            {"crates/core/src/mod.rs": "fn plain() {}\n"},
+            {"validators": {"crates/core/src/mod.rs": 1}, "comparisons": {}},
+            (),
+        )
+        self.assertEqual(failed, 1)
+        self.assertIn("budgeted but no path validator found", stderr)
+
+    def test_a_hand_written_comparison_in_a_recovery_module_is_counted(self):
+        source = (
+            "fn owned(recorded: &std::path::Path, asked: &std::path::Path) -> bool {\n"
+            "    match (recorded.canonicalize(), asked.canonicalize()) {\n"
+            "        (Ok(a), Ok(b)) => a == b,\n"
+            "        _ => false,\n"
+            "    }\n"
+            "}\n"
+        )
+        failed, stderr = self._run(
+            {"crates/core/src/recovery.rs": source},
+            {"validators": {}, "comparisons": {}},
+            ("crates/core/src/recovery.rs",),
+        )
+        self.assertEqual(failed, 1)
+        self.assertIn("2 hand-written path comparison(s) not in the budget", stderr)
+
+    def test_a_comparison_module_that_is_gone_is_reported(self):
+        failed, stderr = self._run(
+            {},
+            {"validators": {}, "comparisons": {}},
+            ("crates/core/src/recovery.rs",),
+        )
+        self.assertEqual(failed, 1)
+        self.assertIn("a counted module that is not there", stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
