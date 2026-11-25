@@ -2536,7 +2536,6 @@ pub(crate) fn scope_contains(declared: &[&str], path: &str) -> bool {
 /// A declared folder covers a root it holds (`state/config` covers the root `state/config`), and a
 /// root covers a declared folder it holds (`state` covers a declaration of `state/config`), because
 /// the root is the unit a manifest records.
-#[cfg(test)]
 pub(crate) fn scope_covers_root(declared: &[&str], root: &str) -> bool {
     scope_contains(declared, root)
         || declared

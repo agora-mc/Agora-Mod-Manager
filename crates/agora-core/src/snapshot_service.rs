@@ -219,12 +219,14 @@ impl SnapshotService {
         let mut outcome = outcome;
         // A snapshot owns what it captured. A folder this game no longer declares is restored
         // anyway, and the result says which, so the person restoring is not left guessing about
-        // state that came back from outside the current scope (MASTER_SPEC §32.7).
+        // state that came back from outside the current scope (MASTER_SPEC §32.7). The question is
+        // asked of the scope the snapshot recorded, compared by path components with the platform's
+        // case rule at any depth: dropping `state/characters` while `state/config` stays is reported.
         let game = self.instance_game(instance_id)?;
-        for root in &outcome.restored_roots {
-            if !declared.iter().any(|declared| declared == root) {
+        for folder in &scope {
+            if !snapshot::scope_covers_root(&entries, folder) {
                 outcome.notices.push(format!(
-                    "folder '{root}' is no longer tracked by {}; restored from the snapshot anyway",
+                    "folder '{folder}' is no longer tracked by {}; restored from the snapshot anyway",
                     game.as_str()
                 ));
             }

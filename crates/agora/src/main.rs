@@ -5691,6 +5691,9 @@ async fn run_snapshots_command(
                         "Restored '{}' to its last-known-good setup (undo snapshot {}).",
                         instance, outcome.undo_snapshot_id
                     );
+                    for notice in &outcome.outcome.notices {
+                        println!("  Note: {notice}");
+                    }
                 }
             } else {
                 let state = agora_core::lkg::read_lkg_state(&instance_dir)
@@ -5709,6 +5712,9 @@ async fn run_snapshots_command(
                         "Restored '{}' to its last-known-good snapshot {}.",
                         instance, snapshot_id
                     );
+                    for notice in &outcome.notices {
+                        println!("  Note: {notice}");
+                    }
                 }
             }
         }

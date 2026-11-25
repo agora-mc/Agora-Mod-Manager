@@ -9,6 +9,7 @@ import { useConfirm } from '@/components/ui/confirm';
 import {
   createSnapshot,
   deleteSnapshot,
+  describeRestoreCoverage,
   detectDrift,
   errorCode,
   exportBackup,
@@ -85,10 +86,19 @@ export function InstanceRecoveryTab({ instanceId }: InstanceRecoveryTabProps) {
 
   async function restore(snapshotId: string, force = false): Promise<boolean> {
     try {
-      await restoreSnapshot(instanceId, snapshotId, force);
+      const outcome = await restoreSnapshot(instanceId, snapshotId, force);
       setDiff(null);
       await reload();
-      setStatus('Snapshot restored. The previous state was saved as an undo snapshot.');
+      // The restore reports a folder it captured but the game no longer declares, so the tab says
+      // what came back rather than leaving the person to wonder (MASTER_SPEC §32.7).
+      setStatus(
+        [
+          'Snapshot restored. The previous state was saved as an undo snapshot.',
+          describeRestoreCoverage(outcome),
+        ]
+          .filter(Boolean)
+          .join(' '),
+      );
       return true;
     } catch (reason) {
       if (!force && errorCode(reason) === 'ERR_SNAPSHOT_NOT_IDLE') {

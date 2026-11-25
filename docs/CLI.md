@@ -707,7 +707,7 @@ Instance delete, restore, and purge can also report that the lock is busy.
 
 A restore replaces tracked instance state. Preserve valuable worlds separately and verify the intended snapshot ID before restoring. Every restore takes a pre-restore snapshot first, so the restore itself can be undone by restoring that `pre-restore-…` entry.
 
-A snapshot owns what it captured. When a snapshot covers a folder the game's package no longer declares as snapshot state, `snapshots restore` restores it anyway and prints a `Note:` line naming the folder and the game, so state that came back from outside the current scope is never silent. The same line appears in `--output json` as an entry in the result's `notices` array.
+A snapshot owns what it captured. When a snapshot covers a folder the game's package no longer declares as snapshot state, `snapshots restore` and `snapshots restore-lkg` restore it anyway and print a `Note:` line naming the folder and the game, so state that came back from outside the current scope is never silent. The desktop app's Recovery tab says the same thing after a restore, and `--output json` carries the lines in the result's `notices` array. The comparison is by path components with the platform's case rule, at any depth: dropping `state/characters` while `state/config` stays is reported. A restored file is written through the instance's own folder and the launcher refuses to write through a folder a link has replaced since the capture.
 
 Agora's automatic pre-launch recovery snapshot is optimized for mod, configuration, and layout recovery and does not include `saves/`. Full manual and transactional snapshots use a broader scope, but no local snapshot system should be the only backup for an irreplaceable world.
 

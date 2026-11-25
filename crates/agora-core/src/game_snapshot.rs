@@ -236,30 +236,21 @@ fn read_state_file(dir: &Path, relative: &str) -> Result<Option<Vec<u8>>, String
     }
 }
 
-/// The roots a game still declares as snapshot state, for reporting a restore of a snapshot that
-/// covers more than the game tracks today (MASTER_SPEC §32.7): the first path component of every
-/// state file its definition names, the loadout store, and every declared folder.
-fn tracked_roots(definition: &GameDefinition) -> BTreeSet<String> {
-    let mut roots: BTreeSet<String> = declared_state_paths(definition)
-        .iter()
-        .map(|path| path.split('/').next().unwrap_or_default().to_string())
-        .collect();
-    roots.insert(LOADOUTS_SCOPE_ROOT.to_string());
+/// The paths a game still declares as snapshot state, for reporting a restore of a snapshot that
+/// covers more than the game tracks today (MASTER_SPEC §32.7): every state file its definition
+/// names, the loadout store, and every declared folder - in full, so a folder dropped from a nested
+/// declaration (`state/characters`) is told apart from one that stays (`state/config`).
+fn tracked_paths(definition: &GameDefinition) -> BTreeSet<String> {
+    let mut paths: BTreeSet<String> = declared_state_paths(definition).into_iter().collect();
+    paths.insert(LOADOUTS_SCOPE_ROOT.to_string());
     for folder in definition
         .snapshot
         .iter()
         .flat_map(|scope| scope.tracked.iter())
     {
-        roots.insert(
-            folder
-                .as_str()
-                .split('/')
-                .next()
-                .unwrap_or_default()
-                .to_string(),
-        );
+        paths.insert(folder.as_str().to_string());
     }
-    roots
+    paths
 }
 
 /// The state files, as data. A missing declared file is recorded as absent.
@@ -1020,6 +1011,16 @@ pub fn restore_locked(
         )));
     }
 
+    // What the snapshot recorded as its scope, and what this game tracks today. Read before
+    // anything moves: retention after the restore may prune the snapshot being restored. A folder
+    // the snapshot captured but the game no longer declares is restored anyway, and named in the
+    // result (MASTER_SPEC §32.7). Compared by path components with the platform's case rule at any
+    // depth, against the folders the game lists in full, so dropping `state/characters` while
+    // `state/config` stays is reported.
+    let recorded = snapshot::restore_scope(&dir, snapshot_id)?;
+    let tracked = tracked_paths(definition);
+    let tracked_refs: Vec<&str> = tracked.iter().map(String::as_str).collect();
+
     // The undo point records the current state, including the current rules, so
     // undoing the restore puts back everything the restore replaces.
     let current = capture_data(ctx, instance_id, definition)?;
@@ -1113,13 +1114,12 @@ pub fn restore_locked(
         cleanup_warning: None,
         preserved_recovery_dir: None,
         undo_snapshot_id: Some(undo.id.clone()),
-        // A root this game no longer tracks is still restored, and named here (MASTER_SPEC §32.7).
-        notices: roots_of(&restored)
-            .into_iter()
-            .filter(|root| !tracked_roots(definition).contains(root))
-            .map(|root| {
+        notices: recorded
+            .iter()
+            .filter(|folder| !snapshot::scope_covers_root(&tracked_refs, folder))
+            .map(|folder| {
                 format!(
-                    "folder '{root}' is no longer tracked by {}; restored from the snapshot anyway",
+                    "folder '{folder}' is no longer tracked by {}; restored from the snapshot anyway",
                     definition.id.as_str()
                 )
             })

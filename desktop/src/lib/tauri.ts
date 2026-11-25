@@ -2644,6 +2644,12 @@ export interface RestoreOutcome {
   cleanupWarning?: string;
   preservedRecoveryDir?: string;
   undoSnapshotId?: string;
+  /**
+   * What the person restoring should know about what it did, in words they can read. A folder the
+   * snapshot captured but the game no longer declares is restored anyway and named here, so it is
+   * never restored quietly.
+   */
+  notices?: string[];
 }
 
 export const restoreSnapshot = (
@@ -2669,6 +2675,9 @@ export const describeRestoreCoverage = (outcome: RestoreOutcome): string | null 
   }
   if (outcome.cleanupWarning) {
     notes.push(outcome.cleanupWarning);
+  }
+  for (const notice of outcome.notices ?? []) {
+    notes.push(notice);
   }
   return notes.length > 0 ? notes.join(' ') : null;
 };
