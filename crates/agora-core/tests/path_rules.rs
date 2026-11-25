@@ -7,8 +7,8 @@
 //! consumer these tests speak for.
 
 use agora_game_api::{
-    compare_folder, is_link, join_under, resolve_destination, same_spelling, same_target,
-    PathError, PathRelation, RelPath,
+    compare_folder, is_link, join_under, resolve_destination, same_spelling, same_target, PathError,
+    PathRelation, RelPath,
 };
 use std::path::{Path, PathBuf};
 
@@ -40,15 +40,14 @@ fn joining_under_a_root_returns_the_path_it_checked() {
 }
 
 #[test]
-fn joining_reports_a_stored_value_the_strict_rule_refuses() {
+fn a_stored_value_the_strict_rule_refuses_is_reported_by_name() {
     // A value written before the strict rule existed: it loads, and it is refused by name when a
     // writer is about to create it, rather than dropped or written as a different file.
-    let root = temp_dir();
     let stored = RelPath::new("mods/BuildCraft.").unwrap();
-    match join_under(root.path(), &stored) {
-        Err(PathError::UnsafePath { path, reason }) => {
-            assert_eq!(path, "mods/BuildCraft.");
-            assert!(reason.contains("dot"), "{reason}");
+    match stored.check_strict() {
+        Err(error) => {
+            assert_eq!(error.value, "mods/BuildCraft.");
+            assert!(error.reason().contains("dot"), "{}", error.reason());
         }
         other => panic!("a trailing dot cannot be written as named, got {other:?}"),
     }
@@ -56,13 +55,11 @@ fn joining_reports_a_stored_value_the_strict_rule_refuses() {
 
 #[test]
 fn a_path_that_is_the_root_is_not_a_file_path() {
-    let root = temp_dir();
+    // The empty path is the root, so no write may name it. It loads as a stored value (the root has
+    // always been spelled that way) and the strict rule, which a writer applies, refuses it.
     let stored = RelPath::new("").unwrap();
     assert!(
-        matches!(
-            join_under(root.path(), &stored),
-            Err(PathError::UnsafePath { .. })
-        ),
+        stored.check_strict().is_err(),
         "the empty path is the root, so no write may name it"
     );
 }

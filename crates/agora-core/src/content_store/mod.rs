@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use agora_game_api::RelPath;
+use agora_game_api::{RelPath, StrictRelPath};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -403,10 +403,21 @@ pub(crate) fn is_reparse_point_or_symlink(metadata: &std::fs::Metadata) -> bool 
 }
 
 /// The strict path rule the game contract owns: an archive entry becomes a file name only when
-/// something writes it, and the rule it is held to is [`agora_game_api::RelPath::strict`].
-pub fn validate_entry_path(rel_str: &str) -> Result<RelPath, ContentError> {
+/// something writes it, and the rule it is held to is [`agora_game_api::RelPath::strict`]. The
+/// result is the strict type, so an archive entry cannot reach a write without having been held to
+/// the rule.
+pub fn validate_entry_path(rel_str: &str) -> Result<StrictRelPath, ContentError> {
     RelPath::strict(rel_str).map_err(|error| ContentError::InvalidPath {
         path: rel_str.to_string(),
+        reason: error.reason().to_string(),
+    })
+}
+
+/// Hold a path this layer already holds to the strict rule before anything writes it, reporting the
+/// value that fails rather than dropping it.
+pub fn strict_before_write(path: &RelPath) -> Result<StrictRelPath, ContentError> {
+    path.check_strict().map_err(|error| ContentError::InvalidPath {
+        path: path.to_string(),
         reason: error.reason().to_string(),
     })
 }
@@ -423,7 +434,7 @@ pub(crate) fn fold_case(name: &str) -> String {
 
 /// Refuse a set of paths one case-insensitive disk cannot hold separately: the game contract's
 /// rule, so a plugin and the content store refuse the same sets.
-pub fn validate_path_set(paths: &[RelPath]) -> Result<(), ContentError> {
+pub fn validate_path_set(paths: &[StrictRelPath]) -> Result<(), ContentError> {
     agora_game_api::validate_path_set(paths).map_err(|error| {
         let reason = error.reason();
         match error {
@@ -649,7 +660,7 @@ fn write_manifest_atomic(paths: &AppPaths, item: &ContentItem) -> Result<(), Con
 // ---------------------------------------------------------------------------
 
 struct StagedEntry {
-    rel_path: RelPath,
+    rel_path: StrictRelPath,
     staged_path: PathBuf,
     size: u64,
     sha256: String,
@@ -686,7 +697,7 @@ struct ListedArchiveEntry {
     index: usize,
     /// The name exactly as the archive stores it (7z matches entries by this).
     name: String,
-    rel_path: RelPath,
+    rel_path: StrictRelPath,
     size: u64,
 }
 
@@ -982,7 +993,7 @@ pub(crate) fn add_archive_replacing_locked(
         ArchiveFormat::SevenZ => {
             let listed = list_sevenz_entries(archive_path)?;
             let declared_total_size: u64 = listed.iter().map(|entry| entry.size).sum();
-            let validated_paths: Vec<RelPath> =
+            let validated_paths: Vec<StrictRelPath> =
                 listed.iter().map(|entry| entry.rel_path.clone()).collect();
             let file_names: Vec<String> = listed.iter().map(|entry| entry.name.clone()).collect();
 
@@ -1179,7 +1190,7 @@ pub(crate) fn collect_folder_files(
                 walk_dir(root, &entry_rel, collected)?;
             } else if meta.is_file() {
                 let rel_path = validate_entry_path(&rel_str)?;
-                collected.push((rel_path, abs_path));
+                collected.push((rel_path.into_rel_path(), abs_path));
             }
         }
         Ok(())
@@ -1265,7 +1276,7 @@ pub fn add_file(
     add_collected(
         ctx,
         &item_name,
-        vec![(rel, file_path.to_path_buf())],
+        vec![(rel.into_rel_path(), file_path.to_path_buf())],
         source,
     )
 }
@@ -1285,7 +1296,10 @@ pub fn add_collected(
 
     clean_staging_dir(&ctx.paths);
 
-    let validated_paths: Vec<RelPath> = collected.iter().map(|(p, _)| p.clone()).collect();
+    let validated_paths: Vec<StrictRelPath> = collected
+        .iter()
+        .map(|(p, _)| strict_before_write(p))
+        .collect::<Result<_, _>>()?;
     validate_path_set(&validated_paths)?;
 
     // Untrusted sizes: check free disk space
@@ -1311,11 +1325,11 @@ pub fn add_collected(
         collected.len(),
         || vec![0u8; HASH_BUFFER_SIZE],
         |buf: &mut Vec<u8>, idx| -> Result<StagedEntry, ContentError> {
-            let (rel_path, abs_path) = &collected[idx];
+            let abs_path = &collected[idx].1;
             let staged_path = staging_dir.join(format!("obj_{idx}"));
             let (size, sha256) = copy_and_hash(abs_path, &staged_path, buf)?;
             Ok(StagedEntry {
-                rel_path: rel_path.clone(),
+                rel_path: validated_paths[idx].clone(),
                 staged_path,
                 size,
                 sha256,
@@ -1486,7 +1500,7 @@ fn finish_adding(
     for entry in staged_entries {
         total_size += entry.size;
         files.push(ContentFile {
-            path: entry.rel_path,
+            path: entry.rel_path.into_rel_path(),
             size: entry.size,
             sha256: entry.sha256,
         });
@@ -1871,7 +1885,11 @@ pub fn derive_item(
         total_size += size;
         present.insert(sha256.clone());
         paths.push(path.clone());
-        content_files.push(ContentFile { path, size, sha256 });
+        content_files.push(ContentFile {
+            path: path.into_rel_path(),
+            size,
+            sha256,
+        });
     }
     validate_path_set(&paths)?;
 

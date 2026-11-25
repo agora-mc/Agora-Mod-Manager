@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 
-use agora_game_api::{LayerSource, RelPath};
+use agora_game_api::{LayerSource, RelPath, StrictRelPath};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -1897,11 +1897,13 @@ pub fn evaluate(
         };
         files.push(PlannedFile {
             destination,
-            source: RelPath::new(relative).map_err(|e| FomodError::UnsafePath {
-                element: cand.origin.clone(),
-                path: relative.to_string(),
-                reason: e.to_string(),
-            })?,
+            source: RelPath::strict(relative)
+                .map_err(|e| FomodError::UnsafePath {
+                    element: cand.origin.clone(),
+                    path: relative.to_string(),
+                    reason: e.to_string(),
+                })?
+                .into_rel_path(),
             sha256: src.sha256.clone(),
             size: src.size,
         });
@@ -1910,7 +1912,10 @@ pub fn evaluate(
     if files.is_empty() {
         notes.add("the chosen options install no files".to_string());
     } else {
-        let paths: Vec<RelPath> = files.iter().map(|f| f.destination.clone()).collect();
+        let paths: Vec<StrictRelPath> = files
+            .iter()
+            .map(|f| content_store::strict_before_write(&f.destination))
+            .collect::<Result<_, _>>()?;
         content_store::validate_path_set(&paths)?;
     }
 

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use agora_game_api::RelPath;
+use agora_game_api::StrictRelPath;
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -200,7 +200,7 @@ fn parse_tar_listing(output: &[u8]) -> Result<Vec<ListedEntry>, ContentError> {
 
 #[derive(Debug)]
 struct RarPlan {
-    files: Vec<(RelPath, u64)>,
+    files: Vec<(StrictRelPath, u64)>,
     /// Every folder the extraction may legitimately contain (listed folders and the parents of
     /// everything), as normalised relative paths.
     dirs: HashSet<String>,

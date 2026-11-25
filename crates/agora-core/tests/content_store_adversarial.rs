@@ -380,8 +380,8 @@ fn names_that_differ_only_in_non_ascii_case_are_one_file_on_windows() {
     // archive holding both would overwrite one with the other. The check only folds ASCII.
     use agora_game_api::RelPath;
     let paths = [
-        RelPath::new("Data/CAFÉ.txt").unwrap(),
-        RelPath::new("Data/café.txt").unwrap(),
+        RelPath::strict("Data/CAFÉ.txt").unwrap(),
+        RelPath::strict("Data/café.txt").unwrap(),
     ];
     assert!(
         cs::validate_path_set(&paths).is_err(),
@@ -436,12 +436,12 @@ fn names_that_differ_only_in_case_are_one_file_for_ascii_and_beyond() {
         ("Data/Σ.txt", "Data/σ.txt"),
         ("Data/ǅ.txt", "Data/ǆ.txt"),
     ] {
-        let paths = [RelPath::new(a).unwrap(), RelPath::new(b).unwrap()];
+        let paths = [RelPath::strict(a).unwrap(), RelPath::strict(b).unwrap()];
         assert!(cs::validate_path_set(&paths).is_err(), "{a} vs {b}");
     }
     let distinct = [
-        RelPath::new("Data/café.txt").unwrap(),
-        RelPath::new("Data/cafe.txt").unwrap(),
+        RelPath::strict("Data/café.txt").unwrap(),
+        RelPath::strict("Data/cafe.txt").unwrap(),
     ];
     cs::validate_path_set(&distinct).expect("different letters are not folded together");
 }

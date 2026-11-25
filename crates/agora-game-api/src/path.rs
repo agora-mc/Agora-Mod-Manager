@@ -89,8 +89,9 @@ impl RelPath {
     ///
     /// Stricter than [`RelPath::new`] by every rule that would produce a file a platform cannot
     /// create, or a different file than the one named. The empty path is not a file: it is the
-    /// root, which is [`InstanceRoot`].
-    pub fn strict(value: impl Into<String>) -> Result<Self, RelPathError> {
+    /// root, which is [`InstanceRoot`]. The result is a [`StrictRelPath`], which is what a writer
+    /// takes, so "did the caller check strictness" is answered by the compiler.
+    pub fn strict(value: impl Into<String>) -> Result<StrictRelPath, RelPathError> {
         let value = value.into();
         let normalized = value.replace('\\', "/");
         if normalized.is_empty() {
@@ -162,7 +163,7 @@ impl RelPath {
                 ));
             }
         }
-        Ok(Self(normalized))
+        Ok(StrictRelPath(Self(normalized)))
     }
 
     /// The path with `/` separators, as it will be written.
@@ -179,8 +180,88 @@ impl RelPath {
     ///
     /// The error carries this path, so a stored value that breaks the strict rule is reported by
     /// name rather than dropped.
-    pub fn check_strict(&self) -> Result<(), RelPathError> {
-        Self::strict(self.0.clone()).map(|_| ())
+    pub fn check_strict(&self) -> Result<StrictRelPath, RelPathError> {
+        Self::strict(self.0.clone())
+    }
+}
+
+/// A relative path that passed the **strict** rule: a path Agora may write, or touch on disk.
+///
+/// This exists so the question "did the caller check strictness" is answered by the compiler rather
+/// than by a runtime test at the last moment. A writer takes a `StrictRelPath`; the only ways to get
+/// one are [`RelPath::strict`], [`StrictRelPath::new`] and [`RelPath::check_strict`], all of which
+/// apply the rule. A [`RelPath`] that came out of storage or a plugin must be converted, which is
+/// where a value written before the rule existed is reported — never dropped.
+///
+/// The empty path is not one: it is the root, which is [`InstanceRoot`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct StrictRelPath(RelPath);
+
+impl StrictRelPath {
+    /// Validate a path under the strict rule.
+    pub fn new(value: impl Into<String>) -> Result<Self, RelPathError> {
+        RelPath::strict(value)
+    }
+
+    /// The path with `/` separators, as it will be written.
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// The same path as the lenient type, for an API that stores one.
+    pub fn as_rel_path(&self) -> &RelPath {
+        &self.0
+    }
+
+    /// The same path as the lenient type, by value.
+    pub fn into_rel_path(self) -> RelPath {
+        self.0
+    }
+}
+
+impl From<StrictRelPath> for RelPath {
+    fn from(path: StrictRelPath) -> Self {
+        path.0
+    }
+}
+
+impl From<StrictRelPath> for String {
+    fn from(path: StrictRelPath) -> Self {
+        path.0 .0
+    }
+}
+
+impl TryFrom<String> for StrictRelPath {
+    type Error = RelPathError;
+    fn try_from(value: String) -> Result<Self, RelPathError> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for StrictRelPath {
+    type Error = RelPathError;
+    fn try_from(value: &str) -> Result<Self, RelPathError> {
+        Self::new(value)
+    }
+}
+
+impl fmt::Display for StrictRelPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for StrictRelPath {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::ops::Deref for StrictRelPath {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
     }
 }
 
@@ -308,12 +389,17 @@ impl FileName {
                 "is a path, not a file name: it contains a separator",
             ));
         }
-        Ok(Self(path.0))
+        Ok(Self(path.into_rel_path().into()))
     }
 
     /// The name, as it will be written.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The one-component path this name is, for an API that takes a [`StrictRelPath`].
+    pub fn as_strict(&self) -> StrictRelPath {
+        StrictRelPath(RelPath(self.0.clone()))
     }
 
     /// The one-component path this name is, for an API that takes a [`RelPath`].
@@ -366,7 +452,10 @@ impl PathSetError {
 /// Two files whose names differ only in case are one file on NTFS and one on the default APFS or
 /// ext4-with-casefold setup too: writing the set would silently lose one of them. A path that is a
 /// folder for one file and a file for another fails the same way.
-pub fn validate_path_set(paths: &[RelPath]) -> Result<(), PathSetError> {
+///
+/// Takes [`StrictRelPath`]: a set about to be written has been through the strict rule already, so
+/// there is no way to hand this function a path a disk cannot hold.
+pub fn validate_path_set(paths: &[StrictRelPath]) -> Result<(), PathSetError> {
     if paths.is_empty() {
         return Err(PathSetError::EmptySet);
     }
@@ -495,20 +584,39 @@ pub enum PathError {
 
 /// Join a relative path under a root, for a caller about to write there.
 ///
-/// Two things this checks and a plain `root.join(rel)` does not:
+/// The relative path is a [`StrictRelPath`], so a value that predates the strict rule (a trailing
+/// dot, a reserved name) cannot reach a write without being converted where it is reported. What
+/// this adds to `root.join(rel)` at run time:
 ///
-/// * the relative path is re-checked against the **strict** rule, so a stored value that predates it
-///   (a trailing dot, a reserved name) is reported here rather than written as a different file;
-/// * nothing on the way is a link or junction. A junction is not a symbolic link to
-///   [`std::fs::symlink_metadata`]'s `file_type().is_symlink()` on Windows, so this asks the
-///   attribute Windows sets for both.
+/// * the root itself is a folder Agora made — not a link that points somewhere else, not a file, and
+///   not missing;
+/// * nothing on the way is a link that redirects a name (a symbolic link, a junction, a mount
+///   point). A reparse point that carries data instead of redirecting — a cloud placeholder, a
+///   deduplicated file — is written through, because it is not a redirection;
+/// * nothing on the way is a file where the path continues.
+///
+/// **This is a path check, not a handle, and the answer is only good while the caller holds the
+/// instance's lock.** Between the check and the write another process — a syncing client, an
+/// antivirus scanner, the user with a shell — can replace a folder on the way with a link, and the
+/// write then lands outside the root. Closing that needs the write to happen through an opened
+/// handle whose final path is compared, which is the staged-apply work, not this check.
 ///
 /// A component that does not exist ends the walk: nothing below it can exist either.
-pub fn join_under(root: &Path, rel: &RelPath) -> Result<PathBuf, PathError> {
-    rel.check_strict().map_err(|error| PathError::UnsafePath {
-        path: error.value.clone(),
-        reason: error.reason.clone(),
-    })?;
+///
+/// ```compile_fail
+/// # use std::path::Path;
+/// use agora_game_api::{join_under, RelPath};
+/// // A stored or supplied path has not passed the strict rule, so it cannot be written under.
+/// let lenient = RelPath::new("mods/a.jar").unwrap();
+/// let _ = join_under(Path::new("root"), &lenient);
+/// ```
+///
+/// ```compile_fail
+/// # use std::path::Path;
+/// use agora_game_api::{join_under, RelPath};
+/// let _ = join_under(Path::new("root"), &"mods/a.jar");
+/// ```
+pub fn join_under(root: &Path, rel: &StrictRelPath) -> Result<PathBuf, PathError> {
     // The root is the caller's own choice, and it has to be a folder Agora made rather than a link
     // that points somewhere else: everything joined under it is written through it.
     match std::fs::symlink_metadata(root) {
@@ -1050,10 +1158,10 @@ mod tests {
 
     #[test]
     fn a_path_set_that_a_case_insensitive_disk_cannot_hold_is_refused() {
-        let paths = |names: &[&str]| -> Vec<RelPath> {
+        let paths = |names: &[&str]| -> Vec<StrictRelPath> {
             names
                 .iter()
-                .map(|name| RelPath::new(*name).unwrap())
+                .map(|name| RelPath::strict(*name).unwrap())
                 .collect()
         };
 
