@@ -719,7 +719,14 @@ pub fn is_link(path: &Path) -> Result<bool, PathError> {
         path: path.display().to_string(),
         error: error.to_string(),
     })?;
-    if !is_a_reparse_point(&metadata) {
+    link_from_metadata(path, &metadata)
+}
+
+/// [`is_link`] for a caller that already has the entry own metadata. A sweep of a large
+/// instance asks about tens of thousands of entries, so the metadata each one fetched is reused
+/// rather than fetched twice.
+fn link_from_metadata(path: &Path, metadata: &std::fs::Metadata) -> Result<bool, PathError> {
+    if !is_a_reparse_point(metadata) {
         return Ok(false);
     }
     #[cfg(windows)]
@@ -748,8 +755,9 @@ pub fn is_link(path: &Path) -> Result<bool, PathError> {
 /// still refused.
 pub fn redirects_a_name(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
-        // A path that cannot be asked about may be a link; following it is the failure.
-        Ok(_) => is_link(path).unwrap_or(true),
+        // A path that cannot be asked about may be a link; following it is the failure. One stat
+        // is enough: that metadata is what the answer is made of.
+        Ok(metadata) => link_from_metadata(path, &metadata).unwrap_or(true),
         Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     }
 }
