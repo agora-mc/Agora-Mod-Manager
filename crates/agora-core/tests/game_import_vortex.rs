@@ -1484,7 +1484,7 @@ fn a_merged_import_layers_later_profiles_in_vortex_order() {
         "{:?}",
         report.plan.plans[0].order
     );
-    agora_core::game_loadout::apply_game_profile_with_undo(
+    agora_core::loadout::game::apply_game_profile_with_undo(
         &f.ctx,
         instance,
         &skyrim_like(),

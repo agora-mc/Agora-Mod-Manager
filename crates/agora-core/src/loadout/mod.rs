@@ -1,3 +1,16 @@
+//! The one loadout service (MASTER_SPEC §32.7).
+//!
+//! A loadout profile records what an instance's setup was and puts that setup back. The record,
+//! its storage (`.agora_loadouts`), listing, apply/switch and the rules every game shares — the
+//! undo point taken before anything changes, and the all-or-nothing renames — live here.
+//!
+//! What a profile captures for a particular game is a section, not a second service. [`game`]
+//! holds the section a generic game contributes from its definition (content layers, plugin lists,
+//! INI copies, load-after rules, the save choice). The content section in this module is the set of
+//! enabled items a Minecraft instance records in its manifest.
+
+pub mod game;
+
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -49,7 +62,7 @@ pub struct LoadoutProfile {
     /// load-after rules and save choice (MASTER_SPEC §26.10). `None` on a
     /// Minecraft profile, which keeps the fields above instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub game: Option<crate::game_loadout::GameLoadout>,
+    pub game: Option<crate::loadout::game::GameLoadout>,
 }
 
 /// Mods are every kind that is not a pack or a world, matching `content_subdir`.

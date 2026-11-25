@@ -7,8 +7,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use agora_core::ctx::CoreContext;
 use agora_core::game_instance::{GameInstanceManifest, SavesChoice};
-use agora_core::game_loadout::{self, GameLoadout};
 use agora_core::game_saves;
+use agora_core::loadout::game::{self, GameLoadout};
 use agora_game_api::{BaseReference, GameId, InstallId, RuntimeIdentity, StoreId};
 use tempfile::TempDir;
 
@@ -93,8 +93,8 @@ fn applying_a_loadout_sets_the_saves_ini_to_the_loadouts_folder() {
         save_folder: Some("Own Saves".to_string()),
         ..GameLoadout::default()
     };
-    game_loadout::save_game_profile(&h.ctx, h.instance, "Own Saves", state).unwrap();
-    game_loadout::apply_game_profile_with_undo(&h.ctx, h.instance, &def, "Own Saves", false)
+    game::save_game_profile(&h.ctx, h.instance, "Own Saves", state).unwrap();
+    game::apply_game_profile_with_undo(&h.ctx, h.instance, &def, "Own Saves", false)
         .expect("the loadout applies");
 
     let rule = game_saves::rule_for(&def, &StoreId::steam()).expect("a save rule");
@@ -133,14 +133,14 @@ fn the_first_own_loadout_adopts_the_instances_existing_save_folder() {
     .unwrap();
 
     // The first own-saves loadout adopts the folder the player has been using.
-    let first = game_loadout::create_game_profile(&h.ctx, h.instance, &def, "First Setup")
+    let first = game::create_game_profile(&h.ctx, h.instance, &def, "First Setup")
         .expect("the first loadout is created");
     assert_eq!(
         first.game.as_ref().unwrap().save_folder,
         None,
         "the first loadout records the instance's existing folder"
     );
-    game_loadout::apply_game_profile_with_undo(&h.ctx, h.instance, &def, "First Setup", false)
+    game::apply_game_profile_with_undo(&h.ctx, h.instance, &def, "First Setup", false)
         .expect("the first loadout applies");
     let status = game_saves::status(&h.ctx, h.instance, &def).expect("the saves status");
     assert_eq!(
@@ -159,14 +159,14 @@ fn the_first_own_loadout_adopts_the_instances_existing_save_folder() {
     );
 
     // The second loadout gets a new folder; the first folder and its save stay untouched.
-    let second = game_loadout::create_game_profile(&h.ctx, h.instance, &def, "Second Setup")
+    let second = game::create_game_profile(&h.ctx, h.instance, &def, "Second Setup")
         .expect("the second loadout is created");
     assert_eq!(
         second.game.as_ref().unwrap().save_folder.as_deref(),
         Some("Second Setup"),
         "a later loadout gets its own folder"
     );
-    game_loadout::apply_game_profile_with_undo(&h.ctx, h.instance, &def, "Second Setup", false)
+    game::apply_game_profile_with_undo(&h.ctx, h.instance, &def, "Second Setup", false)
         .expect("the second loadout applies");
     let second_folder =
         game_saves::own_folder_scoped(rule, h.instance, Some("Second Setup")).unwrap();
@@ -183,8 +183,8 @@ fn the_first_own_loadout_adopts_the_instances_existing_save_folder() {
         saves: SavesChoice::Shared,
         ..GameLoadout::default()
     };
-    game_loadout::save_game_profile(&h.ctx, h.instance, "Shared Setup", shared).unwrap();
-    game_loadout::apply_game_profile_with_undo(&h.ctx, h.instance, &def, "Shared Setup", false)
+    game::save_game_profile(&h.ctx, h.instance, "Shared Setup", shared).unwrap();
+    game::apply_game_profile_with_undo(&h.ctx, h.instance, &def, "Shared Setup", false)
         .expect("the shared loadout applies");
     let status = game_saves::status(&h.ctx, h.instance, &def).expect("the saves status");
     assert_eq!(status.choice, SavesChoice::Shared);
@@ -202,16 +202,16 @@ fn a_shared_loadout_goes_back_to_the_shared_saves() {
         saves: SavesChoice::Own,
         ..GameLoadout::default()
     };
-    game_loadout::save_game_profile(&h.ctx, h.instance, "Own Setup", own).unwrap();
-    game_loadout::apply_game_profile_with_undo(&h.ctx, h.instance, &def, "Own Setup", false)
+    game::save_game_profile(&h.ctx, h.instance, "Own Setup", own).unwrap();
+    game::apply_game_profile_with_undo(&h.ctx, h.instance, &def, "Own Setup", false)
         .expect("the own loadout applies");
 
     let shared = GameLoadout {
         saves: SavesChoice::Shared,
         ..GameLoadout::default()
     };
-    game_loadout::save_game_profile(&h.ctx, h.instance, "Shared Setup", shared).unwrap();
-    game_loadout::apply_game_profile_with_undo(&h.ctx, h.instance, &def, "Shared Setup", false)
+    game::save_game_profile(&h.ctx, h.instance, "Shared Setup", shared).unwrap();
+    game::apply_game_profile_with_undo(&h.ctx, h.instance, &def, "Shared Setup", false)
         .expect("the shared loadout applies");
 
     let status = game_saves::status(&h.ctx, h.instance, &def).expect("the saves status");

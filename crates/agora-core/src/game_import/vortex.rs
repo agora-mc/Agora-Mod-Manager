@@ -3468,9 +3468,9 @@ fn profile_state_for_merge(
     definition: &GameDefinition,
     plan: &VortexPlan,
     layer_mod: &HashMap<String, Vec<String>>,
-) -> Result<crate::game_loadout::GameLoadout, ImportError> {
+) -> Result<crate::loadout::game::GameLoadout, ImportError> {
     let mut state =
-        crate::game_loadout::capture(ctx, instance_id, definition).map_err(ImportError::Other)?;
+        crate::loadout::game::capture(ctx, instance_id, definition).map_err(ImportError::Other)?;
     let enabled: BTreeSet<&str> = plan
         .mods
         .iter()
@@ -3544,7 +3544,7 @@ fn profile_state_for_merge(
         if let Some(existing) = state.inis.iter_mut().find(|i| i.file == ini.instance_path) {
             existing.contents = Some(contents);
         } else {
-            state.inis.push(crate::game_loadout::GameLoadoutIni {
+            state.inis.push(crate::loadout::game::GameLoadoutIni {
                 file: ini.instance_path.clone(),
                 contents: Some(contents),
             });
@@ -3579,7 +3579,7 @@ fn profile_state_for_merge(
         if let Some(existing) = state.rules.iter_mut().find(|r| r.list == rule.id) {
             existing.rules = rules;
         } else {
-            state.rules.push(crate::game_loadout::GameLoadoutRules {
+            state.rules.push(crate::loadout::game::GameLoadoutRules {
                 list: rule.id.clone(),
                 rules,
             });
@@ -3750,14 +3750,14 @@ pub fn run_profiles(
                         profile_plan,
                         &layer_mod,
                     )?;
-                    crate::game_loadout::save_game_profile(ctx, &instance_id, profile, state)
+                    crate::loadout::game::save_game_profile(ctx, &instance_id, profile, state)
                         .map_err(ImportError::Other)?;
                     loadouts.push(profile.clone());
                 }
 
                 // The instance keeps the first profile's setup, including its save choice and
                 // the loadout's own save folder.
-                crate::game_loadout::apply_game_profile_with_undo(
+                crate::loadout::game::apply_game_profile_with_undo(
                     ctx,
                     &instance_id,
                     &definition,

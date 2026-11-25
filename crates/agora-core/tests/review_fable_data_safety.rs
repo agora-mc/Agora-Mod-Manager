@@ -6,8 +6,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use agora_core::ctx::CoreContext;
 use agora_core::game_instance::{GameInstanceManifest, SavesChoice};
-use agora_core::game_loadout::{self, GameLoadout, GameLoadoutIni};
 use agora_core::game_user_files::{self, restore, status, swap_in};
+use agora_core::loadout::game::{self, GameLoadout, GameLoadoutIni};
 use agora_core::save_backup;
 use agora_game_api::{BaseReference, GameId, InstallId, RuntimeIdentity, StoreId};
 use tempfile::TempDir;
@@ -254,9 +254,9 @@ fn a_loadout_ini_entry_cannot_reach_outside_the_instance() {
         ],
         ..GameLoadout::default()
     };
-    game_loadout::save_game_profile(&h.ctx, "reach", "reach", state).unwrap();
+    game::save_game_profile(&h.ctx, "reach", "reach", state).unwrap();
 
-    let applied = game_loadout::apply_game_profile_with_undo(&h.ctx, "reach", &def, "reach", false);
+    let applied = game::apply_game_profile_with_undo(&h.ctx, "reach", &def, "reach", false);
 
     assert!(
         !written.exists(),

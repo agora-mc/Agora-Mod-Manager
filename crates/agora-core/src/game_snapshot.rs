@@ -24,8 +24,8 @@ use agora_game_api::crash::SessionVerdict;
 use crate::ctx::Ctx;
 use crate::game_instance::{self, GameInstanceManifest};
 use crate::game_load_order::{self, LoadAfterRule};
-use crate::game_loadout::GameLoadoutRules;
 use crate::lkg::{self, Diff, FileEntry, LaunchOutcome, LkgState};
+use crate::loadout::game::GameLoadoutRules;
 use crate::lock_manager::LockResource;
 use crate::snapshot::{
     self, RestoreCoverageKind, RestoreOutcome, Snapshot, SnapshotAux, SnapshotInputFile,

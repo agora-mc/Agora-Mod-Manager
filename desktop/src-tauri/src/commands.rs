@@ -5488,7 +5488,7 @@ pub async fn create_loadout_profile(
                         message: format!("The definition for game '{}' is missing", record.game),
                     }
                 })?;
-                agora_core::game_loadout::create_game_profile(&ctx, &sanitized, &definition, &name)
+                agora_core::loadout::game::create_game_profile(&ctx, &sanitized, &definition, &name)
             }
             None => agora_core::loadout::create_profile(&instance_dir, &name),
         };
@@ -5510,7 +5510,7 @@ pub async fn preview_loadout_update(
     let ctx = crate::core_context(&app)?;
     let sanitized = paths::sanitize_id(&instance_id);
     tokio::task::spawn_blocking(move || match game_definition_for(&ctx, &sanitized)? {
-        Some(definition) => agora_core::game_loadout::plan_game_profile_update(
+        Some(definition) => agora_core::loadout::game::plan_game_profile_update(
             &ctx,
             &sanitized,
             &definition,
@@ -5536,7 +5536,7 @@ pub async fn update_loadout_profile(
     let ctx = crate::core_context(&app)?;
     let sanitized = paths::sanitize_id(&instance_id);
     tokio::task::spawn_blocking(move || match game_definition_for(&ctx, &sanitized)? {
-        Some(definition) => agora_core::game_loadout::update_game_profile(
+        Some(definition) => agora_core::loadout::game::update_game_profile(
             &ctx,
             &sanitized,
             &definition,
@@ -5585,7 +5585,7 @@ pub async fn apply_loadout_profile(
     let ctx = crate::core_context(&app)?;
     let sanitized = paths::sanitize_id(&instance_id);
     tokio::task::spawn_blocking(move || match game_definition_for(&ctx, &sanitized)? {
-        Some(definition) => agora_core::game_loadout::apply_game_profile_with_undo(
+        Some(definition) => agora_core::loadout::game::apply_game_profile_with_undo(
             &ctx,
             &sanitized,
             &definition,

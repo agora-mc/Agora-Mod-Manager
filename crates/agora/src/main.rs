@@ -6578,7 +6578,7 @@ async fn run_loadout_command(
                 let definition = ctx.games.game(&record.game).ok_or_else(|| {
                     anyhow::anyhow!("The definition for game '{}' is missing", record.game)
                 })?;
-                agora_core::game_loadout::create_game_profile(ctx, &instance, definition, &name)
+                agora_core::loadout::game::create_game_profile(ctx, &instance, definition, &name)
                     .map_err(|e| anyhow::anyhow!("Failed to create loadout: {e}"))?
             } else {
                 agora_core::loadout::create_profile(&instance_dir, &name)
@@ -6672,7 +6672,7 @@ async fn run_loadout_command(
                 let definition = ctx.games.game(&record.game).ok_or_else(|| {
                     anyhow::anyhow!("The definition for game '{}' is missing", record.game)
                 })?;
-                agora_core::game_loadout::apply_game_profile_with_undo(
+                agora_core::loadout::game::apply_game_profile_with_undo(
                     ctx,
                     &instance,
                     definition,
@@ -6741,7 +6741,7 @@ async fn run_loadout_command(
             };
             let service = agora_game_minecraft::loadout_service::LoadoutService::new(ctx.clone());
             let preview = match game_definition {
-                Some(definition) => agora_core::game_loadout::plan_game_profile_update(
+                Some(definition) => agora_core::loadout::game::plan_game_profile_update(
                     ctx, &instance, definition, &name,
                 )
                 .map_err(|e| anyhow::anyhow!("Failed to read the loadout: {e}"))?,
@@ -6770,7 +6770,7 @@ async fn run_loadout_command(
                 }
             } else {
                 let done = match game_definition {
-                    Some(definition) => agora_core::game_loadout::update_game_profile(
+                    Some(definition) => agora_core::loadout::game::update_game_profile(
                         ctx, &instance, definition, &name,
                     )
                     .map_err(|e| anyhow::anyhow!("Failed to update the loadout: {e}"))?,
