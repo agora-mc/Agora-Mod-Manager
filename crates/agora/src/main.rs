@@ -2796,7 +2796,7 @@ fn print_recovery_report(report: &agora_core::recovery_report::RecoveryReport) {
         println!("Recovery journals: none of the kinds that could be searched have one.");
     } else {
         println!(
-            "Recovery journals ({}; the next start finishes or undoes these, read-only report):",
+            "Recovery journals ({} found): what a start would do with each, read-only:",
             report.entries.len()
         );
         for entry in &report.entries {
