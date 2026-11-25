@@ -730,3 +730,43 @@ fn a_row_that_would_change_owner_is_found_beside_an_instance_with_no_id() {
     assert!(table_exists(&conn, "user_instances"));
     assert!(!table_exists(&conn, "instances"));
 }
+
+#[test]
+fn the_rebuild_keeps_rowids_so_a_report_names_the_row_it_meant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = old_database(tmp.path());
+    // One child row, already an orphan when the database arrives, and not one that the merge
+    // would re-parent: nothing in either instance table has this id. It sits at rowid 2 because
+    // a valid row was there before it and has since been deleted — so a rebuild that copies the
+    // rows in order lands it at rowid 1, a row the arrival record has never seen, and the runner
+    // refuses to commit a database that only needed upgrading.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DELETE FROM instance_pack_gaps;
+             INSERT INTO instance_pack_gaps (rowid, instance_id, filename, display_name, status)
+             VALUES (2, 'gone-instance', 'c.jar', 'Sea', 'missing');",
+        )
+        .unwrap();
+    }
+
+    let report = init_local_state_db_with(&path, &LocalStateOpenOptions::default())
+        .expect("an orphan the database arrived with does not stop the upgrade");
+    assert_eq!(report.migrated_to, 31);
+    let warned = report.warnings.join("\n");
+    assert!(
+        warned.contains("instance_pack_gaps row 2"),
+        "the warning names the row that was already broken: {warned}"
+    );
+
+    let conn = local_state_connection(&path).unwrap();
+    let rowid: i64 = conn
+        .query_row(
+            "SELECT rowid FROM instance_pack_gaps WHERE instance_id = 'gone-instance'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rowid, 2, "the row keeps the rowid it had");
+}

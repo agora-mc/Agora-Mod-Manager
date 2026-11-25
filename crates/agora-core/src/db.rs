@@ -2554,6 +2554,10 @@ fn migrate_v31(conn: &Connection) -> anyhow::Result<()> {
     // A foreign key cannot be altered, so each is rebuilt with its rows carried over: SQLite's
     // procedure for a table rebuild, which needs the foreign keys off (this step's flag) or the
     // `DROP TABLE` below would delete the rows that reference the table being replaced.
+    //
+    // Each copy names `rowid` for the same reason: the runner compared the arrivals and the
+    // result by row, so a rebuilt row that lands on a different rowid reads as an orphan this
+    // step created, and a report about a row that moved names the wrong row.
     conn.execute_batch(
         "DROP TABLE IF EXISTS instance_imports_v31;
          CREATE TABLE instance_imports_v31 (
@@ -2571,12 +2575,12 @@ fn migrate_v31(conn: &Connection) -> anyhow::Result<()> {
              FOREIGN KEY (instance_id) REFERENCES instances(instance_id) ON DELETE CASCADE
          );
          INSERT INTO instance_imports_v31
-             (instance_id, launcher_kind, installation_key, source_instance_key, source_path,
+             (rowid, instance_id, launcher_kind, installation_key, source_instance_key, source_path,
               source_metadata_json, imported_settings_json, source_fingerprint, imported_at,
               updated_at, last_result)
-         SELECT instance_id, launcher_kind, installation_key, source_instance_key, source_path,
-                source_metadata_json, imported_settings_json, source_fingerprint, imported_at,
-                updated_at, last_result
+         SELECT rowid, instance_id, launcher_kind, installation_key, source_instance_key,
+                source_path, source_metadata_json, imported_settings_json, source_fingerprint,
+                imported_at, updated_at, last_result
            FROM instance_imports;
          DROP TABLE instance_imports;
          ALTER TABLE instance_imports_v31 RENAME TO instance_imports;
@@ -2592,8 +2596,8 @@ fn migrate_v31(conn: &Connection) -> anyhow::Result<()> {
              PRIMARY KEY (instance_id, relative_path),
              FOREIGN KEY (instance_id) REFERENCES instances(instance_id) ON DELETE CASCADE
          );
-         INSERT INTO instance_pack_files_v31 (instance_id, relative_path, sha256, size)
-         SELECT instance_id, relative_path, sha256, size FROM instance_pack_files;
+         INSERT INTO instance_pack_files_v31 (rowid, instance_id, relative_path, sha256, size)
+         SELECT rowid, instance_id, relative_path, sha256, size FROM instance_pack_files;
          DROP TABLE instance_pack_files;
          ALTER TABLE instance_pack_files_v31 RENAME TO instance_pack_files;
          CREATE INDEX IF NOT EXISTS idx_instance_pack_files_instance
@@ -2609,8 +2613,8 @@ fn migrate_v31(conn: &Connection) -> anyhow::Result<()> {
              FOREIGN KEY (instance_id) REFERENCES instances(instance_id) ON DELETE CASCADE
          );
          INSERT INTO instance_pack_gaps_v31
-             (instance_id, filename, display_name, status, reason)
-         SELECT instance_id, filename, display_name, status, reason FROM instance_pack_gaps;
+             (rowid, instance_id, filename, display_name, status, reason)
+         SELECT rowid, instance_id, filename, display_name, status, reason FROM instance_pack_gaps;
          DROP TABLE instance_pack_gaps;
          ALTER TABLE instance_pack_gaps_v31 RENAME TO instance_pack_gaps;
          CREATE INDEX IF NOT EXISTS idx_instance_pack_gaps_instance
@@ -2623,8 +2627,8 @@ fn migrate_v31(conn: &Connection) -> anyhow::Result<()> {
              checked_at TEXT NOT NULL,
              FOREIGN KEY (instance_id) REFERENCES instances(instance_id) ON DELETE CASCADE
          );
-         INSERT INTO instance_update_cache_v31 (instance_id, updates_json, checked_at)
-         SELECT instance_id, updates_json, checked_at FROM instance_update_cache;
+         INSERT INTO instance_update_cache_v31 (rowid, instance_id, updates_json, checked_at)
+         SELECT rowid, instance_id, updates_json, checked_at FROM instance_update_cache;
          DROP TABLE instance_update_cache;
          ALTER TABLE instance_update_cache_v31 RENAME TO instance_update_cache;
          CREATE INDEX IF NOT EXISTS idx_instance_update_cache_checked_at
