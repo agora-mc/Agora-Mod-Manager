@@ -8,7 +8,6 @@
     "crates/agora-core/src/snapshot.rs": 5,
     "crates/agora-game-minecraft/src/import.rs": 6,
     "crates/agora-game-minecraft/src/installed_profile.rs": 1,
-    "crates/agora-game-minecraft/src/jar_metadata.rs": 6,
     "crates/agora-game-minecraft/src/launch_planner.rs": 1,
     "crates/agora-game-minecraft/src/pack_update.rs": 3,
     "crates/agora-game-minecraft/src/server_export.rs": 1,

@@ -1445,11 +1445,12 @@ fn sevenz_unix_mode(entry: &sevenz_rust2::ArchiveEntry) -> Option<u32> {
     if !entry.has_windows_attributes {
         return None;
     }
-    let mode = (entry.windows_attributes >> 16) as u32;
+    let mode = entry.windows_attributes >> 16;
     (mode != 0).then_some(mode)
 }
 
-fn claims_to_be_a_link(entry: &sevenz_rust2::ArchiveEntry) -> bool {    if !entry.has_windows_attributes {
+fn claims_to_be_a_link(entry: &sevenz_rust2::ArchiveEntry) -> bool {
+    if !entry.has_windows_attributes {
         return false;
     }
     let attributes = entry.windows_attributes;

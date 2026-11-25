@@ -1067,7 +1067,12 @@ fn extract_runtime_archive(
 
     let cancelled = || check_cancelled(progress, entry.major, component).is_err();
     archive
-        .extract_checked(staging, NamePolicy::Refuse, &mut |_| Select::Write, &cancelled)
+        .extract_checked(
+            staging,
+            NamePolicy::Refuse,
+            &mut |_| Select::Write,
+            &cancelled,
+        )
         .map(|_| ())
         .map_err(|error| match error {
             ArchiveError::Cancelled { .. } => LauncherError::JavaRuntimeCancelled {

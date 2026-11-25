@@ -3,9 +3,9 @@ use agora_core::dependency_ops::{
     DependencyDecl, DependencyImportance, DependencySource, IncompatibilityDecl,
     IncompatibilitySource, JarDeps, ProvidedMod, ProvidedModSource, VersionGrammar,
 };
+use agora_game_api::{ArchiveError, ArchiveLimits, SafeArchive};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 
 /// Whether an artifact was fully inspected.
@@ -161,31 +161,13 @@ pub fn parse_jar_metadata(jar_path: &Path) -> JarDeps {
 
 /// Parse a JAR and retain inspection status and safe diagnostics.
 pub fn parse_jar_metadata_result(jar_path: &Path) -> JarInventoryResult {
-    let file = match std::fs::File::open(jar_path) {
-        Ok(f) => f,
-        Err(_) => {
+    let mut archive = match open_jar(jar_path) {
+        Ok(archive) => archive,
+        Err(diagnostic) => {
             return JarInventoryResult {
                 metadata: JarDeps::default(),
                 status: ParseStatus::Failed,
-                diagnostics: vec![ParseDiagnostic {
-                    kind: ParseDiagnosticKind::ArchiveOpenFailed,
-                    entry_path: None,
-                    message: "The JAR could not be opened.".into(),
-                }],
-            }
-        }
-    };
-    let mut archive = match zip::ZipArchive::new(file) {
-        Ok(a) => a,
-        Err(_) => {
-            return JarInventoryResult {
-                metadata: JarDeps::default(),
-                status: ParseStatus::Failed,
-                diagnostics: vec![ParseDiagnostic {
-                    kind: ParseDiagnosticKind::ArchiveOpenFailed,
-                    entry_path: None,
-                    message: "The JAR archive is malformed.".into(),
-                }],
+                diagnostics: vec![diagnostic],
             }
         }
     };
@@ -195,6 +177,38 @@ pub fn parse_jar_metadata_result(jar_path: &Path) -> JarInventoryResult {
         metadata: parsed.metadata,
         status: parsed.status,
         diagnostics: parsed.diagnostics,
+    }
+}
+
+/// A jar as the one archive reader lists it, held to the `JAR_METADATA` preset.
+///
+/// The entry names are the archive's own keys here, never paths: metadata is read, nothing is
+/// written, so a jar may hold an entry called `aux.class` (MASTER_SPEC §32.3). What the preset adds
+/// is the entry count and the per-entry and total sizes, and a jar that cannot be listed is an
+/// error with its reason rather than a jar with no metadata (MASTER_SPEC §32.13).
+fn open_jar(jar_path: &Path) -> Result<SafeArchive, ParseDiagnostic> {
+    SafeArchive::open(jar_path, ArchiveLimits::JAR_METADATA).map_err(jar_open_failure)
+}
+
+/// [`open_jar`] for bytes already in hand: a verified download, or a nested jar out of one.
+fn open_jar_bytes(bytes: Vec<u8>) -> Result<SafeArchive, ParseDiagnostic> {
+    SafeArchive::open_bytes(bytes, ArchiveLimits::JAR_METADATA).map_err(jar_open_failure)
+}
+
+/// The reader's refusal as the diagnostic a jar inventory already reports, with its reason.
+fn jar_open_failure(error: ArchiveError) -> ParseDiagnostic {
+    match error {
+        // The file is there or it is not: that is an open, not a parse.
+        ArchiveError::Unreadable { .. } => ParseDiagnostic {
+            kind: ParseDiagnosticKind::ArchiveOpenFailed,
+            entry_path: None,
+            message: "The JAR could not be opened.".into(),
+        },
+        other => ParseDiagnostic {
+            kind: ParseDiagnosticKind::ArchiveOpenFailed,
+            entry_path: None,
+            message: format!("The JAR archive is malformed: {other}"),
+        },
     }
 }
 
@@ -213,33 +227,14 @@ pub fn parse_jar_metadata_for_loader_with_status(
     jar_path: &Path,
     loader: &str,
 ) -> LoaderJarMetadata {
-    let file = match std::fs::File::open(jar_path) {
-        Ok(f) => f,
-        Err(_) => {
+    let mut archive = match open_jar(jar_path) {
+        Ok(archive) => archive,
+        Err(diagnostic) => {
             return LoaderJarMetadata {
                 metadata: JarDeps::default(),
                 has_native_metadata: false,
                 status: ParseStatus::Failed,
-                diagnostics: vec![ParseDiagnostic {
-                    kind: ParseDiagnosticKind::ArchiveOpenFailed,
-                    entry_path: None,
-                    message: "The JAR could not be opened.".into(),
-                }],
-            }
-        }
-    };
-    let mut archive = match zip::ZipArchive::new(file) {
-        Ok(a) => a,
-        Err(_) => {
-            return LoaderJarMetadata {
-                metadata: JarDeps::default(),
-                has_native_metadata: false,
-                status: ParseStatus::Failed,
-                diagnostics: vec![ParseDiagnostic {
-                    kind: ParseDiagnosticKind::ArchiveOpenFailed,
-                    entry_path: None,
-                    message: "The JAR archive is malformed.".into(),
-                }],
+                diagnostics: vec![diagnostic],
             }
         }
     };
@@ -275,33 +270,14 @@ pub fn parse_jar_metadata_for_loader_with_status_at_mc(
     loader: &str,
     minecraft_version: &str,
 ) -> LoaderJarMetadata {
-    let file = match std::fs::File::open(jar_path) {
-        Ok(f) => f,
-        Err(_) => {
+    let mut archive = match open_jar(jar_path) {
+        Ok(archive) => archive,
+        Err(diagnostic) => {
             return LoaderJarMetadata {
                 metadata: JarDeps::default(),
                 has_native_metadata: false,
                 status: ParseStatus::Failed,
-                diagnostics: vec![ParseDiagnostic {
-                    kind: ParseDiagnosticKind::ArchiveOpenFailed,
-                    entry_path: None,
-                    message: "The JAR could not be opened.".into(),
-                }],
-            }
-        }
-    };
-    let mut archive = match zip::ZipArchive::new(file) {
-        Ok(a) => a,
-        Err(_) => {
-            return LoaderJarMetadata {
-                metadata: JarDeps::default(),
-                has_native_metadata: false,
-                status: ParseStatus::Failed,
-                diagnostics: vec![ParseDiagnostic {
-                    kind: ParseDiagnosticKind::ArchiveOpenFailed,
-                    entry_path: None,
-                    message: "The JAR archive is malformed.".into(),
-                }],
+                diagnostics: vec![diagnostic],
             }
         }
     };
@@ -346,19 +322,14 @@ fn minecraft_before_1_20_5(version: &str) -> bool {
 
 /// Parse loader-specific metadata directly from verified JAR bytes.
 pub fn parse_jar_metadata_bytes_for_loader(bytes: &[u8], loader: &str) -> LoaderJarMetadata {
-    let cursor = Cursor::new(bytes);
-    let mut archive = match zip::ZipArchive::new(cursor) {
-        Ok(a) => a,
-        Err(_) => {
+    let mut archive = match open_jar_bytes(bytes.to_vec()) {
+        Ok(archive) => archive,
+        Err(diagnostic) => {
             return LoaderJarMetadata {
                 metadata: JarDeps::default(),
                 has_native_metadata: false,
                 status: ParseStatus::Failed,
-                diagnostics: vec![ParseDiagnostic {
-                    kind: ParseDiagnosticKind::ArchiveOpenFailed,
-                    entry_path: None,
-                    message: "The JAR archive is malformed.".into(),
-                }],
+                diagnostics: vec![diagnostic],
             }
         }
     };
@@ -379,19 +350,14 @@ pub fn parse_jar_metadata_bytes_for_loader_at_mc(
     loader: &str,
     minecraft_version: &str,
 ) -> LoaderJarMetadata {
-    let cursor = Cursor::new(bytes);
-    let mut archive = match zip::ZipArchive::new(cursor) {
-        Ok(a) => a,
-        Err(_) => {
+    let mut archive = match open_jar_bytes(bytes.to_vec()) {
+        Ok(archive) => archive,
+        Err(diagnostic) => {
             return LoaderJarMetadata {
                 metadata: JarDeps::default(),
                 has_native_metadata: false,
                 status: ParseStatus::Failed,
-                diagnostics: vec![ParseDiagnostic {
-                    kind: ParseDiagnosticKind::ArchiveOpenFailed,
-                    entry_path: None,
-                    message: "The JAR archive is malformed.".into(),
-                }],
+                diagnostics: vec![diagnostic],
             }
         }
     };
@@ -674,11 +640,11 @@ fn parse_loader_json(content: &str) -> Result<serde_json::Value, serde_json::Err
 
 /// Generic recursive JAR metadata parser.
 ///
-/// Works over any `R: Read + Seek` so it can be called with
-/// `ZipArchive<File>` for the top-level JAR and `ZipArchive<Cursor<Vec<u8>>>`
-/// for nested JARs extracted from parent entries.
-fn parse_from_archive<R: Read + Seek>(
-    archive: &mut zip::ZipArchive<R>,
+/// Works over a jar the one archive reader has already listed, so the top-level jar and a nested one
+/// taken out of a parent entry are parsed by the same code and held to the same `JAR_METADATA`
+/// preset.
+fn parse_from_archive(
+    archive: &mut SafeArchive,
     depth: u32,
     budget: &mut NestedJarBudget,
     scope: MetadataScope,
@@ -697,20 +663,16 @@ fn parse_from_archive<R: Read + Seek>(
         };
     }
 
-    let total_len = archive.len();
-    let has_quilt_metadata = (0..total_len).any(|i| {
-        archive
-            .by_index(i)
-            .ok()
-            .is_some_and(|entry| entry.name().is_ok_and(|name| name == "quilt.mod.json"))
-    });
-    let has_neoforge_metadata = (0..total_len).any(|i| {
-        archive.by_index(i).ok().is_some_and(|entry| {
-            entry
-                .name()
-                .is_ok_and(|name| name == "META-INF/neoforge.mods.toml")
-        })
-    });
+    // The names as the archive lists them: keys for reading, never paths (MASTER_SPEC §32.3).
+    let names: Vec<String> = archive
+        .entries()
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+    let has_quilt_metadata = names.iter().any(|name| name == "quilt.mod.json");
+    let has_neoforge_metadata = names
+        .iter()
+        .any(|name| name == "META-INF/neoforge.mods.toml");
     let include_fabric = scope.includes_fabric(has_quilt_metadata);
     let include_quilt = scope.includes_quilt();
     let include_forge = scope.includes_forge();
@@ -750,14 +712,7 @@ fn parse_from_archive<R: Read + Seek>(
     let mut forge_jarjar_paths: Vec<String> = Vec::new();
 
     // ---- First pass: collect metadata and record declared nested paths ----
-    for i in 0..total_len {
-        let name = match archive.by_index(i) {
-            Ok(e) => match e.name() {
-                Ok(name) => name.into_owned(),
-                Err(_) => continue,
-            },
-            Err(_) => continue,
-        };
+    for name in names.iter().cloned() {
         if name.ends_with(".class") {
             let stem = match name.strip_suffix(".class") {
                 Some(s) => s,
@@ -773,7 +728,7 @@ fn parse_from_archive<R: Read + Seek>(
             continue;
         }
         if name == "fabric.mod.json" && include_fabric {
-            match read_entry_utf8_bounded(archive, i, MAX_METADATA_TEXT_BYTES) {
+            match read_entry_utf8_bounded(archive, &name, MAX_METADATA_TEXT_BYTES) {
                 Some(content) => match parse_loader_json(&content) {
                     Ok(value) => {
                         has_native_metadata = true;
@@ -819,7 +774,7 @@ fn parse_from_archive<R: Read + Seek>(
         }
 
         if name == "quilt.mod.json" && include_quilt {
-            match read_entry_utf8_bounded(archive, i, MAX_METADATA_TEXT_BYTES) {
+            match read_entry_utf8_bounded(archive, &name, MAX_METADATA_TEXT_BYTES) {
                 Some(content) => match parse_loader_json(&content) {
                     Ok(value) => {
                         has_native_metadata = true;
@@ -869,7 +824,7 @@ fn parse_from_archive<R: Read + Seek>(
         // a stub).
         if name == "META-INF/neoforge.mods.toml" && include_neoforge {
             saw_neoforge_toml = true;
-            match read_entry_utf8_bounded(archive, i, MAX_METADATA_TEXT_BYTES) {
+            match read_entry_utf8_bounded(archive, &name, MAX_METADATA_TEXT_BYTES) {
                 Some(content) => match parse_forge_metadata(&content) {
                     Ok(parsed) => {
                         has_native_metadata = true;
@@ -914,7 +869,7 @@ fn parse_from_archive<R: Read + Seek>(
                 && has_neoforge_metadata)
             && !saw_neoforge_toml
         {
-            match read_entry_utf8_bounded(archive, i, MAX_METADATA_TEXT_BYTES) {
+            match read_entry_utf8_bounded(archive, &name, MAX_METADATA_TEXT_BYTES) {
                 Some(content) => match parse_forge_metadata(&content) {
                     Ok(parsed) => {
                         has_native_metadata = true;
@@ -954,7 +909,7 @@ fn parse_from_archive<R: Read + Seek>(
             continue;
         }
         if name == "META-INF/jarjar/metadata.json" && (include_forge || include_neoforge) {
-            match read_entry_utf8_bounded(archive, i, MAX_METADATA_TEXT_BYTES) {
+            match read_entry_utf8_bounded(archive, &name, MAX_METADATA_TEXT_BYTES) {
                 Some(content) => match extract_jarjar_paths(&content) {
                     Ok(paths) => forge_jarjar_paths.extend(paths),
                     Err(message) => {
@@ -979,7 +934,8 @@ fn parse_from_archive<R: Read + Seek>(
             continue;
         }
         if name == "META-INF/MANIFEST.MF" {
-            if let Some(content) = read_entry_utf8_bounded(archive, i, MAX_METADATA_TEXT_BYTES) {
+            if let Some(content) = read_entry_utf8_bounded(archive, &name, MAX_METADATA_TEXT_BYTES)
+            {
                 manifest_impl_version = parse_manifest_version(&content);
                 if include_forge || include_neoforge {
                     forge_jarjar_paths.extend(parse_manifest_embedded_mods(&content));
@@ -1069,14 +1025,7 @@ fn parse_from_archive<R: Read + Seek>(
 
     // ---- Second pass: read and parse declared nested JARs ----
     let mut processed_nested_paths: BTreeSet<String> = BTreeSet::new();
-    for i in 0..total_len {
-        let entry_name = match archive.by_index(i) {
-            Ok(e) => match e.name() {
-                Ok(name) => name.into_owned(),
-                Err(_) => continue,
-            },
-            Err(_) => continue,
-        };
+    for entry_name in &names {
         let normalized = entry_name.replace('\\', "/");
         if !nested_paths.contains(&normalized) || !processed_nested_paths.insert(normalized.clone())
         {
@@ -1093,7 +1042,7 @@ fn parse_from_archive<R: Read + Seek>(
             break;
         }
 
-        let bytes = read_entry_bytes_bounded(archive, i, MAX_ENTRY_BYTES);
+        let bytes = read_entry_bytes_bounded(archive, entry_name, MAX_ENTRY_BYTES);
         let bytes = match bytes {
             Some(b) if !b.is_empty() => b,
             _ => {
@@ -1120,9 +1069,8 @@ fn parse_from_archive<R: Read + Seek>(
         budget.total_bytes += entry_size;
         budget.total_count += 1;
 
-        let cursor = Cursor::new(bytes);
-        let mut nested_archive = match zip::ZipArchive::new(cursor) {
-            Ok(a) => a,
+        let mut nested_archive = match open_jar_bytes(bytes) {
+            Ok(archive) => archive,
             Err(_) => {
                 status.record_partial();
                 diagnostics.push(ParseDiagnostic {
@@ -1283,34 +1231,37 @@ fn is_safe_nested_path(path: &str) -> bool {
 
 /// Read a text entry from the archive with a byte-size bound.
 /// Returns `None` if the entry exceeds `max_bytes` or is not valid UTF-8.
-fn read_entry_utf8_bounded<R: Read + Seek>(
-    archive: &mut zip::ZipArchive<R>,
-    index: usize,
+fn read_entry_utf8_bounded(
+    archive: &mut SafeArchive,
+    name: &str,
     max_bytes: u64,
 ) -> Option<String> {
-    let entry = archive.by_index(index).ok()?;
-    let mut buf = Vec::new();
-    entry.take(max_bytes + 1).read_to_end(&mut buf).ok()?;
-    if buf.len() > max_bytes as usize {
-        return None;
-    }
-    String::from_utf8(buf).ok()
+    let bytes = read_entry_bytes_bounded(archive, name, max_bytes)?;
+    String::from_utf8(bytes).ok()
 }
 
-/// Read a binary entry from the archive with a byte-size bound.
+/// Read a binary entry, named as the archive names it, with a byte-size bound.
 /// Returns `None` if the entry exceeds `max_bytes`.
-fn read_entry_bytes_bounded<R: Read + Seek>(
-    archive: &mut zip::ZipArchive<R>,
-    index: usize,
+fn read_entry_bytes_bounded(
+    archive: &mut SafeArchive,
+    name: &str,
     max_bytes: u64,
 ) -> Option<Vec<u8>> {
-    let entry = archive.by_index(index).ok()?;
-    let mut buf = Vec::new();
-    entry.take(max_bytes + 1).read_to_end(&mut buf).ok()?;
-    if buf.len() > max_bytes as usize {
+    // The declared size first, so an entry that claims more than a metadata file may hold is never
+    // read; then the bytes actually returned, because a declared size can lie (MASTER_SPEC §32.13).
+    let declared = archive
+        .entries()
+        .iter()
+        .find(|entry| entry.name == name)?
+        .size;
+    if declared > max_bytes {
         return None;
     }
-    Some(buf)
+    let bytes = archive.read(name).ok()?;
+    if bytes.len() as u64 > max_bytes {
+        return None;
+    }
+    Some(bytes)
 }
 
 /// Extract Fabric dependency ids (and, for `breaks`/`conflicts`, structured
@@ -2071,7 +2022,7 @@ mod tests {
 
     /// Build a JAR (zip) entirely in memory and return its raw bytes.
     fn build_jar_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        use std::io::Write;
+        use std::io::{Cursor, Write};
         let mut buf = Cursor::new(Vec::new());
         {
             let mut zip = zip::ZipWriter::new(&mut buf);
@@ -3304,7 +3255,10 @@ Embedded-Dependencies-Mod: a.jar
     }
 
     #[test]
-    fn oversized_nested_entry_is_partial_not_provider() {
+    fn an_entry_above_the_preset_refuses_the_jar_rather_than_trusting_the_rest() {
+        // `JAR_METADATA`'s per-entry limit is where a nested jar used to be skipped at read time.
+        // The listing refuses it instead, so the rest of the jar is not read on the strength of a
+        // size the archive itself declared (MASTER_SPEC §32.13); health falls back to the manifest.
         let big = vec![0u8; (MAX_ENTRY_BYTES + 1) as usize];
         let jar = build_test_jar_binary(&[
             (
@@ -3315,8 +3269,14 @@ Embedded-Dependencies-Mod: a.jar
         ]);
         let parsed = parse_jar_metadata_for_loader_with_status(&jar, "fabric");
         let _ = std::fs::remove_file(&jar);
-        assert_eq!(parsed.status, ParseStatus::Partial);
+        assert_eq!(parsed.status, ParseStatus::Failed);
         assert!(parsed.metadata.provided_mods.is_empty());
+        assert_eq!(parsed.diagnostics.len(), 1);
+        assert_eq!(
+            parsed.diagnostics[0].kind,
+            ParseDiagnosticKind::ArchiveOpenFailed
+        );
+        assert!(parsed.diagnostics[0].message.contains("big.jar"));
     }
 
     #[test]
@@ -3345,6 +3305,33 @@ Embedded-Dependencies-Mod: a.jar
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.kind == ParseDiagnosticKind::ArchiveOpenFailed));
+    }
+
+    #[test]
+    fn an_entry_a_windows_disk_cannot_hold_is_still_read_as_metadata_key() {
+        // `aux.class` and `textures/aux.dds` are names Windows reserves, and a case-colliding pair
+        // is a name a case-insensitive disk cannot hold twice. Reading a jar writes nothing, so the
+        // names stay the archive's own keys and the metadata in them is read like any other
+        // (MASTER_SPEC §32.3).
+        let jar = build_test_jar(&[
+            (
+                "fabric.mod.json",
+                r#"{"id":"auxmod","version":"1.0.0","depends":{"minecraft":"*"}}"#,
+            ),
+            ("com/example/aux.class", "not-really-bytecode"),
+            ("textures/aux.dds", ""),
+            ("assets/Readme.txt", ""),
+            ("assets/README.TXT", ""),
+        ]);
+        let parsed = parse_jar_metadata_result(&jar);
+        let _ = std::fs::remove_file(&jar);
+        assert_eq!(parsed.status, ParseStatus::Complete);
+        assert!(parsed.diagnostics.is_empty());
+        assert_eq!(parsed.metadata.mod_jar_id.as_deref(), Some("auxmod"));
+        assert!(parsed
+            .metadata
+            .java_packages
+            .contains(&"com.example".to_string()));
     }
 
     // -------------------------------------------------------------------
