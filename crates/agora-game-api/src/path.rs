@@ -23,8 +23,9 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::game::fold_path_case;
 
-/// The Windows attribute bit that marks a reparse point: a symbolic link, a junction or another
-/// filesystem redirection. `FILE_ATTRIBUTE_REPARSE_POINT`.
+/// The Windows attribute bit that marks a reparse point: a symbolic link, a junction, a mount point,
+/// or a reparse point that carries data instead (a cloud placeholder, a deduplicated file).
+/// `FILE_ATTRIBUTE_REPARSE_POINT`.
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
@@ -619,20 +620,8 @@ pub enum PathError {
 pub fn join_under(root: &Path, rel: &StrictRelPath) -> Result<PathBuf, PathError> {
     // The root is the caller's own choice, and it has to be a folder Agora made rather than a link
     // that points somewhere else: everything joined under it is written through it.
-    match std::fs::symlink_metadata(root) {
-        Ok(metadata) if is_link(&metadata) => {
-            return Err(PathError::LinkOnTheWay {
-                path: root.display().to_string(),
-                link: root.display().to_string(),
-            })
-        }
-        Ok(metadata) if !metadata.is_dir() => {
-            return Err(PathError::NotAFolder {
-                path: root.display().to_string(),
-                reason: "it is not a folder".to_string(),
-            })
-        }
-        Ok(_) => {}
+    let root_metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(PathError::NotAFolder {
                 path: root.display().to_string(),
@@ -645,7 +634,20 @@ pub fn join_under(root: &Path, rel: &StrictRelPath) -> Result<PathBuf, PathError
                 error: error.to_string(),
             })
         }
+    };
+    if is_a_reparse_point(&root_metadata) && is_link(root)? {
+        return Err(PathError::LinkOnTheWay {
+            path: root.display().to_string(),
+            link: root.display().to_string(),
+        });
     }
+    if !root_metadata.is_dir() {
+        return Err(PathError::NotAFolder {
+            path: root.display().to_string(),
+            reason: "it is not a folder".to_string(),
+        });
+    }
+
     let parts: Vec<&str> = rel.as_str().split('/').collect();
     let mut joined = root.to_path_buf();
     let mut walked = String::new();
@@ -662,19 +664,22 @@ pub fn join_under(root: &Path, rel: &StrictRelPath) -> Result<PathBuf, PathError
             continue;
         }
         match std::fs::symlink_metadata(&joined) {
-            Ok(metadata) if is_link(&metadata) => {
-                return Err(PathError::LinkOnTheWay {
-                    path: walked,
-                    link: joined.display().to_string(),
-                })
+            Ok(metadata) => {
+                // A reparse point that carries data (a cloud placeholder, a deduplicated file) is
+                // not a redirection: it is what the name means, so the walk goes on through it.
+                if is_a_reparse_point(&metadata) && is_link(&joined)? {
+                    return Err(PathError::LinkOnTheWay {
+                        path: walked,
+                        link: joined.display().to_string(),
+                    });
+                }
+                if !is_last && !metadata.is_dir() {
+                    return Err(PathError::NotAFolder {
+                        path: walked,
+                        reason: "it is not a folder, so nothing can be written under it".to_string(),
+                    });
+                }
             }
-            Ok(metadata) if !is_last && !metadata.is_dir() => {
-                return Err(PathError::NotAFolder {
-                    path: walked,
-                    reason: "it is not a folder, so nothing can be written under it".to_string(),
-                })
-            }
-            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 parent_is_a_folder = false;
             }
@@ -689,10 +694,70 @@ pub fn join_under(root: &Path, rel: &StrictRelPath) -> Result<PathBuf, PathError
     Ok(joined)
 }
 
-/// Whether this metadata describes a link: a symbolic link, or a Windows junction or other reparse
-/// point. Windows reports a junction as a directory whose attributes carry a reparse point, so
-/// `file_type().is_symlink()` alone misses it.
-pub fn is_link(metadata: &std::fs::Metadata) -> bool {
+/// Whether `path` is a **link that redirects a name**: a symbolic link, a Windows junction or a
+/// mount point.
+///
+/// A reparse point that carries data instead of redirecting — a cloud placeholder (OneDrive, a
+/// synced folder) or a deduplicated file — names its own file: a write through it lands where the
+/// caller put the name, so it is not a redirection and is not refused. Windows reports both kinds
+/// with one attribute bit, so the reparse *tag* decides: only a name surrogate
+/// (`IsReparseTagNameSurrogate`, the `0x2000_0000` bit of the tag) redirects a name.
+///
+/// Fails closed: a path that cannot be asked about is an error, never "not a link".
+pub fn is_link(path: &Path) -> Result<bool, PathError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| PathError::Unreadable {
+        path: path.display().to_string(),
+        error: error.to_string(),
+    })?;
+    if !is_a_reparse_point(&metadata) {
+        return Ok(false);
+    }
+    #[cfg(windows)]
+    {
+        let tag = reparse_tag(path).map_err(|error| PathError::Unreadable {
+            path: path.display().to_string(),
+            error: error.to_string(),
+        })?;
+        Ok(tag.redirects_a_name())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(metadata.file_type().is_symlink())
+    }
+}
+
+/// Whether the reparse tag of a Windows reparse point wraps another name, which is what makes a
+/// symbolic link, a junction and a mount point redirections. `IsReparseTagNameSurrogate` is the
+/// documented test: the tag's `0x2000_0000` bit.
+///
+/// Exposed because the interesting cases cannot all be made on one machine — a real OneDrive
+/// placeholder or a deduplicated file needs a cloud account or ReFS — so the classification is
+/// tested on the tags Windows documents rather than only through a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReparseTag(u32);
+
+impl ReparseTag {
+    /// The tag Windows reported for a path, or `None` when the path is not a reparse point.
+    pub fn of(tag: u32) -> Self {
+        Self(tag)
+    }
+
+    /// The raw tag.
+    pub fn value(self) -> u32 {
+        self.0
+    }
+
+    /// Whether this tag redirects a name: a symbolic link, a junction, a mount point.
+    pub fn redirects_a_name(self) -> bool {
+        // IsReparseTagNameSurrogate: a name surrogate stores the name it stands for.
+        self.0 & 0x2000_0000 != 0
+    }
+}
+
+/// Whether the metadata of a path says it is some kind of reparse point (Windows) or a symbolic link
+/// (Unix). Only the first half of the question: on Windows it does not say whether the tag redirects
+/// a name, which is what [`is_link`] answers.
+fn is_a_reparse_point(metadata: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -702,6 +767,59 @@ pub fn is_link(metadata: &std::fs::Metadata) -> bool {
     {
         metadata.file_type().is_symlink()
     }
+}
+
+/// The reparse tag Windows reports for `path`, read from `FindFirstFileW`.
+///
+/// `dwReserved0` holds the tag for a reparse point; it is the one documented place the tag is
+/// available without opening a handle on the reparse point itself.
+#[cfg(windows)]
+fn reparse_tag(path: &Path) -> std::io::Result<ReparseTag> {
+    use std::os::windows::ffi::OsStrExt;
+
+    // `FindFirstFileW` refuses a path that ends in a separator, except a bare drive ("C:\"), which
+    // is what a caller passing a root hands it. Everything else loses its trailing separator.
+    let mut name = path.as_os_str().to_os_string();
+    {
+        let text = name.to_string_lossy();
+        let trimmed = text.trim_end_matches(['\\', '/']);
+        if !trimmed.is_empty() && trimmed.len() != text.len() && !trimmed.ends_with(':') {
+            name = std::ffi::OsString::from(trimmed);
+        }
+    }
+    let wide: Vec<u16> = name.encode_wide().chain(std::iter::once(0)).collect();
+
+    let mut data: Win32FindDataW = unsafe { std::mem::zeroed() };
+    let found = unsafe { FindFirstFileW(wide.as_ptr(), &mut data) };
+    if found as isize == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    unsafe { FindClose(found) };
+    Ok(ReparseTag(data.reserved0))
+}
+
+/// `WIN32_FIND_DATAW` as far as its layout can be relied on: the attribute word first and
+/// `dwReserved0` — the reparse tag — at its documented offset.
+#[cfg(windows)]
+#[repr(C)]
+struct Win32FindDataW {
+    file_attributes: u32,
+    creation_time: [u32; 2],
+    last_access_time: [u32; 2],
+    last_write_time: [u32; 2],
+    file_size_high: u32,
+    file_size_low: u32,
+    /// The reparse tag, when `file_attributes` carries `FILE_ATTRIBUTE_REPARSE_POINT`.
+    reserved0: u32,
+    reserved1: u32,
+    file_name: [u16; 260],
+    alternate_file_name: [u16; 14],
+}
+
+#[cfg(windows)]
+extern "system" {
+    fn FindFirstFileW(name: *const u16, data: *mut Win32FindDataW) -> *mut std::ffi::c_void;
+    fn FindClose(handle: *mut std::ffi::c_void) -> i32;
 }
 
 /// Resolve a path once, to the exact value to check and then write.

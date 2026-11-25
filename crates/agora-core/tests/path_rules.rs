@@ -8,7 +8,7 @@
 
 use agora_game_api::{
     compare_folder, is_link, join_under, resolve_destination, same_spelling, same_target, PathError,
-    PathRelation, RelPath,
+    PathRelation, RelPath, ReparseTag,
 };
 use std::path::{Path, PathBuf};
 
@@ -101,7 +101,11 @@ fn a_windows_junction_is_a_reparse_point() {
         !metadata.file_type().is_dir(),
         "and it reports no directory type for it, so asking for a reparse point is precise"
     );
-    assert!(is_link(&metadata), "the reparse point is still visible");
+    assert_eq!(
+        is_link(&link),
+        Ok(true),
+        "the reparse point redirects a name, so it is a link"
+    );
 }
 
 #[cfg(windows)]
@@ -347,10 +351,31 @@ fn a_plain_folder_is_not_a_link() {
     // A plain folder is not a link, so the same code path says no.
     let root = temp_dir();
     std::fs::create_dir_all(root.path().join("mods")).unwrap();
-    let plain = std::fs::symlink_metadata(root.path().join("mods")).unwrap();
-    assert!(!is_link(&plain), "a plain directory is not a reparse point");
+    let plain = root.path().join("mods");
+    assert_eq!(is_link(&plain), Ok(false), "a plain directory is not a link");
     assert!(
         !same_spelling(root.path(), &root.path().join("mods")),
         "different folders are different spellings"
     );
+}
+
+#[test]
+fn only_a_reparse_tag_that_wraps_a_name_redirects_one() {
+    // The tags Windows documents. The first three are name surrogates (a symbolic link, a junction,
+    // a mount point); the last two carry data and stand for nothing else — a cloud placeholder that
+    // keeps a file on OneDrive, and a deduplicated file. A real placeholder cannot be made on this
+    // machine (it needs a synced account) and a deduplicated file needs ReFS, so the classification
+    // is tested on the tags themselves; the junction above is the end-to-end case.
+    for tag in [0xA000_000C, 0xA000_0003, 0xA000_0004] {
+        assert!(
+            ReparseTag::of(tag).redirects_a_name(),
+            "{tag:#010X} is a name surrogate"
+        );
+    }
+    for tag in [0x9000_001A, 0x8000_0013, 0x8000_0017, 0x9000_001C] {
+        assert!(
+            !ReparseTag::of(tag).redirects_a_name(),
+            "{tag:#010X} carries data rather than redirecting a name"
+        );
+    }
 }
