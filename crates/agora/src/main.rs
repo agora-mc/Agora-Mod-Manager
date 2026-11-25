@@ -2779,6 +2779,69 @@ async fn async_main() {
 /// Returns `false` when it found a problem (damage, an unreadable store, or a
 /// database from a newer Agora). The caller exits 10 in that case, keeping the
 /// whole report on standard output.
+/// The recovery section of `agora doctor`: one short block per unresolved crash journal.
+///
+/// Plain and short on purpose — a journal is the kind of thing a user meets while something is
+/// wrong, so the line says what the journal covers, what recovery would do, and what to run.
+fn print_recovery_report(report: &agora_core::recovery_report::RecoveryReport) {
+    use agora_core::recovery_report::RecoveryOutcome;
+    for note in &report.notes {
+        println!("{note}");
+    }
+    if report.is_empty() {
+        println!("Recovery journals: none");
+        return;
+    }
+    if report.entries.is_empty() {
+        println!("Recovery journals: none of the kinds that could be searched have one.");
+    } else {
+        println!(
+            "Recovery journals ({}; the next start finishes or undoes these, read-only report):",
+            report.entries.len()
+        );
+        for entry in &report.entries {
+            let decision = match entry.outcome {
+                RecoveryOutcome::NothingToDo => "nothing to do",
+                RecoveryOutcome::WouldFinish => "recovery would finish it",
+                RecoveryOutcome::WouldUndo => "recovery would undo it",
+                RecoveryOutcome::Busy => "busy: an operation may still be running",
+                RecoveryOutcome::NeedsHand => "needs a hand",
+                RecoveryOutcome::Undecided => "this build does not decide it yet",
+            };
+            let state = entry
+                .state
+                .as_deref()
+                .map(|state| format!(", state {state}"))
+                .unwrap_or_default();
+            println!(
+                "- {} {}{state}: {decision}",
+                entry.kind.as_str(),
+                entry.resource
+            );
+            println!("  journal: {}", entry.path);
+            if let Some(reason) = &entry.reason {
+                println!("  {reason}");
+            }
+            if let Some(command) = &entry.command {
+                println!("  Resolve it now: `{command}`");
+            }
+        }
+    }
+    for missing in &report.not_searched {
+        println!(
+            "Recovery journals of kind {}: could not tell — {}",
+            missing.kind.as_str(),
+            missing.reason
+        );
+    }
+    if report.needs_a_hand() {
+        println!(
+            "At least one journal needs a hand; a start will not settle it on its own. This \
+             report changed nothing."
+        );
+    }
+}
+
 fn run_doctor(paths: &agora_core::app_paths::AppPaths, json: bool) -> anyhow::Result<bool> {
     use agora_core::db::{inspect_local_state, LocalStateIntegrity};
     let info = inspect_local_state(&paths.local_state_db());
@@ -2793,9 +2856,14 @@ fn run_doctor(paths: &agora_core::app_paths::AppPaths, json: bool) -> anyhow::Re
     // The database part of the report is core's, shared with the desktop's data health panel.
     let report = agora_core::db::local_state_report(&paths.local_state_db());
     let problems = report.problems || account.needs_repair;
+    // What recovery would do about every unresolved crash journal, decided read-only: `doctor`
+    // runs before core initialises, so this is the one place a recovery that blocks startup can
+    // be explained without a start happening first (MASTER_SPEC §32.11).
+    let recovery = agora_core::recovery_report::report(paths);
     if json {
         let mut out = serde_json::to_value(&report)?;
         out["problems"] = serde_json::json!(problems);
+        out["recovery"] = serde_json::to_value(&recovery)?;
         out["accountStore"] = serde_json::json!({
             "needsRepair": account.needs_repair,
             "corruptFile": account.corrupt_file,
@@ -2880,6 +2948,7 @@ fn run_doctor(paths: &agora_core::app_paths::AppPaths, json: bool) -> anyhow::Re
     } else {
         println!("Account store: ok");
     }
+    print_recovery_report(&recovery);
     if problems {
         println!(
             "Agora found problems with the local state (exit code 10). The report above \

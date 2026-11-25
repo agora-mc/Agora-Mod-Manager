@@ -324,21 +324,11 @@ fn asking_for_the_report_changes_nothing_in_the_data_root() {
     let (_dir, paths) = data_root();
     init_database(&paths);
     interrupted_install(&paths, InstallCrashPoint::Extracted);
-    // A journal whose lock is held, so the report answers the question that is most tempting to
-    // settle by taking the lock itself.
-    let locks = agora_core::lock_manager::LockManager::new(paths.locks_root());
-    let held = locks
-        .acquire(
-            agora_core::lock_manager::LockResource::PluginInstall,
-            "test",
-        )
-        .unwrap();
 
     let before = snapshot(paths.root());
     let report = report(&paths);
     let after = snapshot(paths.root());
 
-    drop(held);
     let differences: Vec<String> = changed(&before, &after)
         .into_iter()
         .filter(|line| !is_sqlite_sidecar(line))
@@ -348,6 +338,46 @@ fn asking_for_the_report_changes_nothing_in_the_data_root() {
         Vec::<String>::new(),
         "the report wrote, created, renamed or deleted something in the data root"
     );
+    let entry = entry(&report, JournalKind::PluginInstall);
+    assert_eq!(entry.outcome, RecoveryOutcome::WouldUndo, "{entry:?}");
+}
+
+/// A journal whose lock is held is busy, and asking about it neither takes the lock nor touches the
+/// lock file: the report says an operation may still be running and leaves it alone.
+#[test]
+fn a_journal_whose_lock_is_held_is_busy_and_the_lock_is_left_alone() {
+    let (_dir, paths) = data_root();
+    init_database(&paths);
+    interrupted_install(&paths, InstallCrashPoint::Extracted);
+    let locks = agora_core::lock_manager::LockManager::new(paths.locks_root());
+    let held = locks
+        .acquire(
+            agora_core::lock_manager::LockResource::PluginInstall,
+            "test",
+        )
+        .unwrap();
+
+    let lock_file = held.path().to_path_buf();
+    let lock_bytes = std::fs::read(&lock_file).unwrap();
+    let before = snapshot(paths.root());
+    let report = report(&paths);
+    let after = snapshot(paths.root());
+
+    let differences: Vec<String> = changed(&before, &after)
+        .into_iter()
+        .filter(|line| !is_sqlite_sidecar(line))
+        .collect();
+    assert_eq!(
+        differences,
+        Vec::<String>::new(),
+        "asking about a held lock must not take it or rewrite it"
+    );
+    assert_eq!(
+        std::fs::read(&lock_file).ok(),
+        Some(lock_bytes),
+        "the live holder's owner record is untouched"
+    );
+    drop(held);
     let entry = entry(&report, JournalKind::PluginInstall);
     assert_eq!(entry.outcome, RecoveryOutcome::Busy, "{entry:?}");
 }

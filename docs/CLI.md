@@ -171,7 +171,7 @@ agora plugin install package ./example-plugin.zip
 | Command | Purpose |
 | --- | --- |
 | `agora paths` | Print resolved application, database, cache, runtime, and instance paths |
-| `agora doctor` | Report the local database's path, schema version, integrity, backups, and files kept aside after recovery, plus whether the saved account list needs repair. It reads only: nothing is migrated, copied, renamed or deleted, and it works even when startup would refuse the database |
+| `agora doctor` | Report the local database's path, schema version, integrity, backups, and files kept aside after recovery, plus whether the saved account list needs repair, and what recovery would do about every unresolved crash journal. It reads only: nothing is migrated, copied, renamed or deleted, and it works even when startup would refuse the database |
 | `agora list-instances` | List local instances |
 | `agora get-instance <ID>` | Print one instance |
 | `agora inventory <INSTANCE>` | Inspect installed content |
@@ -189,6 +189,47 @@ Every command that needs launcher state opens `local_state.db` under the data ro
 - runs the one startup recovery pass over every crash journal (`agora_core::startup_recovery::run_at_startup`): interrupted tool swaps are put back, user-file sessions of runs that are no longer alive have their files restored, half-done Recently deleted deletes and restores are finished or called off, and each game package's own journal (Minecraft's launcher-import jobs) is recovered through the game registry. Every result is printed: what recovery did on stdout's warning channel, and a `Warning:` line for anything it left alone — a journal that needs a hand, or one whose lock another running Agora process (the desktop app, another CLI) still holds. Recovery never waits on such a lock and never touches that journal; it is reported and left for the live operation. The desktop and the MCP listener run the same pass at their own startup and report the same lines their own way.
 
 `agora doctor` reports all of this without changing anything, including files kept aside as `local_state.db.corrupt-*` and `local_state.db.newer-v*`. It also runs the same account-list check as `agora auth status` and reports a corrupt or quarantined account index, naming `agora auth repair`; that is a local-state problem too, so it exits `10`.
+
+### The recovery report
+
+`doctor` also runs before startup recovery has had a chance to act, which makes it the one place a recovery that blocks a start can be explained. So it explains it: one entry per unresolved crash journal, with its kind, the resource it covers, where the journal is, its state, and the decision recovery would take.
+
+| Decision | What it means |
+|---|---|
+| `nothingToDo` | The journal is already settled; nothing is waiting |
+| `wouldUndo` | The next start would undo the operation: put back what it replaced |
+| `wouldFinish` | The next start would finish the operation: roll forward through its cleanup |
+| `busy` | Another Agora holds the journal's lock, or its recorded writer is still running, so nothing would be done — report and retry at the next start |
+| `needsHand` | It cannot be decided safely; the reason says why, and the command that resolves or overrides it |
+| `undecided` | This build does not decide that kind yet; the next start settles it with that kind's own rules |
+
+The kinds are `plugin-install` (a plugin package being installed, updated, rolled back or removed), `instance-import` (an instance being imported from another launcher), `tool-swap` (a tool running on a real install's `Data` folder) and `user-files` (game files swapped in for a run). Plugin installs and imports live in the local database; tool swaps and user-files sessions are files under the data root.
+
+The report is read-only, all the way through: no operation's lock is taken (it is asked about, then left exactly as it was), no file is written, renamed or deleted, no stale lease is cleared, and the database is opened read-only — no migration, no busy-check, no journal-mode switch. A journal whose writer may still be running, or whose liveness cannot be told, is reported as busy or as needing a hand, never as "would act".
+
+It fails closed. A journal that cannot be read is listed with its path and the error, never skipped. A kind whose journals cannot be searched at all — no database yet, a database this build does not know (a newer schema), a file that cannot be opened, a folder that cannot be listed — is said so in `notSearched` with the reason, and `notes` carries the plain facts. None of that is ever reported as "no journals".
+
+`--json` carries the same entries, with stable field names:
+
+```json
+"recovery": {
+  "entries": [
+    {
+      "kind": "plugin-install",
+      "resource": "acme.one",
+      "path": "…/local_state.db",
+      "state": "extracted",
+      "outcome": "wouldUndo",
+      "reason": "The operation had not committed (state \"extracted\"), so recovery would put the previous package back.",
+      "command": "agora plugin recover acme.one --yes"
+    }
+  ],
+  "notSearched": [{ "kind": "plugin-install", "reason": "…" }],
+  "notes": ["No local database yet, …"]
+}
+```
+
+The report does not change the exit code: `doctor` still exits `0` for a healthy or not-yet-created local database and `10` for damage, an unreadable store, a newer schema or an account list that needs repair. A journal that needs a hand is printed and named, not turned into a different exit code, so existing scripts keep their meaning.
 
 ### Games
 
@@ -1137,7 +1178,7 @@ The exit code follows the error's machine-readable code, not the shape it is car
 
 Every machine code, its exit code and its area are declared once, in `agora-core`'s `error_code` module; this page and the CLI read that declaration rather than keeping a table of their own.
 
-`agora doctor` prints its whole report (human or `--json`) and exits `0` when the local database is healthy or not created yet. It exits `10` when it finds damage, a store it cannot read, a database written by a newer Agora, or a saved account list that needs `agora auth repair`. The JSON report always includes `problems: true` or `false`, so a script can read the reason without parsing the message.
+`agora doctor` prints its whole report (human or `--json`) and exits `0` when the local database is healthy or not created yet. It exits `10` when it finds damage, a store it cannot read, a database written by a newer Agora, or a saved account list that needs `agora auth repair`. The JSON report always includes `problems: true` or `false`, so a script can read the reason without parsing the message. The recovery report (see [The recovery report](#the-recovery-report)) is carried in the same output and does not change the exit code; read `recovery.entries[].outcome` for it.
 
 Most ordinary lookups for a nonexistent instance currently return generic exit code `1`, not `11`.
 
