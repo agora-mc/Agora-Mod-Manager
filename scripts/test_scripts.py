@@ -4911,6 +4911,103 @@ class TestPathRuleGuard(unittest.TestCase):
         self.assertEqual(failed, 1)
         self.assertIn("a counted module that is not there", stderr)
 
+    def test_a_free_canonicalize_call_is_counted(self):
+        # `canonicalize(x)`, not only `canonicalize()`: the free function is the same ingredient.
+        source = (
+            "fn real(path: &std::path::Path) -> Option<std::path::PathBuf> {\n"
+            "    std::fs::canonicalize(path).ok()\n"
+            "}\n"
+        )
+        failed, stderr = self._run(
+            {"crates/core/src/recovery.rs": source},
+            {"validators": {}, "comparisons": {}},
+            ("crates/core/src/recovery.rs",),
+        )
+        self.assertEqual(failed, 1)
+        self.assertIn("1 hand-written path comparison(s)", stderr)
+
+    def test_an_associated_components_call_is_counted(self):
+        source = (
+            "fn depth(path: &std::path::Path) -> usize {\n"
+            "    <std::path::Path as AsRef<std::path::Path>>::as_ref(path)\n"
+            "        .components()\n"
+            "        .count()\n"
+            "}\n"
+            "fn same(a: &std::path::Path, b: &std::path::Path) -> bool {\n"
+            "    std::path::Path::components(a).next() == std::path::Path::components(b).next()\n"
+            "}\n"
+        )
+        failed, stderr = self._run(
+            {"crates/core/src/recovery.rs": source},
+            {"validators": {}, "comparisons": {}},
+            ("crates/core/src/recovery.rs",),
+        )
+        self.assertEqual(failed, 1)
+        self.assertIn("3 hand-written path comparison(s)", stderr)
+
+    def test_a_comparator_imported_under_another_name_is_counted(self):
+        # `use ... as ...` is not a way out: the alias is the ingredient.
+        source = (
+            "use agora_game_api::fold_path_case as fold;\n"
+            "fn same(a: &str, b: &str) -> bool {\n"
+            "    fold(a) == fold(b)\n"
+            "}\n"
+        )
+        failed, stderr = self._run(
+            {"crates/core/src/recovery.rs": source},
+            {"validators": {}, "comparisons": {}},
+            ("crates/core/src/recovery.rs",),
+        )
+        self.assertEqual(failed, 1)
+        self.assertIn("2 hand-written path comparison(s)", stderr)
+
+    def test_a_validator_renamed_off_the_verb_list_is_found_by_its_body(self):
+        # Renaming is not a way out either: the body is what decides. Only identifiers can be
+        # markers — a rule spelled as `== ".."` is blanked with the rest of the literal — so these
+        # are the three identifiers a name or escaping decision is written with.
+        for body in (
+            "path.components().any(|part| matches!(part, ParentDir))",
+            "path.is_absolute() || path.has_root()",
+            "is_windows_device_name(stem)",
+        ):
+            source = f"fn trip(path: &std::path::Path, stem: &str) -> bool {{\n    {body}\n}}\n"
+            failed, _stderr = self._run(
+                {"crates/core/src/mod.rs": source}, {"validators": {}, "comparisons": {}}, ()
+            )
+            self.assertEqual(failed, 1, body)
+
+    def test_a_raised_budget_fails_against_the_committed_baseline(self):
+        # Code and budget raised together in one commit is what this catches: the file agrees with
+        # the code, and the committed copy does not.
+        source = "fn validate_entry_path(path: &str) -> bool { !path.is_empty() }\n"
+        with mock.patch.object(
+            cak,
+            "committed_budget",
+            return_value={"rule": 1, "validators": {"crates/core/src/mod.rs": 1}},
+        ):
+            failed, stderr = self._run(
+                {"crates/core/src/mod.rs": source},
+                {"rule": 1, "validators": {"crates/core/src/mod.rs": 2}, "comparisons": {}},
+                (),
+            )
+        self.assertEqual(failed, 1)
+        self.assertIn("budget raised from 1 to 2", stderr)
+
+    def test_a_changed_counting_rule_re_takes_the_numbers(self):
+        # A rule change is a deliberate act with its own diff, so it may move the baseline once.
+        source = "fn validate_entry_path(path: &str) -> bool { !path.is_empty() }\n"
+        with mock.patch.object(
+            cak,
+            "committed_budget",
+            return_value={"rule": 1, "validators": {"crates/core/src/mod.rs": 1}},
+        ):
+            failed, _stderr = self._run(
+                {"crates/core/src/mod.rs": source},
+                {"rule": 2, "validators": {"crates/core/src/mod.rs": 1}, "comparisons": {}},
+                (),
+            )
+        self.assertEqual(failed, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

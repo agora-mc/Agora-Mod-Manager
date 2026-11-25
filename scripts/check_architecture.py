@@ -28,9 +28,11 @@ Checks:
 import json
 import os
 import re
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -1127,13 +1129,40 @@ PATH_VALIDATOR_VERB = re.compile(
 PATH_VALIDATOR_NOUN = re.compile(
     r"(path|entry|component|relative|filename|file_name|rel_path|name|folder)"
 )
-# Tokens a function that reasons about escaping has and a name check does not.
-PATH_VALIDATOR_BODY = ("ParentDir", "is_absolute", "has_root")
-PATH_COMPARISON_PATTERNS = (
-    re.compile(r"fold_path_case\s*\("),
-    re.compile(r"canonicalize\s*\(\s*\)"),
-    re.compile(r"\.components\s*\("),
+# Tokens a function that reasons about escaping has and a name check does not. A validator renamed
+# off the verb list is still found by these, which is the point: renaming is not a way out. Only
+# identifiers can be markers: comments and the insides of string and char literals are blanked
+# before the body is searched, so a rule written as `== ".."` is invisible to this count.
+PATH_VALIDATOR_BODY = (
+    "ParentDir",
+    "is_absolute",
+    "has_root",
+    "is_windows_device_name",
 )
+PATH_COMPARISON_PATTERNS = (
+    # The comparison ingredient itself, however it is called: a free function too.
+    re.compile(r"fold_path_case\s*\("),
+    # `canonicalize(` is the same call whether it is a method or a free function, and a comparison
+    # that spells it without the empty parentheses would otherwise not be counted.
+    re.compile(r"canonicalize\s*\("),
+    # `.components()`, `Path::components(` and an associated call alike.
+    re.compile(r"components\s*\("),
+)
+# The comparison functions and orderings a module may import under another name. An alias is the
+# same ingredient under a shorter spelling, so the alias is counted where it is used.
+PATH_COMPARATOR_NAMES = (
+    "fold_path_case",
+    "same_spelling",
+    "same_target",
+    "same_folder",
+    "compare_folder",
+    "same_path",
+    "paths_eq_case_insensitive",
+    "paths_eq_exact",
+    "canonical_paths_match",
+)
+ALIASED_IMPORT = re.compile(r"\b(?:pub\s+)?use\s+[^;]*;", re.S)
+ALIAS_PAIR = re.compile(r"\b([A-Za-z0-9_]+)\s+as\s+([A-Za-z0-9_]+)")
 # The recovery, trust, lease, GC and staging modules: the same set §15 counts, because they are
 # the modules whose decisions delete, overwrite or adopt user files.
 PATH_COMPARISON_MODULES = (
@@ -1142,6 +1171,7 @@ PATH_COMPARISON_MODULES = (
     "crates/agora-core/src/db.rs",
     "crates/agora-core/src/game_base/mod.rs",
     "crates/agora-core/src/game_instance/trash.rs",
+    "crates/agora-core/src/game_mod_ini.rs",
     "crates/agora-core/src/game_tool_swap.rs",
     "crates/agora-core/src/game_user_files.rs",
     "crates/agora-core/src/instance_runtime.rs",
@@ -1193,14 +1223,57 @@ def count_path_validators_in(path: Path) -> int:
     return len(path_validators(path.read_text(encoding="utf-8", errors="replace")))
 
 
+def comparison_aliases(source: str) -> list[str]:
+    """The other names this file gives a comparison function, from `use ... as ...`.
+
+    An ingredient imported under a shorter name is the same ingredient: `use
+    agora_game_api::fold_path_case as fold;` then `fold(a) == fold(b)` is a hand-written comparison
+    with the module's name hidden, so the alias is counted where it is used.
+    """
+    aliases = []
+    for declaration in ALIASED_IMPORT.findall(source):
+        for original, alias in ALIAS_PAIR.findall(declaration):
+            if original in PATH_COMPARATOR_NAMES:
+                aliases.append(alias)
+    return aliases
+
+
 def count_path_comparisons(source: str) -> int:
     """Hand-written path comparisons in one Rust file, comments and test items excluded."""
     cleaned = blank_test_items(blank_rust_noise(source))
-    return sum(len(pattern.findall(cleaned)) for pattern in PATH_COMPARISON_PATTERNS)
+    count = sum(len(pattern.findall(cleaned)) for pattern in PATH_COMPARISON_PATTERNS)
+    for alias in comparison_aliases(cleaned):
+        count += len(re.findall(rf"\b{re.escape(alias)}\s*\(", cleaned))
+    return count
 
 
 def count_path_comparisons_in(path: Path) -> int:
     return count_path_comparisons(path.read_text(encoding="utf-8", errors="replace"))
+
+
+def committed_budget() -> dict[str, Any] | None:
+    """The budget as the last commit has it, or `None` when there is no git to ask.
+
+    The budget may only go down, and a comparison against the file's own numbers cannot see a
+    commit that raised code and budget together. The committed copy can: a raised number is a
+    raised number, whatever the working tree says.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "show", f"HEAD:{PATH_RULES_BUDGET.relative_to(REPO_ROOT).as_posix()}"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except ValueError:
+        return None
 
 
 def check_path_rules() -> None:
@@ -1216,6 +1289,36 @@ def check_path_rules() -> None:
     comparisons = budget.get("comparisons", {})
     problems: list[str] = []
     report: list[str] = []
+
+    # The budget only goes down. Raising it in the same commit as the code it counts would otherwise
+    # pass, because the file and the code would agree; the committed copy does not agree. The one
+    # exception is a change to the counting rule itself, which says so by bumping `rule`: then the
+    # numbers are re-taken from the truth and the reviewer sees the rule diff beside them.
+    committed = committed_budget()
+    if committed is None:
+        print(
+            "note: no committed budget to compare against (no git, or the file is new); "
+            "the only-goes-down rule is unchecked this run",
+            file=sys.stderr,
+        )
+    elif budget.get("rule") != committed.get("rule"):
+        print(
+            f"note: the counting rule changed ({committed.get('rule')} -> {budget.get('rule')}), "
+            "so the numbers are re-taken; the only-goes-down rule starts from this commit",
+            file=sys.stderr,
+        )
+    else:
+        for section in ("validators", "comparisons"):
+            was = committed.get(section, {})
+            now = budget.get(section, {})
+            for name in sorted(set(now) | set(was)):
+                allowed_now = now.get(name, 0)
+                allowed_was = was.get(name, 0)
+                if isinstance(allowed_now, int) and allowed_now > allowed_was:
+                    problems.append(
+                        f"  {name}: {section} budget raised from {allowed_was} to {allowed_now}; "
+                        f"this budget only shrinks, so the code it counts must fall instead"
+                    )
 
     def compare(relative: str, count: int, allowed: int, what: str, hint: str) -> None:
         if count > allowed:

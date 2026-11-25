@@ -230,12 +230,18 @@ A new or renamed Tauri command also needs `python scripts/check_tauri_bindings.p
 - `scripts/path_rules_budget.json` counts what is left of the old per-feature path rules
   (MASTER_SPEC §32.3): private functions that decide whether a path or a name may be used, and
   hand-written path comparisons in recovery, trust and staging modules. New writes and anything
-  about to touch the disk use `agora_game_api::RelPath::strict`, `FileName` and `join_under`; path
-  comparison uses `same_spelling`, `same_target`, `same_folder` and `resolve_destination` in
-  `crates/agora-game-api/src/path.rs`. A count that falls must be written back, and one that rises
-  fails `check_architecture.py`. The validator count is a name and body heuristic, so it counts a
-  few harmless functions; that errs toward counting, and a slice that deletes or renames one lowers
-  the number.
+  about to touch the disk use `agora_game_api::RelPath::strict`, `StrictRelPath`, `FileName` and
+  `join_under`; path comparison uses `same_spelling`, `same_target`, `compare_folder` and
+  `resolve_destination` in `crates/agora-game-api/src/path.rs`. A count that falls must be written
+  back, and one that rises fails `check_architecture.py`. The validator count is a name and body
+  heuristic, so it counts a few harmless functions; that errs toward counting, and a slice that
+  deletes or renames one lowers the number. The comparison count matches `fold_path_case(`,
+  `canonicalize(` (a free function too) and `components(`, and it follows `use … as …` aliases of
+  the comparators, so importing one under another name is not a way out; it also counts key building
+  and path iteration that mention those calls, which errs toward counting for the same reason. The
+  numbers are also compared with the committed copy (`git show HEAD:`), so a commit that raises the
+  code and the budget together fails; the only exception is a change to the counting rule itself,
+  which bumps `"rule"` and so re-takes every number with the rule diff beside it.
 - A static export of `web/` built on Windows writes its segment-prefetch files into nested
   folders (`docs/__next.docs/__PAGE__.txt` instead of `docs/__next.docs.__PAGE__.txt`), so a
   local preview logs RSC prefetch 404s even though navigation still works. This is upstream
