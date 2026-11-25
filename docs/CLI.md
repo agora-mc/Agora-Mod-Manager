@@ -171,7 +171,7 @@ agora plugin install package ./example-plugin.zip
 | Command | Purpose |
 | --- | --- |
 | `agora paths` | Print resolved application, database, cache, runtime, and instance paths |
-| `agora doctor` | Report the local database's path, schema version, integrity, backups, and files kept aside after recovery, plus whether the saved account list needs repair, and what recovery would do about every unresolved crash journal. It reads only: nothing is migrated, copied, renamed or deleted, and it works even when startup would refuse the database |
+| `agora doctor` | Report the local database's path, schema version, integrity, backups, and files kept aside after recovery, plus whether the saved account list needs repair, and what recovery would do about every unresolved crash journal. It reads only — nothing is migrated, copied, renamed or deleted, and it writes no log — and it works even when startup would refuse the database. A recovery journal that needs a hand is a problem, so it exits `10` |
 | `agora list-instances` | List local instances |
 | `agora get-instance <ID>` | Print one instance |
 | `agora inventory <INSTANCE>` | Inspect installed content |
@@ -203,11 +203,15 @@ Every command that needs launcher state opens `local_state.db` under the data ro
 | `needsHand` | It cannot be decided safely; the reason says why, and the command that resolves or overrides it |
 | `undecided` | This build does not decide that kind yet; the next start settles it with that kind's own rules |
 
-The kinds are `plugin-install` (a plugin package being installed, updated, rolled back or removed), `instance-import` (an instance being imported from another launcher), `tool-swap` (a tool running on a real install's `Data` folder) and `user-files` (game files swapped in for a run). Plugin installs and imports live in the local database; tool swaps and user-files sessions are files under the data root.
+The kinds are `plugin-install` (a plugin package being installed, updated, rolled back or removed), `instance-import` (an instance being imported from another launcher), `tool-swap` (a tool running on a real install's `Data` folder), `user-files` (game files swapped in for a run), `database-recovery` (a damaged database moved aside with its restore unfinished) and `recently-deleted` (a delete or a restore into, or out of, Recently deleted). Plugin installs and imports live in the local database; the rest are markers or files under the data root.
 
-The report is read-only, all the way through: no operation's lock is taken (it is asked about, then left exactly as it was), no file is written, renamed or deleted, no stale lease is cleared, and the database is opened read-only — no migration, no busy-check, no journal-mode switch. A journal whose writer may still be running, or whose liveness cannot be told, is reported as busy or as needing a hand, never as "would act".
+Launcher imports are reported with their facts — which instance, which phase, which staging and instance folders — and with `undecided`: their recovery asks more questions than a journal row answers (the instance's runtime lease, the quarantine folder a failed update left, which marker each folder carries), so `doctor` does not repeat those rules. The next start settles it; a journal that keeps appearing is stuck, and nothing has been changed.
 
-It fails closed. A journal that cannot be read is listed with its path and the error, never skipped. A kind whose journals cannot be searched at all — no database yet, a database this build does not know (a newer schema), a file that cannot be opened, a folder that cannot be listed — is said so in `notSearched` with the reason, and `notes` carries the plain facts. None of that is ever reported as "no journals".
+The report is read-only, all the way through: no operation's lock is taken, no file is written, renamed or deleted, no stale lease is cleared, and the database is opened read-only — no migration, no busy-check, no journal-mode switch. `doctor` runs before the CLI log is opened, so it writes no log either. To tell a held lock from a free one, the lock file is briefly try-locked and released at once; that never disturbs a live holder, and a recovery that collides with the probe reports `busy` and retries at the next start. A journal whose writer may still be running is `busy`, and so is a liveness or lock answer of "could not tell" — never "would act".
+
+`busy` never carries a command: the operation it belongs to is still going, or may be, and the next start retries it. Every other `needsHand` entry names the command that resolves or overrides it: `agora plugin recover <id> --yes` for an interrupted plugin package, `agora plugin recover <id> --keep-aside --yes` for a stash no database knows about, and `agora instance restore <entry>` for an entry held in Recently deleted.
+
+It fails closed. A journal that cannot be read — malformed, a folder where a journal file belongs, a row this build cannot parse — is listed as itself, with its path and the error, never skipped, and one bad row does not hide the others. A kind whose journals cannot be searched at all — a database this build does not know (a newer schema), a file that cannot be opened, a folder that cannot be listed — is said so in `notSearched` with the reason and `blocking: true`, and errors stay per kind: a plugin-install problem never hides the import rows, or the other way round. A data root with no database yet is `blocking: false` for the two kinds that live in it (nothing has been written, so nothing is hidden), and the journals an earlier build left as files are listed anyway. `notes` carries the plain facts. None of that is ever reported as "no journals".
 
 `--json` carries the same entries, with stable field names:
 
@@ -224,12 +228,12 @@ It fails closed. A journal that cannot be read is listed with its path and the e
       "command": "agora plugin recover acme.one --yes"
     }
   ],
-  "notSearched": [{ "kind": "plugin-install", "reason": "…" }],
+  "notSearched": [{ "kind": "plugin-install", "reason": "…", "blocking": false }],
   "notes": ["No local database yet, …"]
 }
 ```
 
-The report does not change the exit code: `doctor` still exits `0` for a healthy or not-yet-created local database and `10` for damage, an unreadable store, a newer schema or an account list that needs repair. A journal that needs a hand is printed and named, not turned into a different exit code, so existing scripts keep their meaning.
+A journal that needs a hand, or a kind that could not be searched, is a problem with the local state like any other: `doctor` exits `10` and the report names it. A data root with no database yet is not.
 
 ### Games
 
@@ -1178,7 +1182,7 @@ The exit code follows the error's machine-readable code, not the shape it is car
 
 Every machine code, its exit code and its area are declared once, in `agora-core`'s `error_code` module; this page and the CLI read that declaration rather than keeping a table of their own.
 
-`agora doctor` prints its whole report (human or `--json`) and exits `0` when the local database is healthy or not created yet. It exits `10` when it finds damage, a store it cannot read, a database written by a newer Agora, or a saved account list that needs `agora auth repair`. The JSON report always includes `problems: true` or `false`, so a script can read the reason without parsing the message. The recovery report (see [The recovery report](#the-recovery-report)) is carried in the same output and does not change the exit code; read `recovery.entries[].outcome` for it.
+`agora doctor` prints its whole report (human or `--json`) and exits `0` when the local database is healthy or not created yet. It exits `10` when it finds damage, a store it cannot read, a database written by a newer Agora, a saved account list that needs `agora auth repair`, or a recovery journal that needs a hand. The JSON report always includes `problems: true` or `false`, so a script can read the reason without parsing the message. The recovery report (see [The recovery report](#the-recovery-report)) is carried in the same output; `problems` covers it, and `recovery.entries[].outcome` says which journal.
 
 Most ordinary lookups for a nonexistent instance currently return generic exit code `1`, not `11`.
 

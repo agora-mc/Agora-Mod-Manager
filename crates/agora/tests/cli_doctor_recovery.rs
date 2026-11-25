@@ -16,6 +16,8 @@ use agora_core::plugins::PluginService;
 
 const AGORA_BIN: &str = env!("CARGO_BIN_EXE_agora");
 const PLUGIN: &str = "test.recovery";
+/// The exit code `doctor` already used for a local state that needs a person.
+const PROBLEMS: i32 = 10;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -41,6 +43,10 @@ fn json_of(output: &std::process::Output) -> serde_json::Value {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+fn doctor_json(data_dir: &Path) -> serde_json::Value {
+    json_of(&agora(data_dir, &["doctor", "--json"]))
 }
 
 fn package(version: &str) -> Vec<u8> {
@@ -115,6 +121,20 @@ fn plugin_entry<'a>(doctor: &'a serde_json::Value, resource: &str) -> &'a serde_
         .unwrap_or_else(|| panic!("the plugin-install journal for {resource} is listed: {doctor}"))
 }
 
+fn not_searched<'a>(doctor: &'a serde_json::Value, kind: &str) -> &'a serde_json::Value {
+    doctor["recovery"]["notSearched"]
+        .as_array()
+        .unwrap_or_else(|| panic!("doctor says what it could not search: {doctor}"))
+        .iter()
+        .find(|missing| missing["kind"] == kind)
+        .unwrap_or_else(|| panic!("the {kind} kind is reported as not searched: {doctor}"))
+}
+
+/// A printed command, without the program name: the harness runs `agora` itself.
+fn words(command: &str) -> Vec<&str> {
+    command.split_whitespace().skip(1).collect()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -147,6 +167,36 @@ fn doctor_reports_an_interrupted_install_that_would_be_undone() {
         stdout.contains("plugin-install test.recovery")
             && stdout.contains("recovery would undo it"),
         "the human report says the same thing: {stdout}"
+    );
+}
+
+/// The command `doctor` prints is the command that resolves the journal: running it settles the
+/// journal, and the next report has nothing left to say about it.
+#[test]
+fn the_command_doctor_prints_resolves_the_plugin_journal() {
+    let (dir, paths) = prepared_root();
+    interrupted_install(&paths, InstallCrashPoint::Extracted);
+    let command = plugin_entry(&doctor_json(dir.path()), PLUGIN)["command"]
+        .as_str()
+        .expect("a journal that would be undone names the command that undoes it")
+        .to_string();
+
+    let resolved = agora(dir.path(), &words(&command));
+    assert!(
+        resolved.status.success(),
+        "the printed command runs: {command}\nstdout {}\nstderr {}",
+        String::from_utf8_lossy(&resolved.stdout),
+        String::from_utf8_lossy(&resolved.stderr)
+    );
+
+    let after = doctor_json(dir.path());
+    assert!(
+        after["recovery"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["kind"] != "plugin-install"),
+        "the journal is gone, not reported again: {after}"
     );
 }
 
@@ -188,34 +238,9 @@ fn doctor_reports_a_journal_whose_writer_is_still_running_as_busy() {
 }
 
 #[test]
-fn doctor_lists_a_malformed_import_journal_with_its_path_and_error() {
+fn doctor_lists_an_import_with_its_facts_and_no_prediction() {
     let (dir, paths) = prepared_root();
-    let staging = paths.staging_root().join("import-broken");
-    std::fs::create_dir_all(&staging).unwrap();
-    let marker = staging.join(".agora-import-owner.json");
-    std::fs::write(&marker, b"{ this is not json").unwrap();
-    {
-        let conn = agora_core::db::local_state_connection(&paths.local_state_db()).unwrap();
-        let job = agora_core::db::InstanceImportJob {
-            job_id: "job-broken".into(),
-            instance_id: "imported-one".into(),
-            launcher_kind: "official".into(),
-            source_instance_key: "some-source".into(),
-            staging_path: staging.display().to_string(),
-            final_path: paths
-                .instances_root()
-                .join("imported-one")
-                .display()
-                .to_string(),
-            quarantine_path: None,
-            state: "staging".into(),
-            plan_fingerprint: "fingerprint".into(),
-            error: None,
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-        };
-        agora_core::db::upsert_instance_import_job(&conn, &job).unwrap();
-    }
+    write_import_job(&paths, "job-one", "imported-one");
 
     let doctor = agora(dir.path(), &["doctor", "--json"]);
     let parsed = json_of(&doctor);
@@ -223,16 +248,90 @@ fn doctor_lists_a_malformed_import_journal_with_its_path_and_error() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|entry| entry["kind"] == "instance-import")
+        .find(|entry| entry["kind"] == "instance-import" && entry["resource"] == "imported-one")
         .unwrap_or_else(|| panic!("the import journal is listed: {parsed}"));
-    assert_eq!(entry["resource"], "imported-one");
-    assert_eq!(entry["outcome"], "needsHand", "{entry}");
-    assert_eq!(entry["path"], marker.display().to_string());
-    let reason = entry["reason"].as_str().unwrap_or_default();
-    assert!(
-        reason.contains("not JSON") || reason.contains("could not be read"),
-        "the parse error is reported: {reason}"
+    assert_eq!(entry["state"], "staging");
+    assert_eq!(entry["outcome"], "undecided", "{entry}");
+    assert_eq!(
+        entry["command"],
+        serde_json::Value::Null,
+        "this build prints no command for a kind it does not decide: {entry}"
     );
+    assert!(
+        entry["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("The next start settles it")),
+        "the report says who settles it, and that nothing was changed: {entry}"
+    );
+
+    let human = agora(dir.path(), &["doctor"]);
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        stdout.contains("instance-import imported-one")
+            && stdout.contains("this build does not decide it yet"),
+        "{stdout}"
+    );
+}
+
+/// One unreadable row is reported as that row; the readable ones are still listed.
+#[test]
+fn doctor_reports_an_unreadable_import_row_as_that_row() {
+    let (dir, paths) = prepared_root();
+    write_import_job(&paths, "job-one", "imported-one");
+    write_import_job(&paths, "job-two", "imported-two");
+    {
+        // A value this build cannot read as text: the journal row is one it cannot parse.
+        let conn = agora_core::db::local_state_connection(&paths.local_state_db()).unwrap();
+        conn.execute(
+            "UPDATE instance_import_jobs SET staging_path = x'00ff' WHERE job_id = 'job-two'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let parsed = doctor_json(dir.path());
+    let listed = parsed["recovery"]["entries"].as_array().unwrap();
+    let good = listed
+        .iter()
+        .find(|entry| entry["kind"] == "instance-import" && entry["outcome"] == "undecided")
+        .unwrap_or_else(|| panic!("the readable row is still listed: {parsed}"));
+    assert_eq!(good["resource"], "imported-one", "{good}");
+    let bad = listed
+        .iter()
+        .find(|entry| entry["kind"] == "instance-import" && entry["outcome"] == "needsHand")
+        .unwrap_or_else(|| panic!("the unreadable row is reported as needing a hand: {parsed}"));
+    assert!(
+        bad["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("cannot be read")),
+        "the row's own error is reported: {bad}"
+    );
+}
+
+/// An import job row, written the way the import service writes it.
+fn write_import_job(paths: &AppPaths, job_id: &str, instance_id: &str) {
+    let staging = paths.staging_root().join(format!("import-{job_id}"));
+    std::fs::create_dir_all(&staging).unwrap();
+    let conn = agora_core::db::local_state_connection(&paths.local_state_db()).unwrap();
+    let job = agora_core::db::InstanceImportJob {
+        job_id: job_id.into(),
+        instance_id: instance_id.into(),
+        launcher_kind: "official".into(),
+        source_instance_key: "some-source".into(),
+        staging_path: staging.display().to_string(),
+        final_path: paths
+            .instances_root()
+            .join(instance_id)
+            .display()
+            .to_string(),
+        quarantine_path: None,
+        state: "staging".into(),
+        plan_fingerprint: "fingerprint".into(),
+        error: None,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    };
+    agora_core::db::upsert_instance_import_job(&conn, &job).unwrap();
 }
 
 #[test]
@@ -244,6 +343,12 @@ fn doctor_says_there_is_no_database_yet_and_lists_file_journals() {
     std::fs::write(swaps.join("skyrim-se_steam.json"), b"not a swap journal").unwrap();
 
     let doctor = agora(dir.path(), &["doctor", "--json"]);
+    assert_eq!(
+        doctor.status.code(),
+        Some(PROBLEMS),
+        "a journal on disk that cannot be read is a problem, even with no database: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
     let parsed = json_of(&doctor);
     assert!(
         !paths.local_state_db().exists(),
@@ -256,6 +361,19 @@ fn doctor_says_there_is_no_database_yet_and_lists_file_journals() {
             .is_some_and(|note| note.to_lowercase().contains("no local database"))),
         "the report says there is no database yet: {parsed}"
     );
+    for kind in ["plugin-install", "instance-import"] {
+        let missing = not_searched(&parsed, kind);
+        assert_eq!(
+            missing["blocking"], false,
+            "a fresh data root is not a problem: {missing}"
+        );
+        assert!(
+            missing["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("No local database yet")),
+            "{missing}"
+        );
+    }
     let swap = parsed["recovery"]["entries"]
         .as_array()
         .unwrap()
@@ -275,19 +393,145 @@ fn doctor_reports_a_newer_database_as_cannot_tell_for_the_journals() {
     }
 
     let doctor = agora(dir.path(), &["doctor", "--json"]);
+    assert_eq!(
+        doctor.status.code(),
+        Some(PROBLEMS),
+        "a database this build cannot read may hide the journal that blocks startup: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
     let parsed = json_of(&doctor);
-    let not_searched = parsed["recovery"]["notSearched"]
-        .as_array()
-        .unwrap_or_else(|| panic!("doctor says what it could not search: {parsed}"));
-    let plugin = not_searched
-        .iter()
-        .find(|kind| kind["kind"] == "plugin-install")
-        .unwrap_or_else(|| panic!("the plugin-install kind is reported: {parsed}"));
+    for kind in ["plugin-install", "instance-import"] {
+        let missing = not_searched(&parsed, kind);
+        assert_eq!(missing["blocking"], true, "{missing}");
+        assert!(
+            missing["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("newer")),
+            "the reason names the newer schema: {missing}"
+        );
+    }
+}
+
+/// A journal whose ownership marker was removed cannot be acted on, so `doctor` says "needs a hand",
+/// names the reason startup gives, and exits with the code it already used for a local state that
+/// needs a person.
+#[test]
+fn doctor_says_a_journal_that_needs_a_hand_and_exits_with_the_problems_code() {
+    let (dir, paths) = prepared_root();
+    interrupted_install(&paths, InstallCrashPoint::Extracted);
+    let markers: Vec<PathBuf> = std::fs::read_dir(paths.plugin_rollback_root())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".owner-"))
+        })
+        .collect();
+    assert!(!markers.is_empty(), "the install wrote an ownership marker");
+    for marker in markers {
+        std::fs::remove_file(marker).unwrap();
+    }
+
+    let doctor = agora(dir.path(), &["doctor", "--json"]);
+    assert_eq!(
+        doctor.status.code(),
+        Some(PROBLEMS),
+        "a journal that needs a hand is a problem: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let parsed = json_of(&doctor);
+    assert_eq!(parsed["problems"], true, "{parsed}");
+    let entry = plugin_entry(&parsed, PLUGIN);
+    assert_eq!(entry["outcome"], "needsHand", "{entry}");
     assert!(
-        plugin["reason"]
+        entry["reason"]
             .as_str()
-            .is_some_and(|reason| reason.contains("newer")),
-        "the reason names the newer schema: {plugin}"
+            .is_some_and(|reason| reason.contains("could not be verified")),
+        "the reason is the one startup gives: {entry}"
+    );
+
+    let human = agora(dir.path(), &["doctor"]);
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(stdout.contains("needs a hand"), "{stdout}");
+    assert!(
+        !stdout.contains("Agora found no problems"),
+        "a journal that needs a hand is not \"no problems\": {stdout}"
+    );
+}
+
+/// A legacy stash no database knows about is reported with the one command that resolves it, and
+/// that command really does resolve it.
+#[test]
+fn the_legacy_keep_aside_command_doctor_prints_resolves_the_stash() {
+    let (dir, paths) = prepared_root();
+    let legacy = paths.plugin_rollback_root().join("test.legacy");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(legacy.join("agora-plugin.json"), "{}").unwrap();
+
+    let doctor = agora(dir.path(), &["doctor", "--json"]);
+    assert_eq!(doctor.status.code(), Some(PROBLEMS));
+    let parsed = json_of(&doctor);
+    let entry = plugin_entry(&parsed, "test.legacy");
+    assert_eq!(entry["outcome"], "needsHand", "{entry}");
+    let command = entry["command"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the legacy stash names its command: {entry}"))
+        .to_string();
+    assert_eq!(
+        command,
+        "agora plugin recover test.legacy --keep-aside --yes"
+    );
+
+    let resolved = agora(dir.path(), &words(&command));
+    assert!(
+        resolved.status.success(),
+        "the printed command runs: {command}\nstdout {}\nstderr {}",
+        String::from_utf8_lossy(&resolved.stdout),
+        String::from_utf8_lossy(&resolved.stderr)
+    );
+    let after = doctor_json(dir.path());
+    assert!(
+        after["recovery"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["resource"] != "test.legacy"),
+        "the stash was kept aside, so it is not reported as unresolved: {after}"
+    );
+}
+
+/// A database recovery marker with the database moved aside is explained, and `doctor` does not
+/// claim the next start will create a fresh database.
+#[test]
+fn doctor_explains_a_pending_database_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::from_root(dir.path().to_path_buf());
+    let db = paths.local_state_db();
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let identity = "3f0e0c2e-0000-4000-8000-000000000001";
+    std::fs::write(db.with_file_name("local_state.db.identity"), identity).unwrap();
+    std::fs::write(
+        db.with_file_name("local_state.db.recovery"),
+        serde_json::json!({ "identity": identity, "db_path": db.display().to_string() })
+            .to_string(),
+    )
+    .unwrap();
+
+    let parsed = doctor_json(dir.path());
+    let entry = parsed["recovery"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "database-recovery")
+        .unwrap_or_else(|| panic!("the pending database recovery is listed: {parsed}"));
+    assert_eq!(entry["outcome"], "wouldFinish", "{entry}");
+    let notes = parsed["recovery"]["notes"].as_array().unwrap();
+    assert!(
+        notes.iter().all(|note| !note
+            .as_str()
+            .is_some_and(|note| note.contains("No local database yet"))),
+        "the database was moved aside; it was not never created: {parsed}"
     );
 }
 
@@ -323,24 +567,23 @@ fn snapshot(root: &Path) -> Snapshot {
 }
 
 /// `agora doctor` is read-only: every file the data root had when it was asked is unchanged
-/// afterwards, byte for byte, and nothing is removed.
+/// afterwards, byte for byte, and nothing is removed or added — its own support log included, since
+/// `doctor` runs before the log is opened.
 ///
 /// SQLite materialises its own `-shm` and `-wal` sidecars for any reader of a WAL database; they
 /// hold no part of the data root's content, the database file itself is unchanged, and a read-write
 /// open (which `doctor` already does to inspect the database) deletes them again. Declaring the file
 /// immutable to avoid them would mean trusting a database another Agora may be writing to.
-///
-/// The command's own support log (`logs/agora-cli.log`, the record of what a run printed) is
-/// written by every CLI run, before and after this change, and is not part of the data.
 #[test]
 fn asking_doctor_changes_nothing_in_the_data_root() {
     let (dir, paths) = prepared_root();
     interrupted_install(&paths, InstallCrashPoint::Extracted);
+    write_import_job(&paths, "job-one", "imported-one");
 
     let before = snapshot(dir.path());
     let doctor = agora(dir.path(), &["doctor", "--json"]);
     assert!(
-        doctor.status.success() || doctor.status.code() == Some(10),
+        doctor.status.success() || doctor.status.code() == Some(PROBLEMS),
         "{}",
         String::from_utf8_lossy(&doctor.stderr)
     );
@@ -357,8 +600,6 @@ fn asking_doctor_changes_nothing_in_the_data_root() {
     for path in after.keys() {
         if !before.contains_key(path)
             && !(path.ends_with("local_state.db-shm") || path.ends_with("local_state.db-wal"))
-            && !path.contains("\\logs")
-            && !path.contains("/logs")
         {
             differences.push(format!("added: {path}"));
         }
