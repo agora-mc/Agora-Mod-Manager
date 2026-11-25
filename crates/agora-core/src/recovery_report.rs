@@ -489,15 +489,20 @@ fn file_journals(paths: &AppPaths, report: &mut RecoveryReport) {
             blocking: true,
         }),
     }
-    // `<data>/user-files/<game>_<store>/journal.json`, the same place `AppPaths` names.
+    // `<data>/user-files/<game>_<store>/journal.json`, the same place `AppPaths` names. A session
+    // folder with no journal is not a journal: the startup pass that reads these folders skips it
+    // in exactly the same way, so the report does not invent one either. One that cannot be asked
+    // about is listed as unreadable, never dropped.
     match read_children(paths.user_files_root(), None) {
         Ok(dirs) => {
             for dir in dirs {
-                report.entries.push(file_entry(
-                    JournalKind::UserFiles,
-                    &dir.join("journal.json"),
-                    &locks,
-                ));
+                let journal = dir.join("journal.json");
+                if matches!(probe(&journal), Probe::Absent) {
+                    continue;
+                }
+                report
+                    .entries
+                    .push(file_entry(JournalKind::UserFiles, &journal, &locks));
             }
         }
         Err(reason) => report.not_searched.push(KindNotSearched {

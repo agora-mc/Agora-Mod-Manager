@@ -593,6 +593,41 @@ fn a_journal_path_that_is_a_folder_is_listed_as_unreadable() {
     );
 }
 
+/// A `user-files/<game>_<store>/` folder with no `journal.json` is not a journal at all — the
+/// startup pass that reads these folders skips exactly that — so the report does not invent one.
+#[test]
+fn a_user_files_folder_without_a_journal_is_not_a_journal() {
+    let (_dir, paths) = data_root();
+    init_database(&paths);
+    let session = paths.user_files_root().join("skyrim-se_steam");
+    std::fs::create_dir_all(session.join("saves")).unwrap();
+    std::fs::write(session.join("saves/one.sav"), b"save").unwrap();
+
+    let report = report(&paths);
+    assert!(
+        entries_of(&report, JournalKind::UserFiles).is_empty(),
+        "a folder with no journal.json is not a user-files journal: {report:?}"
+    );
+    assert!(!report.needs_a_hand(), "and it is not a hand either: {report:?}");
+}
+
+/// A `journal.json` that is there but cannot be read as a journal is listed, never dropped with it.
+#[test]
+fn a_user_files_journal_that_cannot_be_read_is_listed() {
+    let (_dir, paths) = data_root();
+    init_database(&paths);
+    let session = paths.user_files_root().join("skyrim-se_steam");
+    std::fs::create_dir_all(session.join("journal.json")).unwrap();
+
+    let report = report(&paths);
+    let entry = entry(&report, JournalKind::UserFiles);
+    assert_eq!(entry.outcome, RecoveryOutcome::NeedsHand, "{entry:?}");
+    assert!(
+        entry.reason.contains("not a journal file"),
+        "the reason says what is there: {entry:?}"
+    );
+}
+
 /// A tool swap whose game is being run holds the game/store lock: busy, with no command, because
 /// the next start retries it once the run is over.
 #[test]
