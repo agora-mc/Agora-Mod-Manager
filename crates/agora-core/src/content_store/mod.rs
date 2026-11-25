@@ -386,50 +386,9 @@ pub(crate) fn now_unix_ms() -> i64 {
     }
 }
 
-/// Reserved DOS device names, per Microsoft's "Naming Files, Paths, and Namespaces"
-/// (<https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file>): `CON`, `PRN`, `AUX`,
-/// `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, and the superscript forms `COM¹`/`COM²`/`COM³` and
-/// `LPT¹`/`LPT²`/`LPT³`. `COM0` and `LPT0` are refused too: the same page shows `COM0` as a device
-/// symlink, and refusing a name Windows may route to a device is the safe direction.
-///
-/// Windows ignores trailing spaces in a name, including before the extension (`aux .txt` is
-/// `AUX`), so they are trimmed before matching. The caller passes the part before the first dot.
-pub fn is_windows_device_name(stem: &str) -> bool {
-    let s = stem.trim_end_matches([' ', '.']).to_ascii_uppercase();
-    matches!(
-        s.as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM0"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "COM¹"
-            | "COM²"
-            | "COM³"
-            | "LPT0"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-            | "LPT¹"
-            | "LPT²"
-            | "LPT³"
-    )
-}
+/// Reserved DOS device names: the game contract's rule, so a plugin and the content store refuse
+/// the same ones. See [`agora_game_api::is_windows_device_name`].
+pub use agora_game_api::is_windows_device_name;
 
 pub(crate) fn is_reparse_point_or_symlink(metadata: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
@@ -443,63 +402,12 @@ pub(crate) fn is_reparse_point_or_symlink(metadata: &std::fs::Metadata) -> bool 
     }
 }
 
+/// The strict path rule the game contract owns: an archive entry becomes a file name only when
+/// something writes it, and the rule it is held to is [`agora_game_api::RelPath::strict`].
 pub fn validate_entry_path(rel_str: &str) -> Result<RelPath, ContentError> {
-    let norm = rel_str.replace('\\', "/");
-
-    // Check empty or '.' components
-    for comp in norm.split('/') {
-        if comp.is_empty() {
-            return Err(ContentError::InvalidPath {
-                path: rel_str.to_string(),
-                reason: "contains empty component or trailing slash".into(),
-            });
-        }
-        if comp == "." {
-            return Err(ContentError::InvalidPath {
-                path: rel_str.to_string(),
-                reason: "contains '.' component".into(),
-            });
-        }
-        if comp == ".." {
-            return Err(ContentError::InvalidPath {
-                path: rel_str.to_string(),
-                reason: "contains '..' component".into(),
-            });
-        }
-        if comp.ends_with('.') || comp.ends_with(' ') {
-            return Err(ContentError::InvalidPath {
-                path: rel_str.to_string(),
-                reason: "component ends in '.' or space".into(),
-            });
-        }
-        if let Some(bad) = comp
-            .chars()
-            .find(|c| matches!(c, '?' | '*' | '"' | '<' | '>' | '|') || c.is_control())
-        {
-            return Err(ContentError::InvalidPath {
-                path: rel_str.to_string(),
-                reason: format!(
-                    "component '{comp}' contains {} which Windows cannot have in a file name",
-                    if bad.is_control() {
-                        format!("the control character U+{:04X}", u32::from(bad))
-                    } else {
-                        format!("'{bad}'")
-                    }
-                ),
-            });
-        }
-        let stem = comp.split('.').next().unwrap_or("");
-        if is_windows_device_name(stem) {
-            return Err(ContentError::InvalidPath {
-                path: rel_str.to_string(),
-                reason: format!("component '{comp}' uses Windows device name '{stem}'"),
-            });
-        }
-    }
-
-    RelPath::new(&norm).map_err(|e| ContentError::InvalidPath {
+    RelPath::strict(rel_str).map_err(|error| ContentError::InvalidPath {
         path: rel_str.to_string(),
-        reason: e.to_string(),
+        reason: error.reason().to_string(),
     })
 }
 
@@ -513,36 +421,19 @@ pub(crate) fn fold_case(name: &str) -> String {
         .collect()
 }
 
+/// Refuse a set of paths one case-insensitive disk cannot hold separately: the game contract's
+/// rule, so a plugin and the content store refuse the same sets.
 pub fn validate_path_set(paths: &[RelPath]) -> Result<(), ContentError> {
-    if paths.is_empty() {
-        return Err(ContentError::EmptyItem);
-    }
-
-    let mut seen_lower = HashSet::with_capacity(paths.len());
-    for p in paths {
-        let lower = fold_case(p.as_str());
-        if !seen_lower.insert(lower) {
-            return Err(ContentError::InvalidPath {
-                path: p.to_string(),
-                reason: "equals another file's path case-insensitively".into(),
-            });
-        }
-    }
-
-    for p in paths {
-        let parts: Vec<&str> = p.as_str().split('/').collect();
-        for i in 1..parts.len() {
-            let prefix = fold_case(&parts[..i].join("/"));
-            if seen_lower.contains(&prefix) {
-                return Err(ContentError::InvalidPath {
-                    path: p.to_string(),
-                    reason: format!("prefix folder '{prefix}' matches another file"),
-                });
+    agora_game_api::validate_path_set(paths).map_err(|error| {
+        let reason = error.reason();
+        match error {
+            agora_game_api::PathSetError::EmptySet => ContentError::EmptyItem,
+            agora_game_api::PathSetError::Collides { path }
+            | agora_game_api::PathSetError::FolderIsAFile { path, .. } => {
+                ContentError::InvalidPath { path, reason }
             }
         }
-    }
-
-    Ok(())
+    })
 }
 
 fn disk_free_space(path: &Path) -> Option<u64> {

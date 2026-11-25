@@ -373,7 +373,7 @@ pub fn validate_path_set(paths: &[RelPath]) -> Result<(), PathSetError> {
 
     let mut seen = std::collections::HashSet::with_capacity(paths.len());
     for path in paths {
-        if !seen.insert(fold_path_case(path.as_str())) {
+        if !seen.insert(collision_key(path.as_str())) {
             return Err(PathSetError::Collides {
                 path: path.to_string(),
             });
@@ -384,7 +384,7 @@ pub fn validate_path_set(paths: &[RelPath]) -> Result<(), PathSetError> {
         let parts: Vec<&str> = path.as_str().split('/').collect();
         for i in 1..parts.len() {
             let prefix = parts[..i].join("/");
-            if seen.contains(&fold_path_case(&prefix)) {
+            if seen.contains(&collision_key(&prefix)) {
                 return Err(PathSetError::FolderIsAFile {
                     path: path.to_string(),
                     prefix,
@@ -394,6 +394,21 @@ pub fn validate_path_set(paths: &[RelPath]) -> Result<(), PathSetError> {
     }
 
     Ok(())
+}
+
+/// The key a set of names is checked against: two names with one key may be one file on a
+/// case-insensitive disk.
+///
+/// This folds harder than [`fold_path_case`]: the full Unicode case mapping first, so `ß` meets
+/// `SS`, then the NTFS spelling of the result. A volume whose upcase table folds less than Unicode
+/// does keeps the two files apart, and refusing them costs a refusal; the other error costs a file.
+fn collision_key(name: &str) -> String {
+    let full: String = name
+        .chars()
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+        .collect();
+    fold_path_case(&full)
 }
 
 /// A path could not be used safely on disk.
