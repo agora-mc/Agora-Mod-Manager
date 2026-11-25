@@ -294,7 +294,10 @@ fn check_pid(
 
 #[cfg(target_os = "macos")]
 fn lookup_unreaped_exit(pid: u32) -> Option<Lookup> {
-    let pid = libc::pid_t::try_from(pid).ok()?;
+    // A PID too large for pid_t cannot name a process; the caller then asks pid_absent.
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return None;
+    };
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     // sysinfo asks for BSD info with arg=0, which omits zombies. Signal 0 can
