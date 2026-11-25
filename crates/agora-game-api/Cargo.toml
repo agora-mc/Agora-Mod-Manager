@@ -12,3 +12,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 semver = { workspace = true }
 thiserror = { workspace = true }
+# The one archive reader (MASTER_SPEC §32.3) reads zip, 7z, tar and tar.gz in process. These are
+# plain decoding libraries with no runtime of their own, like `regex` for the crash contract; the
+# workspace already carries all four for core and the Minecraft package. RAR has no such library,
+# so it is a seam (`archive::RarReader`) that core fills in out of process.
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+sevenz-rust2 = "0.23"
+tar = "0.4"
+flate2 = "1"
+
+[dev-dependencies]
+tempfile = { workspace = true }

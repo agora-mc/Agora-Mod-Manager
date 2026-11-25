@@ -499,7 +499,25 @@ def resolved_dependency(name: str, specification, workspace: dict) -> tuple[str,
 def check_game_api_dependencies() -> None:
     # serde_json and regex are for the crash contract: a pack is hand-written JSON, and its linter
     # compiles rule regexes (MASTER_SPEC §30.11). Both are plain libraries, not a runtime.
-    allowed = {"serde", "serde_json", "semver", "thiserror", "regex"}
+    #
+    # zip, sevenz-rust2, tar and flate2 are the one archive reader (§32.3). They are decoders, not a
+    # runtime: no process, no network, no operating-system store, and the workspace already carried
+    # all four for core and the Minecraft package. RAR has no such library, so the reader declares a
+    # seam and core fills it in out of process.
+    allowed = {
+        "serde",
+        "serde_json",
+        "semver",
+        "thiserror",
+        "regex",
+        "zip",
+        "sevenz-rust2",
+        "tar",
+        "flate2",
+        # Test-only, and the repository's own rule for a temporary directory (a path unique per
+        # process). It builds into no code that ships.
+        "tempfile",
+    }
     if not GAME_API_CARGO.exists():
         err("agora-game-api Cargo.toml missing")
         return
@@ -516,9 +534,15 @@ def check_game_api_dependencies() -> None:
         if package not in allowed or "path" in details or "git" in details:
             forbidden.append(alias)
     if forbidden:
-        err(f"agora-game-api dependencies must be serde, serde_json, semver, thiserror or regex only: {sorted(forbidden)}")
+        err(
+            "agora-game-api dependencies must be serde, serde_json, semver, thiserror, regex or "
+            f"the archive decoders (zip, sevenz-rust2, tar, flate2) only: {sorted(forbidden)}"
+        )
     else:
-        print("OK: agora-game-api depends only on serde, serde_json, semver, thiserror and regex")
+        print(
+            "OK: agora-game-api depends only on serde, serde_json, semver, thiserror, regex and "
+            "the archive decoders"
+        )
 
 
 def is_game_package(name: str, path: str = "") -> bool:
