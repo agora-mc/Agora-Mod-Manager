@@ -35,6 +35,21 @@ impl recovery::JournalState for PluginInstallState {
     const KIND: recovery::OperationKind = recovery::OperationKind::PluginInstall;
 }
 
+impl PluginInstallState {
+    /// This state's own name, exactly as the journal writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PluginInstallState::Starting => "starting",
+            PluginInstallState::Stashed => "stashed",
+            PluginInstallState::Extracted => "extracted",
+            PluginInstallState::Committed => "committed",
+            PluginInstallState::Restoring => "restoring",
+            PluginInstallState::Uninstalling => "uninstalling",
+            PluginInstallState::UninstallCommitted => "uninstall-committed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(in crate::plugins) struct InstallJournal {
     #[serde(flatten)]
@@ -1130,8 +1145,121 @@ fn apply_uninstall(
     })
 }
 
+/// Which way recovery would take a journal in `state`, for `agora doctor` (read-only).
+///
+/// The direction is the *feature's* knowledge, not the decision's: it is read from this kind's own
+/// state enum, and it must stay in step with [`apply`], which rolls forward from
+/// [`PluginInstallState::Committed`] and [`PluginInstallState::UninstallCommitted`] and puts the
+/// previous version back from every other state (a restore the writer had already recorded, or an
+/// install or uninstall that never reached its commit point).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallDirection {
+    /// Recovery finishes what the operation had already committed.
+    Finish,
+    /// Recovery puts back what the operation replaced.
+    Undo,
+}
+
+pub fn direction(state: PluginInstallState) -> InstallDirection {
+    match state {
+        PluginInstallState::Committed | PluginInstallState::UninstallCommitted => {
+            InstallDirection::Finish
+        }
+        PluginInstallState::Starting
+        | PluginInstallState::Stashed
+        | PluginInstallState::Extracted
+        | PluginInstallState::Restoring
+        | PluginInstallState::Uninstalling => InstallDirection::Undo,
+    }
+}
+
+/// One plugin-install journal as the read-only report sees it (MASTER_SPEC §32.11).
+#[derive(Debug, Clone)]
+pub struct InstallJournalReport {
+    /// The plugin the journal covers.
+    pub plugin_id: PluginId,
+    /// Where the journal is: the database row, or the file an older build left.
+    pub path: PathBuf,
+    /// This kind's own state, when the journal was readable.
+    pub state: Option<PluginInstallState>,
+    /// What recovery would do, and why.
+    pub outcome: recovery::RecoveryOutcome,
+    pub reason: Option<String>,
+}
+
+/// Every plugin-install journal this data root has, decided without touching anything.
+///
+/// The same journals the startup pass recovers from ([`interrupted_installs`]), each put through
+/// [`recovery::decide_readonly`]: nothing is locked, written, renamed or deleted, and a journal
+/// whose lock is held or whose writer may still be running is reported as such rather than acted on.
+pub fn journal_report(
+    conn: &Connection,
+    paths: &AppPaths,
+    view: &dyn ProcessView,
+) -> LauncherResult<Vec<InstallJournalReport>> {
+    let locks = LockManager::new(paths.locks_root());
+    let mut out = Vec::new();
+    for id in interrupted_installs(conn, paths)? {
+        let legacy = install_journal_path(paths, &id);
+        // One read of the journal: the state it carries, and the document the decision is made
+        // from, are the same bytes rather than two chances for the row to change in between.
+        let read = read_locked(conn, paths, &id);
+        let state = match &read {
+            JournalRead::Valid(journal) => Some(journal.envelope().state),
+            _ => None,
+        };
+        let decision = recovery::decide_readonly(
+            &locks,
+            &LockResource::PluginInstall,
+            || read.clone(),
+            &NoContentProof,
+            view,
+        );
+        let path = if journal_document(conn, &id)?.is_some() {
+            paths.local_state_db()
+        } else {
+            legacy
+        };
+        let (outcome, reason) = match decision {
+            recovery::ReadOnlyDecision::Nothing => (
+                recovery::RecoveryOutcome::NothingToDo,
+                "The journal is already settled: recovery has nothing to do.".to_string(),
+            ),
+            recovery::ReadOnlyDecision::Busy(why) => (recovery::RecoveryOutcome::Busy, why),
+            recovery::ReadOnlyDecision::NeedsHand(why) => {
+                (recovery::RecoveryOutcome::NeedsHand, why)
+            }
+            recovery::ReadOnlyDecision::WouldAct(_) => match state.map(direction) {
+                Some(InstallDirection::Finish) => (
+                    recovery::RecoveryOutcome::WouldFinish,
+                    format!(
+                        "The operation had committed (state \"{}\"), so recovery would finish its \
+                         cleanup and keep the version that is installed.",
+                        state.map(PluginInstallState::as_str).unwrap_or("committed")
+                    ),
+                ),
+                _ => (
+                    recovery::RecoveryOutcome::WouldUndo,
+                    format!(
+                        "The operation had not committed (state \"{}\"), so recovery would put the \
+                         previous package back.",
+                        state.map(PluginInstallState::as_str).unwrap_or("unknown")
+                    ),
+                ),
+            },
+        };
+        out.push(InstallJournalReport {
+            plugin_id: id,
+            path,
+            state,
+            outcome,
+            reason: Some(reason),
+        });
+    }
+    Ok(out)
+}
+
 fn delete_journal(conn: &Connection, journal: &InstallJournal) -> LauncherResult<()> {
-    // The row must be durably gone before its marker can be removed.
     conn.pragma_update(None, "synchronous", "FULL")
         .map_err(sql_error)?;
     let deleted = conn

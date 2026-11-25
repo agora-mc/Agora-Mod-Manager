@@ -154,6 +154,25 @@ pub fn registry_connection(db_path: &std::path::Path) -> anyhow::Result<Connecti
     Ok(conn)
 }
 
+/// Open the local state database read-only, changing nothing (MASTER_SPEC §32.11).
+///
+/// `agora doctor` reads journals out of the database before core initialises, and a report may not
+/// migrate, copy or repair what it reports on. So this opens the file with
+/// `SQLITE_OPEN_READ_ONLY` — no migration, no repair, and deliberately no
+/// [`ensure_wal`] switch — and refuses writes at the connection level as well
+/// (`PRAGMA query_only`). A missing database is an error here: callers that can do without one
+/// check first, rather than having "no database" look like "no journals".
+pub fn local_state_connection_read_only(db_path: &std::path::Path) -> anyhow::Result<Connection> {
+    let conn = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.execute_batch("PRAGMA query_only = ON;")?;
+    Ok(conn)
+}
+
+/// The schema version a database records, for a caller that must not migrate it.
+pub fn recorded_schema_version(conn: &Connection) -> anyhow::Result<i64> {
+    schema_version(conn)
+}
+
 /// Initialize the local SQLite database on first run and apply migrations.
 pub fn init_local_state_db(db_path: &std::path::Path) -> anyhow::Result<()> {
     init_local_state_db_with(db_path, &LocalStateOpenOptions::default()).map(|_| ())

@@ -303,6 +303,22 @@ impl LockRefusal {
     }
 }
 
+/// What a read-only question about one lock found (MASTER_SPEC §32.11).
+///
+/// The same three answers [`LockRefusal`] gives a caller that asked for the lock, minus the lock:
+/// `agora doctor` reports a journal whose lock is held as busy, and nothing else about the lock is
+/// its business.
+#[derive(Debug, Clone)]
+pub enum LockProbe {
+    /// No lock file, or a lock file nobody holds. Nothing was created or written to ask.
+    Free,
+    /// A live handle holds it, with the holder's record when the lock file has a readable one.
+    Held(Option<LockMetadata>),
+    /// The question could not be answered: the lock file exists but could not be opened or asked.
+    /// Not the same as free, and never reported as if it were.
+    CantTell(String),
+}
+
 // ---------------------------------------------------------------------------
 // LockGuard
 // ---------------------------------------------------------------------------
@@ -484,6 +500,47 @@ impl LockManager {
                 .map(|meta| meta.operation);
         }
         None
+    }
+
+    /// Whether `resource` is held right now, without taking, creating or writing anything
+    /// (MASTER_SPEC §32.11).
+    ///
+    /// `agora doctor` asks this before it explains a journal: a journal whose lock is held belongs
+    /// to an operation that may still be running, and the report must say so rather than take the
+    /// lock and become a holder itself. Nothing here creates the locks directory or a lock file, and
+    /// the momentary try is released again before this returns; an answer of "free" can therefore
+    /// be stale a moment later, which is the same answer the next start would get.
+    pub fn probe(&self, resource: &LockResource) -> LockProbe {
+        let name = match resource.lock_name() {
+            Ok(name) => name,
+            // Nothing usable to ask: the resource itself is not one a lock can be named after.
+            Err(error) => return LockProbe::CantTell(error.to_string()),
+        };
+        let lock_path = self.locks_root.join(format!("{name}.lock"));
+        let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+            Ok(file) => file,
+            // No lock file is no holder: the OS releases a lock when its process dies, and the
+            // file is only created by a process that takes it.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return LockProbe::Free,
+            Err(error) => {
+                return LockProbe::CantTell(format!(
+                    "the lock file {} could not be opened ({error})",
+                    lock_path.display()
+                ))
+            }
+        };
+        match platform::try_lock(&file) {
+            Ok(true) => {
+                let _ = platform::unlock(&file);
+                LockProbe::Free
+            }
+            Ok(false) => LockProbe::Held(read_lock_metadata(&lock_path).ok()),
+            // Could not tell; a lock that cannot be asked is not evidence that nobody holds it.
+            Err(error) => LockProbe::CantTell(format!(
+                "the lock file {} could not be asked ({error})",
+                lock_path.display()
+            )),
+        }
     }
 
     /// Record a change to an instance for other Agora programs, for an edit that takes no
