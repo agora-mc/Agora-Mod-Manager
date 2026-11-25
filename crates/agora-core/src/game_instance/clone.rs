@@ -305,19 +305,23 @@ pub fn clone_instance(
         }
     }
 
-    let inserted = conn.execute(
-        "INSERT INTO game_instances (instance_id, game, name, base_json, created_at, last_launched_at)
-         VALUES (?1, ?2, ?3, ?4, datetime('now'), NULL)",
-        rusqlite::params![
-            &new_id,
-            definition.id.as_str(),
-            new_name,
-            serde_json::to_string(&source_manifest.base)?
-        ],
-    );
+    // The identity row and the base record it is keyed from go together: a clone whose pin
+    // was not published would look like an instance nothing pins.
+    let inserted = crate::db::in_one_transaction(&conn, |conn| -> Result<(), InstanceError> {
+        conn.execute(
+            "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
+             VALUES (?1, ?2, ?3, datetime('now'), NULL)",
+            rusqlite::params![&new_id, definition.id.as_str(), new_name],
+        )?;
+        conn.execute(
+            "INSERT INTO game_instance_bases (instance_id, base_json) VALUES (?1, ?2)",
+            rusqlite::params![&new_id, serde_json::to_string(&source_manifest.base)?],
+        )?;
+        Ok(())
+    });
     if let Err(error) = inserted {
         rollback(clone_save_folder.as_deref());
-        return Err(error.into());
+        return Err(error);
     }
 
     Ok(ClonedInstance {

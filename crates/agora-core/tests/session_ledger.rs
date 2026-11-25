@@ -446,7 +446,7 @@ fn a_ledger_that_cannot_write_never_fails_the_launch() {
     // The launch itself carried on: the instance shows as launched.
     let (_, started): (i64, Option<String>) = ledger(&f)
         .query_row(
-            "SELECT 1, last_launched_at FROM game_instances WHERE instance_id = ?1",
+            "SELECT 1, last_launched_at FROM instances WHERE instance_id = ?1",
             [&f.record.instance_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )

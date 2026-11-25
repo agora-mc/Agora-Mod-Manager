@@ -76,13 +76,14 @@ fn instance(ctx: &Ctx, id: &str, item: Option<&str>) -> PathBuf {
     fs::write(dir.join("tracked.txt"), b"shared snapshot bytes").unwrap();
     let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
     conn.execute(
-        "INSERT INTO game_instances (instance_id, game, name, base_json, created_at)
-         VALUES (?1, ?2, ?1, ?3, datetime('now'))",
-        rusqlite::params![
-            id,
-            manifest.game.as_str(),
-            serde_json::to_string(&manifest.base).unwrap()
-        ],
+        "INSERT INTO instances (instance_id, game, name, created_at)
+         VALUES (?1, ?2, ?1, datetime('now'))",
+        rusqlite::params![id, manifest.game.as_str()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO game_instance_bases (instance_id, base_json) VALUES (?1, ?2)",
+        rusqlite::params![id, serde_json::to_string(&manifest.base).unwrap()],
     )
     .unwrap();
     dir
@@ -383,13 +384,14 @@ fn pinned_instance(ctx: &Ctx, id: &str, base_id: &str) -> PathBuf {
     fs::write(dir.join("tracked.txt"), b"shared snapshot bytes").unwrap();
     let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
     conn.execute(
-        "INSERT INTO game_instances (instance_id, game, name, base_json, created_at)
-         VALUES (?1, ?2, ?1, ?3, datetime('now'))",
-        rusqlite::params![
-            id,
-            manifest.game.as_str(),
-            serde_json::to_string(&manifest.base).unwrap()
-        ],
+        "INSERT INTO instances (instance_id, game, name, created_at)
+         VALUES (?1, ?2, ?1, datetime('now'))",
+        rusqlite::params![id, manifest.game.as_str()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO game_instance_bases (instance_id, base_json) VALUES (?1, ?2)",
+        rusqlite::params![id, serde_json::to_string(&manifest.base).unwrap()],
     )
     .unwrap();
     dir
@@ -424,6 +426,7 @@ fn base_removal_cannot_race_a_restore_between_pinning_reads() {
             }
         },
         |path| std::fs::metadata(path),
+        |path| std::fs::remove_file(path),
     );
     assert!(fired.load(Ordering::SeqCst), "the pause was reached");
     assert!(
@@ -509,6 +512,7 @@ fn base_removal_cannot_delete_a_base_a_restore_is_publishing() {
             }
         },
         |path| std::fs::metadata(path),
+        |path| std::fs::remove_file(path),
     );
     if !fired.load(Ordering::SeqCst) {
         // The removal was kept back at the locations lock while the restore still
@@ -537,7 +541,7 @@ fn base_removal_cannot_delete_a_base_a_restore_is_publishing() {
     let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
     let present: Option<i64> = conn
         .query_row(
-            "SELECT 1 FROM game_instances WHERE instance_id = 'pinned'",
+            "SELECT 1 FROM game_instance_bases WHERE instance_id = 'pinned'",
             [],
             |row| row.get(0),
         )
@@ -592,6 +596,7 @@ fn base_removal_keeps_base_when_state_db_metadata_fails() {
                 std::fs::metadata(path)
             }
         },
+        |path| std::fs::remove_file(path),
     );
     assert!(
         base_dir.is_dir(),
@@ -628,6 +633,7 @@ fn base_removal_still_reads_recently_deleted_when_the_state_db_is_missing() {
                 std::fs::metadata(path)
             }
         },
+        |path| std::fs::remove_file(path),
     );
     assert!(
         matches!(&removal, Err(BaseError::InUse { instances }) if instances == &vec!["pinned".to_string()]),

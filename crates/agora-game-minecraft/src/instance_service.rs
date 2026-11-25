@@ -2,6 +2,7 @@
 
 use crate::clone::ClonePrefs;
 use crate::loader_service::LoaderService;
+use agora_core::db::instance_id_exists;
 use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::event_sink::{CoreEvent, EventStatus, ProgressEvent, ProgressPhase};
 use agora_core::models::{InstanceManifest, InstanceRow};
@@ -1284,12 +1285,14 @@ impl InstanceService {
             }
         };
         let paths = &self.ctx.paths;
+        // One identity table means one question, whatever game owns the id. A database that
+        // cannot answer is not permission, so an unreadable answer counts as taken.
         let free = |candidate: &str| {
             paths
                 .instance_dir(candidate)
                 .map(|dir| std::fs::symlink_metadata(dir).is_err())
                 .unwrap_or(false)
-                && matches!(agora_core::db::get_instance(&probe, candidate), Ok(None))
+                && !instance_id_exists(&probe, candidate).unwrap_or(true)
         };
         match crate::recently_deleted::restore_entry(
             &self.ctx,
@@ -1395,7 +1398,8 @@ impl InstanceService {
         };
         drop(conn);
 
-        // Check destination does not exist before acquiring the ordered locks.
+        // Check destination does not exist before acquiring the ordered locks. The folder is
+        // not the whole answer: another game's instance can own the id with no folder here.
         let dest_dir = self.ctx.paths.instance_dir(&new_id)?;
         if dest_dir.exists() {
             op.fail(format!("An instance named '{new_id}' already exists."));
@@ -1403,6 +1407,26 @@ impl InstanceService {
                 code: "ERR_INSTANCE_EXISTS".into(),
                 message: format!("An instance named '{new_id}' already exists."),
             });
+        }
+        match self.connection().and_then(|conn| {
+            instance_id_exists(&conn, &new_id).map_err(|error| LauncherError::Generic {
+                code: "ERR_LOCAL_STATE_FAILED".into(),
+                message: error.to_string(),
+            })
+        }) {
+            Ok(false) => {}
+            Ok(true) => {
+                let message = format!("The id '{new_id}' already belongs to another instance.");
+                op.fail(message.clone());
+                return Err(LauncherError::Generic {
+                    code: "ERR_INSTANCE_EXISTS".into(),
+                    message,
+                });
+            }
+            Err(error) => {
+                op.fail(error.to_string());
+                return Err(error);
+            }
         }
 
         // Acquire source and destination locks in a stable order so reverse
@@ -1627,7 +1651,7 @@ impl InstanceService {
                 return Err(error);
             }
         };
-        if let Err(error) = agora_core::db::upsert_instance(&conn, &new_row) {
+        if let Err(error) = agora_core::db::upsert_instance(&conn, crate::GAME_ID, &new_row) {
             let _ = std::fs::remove_dir_all(&dest_dir);
             op.fail(error.to_string());
             return Err(LauncherError::Generic {
@@ -1794,6 +1818,31 @@ impl InstanceService {
                 message: format!("An instance named '{instance_id}' already exists."),
             });
         }
+        // The folder says nothing about another game's instance: an id can be in use with no
+        // Minecraft folder of its own. One identity table means every game is asked.
+        match self.connection().and_then(|conn| {
+            instance_id_exists(&conn, &instance_id).map_err(|error| LauncherError::Generic {
+                code: "ERR_LOCAL_STATE_FAILED".into(),
+                message: error.to_string(),
+            })
+        }) {
+            Ok(false) => {}
+            Ok(true) => {
+                let message = format!(
+                    "The id '{instance_id}' already belongs to an instance of another game."
+                );
+                op.fail(message.clone());
+                return Err(LauncherError::Generic {
+                    code: "ERR_INSTANCE_EXISTS".into(),
+                    message,
+                });
+            }
+            Err(error) => {
+                // A database that cannot answer is not permission: nothing was created.
+                op.fail(error.to_string());
+                return Err(error);
+            }
+        }
         let staging_dir = self
             .ctx
             .paths
@@ -1945,7 +1994,7 @@ impl InstanceService {
                 return Err(error);
             }
         };
-        if let Err(error) = agora_core::db::upsert_instance(&conn, &row) {
+        if let Err(error) = agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row) {
             let _ = std::fs::remove_dir_all(&dir);
             op.fail(error.to_string());
             return Err(LauncherError::Generic {
@@ -2272,7 +2321,8 @@ mod tests {
             template_id: None,
         };
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::upsert_instance(&conn, &prepare_row("inst", &request)).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &prepare_row("inst", &request))
+            .unwrap();
         let manifest: InstanceManifest = serde_json::from_value(serde_json::json!({
             "instance_id": "inst", "name": "Inst", "minecraft_version": "1.21",
             "loader": "fabric", "loader_version": "0.16.0", "is_locked": false,
@@ -2340,7 +2390,8 @@ mod tests {
             template_id: None,
         };
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::upsert_instance(&conn, &prepare_row("inst", &request)).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &prepare_row("inst", &request))
+            .unwrap();
         drop(conn);
         let dir = ctx.paths.instance_dir("inst").unwrap();
         std::fs::create_dir_all(dir.join("mods")).unwrap();
@@ -2543,7 +2594,7 @@ mod tests {
         let row = prepare_row("test", &request);
         assert_eq!(row.jvm_memory_mode, "auto");
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::upsert_instance(&conn, &row).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         let manifest = manifest_from_request("test", &request);
         let dir = ctx.paths.instance_dir("test").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
@@ -2604,7 +2655,7 @@ mod tests {
         };
         let row = prepare_row("gc-test", &request);
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::upsert_instance(&conn, &row).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         drop(conn);
 
         let service = InstanceService::new(ctx.clone());
@@ -2672,7 +2723,7 @@ mod tests {
         };
         let row = prepare_row("gc-invalid", &request);
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::upsert_instance(&conn, &row).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         drop(conn);
 
         let service = InstanceService::new(ctx.clone());
@@ -2775,7 +2826,7 @@ mod tests {
         };
         let row = prepare_row("delegated", &request);
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::upsert_instance(&conn, &row).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         let instance_dir = ctx.paths.instance_dir("delegated").unwrap();
         std::fs::create_dir_all(&instance_dir).unwrap();
         std::fs::write(
@@ -2873,7 +2924,7 @@ mod tests {
         };
         let row = prepare_row("original", &request);
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::upsert_instance(&conn, &row).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         drop(conn);
         // Create source directory and manifest
         let src_dir = ctx.paths.instance_dir("original").unwrap();
@@ -2935,7 +2986,7 @@ mod tests {
         };
         let row = prepare_row("locked", &request);
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::upsert_instance(&conn, &row).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         agora_core::db::set_locked(&conn, "locked", true).unwrap();
         drop(conn);
         // Fully lock the source: DB row AND manifest.
@@ -3001,14 +3052,19 @@ mod tests {
         };
         let row = prepare_row("doomed", &request);
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::upsert_instance(&conn, &row).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         // A survivor, so the deleted pack is not the only thing to select.
         let survivor_request = CreateInstanceRequest {
             name: "Keeper".into(),
             instance_id: "keeper".into(),
             ..request.clone()
         };
-        agora_core::db::upsert_instance(&conn, &prepare_row("keeper", &survivor_request)).unwrap();
+        agora_core::db::upsert_instance(
+            &conn,
+            crate::GAME_ID,
+            &prepare_row("keeper", &survivor_request),
+        )
+        .unwrap();
         drop(conn);
         for id in ["doomed", "keeper"] {
             let dir = ctx.paths.instance_dir(id).unwrap();
@@ -3106,7 +3162,7 @@ $#
         };
         let row = prepare_row("delop", &request);
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::upsert_instance(&conn, &row).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         let manifest = manifest_from_request("delop", &request);
         let dir = ctx.paths.instance_dir("delop").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
@@ -3160,7 +3216,7 @@ $#
             };
             let row = prepare_row("src", &request);
             let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-            agora_core::db::upsert_instance(&conn, &row).unwrap();
+            agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
             drop(conn);
             let src_dir = ctx.paths.instance_dir("src").unwrap();
             std::fs::create_dir_all(&src_dir).unwrap();
@@ -3239,7 +3295,7 @@ $#
         };
         let row = prepare_row("source-pack", &request);
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::upsert_instance(&conn, &row).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         drop(conn);
         let src_dir = ctx.paths.instance_dir("source-pack").unwrap();
         std::fs::create_dir_all(src_dir.join("mods")).unwrap();
@@ -3346,7 +3402,7 @@ $#
         fn seed(ctx: &Ctx, id: &str) {
             let req = request(id);
             let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-            agora_core::db::upsert_instance(&conn, &prepare_row(id, &req)).unwrap();
+            agora_core::db::upsert_instance(&conn, crate::GAME_ID, &prepare_row(id, &req)).unwrap();
             let dir = ctx.paths.instance_dir(id).unwrap();
             std::fs::create_dir_all(dir.join("mods")).unwrap();
             std::fs::create_dir_all(dir.join("snapshots")).unwrap();
@@ -4121,9 +4177,10 @@ $#
                 // The save backup taken before one session's crash test, keyed by session. It
                 // belongs to the instance, so it is captured, deleted and restored with it.
                 "crash_save_backups",
-                // Other games' instances. Ids are unique across games, so a Minecraft delete finds
-                // no row here; the generic capture still carries one if it ever did.
-                "game_instances",
+                // The base record of a game instance. Ids are unique across games, so a
+                // Minecraft delete finds no row here; the generic capture still carries one if
+                // it ever did.
+                "game_instance_bases",
                 "instance_import_files",
                 "instance_import_jobs",
                 "instance_imports",
@@ -4140,9 +4197,10 @@ $#
                 // The crash answer attached to one session; deleted and restored with the
                 // instance because it never exists without one.
                 "session_answers",
+                "instances",
                 "mcp_approval_grants",
+                "minecraft_instances",
                 "plugin_storage",
-                "user_instances",
             ];
             reviewed.sort();
             let mut direct = with_column.clone();
@@ -4249,7 +4307,7 @@ $#
                 let conn =
                     agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
                 conn.execute(
-                    "UPDATE user_instances SET created_at = 'other' WHERE instance_id='pack'",
+                    "UPDATE instances SET created_at = 'other' WHERE instance_id='pack'",
                     [],
                 )
                 .unwrap();

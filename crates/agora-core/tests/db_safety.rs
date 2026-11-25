@@ -123,7 +123,7 @@ fn the_v4_and_v6_columns_are_really_added() {
 
     let conn = Connection::open(&path).unwrap();
     let mut statement = conn
-        .prepare("SELECT name FROM pragma_table_info('user_instances')")
+        .prepare("SELECT name FROM pragma_table_info('minecraft_instances')")
         .unwrap();
     let columns: Vec<String> = statement
         .query_map([], |row| row.get(0))
@@ -150,14 +150,14 @@ fn no_alter_runs_at_a_start_with_nothing_pending() {
     let path = database_at(dir.path(), "local_state.db", LOCAL_STATE_SCHEMA_VERSION);
 
     {
-        // Make any attempted ALTER on this table fail: `user_instances` is now a
+        // Make any attempted ALTER on this table fail: `minecraft_instances` is now a
         // view without the pre-touch column, so v28's conditional ALTER would
         // see it missing and error. A start with nothing pending must not run it.
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "PRAGMA foreign_keys = OFF;
-             DROP TABLE user_instances;
-             CREATE VIEW user_instances AS SELECT 1 AS instance_id;",
+             DROP TABLE minecraft_instances;
+             CREATE VIEW minecraft_instances AS SELECT 1 AS instance_id;",
         )
         .unwrap();
     }
@@ -169,7 +169,7 @@ fn no_alter_runs_at_a_start_with_nothing_pending() {
     let conn = Connection::open(&path).unwrap();
     let is_view: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'view' AND name = 'user_instances'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'view' AND name = 'minecraft_instances'",
             [],
             |row| row.get(0),
         )
@@ -649,11 +649,10 @@ fn a_database_written_by_todays_schema_migrates_cleanly() {
     set_setting(&path, "safety_probe", "\"from-v27\"");
     {
         let conn = Connection::open(&path).unwrap();
-        conn.execute(
-            "INSERT INTO user_instances (
-                 instance_id, name, minecraft_version, loader, loader_version
-             ) VALUES ('kept-instance', 'Kept', '1.21', 'vanilla', '')",
-            [],
+        conn.execute_batch(
+            "INSERT INTO user_instances (instance_id, name, minecraft_version, loader,
+                                         loader_version)
+             VALUES ('kept-instance', 'Kept', '1.21', 'vanilla', '');",
         )
         .unwrap();
     }
@@ -668,7 +667,7 @@ fn a_database_written_by_todays_schema_migrates_cleanly() {
     let conn = Connection::open(&path).unwrap();
     let name: String = conn
         .query_row(
-            "SELECT name FROM user_instances WHERE instance_id = 'kept-instance'",
+            "SELECT name FROM instances WHERE instance_id = 'kept-instance'",
             [],
             |row| row.get(0),
         )
@@ -685,9 +684,15 @@ fn quick_check_time_on_a_realistic_database() {
         let conn = Connection::open(&path).unwrap();
         let tx = conn.unchecked_transaction().unwrap();
         tx.execute(
-            "INSERT INTO user_instances (
-                 instance_id, name, minecraft_version, loader, loader_version
-             ) VALUES ('instance-1', 'Instance', '1.21', 'fabric', '0.16')",
+            "INSERT INTO instances (instance_id, game, name)
+             VALUES ('instance-1', 'minecraft', 'Instance')",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO minecraft_instances
+                 (instance_id, minecraft_version, loader, loader_version)
+             VALUES ('instance-1', '1.21', 'fabric', '0.16')",
             [],
         )
         .unwrap();

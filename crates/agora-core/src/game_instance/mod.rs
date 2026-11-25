@@ -268,6 +268,9 @@ pub fn generate_instance_id_from_name(name: &str) -> String {
 
 /// The one insert a new game instance uses, whether it came from an install,
 /// a clone, a restored deletion or an imported backup.
+///
+/// The identity row and the base record it is keyed from go together: a failed base write leaves
+/// no identity row behind, rather than an instance that lists and has no base.
 fn insert_instance_row(
     conn: &rusqlite::Connection,
     instance_id: &str,
@@ -275,17 +278,18 @@ fn insert_instance_row(
     name: &str,
     base: &BaseReference,
 ) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO game_instances (instance_id, game, name, base_json, created_at, last_launched_at)
-         VALUES (?1, ?2, ?3, ?4, datetime('now'), NULL)",
-        rusqlite::params![
-            instance_id,
-            game.as_str(),
-            name,
-            serde_json::to_string(base).unwrap_or_default()
-        ],
-    )?;
-    Ok(())
+    crate::db::in_one_transaction(conn, |conn| {
+        conn.execute(
+            "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
+             VALUES (?1, ?2, ?3, datetime('now'), NULL)",
+            rusqlite::params![instance_id, game.as_str(), name],
+        )?;
+        conn.execute(
+            "INSERT INTO game_instance_bases (instance_id, base_json) VALUES (?1, ?2)",
+            rusqlite::params![instance_id, serde_json::to_string(base).unwrap_or_default()],
+        )?;
+        Ok(())
+    })
 }
 
 fn check_id_exists(
@@ -293,18 +297,12 @@ fn check_id_exists(
     conn: &rusqlite::Connection,
     candidate: &str,
 ) -> Result<bool, InstanceError> {
-    // Only "no row" means free: a query that fails must not read as "unused".
-    for query in [
-        "SELECT 1 FROM user_instances WHERE instance_id = ?1",
-        "SELECT 1 FROM game_instances WHERE instance_id = ?1",
-    ] {
-        if conn
-            .query_row(query, [candidate], |_| Ok(()))
-            .optional()?
-            .is_some()
-        {
-            return Ok(true);
-        }
+    // Only "no row" means free: a query that fails must not read as "unused". One
+    // identity table means one question, which covers both kinds of instance.
+    if crate::db::instance_id_exists(conn, candidate)
+        .map_err(|error| InstanceError::Other(error.to_string()))?
+    {
+        return Ok(true);
     }
     let dir = paths
         .instance_dir(candidate)
@@ -542,7 +540,7 @@ pub fn create_with_options(
     drop(base_lock);
 
     let created_at: String = conn.query_row(
-        "SELECT created_at FROM game_instances WHERE instance_id = ?1",
+        "SELECT created_at FROM instances WHERE instance_id = ?1",
         [&instance_id],
         |row| row.get(0),
     )?;
@@ -599,7 +597,7 @@ pub fn register_manifest(
         .map_err(|e| InstanceError::Other(e.to_string()))?;
     let registered: Option<i64> = conn
         .query_row(
-            "SELECT 1 FROM game_instances WHERE instance_id = ?1",
+            "SELECT 1 FROM instances WHERE instance_id = ?1",
             [instance_id],
             |row| row.get(0),
         )
@@ -615,7 +613,7 @@ pub fn register_manifest(
         &manifest.base,
     )?;
     let created_at: String = conn.query_row(
-        "SELECT created_at FROM game_instances WHERE instance_id = ?1",
+        "SELECT created_at FROM instances WHERE instance_id = ?1",
         [instance_id],
         |row| row.get(0),
     )?;
@@ -692,8 +690,12 @@ pub fn get(ctx: &Ctx, id: &str) -> Result<Option<GameInstanceRecord>, InstanceEr
     let conn = crate::db::local_state_connection(&db_path)
         .map_err(|e| InstanceError::Other(e.to_string()))?;
     let mut stmt = conn.prepare(
-        "SELECT instance_id, game, name, base_json, created_at, last_launched_at
-         FROM game_instances WHERE instance_id = ?1",
+        "SELECT instances.instance_id, instances.game, instances.name,
+                game_instance_bases.base_json, instances.created_at, instances.last_launched_at
+           FROM instances
+           JOIN game_instance_bases
+             ON game_instance_bases.instance_id = instances.instance_id
+          WHERE instances.instance_id = ?1",
     )?;
     let mut rows = stmt.query([id])?;
     if let Some(row) = rows.next()? {
@@ -820,9 +822,13 @@ pub fn list(ctx: &Ctx) -> Result<Vec<GameInstanceRecord>, InstanceError> {
     let conn = crate::db::local_state_connection(&db_path)
         .map_err(|e| InstanceError::Other(e.to_string()))?;
     let mut stmt = match conn.prepare(
-        "SELECT instance_id, game, name, base_json, created_at, last_launched_at
-         FROM game_instances
-         ORDER BY COALESCE(last_played_at, last_launched_at) DESC NULLS LAST, created_at DESC",
+        "SELECT instances.instance_id, instances.game, instances.name,
+                game_instance_bases.base_json, instances.created_at, instances.last_launched_at
+           FROM instances
+           JOIN game_instance_bases
+             ON game_instance_bases.instance_id = instances.instance_id
+          ORDER BY COALESCE(instances.last_played_at, instances.last_launched_at) DESC NULLS LAST,
+                   instances.created_at DESC",
     ) {
         Ok(stmt) => stmt,
         Err(_) => return Ok(Vec::new()),
@@ -862,7 +868,7 @@ pub fn list(ctx: &Ctx) -> Result<Vec<GameInstanceRecord>, InstanceError> {
     Ok(records)
 }
 
-/// Whether an instance ID belongs to a Minecraft instance in `user_instances`.
+/// Whether an instance ID belongs to a Minecraft instance.
 pub fn is_minecraft_instance(ctx: &Ctx, id: &str) -> bool {
     let db_path = ctx.paths.local_state_db();
     if !db_path.exists() {
@@ -872,7 +878,7 @@ pub fn is_minecraft_instance(ctx: &Ctx, id: &str) -> bool {
         return false;
     };
     conn.query_row(
-        "SELECT 1 FROM user_instances WHERE instance_id = ?1",
+        "SELECT 1 FROM minecraft_instances WHERE instance_id = ?1",
         [id],
         |_| Ok(()),
     )
@@ -1022,10 +1028,10 @@ pub fn delete_with_options(
     let conn = crate::db::local_state_connection(&db_path)
         .map_err(|e| InstanceError::Other(e.to_string()))?;
 
-    // Refuse an id that is in user_instances (Minecraft instance)
+    // Refuse an id that has Minecraft columns beside it (a Minecraft instance)
     let in_mc = conn
         .query_row(
-            "SELECT 1 FROM user_instances WHERE instance_id = ?1",
+            "SELECT 1 FROM minecraft_instances WHERE instance_id = ?1",
             [id],
             |_| Ok(()),
         )
@@ -1035,9 +1041,9 @@ pub fn delete_with_options(
         return Err(InstanceError::MinecraftInstance(id.to_string()));
     }
 
-    // Check if it exists in game_instances
+    // Check if it has a base record (a game instance, not a Minecraft one)
     let base_json: String = match conn.query_row(
-        "SELECT base_json FROM game_instances WHERE instance_id = ?1",
+        "SELECT base_json FROM game_instance_bases WHERE instance_id = ?1",
         [id],
         |row| row.get(0),
     ) {
@@ -1110,9 +1116,7 @@ pub fn delete_with_options(
                 chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()),
             )?;
             drop(locations);
-            if let Err(error) =
-                conn.execute("DELETE FROM game_instances WHERE instance_id = ?1", [id])
-            {
+            if let Err(error) = conn.execute("DELETE FROM instances WHERE instance_id = ?1", [id]) {
                 if let Err(rollback) = trash::undo_stash(ctx, &entry, &instance_dir) {
                     eprintln!("could not roll back the move to Recently deleted: {rollback}");
                 }
@@ -1122,7 +1126,7 @@ pub fn delete_with_options(
         } else {
             // A row whose folder is already gone has nothing to recover.
             drop(locations);
-            conn.execute("DELETE FROM game_instances WHERE instance_id = ?1", [id])?;
+            conn.execute("DELETE FROM instances WHERE instance_id = ?1", [id])?;
             None
         };
         if let BaseReference::Pinned { id: base_id, .. } = &base_ref {
@@ -1140,7 +1144,7 @@ pub fn delete_with_options(
 
     // The row goes first: a folder left behind by a failed removal is inert,
     // while a row whose folder is gone is a broken instance.
-    conn.execute("DELETE FROM game_instances WHERE instance_id = ?1", [id])?;
+    conn.execute("DELETE FROM instances WHERE instance_id = ?1", [id])?;
     // The instance's kept copy of Data goes with it (MASTER_SPEC §26.9). A folder the copy's marker does
     // not name is left in place, and the deletion still succeeds.
     if let BaseReference::Pinned { id: base_id, .. } = &base_ref {
@@ -1230,7 +1234,7 @@ pub fn record_launch(ctx: &Ctx, id: &str) -> Result<(), InstanceError> {
     let conn = crate::db::local_state_connection(&db_path)
         .map_err(|e| InstanceError::Other(e.to_string()))?;
     let count = conn.execute(
-        "UPDATE game_instances SET last_launched_at = datetime('now') WHERE instance_id = ?1",
+        "UPDATE instances SET last_launched_at = datetime('now') WHERE instance_id = ?1",
         [id],
     )?;
     if count == 0 {
@@ -1268,7 +1272,7 @@ pub fn rename(ctx: &Ctx, id: &str, name: &str) -> Result<(), InstanceError> {
     manifest.name = name.to_string();
     crate::game_deploy::write_instance_manifest_atomic(ctx, id, &manifest)?;
     let count = conn.execute(
-        "UPDATE game_instances SET name = ?1 WHERE instance_id = ?2",
+        "UPDATE instances SET name = ?1 WHERE instance_id = ?2",
         [name, id],
     )?;
     if count == 0 {
@@ -1293,7 +1297,7 @@ pub fn play_stats(ctx: &Ctx, id: &str) -> Result<PlayStats, InstanceError> {
     let conn = crate::db::local_state_connection(&db_path)
         .map_err(|e| InstanceError::Other(e.to_string()))?;
     conn.query_row(
-        "SELECT total_play_ms, last_played_at FROM game_instances WHERE instance_id = ?1",
+        "SELECT total_play_ms, last_played_at FROM instances WHERE instance_id = ?1",
         [id],
         |row| {
             Ok(PlayStats {
@@ -1319,7 +1323,7 @@ pub fn record_play_time(
     let conn = crate::db::local_state_connection(&db_path)
         .map_err(|e| InstanceError::Other(e.to_string()))?;
     let count = conn.execute(
-        "UPDATE game_instances
+        "UPDATE instances
             SET total_play_ms = total_play_ms + ?1,
                 last_played_at = ?2
           WHERE instance_id = ?3",

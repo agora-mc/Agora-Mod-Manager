@@ -322,9 +322,13 @@ fn read_entry(root: &Path, entry_id: &str) -> Result<StoredEntry, InstanceError>
 /// Read the instance's row. A missing row is an error: delete never guesses.
 pub(crate) fn read_row(conn: &Connection, instance_id: &str) -> Result<GameRow, InstanceError> {
     conn.query_row(
-        "SELECT instance_id, game, name, base_json, created_at, last_launched_at,
-                total_play_ms, last_played_at
-         FROM game_instances WHERE instance_id = ?1",
+        "SELECT instances.instance_id, instances.game, instances.name,
+                game_instance_bases.base_json, instances.created_at, instances.last_launched_at,
+                instances.total_play_ms, instances.last_played_at
+           FROM instances
+           JOIN game_instance_bases
+             ON game_instance_bases.instance_id = instances.instance_id
+          WHERE instances.instance_id = ?1",
         [instance_id],
         |row| {
             Ok(GameRow {
@@ -474,17 +478,16 @@ pub fn list(ctx: &Ctx, game_id: &str) -> Vec<DeletedEntry> {
 }
 
 fn id_is_free(conn: &Connection, instances_root: &Path, id: &str) -> Result<bool, InstanceError> {
-    for query in [
-        "SELECT 1 FROM game_instances WHERE instance_id = ?1",
-        "SELECT 1 FROM user_instances WHERE instance_id = ?1",
-    ] {
-        if conn
-            .query_row(query, [id], |_| Ok(()))
-            .optional()?
-            .is_some()
-        {
-            return Ok(false);
-        }
+    if conn
+        .query_row(
+            "SELECT 1 FROM instances WHERE instance_id = ?1",
+            [id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some()
+    {
+        return Ok(false);
     }
     Ok(std::fs::symlink_metadata(instances_root.join(id)).is_err())
 }
@@ -598,7 +601,7 @@ fn try_lock_instance(
 fn row_exists(conn: &Connection, id: &str) -> Result<bool, InstanceError> {
     Ok(conn
         .query_row(
-            "SELECT 1 FROM game_instances WHERE instance_id = ?1",
+            "SELECT 1 FROM game_instance_bases WHERE instance_id = ?1",
             [id],
             |_| Ok(()),
         )
@@ -638,20 +641,24 @@ fn finish_restore(
     let row = &stored.row;
     let tx = conn.unchecked_transaction().map_err(db_err)?;
     tx.execute(
-        "INSERT INTO game_instances
-             (instance_id, game, name, base_json, created_at, last_launched_at,
+        "INSERT INTO instances
+             (instance_id, game, name, created_at, last_launched_at,
               total_play_ms, last_played_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
             &restoring.new_id,
             &row.game,
             &restoring.new_name,
-            &row.base_json,
             &row.created_at,
             &row.last_launched_at,
             row.total_play_ms,
             &row.last_played_at,
         ],
+    )
+    .map_err(db_err)?;
+    tx.execute(
+        "INSERT INTO game_instance_bases (instance_id, base_json) VALUES (?1, ?2)",
+        rusqlite::params![&restoring.new_id, &row.base_json],
     )
     .map_err(db_err)?;
     for rule in &stored.load_order_rules {
@@ -746,7 +753,7 @@ fn recover_entry(
         && std::fs::symlink_metadata(instances_root.join(&stored.entry.instance_id)).is_err()
     {
         conn.execute(
-            "DELETE FROM game_instances WHERE instance_id = ?1",
+            "DELETE FROM instances WHERE instance_id = ?1",
             [&stored.entry.instance_id],
         )?;
         return Ok(Some(format!(

@@ -1861,7 +1861,7 @@ mod tests {
             total_play_ms: 0,
         };
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::upsert_instance(&conn, &row).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         let instance_dir = ctx.paths.instance_dir("gc-fixture").unwrap();
         std::fs::create_dir_all(&instance_dir).unwrap();
         let manifest = agora_core::models::InstanceManifest {
@@ -1906,7 +1906,7 @@ mod tests {
         for (stored, expected_selection) in fixtures {
             let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
             conn.execute(
-                "UPDATE user_instances SET jvm_gc = ?1 WHERE instance_id = ?2",
+                "UPDATE minecraft_instances SET jvm_gc = ?1 WHERE instance_id = ?2",
                 rusqlite::params![stored, "gc-fixture"],
             )
             .unwrap();

@@ -1,13 +1,21 @@
 use crate::models::InstanceRow;
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 /// Expected schema version for the mutable local SQLite database.
 /// Migrations are applied sequentially on startup.
-pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 30;
+pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 31;
+
+/// The game whose columns `minecraft_instances` holds.
+///
+/// Core holds the schema, so it holds the one name that says which detail table belongs to which
+/// identity; what the game *is* stays in its package.
+pub const MINECRAFT_GAME: &str = "minecraft";
 
 /// How many pre-migration database backups are kept.
 pub const LOCAL_STATE_BACKUP_RETENTION: usize = 3;
@@ -321,7 +329,7 @@ pub fn init_local_state_db_with(
         }
     }
     if current < target {
-        run_migrations(&conn)?;
+        report.warnings.extend(run_migrations(&conn)?);
     }
     report.migrated_to = schema_version(&conn)?;
 
@@ -1080,20 +1088,28 @@ pub fn global_always_pre_touch(conn: &Connection) -> Option<bool> {
 /// Each step runs in its own transaction, which also records the step's
 /// version, so a failure leaves the last successful version recorded and the
 /// database usable. When no step is pending, nothing is executed at all.
-pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
+///
+/// Returns the warnings a caller should surface (see `run_migration_steps`); a caller that
+/// drops them loses a report, not data.
+pub fn run_migrations(conn: &Connection) -> anyhow::Result<Vec<String>> {
     run_migration_steps(conn, MIGRATIONS, LOCAL_STATE_SCHEMA_VERSION)
 }
 
 /// Apply migrations only up to `target`. Tests use this to build a database as
 /// an earlier release wrote it, then open it with [`init_local_state_db`].
 #[doc(hidden)]
-pub fn run_migrations_to(conn: &Connection, target: i64) -> anyhow::Result<()> {
+pub fn run_migrations_to(conn: &Connection, target: i64) -> anyhow::Result<Vec<String>> {
     run_migration_steps(conn, MIGRATIONS, target)
 }
 
 struct MigrationStep {
     version: i64,
     name: &'static str,
+    /// True for a step that rebuilds a table other tables reference (SQLite's procedure for
+    /// changing a foreign key). The pragma is ignored inside a transaction, so the runner turns
+    /// foreign keys off *before* `BEGIN IMMEDIATE` and checks them again before `COMMIT`: a
+    /// violation rolls the step back and is reported rather than committed.
+    foreign_keys_off: bool,
     run: fn(&Connection) -> anyhow::Result<()>,
 }
 
@@ -1101,152 +1117,188 @@ const MIGRATIONS: &[MigrationStep] = &[
     MigrationStep {
         version: 1,
         name: "initial schema",
+        foreign_keys_off: false,
         run: migrate_v1,
     },
     MigrationStep {
         version: 2,
         name: "flag submissions",
+        foreign_keys_off: false,
         run: migrate_v2,
     },
     MigrationStep {
         version: 3,
         name: "crash investigator tables",
+        foreign_keys_off: false,
         run: migrate_v3,
     },
     MigrationStep {
         version: 4,
         name: "java path and incompatibility override",
+        foreign_keys_off: false,
         run: migrate_v4,
     },
     MigrationStep {
         version: 5,
         name: "gc selector baseline",
+        foreign_keys_off: false,
         run: migrate_v5,
     },
     MigrationStep {
         version: 6,
         name: "import provenance and jobs",
+        foreign_keys_off: false,
         run: migrate_v6,
     },
     MigrationStep {
         version: 7,
         name: "import quarantine path",
+        foreign_keys_off: false,
         run: migrate_v7,
     },
     MigrationStep {
         version: 8,
         name: "modrinth content metadata cache",
+        foreign_keys_off: false,
         run: migrate_v8,
     },
     MigrationStep {
         version: 9,
         name: "instance memory policy",
+        foreign_keys_off: false,
         run: migrate_v9,
     },
     MigrationStep {
         version: 10,
         name: "retire browse curated only",
+        foreign_keys_off: false,
         run: migrate_v10,
     },
     MigrationStep {
         version: 11,
         name: "update caches",
+        foreign_keys_off: false,
         run: migrate_v11,
     },
     MigrationStep {
         version: 12,
         name: "pack file inventory",
+        foreign_keys_off: false,
         run: migrate_v12,
     },
     MigrationStep {
         version: 13,
         name: "launch history",
+        foreign_keys_off: false,
         run: migrate_v13,
     },
     MigrationStep {
         version: 14,
         name: "plugin installs and storage",
+        foreign_keys_off: false,
         run: migrate_v14,
     },
     MigrationStep {
         version: 15,
         name: "plugin trust",
+        foreign_keys_off: false,
         run: migrate_v15,
     },
     MigrationStep {
         version: 16,
         name: "instance pack gaps",
+        foreign_keys_off: false,
         run: migrate_v16,
     },
     MigrationStep {
         version: 17,
         name: "lifetime play time",
+        foreign_keys_off: false,
         run: migrate_v17,
     },
     MigrationStep {
         version: 18,
         name: "game instances",
+        foreign_keys_off: false,
         run: migrate_v18,
     },
     MigrationStep {
         version: 19,
         name: "official plugins",
+        foreign_keys_off: false,
         run: migrate_v19,
     },
     MigrationStep {
         version: 20,
         name: "plugin script consent",
+        foreign_keys_off: false,
         run: migrate_v20,
     },
     MigrationStep {
         version: 21,
         name: "consent code hash",
+        foreign_keys_off: false,
         run: migrate_v21,
     },
     MigrationStep {
         version: 22,
         name: "game play time",
+        foreign_keys_off: false,
         run: migrate_v22,
     },
     MigrationStep {
         version: 23,
         name: "session ledger",
+        foreign_keys_off: false,
         run: migrate_v23,
     },
     MigrationStep {
         version: 24,
         name: "session answers",
+        foreign_keys_off: false,
         run: migrate_v24,
     },
     MigrationStep {
         version: 25,
         name: "crash log results",
+        foreign_keys_off: false,
         run: migrate_v25,
     },
     MigrationStep {
         version: 26,
         name: "crash save backups",
+        foreign_keys_off: false,
         run: migrate_v26,
     },
     MigrationStep {
         version: 27,
         name: "load order rules",
+        foreign_keys_off: false,
         run: migrate_v27,
     },
     MigrationStep {
         version: 28,
         name: "pre-touch column",
+        foreign_keys_off: false,
         run: migrate_v28,
     },
     MigrationStep {
         version: 29,
         name: "plugin package journal and ledger process identity",
+        foreign_keys_off: false,
         run: migrate_v29,
     },
     MigrationStep {
         version: 30,
         name: "committed plugin game packages",
+        foreign_keys_off: false,
         run: migrate_v30,
+    },
+    MigrationStep {
+        version: 31,
+        name: "one instance identity table",
+        foreign_keys_off: true,
+        run: migrate_v31,
     },
 ];
 
@@ -1256,11 +1308,17 @@ const MIGRATIONS: &[MigrationStep] = &[
 /// two processes starting at once cannot apply the same step twice; inside an
 /// existing transaction it uses a savepoint instead. The version is re-read
 /// under that lock before running, which is what makes the second starter skip.
+///
+/// Returns what the caller should tell the player: today, the broken references a rebuilt step
+/// found in the database it arrived with. Those are reported and left alone (the protection is
+/// against orphans the step itself creates), and a step that stops to report them is still
+/// better than one that quietly keeps them.
 fn run_migration_steps(
     conn: &Connection,
     steps: &[MigrationStep],
     target: i64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
+    let mut notices = Vec::new();
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_version (
              version INTEGER PRIMARY KEY
@@ -1280,6 +1338,33 @@ fn run_migration_steps(
         }
         let token = format!("migration_v{}", step.version);
         let standalone = conn.is_autocommit();
+        let mut restore: Option<ConnectionRestore<'_>> = None;
+        if step.foreign_keys_off && !standalone {
+            // The pragma is a no-op inside a transaction, so a rebuild run inside a caller's
+            // transaction would silently delete child rows through a cascade instead of moving
+            // them. Refuse rather than damage the database.
+            anyhow::bail!(
+                "local_state.db migration v{} ({}) rebuilds tables and cannot run inside another \
+                 transaction",
+                step.version,
+                step.name
+            );
+        }
+        let arrived_broken = if step.foreign_keys_off {
+            conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+            // From here on, every way out of this iteration — the pragma restore included —
+            // leaves the connection as the caller lent it: no transaction open, foreign keys on.
+            // Installed before the check below, because that check reads the database it arrived
+            // with and can fail on a database damaged badly enough (a foreign key naming a
+            // parent column that is not unique errors instead of listing rows).
+            restore = Some(ConnectionRestore { conn });
+            // Recorded before the rebuild, so the check after it reports what this step broke
+            // rather than a reference that was already broken when the database arrived.
+            foreign_key_violations(conn)?
+        } else {
+            Vec::new()
+        };
+        let mut broken_rows = broken_reference_budget(&arrived_broken);
         if standalone {
             conn.execute_batch("BEGIN IMMEDIATE")?;
         } else {
@@ -1295,29 +1380,73 @@ fn run_migration_steps(
                 return Ok(false);
             }
             (step.run)(conn)?;
+            if step.foreign_keys_off {
+                // Inside the transaction, before the commit: a row whose parent this step did not
+                // create would otherwise be committed as an orphan.
+                let mut new = Vec::new();
+                for violation in foreign_key_violations(conn)? {
+                    match broken_rows.get_mut(&violation.key()) {
+                        Some(left) if *left > 0 => *left -= 1,
+                        _ => new.push(violation.describe()),
+                    }
+                }
+                if !new.is_empty() {
+                    anyhow::bail!(
+                        "the rebuild left rows that point at no instance: {}",
+                        new.join("; ")
+                    );
+                }
+            }
             conn.execute(
                 "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
                 rusqlite::params![step.version],
             )?;
             Ok(true)
         })();
-        match outcome {
-            Ok(applied) => {
-                if standalone {
-                    conn.execute_batch("COMMIT")?;
-                } else {
-                    conn.execute_batch(&format!("RELEASE {token}"))?;
-                }
-                if applied {
-                    current = step.version;
-                }
+        let result: anyhow::Result<bool> = match outcome {
+            Ok(applied) => if standalone {
+                conn.execute_batch("COMMIT")
+            } else {
+                conn.execute_batch(&format!("RELEASE {token}"))
             }
+            .map(|()| applied)
+            .map_err(Into::into),
             Err(error) => {
                 if standalone {
                     let _ = conn.execute_batch("ROLLBACK");
                 } else {
                     let _ = conn.execute_batch(&format!("ROLLBACK TO {token}; RELEASE {token}"));
                 }
+                Err(error)
+            }
+        };
+        if step.foreign_keys_off {
+            // The guard put the pragma back on drop; dropping it here keeps the lifetime obvious
+            // and makes the restore happen before `notices` is filled for this step.
+            drop(restore);
+        }
+        match result {
+            Ok(applied) => {
+                if applied {
+                    current = step.version;
+                    if !arrived_broken.is_empty() {
+                        notices.push(format!(
+                            "local_state.db already had {} row(s) that point at no instance when \
+                             migration v{} ({}) ran: {}. They were left alone rather than deleted; \
+                             delete or repair them by hand if they matter.",
+                            arrived_broken.len(),
+                            step.version,
+                            step.name,
+                            arrived_broken
+                                .iter()
+                                .map(BrokenReference::describe)
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
                 return Err(error.context(format!(
                     "local_state.db migration v{} ({}) failed; version {current} is still recorded",
                     step.version, step.name
@@ -1325,7 +1454,95 @@ fn run_migration_steps(
             }
         }
     }
-    Ok(())
+    Ok(notices)
+}
+
+/// A row that references a parent row which does not exist.
+///
+/// `PRAGMA foreign_key_check` names the child table and the rowid, but not which instance is
+/// missing, so the parent table is kept for a report a person can act on.
+struct BrokenReference {
+    table: String,
+    rowid: Option<i64>,
+    parent: String,
+}
+
+impl BrokenReference {
+    fn describe(&self) -> String {
+        format!(
+            "{} row {} references {}",
+            self.table,
+            self.rowid
+                .map_or_else(|| "?".to_string(), |id| id.to_string()),
+            self.parent
+        )
+    }
+
+    /// The row this violation is about, so a rebuild can be asked whether it broke *this* row.
+    ///
+    /// Not the message: a rebuild renames the parent table, so the same row reads differently
+    /// after the step, which made a pre-existing orphan look new and refused a database that
+    /// only needed migrating. Not the table alone either: one vanished violation would then
+    /// cover a new one beside it.
+    fn key(&self) -> (String, Option<i64>) {
+        (self.table.clone(), self.rowid)
+    }
+}
+
+/// What a rebuilt step must not leave behind, however it leaves: a transaction open, or foreign
+/// keys switched off.
+///
+/// A step turns the pragma off before `BEGIN IMMEDIATE` (it is ignored inside a transaction) and
+/// the runner commits or rolls back itself. Every early return between those two points — the
+/// arrived-broken check, a busy database, the step, the check before the commit — would otherwise
+/// hand the caller a connection that cascades nothing, or one whose next statement silently joins
+/// a transaction nobody closed. The guard runs on all of them, and costs nothing on the path that
+/// already cleaned up (it finds autocommit on and the pragma already on).
+struct ConnectionRestore<'a> {
+    conn: &'a Connection,
+}
+
+impl Drop for ConnectionRestore<'_> {
+    fn drop(&mut self) {
+        if !self.conn.is_autocommit() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+        let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON");
+    }
+}
+
+/// Every row that references a parent row which does not exist.
+fn foreign_key_violations(conn: &Connection) -> anyhow::Result<Vec<BrokenReference>> {
+    let mut stmt = conn.prepare("SELECT \"table\", rowid, parent FROM pragma_foreign_key_check")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(BrokenReference {
+            table: row.get(0)?,
+            rowid: row.get(1)?,
+            parent: row.get(2)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    out.sort_by(|a, b| (&a.table, a.rowid, &a.parent).cmp(&(&b.table, b.rowid, &b.parent)));
+    Ok(out)
+}
+
+/// The broken references the database arrived with, per row, so each can be excused once.
+///
+/// Keyed by table and rowid rather than by the message (a rebuild renames the parent table, so
+/// the same row reads differently afterwards) or by the table alone (one vanished violation would
+/// then excuse a new one beside it). A rebuild that renumbers rowids makes an arrival look new,
+/// which refuses the database with a report rather than committing an orphan — the safe direction.
+fn broken_reference_budget(
+    violations: &[BrokenReference],
+) -> BTreeMap<(String, Option<i64>), usize> {
+    let mut counts = BTreeMap::new();
+    for violation in violations {
+        *counts.entry(violation.key()).or_insert(0) += 1;
+    }
+    counts
 }
 
 /// Add a column only when it is missing, failing on a real ALTER error.
@@ -1785,6 +2002,13 @@ fn migrate_v17(conn: &Connection) -> anyhow::Result<()> {
     // Lifetime play time. `launch_history` is trimmed to its newest rows,
     // so the total has to live with the instance. Seeded from whatever
     // history survives, which is the best figure available.
+    //
+    // Replayed after v31 the table this seeds no longer exists (its rows are in `instances`
+    // by then and already carry the total), so the step does nothing rather than fail: the
+    // migration tests replay history over a migrated database.
+    if !table_exists(conn, "user_instances")? {
+        return Ok(());
+    }
     add_column_if_missing(
         conn,
         "user_instances",
@@ -1932,10 +2156,12 @@ fn migrate_v23(conn: &Connection) -> anyhow::Result<()> {
     // promise that history cannot outlive the instance (deleting either kind of instance
     // deletes its rows and manifests). Manifests are stored once per distinct manifest.
     // The triggers go first: replaying this step over a database that already has them would
-    // otherwise fail when the table they name is dropped.
+    // otherwise fail when the table they name is dropped. That includes step 31's trigger on
+    // `instances`, which names `launch_history` too and is put back at the end of the step.
     conn.execute_batch(
         "DROP TRIGGER IF EXISTS launch_history_minecraft_instance_gone;
          DROP TRIGGER IF EXISTS launch_history_game_instance_gone;
+         DROP TRIGGER IF EXISTS launch_history_instance_gone;
          DROP TABLE IF EXISTS launch_history_v23;
          CREATE TABLE launch_history_v23 (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1989,7 +2215,29 @@ fn migrate_v23(conn: &Connection) -> anyhow::Result<()> {
              DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
          END;",
     )?;
+    // Put back the promise on the one identity table when this step is replayed over a
+    // database that step 31 already migrated.
+    if table_exists(conn, "instances")? {
+        conn.execute_batch(instance_delete_trigger())?;
+    }
     Ok(())
+}
+
+/// The trigger that keeps an instance's history from outliving it, on the one identity table.
+///
+/// Step 31 creates it; step 23 puts it back when it is replayed over a database that step 31
+/// already migrated (the migration tests replay history that way).
+fn instance_delete_trigger() -> &'static str {
+    "CREATE TRIGGER IF NOT EXISTS launch_history_instance_gone
+         AFTER DELETE ON instances
+     BEGIN
+         DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+         DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+         DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
+         DELETE FROM crash_log_results WHERE instance_id = OLD.instance_id;
+         DELETE FROM crash_save_backups WHERE instance_id = OLD.instance_id;
+         DELETE FROM plugin_load_order_rules WHERE instance_id = OLD.instance_id;
+     END;"
 }
 
 fn migrate_v24(conn: &Connection) -> anyhow::Result<()> {
@@ -2188,6 +2436,370 @@ fn migrate_v30(conn: &Connection) -> anyhow::Result<()> {
     )
 }
 
+/// The one identity table (MASTER_SPEC §32.7).
+///
+/// `user_instances` (Minecraft) and `game_instances` (every other game) become one
+/// `instances` table holding what an instance is whatever game it belongs to, with each
+/// game's own columns in a detail table keyed by the instance id: `minecraft_instances`
+/// and `game_instance_bases`. The detail tables stay in core's migrations, so core still
+/// holds the schema without gaining game logic.
+///
+/// This is a table rebuild, so it runs with foreign keys off (the step's
+/// `foreign_keys_off`): dropping `user_instances` while they were on would cascade-delete
+/// every child row before it could be copied. The runner checks the references again
+/// before it commits.
+///
+/// The two old tables are separate id namespaces, so an id in both is refused before
+/// anything is copied: the report names both rows and the version stays recorded, which
+/// leaves the database exactly as it was (and the safety net's backup on disk).
+fn migrate_v31(conn: &Connection) -> anyhow::Result<()> {
+    // Already done: the version row was lost and the step is replayed, or a later step is
+    // being re-run over a migrated database. There is nothing left to copy from.
+    if !table_exists(conn, "user_instances")? && !table_exists(conn, "game_instances")? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS launch_history_minecraft_instance_gone;
+         DROP TRIGGER IF EXISTS launch_history_game_instance_gone;
+
+         CREATE TABLE IF NOT EXISTS instances (
+             instance_id TEXT PRIMARY KEY,
+             game TEXT NOT NULL,
+             name TEXT NOT NULL,
+             created_at TEXT NOT NULL DEFAULT (datetime('now')),
+             last_launched_at TEXT,
+             total_play_ms INTEGER NOT NULL DEFAULT 0,
+             last_played_at TEXT
+         );
+
+         CREATE TABLE IF NOT EXISTS minecraft_instances (
+             instance_id TEXT PRIMARY KEY,
+             minecraft_version TEXT NOT NULL,
+             loader TEXT NOT NULL,
+             loader_version TEXT NOT NULL,
+             is_modpack BOOLEAN NOT NULL DEFAULT 0,
+             is_locked BOOLEAN NOT NULL DEFAULT 0,
+             jvm_memory_mb INTEGER NOT NULL DEFAULT 4096,
+             jvm_memory_mode TEXT NOT NULL DEFAULT 'manual',
+             jvm_gc TEXT NOT NULL DEFAULT 'auto',
+             jvm_custom_args TEXT NOT NULL DEFAULT '',
+             jvm_always_pre_touch INTEGER NOT NULL DEFAULT 1,
+             java_path TEXT,
+             java_incompatible_override INTEGER NOT NULL DEFAULT 0,
+             icon_path TEXT,
+             launch_mode_override TEXT NOT NULL DEFAULT 'auto',
+             FOREIGN KEY (instance_id) REFERENCES instances(instance_id) ON DELETE CASCADE
+         );
+
+         CREATE TABLE IF NOT EXISTS game_instance_bases (
+             instance_id TEXT PRIMARY KEY,
+             base_json TEXT NOT NULL,
+             FOREIGN KEY (instance_id) REFERENCES instances(instance_id) ON DELETE CASCADE
+         );",
+    )?;
+
+    // The two tables are separate id namespaces. A collision is not resolved by guessing:
+    // the report names both rows and the migration stops with nothing changed.
+    let collisions = shared_instance_ids(conn)?;
+    if !collisions.is_empty() {
+        anyhow::bail!(
+            "two instances share an id, so they cannot be merged into one instance table: {}. \
+             Nothing was changed; rename one of them and start Agora again.",
+            collisions.join("; ")
+        );
+    }
+
+    // An orphan in one namespace whose id belongs to the other would quietly change owner when
+    // the two tables become one. Nothing is guessed here either.
+    let re_parented = cross_namespace_orphans(conn)?;
+    if !re_parented.is_empty() {
+        anyhow::bail!(
+            "rows that belong to no instance would be given another game's instance when the \
+             instance tables are merged: {}. Nothing was changed; restore or delete those rows \
+             and start Agora again.",
+            re_parented.join("; ")
+        );
+    }
+
+    if table_exists(conn, "user_instances")? {
+        conn.execute_batch(
+            "INSERT INTO instances
+                 (instance_id, game, name, created_at, last_launched_at, total_play_ms)
+             SELECT instance_id, 'minecraft', name, created_at, last_launched_at, total_play_ms
+               FROM user_instances;
+             INSERT INTO minecraft_instances
+                 (instance_id, minecraft_version, loader, loader_version, is_modpack, is_locked,
+                  jvm_memory_mb, jvm_memory_mode, jvm_gc, jvm_custom_args, jvm_always_pre_touch,
+                  java_path, java_incompatible_override, icon_path, launch_mode_override)
+             SELECT instance_id, minecraft_version, loader, loader_version, is_modpack, is_locked,
+                    jvm_memory_mb, jvm_memory_mode, jvm_gc, jvm_custom_args, jvm_always_pre_touch,
+                    java_path, java_incompatible_override, icon_path, launch_mode_override
+               FROM user_instances;",
+        )?;
+    }
+    if table_exists(conn, "game_instances")? {
+        conn.execute_batch(
+            "INSERT INTO instances
+                 (instance_id, game, name, created_at, last_launched_at, total_play_ms,
+                  last_played_at)
+             SELECT instance_id, game, name, created_at, last_launched_at, total_play_ms,
+                    last_played_at
+               FROM game_instances;
+             INSERT INTO game_instance_bases (instance_id, base_json)
+             SELECT instance_id, base_json FROM game_instances;",
+        )?;
+    }
+
+    // The four tables that pointed at `user_instances` must point at `instances` instead.
+    // A foreign key cannot be altered, so each is rebuilt with its rows carried over: SQLite's
+    // procedure for a table rebuild, which needs the foreign keys off (this step's flag) or the
+    // `DROP TABLE` below would delete the rows that reference the table being replaced.
+    //
+    // Each copy names `rowid` for the same reason: the runner compared the arrivals and the
+    // result by row, so a rebuilt row that lands on a different rowid reads as an orphan this
+    // step created, and a report about a row that moved names the wrong row.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS instance_imports_v31;
+         CREATE TABLE instance_imports_v31 (
+             instance_id TEXT PRIMARY KEY,
+             launcher_kind TEXT NOT NULL,
+             installation_key TEXT NOT NULL,
+             source_instance_key TEXT NOT NULL,
+             source_path TEXT NOT NULL,
+             source_metadata_json TEXT NOT NULL DEFAULT '{}',
+             imported_settings_json TEXT NOT NULL DEFAULT '{}',
+             source_fingerprint TEXT NOT NULL,
+             imported_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             last_result TEXT NOT NULL DEFAULT 'imported',
+             FOREIGN KEY (instance_id) REFERENCES instances(instance_id) ON DELETE CASCADE
+         );
+         INSERT INTO instance_imports_v31
+             (rowid, instance_id, launcher_kind, installation_key, source_instance_key, source_path,
+              source_metadata_json, imported_settings_json, source_fingerprint, imported_at,
+              updated_at, last_result)
+         SELECT rowid, instance_id, launcher_kind, installation_key, source_instance_key,
+                source_path, source_metadata_json, imported_settings_json, source_fingerprint,
+                imported_at, updated_at, last_result
+           FROM instance_imports;
+         DROP TABLE instance_imports;
+         ALTER TABLE instance_imports_v31 RENAME TO instance_imports;
+         CREATE INDEX IF NOT EXISTS idx_instance_import_source
+             ON instance_imports (launcher_kind, installation_key, source_instance_key);
+
+         DROP TABLE IF EXISTS instance_pack_files_v31;
+         CREATE TABLE instance_pack_files_v31 (
+             instance_id TEXT NOT NULL,
+             relative_path TEXT NOT NULL,
+             sha256 TEXT NOT NULL,
+             size INTEGER NOT NULL,
+             PRIMARY KEY (instance_id, relative_path),
+             FOREIGN KEY (instance_id) REFERENCES instances(instance_id) ON DELETE CASCADE
+         );
+         INSERT INTO instance_pack_files_v31 (rowid, instance_id, relative_path, sha256, size)
+         SELECT rowid, instance_id, relative_path, sha256, size FROM instance_pack_files;
+         DROP TABLE instance_pack_files;
+         ALTER TABLE instance_pack_files_v31 RENAME TO instance_pack_files;
+         CREATE INDEX IF NOT EXISTS idx_instance_pack_files_instance
+             ON instance_pack_files (instance_id);
+
+         DROP TABLE IF EXISTS instance_pack_gaps_v31;
+         CREATE TABLE instance_pack_gaps_v31 (
+             instance_id TEXT NOT NULL,
+             filename TEXT NOT NULL,
+             display_name TEXT NOT NULL,
+             status TEXT NOT NULL,
+             reason TEXT,
+             FOREIGN KEY (instance_id) REFERENCES instances(instance_id) ON DELETE CASCADE
+         );
+         INSERT INTO instance_pack_gaps_v31
+             (rowid, instance_id, filename, display_name, status, reason)
+         SELECT rowid, instance_id, filename, display_name, status, reason FROM instance_pack_gaps;
+         DROP TABLE instance_pack_gaps;
+         ALTER TABLE instance_pack_gaps_v31 RENAME TO instance_pack_gaps;
+         CREATE INDEX IF NOT EXISTS idx_instance_pack_gaps_instance
+             ON instance_pack_gaps (instance_id);
+
+         DROP TABLE IF EXISTS instance_update_cache_v31;
+         CREATE TABLE instance_update_cache_v31 (
+             instance_id TEXT PRIMARY KEY,
+             updates_json TEXT NOT NULL,
+             checked_at TEXT NOT NULL,
+             FOREIGN KEY (instance_id) REFERENCES instances(instance_id) ON DELETE CASCADE
+         );
+         INSERT INTO instance_update_cache_v31 (rowid, instance_id, updates_json, checked_at)
+         SELECT rowid, instance_id, updates_json, checked_at FROM instance_update_cache;
+         DROP TABLE instance_update_cache;
+         ALTER TABLE instance_update_cache_v31 RENAME TO instance_update_cache;
+         CREATE INDEX IF NOT EXISTS idx_instance_update_cache_checked_at
+             ON instance_update_cache (checked_at);
+
+         DROP TABLE IF EXISTS user_instances;
+         DROP TABLE IF EXISTS game_instances;
+",
+    )?;
+    conn.execute_batch(instance_delete_trigger())?;
+    conn.execute_batch(instance_detail_guards())?;
+    Ok(())
+}
+
+/// The triggers that keep a detail row and its identity agreeing about the game (§32.7).
+///
+/// Two instance tables became one, so the old promise that a row cannot describe another game's
+/// instance has to be stated: `minecraft_instances` only for a Minecraft identity,
+/// `game_instance_bases` only for one that is not Minecraft (Minecraft has no base), and an
+/// identity's game cannot be changed to contradict a detail row it already has.
+fn instance_detail_guards() -> &'static str {
+    "CREATE TRIGGER IF NOT EXISTS minecraft_detail_needs_a_minecraft_instance
+         BEFORE INSERT ON minecraft_instances
+     BEGIN
+         SELECT RAISE(ABORT, 'a minecraft_instances row needs an instance whose game is minecraft')
+         WHERE NOT EXISTS (SELECT 1 FROM instances
+                            WHERE instances.instance_id = NEW.instance_id
+                              AND instances.game = 'minecraft');
+     END;
+     CREATE TRIGGER IF NOT EXISTS base_detail_needs_a_game_instance
+         BEFORE INSERT ON game_instance_bases
+     BEGIN
+         SELECT RAISE(ABORT, 'a game_instance_bases row needs an instance of a game that uses a base; a Minecraft instance has none')
+         WHERE NOT EXISTS (SELECT 1 FROM instances
+                            WHERE instances.instance_id = NEW.instance_id
+                              AND instances.game <> 'minecraft')
+            OR EXISTS (SELECT 1 FROM minecraft_instances
+                        WHERE minecraft_instances.instance_id = NEW.instance_id);
+     END;
+     CREATE TRIGGER IF NOT EXISTS instance_game_change_needs_its_detail
+         BEFORE UPDATE OF game ON instances
+     BEGIN
+         SELECT RAISE(ABORT, 'this instance has minecraft detail columns, so its game must stay minecraft')
+         WHERE NEW.game <> 'minecraft'
+           AND EXISTS (SELECT 1 FROM minecraft_instances
+                        WHERE minecraft_instances.instance_id = NEW.instance_id);
+     END;
+     CREATE TRIGGER IF NOT EXISTS instance_game_change_needs_its_base
+         BEFORE UPDATE OF game ON instances
+     BEGIN
+         SELECT RAISE(ABORT, 'this instance has base detail columns, so its game cannot become minecraft')
+         WHERE NEW.game = 'minecraft'
+           AND EXISTS (SELECT 1 FROM game_instance_bases
+                        WHERE game_instance_bases.instance_id = NEW.instance_id);
+     END;"
+}
+
+/// True when the database has a table (not a view) of that name.
+fn table_exists(conn: &Connection, name: &str) -> anyhow::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Instances whose id is in both old tables, each described by the rows that share it.
+fn shared_instance_ids(conn: &Connection) -> anyhow::Result<Vec<String>> {
+    if !table_exists(conn, "user_instances")? || !table_exists(conn, "game_instances")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT user_instances.instance_id, user_instances.name, game_instances.game,
+                game_instances.name
+           FROM user_instances
+           JOIN game_instances ON game_instances.instance_id = user_instances.instance_id
+          ORDER BY user_instances.instance_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(format!(
+            "'{}' (Minecraft instance '{}' and {} instance '{}')",
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// A schema identifier as SQLite spells it in a query: quoted, with any quote doubled.
+fn quoted_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Rows a rebuild would silently give another game's instance (§32.7).
+///
+/// Two instance tables were two id namespaces. A child row that pointed at `user_instances` but
+/// had no row there, while `game_instances` had one with that id, was an orphan before the
+/// migration and would become that other game's row afterwards: same id, different instance.
+/// Deleting it loses data and re-parenting invents a history, so the step stops and names the
+/// rows instead, exactly as it does for an id in both tables.
+fn cross_namespace_orphans(conn: &Connection) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for (parent, other) in [
+        ("user_instances", "game_instances"),
+        ("game_instances", "user_instances"),
+    ] {
+        if !table_exists(conn, parent)? || !table_exists(conn, other)? {
+            continue;
+        }
+        let mut tables = conn.prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+              ORDER BY name",
+        )?;
+        let children: Vec<String> = tables
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for child in children {
+            if child == parent || child == other {
+                continue;
+            }
+            // Which column of this table points at the parent we are looking at.
+            let column: Option<String> = conn
+                .query_row(
+                    "SELECT \"from\" FROM pragma_foreign_key_list(?1) WHERE \"table\" = ?2 LIMIT 1",
+                    rusqlite::params![child, parent],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(column) = column else { continue };
+            // The row says one id; only the other namespace has an instance with it.
+            //
+            // `NOT EXISTS`, not `NOT IN`: SQLite allows a NULL in a TEXT primary key, and one
+            // NULL in the parent makes every `NOT IN (...)` comparison NULL, which would hide
+            // exactly the rows this scan exists to refuse.
+            let sql = format!(
+                "SELECT c.rowid, c.{column}, o.name FROM {child} c
+                   JOIN {other} o ON o.instance_id = c.{column}
+                  WHERE NOT EXISTS (SELECT 1 FROM {parent} p
+                                     WHERE p.instance_id = c.{column})
+                  ORDER BY c.rowid",
+                column = quoted_identifier(&column),
+                child = quoted_identifier(&child),
+                other = quoted_identifier(other),
+                parent = quoted_identifier(parent),
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |row| {
+                Ok(format!(
+                    "{child} row {} (instance '{}') has no {parent} row, and {other} has an \
+                     instance with that id ('{}')",
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// Read a JSON-encoded setting from user_settings.
 pub fn get_setting(conn: &Connection, key: &str) -> anyhow::Result<Option<serde_json::Value>> {
     let mut stmt = conn.prepare("SELECT value_json FROM user_settings WHERE key = ?1")?;
@@ -2305,24 +2917,79 @@ pub fn set_setting(conn: &Connection, key: &str, value: &serde_json::Value) -> a
     Ok(())
 }
 
-/// Insert or update an instance row.
-pub fn upsert_instance(conn: &Connection, row: &InstanceRow) -> anyhow::Result<()> {
-    conn.execute(
-        "INSERT INTO user_instances (
-             instance_id, name, minecraft_version, loader, loader_version,
-             is_modpack, is_locked, last_launched_at,
-             jvm_memory_mb, jvm_gc, jvm_custom_args, jvm_always_pre_touch, created_at,
+/// Insert or update an instance: its identity row in `instances`, and the Minecraft
+/// columns in `minecraft_instances`.
+///
+/// `game` is the identity's game id, which only the caller knows (the identity table is
+/// shared by every game). The two rows are written in one transaction, so a detail row that
+/// cannot be written leaves no identity row behind — half an instance is not an instance.
+///
+/// Only Minecraft is accepted, because the columns written here are Minecraft's: a
+/// different game's instance gets its identity and its own detail row elsewhere, so a
+/// mismatched `game` is refused before anything is written rather than producing an
+/// identity that contradicts the detail row the database's triggers allow.
+///
+/// An id another game already owns is refused too: the identity table is shared, so a free
+/// id for Minecraft is a free id for everyone, and an instance of Skyrim keeps its row.
+///
+/// The update keeps the statistics it was not given: playtime and the time it was last played
+/// are accumulated by the play-session code, and a caller that never measured them (a launcher
+/// import updating what it already knows, say) must not reset them to zero.
+pub fn upsert_instance(conn: &Connection, game: &str, row: &InstanceRow) -> anyhow::Result<()> {
+    if game != MINECRAFT_GAME {
+        anyhow::bail!(
+            "instance {} belongs to game {game}, but this is the Minecraft instance record; \
+             refusing to write Minecraft columns onto it",
+            row.instance_id
+        );
+    }
+    let owner: Option<String> = conn
+        .query_row(
+            "SELECT game FROM instances WHERE instance_id = ?1",
+            [&row.instance_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(owner) = owner {
+        if owner != game {
+            anyhow::bail!(
+                "instance {} already belongs to game {owner}; its id is not free for a \
+                 Minecraft instance, so nothing was written. Choose another id, or remove that \
+                 instance first.",
+                row.instance_id
+            );
+        }
+    }
+    in_one_transaction(conn, |conn| {
+        conn.execute(
+            "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at, total_play_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(instance_id) DO UPDATE SET
+                 name = excluded.name,
+                 last_launched_at = COALESCE(excluded.last_launched_at, instances.last_launched_at)",
+            rusqlite::params![
+                row.instance_id,
+                game,
+                row.name,
+                row.created_at,
+                row.last_launched_at,
+                row.total_play_ms,
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO minecraft_instances (
+             instance_id, minecraft_version, loader, loader_version,
+             is_modpack, is_locked,
+             jvm_memory_mb, jvm_gc, jvm_custom_args, jvm_always_pre_touch,
               java_path, java_incompatible_override, icon_path, launch_mode_override,
               jvm_memory_mode
-           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(instance_id) DO UPDATE SET
-             name = excluded.name,
              minecraft_version = excluded.minecraft_version,
              loader = excluded.loader,
              loader_version = excluded.loader_version,
              is_modpack = excluded.is_modpack,
              is_locked = excluded.is_locked,
-             last_launched_at = excluded.last_launched_at,
              jvm_memory_mb = excluded.jvm_memory_mb,
              jvm_gc = excluded.jvm_gc,
              jvm_custom_args = excluded.jvm_custom_args,
@@ -2332,28 +2999,66 @@ pub fn upsert_instance(conn: &Connection, row: &InstanceRow) -> anyhow::Result<(
               icon_path = excluded.icon_path,
                launch_mode_override = excluded.launch_mode_override,
                jvm_memory_mode = excluded.jvm_memory_mode",
-        rusqlite::params![
-            row.instance_id,
-            row.name,
-            row.minecraft_version,
-            row.loader,
-            row.loader_version,
-            row.is_modpack,
-            row.is_locked,
-            row.last_launched_at,
-            row.jvm_memory_mb,
-            row.jvm_gc,
-            row.jvm_custom_args,
-            row.jvm_always_pre_touch as i64,
-            row.created_at,
-            row.java_path,
-            row.java_incompatible_override as i64,
-            row.icon_path,
-            normalized_launch_mode(&row.launch_mode_override),
-            normalized_memory_mode(&row.jvm_memory_mode),
-        ],
-    )?;
-    Ok(())
+            rusqlite::params![
+                row.instance_id,
+                row.minecraft_version,
+                row.loader,
+                row.loader_version,
+                row.is_modpack,
+                row.is_locked,
+                row.jvm_memory_mb,
+                row.jvm_gc,
+                row.jvm_custom_args,
+                row.jvm_always_pre_touch as i64,
+                row.java_path,
+                row.java_incompatible_override as i64,
+                row.icon_path,
+                normalized_launch_mode(&row.launch_mode_override),
+                normalized_memory_mode(&row.jvm_memory_mode),
+            ],
+        )?;
+        Ok(())
+    })
+}
+
+/// Run `write` in one transaction, or in the caller's when one is already open.
+///
+/// An instance is two rows (§32.7): the identity, and its game's detail row. A writer that
+/// committed them separately could fail between them and leave an identity with no detail row —
+/// half an instance, which lists and cannot be launched. A caller that already holds a
+/// transaction keeps its own larger unit atomic: nesting a `BEGIN` would fail, so the write gets
+/// a savepoint instead, which the caller's commit or rollback then publishes or drops with
+/// everything else. Without it the two halves would still be one statement each in the caller's
+/// transaction, and a failed detail write would be committed as an identity row by a caller that
+/// handled the error and went on.
+pub(crate) fn in_one_transaction<T, E>(
+    conn: &Connection,
+    write: impl FnOnce(&Connection) -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<rusqlite::Error>,
+{
+    if !conn.is_autocommit() {
+        conn.execute_batch("SAVEPOINT agora_instance_write")?;
+        return match write(conn) {
+            Ok(value) => {
+                conn.execute_batch("RELEASE agora_instance_write")?;
+                Ok(value)
+            }
+            Err(error) => {
+                // A rollback that cannot run is the more serious problem, so it is what the
+                // caller is told: an active savepoint would commit with the caller's work.
+                conn.execute_batch(
+                    "ROLLBACK TO agora_instance_write; RELEASE agora_instance_write",
+                )?;
+                Err(error)
+            }
+        };
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let value = write(&tx)?;
+    tx.commit()?;
+    Ok(value)
 }
 
 /// Update per-instance Java settings. `custom_args` is optional so Java
@@ -2367,12 +3072,12 @@ pub fn update_instance_java(
 ) -> anyhow::Result<()> {
     if let Some(custom_args) = custom_args {
         conn.execute(
-            "UPDATE user_instances SET java_path = ?1, java_incompatible_override = ?2, jvm_custom_args = ?3 WHERE instance_id = ?4",
+            "UPDATE minecraft_instances SET java_path = ?1, java_incompatible_override = ?2, jvm_custom_args = ?3 WHERE instance_id = ?4",
             rusqlite::params![java_path, allow_incompatible as i64, custom_args, instance_id],
         )?;
     } else {
         conn.execute(
-            "UPDATE user_instances SET java_path = ?1, java_incompatible_override = ?2 WHERE instance_id = ?3",
+            "UPDATE minecraft_instances SET java_path = ?1, java_incompatible_override = ?2 WHERE instance_id = ?3",
             rusqlite::params![java_path, allow_incompatible as i64, instance_id],
         )?;
     }
@@ -2390,7 +3095,7 @@ pub fn update_instance_jvm(
     memory_mode: &str,
 ) -> anyhow::Result<()> {
     conn.execute(
-        "UPDATE user_instances
+        "UPDATE minecraft_instances
          SET jvm_memory_mb = ?1,
              jvm_gc = ?2,
               jvm_always_pre_touch = ?3,
@@ -2412,7 +3117,7 @@ pub fn update_instance_jvm(
 /// Set the locked flag for an instance.
 pub fn set_locked(conn: &Connection, instance_id: &str, locked: bool) -> anyhow::Result<()> {
     conn.execute(
-        "UPDATE user_instances SET is_locked = ?1 WHERE instance_id = ?2",
+        "UPDATE minecraft_instances SET is_locked = ?1 WHERE instance_id = ?2",
         rusqlite::params![locked, instance_id],
     )?;
     Ok(())
@@ -2434,7 +3139,7 @@ pub fn update_instance_loader_version(
     new_loader_version: &str,
 ) -> anyhow::Result<u64> {
     let affected = conn.execute(
-        "UPDATE user_instances
+        "UPDATE minecraft_instances
          SET loader_version = ?1
          WHERE instance_id = ?2
            AND loader = ?3
@@ -2464,9 +3169,8 @@ pub fn sync_instance_row_from_manifest(
     manifest: &crate::models::InstanceManifest,
 ) -> anyhow::Result<u64> {
     let affected = conn.execute(
-        "UPDATE user_instances
-         SET minecraft_version = ?1, loader = ?2, loader_version = ?3, is_locked = ?4,
-             name = COALESCE(NULLIF(TRIM(?6), ''), name)
+        "UPDATE minecraft_instances
+         SET minecraft_version = ?1, loader = ?2, loader_version = ?3, is_locked = ?4
          WHERE instance_id = ?5",
         rusqlite::params![
             manifest.minecraft_version,
@@ -2474,8 +3178,11 @@ pub fn sync_instance_row_from_manifest(
             manifest.loader_version,
             manifest.is_locked,
             instance_id,
-            manifest.name
         ],
+    )?;
+    conn.execute(
+        "UPDATE instances SET name = COALESCE(NULLIF(TRIM(?2), ''), name) WHERE instance_id = ?1",
+        rusqlite::params![instance_id, manifest.name],
     )?;
     Ok(affected as u64)
 }
@@ -2487,7 +3194,7 @@ pub fn set_instance_icon_path(
     icon_path: Option<&str>,
 ) -> anyhow::Result<()> {
     conn.execute(
-        "UPDATE user_instances SET icon_path = ?1 WHERE instance_id = ?2",
+        "UPDATE minecraft_instances SET icon_path = ?1 WHERE instance_id = ?2",
         rusqlite::params![icon_path, instance_id],
     )?;
     Ok(())
@@ -2496,7 +3203,7 @@ pub fn set_instance_icon_path(
 /// Rename an instance in the DB.
 pub fn rename_instance(conn: &Connection, instance_id: &str, new_name: &str) -> anyhow::Result<()> {
     conn.execute(
-        "UPDATE user_instances SET name = ?1 WHERE instance_id = ?2",
+        "UPDATE instances SET name = ?1 WHERE instance_id = ?2",
         rusqlite::params![new_name, instance_id],
     )?;
     Ok(())
@@ -2505,7 +3212,7 @@ pub fn rename_instance(conn: &Connection, instance_id: &str, new_name: &str) -> 
 /// Delete an instance row.
 pub fn delete_instance(conn: &Connection, instance_id: &str) -> anyhow::Result<()> {
     conn.execute(
-        "DELETE FROM user_instances WHERE instance_id = ?1",
+        "DELETE FROM instances WHERE instance_id = ?1",
         rusqlite::params![instance_id],
     )?;
     Ok(())
@@ -2514,16 +3221,23 @@ pub fn delete_instance(conn: &Connection, instance_id: &str) -> anyhow::Result<(
 /// List all instances, newest launched first.
 pub fn list_instances(conn: &Connection) -> anyhow::Result<Vec<InstanceRow>> {
     let mut stmt = conn.prepare(
-        "SELECT instance_id, name, minecraft_version, loader, loader_version,
-                is_modpack, is_locked, last_launched_at,
-                jvm_memory_mb, jvm_gc, jvm_custom_args, jvm_always_pre_touch, created_at,
-                 java_path, java_incompatible_override, icon_path, launch_mode_override,
-                 jvm_memory_mode,
+        "SELECT instances.instance_id, instances.name, minecraft_instances.minecraft_version,
+                minecraft_instances.loader, minecraft_instances.loader_version,
+                minecraft_instances.is_modpack, minecraft_instances.is_locked,
+                instances.last_launched_at,
+                minecraft_instances.jvm_memory_mb, minecraft_instances.jvm_gc,
+                minecraft_instances.jvm_custom_args, minecraft_instances.jvm_always_pre_touch,
+                instances.created_at,
+                 minecraft_instances.java_path,
+                 minecraft_instances.java_incompatible_override, minecraft_instances.icon_path,
+                 minecraft_instances.launch_mode_override,
+                 minecraft_instances.jvm_memory_mode,
                  (SELECT launcher_kind FROM instance_imports
-                  WHERE instance_imports.instance_id = user_instances.instance_id LIMIT 1),
-                 total_play_ms
-          FROM user_instances
-         ORDER BY last_launched_at DESC NULLS LAST, created_at DESC",
+                  WHERE instance_imports.instance_id = instances.instance_id LIMIT 1),
+                 instances.total_play_ms
+          FROM instances
+          JOIN minecraft_instances ON minecraft_instances.instance_id = instances.instance_id
+         ORDER BY instances.last_launched_at DESC NULLS LAST, instances.created_at DESC",
     )?;
     let rows = stmt.query_map([], row_to_instance)?;
     let mut out = Vec::new();
@@ -2533,19 +3247,43 @@ pub fn list_instances(conn: &Connection) -> anyhow::Result<Vec<InstanceRow>> {
     Ok(out)
 }
 
+/// Is this instance id taken, by an instance of any game?
+///
+/// One identity table means one question, which covers both kinds of instance: a caller that
+/// asks `get_instance` only learns about Minecraft, and would hand out an id a generic game's
+/// instance already owns. Only "no row" is `false`; a query that fails is an error, never
+/// "free".
+pub fn instance_id_exists(conn: &Connection, instance_id: &str) -> anyhow::Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM instances WHERE instance_id = ?1",
+            [instance_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
 /// Fetch a single instance by id.
 pub fn get_instance(conn: &Connection, instance_id: &str) -> anyhow::Result<Option<InstanceRow>> {
     let mut stmt = conn.prepare(
-        "SELECT instance_id, name, minecraft_version, loader, loader_version,
-                is_modpack, is_locked, last_launched_at,
-                jvm_memory_mb, jvm_gc, jvm_custom_args, jvm_always_pre_touch, created_at,
-                 java_path, java_incompatible_override, icon_path, launch_mode_override,
-                 jvm_memory_mode,
+        "SELECT instances.instance_id, instances.name, minecraft_instances.minecraft_version,
+                minecraft_instances.loader, minecraft_instances.loader_version,
+                minecraft_instances.is_modpack, minecraft_instances.is_locked,
+                instances.last_launched_at,
+                minecraft_instances.jvm_memory_mb, minecraft_instances.jvm_gc,
+                minecraft_instances.jvm_custom_args, minecraft_instances.jvm_always_pre_touch,
+                instances.created_at,
+                 minecraft_instances.java_path,
+                 minecraft_instances.java_incompatible_override, minecraft_instances.icon_path,
+                 minecraft_instances.launch_mode_override,
+                 minecraft_instances.jvm_memory_mode,
                  (SELECT launcher_kind FROM instance_imports
-                  WHERE instance_imports.instance_id = user_instances.instance_id LIMIT 1),
-                 total_play_ms
-          FROM user_instances
-         WHERE instance_id = ?1",
+                  WHERE instance_imports.instance_id = instances.instance_id LIMIT 1),
+                 instances.total_play_ms
+          FROM instances
+          JOIN minecraft_instances ON minecraft_instances.instance_id = instances.instance_id
+         WHERE instances.instance_id = ?1",
     )?;
     let mut rows = stmt.query_map([instance_id], row_to_instance)?;
     if let Some(r) = rows.next() {
@@ -2562,7 +3300,7 @@ pub fn touch_last_launched(
     timestamp: &str,
 ) -> anyhow::Result<()> {
     conn.execute(
-        "UPDATE user_instances SET last_launched_at = ?1 WHERE instance_id = ?2",
+        "UPDATE instances SET last_launched_at = ?1 WHERE instance_id = ?2",
         rusqlite::params![timestamp, instance_id],
     )?;
     Ok(())
@@ -2577,7 +3315,7 @@ pub fn count_instances_by_loader_version(
     loader_version: &str,
 ) -> anyhow::Result<i64> {
     conn.query_row(
-        "SELECT COUNT(*) FROM user_instances
+        "SELECT COUNT(*) FROM minecraft_instances
          WHERE loader = ?1 AND minecraft_version = ?2 AND loader_version = ?3",
         rusqlite::params![loader, minecraft_version, loader_version],
         |row| row.get(0),
@@ -3350,6 +4088,22 @@ mod tests {
         (conn, path)
     }
 
+    /// Helper: a database as an earlier release wrote it, for a test that replays a step.
+    ///
+    /// Replaying a step means deleting its version row, which only describes a database that
+    /// predates that step's successor: an old step cannot be re-run over a schema whose tables
+    /// it no longer has.
+    fn test_db_at(version: i64) -> (Connection, PathBuf) {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("agora-test-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test db folder");
+        let path = dir.join("local_state.db");
+        let conn = Connection::open(&path).expect("failed to open test db");
+        run_migrations_to(&conn, version).expect("failed to build the old test db");
+        (conn, path)
+    }
+
     fn a_good_step(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch("CREATE TABLE kept (value TEXT); INSERT INTO kept VALUES ('yes');")?;
         Ok(())
@@ -3366,11 +4120,13 @@ mod tests {
             MigrationStep {
                 version: 1,
                 name: "good",
+                foreign_keys_off: false,
                 run: a_good_step,
             },
             MigrationStep {
                 version: 2,
                 name: "bad",
+                foreign_keys_off: false,
                 run: a_failing_step,
             },
         ];
@@ -3500,7 +4256,7 @@ mod tests {
     fn retiring_curated_only_keeps_live_browsing_off() {
         // Someone who had switched curated-only on wanted no live third-party
         // browsing. Dropping the switch must not hand that back to them.
-        let (conn, path) = test_db();
+        let (conn, path) = test_db_at(30);
         set_setting(&conn, "browse_curated_only", &serde_json::json!(true)).unwrap();
         set_setting(&conn, "modrinth_enabled", &serde_json::json!(true)).unwrap();
         set_setting(&conn, "technic_enabled", &serde_json::json!(true)).unwrap();
@@ -3525,7 +4281,7 @@ mod tests {
     fn retiring_curated_only_leaves_an_opted_in_user_alone() {
         // Curated-only off means the per-source toggles were already the whole
         // story; they must survive the key being dropped.
-        let (conn, path) = test_db();
+        let (conn, path) = test_db_at(30);
         set_setting(&conn, "browse_curated_only", &serde_json::json!(false)).unwrap();
         set_setting(&conn, "modrinth_enabled", &serde_json::json!(true)).unwrap();
         conn.execute("DELETE FROM schema_version WHERE version >= 10", [])
@@ -3858,6 +4614,46 @@ mod tests {
     }
 
     #[test]
+    fn upsert_instance_refuses_another_game_before_writing_anything() {
+        let (conn, _path) = test_db();
+        let row = InstanceRow {
+            instance_id: "skyrim-pack".into(),
+            name: "Skyrim pack".into(),
+            minecraft_version: "1.21.1".into(),
+            loader: "fabric".into(),
+            loader_version: "0.16.9".into(),
+            is_modpack: false,
+            is_locked: false,
+            last_launched_at: None,
+            jvm_memory_mb: 4096,
+            jvm_memory_mode: "manual".into(),
+            jvm_gc: "auto".into(),
+            jvm_custom_args: String::new(),
+            jvm_always_pre_touch: false,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            java_path: None,
+            java_incompatible_override: false,
+            icon_path: None,
+            launch_mode_override: "delegated".into(),
+            import_source: None,
+            total_play_ms: 0,
+        };
+        let error = upsert_instance(&conn, "skyrim", &row)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("skyrim"), "{error}");
+        assert!(error.contains("skyrim-pack"), "{error}");
+        let identities: i64 = conn
+            .query_row("SELECT COUNT(*) FROM instances", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(identities, 0, "the refusal happens before the write");
+        let details: i64 = conn
+            .query_row("SELECT COUNT(*) FROM minecraft_instances", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(details, 0);
+    }
+
+    #[test]
     fn test_schema_v6_import_provenance_roundtrip_and_cascade() {
         let (conn, _path) = test_db();
         let version: i64 = conn
@@ -3889,7 +4685,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        upsert_instance(&conn, &row).unwrap();
+        upsert_instance(&conn, "minecraft", &row).unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         let record = InstanceImportRecord {
             instance_id: row.instance_id.clone(),
@@ -3965,7 +4761,7 @@ mod tests {
 
         // Verify java columns exist
         let cols: Vec<String> = conn
-            .prepare("PRAGMA table_info(user_instances)")
+            .prepare("PRAGMA table_info(minecraft_instances)")
             .unwrap()
             .query_map([], |row| row.get::<_, String>(1))
             .unwrap()
@@ -4011,7 +4807,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        upsert_instance(&conn, &row).unwrap();
+        upsert_instance(&conn, "minecraft", &row).unwrap();
 
         // Set per-instance Java path
         update_instance_java(
@@ -4061,7 +4857,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        upsert_instance(&conn, &row).unwrap();
+        upsert_instance(&conn, "minecraft", &row).unwrap();
 
         let instances = list_instances(&conn).unwrap();
         let found = instances
@@ -4123,7 +4919,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        upsert_instance(&conn, &row).unwrap();
+        upsert_instance(&conn, "minecraft", &row).unwrap();
 
         let mut files = vec![
             InstancePackFile {
@@ -4179,7 +4975,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        upsert_instance(&conn, &row).unwrap();
+        upsert_instance(&conn, "minecraft", &row).unwrap();
         let files = vec![InstancePackFile {
             relative_path: "mods/a.jar".into(),
             sha256: "a".repeat(64),
@@ -4218,7 +5014,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        upsert_instance(&conn, &row).unwrap();
+        upsert_instance(&conn, "minecraft", &row).unwrap();
         let files = vec![InstancePackFile {
             relative_path: "mods/a.jar".into(),
             sha256: "a".repeat(64),
@@ -4269,7 +5065,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        upsert_instance(&conn, &row).unwrap();
+        upsert_instance(&conn, "minecraft", &row).unwrap();
         let files = vec![InstancePackFile {
             relative_path: "mods/a.jar".into(),
             sha256: "a".repeat(64),
@@ -4374,7 +5170,7 @@ mod tests {
             import_source: None,
             total_play_ms: 0,
         };
-        upsert_instance(&conn, &row).unwrap();
+        upsert_instance(&conn, "minecraft", &row).unwrap();
         let mut manifest: crate::models::InstanceManifest =
             serde_json::from_value(serde_json::json!({
                 "instance_id": "resync",
@@ -4392,7 +5188,12 @@ mod tests {
         );
         let (name, version, locked): (String, String, bool) = conn
             .query_row(
-                "SELECT name, minecraft_version, is_locked FROM user_instances WHERE instance_id = 'resync'",
+                "SELECT instances.name, minecraft_instances.minecraft_version,
+                        minecraft_instances.is_locked
+                   FROM instances
+                   JOIN minecraft_instances
+                     ON minecraft_instances.instance_id = instances.instance_id
+                  WHERE instances.instance_id = 'resync'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -4407,11 +5208,157 @@ mod tests {
         sync_instance_row_from_manifest(&conn, "resync", &manifest).unwrap();
         let name: String = conn
             .query_row(
-                "SELECT name FROM user_instances WHERE instance_id = 'resync'",
+                "SELECT name FROM instances WHERE instance_id = 'resync'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
         assert_eq!(name, "Restored Name");
+    }
+
+    // ---- the runner's connection after a rebuilt step ----
+
+    fn foreign_keys_on(conn: &Connection) -> bool {
+        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+            == 1
+    }
+
+    fn a_rebuilding_step_that_fails(_conn: &Connection) -> anyhow::Result<()> {
+        anyhow::bail!("invented failure inside the rebuild")
+    }
+
+    /// The state a caller must be handed back: no transaction of the runner's left open, and
+    /// foreign keys on, whatever the step did.
+    fn assert_connection_restored(conn: &Connection, what: &str) {
+        assert!(
+            conn.is_autocommit(),
+            "{what}: the runner left a transaction open"
+        );
+        assert!(foreign_keys_on(conn), "{what}: foreign keys left off");
+        // And working: a delete still cascades instead of leaving the child row behind.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS parent (id TEXT PRIMARY KEY);
+             CREATE TABLE IF NOT EXISTS child (
+                 id TEXT PRIMARY KEY,
+                 parent_id TEXT REFERENCES parent(id) ON DELETE CASCADE
+             );
+             DELETE FROM child; DELETE FROM parent;
+             INSERT INTO parent (id) VALUES ('p');
+             INSERT INTO child (id, parent_id) VALUES ('c', 'p');
+             DELETE FROM parent WHERE id = 'p';",
+        )
+        .unwrap();
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM child", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "{what}: the connection no longer cascades");
+    }
+
+    #[test]
+    fn a_failed_rebuilding_step_restores_the_connection() {
+        let conn = Connection::open_in_memory().unwrap();
+        let steps = [MigrationStep {
+            version: 1,
+            name: "rebuild that fails",
+            foreign_keys_off: true,
+            run: a_rebuilding_step_that_fails,
+        }];
+        run_migration_steps(&conn, &steps, 1).expect_err("the step fails");
+        assert_connection_restored(&conn, "a failed rebuild");
+    }
+
+    #[test]
+    fn a_rebuild_that_breaks_a_reference_restores_the_connection() {
+        // The step itself succeeds but leaves an orphan behind: the runner refuses to commit it
+        // and hands the connection back.
+        fn breaks_a_reference(conn: &Connection) -> anyhow::Result<()> {
+            conn.execute_batch(
+                "CREATE TABLE parent (id TEXT PRIMARY KEY);
+                 CREATE TABLE child (
+                     id TEXT PRIMARY KEY,
+                     parent_id TEXT REFERENCES parent(id) ON DELETE CASCADE
+                 );
+                 INSERT INTO child (id, parent_id) VALUES ('c', 'gone');",
+            )?;
+            Ok(())
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        let steps = [MigrationStep {
+            version: 1,
+            name: "rebuild that breaks a reference",
+            foreign_keys_off: true,
+            run: breaks_a_reference,
+        }];
+        let error = run_migration_steps(&conn, &steps, 1).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("point at no instance"),
+            "{error:#}"
+        );
+        assert_connection_restored(&conn, "a rebuild that broke a reference");
+    }
+
+    #[test]
+    fn a_database_another_writer_holds_restores_the_connection() {
+        let dir = std::env::temp_dir().join(format!("agora-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("local_state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE held (value TEXT);")
+            .unwrap();
+        // Another writer holds the database, so `BEGIN IMMEDIATE` cannot start the step.
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        other
+            .execute_batch("INSERT INTO held VALUES ('other')")
+            .unwrap();
+
+        let steps = [MigrationStep {
+            version: 1,
+            name: "rebuild that cannot start",
+            foreign_keys_off: true,
+            run: a_good_step,
+        }];
+        let error = run_migration_steps(&conn, &steps, 1)
+            .expect_err("a database another writer holds cannot start the step");
+        let message = format!("{error:#}").to_lowercase();
+        assert!(
+            message.contains("lock") || message.contains("busy"),
+            "{error:#}"
+        );
+        drop(other);
+        assert_connection_restored(&conn, "a busy database");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_check_that_cannot_run_before_the_rebuild_restores_the_connection() {
+        // The database arrived with a child whose foreign key cannot be checked at all: the
+        // parent column it names is not unique, so `PRAGMA foreign_key_check` errors instead of
+        // listing rows. The runner records what it arrived with before it opens a transaction,
+        // and that is where a database this damaged stops it.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE loose_parent (name TEXT NOT NULL);
+             CREATE TABLE mismatched_child (
+                 id INTEGER PRIMARY KEY,
+                 parent_name TEXT REFERENCES loose_parent(name)
+             );",
+        )
+        .unwrap();
+        let steps = [MigrationStep {
+            version: 1,
+            name: "rebuild behind a check that cannot run",
+            foreign_keys_off: true,
+            run: a_good_step,
+        }];
+        let error = run_migration_steps(&conn, &steps, 1)
+            .expect_err("the initial check cannot run on this database");
+        assert!(
+            format!("{error:#}").contains("foreign key mismatch"),
+            "{error:#}"
+        );
+        assert_connection_restored(&conn, "a check that cannot run");
     }
 }

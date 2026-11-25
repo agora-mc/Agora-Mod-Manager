@@ -585,6 +585,16 @@ fn base_folder_present(dir: &Path) -> bool {
     )
 }
 
+/// Whether a readable record's base folder is really there, and is the one this build made.
+///
+/// A removal deletes the folder and then the record; if the record cannot be deleted, what is
+/// left is a healthy record pointing at nothing. Adopting it would publish a pin to a base whose
+/// files are gone, so the build only reuses a record whose marker-carrying folder is present.
+fn base_folder_is_intact(manifest: &BaseManifest) -> bool {
+    let folder = &manifest.location;
+    base_folder_present(folder) && base_marker_matches(folder, &manifest.base_id)
+}
+
 /// Build a base for `install`: the folder every instance of it shares.
 #[allow(clippy::too_many_arguments)]
 pub fn build_base(
@@ -656,8 +666,13 @@ pub fn build_base_with_frameworks(
     // here only decides whether hashing is worth it. Nothing here asks `exists()`, which on Linux
     // says "there" for a file nobody may read: only a `NotFound` on the real read is absence.
     match read_base_record(&base_id, &manifest_path)? {
-        BaseRecord::Healthy(manifest) => return Ok(BuildOutcome::Existing(*manifest)),
-        BaseRecord::Damaged => {
+        BaseRecord::Healthy(manifest) if base_folder_is_intact(&manifest) => {
+            return Ok(BuildOutcome::Existing(*manifest));
+        }
+        // A record whose folder is gone is a removal that could not delete the record. It is
+        // not a base anything may be pinned to, so the build treats it like a damaged record:
+        // usable only once nothing is pinned to it.
+        BaseRecord::Healthy(_) | BaseRecord::Damaged => {
             let pinning = instances_pinning_base(paths, &base_id)?;
             if !pinning.is_empty() {
                 return Err(BaseError::Other(format!(
@@ -884,11 +899,13 @@ pub fn build_base_with_frameworks(
     let mut damaged_record = false;
     let mut record_missing = false;
     match read_base_record(&base_id, &manifest_path)? {
-        BaseRecord::Healthy(manifest) => {
+        BaseRecord::Healthy(manifest) if base_folder_is_intact(&manifest) => {
             // The staging folder goes with the guards when this returns.
             return Ok(BuildOutcome::Existing(*manifest));
         }
-        BaseRecord::Damaged => damaged_record = true,
+        // A record left behind by a removal that could not delete it: the build replaces the
+        // record and the folder, which is what the stale-folder branch below is for.
+        BaseRecord::Healthy(_) | BaseRecord::Damaged => damaged_record = true,
         BaseRecord::Missing => record_missing = true,
     }
 
@@ -1615,7 +1632,7 @@ fn instances_pinning_base_with(
         Ok(_) => {
             let conn = rusqlite::Connection::open(&db_path).map_err(|e| unreadable(&e))?;
             let mut stmt = conn
-                .prepare("SELECT instance_id, base_json FROM game_instances")
+                .prepare("SELECT instance_id, base_json FROM game_instance_bases")
                 .map_err(|e| unreadable(&e))?;
             let rows = stmt
                 .query_map([], |row| {
@@ -1764,16 +1781,27 @@ fn damaged_record_listed_as(paths: &AppPaths, base_id: &str) -> Result<Option<Pa
 }
 
 pub fn remove_base(paths: &AppPaths, base_id: &str) -> Result<(), BaseError> {
-    remove_base_with(paths, base_id, || {}, |path| std::fs::metadata(path))
+    remove_base_with(
+        paths,
+        base_id,
+        || {},
+        |path| std::fs::metadata(path),
+        |path| std::fs::remove_file(path),
+    )
 }
 
-/// Removal with the pinning read's hooks injected. See [`instances_pinning_base_with`].
-/// Production calls this through [`remove_base`]; the closure runs inside the removal's locks.
-pub(crate) fn remove_base_with(
+/// Removal with the pinning read's hooks and the record's deletion injected. See
+/// [`instances_pinning_base_with`]. Production calls this through [`remove_base`]; the first
+/// closure runs inside the removal's locks, and the last one deletes the record, so a record that
+/// cannot be deleted can be exercised without depending on what the operating system lets a
+/// file's permissions do.
+#[doc(hidden)]
+pub fn remove_base_with(
     paths: &AppPaths,
     base_id: &str,
     between_reads: impl Fn(),
     metadata: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+    remove_record: impl Fn(&Path) -> std::io::Result<()>,
 ) -> Result<(), BaseError> {
     let locks = crate::lock_manager::LockManager::new(paths.locks_root());
     // A plain id can also be named by a build or a framework repair, so take its lock first. A
@@ -1840,7 +1868,17 @@ pub(crate) fn remove_base_with(
             if folder.exists() {
                 std::fs::remove_dir_all(&folder)?;
             }
-            let _ = std::fs::remove_file(&manifest_path);
+            // The folder is gone; a record that stays behind is the base still listed, so the
+            // removal did not finish and must not say it did.
+            if let Err(error) = remove_record(&manifest_path) {
+                return Err(BaseError::Other(format!(
+                    "base {base_id}'s folder was removed, but its record at {} could not be \
+                     deleted ({error}). The record is left where it was: the base keeps being \
+                     listed as damaged until that file is deleted by hand, or the removal is run \
+                     again once nothing holds it.",
+                    manifest_path.display()
+                )));
+            }
             Ok(())
         }
         // The record reads but is not a base record, so there is no recorded location to check.

@@ -1677,7 +1677,7 @@ fn commit_migration_db(
         .map_err(|e| format!("local state failed: {e}"))?;
     let affected = conn
         .execute(
-            "UPDATE user_instances
+            "UPDATE minecraft_instances
              SET minecraft_version = ?1,
                  loader_version = ?2
              WHERE instance_id = ?3
@@ -2098,7 +2098,7 @@ mod tests {
         )
         .unwrap();
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::upsert_instance(&conn, &row).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
     }
 
     fn read_row(ctx: &Ctx, id: &str) -> InstanceRow {

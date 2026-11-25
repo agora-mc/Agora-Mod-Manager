@@ -718,7 +718,7 @@ impl ImportService {
             }
         };
 
-        if let Err(error) = agora_core::db::upsert_instance(&conn, &row) {
+        if let Err(error) = agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row) {
             let _ = rollback();
             op.fail(error.to_string());
             return Err(LauncherError::Generic {
@@ -2032,7 +2032,7 @@ mod review_tests {
             total_play_ms: 0,
         };
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::upsert_instance(&conn, &row).unwrap();
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         let path = pack(
             tmp.path(),
             "spiff.mrpack",

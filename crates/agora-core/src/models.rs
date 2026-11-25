@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-/// A row in `local_state.db`'s `user_instances` table.
+/// A Minecraft instance, read from `local_state.db`: its identity row in `instances`, joined
+/// with the Minecraft columns in `minecraft_instances`.
+///
+/// The identity columns (`instance_id`, `name`, `created_at`, `last_launched_at`,
+/// `total_play_ms`) belong to every game's instances; the rest are Minecraft's own. Writing this
+/// row is [`crate::db::upsert_instance`], which also refuses an id another game owns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceRow {
     pub instance_id: String,

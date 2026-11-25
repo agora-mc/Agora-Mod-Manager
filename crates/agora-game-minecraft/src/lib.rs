@@ -82,3 +82,6 @@ pub mod worlds;
 
 pub use context::{register_into, registry, testing_context};
 pub use package::game_package;
+
+/// This package's game id, as an instance's identity row records it.
+pub const GAME_ID: &str = "minecraft";

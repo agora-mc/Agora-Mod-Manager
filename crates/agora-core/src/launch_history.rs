@@ -148,7 +148,7 @@ pub fn finish_launch(
     // still open, so finishing the same launch twice cannot count it twice.
     if let Some(played) = duration_ms.filter(|ms| *ms > 0) {
         conn.execute(
-            "UPDATE user_instances
+            "UPDATE instances
                 SET total_play_ms = total_play_ms + ?2
               WHERE instance_id = (SELECT instance_id FROM launch_history
                                     WHERE id = ?1 AND outcome IS NULL)",
@@ -169,7 +169,7 @@ pub fn finish_launch(
 pub fn total_play_ms(conn: &Connection, instance_id: &str) -> anyhow::Result<i64> {
     Ok(conn
         .query_row(
-            "SELECT total_play_ms FROM user_instances WHERE instance_id = ?1",
+            "SELECT total_play_ms FROM instances WHERE instance_id = ?1",
             params![instance_id],
             |row| row.get(0),
         )
@@ -305,11 +305,12 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::run_migrations(&conn).unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        conn.execute(
-            "INSERT INTO user_instances
-                (instance_id, name, minecraft_version, loader, loader_version, created_at)
-             VALUES ('inst', 'Inst', '1.21', 'fabric', '0.15.0', '2026-01-01T00:00:00Z')",
-            [],
+        conn.execute_batch(
+            "INSERT INTO instances (instance_id, game, name, created_at)
+             VALUES ('inst', 'minecraft', 'Inst', '2026-01-01T00:00:00Z');
+             INSERT INTO minecraft_instances
+                (instance_id, minecraft_version, loader, loader_version)
+             VALUES ('inst', '1.21', 'fabric', '0.15.0');",
         )
         .unwrap();
         conn
@@ -350,11 +351,12 @@ mod tests {
     #[test]
     fn history_is_newest_first_and_scoped_to_the_instance() {
         let conn = conn();
-        conn.execute(
-            "INSERT INTO user_instances
-                (instance_id, name, minecraft_version, loader, loader_version, created_at)
-             VALUES ('other', 'Other', '1.21', 'fabric', '0.15.0', '2026-01-01T00:00:00Z')",
-            [],
+        conn.execute_batch(
+            "INSERT INTO instances (instance_id, game, name, created_at)
+             VALUES ('other', 'minecraft', 'Other', '2026-01-01T00:00:00Z');
+             INSERT INTO minecraft_instances
+                (instance_id, minecraft_version, loader, loader_version)
+             VALUES ('other', '1.21', 'fabric', '0.15.0');",
         )
         .unwrap();
         record(&conn, "2026-01-01T00:00:00Z", 1000, 5, LaunchResult::Ok);
@@ -393,7 +395,7 @@ mod tests {
         // the thing it describes.
         let conn = conn();
         record(&conn, "2026-01-01T00:00:00Z", 1000, 5, LaunchResult::Ok);
-        conn.execute("DELETE FROM user_instances WHERE instance_id = 'inst'", [])
+        conn.execute("DELETE FROM instances WHERE instance_id = 'inst'", [])
             .unwrap();
         assert!(list_history(&conn, "inst", 10).unwrap().is_empty());
     }
