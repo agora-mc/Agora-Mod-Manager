@@ -43,7 +43,7 @@
 //! for a plugin that has scripts. Official status buys verification and
 //! registration order, not exemption from consent or from the emergency stop.
 
-use super::service::{Consent, PluginService, PluginSummary, UpdateOutcome};
+use super::service::{Consent, PluginService, UpdateOutcome};
 use super::store::{self, OfficialProvenance};
 use super::{install, InstallPreview};
 use crate::error::{LauncherError, LauncherResult};
@@ -803,19 +803,41 @@ pub fn verify_installed(
     app_data_dir: &Path,
     trust: &RegistryTrust,
 ) -> LauncherResult<BTreeMap<String, OfficialStatus>> {
-    let records: Vec<store::PluginRecord> = store::list(conn)?
-        .into_iter()
-        .filter(|record| !store::is_tombstone(record))
-        .collect();
-    if records.is_empty() {
-        return Ok(BTreeMap::new());
+    verify_snapshot(&store::load_snapshot(conn)?, app_data_dir, trust)
+}
+
+pub(crate) fn verify_snapshot(
+    snapshot: &store::PluginLoadSnapshot<'_>,
+    app_data_dir: &Path,
+    trust: &RegistryTrust,
+) -> LauncherResult<BTreeMap<String, OfficialStatus>> {
+    let mut out = snapshot
+        .pending
+        .iter()
+        .map(|(id, reason)| {
+            (
+                id.clone(),
+                OfficialStatus::Unverified {
+                    reason: reason.clone(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut records = snapshot
+        .records
+        .iter()
+        .filter(|record| {
+            !store::is_tombstone(record) && !snapshot.pending.contains_key(record.id().as_str())
+        })
+        .peekable();
+    if records.peek().is_none() {
+        return Ok(out);
     }
-    let provenance = store::list_official(conn)?;
+    let provenance = store::list_official(&snapshot.guard)?;
     let catalog = load_signed_catalog(trust, app_data_dir);
     let packages_root =
         crate::app_paths::AppPaths::from_root(app_data_dir.to_path_buf()).plugin_packages_root();
-    let mut out = BTreeMap::new();
-    for record in &records {
+    for record in records {
         let id = record.id().as_str();
         let recorded = provenance.get(id);
         match &catalog {
@@ -1655,58 +1677,17 @@ impl PluginService {
             });
         }
 
-        // The ordinary installer: same consent comparison, data checkpoint,
-        // staging and rollback as any package. It also clears any earlier
-        // official record, which is rewritten below only on success.
-        let installed: PluginSummary = self.install_package_bytes(bytes, consent)?;
-        let id = PluginId::parse(&installed.id)
-            .map_err(|e| refused("ERR_OFFICIAL_PLUGIN_ENTRY", e.message))?;
-
-        let conn = self.inner.conn()?;
-        let record = store::get(&conn, &id)?.ok_or_else(|| {
-            refused(
-                "ERR_PLUGIN_NOT_FOUND",
-                format!("`{id}` is not installed after installing it"),
-            )
-        })?;
-        let unpacked = tree_digest(&record.install_dir).map_err(|e| {
-            refused(
-                "ERR_OFFICIAL_PLUGIN_RECORD",
-                format!(
-                    "`{id}` was installed but its files could not be verified, so it is \
-                     blocked: {e}"
-                ),
-            )
-        })?;
-        if unpacked != entry.package_tree_sha256 {
-            // Not recorded as official: it will not verify, and says so.
-            return Err(refused(
-                "ERR_OFFICIAL_PLUGIN_TREE",
-                format!(
-                    "`{id}` unpacked to files that are not the ones the signed catalog pins, so \
-                     it is blocked. Update or reinstall it."
-                ),
-            ));
-        }
-        store::set_official(
-            &conn,
-            &id,
-            &OfficialProvenance {
-                entry_id: entry.plugin_id.clone(),
-                entry_version: entry.version.clone(),
-                entry_sha256: entry.package_sha256.clone(),
-                // Informational: the check uses the digest the signed entry pins.
-                tree_sha256: unpacked,
-                recorded_at: chrono::DateTime::<chrono::Utc>::from(self.inner.ctx.clock.now())
-                    .to_rfc3339(),
-            },
-        )?;
-        drop(conn);
-        // Resolution was last computed before the record above existed.
-        self.reload()?;
-
+        let provenance = OfficialProvenance {
+            entry_id: entry.plugin_id.clone(),
+            entry_version: entry.version.clone(),
+            entry_sha256: entry.package_sha256.clone(),
+            tree_sha256: entry.package_tree_sha256.clone(),
+            recorded_at: chrono::DateTime::<chrono::Utc>::from(self.inner.ctx.clock.now())
+                .to_rfc3339(),
+        };
+        let installed = self.install_package_with_provenance(bytes, consent, Some(&provenance))?;
         Ok(UpdateOutcome::Installed {
-            plugin: Box::new(self.summary(&id)?),
+            plugin: Box::new(installed),
         })
     }
 }

@@ -1112,7 +1112,7 @@ const MIGRATIONS: &[MigrationStep] = &[
     },
     MigrationStep {
         version: 29,
-        name: "plugin install journal and ledger process identity",
+        name: "plugin package journal and ledger process identity",
         run: migrate_v29,
     },
 ];
@@ -2031,7 +2031,7 @@ fn migrate_v28(conn: &Connection) -> anyhow::Result<()> {
 }
 
 fn migrate_v29(conn: &Connection) -> anyhow::Result<()> {
-    // First installs need a journal before they have a plugin record.
+    // The first install and a purging uninstall need a journal without a plugin record.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS plugin_install_journal (
              plugin_id TEXT PRIMARY KEY,

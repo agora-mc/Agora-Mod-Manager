@@ -794,7 +794,9 @@ pub fn flush_tree(root: &Path) -> LauncherResult<()> {
 // ---------------------------------------------------------------------------
 #[path = "install_recovery.rs"]
 mod journal;
-pub(super) use journal::{check_for_interrupted_install, settle_before_install, InstallJournal};
+pub(super) use journal::{
+    check_for_interrupted_install, settle_before_install, uninstall, InstallJournal,
+};
 pub use journal::{
     crash_point, install_journal_path, recover_interrupted_installs,
     recover_interrupted_installs_with, resolve_installs, resolve_installs_at_startup,
@@ -994,20 +996,6 @@ pub fn widens_capabilities(granted: &CapabilitySet, manifest: &PluginManifest) -
         .collect()
 }
 
-/// Remove an installed package's files. Development folders are never touched.
-pub fn remove_package_files(source: &PluginSource, install_dir: &Path) -> LauncherResult<()> {
-    if source.is_development() {
-        // The user's own working copy. Removing the plugin from Agora must not
-        // remove the code they are writing.
-        return Ok(());
-    }
-    if install_dir.exists() {
-        std::fs::remove_dir_all(install_dir)
-            .map_err(|e| io_error(format!("could not remove {}: {e}", install_dir.display())))?;
-    }
-    Ok(())
-}
-
 /// Re-export so callers do not have to reach into `store` for this one type.
 pub use super::store::PluginSource as Source;
 
@@ -1185,27 +1173,6 @@ mod tests {
         .unwrap();
         let err = read_folder_manifest(dir.path()).unwrap_err();
         assert!(err.to_string().contains("main.js"), "{err}");
-    }
-
-    #[test]
-    fn removing_a_development_plugin_never_deletes_the_authors_folder() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("main.js"), "x").unwrap();
-        let source = PluginSource::Development {
-            path: dir.path().to_path_buf(),
-        };
-        remove_package_files(&source, dir.path()).unwrap();
-        assert!(dir.path().join("main.js").is_file());
-    }
-
-    #[test]
-    fn removing_an_installed_package_deletes_its_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let install = dir.path().join("acme.one");
-        std::fs::create_dir_all(&install).unwrap();
-        std::fs::write(install.join("main.js"), "x").unwrap();
-        remove_package_files(&PluginSource::Package, &install).unwrap();
-        assert!(!install.exists());
     }
 
     #[test]

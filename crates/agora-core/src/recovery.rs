@@ -81,8 +81,7 @@ const RECOVERY_OPERATION: &str = "recovery";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OperationKind {
-    /// Installing or updating a plugin package: the previous version is stashed in the rollback
-    /// folder while the new one is unpacked and recorded.
+    /// Installing, updating or uninstalling a plugin package under the plugin-install lock.
     PluginInstall,
 }
 

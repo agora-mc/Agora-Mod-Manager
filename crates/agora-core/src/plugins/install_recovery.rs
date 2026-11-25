@@ -27,6 +27,8 @@ pub enum PluginInstallState {
     Committed,
     /// The old record was restored. Recovery can finish the file moves.
     Restoring,
+    Uninstalling,
+    UninstallCommitted,
 }
 
 impl recovery::JournalState for PluginInstallState {
@@ -40,8 +42,22 @@ pub(in crate::plugins) struct InstallJournal {
     plugin_id: PluginId,
     previous: Option<store::InstallSnapshot>,
     old: Option<PathIdentity>,
-    new: PathIdentity,
-    new_version: String,
+    #[serde(flatten)]
+    change: PackageChange,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum PackageChange {
+    Install {
+        new: PathIdentity,
+        new_version: String,
+    },
+    Uninstall {
+        purge_data: bool,
+        version: String,
+        install_dir: String,
+    },
 }
 
 struct Layout {
@@ -51,23 +67,37 @@ struct Layout {
     aside: PathBuf,
     marker: PathBuf,
     kept: PathBuf,
+    dropping: PathBuf,
 }
 
 impl Layout {
-    fn new(paths: &AppPaths, id: &PluginId, operation: uuid::Uuid, had_files: bool) -> Self {
+    fn new(
+        paths: &AppPaths,
+        id: &PluginId,
+        operation: uuid::Uuid,
+        had_files: bool,
+        uninstall: bool,
+    ) -> Self {
         let packages = paths.plugin_packages_root();
         let rollback = paths.plugin_rollback_root();
         Self {
             destination: package_dir(&packages, id),
-            rollback: had_files.then(|| rollback.join(id.as_str())),
+            rollback: had_files.then(|| {
+                if uninstall {
+                    rollback.join(format!(".uninstalling-{id}-{operation}"))
+                } else {
+                    rollback.join(id.as_str())
+                }
+            }),
             staging: packages.join(format!(".staging-{operation}")),
             aside: rollback.join(format!(".replaced-{id}-{operation}")),
             marker: rollback.join(format!(".owner-{operation}.json")),
             kept: rollback.join(format!(".{id}-{operation}.kept")),
+            dropping: rollback.join(format!(".dropping-{id}-{operation}")),
         }
     }
 
-    fn ownership(&self, old: Option<PathIdentity>, new: PathIdentity) -> Vec<OwnedPath> {
+    fn ownership(&self, old: Option<PathIdentity>, change: &PackageChange) -> Vec<OwnedPath> {
         let marked = |path: &Path, identities| OwnedPath {
             path: path.to_path_buf(),
             proof: PathProof::MarkedIdentity {
@@ -75,16 +105,28 @@ impl Layout {
                 identities,
             },
         };
-        let mut owned = vec![
-            marked(&self.destination, old.into_iter().chain([new]).collect()),
-            marked(&self.staging, vec![new]),
-            marked(&self.aside, vec![new]),
-        ];
-        if let (Some(path), Some(old)) = (&self.rollback, old) {
-            owned.push(marked(path, vec![old]));
-            owned.push(marked(&self.kept, vec![old]));
+        match change {
+            PackageChange::Install { new, .. } => {
+                let mut owned = vec![
+                    marked(&self.destination, old.into_iter().chain([*new]).collect()),
+                    marked(&self.staging, vec![*new]),
+                    marked(&self.aside, vec![*new]),
+                ];
+                if let (Some(path), Some(old)) = (&self.rollback, old) {
+                    owned.push(marked(path, vec![old]));
+                    owned.push(marked(&self.kept, vec![old]));
+                    owned.push(marked(&self.dropping, vec![old]));
+                }
+                owned
+            }
+            PackageChange::Uninstall { .. } => match (&self.rollback, old) {
+                (Some(path), Some(old)) => vec![
+                    marked(&self.destination, vec![old]),
+                    marked(path, vec![old]),
+                ],
+                _ => Vec::new(),
+            },
         }
-        owned
     }
 }
 
@@ -97,7 +139,7 @@ impl InstallJournal {
     ) -> LauncherResult<Self> {
         conn.pragma_update(None, "synchronous", "FULL")
             .map_err(sql_error)?;
-        let mut envelope = Envelope::new(
+        let envelope = Envelope::new(
             &LockResource::PluginInstall,
             PluginInstallState::Starting,
             Vec::new(),
@@ -109,6 +151,7 @@ impl InstallJournal {
             id,
             operation_id(&envelope.operation_id)?,
             old.is_some(),
+            false,
         );
 
         let tx = conn.unchecked_transaction().map_err(sql_error)?;
@@ -134,24 +177,35 @@ impl InstallJournal {
         recovery::sync_parent(&layout.staging).map_err(|e| file_error(&layout.staging, e))?;
         let new = directory_identity(&layout.staging)?
             .ok_or_else(|| io_error("the staging folder disappeared"))?;
-        recovery::write_marker(&layout.marker, &envelope.operation_id)?;
-        recovery::sync_parent(&layout.marker).map_err(|e| file_error(&layout.marker, e))?;
-        envelope.owned = layout.ownership(old, new);
-        let journal = Self {
+        let mut journal = Self {
             envelope,
             plugin_id: id.clone(),
             previous,
             old,
-            new,
-            new_version: version,
+            change: PackageChange::Install {
+                new,
+                new_version: version,
+            },
         };
-        tx.execute(
-            "INSERT INTO plugin_install_journal (plugin_id, document) VALUES (?1, ?2)",
-            params![id.as_str(), journal.document()?],
-        )
-        .map_err(sql_error)?;
+        journal.write_new(&tx, &layout)?;
         tx.commit().map_err(sql_error)?;
         Ok(journal)
+    }
+
+    fn write_new(&mut self, conn: &Connection, layout: &Layout) -> LauncherResult<()> {
+        self.envelope.owned = layout.ownership(self.old, &self.change);
+        if !self.envelope.owned.is_empty() {
+            let parent = layout.marker.parent().expect("marker has a parent");
+            std::fs::create_dir_all(parent).map_err(|e| file_error(parent, e))?;
+            recovery::sync_parent(parent).map_err(|e| file_error(parent, e))?;
+            recovery::write_marker(&layout.marker, &self.envelope.operation_id)?;
+        }
+        conn.execute(
+            "INSERT INTO plugin_install_journal (plugin_id, document) VALUES (?1, ?2)",
+            params![self.plugin_id.as_str(), self.document()?],
+        )
+        .map_err(sql_error)?;
+        Ok(())
     }
 
     fn layout(&self, paths: &AppPaths) -> LauncherResult<Layout> {
@@ -160,6 +214,7 @@ impl InstallJournal {
             &self.plugin_id,
             operation_id(&self.envelope.operation_id)?,
             self.old.is_some(),
+            matches!(self.change, PackageChange::Uninstall { .. }),
         ))
     }
 
@@ -197,6 +252,9 @@ impl InstallJournal {
         lock: &LockGuard,
         bytes: &[u8],
     ) -> LauncherResult<()> {
+        let PackageChange::Install { new, .. } = self.change else {
+            return Err(io_error("expected an install journal"));
+        };
         let layout = self.layout(&ctx.paths)?;
         let mut capability = self.authorize(conn, ctx, lock)?;
         if let Some(stash) = &layout.rollback {
@@ -211,7 +269,7 @@ impl InstallJournal {
         }
 
         require(
-            capability.verified_identity(&layout.staging)? == Some(self.new),
+            capability.verified_identity(&layout.staging)? == Some(new),
             "the staging directory disappeared",
         )?;
         extract_into(bytes, &layout.staging)?;
@@ -257,7 +315,7 @@ impl InstallJournal {
         );
         let Decision::Act(capability) = decision else {
             return Err(io_error(format!(
-                "Could not finish install of {}: {decision:?}",
+                "Could not continue the package change for {}: {decision:?}",
                 self.plugin_id
             )));
         };
@@ -268,6 +326,76 @@ impl InstallJournal {
             )));
         }
         Ok(*capability)
+    }
+}
+
+pub(in crate::plugins) fn uninstall(
+    conn: &Connection,
+    ctx: &Ctx,
+    lock: &LockGuard,
+    installed: &store::PluginRecord,
+    purge_data: bool,
+) -> LauncherResult<()> {
+    conn.pragma_update(None, "synchronous", "FULL")
+        .map_err(sql_error)?;
+    let id = installed.id();
+    let envelope = Envelope::new(
+        &LockResource::PluginInstall,
+        PluginInstallState::Uninstalling,
+        Vec::new(),
+    )?;
+    let destination = package_dir(&ctx.paths.plugin_packages_root(), id);
+    let old =
+        if matches!(installed.source, PluginSource::Package) && !store::is_tombstone(installed) {
+            require(
+                installed.install_dir == destination,
+                "the package is outside its managed directory",
+            )?;
+            directory_identity(&destination)?
+        } else {
+            None
+        };
+    let tx = conn.unchecked_transaction().map_err(sql_error)?;
+    let record =
+        store::install_row(&tx, id)?.ok_or_else(|| io_error("the install record disappeared"))?;
+    let mut journal = InstallJournal {
+        envelope,
+        plugin_id: id.clone(),
+        previous: None,
+        old,
+        change: PackageChange::Uninstall {
+            purge_data,
+            version: record.version,
+            install_dir: record.install_dir,
+        },
+    };
+    let layout = journal.layout(&ctx.paths)?;
+    journal.write_new(&tx, &layout)?;
+    tx.commit().map_err(sql_error)?;
+    crash_point(ctx, InstallCrashPoint::UninstallJournalWritten);
+
+    let result = (|| -> LauncherResult<()> {
+        let mut capability = journal.authorize(conn, ctx, lock)?;
+        if let Some(aside) = &layout.rollback {
+            capability.rename(&layout.destination, aside)?;
+        }
+        crash_point(ctx, InstallCrashPoint::UninstallFilesMoved);
+        let tx = conn.unchecked_transaction().map_err(sql_error)?;
+        check_record(&tx, &journal, &layout)?;
+        store::remove(&tx, id, purge_data)?;
+        crash_point(ctx, InstallCrashPoint::UninstallRecorded);
+        journal.advance(&tx, PluginInstallState::UninstallCommitted)?;
+        crash_point(ctx, InstallCrashPoint::UninstallMarked);
+        tx.commit().map_err(sql_error)?;
+        crash_point(ctx, InstallCrashPoint::UninstallCommitted);
+        Ok(())
+    })();
+    let settled = journal.finish(conn, ctx, lock);
+    match (result, settled) {
+        (Err(error), Err(recovery)) => Err(io_error(format!(
+            "{error}. The uninstall was interrupted: {recovery}"
+        ))),
+        (result, settled) => result.and(settled),
     }
 }
 
@@ -323,6 +451,7 @@ pub enum InstallCrashPoint {
     CommitMarked,
     /// The record and the journal have committed together.
     Committed,
+    StashDropStarted,
     StashDropped,
     JournalDeleted,
     RestoreRecorded,
@@ -331,6 +460,14 @@ pub enum InstallCrashPoint {
     RestoreMovedAside,
     RestorePublished,
     RestoreJournalDeleted,
+    UninstallJournalWritten,
+    UninstallFilesMoved,
+    UninstallRecorded,
+    UninstallMarked,
+    UninstallCommitted,
+    UninstallDropStarted,
+    UninstallFilesDropped,
+    UninstallJournalDeleted,
 }
 
 pub fn crash_point(ctx: &Ctx, point: InstallCrashPoint) {
@@ -453,14 +590,7 @@ fn resolve_in(
 
 fn interrupted_installs(conn: &Connection, paths: &AppPaths) -> LauncherResult<Vec<PluginId>> {
     let mut ids = std::collections::BTreeMap::new();
-    let mut stmt = conn
-        .prepare("SELECT plugin_id FROM plugin_install_journal")
-        .map_err(sql_error)?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(sql_error)?;
-    for id in rows {
-        let id = id.map_err(sql_error)?;
+    for id in store::journal_ids(conn)? {
         let parsed = PluginId::parse(&id).map_err(|error| io_error(error.message))?;
         ids.insert(id, parsed);
     }
@@ -534,7 +664,7 @@ fn read_snapshot(
         let journal: InstallJournal = journal.payload().map_err(sql_error)?;
         let layout = journal.layout(paths)?;
         if journal.plugin_id != *id
-            || journal.envelope.owned != layout.ownership(journal.old, journal.new)
+            || journal.envelope.owned != layout.ownership(journal.old, &journal.change)
         {
             return Err(io_error(
                 "the journal's paths do not match this plugin install",
@@ -553,16 +683,43 @@ fn check_record(
 ) -> LauncherResult<()> {
     let record = store::install_row(conn, &journal.plugin_id)?;
     let names = |row: &store::InstallRow| (row.version.clone(), row.install_dir.clone());
-    let expected = if journal.envelope.state == PluginInstallState::Committed {
-        Some((
-            journal.new_version.clone(),
+    use PluginInstallState::*;
+    let expected = match (&journal.change, journal.envelope.state) {
+        (PackageChange::Install { new_version, .. }, Committed) => Some((
+            new_version.clone(),
             layout.destination.to_string_lossy().into_owned(),
-        ))
-    } else {
-        journal
+        )),
+        (PackageChange::Install { .. }, Starting | Stashed | Extracted | Restoring) => journal
             .previous
             .as_ref()
-            .map(|snapshot| names(&snapshot.record))
+            .map(|snapshot| names(&snapshot.record)),
+        (
+            PackageChange::Uninstall {
+                version,
+                install_dir,
+                ..
+            },
+            Uninstalling,
+        ) => Some((version.clone(), install_dir.clone())),
+        (
+            PackageChange::Uninstall {
+                purge_data: true, ..
+            },
+            UninstallCommitted,
+        ) => None,
+        (
+            PackageChange::Uninstall {
+                version,
+                purge_data: false,
+                ..
+            },
+            UninstallCommitted,
+        ) => Some((version.clone(), String::new())),
+        _ => {
+            return Err(io_error(
+                "the plugin journal has an invalid operation state",
+            ))
+        }
     };
     if record.as_ref().map(names) != expected {
         return Err(io_error(format!(
@@ -628,7 +785,7 @@ pub(in crate::plugins) fn check_for_interrupted_install(
 }
 
 fn needs_hand(id: &PluginId, why: &str) -> String {
-    format!("Plugin install for {id} needs a hand: {why} Run `agora plugin recover {id}` to resolve it. Legacy stashes can be preserved with `--keep-aside --yes`.")
+    format!("Plugin package change for {id} needs a hand: {why} Run `agora plugin recover {id}` to resolve it. Legacy stashes can be preserved with `--keep-aside --yes`.")
 }
 
 fn recover_one(
@@ -753,6 +910,10 @@ fn apply(
     let mut journal: InstallJournal = capability.payload()?;
     let id = journal.plugin_id.clone();
     let layout = journal.layout(paths)?;
+    let PackageChange::Install { new, new_version } = &journal.change else {
+        return apply_uninstall(capability, conn, &journal, &layout, resolution, ctx);
+    };
+    let new = *new;
     let installed = capability.verified_identity(&layout.destination)?;
     let stashed = match &layout.rollback {
         Some(path) => capability.verified_identity(path)?,
@@ -769,16 +930,22 @@ fn apply(
 
     if state == PluginInstallState::Committed {
         require(
-            installed == Some(journal.new),
+            installed == Some(new),
             "the committed package directory is missing",
         )?;
-        verify_package(&layout.destination, &id, &journal.new_version)?;
-        if resolution == InstallResolution::Restore {
+        verify_package(&layout.destination, &id, new_version)?;
+        let drop_started =
+            layout.rollback.is_some() && capability.verified_identity(&layout.dropping)?.is_some();
+        require(
+            !drop_started || stashed.is_none(),
+            "the stash and its deletion folder are both occupied",
+        )?;
+        if resolution == InstallResolution::Restore && !drop_started {
             let stash = layout
                 .rollback
                 .as_ref()
                 .filter(|_| stashed.is_some())
-                .ok_or_else(|| io_error("there is no verified stashed copy to restore"))?;
+                .ok_or_else(|| io_error("there is no restorable stash"))?;
             let previous = journal
                 .previous
                 .as_ref()
@@ -807,8 +974,13 @@ fn apply(
                         // Preserve the previous version in a user-visible archive.
                         capability.rename(stash, &layout.kept)?;
                     } else {
-                        capability.remove_dir(stash)?;
+                        capability.rename(stash, &layout.dropping)?;
                     }
+                }
+                if capability.verified_identity(&layout.dropping)?.is_some() {
+                    require(resolution != InstallResolution::KeepAside, "the stash is already being dropped; run automatic recovery to finish cleanup")?;
+                    cut(InstallCrashPoint::StashDropStarted);
+                    capability.remove_dir(&layout.dropping)?;
                 }
                 recovery::sync_parent(stash).map_err(|e| file_error(stash, e))?;
                 cut(InstallCrashPoint::StashDropped);
@@ -816,14 +988,18 @@ fn apply(
             delete_journal(conn, &journal)?;
             cut(InstallCrashPoint::JournalDeleted);
             remove_if_present(&layout.marker)?;
+            if resolution == InstallResolution::Restore {
+                return Err(io_error(format!(
+                    "The previous stash for plugin {id} was already being dropped. Cleanup finished and version {new_version} stays installed."
+                )));
+            }
             let kept = if resolution == InstallResolution::KeepAside && present(&layout.kept)? {
                 format!(" The previous version is at {}.", layout.kept.display())
             } else {
                 String::new()
             };
             return Ok(format!(
-                "Finished the interrupted install of plugin {id} {}.{kept}",
-                journal.new_version
+                "Finished the interrupted install of plugin {id} {new_version}.{kept}"
             ));
         }
     }
@@ -848,7 +1024,7 @@ fn apply(
         };
         verify_package(old_dir, &id, &previous.record.version)?;
     }
-    if installed == Some(journal.new) {
+    if installed == Some(new) {
         capability.rename(&layout.destination, &layout.aside)?;
         if state == PluginInstallState::Restoring {
             cut(InstallCrashPoint::RestoreMovedAside);
@@ -887,6 +1063,70 @@ fn apply(
     Ok(format!(
         "Recovered plugin {id} from an interrupted install.{kept}"
     ))
+}
+
+fn apply_uninstall(
+    mut capability: Capability<'_>,
+    conn: &Connection,
+    journal: &InstallJournal,
+    layout: &Layout,
+    resolution: InstallResolution,
+    ctx: Option<&Ctx>,
+) -> LauncherResult<String> {
+    let committed = journal.envelope.state == PluginInstallState::UninstallCommitted;
+    if committed {
+        require(
+            matches!(
+                resolution,
+                InstallResolution::Automatic | InstallResolution::Discard
+            ),
+            "the uninstall already committed; run automatic recovery to finish removing its files",
+        )?;
+    } else {
+        require(
+            resolution != InstallResolution::Discard,
+            "the uninstall has not committed; recover it to put the package back",
+        )?;
+    }
+    let cut = |point| {
+        if let Some(ctx) = ctx {
+            crash_point(ctx, point);
+        }
+    };
+    if let Some(aside) = &layout.rollback {
+        let installed = capability.verified_identity(&layout.destination)?;
+        let moved = capability.verified_identity(aside)?;
+        if committed {
+            require(
+                installed.is_none(),
+                "the uninstalled package still occupies the install directory",
+            )?;
+            cut(InstallCrashPoint::UninstallDropStarted);
+            capability.remove_dir(aside)?;
+            cut(InstallCrashPoint::UninstallFilesDropped);
+        } else if moved.is_some() {
+            capability.rename(aside, &layout.destination)?;
+        } else {
+            require(
+                installed == journal.old,
+                "the package to restore is missing",
+            )?;
+        }
+        recovery::sync_parent(aside).map_err(|e| file_error(aside, e))?;
+        recovery::sync_parent(&layout.destination)
+            .map_err(|e| file_error(&layout.destination, e))?;
+    }
+    delete_journal(conn, journal)?;
+    cut(InstallCrashPoint::UninstallJournalDeleted);
+    remove_if_present(&layout.marker)?;
+    Ok(if committed {
+        format!("Finished uninstalling plugin {}.", journal.plugin_id)
+    } else {
+        format!(
+            "Recovered plugin {} from an interrupted uninstall.",
+            journal.plugin_id
+        )
+    })
 }
 
 fn delete_journal(conn: &Connection, journal: &InstallJournal) -> LauncherResult<()> {
@@ -1156,6 +1396,133 @@ mod tests {
         );
         assert!(f.stash().is_dir() && original.is_dir() && f.journal().is_some());
         verify_package(&f.destination(), &f.id, "2.0.0").unwrap();
+    }
+
+    #[test]
+    fn round_two_uninstall_crash_keeps_record_files_and_data_in_agreement() {
+        use InstallCrashPoint::*;
+        for purge in [false, true] {
+            for point in [
+                None,
+                Some(UninstallJournalWritten),
+                Some(UninstallFilesMoved),
+                Some(UninstallRecorded),
+                Some(UninstallMarked),
+                Some(UninstallCommitted),
+                Some(UninstallDropStarted),
+                Some(UninstallFilesDropped),
+                Some(UninstallJournalDeleted),
+            ] {
+                let f = Fixture::new(true);
+                let kind = store::StorageKind::Data;
+                let value = serde_json::json!("data from v1");
+                store::storage_set(&f.conn, &f.id, kind, None, "saved", &value).unwrap();
+                let operation = || f.service.uninstall(&f.id, purge).unwrap();
+                if let Some(point) = point {
+                    f.crash_at(point, operation);
+                    if point == UninstallDropStarted {
+                        let aside = f
+                            .journal()
+                            .unwrap()
+                            .layout(&f.ctx.paths)
+                            .unwrap()
+                            .rollback
+                            .unwrap();
+                        assert!(!f.destination().is_dir());
+                        std::fs::remove_file(aside.join("main.js")).unwrap();
+                    }
+                } else {
+                    operation();
+                }
+                let warnings = f.restart();
+                assert!(
+                    !warnings.iter().any(|line| line.contains("needs a hand")),
+                    "{point:?}: {warnings:?}"
+                );
+                let committed = matches!(
+                    point,
+                    None | Some(
+                        UninstallCommitted
+                            | UninstallDropStarted
+                            | UninstallFilesDropped
+                            | UninstallJournalDeleted
+                    )
+                );
+                if committed {
+                    let record = store::get(&f.conn, &f.id).unwrap();
+                    if purge {
+                        assert!(record.is_none());
+                    } else {
+                        assert!(record.as_ref().is_some_and(store::is_tombstone));
+                    }
+                    assert!(!f.destination().is_dir());
+                } else {
+                    f.assert_agreement("1.0.0", "// old package");
+                }
+                let stored = store::storage_get(&f.conn, &f.id, kind, None, "saved").unwrap();
+                assert_eq!(stored, (!(committed && purge)).then_some(value));
+                assert!(f.journal().is_none());
+                assert!(std::fs::read_dir(f.ctx.paths.plugin_rollback_root())
+                    .unwrap()
+                    .all(|entry| !entry.unwrap().path().is_dir()));
+                assert!(f.restart().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn round_two_uninstall_keeps_the_development_source_folder() {
+        let f = Fixture::new(false);
+        let source = f._root.path().join("source");
+        extract_package(&package("1.0.0", "// development package"), &source).unwrap();
+        f.service.add_development_folder(&source, true).unwrap();
+        f.service.uninstall(&f.id, true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(source.join("main.js")).unwrap(),
+            "// development package"
+        );
+        assert!(store::get(&f.conn, &f.id).unwrap().is_none());
+        assert!(f.journal().is_none());
+    }
+
+    #[test]
+    fn round_two_restore_never_publishes_a_partly_dropped_stash() {
+        let restore = |f: &Fixture| {
+            f.service
+                .recover_interrupted_installs(Some(&f.id), InstallResolution::Restore)
+                .unwrap()
+        };
+        let control = Fixture::new(true);
+        control.interrupt_install(InstallCrashPoint::Committed, "2.0.0");
+        assert!(matches!(
+            restore(&control).as_slice(),
+            [(_, InstallRecovery::Done(_))]
+        ));
+        control.assert_agreement("1.0.0", "// old package");
+
+        for explicit_restore in [false, true] {
+            let f = Fixture::new(true);
+            // Simulate a recursive delete that removed an auxiliary file while leaving the
+            // directory identity, manifest and entrypoint intact.
+            std::fs::write(f.destination().join("auxiliary.txt"), "required content").unwrap();
+            f.interrupt_install(InstallCrashPoint::StashDropStarted, "2.0.0");
+            let partially_dropped = f.journal().unwrap().layout(&f.ctx.paths).unwrap().dropping;
+            assert!(!f.stash().is_dir());
+            std::fs::remove_file(partially_dropped.join("auxiliary.txt")).unwrap();
+            if explicit_restore {
+                assert!(
+                    matches!(restore(&f).as_slice(), [(_, InstallRecovery::NeedsHand(why))] if why.contains("stash") && why.contains("already being dropped"))
+                );
+            } else {
+                assert!(f
+                    .restart()
+                    .iter()
+                    .any(|line| line.contains("Finished the interrupted install")));
+            }
+            f.assert_agreement("2.0.0", "// new package");
+            assert!(!partially_dropped.is_dir());
+            assert!(f.restart().is_empty());
+        }
     }
 
     #[test]

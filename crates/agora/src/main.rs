@@ -1726,7 +1726,7 @@ enum PluginCmd {
         )]
         allow_scripts: bool,
     },
-    /// Finish or undo an install that a crash cut short (MASTER_SPEC §32.11).
+    /// Finish or undo a plugin install or uninstall interrupted by a crash (MASTER_SPEC §32.11).
     ///
     /// With no id, recovers every plugin whose install was interrupted, doing only what the
     /// journal proves is safe, and lists what needs a hand.

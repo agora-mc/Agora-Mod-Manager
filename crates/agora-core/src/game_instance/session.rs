@@ -222,7 +222,6 @@ fn stop_ledger_session(
     if ctx.process_check(identity) == ProcessCheck::Gone {
         return Ok(None);
     }
-    crate::session_ledger::record_stop(ctx, instance_id);
     let jobs: Vec<&str> = identity.job.as_deref().into_iter().collect();
     let mut processes_ended = 0;
     for job in &jobs {
@@ -233,6 +232,7 @@ fn stop_ledger_session(
     if processes_ended == 0 {
         return Err(InstanceError::NotStartedByAgora(instance_id.to_string()));
     }
+    crate::session_ledger::record_stop(ctx, instance_id);
     wait_until_gone(&roots, &jobs, STOP_TIMEOUT)?;
     let ended = end_session_if_journal(ctx, instance_id, definition)?;
     let play_time_ms = if let Some(end) = ended {

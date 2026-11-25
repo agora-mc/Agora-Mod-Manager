@@ -55,12 +55,17 @@ struct Seams {
     /// killed process leaves them.
     #[cfg(debug_assertions)]
     install_crash: Mutex<Option<crate::plugins::install::InstallCrashPoint>>,
+    #[cfg(debug_assertions)]
+    install_hook: Mutex<Option<InstallHook>>,
     /// The process table a liveness question is answered from, so every source of "could not tell"
     /// can be made to happen in a test (MASTER_SPEC §32.13).
     process_view: Mutex<Option<Arc<dyn crate::process_identity::ProcessView>>>,
     process_view_installed: AtomicBool,
     process_view_hits: AtomicUsize,
 }
+
+#[cfg(debug_assertions)]
+type InstallHook = Arc<dyn Fn(crate::plugins::install::InstallCrashPoint) + Send + Sync>;
 
 /// Lock a slot, taking the value back from a panic that left it poisoned: a seam is test state, and
 /// a test that panicked must not poison every later seam of the same operation.
@@ -73,6 +78,12 @@ fn slot<T>(slot: &Mutex<T>) -> MutexGuard<'_, T> {
 // ---------------------------------------------------------------------------
 
 impl TestSeams {
+    /// Observe a plugin operation boundary while the writer still holds its lock.
+    #[cfg(debug_assertions)]
+    pub fn set_install_hook(&self, hook: Option<InstallHook>) {
+        *slot(&self.0.install_hook) = hook;
+    }
+
     /// Stand in for the volume check and the free space of this context's operations, or clear it.
     pub fn set_volume_seam(&self, seam: Option<VolumeSeam>) {
         *slot(&self.0.volume) = seam;
@@ -364,6 +375,10 @@ impl TestSeams {
 
     /// Stop the install here if this context asked it to.
     pub(crate) fn install_crash_point(&self, point: crate::plugins::install::InstallCrashPoint) {
+        let hook = slot(&self.0.install_hook).clone();
+        if let Some(hook) = hook {
+            hook(point);
+        }
         if *slot(&self.0.install_crash) == Some(point) {
             panic!("a test cut this plugin install short at {point:?}");
         }

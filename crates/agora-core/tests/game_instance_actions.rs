@@ -1460,7 +1460,7 @@ fn stop_finds_and_stops_a_session_recorded_only_in_the_ledger() {
         child.try_wait().unwrap().is_none(),
         "the watcher's PID is not a stop target"
     );
-    session_ledger::begin_with_process(
+    let session = session_ledger::begin_with_process(
         &conn,
         "grounded-1",
         "2026-01-01T00:00:01Z",
@@ -1473,6 +1473,13 @@ fn stop_finds_and_stops_a_session_recorded_only_in_the_ledger() {
 
     let stopped = game_instance::stop(&f.ctx, "grounded-1", &definition()).expect("stop");
     assert_eq!(stopped.instance_id, "grounded-1");
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).unwrap();
+    assert!(
+        session_ledger::get(&conn, &session)
+            .unwrap()
+            .unwrap()
+            .stop_requested
+    );
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -1486,6 +1493,48 @@ fn stop_finds_and_stops_a_session_recorded_only_in_the_ledger() {
             }
         }
     }
+}
+
+#[test]
+fn round_two_unverified_ledger_stop_does_not_record_a_stop_request() {
+    use agora_core::session_ledger::{self, LaunchManifest, Owner};
+    struct Inconclusive;
+    impl process_identity::ProcessView for Inconclusive {
+        fn lookup(&self, _pid: u32) -> process_identity::Lookup {
+            process_identity::Lookup::CantTell("target was not verified".into())
+        }
+        fn job_members(&self, _job: &str) -> Result<usize, String> {
+            Ok(0)
+        }
+    }
+    let f = Fixture::new();
+    write_instance(&f.ctx, &manifest("grounded-1", "Grounded"));
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).unwrap();
+    session_ledger::begin_with_process(
+        &conn,
+        "grounded-1",
+        "2026-01-01T00:00:00Z",
+        &LaunchManifest::default(),
+        Owner::current(),
+        Some(&ProcessIdentity {
+            pid: u32::MAX - 2,
+            start_time: 1,
+            expected_exe: Some("unknown.exe".into()),
+            job: None,
+        }),
+    )
+    .unwrap();
+    assert!(
+        !session_ledger::open_sessions_for_instance(&conn, "grounded-1").unwrap()[0].stop_requested
+    );
+    f.ctx
+        .test_seams
+        .set_process_view(Some(Arc::new(Inconclusive)));
+    assert!(game_instance::stop(&f.ctx, "grounded-1", &definition()).is_err());
+    assert!(f.ctx.test_seams.process_view_hits() > 0);
+    assert!(
+        !session_ledger::open_sessions_for_instance(&conn, "grounded-1").unwrap()[0].stop_requested
+    );
 }
 
 #[test]

@@ -976,16 +976,22 @@ impl PluginService {
     /// Re-read the install records and work out what can run.
     pub fn reload(&self) -> LauncherResult<()> {
         let conn = self.inner.conn()?;
-        let records = store::list(&conn)?;
+        let snapshot = store::load_snapshot(&conn)?;
         // A plugin that is official, or borrows an official id, and does not
         // verify is blocked outright: it is not runnable, and the status says
         // why. An error reading the records is an error here, not "nothing is
         // blocked".
-        let official = super::official::verify_installed(
-            &conn,
+        let official = super::official::verify_snapshot(
+            &snapshot,
             self.inner.ctx.paths.root(),
             &self.inner.registry_trust,
         )?;
+        let store::PluginLoadSnapshot {
+            guard,
+            records,
+            pending,
+        } = snapshot;
+        drop(guard);
         let blocked: BTreeMap<String, String> = official
             .iter()
             .filter_map(|(id, status)| match status {
@@ -1011,6 +1017,9 @@ impl PluginService {
         }
         let resolution =
             registry::resolve_with_blocks(records, &agora_plugin_api::HOST_API_VERSION, &blocked);
+        for reason in pending.into_values() {
+            eprintln!("[plugins] {reason}");
+        }
         if let Ok(mut slot) = self.inner.resolution.write() {
             *slot = resolution;
         }
@@ -1099,6 +1108,12 @@ impl PluginService {
         let Ok(conn) = self.inner.conn() else {
             return BTreeMap::new();
         };
+        let Ok(guard) = store::guard_package_reads(&conn) else {
+            return BTreeMap::new();
+        };
+        let Ok(pending) = store::journal_ids(&guard) else {
+            return BTreeMap::new();
+        };
         let answers = match store::list_script_consent(&conn) {
             Ok(answers) => answers,
             Err(e) => {
@@ -1119,6 +1134,9 @@ impl PluginService {
         let mut out = BTreeMap::new();
         for resolved in &resolution.plugins {
             let id = resolved.id();
+            if pending.iter().any(|value| value == id.as_str()) {
+                continue;
+            }
             let manifest = &resolved.record.manifest;
             let state = if manifest.is_declarative_only() {
                 CodeConsentState::NoCode
@@ -1506,7 +1524,15 @@ impl PluginService {
         bytes: &[u8],
         consent: impl Into<Consent>,
     ) -> LauncherResult<PluginSummary> {
-        let consent = consent.into();
+        self.install_package_with_provenance(bytes, consent.into(), None)
+    }
+
+    pub(super) fn install_package_with_provenance(
+        &self,
+        bytes: &[u8],
+        consent: Consent,
+        provenance: Option<&store::OfficialProvenance>,
+    ) -> LauncherResult<PluginSummary> {
         if let Some(expected) = consent.previewed_digest.as_deref() {
             if install::package_digest(bytes) != expected {
                 return Err(preview_changed());
@@ -1586,6 +1612,26 @@ impl PluginService {
         install::crash_point(ctx, install::InstallCrashPoint::JournalWritten);
         let result = (|| -> LauncherResult<()> {
             journal.swap_files(&conn, ctx, &lock, bytes)?;
+            if let Some(provenance) = provenance {
+                let unpacked = super::official::tree_digest(&destination).map_err(|error| {
+                    LauncherError::Generic {
+                        code: "ERR_OFFICIAL_PLUGIN_RECORD".into(),
+                        message: format!(
+                            "Could not verify the unpacked files for `{}`: {error}",
+                            manifest.id
+                        ),
+                    }
+                })?;
+                if unpacked != provenance.tree_sha256 {
+                    return Err(LauncherError::Generic {
+                        code: "ERR_OFFICIAL_PLUGIN_TREE".into(),
+                        message: format!(
+                            "The unpacked files for `{}` differ from the signed catalog",
+                            manifest.id
+                        ),
+                    });
+                }
+            }
             let new_code_digest = install::script_digest(&manifest, &destination)?;
             let tx = conn.transaction().map_err(plugin_install_db_error)?;
             // Updating something the user had switched off must not switch it back
@@ -1607,6 +1653,9 @@ impl PluginService {
                 &now(ctx),
             )?;
             install::crash_point(ctx, install::InstallCrashPoint::Recorded);
+            if let Some(provenance) = provenance {
+                store::set_official(&tx, &manifest.id, provenance)?;
+            }
             // Pinned at the moment consent was given, and only then. A package
             // that declares no update source clears any previous pin rather than
             // inheriting it, so a plugin cannot acquire an update channel by
@@ -2304,9 +2353,8 @@ impl PluginService {
                 message: format!("`{plugin_id}` is not installed"),
             });
         };
-        install::remove_package_files(&record.source, &record.install_dir)?;
+        install::uninstall(&conn, &self.inner.ctx, &lock, &record, purge_data)?;
         logs::remove(&self.inner.logs_root, plugin_id);
-        store::remove(&conn, plugin_id, purge_data)?;
         self.reload()
     }
 

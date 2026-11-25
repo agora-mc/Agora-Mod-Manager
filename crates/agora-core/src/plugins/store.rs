@@ -126,6 +126,46 @@ fn db_error(error: impl std::fmt::Display) -> LauncherError {
     }
 }
 
+/// Reserve the next SQLite write while a reader opens package files. An existing
+/// writer has already published its journal before moving files. A new writer
+/// cannot publish one and start moving files until this guard is released.
+pub(super) fn guard_package_reads(conn: &Connection) -> LauncherResult<rusqlite::Transaction<'_>> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(db_error)
+}
+
+pub(super) fn journal_ids(conn: &Connection) -> LauncherResult<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT plugin_id FROM plugin_install_journal ORDER BY plugin_id")
+        .map_err(db_error)?;
+    let rows = stmt.query_map([], |row| row.get(0)).map_err(db_error)?;
+    rows.collect::<rusqlite::Result<_>>().map_err(db_error)
+}
+
+pub(crate) struct PluginLoadSnapshot<'a> {
+    pub guard: rusqlite::Transaction<'a>,
+    pub records: Vec<PluginRecord>,
+    pub pending: std::collections::BTreeMap<String, String>,
+}
+
+pub(crate) fn load_snapshot(conn: &Connection) -> LauncherResult<PluginLoadSnapshot<'_>> {
+    let guard = guard_package_reads(conn)?;
+    let pending = journal_ids(&guard)?
+        .into_iter()
+        .map(|id| {
+            let reason =
+                format!("Plugin {id} is being installed, being removed, or needs recovery.");
+            (id, reason)
+        })
+        .collect();
+    let records = list(&guard)?;
+    Ok(PluginLoadSnapshot {
+        guard,
+        records,
+        pending,
+    })
+}
+
 /// Every installed plugin, in id order.
 pub fn list(conn: &Connection) -> LauncherResult<Vec<PluginRecord>> {
     let mut stmt = conn
@@ -242,6 +282,8 @@ pub(super) struct InstallSnapshot {
     pub record: InstallRow,
     trust: Option<TrustRecord>,
     consent: Option<(i64, String, Option<String>)>,
+    #[serde(default)]
+    official: Option<OfficialProvenance>,
 }
 
 impl InstallSnapshot {
@@ -258,6 +300,7 @@ impl InstallSnapshot {
             record,
             consent,
             trust: get_trust(conn, id)?,
+            official: get_official(conn, id)?,
         }))
     }
 
@@ -304,6 +347,10 @@ impl InstallSnapshot {
             set_script_consent(conn, id, *allowed != 0, hash.as_deref(), decided_at)?;
         } else {
             clear_script_consent(conn, id)?;
+        }
+        match &self.official {
+            Some(provenance) => set_official(conn, id, provenance)?,
+            None => clear_official(conn, id)?,
         }
         Ok(())
     }
@@ -363,9 +410,8 @@ pub fn upsert(
         ],
     )
     .map_err(db_error)?;
-    // Whatever replaced the files, it was not the official installer, which
-    // records its provenance only after this call returns. Leaving the old row
-    // would let a different package inherit the previous one's standing.
+    // Clear the previous package's standing. A verified replacement pins its own
+    // provenance in the same transaction.
     clear_official(conn, &manifest.id)?;
     Ok(())
 }
@@ -478,7 +524,7 @@ pub fn list_script_consent(
 ///
 /// This is a record of an installation, not a verdict. Whether the plugin is
 /// *still* official is decided against the signed registry each time it matters.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfficialProvenance {
     pub entry_id: String,
     pub entry_version: String,
@@ -528,6 +574,27 @@ pub fn clear_official(conn: &Connection, plugin_id: &PluginId) -> LauncherResult
     Ok(())
 }
 
+fn get_official(conn: &Connection, id: &PluginId) -> LauncherResult<Option<OfficialProvenance>> {
+    conn.query_row(
+        "SELECT entry_id, entry_version, entry_sha256, tree_sha256, recorded_at
+         FROM plugin_official WHERE plugin_id = ?1",
+        params![id.as_str()],
+        |row| read_provenance(row, 0),
+    )
+    .optional()
+    .map_err(db_error)
+}
+
+fn read_provenance(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<OfficialProvenance> {
+    Ok(OfficialProvenance {
+        entry_id: row.get(offset)?,
+        entry_version: row.get(offset + 1)?,
+        entry_sha256: row.get(offset + 2)?,
+        tree_sha256: row.get(offset + 3)?,
+        recorded_at: row.get(offset + 4)?,
+    })
+}
+
 /// Every recorded official provenance, keyed by plugin id.
 pub fn list_official(
     conn: &Connection,
@@ -540,16 +607,7 @@ pub fn list_official(
         .map_err(db_error)?;
     let rows = stmt
         .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                OfficialProvenance {
-                    entry_id: row.get(1)?,
-                    entry_version: row.get(2)?,
-                    entry_sha256: row.get(3)?,
-                    tree_sha256: row.get(4)?,
-                    recorded_at: row.get(5)?,
-                },
-            ))
+            Ok((row.get::<_, String>(0)?, read_provenance(row, 1)?))
         })
         .map_err(db_error)?;
     let mut out = std::collections::BTreeMap::new();

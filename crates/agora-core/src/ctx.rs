@@ -257,31 +257,29 @@ impl CoreContext {
                     }
                 }
 
-                // A game package is data: it runs no code, so it loads whatever the
-                // emergency stop says and needs no script permission; installing the
-                // plugin (and granting `game:define`) was the opt-in. The one filter
-                // is official status. A plugin that was installed as official, or
-                // that uses an official plugin's id, and does not verify is blocked:
-                // not loaded, and named in the warnings with the reason. It is not
-                // demoted to a community plugin, which would let a revoked or
-                // tampered package keep loading.
-                let official = match crate::plugins::official::verify_installed(
-                    &conn,
-                    paths.root(),
-                    &registry_trust,
-                ) {
-                    Ok(statuses) => statuses,
-                    Err(e) => {
-                        warnings.push(format!(
-                            "Cannot verify official plugins, so none is treated as official: {e}"
-                        ));
-                        std::collections::BTreeMap::new()
-                    }
-                };
-
-                match crate::plugins::store::list(&conn) {
+                match crate::plugins::store::load_snapshot(&conn) {
                     Err(e) => warnings.push(format!("Cannot read plugin game packages: {e}")),
-                    Ok(mut records) => {
+                    Ok(snapshot) => {
+                        let official = match crate::plugins::official::verify_snapshot(
+                            &snapshot,
+                            paths.root(),
+                            &registry_trust,
+                        ) {
+                            Ok(statuses) => statuses,
+                            Err(e) => {
+                                warnings.push(format!(
+                                    "Cannot verify official plugins, so none is treated as official: {e}"
+                                ));
+                                std::collections::BTreeMap::new()
+                            }
+                        };
+                        let crate::plugins::store::PluginLoadSnapshot {
+                            guard,
+                            mut records,
+                            pending,
+                        } = snapshot;
+                        records.retain(|record| !pending.contains_key(record.id().as_str()));
+                        warnings.extend(pending.into_values());
                         // Official plugins register first. A game id or a store
                         // product id goes to whoever claims it first, and the
                         // records come back in plugin-id order, so without this
@@ -399,6 +397,8 @@ impl CoreContext {
                                 });
                             }
                         }
+
+                        drop(guard);
 
                         // All packages are read before any is resolved, so a parent may live in
                         // another plugin. A broken package warns with its chain and the others

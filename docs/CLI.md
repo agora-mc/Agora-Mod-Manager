@@ -925,7 +925,7 @@ See `docs/plugins/publishing.md` for what the signature does and does not prove.
 
 `plugin restore-data <ID>` puts a plugin's saved data back to the copy Agora kept before its last data-shape change. It always asks first (`--yes` skips the question), and it discards anything the plugin wrote since that copy, so it is a deliberate recovery step, not an undo for an ordinary update.
 
-`plugin recover [ID]` resolves an install that a crash cut short (MASTER_SPEC §32.11). The plugin record and the journal commit together in SQLite. Startup keeps the committed files or restores the previous package from the stash. `plugin recover` runs before automatic startup recovery and accepts these explicit directions for one plugin.
+`plugin recover [ID]` resolves an install or uninstall that a crash cut short (MASTER_SPEC §32.11). The plugin record and the journal commit together in SQLite. Startup completes committed changes and restores the previous package for uncommitted changes. During an uninstall, the package is moved aside before the commit. `plugin recover` runs before automatic startup recovery and accepts these explicit directions for one plugin.
 
 - `--restore --yes` puts the verified stash back and moves the replacement to a separate folder. After a commit, the old plugin record and the restore decision commit together before the files move.
 - `--discard --yes` keeps the committed package and deletes its verified stash. This removes the copy used to go back to the previous version.

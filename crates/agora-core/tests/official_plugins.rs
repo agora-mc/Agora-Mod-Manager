@@ -378,6 +378,7 @@ impl PackageFetcher for FakeFetcher {
 
 struct World {
     dir: tempfile::TempDir,
+    ctx: CoreContext,
     service: PluginService,
     fetcher: FakeFetcher,
 }
@@ -389,13 +390,14 @@ impl World {
         ctx.paths.create_required_dirs().unwrap();
         agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
         let service = PluginService::new_with_registry_trust(
-            ctx,
+            ctx.clone(),
             Arc::new(QuickJsHost::new()),
             Arc::new(NoopUiSink),
             trust(),
         );
         Self {
             dir,
+            ctx,
             service,
             fetcher: FakeFetcher::default(),
         }
@@ -463,6 +465,244 @@ impl World {
         CoreContext::initialize_with_registry_trust(self.paths(), GameRegistry::builder(), trust())
             .unwrap()
     }
+}
+
+fn mark_install_writer_gone(world: &World) {
+    let conn = agora_core::db::local_state_connection(&world.paths().local_state_db()).unwrap();
+    assert_eq!(
+        conn.execute(
+            "UPDATE plugin_install_journal SET document = json_set(document, '$.writer.pid', ?1)
+         WHERE plugin_id = ?2",
+            rusqlite::params![u32::MAX - 2, PLUGIN],
+        )
+        .unwrap(),
+        1
+    );
+}
+
+fn crashed_official_upgrade(crash: bool) -> World {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let world = World::new();
+    let v1 = fixture_zip("1.0.0");
+    world.publish(vec![(Release::of("1.0.0", "current", &v1), v1.clone())]);
+    installed(
+        runtime
+            .block_on(world.service.install_official(PLUGIN, true, &world.fetcher))
+            .unwrap(),
+    );
+    assert!(world.status().is_official());
+    let v2 = fixture_zip("2.0.0");
+    world.publish(vec![
+        (Release::of("1.0.0", "previous", &v1), v1),
+        (Release::of("2.0.0", "current", &v2), v2),
+    ]);
+    let upgrade = || {
+        installed(
+            runtime
+                .block_on(world.service.update_official(PLUGIN, true, &world.fetcher))
+                .unwrap(),
+        )
+    };
+    if crash {
+        world
+            .ctx
+            .test_seams
+            .set_install_crash(Some(InstallCrashPoint::Committed));
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(upgrade)).unwrap_err();
+        assert!(error
+            .downcast_ref::<String>()
+            .is_some_and(|s| s.contains("cut this plugin install short at Committed")));
+        world.ctx.test_seams.set_install_crash(None);
+        mark_install_writer_gone(&world);
+    } else {
+        assert!(upgrade().official.is_official());
+    }
+    world
+}
+
+#[test]
+fn round_two_official_commit_survives_startup_recovery() {
+    let control = crashed_official_upgrade(false);
+    assert!(control
+        .start()
+        .0
+        .games
+        .game(&GameId::new(GAME).unwrap())
+        .is_some());
+
+    let world = crashed_official_upgrade(true);
+    let (ctx, warnings) = world.start();
+    assert!(
+        ctx.games.game(&GameId::new(GAME).unwrap()).is_some(),
+        "{warnings:?}"
+    );
+    assert!(world.status().is_official());
+    assert_eq!(
+        world.service.installed_version(PLUGIN).unwrap().as_deref(),
+        Some("2.0.0")
+    );
+}
+
+#[test]
+fn round_two_official_restore_recovers_previous_provenance() {
+    use agora_core::plugins::install::{InstallRecovery, InstallResolution};
+    let control = crashed_official_upgrade(false);
+    let outcomes = control
+        .service
+        .recover_interrupted_installs(Some(&World::id()), InstallResolution::Restore)
+        .unwrap();
+    assert!(matches!(outcomes.as_slice(), [(_, InstallRecovery::None)]));
+    assert!(control.status().is_official());
+    let world = crashed_official_upgrade(true);
+    let outcome = world
+        .service
+        .recover_interrupted_installs(Some(&World::id()), InstallResolution::Restore)
+        .unwrap();
+    assert!(matches!(
+        outcome.as_slice(),
+        [(_, InstallRecovery::Done(_))]
+    ));
+    let (ctx, warnings) = world.start();
+    assert!(
+        ctx.games.game(&GameId::new(GAME).unwrap()).is_some(),
+        "{warnings:?}"
+    );
+    assert!(world.status().is_official());
+    assert_eq!(
+        world.service.installed_version(PLUGIN).unwrap().as_deref(),
+        Some("1.0.0")
+    );
+}
+
+#[test]
+fn round_two_readers_skip_a_plugin_when_its_journal_needs_recovery() {
+    let world = World::new();
+    world
+        .service
+        .install_package_bytes(&fixture_zip("1.0.0"), true)
+        .unwrap();
+    assert!(world
+        .start()
+        .0
+        .games
+        .game(&GameId::new(GAME).unwrap())
+        .is_some());
+    crash_install(&world, "2.0.0", InstallCrashPoint::FilesPublished);
+    let conn = agora_core::db::local_state_connection(&world.paths().local_state_db()).unwrap();
+    assert_eq!(
+        conn.execute(
+            "UPDATE plugin_install_journal SET document = ?1 WHERE plugin_id = ?2",
+            rusqlite::params!["unreadable journal", PLUGIN]
+        )
+        .unwrap(),
+        1
+    );
+    let (reader, warnings) = world.start();
+    assert!(reader.games.game(&GameId::new(GAME).unwrap()).is_none());
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains(PLUGIN) && w.contains("needs recovery")),
+        "{warnings:?}"
+    );
+    world.service.reload().unwrap();
+    let status = world
+        .service
+        .list()
+        .into_iter()
+        .find(|plugin| plugin.id == PLUGIN)
+        .unwrap()
+        .status_text;
+    assert!(status.contains("needs recovery"), "{status}");
+}
+
+#[test]
+fn round_two_startup_and_reload_skip_a_plugin_while_its_update_is_published() {
+    let world = World::new();
+    let replacement = "replacement-game";
+    let unrelated = "unrelated-game";
+    world
+        .service
+        .install_package_bytes(&fixture_zip("1.0.0"), true)
+        .unwrap();
+    world
+        .service
+        .install_package_bytes(
+            &package_zip("acme.unrelated", "1.0.0", unrelated, "game:define", ""),
+            true,
+        )
+        .unwrap();
+    assert!(world
+        .start()
+        .0
+        .games
+        .game(&GameId::new(GAME).unwrap())
+        .is_some());
+    let paths = world.paths();
+    let findings = Arc::new(Mutex::new(None));
+    let paused = findings.clone();
+    world
+        .ctx
+        .test_seams
+        .set_install_hook(Some(Arc::new(move |point| {
+            if point != InstallCrashPoint::FilesPublished {
+                return;
+            }
+            let (reader, warnings) = CoreContext::initialize_with_registry_trust(
+                paths.clone(),
+                GameRegistry::builder(),
+                trust(),
+            )
+            .unwrap();
+            let visible = reader
+                .games
+                .game(&GameId::new(replacement).unwrap())
+                .is_some();
+            let other = reader
+                .games
+                .game(&GameId::new(unrelated).unwrap())
+                .is_some();
+            let service = PluginService::headless(reader, Arc::new(QuickJsHost::new()));
+            service.reload().unwrap();
+            let status = service
+                .list()
+                .into_iter()
+                .find(|plugin| plugin.id == PLUGIN)
+                .unwrap()
+                .status_text;
+            *paused.lock().unwrap() = Some((visible, other, warnings, status));
+        })));
+    world
+        .service
+        .install_package_bytes(
+            &package_zip(PLUGIN, "2.0.0", replacement, "game:define", ""),
+            true,
+        )
+        .unwrap();
+    world.ctx.test_seams.set_install_hook(None);
+    let (visible, other, warnings, status) = findings
+        .lock()
+        .unwrap()
+        .take()
+        .expect("FilesPublished seam ran");
+    assert!(!visible, "read the uncommitted replacement: {warnings:?}");
+    assert!(other, "unrelated plugin should still load");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains(PLUGIN) && w.contains("needs recovery")),
+        "{warnings:?}"
+    );
+    assert!(status.contains("needs recovery"), "{status}");
+    assert!(world
+        .start()
+        .0
+        .games
+        .game(&GameId::new(replacement).unwrap())
+        .is_some());
 }
 
 /// Every file under the plugins folder, so "nothing was written" can be asserted.
