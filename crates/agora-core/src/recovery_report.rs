@@ -694,21 +694,26 @@ struct DeletedEntryFile {
     name: String,
 }
 
-/// The `restoring.json` a restore writes before it moves anything.
+/// The `restoring.json` a restore writes before it moves anything. Only the id it was restoring is
+/// a fact this report uses: it does not predict what the next start will make of the marker.
 #[derive(Debug, Deserialize)]
 struct RestoringFile {
     #[serde(default)]
     new_id: String,
-    #[serde(default)]
-    new_name: String,
 }
 
-/// Entries in Recently deleted: a restore that a crash cut in half is a startup blocker, and a
-/// plain kept entry is something the user can still bring back.
+/// Entries in Recently deleted, reported as facts and **no prediction**.
+///
+/// This kind is not on the journal envelope yet either (MASTER_SPEC §32.11 D1), so — exactly like a
+/// launcher import — the report says what it can see and nothing more: the entry's id, the instance
+/// it covers, whether `entry.json` and `restoring.json` are there and readable (with the read error
+/// when one is not), and its instance's lock. A restore marker is `undecided`: the next start runs
+/// that kind's own recovery, which decides from the folders and the markers inside them.
 fn recently_deleted(paths: &AppPaths, report: &mut RecoveryReport) {
+    let locks = LockManager::new(paths.locks_root());
     let root = paths.recently_deleted_games_root();
-    let dirs = match read_children(root.clone(), None) {
-        Ok(dirs) => dirs,
+    let children = match read_children(root, None) {
+        Ok(children) => children,
         Err(reason) => {
             report.not_searched.push(KindNotSearched {
                 kind: JournalKind::RecentlyDeleted,
@@ -718,102 +723,164 @@ fn recently_deleted(paths: &AppPaths, report: &mut RecoveryReport) {
             return;
         }
     };
-    for dir in dirs {
-        let entry_file = dir.join("entry.json");
-        let restoring = match read_json::<RestoringFile>(&dir.join("restoring.json")) {
-            Ok(found) => found,
-            Err(reason) => {
+    for child in children {
+        // Only a folder is an entry: the kind's own reader looks at `<root>/<id>/entry.json`.
+        match probe(&child) {
+            Probe::Present(PresentKind::Directory) => {}
+            Probe::Present(_) => continue,
+            Probe::CantTell(error) => {
                 report.entries.push(JournalEntry {
                     kind: JournalKind::RecentlyDeleted,
-                    resource: name_of(&dir),
-                    path: dir.join("restoring.json").display().to_string(),
-                    state: Some("restoring".into()),
+                    resource: name_of(&child),
+                    path: child.display().to_string(),
+                    state: None,
                     outcome: RecoveryOutcome::NeedsHand,
-                    reason: format!("Its restore was started and cannot be read: {reason}"),
+                    reason: format!(
+                        "{} could not be examined ({error}), so whether it holds a deleted instance \
+                         is unknown. Nothing was changed.",
+                        child.display()
+                    ),
                     command: None,
                 });
                 continue;
             }
-        };
-        let deleted = read_json::<DeletedEntryFile>(&entry_file);
-        let resource = match (&deleted, &restoring) {
-            (Ok(Some(entry)), _) if !entry.instance_id.is_empty() => entry.instance_id.clone(),
-            _ => name_of(&dir),
-        };
-        let (state, outcome, reason) = match restoring {
-            Some(restoring) => {
-                let target = if restoring.new_name.is_empty() {
-                    restoring.new_id.clone()
-                } else {
-                    format!("{} ({})", restoring.new_name, restoring.new_id)
-                };
-                (
-                    Some("restoring".to_string()),
-                    RecoveryOutcome::WouldFinish,
-                    format!(
-                        "A restore of this entry was started and cut off; the next start finishes \
-                         it as {} (or calls it off, keeping the files in Recently deleted, when the \
-                         folders do not match what the entry recorded).",
-                        if target.is_empty() {
-                            "the instance it recorded".to_string()
-                        } else {
-                            target
-                        }
-                    ),
-                )
-            }
-            None => {
-                // A kept entry whose own record cannot be read is not "nothing to do": the files
-                // are there but nothing can be told about them, and no restore can bring them back.
-                if let Err(reason) = &deleted {
-                    report.entries.push(JournalEntry {
-                        kind: JournalKind::RecentlyDeleted,
-                        resource: name_of(&dir),
-                        path: dir.display().to_string(),
-                        state: Some("kept".into()),
-                        outcome: RecoveryOutcome::NeedsHand,
-                        reason: format!(
-                            "A deleted instance is held here and its record cannot be read: \
-                             {reason}. No restore was started, so nothing is pending, and the \
-                             files are left exactly as they are."
-                        ),
-                        command: None,
-                    });
-                    continue;
-                }
-                let what = match &deleted {
-                    Ok(Some(entry)) if !entry.name.is_empty() => {
-                        format!("instance {} (\"{}\")", resource, entry.name)
-                    }
-                    _ => format!("instance {resource}"),
-                };
-                (
-                    Some("kept".to_string()),
-                    RecoveryOutcome::NothingToDo,
-                    format!(
-                        "A deleted {what} is held here until it expires; nothing is pending. Bring \
-                         it back with `agora instance restore {}`.",
-                        name_of(&dir)
-                    ),
-                )
-            }
-        };
-        report.entries.push(JournalEntry {
-            kind: JournalKind::RecentlyDeleted,
-            resource,
-            path: if entry_file_is_there(&entry_file) {
-                entry_file.display().to_string()
-            } else {
-                dir.display().to_string()
-            },
-            state,
-            outcome,
-            reason,
-            command: None,
-        });
+            Probe::Absent => continue,
+        }
+        report.entries.push(deleted_entry(&child, &locks));
     }
 }
 
+/// One Recently deleted entry, as the facts a person can act on.
+fn deleted_entry(dir: &Path, locks: &LockManager) -> JournalEntry {
+    let entry_file = dir.join("entry.json");
+    let restoring_file = dir.join("restoring.json");
+    let entry = read_json::<DeletedEntryFile>(&entry_file);
+    let restoring = read_json::<RestoringFile>(&restoring_file);
+    let instance = instance_of(&entry, &restoring);
+    let facts = format!(
+        "Entry {} covers {}{}: {}; {}.",
+        name_of(dir),
+        match &instance {
+            Some(instance) => format!("instance {instance}"),
+            // No file it can read names the instance, so there is nothing to ask its lock about.
+            None => "no instance it can name".to_string(),
+        },
+        match &entry {
+            Ok(Some(entry)) if !entry.name.is_empty() => format!(" (\"{}\")", entry.name),
+            _ => String::new(),
+        },
+        described("entry.json", &entry),
+        described("restoring.json", &restoring)
+    );
+    let mut listed = JournalEntry {
+        kind: JournalKind::RecentlyDeleted,
+        resource: name_of(dir),
+        path: match probe(&entry_file) {
+            Probe::Absent => dir.display().to_string(),
+            _ => entry_file.display().to_string(),
+        },
+        state: Some(
+            match (&restoring, &entry) {
+                (Ok(Some(_)), _) => "restoring",
+                (Err(_), _) => "restoring-unreadable",
+                (Ok(None), Ok(Some(_))) => "kept",
+                (Ok(None), Err(_)) => "unreadable-record",
+                (Ok(None), Ok(None)) => "empty",
+            }
+            .to_string(),
+        ),
+        outcome: RecoveryOutcome::NothingToDo,
+        reason: String::new(),
+        command: None,
+    };
+    // The instance's lock first: while a run holds it, nothing about this entry is decided. With no
+    // instance it can name there is no lock to ask, and the facts already say what is known.
+    let probed = match &instance {
+        Some(instance) => Some(locks.probe(&LockResource::Instance(instance.clone()))),
+        None => None,
+    };
+    match probed {
+        Some(LockProbe::Held(metadata)) => {
+            listed.outcome = RecoveryOutcome::Busy;
+            listed.reason = format!(
+                "{facts} Another Agora holds this instance's lock right now{}, so a run may still \
+                 be using it. Nothing would be done; the next start retries.",
+                match metadata {
+                    Some(metadata) => format!(
+                        " ({} on {}, operation: {})",
+                        metadata.program, metadata.hostname, metadata.operation
+                    ),
+                    None => String::new(),
+                }
+            );
+            return listed;
+        }
+        Some(LockProbe::CantTell(why)) => {
+            listed.outcome = RecoveryOutcome::Busy;
+            listed.reason = format!(
+                "{facts} Agora could not tell whether this instance's lock is held ({why}), so a \
+                 run may still be using it. Nothing was changed."
+            );
+            return listed;
+        }
+        Some(LockProbe::Free) | None => {}
+    }
+    match (restoring, entry) {
+        // A restore was started: this build does not decide what a start will make of it.
+        (Ok(Some(_)), _) | (Err(_), _) => {
+            listed.outcome = RecoveryOutcome::Undecided;
+            listed.reason = format!(
+                "{facts} A restore of this entry was started; the next start settles it with that \
+                 kind's own rules, and nothing has been changed."
+            );
+        }
+        (Ok(None), Ok(Some(_))) => {
+            listed.outcome = RecoveryOutcome::NothingToDo;
+            listed.reason = format!(
+                "{facts} The entry is held until it expires; nothing is pending. Bring it back \
+                 with `agora games instance restore {}`.",
+                name_of(dir)
+            );
+            listed.command = Some(format!("agora games instance restore {}", name_of(dir)));
+        }
+        (Ok(None), Err(error)) => {
+            listed.outcome = RecoveryOutcome::NeedsHand;
+            listed.reason = format!(
+                "{facts} It cannot be brought back while its record is unreadable ({error}); no \
+                 restore was started, so nothing is pending, and the files are left as they are."
+            );
+        }
+        (Ok(None), Ok(None)) => {
+            listed.outcome = RecoveryOutcome::NothingToDo;
+            listed.reason = format!(
+                "{facts} There is no deleted instance to bring back: the folder holds neither \
+                 file, so nothing is pending."
+            );
+        }
+    }
+    listed
+}
+
+/// The instance an entry covers: its own record's instance, then the restore's target id.
+fn instance_of(
+    entry: &std::result::Result<Option<DeletedEntryFile>, String>,
+    restoring: &std::result::Result<Option<RestoringFile>, String>,
+) -> Option<String> {
+    match (entry, restoring) {
+        (Ok(Some(entry)), _) if !entry.instance_id.is_empty() => Some(entry.instance_id.clone()),
+        (_, Ok(Some(restoring))) if !restoring.new_id.is_empty() => Some(restoring.new_id.clone()),
+        _ => None,
+    }
+}
+
+/// One of the entry's two files, said in one clause: there and readable, not there, or the error.
+fn described<T>(what: &str, read: &std::result::Result<Option<T>, String>) -> String {
+    match read {
+        Ok(Some(_)) => format!("{what} is there and readable"),
+        Ok(None) => format!("{what} is not there"),
+        Err(error) => format!("{what} could not be read ({error})"),
+    }
+}
 /// A folder's own name, for the resource a marker covers when its record is unreadable.
 fn name_of(dir: &Path) -> String {
     dir.file_name()
@@ -842,9 +909,4 @@ fn read_json<T: serde::de::DeserializeOwned>(
                 .map_err(|error| format!("{} is not readable JSON ({error})", path.display()))
         }
     }
-}
-
-/// Whether an entry's own record is a readable file, for naming the path the report points at.
-fn entry_file_is_there(path: &Path) -> bool {
-    matches!(probe(path), Probe::Present(PresentKind::File))
 }

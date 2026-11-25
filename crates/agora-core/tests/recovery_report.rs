@@ -794,24 +794,58 @@ fn trash_entry(paths: &AppPaths, entry_id: &str, restoring: Option<(&str, &str)>
     }
 }
 
-/// A restore that a crash cut in half is a startup blocker: the next start finishes it.
+/// A restore marker means a restore was in flight. Recently Deleted is not on the journal envelope
+/// yet, so the report gives the facts — both files, and which of them is there and readable — and
+/// says `undecided`: it never re-derives what the next start will do.
 #[test]
-fn an_interrupted_trash_restore_is_listed_as_something_the_next_start_finishes() {
+fn an_interrupted_trash_restore_is_undecided_not_a_prediction() {
     let (_dir, paths) = data_root();
     trash_entry(&paths, "entry-1", Some(("deleted-one", "A Deleted World")));
 
     let report = report(&paths);
     let entry = entry(&report, JournalKind::RecentlyDeleted);
-    assert_eq!(entry.resource, "deleted-one");
-    assert_eq!(entry.state.as_deref(), Some("restoring"));
-    assert_eq!(entry.outcome, RecoveryOutcome::WouldFinish, "{entry:?}");
+    assert_eq!(entry.resource, "entry-1", "the entry is named by its id");
+    assert_eq!(entry.outcome, RecoveryOutcome::Undecided, "{entry:?}");
+    assert_eq!(entry.command, None, "this build decides no command: {entry:?}");
     assert!(
-        entry.reason.contains("the next start finishes it"),
-        "{entry:?}"
+        entry.reason.contains("instance deleted-one"),
+        "the facts name the instance it covers: {entry:?}"
+    );
+    assert!(
+        entry.reason.contains("restoring.json") && entry.reason.contains("readable"),
+        "the facts say which marker is there, and that it was read: {entry:?}"
+    );
+    assert!(
+        entry.reason.contains("the next start"),
+        "the report says who settles it: {entry:?}"
     );
 }
 
-/// An entry that is merely kept has nothing pending, and says how to bring it back.
+/// A restore marker that cannot be read is part of the facts, not a decision.
+#[test]
+fn a_restore_marker_that_cannot_be_read_is_reported_in_the_facts() {
+    let (_dir, paths) = data_root();
+    trash_entry(&paths, "entry-1", Some(("deleted-one", "A Deleted World")));
+    std::fs::write(
+        paths
+            .recently_deleted_games_root()
+            .join("entry-1/restoring.json"),
+        b"{ broken",
+    )
+    .unwrap();
+
+    let report = report(&paths);
+    let entry = entry(&report, JournalKind::RecentlyDeleted);
+    assert_eq!(entry.outcome, RecoveryOutcome::Undecided, "{entry:?}");
+    assert_eq!(entry.command, None);
+    assert!(
+        entry.reason.contains("could not be read"),
+        "the parse error is reported with the facts: {entry:?}"
+    );
+}
+
+/// A plain kept entry: nothing is pending, its record is readable, and the command that brings it
+/// back is the one the CLI really has.
 #[test]
 fn a_kept_trash_entry_has_nothing_pending_and_names_the_restore_command() {
     let (_dir, paths) = data_root();
@@ -819,19 +853,24 @@ fn a_kept_trash_entry_has_nothing_pending_and_names_the_restore_command() {
 
     let report = report(&paths);
     let entry = entry(&report, JournalKind::RecentlyDeleted);
-    assert_eq!(entry.resource, "deleted-one");
+    assert_eq!(entry.resource, "entry-1");
     assert_eq!(entry.outcome, RecoveryOutcome::NothingToDo, "{entry:?}");
+    assert_eq!(
+        entry.command.as_deref(),
+        Some("agora games instance restore entry-1"),
+        "{entry:?}"
+    );
     assert!(
-        entry.reason.contains("agora instance restore entry-1"),
+        entry.reason.contains("instance deleted-one") && entry.reason.contains("readable"),
         "{entry:?}"
     );
     assert!(!report.needs_a_hand(), "{report:?}");
 }
 
-/// An entry whose own record cannot be read is reported as unreadable, with the error: the files are
-/// there, but nothing can be told about them and no restore can bring them back.
+/// An entry whose own record cannot be read is a hand: the files are there, nothing can be told
+/// about them, and no command can bring them back.
 #[test]
-fn a_trash_entry_whose_record_is_not_json_is_listed_as_unreadable() {
+fn a_trash_entry_whose_record_is_not_json_needs_a_hand() {
     let (_dir, paths) = data_root();
     trash_entry(&paths, "entry-1", None);
     std::fs::write(
@@ -846,10 +885,45 @@ fn a_trash_entry_whose_record_is_not_json_is_listed_as_unreadable() {
     let entry = entry(&report, JournalKind::RecentlyDeleted);
     assert_eq!(entry.resource, "entry-1", "the folder names the entry");
     assert_eq!(entry.outcome, RecoveryOutcome::NeedsHand, "{entry:?}");
+    assert_eq!(entry.command, None, "{entry:?}");
     assert!(
-        entry.reason.contains("record cannot be read"),
+        entry.reason.contains("could not be read"),
         "the reason carries the parse error: {entry:?}"
     );
+}
+
+/// A folder with neither file is not a pending anything: it is a leftover, said plainly.
+#[test]
+fn an_empty_trash_folder_has_nothing_pending_and_says_what_is_missing() {
+    let (_dir, paths) = data_root();
+    std::fs::create_dir_all(paths.recently_deleted_games_root().join("entry-1")).unwrap();
+
+    let report = report(&paths);
+    let entry = entry(&report, JournalKind::RecentlyDeleted);
+    assert_eq!(entry.resource, "entry-1");
+    assert_eq!(entry.outcome, RecoveryOutcome::NothingToDo, "{entry:?}");
+    assert_eq!(entry.command, None, "there is nothing to restore: {entry:?}");
+    assert!(
+        entry.reason.contains("entry.json") && entry.reason.contains("restoring.json"),
+        "the note says which files are missing: {entry:?}"
+    );
+}
+
+/// A running instance holds the lock its restore would need: busy, and no command.
+#[test]
+fn a_trash_entry_whose_instance_lock_is_held_is_busy() {
+    let (_dir, paths) = data_root();
+    trash_entry(&paths, "entry-1", None);
+    let locks = LockManager::new(paths.locks_root());
+    let held = locks
+        .acquire(LockResource::Instance("deleted-one".to_string()), "launch")
+        .unwrap();
+
+    let report = report(&paths);
+    let entry = entry(&report, JournalKind::RecentlyDeleted);
+    assert_eq!(entry.outcome, RecoveryOutcome::Busy, "{entry:?}");
+    assert_eq!(entry.command, None, "{entry:?}");
+    drop(held);
 }
 
 // ---------------------------------------------------------------------------

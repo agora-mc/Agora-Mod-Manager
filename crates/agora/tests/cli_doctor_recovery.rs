@@ -535,6 +535,62 @@ fn doctor_explains_a_pending_database_recovery() {
     );
 }
 
+/// A Recently deleted entry is reported with its facts and no prediction, and a kept one names the
+/// restore command the CLI really has.
+#[test]
+fn doctor_reports_a_recently_deleted_entry_with_its_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::from_root(dir.path().to_path_buf());
+    let entry_dir = paths.recently_deleted_games_root().join("entry-1");
+    std::fs::create_dir_all(entry_dir.join("instance")).unwrap();
+    let record = serde_json::json!({
+        "version": 1,
+        "entryId": "entry-1",
+        "instanceId": "deleted-one",
+        "game": "minecraft",
+        "name": "A Deleted World",
+        "deletedAt": "2026-01-01T00:00:00Z",
+        "expiresAt": "2026-02-01T00:00:00Z",
+        "sizeBytes": 1024,
+    });
+    std::fs::write(entry_dir.join("entry.json"), record.to_string()).unwrap();
+
+    let parsed = doctor_json(dir.path());
+    let kept = parsed["recovery"]["entries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("doctor lists the entry: {parsed}"))
+        .iter()
+        .find(|entry| entry["kind"] == "recently-deleted" && entry["resource"] == "entry-1")
+        .unwrap_or_else(|| panic!("the kept entry is listed: {parsed}"));
+    assert_eq!(kept["outcome"], "nothingToDo", "{kept}");
+    assert_eq!(
+        kept["command"], "agora games instance restore entry-1",
+        "the command is the one this CLI has: {kept}"
+    );
+
+    // A restore marker makes the same entry undecided: this build does not decide that kind.
+    std::fs::write(
+        entry_dir.join("restoring.json"),
+        serde_json::json!({ "new_id": "deleted-one", "new_name": "" }).to_string(),
+    )
+    .unwrap();
+    let parsed = doctor_json(dir.path());
+    let restoring = parsed["recovery"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "recently-deleted" && entry["resource"] == "entry-1")
+        .unwrap_or_else(|| panic!("the entry is listed: {parsed}"));
+    assert_eq!(restoring["outcome"], "undecided", "{restoring}");
+    assert_eq!(restoring["command"], serde_json::Value::Null, "{restoring}");
+    assert!(
+        restoring["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("restoring.json is there and readable")),
+        "the facts name both files: {restoring}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Read-only, all the way, through the real command
 // ---------------------------------------------------------------------------
