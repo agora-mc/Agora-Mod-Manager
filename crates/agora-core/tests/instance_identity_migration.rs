@@ -714,8 +714,8 @@ fn a_row_that_would_change_owner_is_found_beside_an_instance_with_no_id() {
         .unwrap()
     };
 
-    let error = init_local_state_db(&path)
-        .expect_err("a row that would change owner stops the migration");
+    let error =
+        init_local_state_db(&path).expect_err("a row that would change owner stops the migration");
     let message = format!("{error:#}");
     assert!(message.contains("instance_pack_gaps"), "{message}");
     assert!(

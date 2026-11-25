@@ -3048,7 +3048,9 @@ where
             Err(error) => {
                 // A rollback that cannot run is the more serious problem, so it is what the
                 // caller is told: an active savepoint would commit with the caller's work.
-                conn.execute_batch("ROLLBACK TO agora_instance_write; RELEASE agora_instance_write")?;
+                conn.execute_batch(
+                    "ROLLBACK TO agora_instance_write; RELEASE agora_instance_write",
+                )?;
                 Err(error)
             }
         };

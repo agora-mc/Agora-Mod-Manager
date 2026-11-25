@@ -1183,72 +1183,71 @@ impl LauncherImportService {
 
             // Determine action and destination. Updates always target the
             // previously imported instance rather than a collision suffix.
-            let (action, dest_id, dest_name, planned_existing_import) = if let Some(ref import) =
-                existing_import
-            {
-                // Check if the current Agora destination is unchanged.
-                let baseline = conn
-                    .as_ref()
-                    .and_then(|c| {
-                        agora_core::db::list_instance_import_files(c, &import.instance_id).ok()
-                    })
-                    .unwrap_or_default();
-
-                let current_inv = self
-                    .ctx
-                    .paths
-                    .instance_dir(&import.instance_id)
-                    .ok()
-                    .and_then(|path| hash_payload(&path).ok())
-                    .unwrap_or_default();
-
-                let metadata_unchanged = conn
-                    .as_ref()
-                    .is_some_and(|connection| imported_metadata_unchanged(connection, import));
-                if !baseline.is_empty()
-                    && is_baseline_unchanged(&current_inv, &baseline)
-                    && metadata_unchanged
-                {
-                    let existing_name = conn
+            let (action, dest_id, dest_name, planned_existing_import) =
+                if let Some(ref import) = existing_import {
+                    // Check if the current Agora destination is unchanged.
+                    let baseline = conn
                         .as_ref()
-                        .and_then(|connection| {
-                            agora_core::db::get_instance(connection, &import.instance_id)
-                                .ok()
-                                .flatten()
+                        .and_then(|c| {
+                            agora_core::db::list_instance_import_files(c, &import.instance_id).ok()
                         })
-                        .map(|row| row.name)
-                        .unwrap_or_else(|| requested_name.clone());
-                    let source_inventory =
-                        hash_payload(&candidate.payload_root).unwrap_or_default();
-                    let action = if is_baseline_unchanged(&source_inventory, &baseline)
-                        && source_metadata_matches_baseline(
-                            candidate.loader_tuple.as_ref(),
-                            &sanitized,
-                            sel.preserve_settings,
-                            import,
-                        ) {
-                        ItemAction::Unchanged
+                        .unwrap_or_default();
+
+                    let current_inv = self
+                        .ctx
+                        .paths
+                        .instance_dir(&import.instance_id)
+                        .ok()
+                        .and_then(|path| hash_payload(&path).ok())
+                        .unwrap_or_default();
+
+                    let metadata_unchanged = conn
+                        .as_ref()
+                        .is_some_and(|connection| imported_metadata_unchanged(connection, import));
+                    if !baseline.is_empty()
+                        && is_baseline_unchanged(&current_inv, &baseline)
+                        && metadata_unchanged
+                    {
+                        let existing_name = conn
+                            .as_ref()
+                            .and_then(|connection| {
+                                agora_core::db::get_instance(connection, &import.instance_id)
+                                    .ok()
+                                    .flatten()
+                            })
+                            .map(|row| row.name)
+                            .unwrap_or_else(|| requested_name.clone());
+                        let source_inventory =
+                            hash_payload(&candidate.payload_root).unwrap_or_default();
+                        let action = if is_baseline_unchanged(&source_inventory, &baseline)
+                            && source_metadata_matches_baseline(
+                                candidate.loader_tuple.as_ref(),
+                                &sanitized,
+                                sel.preserve_settings,
+                                import,
+                            ) {
+                            ItemAction::Unchanged
+                        } else {
+                            ItemAction::Update
+                        };
+                        (
+                            action,
+                            import.instance_id.clone(),
+                            existing_name,
+                            Some(import.clone()),
+                        )
                     } else {
-                        ItemAction::Update
-                    };
-                    (
-                        action,
-                        import.instance_id.clone(),
-                        existing_name,
-                        Some(import.clone()),
-                    )
+                        warnings.push(
+                            "Agora copy was modified; offering a new copy instead of update"
+                                .to_string(),
+                        );
+                        let id = resolve_destination_id(candidate, Some(&requested_name), &taken);
+                        (ItemAction::New, id, requested_name.clone(), None)
+                    }
                 } else {
-                    warnings.push(
-                        "Agora copy was modified; offering a new copy instead of update"
-                            .to_string(),
-                    );
                     let id = resolve_destination_id(candidate, Some(&requested_name), &taken);
                     (ItemAction::New, id, requested_name.clone(), None)
-                }
-            } else {
-                let id = resolve_destination_id(candidate, Some(&requested_name), &taken);
-                (ItemAction::New, id, requested_name.clone(), None)
-            };
+                };
 
             if !used_ids.contains(&dest_id) {
                 used_ids.push(dest_id.clone());
