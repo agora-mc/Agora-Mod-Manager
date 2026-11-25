@@ -1349,8 +1349,36 @@ mod tests {
     }
 
     #[test]
+    fn one_spelling_ignores_a_dot_component_and_one_target_does_not() {
+        // What holds on every platform: a `.` component names the folder it sits in, a trailing
+        // separator adds nothing, and a different name is different.
+        assert!(same_spelling(
+            Path::new("Data/./Mods/A.jar"),
+            Path::new("Data/Mods/A.jar")
+        ));
+        assert!(same_spelling(
+            Path::new("Data/Mods/A.jar/"),
+            Path::new("Data/Mods/A.jar")
+        ));
+        assert!(!same_spelling(
+            Path::new("Data/Mods/A.jar"),
+            Path::new("Data/Mods/B.jar")
+        ));
+
+        // One target: exactly, component by component, on every platform. A trailing separator and
+        // a `.` component are not names, so they do not make it a different path; a different name
+        // does.
+        let left = Path::new("Data/Mods/A.jar");
+        assert!(same_target(left, Path::new("Data/Mods/A.jar/")));
+        assert!(same_target(left, Path::new("Data/./Mods/A.jar")));
+        assert!(!same_target(left, Path::new("Data/Mods/B.jar")));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn one_spelling_ignores_case_and_separators_and_one_target_does_not() {
-        // Two spellings of one path: case, separators and a `.` component do not matter.
+        // Two spellings of one path: case, separators and a `.` component do not matter. Windows
+        // only: a backslash separates names there and not on Unix, and its disk folds case.
         assert!(same_spelling(
             Path::new("Data\\Mods\\A.jar"),
             Path::new("data/mods/a.jar")
@@ -1467,6 +1495,7 @@ mod tests {
         assert!(same_spelling(one, one));
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_verbatim_prefix_names_no_folder_of_its_own() {
         // What `std::fs::canonicalize` returns on Windows, and what a caller configured: one target.

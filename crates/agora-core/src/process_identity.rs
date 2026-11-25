@@ -592,8 +592,11 @@ mod tests {
         assert!(!executable_is_same(&unresolved, &game));
     }
 
+    #[cfg(windows)]
     #[test]
     fn executable_paths_fall_back_to_normalized_text_when_both_are_unavailable() {
+        // The spelling rule unifies a backslash with a separator on Windows only; on Unix a
+        // backslash is part of a name, so this case has no Unix counterpart to assert.
         let dir = tempfile::tempdir().unwrap();
         let expected = dir.path().join("missing").join("game");
         let same = format!(r"{}/missing\game", dir.path().display());
@@ -602,13 +605,19 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_paths_are_compared_by_spelling_with_case_folded() {
+    fn unavailable_paths_are_compared_by_spelling_as_the_disk_folds_case() {
         // The fall-back is the comparison module's spelling rule, which folds case the way the disk
-        // does: an executable path that no longer exists is still recognisably the one recorded.
+        // does: an executable path that no longer exists is still recognisably the one recorded
+        // where the disk folds case, and two names on Linux.
+        let folds = cfg!(windows) || cfg!(target_os = "macos");
         let dir = tempfile::tempdir().unwrap();
         let expected = dir.path().join("missing").join("Game.exe");
-        let same = format!(r"{}/missing\game.EXE", dir.path().display());
-        assert!(executable_is_same(&expected, Path::new(&same)));
+        let other_case = dir.path().join("missing").join("game.EXE");
+        assert_eq!(
+            executable_is_same(&expected, &other_case),
+            folds,
+            "case is folded only where the filesystem folds it"
+        );
     }
 
     #[test]

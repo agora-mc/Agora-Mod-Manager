@@ -921,6 +921,7 @@ pub(crate) fn instance_lock(instance_id: &str) -> LockResource {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn paths_compare_without_case_or_the_extended_prefix() {
         assert!(agora_game_api::same_spelling(

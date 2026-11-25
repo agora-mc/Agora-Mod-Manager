@@ -137,7 +137,6 @@ fn joining_refuses_a_junction_on_the_way() {
     );
 }
 
-#[cfg(windows)]
 /// A folder link the ordinary user can make, on either platform.
 fn make_link(link: &Path, target: &Path) {
     #[cfg(windows)]
@@ -220,13 +219,13 @@ fn a_resolved_destination_drops_a_dot_component_and_keeps_the_file_name() {
 #[cfg(unix)]
 #[test]
 fn one_folder_reached_through_a_link_is_one_folder() {
-    use agora_game_api::same_folder;
     let root = temp_dir();
     let real = root.path().join("real");
     std::fs::create_dir_all(real.join("mods")).unwrap();
     std::os::unix::fs::symlink(&real, root.path().join("alias")).unwrap();
-    assert!(
-        same_folder(&real.join("mods"), &root.path().join("alias").join("mods")),
+    assert_eq!(
+        compare_folder(&real.join("mods"), &root.path().join("alias").join("mods")),
+        PathRelation::Same,
         "two spellings of one folder are one folder once the link is resolved"
     );
 }
