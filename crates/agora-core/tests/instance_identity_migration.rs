@@ -636,3 +636,48 @@ fn a_row_that_already_pointed_at_no_instance_is_reported_and_left_alone() {
         "the report names the row, not just the table: {warning}"
     );
 }
+
+#[test]
+fn a_row_that_belongs_to_the_other_namespace_stops_the_migration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = old_database(tmp.path());
+    // A row that hangs off a Minecraft instance but names one of the *other* table's instances.
+    // Before the merge it is an orphan; after it, it would silently become that game's row.
+    let orphan_rowid: i64 = {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        conn.execute(
+            "INSERT INTO instance_pack_gaps (instance_id, filename, display_name, status)
+             VALUES ('skyrim-pack', 'c.jar', 'Sea', 'missing')",
+            [],
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT rowid FROM instance_pack_gaps WHERE instance_id = 'skyrim-pack'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    let error =
+        init_local_state_db(&path).expect_err("a row that would change owner stops the migration");
+    let message = format!("{error:#}");
+    assert!(message.contains("instance_pack_gaps"), "{message}");
+    assert!(
+        message.contains(&format!("row {orphan_rowid}")),
+        "the report names the row: {message}"
+    );
+    assert!(message.contains("skyrim-pack"), "{message}");
+    assert!(
+        message.contains("user_instances") && message.contains("game_instances"),
+        "the report names both namespaces: {message}"
+    );
+
+    // Nothing was changed: version 30 is still recorded and both old tables are there.
+    let conn = local_state_connection(&path).unwrap();
+    assert_eq!(version(&conn), 30);
+    assert!(table_exists(&conn, "user_instances"));
+    assert!(table_exists(&conn, "game_instances"));
+    assert!(!table_exists(&conn, "instances"));
+}
