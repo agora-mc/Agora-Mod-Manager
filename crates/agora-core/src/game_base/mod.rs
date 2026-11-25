@@ -1414,17 +1414,14 @@ static BASE_ROOTS_LOCK: Mutex<()> = Mutex::new(());
 /// Remember a bases root a build is about to use, so removal can later tell a folder Agora made
 /// from one a hand-edited record names. The data folder's own `bases` folder needs no entry.
 fn register_base_root(paths: &AppPaths, root: &Path) -> Result<(), BaseError> {
-    if agora_game_api::same_folder(root, &paths.bases_dir()) {
+    if is_same_folder(root, &paths.bases_dir()) {
         return Ok(());
     }
     let _guard = BASE_ROOTS_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut roots = read_base_roots(paths)?;
-    if roots
-        .iter()
-        .any(|known| agora_game_api::same_folder(known, root))
-    {
+    if roots.iter().any(|known| is_same_folder(known, root)) {
         return Ok(());
     }
     roots.push(root.to_path_buf());
@@ -1532,6 +1529,33 @@ fn live_process_ids() -> std::collections::HashSet<u32> {
 /// registered. The record's location only has to agree with it. A manifest is a user-writable
 /// file, so a record that names any other folder is refused and nothing is deleted. The base
 /// folder must also not overlap the install it was built from.
+/// Whether two paths are provably one folder. A pair that cannot be resolved is **not** the same:
+/// a caller that would otherwise copy a file onto itself, or delete a folder it cannot identify,
+/// refuses instead.
+fn is_same_folder(one: &Path, other: &Path) -> bool {
+    matches!(
+        agora_game_api::compare_folder(one, other),
+        agora_game_api::PathRelation::Same
+    )
+}
+
+/// Whether two paths are provably two different folders. "Could not tell" is not one of them, so a
+/// caller about to copy one onto the other refuses.
+fn is_distinct_folder(one: &Path, other: &Path) -> bool {
+    matches!(
+        agora_game_api::compare_folder(one, other),
+        agora_game_api::PathRelation::Different
+    )
+}
+
+/// The folder a record names, or a refusal: it has to be a base folder Agora made, and it may not
+/// be the install it was built from.
+///
+/// The record matches by **spelling**, as it always has: a record whose `location` is some other
+/// path that happens to resolve to the base folder — an alias, a link, a junction — is not a record
+/// Agora wrote, and deleting through it is exactly what this refuses. The overlap with the source
+/// install is then checked on **resolved** values, because a source install that is a link to the
+/// base folder overlaps it even though no spelling of it looks like the base's.
 pub(crate) fn trusted_base_folder(
     paths: &AppPaths,
     manifest: &BaseManifest,
@@ -1551,14 +1575,27 @@ pub(crate) fn trusted_base_folder(
     let folder = roots
         .iter()
         .map(|root| root.join(base_id))
-        .find(|candidate| agora_game_api::same_folder(candidate, &manifest.location))
+        .find(|candidate| agora_game_api::same_spelling(candidate, &manifest.location))
         .ok_or_else(|| refuse("does not point at a base folder Agora made"))?;
-    let overlaps_source = folder.starts_with(&manifest.source_location)
-        || manifest.source_location.starts_with(&folder);
+    let folder_real = resolved_for_removal(&folder).ok_or_else(|| {
+        refuse("names a base folder that could not be resolved, so it was not removed")
+    })?;
+    let source_real = resolved_for_removal(&manifest.source_location).ok_or_else(|| {
+        refuse("names a source install that could not be resolved, so whether the base is inside it could not be told")
+    })?;
+    let overlaps_source =
+        folder_real.starts_with(&source_real) || source_real.starts_with(&folder_real);
     if overlaps_source {
         return Err(refuse("points at the install it was built from"));
     }
     Ok(folder)
+}
+
+/// A path resolved once, for a decision about deleting it: the part that exists is canonicalized and
+/// the part that does not is appended as written. `None` when that cannot be done, which a caller
+/// about to delete must treat as "do not".
+fn resolved_for_removal(path: &Path) -> Option<PathBuf> {
+    agora_game_api::resolve_destination(path).ok()
 }
 
 /// The game instances pinned to `base_id`. Fails closed: if the instance table
@@ -1907,10 +1944,12 @@ pub fn repair_framework(
         )));
     }
     // Copying a file onto itself zeroes it. A base whose source install is its own folder cannot
-    // be repaired by copying, so nothing is written.
-    if agora_game_api::same_folder(&manifest.location, &manifest.source_location) {
+    // be repaired by copying, so nothing is written — and a pair that cannot be resolved is refused
+    // for the same reason: it might be one folder.
+    if !is_distinct_folder(&manifest.location, &manifest.source_location) {
         return Err(BaseError::Other(format!(
-            "refusing to repair {}: the base folder and its source install are the same folder ({})",
+            "refusing to repair {}: the base folder and its source install are the same folder, or \
+             could not be told apart ({})",
             framework.name,
             manifest.location.display()
         )));
@@ -1939,9 +1978,10 @@ pub fn repair_framework(
             None => manifest.location.join(required),
         };
         let source = manifest.source_location.join(required);
-        if agora_game_api::same_folder(&source, &destination) {
+        if !is_distinct_folder(&source, &destination) {
             return Err(BaseError::Other(format!(
-                "refusing to repair {required}: its source and destination are the same file ({})",
+                "refusing to repair {required}: its source and destination are the same file or \
+                 could not be told apart ({})",
                 source.display()
             )));
         }

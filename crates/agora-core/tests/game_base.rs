@@ -2215,6 +2215,95 @@ fn build_in_other_root(tmp: &TempDir, build: &str) -> (AppPaths, std::path::Path
     (paths, root, outcome.manifest().base_id.clone())
 }
 
+/// A link to a folder: a junction on Windows (no administrator rights needed), a symbolic link
+/// elsewhere. Panics when the link cannot be made, because a test that silently skips proves
+/// nothing.
+fn link_folder(link: &std::path::Path, target: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("cmd runs");
+        assert!(
+            status.status.success() && link.exists(),
+            "mklink /J failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).expect("the link is made");
+}
+
+#[test]
+fn a_record_that_reaches_the_base_through_a_link_is_refused() {
+    // The record's `location` is a link to the base folder rather than the folder Agora made. That
+    // is not a record Agora wrote, and deleting through it is exactly what removal must not do.
+    let tmp = TempDir::new().unwrap();
+    let (paths, root, base_id) = build_in_other_root(&tmp, "alias");
+    let real = root.join(&base_id);
+    std::fs::write(real.join("keep.txt"), b"keep me").unwrap();
+    let alias = tmp.path().join("alias");
+    link_folder(&alias, &real);
+
+    let manifest_path = paths.base_manifest_path(&base_id);
+    let mut manifest: agora_core::game_base::BaseManifest =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest.location = alias.clone();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        remove_base(&paths, &base_id).is_err(),
+        "a record that only reaches the base through a link must be refused"
+    );
+    assert_eq!(
+        std::fs::read(real.join("keep.txt")).unwrap(),
+        b"keep me",
+        "the base folder Agora made survives"
+    );
+}
+
+#[test]
+fn a_source_install_that_is_a_link_to_the_base_is_refused() {
+    // The base sits inside the install it was built from, but no spelling of the install path looks
+    // like the base's: only the resolved values show it. The check runs on those, so removing the
+    // base cannot delete the install that is pointed at it.
+    let tmp = TempDir::new().unwrap();
+    let (paths, root, base_id) = build_in_other_root(&tmp, "source-link");
+    let real = root.join(&base_id);
+    std::fs::write(real.join("keep.txt"), b"keep me").unwrap();
+    let install_link = tmp.path().join("install-link");
+    link_folder(&install_link, &real);
+
+    let manifest_path = paths.base_manifest_path(&base_id);
+    let mut manifest: agora_core::game_base::BaseManifest =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest.source_location = install_link.clone();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let error =
+        remove_base(&paths, &base_id).expect_err("the base is inside its own source install");
+    assert!(
+        error.to_string().contains("install it was built from"),
+        "the refusal says why: {error}"
+    );
+    assert_eq!(
+        std::fs::read(real.join("keep.txt")).unwrap(),
+        b"keep me",
+        "the base folder survives"
+    );
+}
+
 #[test]
 fn a_base_in_another_root_is_removable_only_while_its_root_is_remembered() {
     // The roots a build used are kept in the data folder; removal trusts exactly those.

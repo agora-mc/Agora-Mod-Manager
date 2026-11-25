@@ -7,7 +7,8 @@
 //! consumer these tests speak for.
 
 use agora_game_api::{
-    is_link, join_under, resolve_destination, same_spelling, same_target, PathError, RelPath,
+    compare_folder, is_link, join_under, resolve_destination, same_spelling, same_target,
+    PathError, PathRelation, RelPath,
 };
 use std::path::{Path, PathBuf};
 
@@ -207,6 +208,141 @@ fn one_folder_reached_through_a_link_is_one_folder() {
         same_folder(&real.join("mods"), &root.path().join("alias").join("mods")),
         "two spellings of one folder are one folder once the link is resolved"
     );
+}
+
+#[test]
+fn a_path_that_cannot_be_resolved_is_not_said_to_be_the_same() {
+    // The folder is a file, so nothing below it can be resolved: canonicalize answers
+    // "not a directory" (a dangling link, a link loop or a missing permission answers the same way).
+    let root = temp_dir();
+    let file = root.path().join("a-file");
+    std::fs::write(&file, b"x").unwrap();
+    let under_a_file = file.join("child");
+    match compare_folder(&under_a_file, &under_a_file) {
+        PathRelation::CantTell(why) => assert!(
+            why.contains("a-file"),
+            "the reason says what could not be read: {why}"
+        ),
+        other => {
+            panic!("the same unresolvable path is a question, not a positive identity: {other:?}")
+        }
+    }
+    assert!(matches!(
+        compare_folder(&under_a_file, &file),
+        PathRelation::CantTell(_)
+    ));
+}
+
+#[test]
+fn two_paths_that_are_genuinely_absent_are_compared_by_spelling() {
+    let root = temp_dir();
+    let one = root.path().join("gone").join("mods");
+    let same = root.path().join("gone").join("MODS");
+    // Windows and macOS compare these as one name; Linux does not.
+    let folded = cfg!(windows) || cfg!(target_os = "macos");
+    assert_eq!(
+        compare_folder(&one, &same),
+        if folded {
+            PathRelation::Same
+        } else {
+            PathRelation::Different
+        }
+    );
+    assert_eq!(
+        compare_folder(&one, &root.path().join("gone").join("other")),
+        PathRelation::Different
+    );
+}
+
+#[test]
+fn a_path_that_exists_and_one_that_does_not_are_two_things() {
+    let root = temp_dir();
+    std::fs::create_dir_all(root.path().join("mods")).unwrap();
+    assert_eq!(
+        compare_folder(&root.path().join("mods"), &root.path().join("gone")),
+        PathRelation::Different
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn resolving_refuses_a_dangling_link_on_the_way() {
+    let root = temp_dir();
+    let gone = root.path().join("gone");
+    std::os::unix::fs::symlink(&gone, root.path().join("link")).unwrap();
+    match resolve_destination(&root.path().join("link").join("a.jar")) {
+        Err(PathError::Unresolvable { .. }) => {}
+        other => panic!("a link whose target is gone has no destination: {other:?}"),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn resolving_refuses_a_dangling_junction_on_the_way() {
+    let root = temp_dir();
+    let gone = root.path().join("gone");
+    make_junction(&root.path().join("link"), &gone);
+    match resolve_destination(&root.path().join("link").join("a.jar")) {
+        Err(PathError::Unresolvable { .. }) => {}
+        other => panic!("a junction whose target is gone has no destination: {other:?}"),
+    }
+}
+
+#[test]
+fn resolving_refuses_a_path_under_a_file() {
+    let root = temp_dir();
+    let file = root.path().join("a-file");
+    std::fs::write(&file, b"x").unwrap();
+    match resolve_destination(&file.join("child").join("a.jar")) {
+        Err(PathError::Unresolvable { .. }) => {}
+        other => panic!("nothing can be written under a file: {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn joining_refuses_a_root_that_is_itself_a_link() {
+    let root = temp_dir();
+    let real = temp_dir();
+    std::os::unix::fs::symlink(real.path(), root.path().join("instance")).unwrap();
+    let rel = RelPath::strict("mods/a.jar").unwrap();
+    match join_under(&root.path().join("instance"), &rel) {
+        Err(PathError::LinkOnTheWay { .. }) => {}
+        other => panic!("the root itself is a link, so nothing is written through it: {other:?}"),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn joining_refuses_a_root_that_is_itself_a_junction() {
+    let root = temp_dir();
+    let real = temp_dir();
+    make_junction(&root.path().join("instance"), real.path());
+    let rel = RelPath::strict("mods/a.jar").unwrap();
+    match join_under(&root.path().join("instance"), &rel) {
+        Err(PathError::LinkOnTheWay { .. }) => {}
+        other => {
+            panic!("the root itself is a junction, so nothing is written through it: {other:?}")
+        }
+    }
+}
+
+#[test]
+fn joining_refuses_a_root_that_is_a_file() {
+    let root = temp_dir();
+    let file = root.path().join("a-file");
+    std::fs::write(&file, b"x").unwrap();
+    let rel = RelPath::strict("child/a.jar").unwrap();
+    match join_under(&file, &rel) {
+        Err(PathError::NotAFolder { .. }) => {}
+        other => panic!("a file is not an instance root: {other:?}"),
+    }
+    // And a file met on the way inside the root is refused too.
+    std::fs::write(root.path().join("child"), b"x").unwrap();
+    match join_under(root.path(), &rel) {
+        Err(PathError::NotAFolder { path, .. }) => assert_eq!(path, "child"),
+        other => panic!("nothing can be written under a file: {other:?}"),
+    }
 }
 
 #[test]

@@ -22,10 +22,20 @@ use std::time::Duration;
 use sysinfo::{Pid, System};
 
 /// Whether the OS reports the executable the identity recorded: the game contract's path
-/// comparison, because a recorded path is a spelling that may name a resolved target or a file
-/// that is already gone.
-fn executable_paths_match(expected: &Path, observed: &Path) -> bool {
-    agora_game_api::same_folder(expected, observed)
+/// comparison, because a recorded path is a spelling that may name a resolved target or a file that
+/// is already gone. "Could not tell" is not "the same": the caller reports it rather than signalling
+/// a process it could not identify.
+fn compare_executable(expected: &Path, observed: &Path) -> agora_game_api::PathRelation {
+    agora_game_api::compare_folder(expected, observed)
+}
+
+/// Whether the OS reports exactly the executable recorded, which is the only answer that settles a
+/// question or names a process.
+fn executable_is_same(expected: &Path, observed: &Path) -> bool {
+    matches!(
+        compare_executable(expected, observed),
+        agora_game_api::PathRelation::Same
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -57,9 +67,9 @@ pub fn capture(pid: u32) -> LauncherResult<ProcessIdentity> {
         let still_parent_image = parent_exe
             .as_deref()
             .zip(current_exe)
-            .is_some_and(|(parent, exe)| executable_paths_match(parent, exe));
+            .is_some_and(|(parent, exe)| executable_is_same(parent, exe));
         let image_settled = match (previous_exe, current_exe) {
-            (Some(previous), Some(current)) => executable_paths_match(previous, current),
+            (Some(previous), Some(current)) => executable_is_same(previous, current),
             (None, None) => true,
             _ => false,
         };
@@ -276,8 +286,17 @@ fn check_pid(
             }
             match (&identity.expected_exe, &exe) {
                 (Some(expected), Some(current)) => {
-                    if !executable_paths_match(Path::new(expected), Path::new(current)) {
-                        return ProcessCheck::Gone;
+                    match compare_executable(Path::new(expected), Path::new(current)) {
+                        agora_game_api::PathRelation::Same => {}
+                        agora_game_api::PathRelation::Different => return ProcessCheck::Gone,
+                        // A path that cannot be read does not name this process, and guessing would
+                        // let a signal reach one Agora never identified.
+                        agora_game_api::PathRelation::CantTell(why) => {
+                            return ProcessCheck::CantTell(format!(
+                                "pid {} could not be identified: its executable {why}",
+                                identity.pid
+                            ))
+                        }
                     }
                 }
                 _ if require_exe => return unknown(),
@@ -406,7 +425,7 @@ pub(crate) fn terminate_tree(roots: &[&ProcessIdentity]) -> usize {
                     .as_deref()
                     .map(Path::new)
                     .zip(process.exe())
-                    .is_some_and(|(expected, observed)| executable_paths_match(expected, observed))
+                    .is_some_and(|(expected, observed)| executable_is_same(expected, observed))
         }) else {
             continue;
         };
@@ -565,12 +584,12 @@ mod tests {
         std::fs::write(&game, b"game").unwrap();
         std::fs::write(&other, b"other").unwrap();
 
-        assert!(executable_paths_match(&game, &alias.join("game")));
-        assert!(!executable_paths_match(&game, &alias.join("other")));
+        assert!(executable_is_same(&game, &alias.join("game")));
+        assert!(!executable_is_same(&game, &alias.join("other")));
         // This spelling normalizes to the real path, but cannot itself be resolved on Unix.
         let unresolved = dir.path().join(r"real\game");
-        assert!(!executable_paths_match(&game, &unresolved));
-        assert!(!executable_paths_match(&unresolved, &game));
+        assert!(!executable_is_same(&game, &unresolved));
+        assert!(!executable_is_same(&unresolved, &game));
     }
 
     #[test]
@@ -578,11 +597,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let expected = dir.path().join("missing").join("game");
         let same = format!(r"{}/missing\game", dir.path().display());
-        assert!(executable_paths_match(&expected, Path::new(&same)));
-        assert!(!executable_paths_match(
-            &expected,
-            &dir.path().join("other")
-        ));
+        assert!(executable_is_same(&expected, Path::new(&same)));
+        assert!(!executable_is_same(&expected, &dir.path().join("other")));
     }
 
     #[test]
@@ -592,7 +608,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let expected = dir.path().join("missing").join("Game.exe");
         let same = format!(r"{}/missing\game.EXE", dir.path().display());
-        assert!(executable_paths_match(&expected, Path::new(&same)));
+        assert!(executable_is_same(&expected, Path::new(&same)));
     }
 
     #[test]
@@ -604,8 +620,8 @@ mod tests {
         let other = dir.path().join("other");
         std::fs::write(&game, b"game").unwrap();
         std::fs::write(&other, b"other").unwrap();
-        assert!(executable_paths_match(&game, &game));
-        assert!(!executable_paths_match(&game, &other));
+        assert!(executable_is_same(&game, &game));
+        assert!(!executable_is_same(&game, &other));
     }
 
     #[test]
@@ -671,6 +687,45 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn a_process_whose_executable_cannot_be_read_is_cant_tell_not_alive() {
+        // The pid, the start time and the executable's spelling all agree, but the executable path
+        // exists and cannot be resolved, so identity has no answer. Signalling on "the same
+        // spelling" would be a guess about a process Agora never identified.
+        struct Fake(Lookup);
+        impl ProcessView for Fake {
+            fn lookup(&self, _pid: u32) -> Lookup {
+                self.0.clone()
+            }
+            fn job_members(&self, _job: &str) -> Result<usize, String> {
+                Ok(0)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        let unreachable = file.join("child");
+        let spelled = unreachable.display().to_string();
+        let identity = ProcessIdentity {
+            pid: 4242,
+            start_time: 7,
+            expected_exe: Some(spelled.clone()),
+            job: None,
+        };
+        let view = Fake(Lookup::Found {
+            start_time: 7,
+            exe: Some(spelled),
+            zombie: false,
+            exited: false,
+        });
+        let checked = check_exact_with(&identity, &view);
+        assert!(
+            matches!(checked, ProcessCheck::CantTell(_)),
+            "an unreadable executable path is a question, not an answer: {checked:?}"
+        );
     }
 
     #[test]

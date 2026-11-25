@@ -411,22 +411,65 @@ fn collision_key(name: &str) -> String {
     fold_path_case(&full)
 }
 
-/// Whether two paths are one folder or file, spelled either way: the same target when both exist,
-/// the same spelling when neither does, and not the same when only one does.
+/// What two paths are to each other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathRelation {
+    /// One path, spelled differently.
+    Same,
+    /// Two things on disk.
+    Different,
+    /// At least one path could not be read, so the question has no answer. A caller that grants
+    /// permission (signals a process, deletes a folder) treats this as "not the same" and says so.
+    CantTell(String),
+}
+
+/// What two paths are to each other: one, two, or a question nobody could answer.
 ///
 /// This is the question a caller asks when it has to find something it recorded earlier and the
 /// thing may be gone: a base folder named in a manifest, an executable the OS reports for a
 /// process. Comparing what exists resolves a symlinked or junctioned parent once, so one folder
 /// does not look like two, and it stays exact where the disk is case-sensitive. Two paths that are
-/// both gone can only be compared by spelling, which folds case the way the disk does.
+/// both genuinely absent can only be compared by spelling.
 ///
-/// A path that is gone is compared as a spelling, so two such paths that differ only in invalid
-/// UTF-8 compare equal. Callers that delete or signal still confirm identity — see [`same_spelling`].
-pub fn same_folder(left: &Path, right: &Path) -> bool {
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => same_target(&left, &right),
-        (Err(_), Err(_)) => same_spelling(left, right),
-        _ => false,
+/// A path that exists but cannot be resolved — a link whose target is gone, a link loop, a name that
+/// is not a folder on the way, a permission this process does not have — is `CantTell`, never
+/// "the same": the two paths might be one.
+pub fn compare_folder(left: &Path, right: &Path) -> PathRelation {
+    match (read_target(left), read_target(right)) {
+        (Ok(Some(left)), Ok(Some(right))) => {
+            if same_target(&left, &right) {
+                PathRelation::Same
+            } else {
+                PathRelation::Different
+            }
+        }
+        (Ok(None), Ok(None)) => {
+            if same_spelling(left, right) {
+                PathRelation::Same
+            } else {
+                PathRelation::Different
+            }
+        }
+        // One of them is there and the other is not: two things, never one.
+        (Ok(_), Ok(_)) => PathRelation::Different,
+        (Err(why), _) | (_, Err(why)) => PathRelation::CantTell(why),
+    }
+}
+
+/// What a path is: its canonical target, or nothing at all when no name is there.
+///
+/// A name that exists but does not resolve is an error, not "absent": a dangling link, a link loop,
+/// a name that is a file where the path continues, or a permission this process lacks. The question
+/// "may this missing tail have been created" is the same one [`resolve_destination`] answers, so it
+/// asks that.
+fn read_target(path: &Path) -> Result<Option<PathBuf>, String> {
+    match path.canonicalize() {
+        Ok(real) => Ok(Some(real)),
+        Err(_) => match resolve_destination(path) {
+            // Nothing is there and nothing stops a write: the path is genuinely absent.
+            Ok(_) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        },
     }
 }
 
@@ -442,6 +485,9 @@ pub enum PathError {
     /// What is on the way could not be read, so the question has no answer.
     #[error("cannot tell what '{path}' is: {error}")]
     Unreadable { path: String, error: String },
+    /// Something on the way exists but is not a folder a write can go into.
+    #[error("'{path}' cannot be written into: {reason}")]
+    NotAFolder { path: String, reason: String },
     /// The path could not be resolved to a value that could then be checked and written.
     #[error("cannot resolve '{path}': {reason}")]
     Unresolvable { path: String, reason: String },
@@ -463,17 +509,48 @@ pub fn join_under(root: &Path, rel: &RelPath) -> Result<PathBuf, PathError> {
         path: error.value.clone(),
         reason: error.reason.clone(),
     })?;
+    // The root is the caller's own choice, and it has to be a folder Agora made rather than a link
+    // that points somewhere else: everything joined under it is written through it.
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) if is_link(&metadata) => {
+            return Err(PathError::LinkOnTheWay {
+                path: root.display().to_string(),
+                link: root.display().to_string(),
+            })
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(PathError::NotAFolder {
+                path: root.display().to_string(),
+                reason: "it is not a folder".to_string(),
+            })
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PathError::NotAFolder {
+                path: root.display().to_string(),
+                reason: "it is missing".to_string(),
+            })
+        }
+        Err(error) => {
+            return Err(PathError::Unreadable {
+                path: root.display().to_string(),
+                error: error.to_string(),
+            })
+        }
+    }
+    let parts: Vec<&str> = rel.as_str().split('/').collect();
     let mut joined = root.to_path_buf();
     let mut walked = String::new();
-    let mut exists = true;
-    for part in rel.as_str().split('/') {
+    let mut parent_is_a_folder = true;
+    for (index, part) in parts.iter().enumerate() {
+        let is_last = index + 1 == parts.len();
         joined.push(part);
         if !walked.is_empty() {
             walked.push('/');
         }
         walked.push_str(part);
-        if !exists {
-            // Nothing below a component that does not exist can exist either.
+        if !parent_is_a_folder {
+            // Nothing below a component that is absent can exist, and a write will report it.
             continue;
         }
         match std::fs::symlink_metadata(&joined) {
@@ -483,8 +560,16 @@ pub fn join_under(root: &Path, rel: &RelPath) -> Result<PathBuf, PathError> {
                     link: joined.display().to_string(),
                 })
             }
+            Ok(metadata) if !is_last && !metadata.is_dir() => {
+                return Err(PathError::NotAFolder {
+                    path: walked,
+                    reason: "it is not a folder, so nothing can be written under it".to_string(),
+                })
+            }
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => exists = false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                parent_is_a_folder = false;
+            }
             Err(error) => {
                 return Err(PathError::Unreadable {
                     path: walked,
@@ -518,6 +603,11 @@ pub fn is_link(metadata: &std::fs::Metadata) -> bool {
 /// rather than resolved, because the two platforms resolve it differently when a folder on the way
 /// does not exist: Windows collapses it lexically, Unix fails. The same path would then name two
 /// different targets, which is the one thing one path may not do.
+///
+/// It fails closed. A part of the path that is only *missing* is an answer: nothing is there, and
+/// the caller may create it. Anything else that stops the resolution is not — a link whose target is
+/// gone, a link loop, a name that is a file where the path continues, a permission this process does
+/// not have — because each of those might be a real destination Agora cannot see.
 pub fn resolve_destination(path: &Path) -> Result<PathBuf, PathError> {
     if path
         .components()
@@ -535,11 +625,57 @@ pub fn resolve_destination(path: &Path) -> Result<PathBuf, PathError> {
     loop {
         match existing.canonicalize() {
             Ok(real) => {
+                if tail.is_empty() {
+                    return Ok(real);
+                }
+                // The part that exists has to be a folder for a missing tail to hang off it: a file
+                // here means the tail names nothing that could ever be written.
+                match std::fs::symlink_metadata(&real) {
+                    Ok(metadata) if metadata.is_dir() => {}
+                    Ok(_) => {
+                        return Err(PathError::Unresolvable {
+                            path: path.display().to_string(),
+                            reason: format!(
+                                "'{}' is not a folder, so nothing can be written under it",
+                                real.display()
+                            ),
+                        })
+                    }
+                    Err(error) => {
+                        return Err(PathError::Unresolvable {
+                            path: path.display().to_string(),
+                            reason: format!("cannot tell what '{}' is: {error}", real.display()),
+                        })
+                    }
+                }
                 let mut resolved = real;
                 resolved.extend(tail.iter().rev());
                 return Ok(resolved);
             }
             Err(error) => {
+                // A name is there but the path it leads to is not: a dangling link, a link loop, a
+                // permission. Only an absent name may be walked past.
+                match std::fs::symlink_metadata(&existing) {
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => {
+                        return Err(PathError::Unresolvable {
+                            path: path.display().to_string(),
+                            reason: format!(
+                                "'{}' exists but does not resolve: {error}",
+                                existing.display()
+                            ),
+                        })
+                    }
+                    Err(other) => {
+                        return Err(PathError::Unresolvable {
+                            path: path.display().to_string(),
+                            reason: format!(
+                                "cannot tell what '{}' is: {other}",
+                                existing.display()
+                            ),
+                        })
+                    }
+                }
                 let Some(name) = existing.file_name() else {
                     return Err(PathError::Unresolvable {
                         path: path.display().to_string(),
@@ -981,22 +1117,29 @@ mod tests {
 
     #[test]
     fn two_paths_that_are_both_gone_are_compared_by_spelling() {
-        assert!(same_folder(
-            Path::new("/gone/One/mods"),
-            Path::new("/gone/one/MODS")
-        ));
-        assert!(!same_folder(
-            Path::new("/gone/One/mods"),
-            Path::new("/gone/One/mods2")
-        ));
+        // The spelling rule decides: Windows and macOS fold these two names into one, Linux does
+        // not. Either way it is an answer, not a shrug, because both paths are genuinely absent.
+        let folded = cfg!(windows) || cfg!(target_os = "macos");
+        assert_eq!(
+            compare_folder(Path::new("/gone/One/mods"), Path::new("/gone/one/MODS")),
+            if folded {
+                PathRelation::Same
+            } else {
+                PathRelation::Different
+            }
+        );
+        assert_eq!(
+            compare_folder(Path::new("/gone/One/mods"), Path::new("/gone/One/mods2")),
+            PathRelation::Different
+        );
     }
 
     #[test]
     fn a_path_that_exists_is_not_the_same_as_one_that_does_not() {
-        assert!(!same_folder(
-            Path::new("."),
-            Path::new("./a-folder-that-is-not-there")
-        ));
+        assert_eq!(
+            compare_folder(Path::new("."), Path::new("./a-folder-that-is-not-there")),
+            PathRelation::Different
+        );
     }
 
     #[test]
