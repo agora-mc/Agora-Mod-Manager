@@ -14,8 +14,8 @@ fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
-        let options =
-            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
         for (name, bytes) in entries {
             writer.start_file(*name, options).unwrap();
             writer.write_all(bytes).unwrap();
@@ -76,10 +76,10 @@ fn raw_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
         out.extend_from_slice(&header);
         out.extend_from_slice(bytes);
         let padding = (512 - bytes.len() % 512) % 512;
-        out.extend(std::iter::repeat(0u8).take(padding));
+        out.extend(std::iter::repeat_n(0u8, padding));
     }
     // Two zero blocks end a tar.
-    out.extend(std::iter::repeat(0u8).take(1024));
+    out.extend(std::iter::repeat_n(0u8, 1024));
     out
 }
 
@@ -215,14 +215,25 @@ fn more_entries_than_the_preset_allows_is_refused() {
     let error = SafeArchive::open_bytes(zip_bytes(&entries), small_limits())
         .err()
         .expect("five files, four allowed");
-    assert!(matches!(error, ArchiveError::TooManyEntries { count: 5, limit: 4, .. }));
+    assert!(matches!(
+        error,
+        ArchiveError::TooManyEntries {
+            count: 5,
+            limit: 4,
+            ..
+        }
+    ));
 }
 
 #[test]
 fn more_bytes_than_the_preset_allows_is_refused() {
     let entry = [b'a'; 20];
     let error = SafeArchive::open_bytes(
-        zip_bytes(&[("a.txt", &entry[..]), ("b.txt", &entry[..]), ("c.txt", &entry[..])]),
+        zip_bytes(&[
+            ("a.txt", &entry[..]),
+            ("b.txt", &entry[..]),
+            ("c.txt", &entry[..]),
+        ]),
         small_limits(),
     )
     .err()
@@ -290,7 +301,10 @@ fn an_entry_that_declares_more_than_it_holds_is_refused() {
         ),
         "{error:?}"
     );
-    assert!(sink.len() < 4096, "nothing larger than the entry was handed over");
+    assert!(
+        sink.len() < 4096,
+        "nothing larger than the entry was handed over"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -305,7 +319,10 @@ fn assert_escape_refused(bytes: Vec<u8>, what: &str) {
         .extract(&dest, NamePolicy::WithoutThem)
         .expect_err("an escaping name is refused even when the caller would skip entries");
     assert!(
-        matches!(error, ArchiveError::Escapes { .. } | ArchiveError::LinkEntry { .. }),
+        matches!(
+            error,
+            ArchiveError::Escapes { .. } | ArchiveError::LinkEntry { .. }
+        ),
         "{what}: {error:?}"
     );
     assert!(!dest.join("evil.txt").exists(), "{what}: nothing written");
@@ -328,7 +345,12 @@ fn zip_slip_forms_are_refused() {
 
 #[test]
 fn tar_slip_forms_are_refused() {
-    for name in ["../evil.txt", "/etc/evil.txt", "config/../../evil.txt", "C:/evil.txt"] {
+    for name in [
+        "../evil.txt",
+        "/etc/evil.txt",
+        "config/../../evil.txt",
+        "C:/evil.txt",
+    ] {
         assert_escape_refused(raw_tar(&[(name, b"evil")]), name);
     }
 }
@@ -346,9 +368,11 @@ fn a_zip_symlink_entry_is_refused() {
 #[test]
 fn a_reserved_name_is_refused_and_named() {
     let (dir, dest) = extract_dir();
-    let mut archive =
-        SafeArchive::open_bytes(zip_bytes(&[("textures/aux.dds", b"data")]), ArchiveLimits::PACK)
-            .unwrap();
+    let mut archive = SafeArchive::open_bytes(
+        zip_bytes(&[("textures/aux.dds", b"data")]),
+        ArchiveLimits::PACK,
+    )
+    .unwrap();
     let error = archive
         .extract(&dest, NamePolicy::Refuse)
         .expect_err("aux is a name Windows reserves");
@@ -375,7 +399,10 @@ fn a_name_that_ends_in_a_dot_is_refused() {
         SafeArchive::open_bytes(zip_bytes(&[("config/run.bat.", b"x")]), ArchiveLimits::PACK)
             .unwrap();
     let error = archive.extract(&dest, NamePolicy::Refuse).unwrap_err();
-    assert!(matches!(error, ArchiveError::UnsafeNames { .. }), "{error:?}");
+    assert!(
+        matches!(error, ArchiveError::UnsafeNames { .. }),
+        "{error:?}"
+    );
     drop(dir);
 }
 
@@ -428,7 +455,10 @@ fn a_case_collision_is_extracted_without_when_the_caller_opts_in() {
     // filesystem then reports for it depends on the platform, which is exactly why the collision is
     // refused rather than written twice.
     assert_eq!(std::fs::read(dest.join("config/Mod.toml")).unwrap(), b"one");
-    assert_eq!(std::fs::read(dest.join("config/other.toml")).unwrap(), b"three");
+    assert_eq!(
+        std::fs::read(dest.join("config/other.toml")).unwrap(),
+        b"three"
+    );
     assert!(!dest.join("textures").exists());
     drop(dir);
 }
@@ -437,9 +467,11 @@ fn a_case_collision_is_extracted_without_when_the_caller_opts_in() {
 fn a_jar_entry_named_after_a_windows_device_is_still_readable() {
     // An entry name is not a file name until something writes it: reading `aux.class` out of a jar
     // is what a mod loader does, and the reader must not refuse it.
-    let mut archive =
-        SafeArchive::open_bytes(zip_bytes(&[("aux.class", b"\xca\xfe\xba\xbe")]), ArchiveLimits::PACK)
-            .unwrap();
+    let mut archive = SafeArchive::open_bytes(
+        zip_bytes(&[("aux.class", b"\xca\xfe\xba\xbe")]),
+        ArchiveLimits::PACK,
+    )
+    .unwrap();
     let bytes = archive.read("aux.class").unwrap();
     assert_eq!(bytes, b"\xca\xfe\xba\xbe");
 }
@@ -464,7 +496,10 @@ fn a_tar_gz_is_listed_and_extracted() {
 #[test]
 fn a_sevenz_is_listed_read_and_extracted() {
     let (dir, dest) = extract_dir();
-    let bytes = sevenz_bytes(&[("mods/info.json", b"{\"id\":\"x\"}"), ("mods/a.class", b"code")]);
+    let bytes = sevenz_bytes(&[
+        ("mods/info.json", b"{\"id\":\"x\"}"),
+        ("mods/a.class", b"code"),
+    ]);
     let mut archive = SafeArchive::open_bytes(bytes, ArchiveLimits::MOD_ARCHIVE).unwrap();
     assert_eq!(archive.format(), ArchiveFormat::SevenZ);
     assert_eq!(archive.file_entries().count(), 2);
@@ -487,7 +522,10 @@ fn a_file_that_is_not_an_archive_is_refused() {
     let error = SafeArchive::open_bytes(b"not an archive at all".to_vec(), ArchiveLimits::PACK)
         .err()
         .expect("refused");
-    assert!(matches!(error, ArchiveError::UnknownFormat { .. }), "{error:?}");
+    assert!(
+        matches!(error, ArchiveError::UnknownFormat { .. }),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -526,21 +564,22 @@ fn a_corrupt_archive_of_each_format_is_refused_with_a_reason() {
     tar.extend_from_slice(b"ustar  \0");
     tar.extend_from_slice(&[0xEE; 200]);
 
-    for (name, bytes) in [
-        ("zip", zip),
-        ("7z", seven),
-        ("tar.gz", gz),
-        ("tar", tar),
-    ] {
+    for (name, bytes) in [("zip", zip), ("7z", seven), ("tar.gz", gz), ("tar", tar)] {
         let error = match SafeArchive::open_bytes(bytes, ArchiveLimits::PACK) {
             Ok(_) => panic!("{name}: a damaged archive is never read as empty"),
             Err(error) => error,
         };
         assert!(
-            matches!(error, ArchiveError::Corrupt { .. } | ArchiveError::Unreadable { .. }),
+            matches!(
+                error,
+                ArchiveError::Corrupt { .. } | ArchiveError::Unreadable { .. }
+            ),
             "{name}: {error:?}"
         );
-        assert!(!error.to_string().is_empty(), "{name}: the reason is stated");
+        assert!(
+            !error.to_string().is_empty(),
+            "{name}: the reason is stated"
+        );
     }
 }
 
@@ -559,7 +598,10 @@ fn a_rar_archive_without_a_reader_is_refused() {
     let error = SafeArchive::open_bytes(rar_magic_bytes(), ArchiveLimits::MOD_ARCHIVE)
         .err()
         .expect("no reader was given");
-    assert!(matches!(error, ArchiveError::NoRarReader { .. }), "{error:?}");
+    assert!(
+        matches!(error, ArchiveError::NoRarReader { .. }),
+        "{error:?}"
+    );
 }
 
 struct FakeRar;
@@ -592,8 +634,8 @@ fn a_rar_archive_reads_through_the_seam() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mod.rar");
     std::fs::write(&path, rar_magic_bytes()).unwrap();
-    let mut archive = SafeArchive::open_with_rar(&path, ArchiveLimits::MOD_ARCHIVE, Box::new(FakeRar))
-        .unwrap();
+    let mut archive =
+        SafeArchive::open_with_rar(&path, ArchiveLimits::MOD_ARCHIVE, Box::new(FakeRar)).unwrap();
     assert_eq!(archive.format(), ArchiveFormat::Rar);
     assert_eq!(archive.file_entries().count(), 2);
     assert_eq!(archive.read("mods/a.esp").unwrap(), b"data");
@@ -602,10 +644,13 @@ fn a_rar_archive_reads_through_the_seam() {
     // The same reader behind the same interface extracts, and the same naming rules apply: the
     // RAR's `textures/aux.dds` is refused by default like an entry of any other format.
     let out = dir.path().join("out");
-    let mut archive = SafeArchive::open_with_rar(&path, ArchiveLimits::MOD_ARCHIVE, Box::new(FakeRar))
-        .unwrap();
+    let mut archive =
+        SafeArchive::open_with_rar(&path, ArchiveLimits::MOD_ARCHIVE, Box::new(FakeRar)).unwrap();
     let error = archive.extract(&out, NamePolicy::Refuse).unwrap_err();
-    assert!(matches!(error, ArchiveError::UnsafeNames { .. }), "{error:?}");
+    assert!(
+        matches!(error, ArchiveError::UnsafeNames { .. }),
+        "{error:?}"
+    );
     let report = archive.extract(&out, NamePolicy::WithoutThem).unwrap();
     assert_eq!(report.written, vec!["mods/a.esp".to_string()]);
     assert_eq!(report.skipped.len(), 1);

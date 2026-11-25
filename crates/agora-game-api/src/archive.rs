@@ -252,7 +252,8 @@ pub fn classify_entry_name(name: &str) -> EntryName {
     if let (Some(first), Some(':')) = (characters.next(), characters.next()) {
         if first.is_ascii_alphabetic() {
             return EntryName::Escapes {
-                reason: "it starts with a drive letter, so it leaves the extraction root".to_string(),
+                reason: "it starts with a drive letter, so it leaves the extraction root"
+                    .to_string(),
             };
         }
     }
@@ -330,9 +331,7 @@ pub enum ArchiveError {
         limit: u64,
     },
     /// An entry delivered a different number of bytes than it declared, so its own header lied.
-    #[error(
-        "'{path}' entry '{entry}' declared {declared} bytes and delivered {delivered}"
-    )]
+    #[error("'{path}' entry '{entry}' declared {declared} bytes and delivered {delivered}")]
     EntrySizeLies {
         path: String,
         entry: String,
@@ -709,17 +708,15 @@ impl SafeArchive {
                     });
                 };
                 let Source::Path(archive) = &self.source else {
-                    return Err(ArchiveError::NoRarReader {
-                        path: self.label(),
-                    });
+                    return Err(ArchiveError::NoRarReader { path: self.label() });
                 };
                 let mut sink = Sink::new(out, &context);
-                let written = rar
-                    .read_entry(archive, name, &mut sink)
-                    .map_err(|reason| ArchiveError::Rar {
+                let written = rar.read_entry(archive, name, &mut sink).map_err(|reason| {
+                    ArchiveError::Rar {
                         path: context.archive.clone(),
                         reason,
-                    })?;
+                    }
+                })?;
                 sink.finish()?;
                 Ok(written)
             }
@@ -734,11 +731,9 @@ impl SafeArchive {
         declared: u64,
     ) -> Result<u64, ArchiveError> {
         let mut source = self.open_reader()?;
-        let mut reader = sevenz_rust2::ArchiveReader::new(
-            &mut source,
-            sevenz_rust2::Password::empty(),
-        )
-        .map_err(|error| sevenz_error(&context.archive, error))?;
+        let mut reader =
+            sevenz_rust2::ArchiveReader::new(&mut source, sevenz_rust2::Password::empty())
+                .map_err(|error| sevenz_error(&context.archive, error))?;
         let mut failure: Option<ArchiveError> = None;
         let mut written = 0u64;
         let wanted = name.to_string();
@@ -805,9 +800,7 @@ impl SafeArchive {
             return Err(ArchiveError::NoRarReader { path });
         };
         let Source::Path(archive) = &self.source else {
-            return Err(ArchiveError::NoRarReader {
-                path: self.label(),
-            });
+            return Err(ArchiveError::NoRarReader { path: self.label() });
         };
         let listed = rar.list(archive).map_err(|reason| ArchiveError::Rar {
             path: path.clone(),
@@ -866,11 +859,11 @@ impl SafeArchive {
     fn list_sevenz(&self) -> Result<Vec<ArchiveEntry>, ArchiveError> {
         let path = self.label();
         let mut source = self.open_reader()?;
-        let archive = match sevenz_rust2::Archive::read(&mut source, &sevenz_rust2::Password::empty())
-        {
-            Ok(archive) => archive,
-            Err(error) => return Err(sevenz_error(&path, error)),
-        };
+        let archive =
+            match sevenz_rust2::Archive::read(&mut source, &sevenz_rust2::Password::empty()) {
+                Ok(archive) => archive,
+                Err(error) => return Err(sevenz_error(&path, error)),
+            };
         let mut entries = Vec::with_capacity(archive.files.len());
         for entry in &archive.files {
             let kind = if entry.is_directory || entry.name.ends_with('/') {
@@ -1043,10 +1036,13 @@ impl SafeArchive {
         // together" has one home. It reports one offender at a time, so this asks again with that
         // one set aside, and every offending name ends up in the list.
         loop {
-            let paths: Vec<StrictRelPath> = plan.iter().map(|(strict, _, _)| strict.clone()).collect();
+            let paths: Vec<StrictRelPath> =
+                plan.iter().map(|(strict, _, _)| strict.clone()).collect();
             match validate_path_set(&paths) {
                 Ok(()) | Err(PathSetError::EmptySet) => break,
-                Err(error @ (PathSetError::Collides { .. } | PathSetError::FolderIsAFile { .. })) => {
+                Err(
+                    error @ (PathSetError::Collides { .. } | PathSetError::FolderIsAFile { .. }),
+                ) => {
                     let offending = match &error {
                         PathSetError::Collides { path } => path.clone(),
                         PathSetError::FolderIsAFile { path, .. } => path.clone(),
@@ -1186,7 +1182,9 @@ fn detect_format(source: &Source) -> Result<ArchiveFormat, ArchiveError> {
         }
     };
     let zip_magic = read >= 4
-        && (&head[..4] == b"PK\x03\x04" || &head[..4] == b"PK\x05\x06" || &head[..4] == b"PK\x07\x08");
+        && (&head[..4] == b"PK\x03\x04"
+            || &head[..4] == b"PK\x05\x06"
+            || &head[..4] == b"PK\x07\x08");
     if zip_magic {
         return Ok(ArchiveFormat::Zip);
     }
@@ -1209,7 +1207,11 @@ fn detect_format(source: &Source) -> Result<ArchiveFormat, ArchiveError> {
     })
 }
 
-fn read_up_to<R: Read>(reader: &mut R, buffer: &mut [u8], path: &str) -> Result<usize, ArchiveError> {
+fn read_up_to<R: Read>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    path: &str,
+) -> Result<usize, ArchiveError> {
     let mut filled = 0;
     while filled < buffer.len() {
         match reader.read(&mut buffer[filled..]) {

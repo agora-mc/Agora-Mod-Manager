@@ -183,7 +183,12 @@ pub struct LeftOutEntry {
 ///    ask for the rest instead, and gets the list of what was left out.
 /// 6. On any refusal, deletes the files it had already written.
 pub fn extract_overrides(zip_path: &Path, dest_dir: &Path) -> LauncherResult<ExtractionResult> {
-    extract_overrides_with_inputs(zip_path, dest_dir, OverridePolicy::Standard, NamesPolicy::Refuse)
+    extract_overrides_with_inputs(
+        zip_path,
+        dest_dir,
+        OverridePolicy::Standard,
+        NamesPolicy::Refuse,
+    )
 }
 
 /// [`extract_overrides`] under an explicit [`OverridePolicy`].
@@ -425,10 +430,7 @@ mod tests {
         let zip_path = dir.path().join("pack.zip");
         write_zip_at(
             &zip_path,
-            &[
-                ("config/settings.toml", b"a"),
-                ("config/aux.dds", b"b"),
-            ],
+            &[("config/settings.toml", b"a"), ("config/aux.dds", b"b")],
         );
         let dest = dir.path().join("instance");
         std::fs::create_dir_all(&dest).unwrap();
@@ -448,9 +450,13 @@ mod tests {
         );
 
         // The caller's explicit answer: write what can be written, and say what was left out.
-        let result =
-            extract_overrides_with_inputs(&zip_path, &dest, OverridePolicy::Standard, NamesPolicy::WithoutThem)
-                .unwrap();
+        let result = extract_overrides_with_inputs(
+            &zip_path,
+            &dest,
+            OverridePolicy::Standard,
+            NamesPolicy::WithoutThem,
+        )
+        .unwrap();
         assert_eq!(result.extracted, vec!["config/settings.toml"]);
         assert_eq!(result.skipped, vec!["config/aux.dds"]);
         assert_eq!(result.left_out.len(), 1);
@@ -476,9 +482,13 @@ mod tests {
         let error = extract_overrides(&zip_path, &dest).unwrap_err();
         assert!(error.to_string().contains("mod.toml"), "{error}");
 
-        let result =
-            extract_overrides_with_inputs(&zip_path, &dest, OverridePolicy::Standard, NamesPolicy::WithoutThem)
-                .unwrap();
+        let result = extract_overrides_with_inputs(
+            &zip_path,
+            &dest,
+            OverridePolicy::Standard,
+            NamesPolicy::WithoutThem,
+        )
+        .unwrap();
         assert_eq!(result.extracted.len(), 2);
         assert_eq!(result.left_out.len(), 1);
         assert_eq!(result.left_out[0].path, "config/mod.toml");
@@ -506,9 +516,13 @@ mod tests {
         std::fs::create_dir_all(&dest).unwrap();
 
         // An escape is never skippable, even for a caller that would leave entries out.
-        let error =
-            extract_overrides_with_inputs(&zip_path, &dest, OverridePolicy::Standard, NamesPolicy::WithoutThem)
-                .unwrap_err();
+        let error = extract_overrides_with_inputs(
+            &zip_path,
+            &dest,
+            OverridePolicy::Standard,
+            NamesPolicy::WithoutThem,
+        )
+        .unwrap_err();
         assert!(
             matches!(&error, LauncherError::Generic { code, .. } if code == "ERR_ZIP_SLIP"),
             "{error:?}"

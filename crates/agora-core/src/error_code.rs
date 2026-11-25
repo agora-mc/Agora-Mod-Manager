@@ -230,6 +230,10 @@ error_codes! {
     UsePackInstall = "ERR_USE_PACK_INSTALL", Install, 1;
     ZipBomb = "ERR_ZIP_BOMB", Install, 30;
     ZipSlip = "ERR_ZIP_SLIP", Install, 1;
+    // A pack or archive holds entries whose names a disk cannot hold. The refusal names each one;
+    // the caller may extract without them instead (MASTER_SPEC 32.3), which is why this uses the
+    // integrity group the override codes use rather than the plain install failure.
+    ZipUnsafeNames = "ERR_ZIP_UNSAFE_NAMES", Install, 30;
     ZipTooLarge = "ERR_ZIP_TOO_LARGE", Install, 1;
     // ---- Instance ----
     Backup = "ERR_BACKUP", Instance, 1;
