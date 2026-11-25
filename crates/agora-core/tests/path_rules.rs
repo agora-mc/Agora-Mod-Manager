@@ -7,8 +7,8 @@
 //! consumer these tests speak for.
 
 use agora_game_api::{
-    compare_folder, is_link, join_under, resolve_destination, same_spelling, same_target, PathError,
-    PathRelation, RelPath, ReparseTag,
+    compare_folder, is_link, join_under, resolve_destination, same_spelling, same_target,
+    PathError, PathRelation, RelPath, ReparseTag,
 };
 use std::path::{Path, PathBuf};
 
@@ -352,7 +352,11 @@ fn a_plain_folder_is_not_a_link() {
     let root = temp_dir();
     std::fs::create_dir_all(root.path().join("mods")).unwrap();
     let plain = root.path().join("mods");
-    assert_eq!(is_link(&plain), Ok(false), "a plain directory is not a link");
+    assert_eq!(
+        is_link(&plain),
+        Ok(false),
+        "a plain directory is not a link"
+    );
     assert!(
         !same_spelling(root.path(), &root.path().join("mods")),
         "different folders are different spellings"

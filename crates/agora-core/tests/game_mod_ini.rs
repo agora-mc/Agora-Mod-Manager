@@ -233,11 +233,7 @@ fn a_path_typed_in_another_case_names_its_row_only_where_the_disk_folds_case() {
     // and the default macOS volume fold; Linux does not.
     let tmp = TempDir::new().unwrap();
     let ctx = context(&tmp);
-    let a = add_item(
-        &ctx,
-        "Mod A",
-        &[("Data/Config.ini", b"[S]\r\nk=v\r\n")],
-    );
+    let a = add_item(&ctx, "Mod A", &[("Data/Config.ini", b"[S]\r\nk=v\r\n")]);
     make_instance(&ctx, "inst-a", vec![layer("mod-a", &a, true)]);
 
     let folded = cfg!(windows) || cfg!(target_os = "macos");

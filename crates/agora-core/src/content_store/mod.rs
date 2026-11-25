@@ -416,10 +416,11 @@ pub fn validate_entry_path(rel_str: &str) -> Result<StrictRelPath, ContentError>
 /// Hold a path this layer already holds to the strict rule before anything writes it, reporting the
 /// value that fails rather than dropping it.
 pub fn strict_before_write(path: &RelPath) -> Result<StrictRelPath, ContentError> {
-    path.check_strict().map_err(|error| ContentError::InvalidPath {
-        path: path.to_string(),
-        reason: error.reason().to_string(),
-    })
+    path.check_strict()
+        .map_err(|error| ContentError::InvalidPath {
+            path: path.to_string(),
+            reason: error.reason().to_string(),
+        })
 }
 
 /// The spelling NTFS compares names by: every Unicode letter folded, not just ASCII. Upper then

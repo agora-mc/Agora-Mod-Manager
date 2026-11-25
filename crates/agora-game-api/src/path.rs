@@ -676,7 +676,8 @@ pub fn join_under(root: &Path, rel: &StrictRelPath) -> Result<PathBuf, PathError
                 if !is_last && !metadata.is_dir() {
                     return Err(PathError::NotAFolder {
                         path: walked,
-                        reason: "it is not a folder, so nothing can be written under it".to_string(),
+                        reason: "it is not a folder, so nothing can be written under it"
+                            .to_string(),
                     });
                 }
             }
