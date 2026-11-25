@@ -1133,3 +1133,86 @@ fn the_repo_skyrim_package_keeps_its_vortex_import_id() {
         Some("skyrimse")
     );
 }
+
+// -- declared snapshot scope (MASTER_SPEC §32.7) -------------------------------------------------
+
+/// A package that declares a snapshot scope, valid or not.
+struct ScopePackage {
+    definition: PackageDefinition,
+    scope: agora_game_api::SnapshotScope,
+}
+
+impl GamePackage for ScopePackage {
+    fn definition(&self) -> &PackageDefinition {
+        &self.definition
+    }
+
+    fn snapshot_scope(&self, _game: &GameId) -> Option<agora_game_api::SnapshotScope> {
+        Some(self.scope.clone())
+    }
+}
+
+/// A scope built field by field, so a test can declare something the checked constructor refuses.
+fn scope(tracked: &[&str]) -> agora_game_api::SnapshotScope {
+    agora_game_api::SnapshotScope {
+        tracked: tracked
+            .iter()
+            .map(|folder| RelPath::new(*folder).unwrap())
+            .collect(),
+        prelaunch: None,
+    }
+}
+
+fn register_with_scope(scope: agora_game_api::SnapshotScope) -> Result<(), GameRegistryError> {
+    let mut builder = GameRegistry::builder();
+    let definition = PackageDefinition {
+        id: "test.scope".into(),
+        version: semver::Version::new(0, 1, 0),
+        api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
+        parents: vec![],
+        game_templates: BTreeMap::new(),
+        behaviours: None,
+        games: vec![dummy_game("scope-game", vec![])],
+        frameworks: vec![],
+        tools: vec![],
+    };
+    builder.add(
+        PackageSource::Compiled {
+            crate_name: "test".into(),
+        },
+        Arc::new(ScopePackage { definition, scope }),
+    )
+}
+
+#[test]
+fn a_package_declaring_the_instance_root_as_a_snapshot_folder_is_refused_at_load() {
+    let refused = register_with_scope(scope(&["mods", ""]))
+        .expect_err("the instance root is not a folder a snapshot can own");
+    assert!(
+        matches!(refused, GameRegistryError::InvalidSnapshotScope { .. }),
+        "{refused:?}"
+    );
+    assert!(refused.to_string().contains("instance root"), "{refused}");
+}
+
+#[test]
+fn a_package_declaring_no_snapshot_folder_is_refused_at_load() {
+    let refused =
+        register_with_scope(scope(&[])).expect_err("an empty declaration captures nothing");
+    assert!(
+        matches!(refused, GameRegistryError::InvalidSnapshotScope { .. }),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn a_package_declaring_a_folder_that_leaves_the_instance_cannot_even_build_one() {
+    // `..`, an absolute path and a drive letter are refused when the value is read, so a package
+    // cannot hand one to the registry in the first place.
+    for listed in ["..", "../elsewhere", "/etc", "D:/elsewhere"] {
+        assert!(
+            agora_game_api::SnapshotScope::declared(&[listed], None).is_err(),
+            "'{listed}' must be refused"
+        );
+    }
+}

@@ -207,6 +207,17 @@ pub trait GamePackage: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// The folders a snapshot of this game's instance covers (MASTER_SPEC §32.7).
+    ///
+    /// This is the one place a game says what a snapshot of one of its instances owns: capture
+    /// walks these folders, and a restore replaces these and nothing else. Core holds no game's
+    /// list. `None` means the package declares nothing, and a snapshot of that game's instance is
+    /// refused rather than taken against an empty or guessed scope. A declaration naming the
+    /// instance root, `..` or an absolute path is refused when the package loads.
+    fn snapshot_scope(&self, _game: &GameId) -> Option<crate::SnapshotScope> {
+        None
+    }
+
     fn diagnostics<'a>(&'a self, _context: GameContext) -> GameFuture<'a, Vec<Diagnostic>> {
         Box::pin(async { Ok(Vec::new()) })
     }

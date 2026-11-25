@@ -61,12 +61,8 @@ pub fn core_context<R: tauri::Runtime>(
         }
     })?;
     let games = build_game_registry();
-    agora_core::ctx::CoreContext::initialize(paths, games).map(|(ctx, _)| {
-        let ctx = ctx.with_minecraft_snapshot_entries(
-            agora_game_minecraft::snapshot_scope::tracked_entries(),
-        );
-        plugins::with_events(app, ctx)
-    })
+    agora_core::ctx::CoreContext::initialize(paths, games)
+        .map(|(ctx, _)| plugins::with_events(app, ctx))
 }
 
 /// Pull the instance id out of a `--launch <id>` / `--launch=<id>` argv.
@@ -797,9 +793,6 @@ pub fn run() {
                             eprintln!("[core] {w}");
                         }
                         show_startup_notices(&report);
-                        let ctx = ctx.with_minecraft_snapshot_entries(
-                            agora_game_minecraft::snapshot_scope::tracked_entries(),
-                        );
                         // One startup recovery pass over every crash journal, the same one the
                         // CLI and the MCP listener run (MASTER_SPEC §32.11). A journal that
                         // belongs to a live operation in another process is left alone and

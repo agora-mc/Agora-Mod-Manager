@@ -105,6 +105,8 @@ pub enum GameRegistryError {
     InvalidLaunchAlternative { game_id: GameId, reason: String },
     #[error("game {game_id} has an invalid import id: {reason}")]
     InvalidImportId { game_id: GameId, reason: String },
+    #[error("game {game_id} has an invalid snapshot folder list: {reason}")]
+    InvalidSnapshotScope { game_id: GameId, reason: String },
     #[error("import id {import_id} for {manager} is already claimed by game {claimed_by}")]
     ImportIdAlreadyClaimed {
         manager: String,
@@ -288,6 +290,20 @@ impl GameRegistryBuilder {
                         }
                     }
                 }
+            }
+        }
+
+        // 4c. A declared snapshot folder list stays inside the instance (MASTER_SPEC §32.7).
+        // A declaration naming the root, `..` or an absolute path is refused here, when the
+        // package loads, rather than when a snapshot is first taken or restored.
+        for game in &def.games {
+            if let Some(scope) = package.snapshot_scope(&game.id) {
+                scope
+                    .validate()
+                    .map_err(|error| GameRegistryError::InvalidSnapshotScope {
+                        game_id: game.id.clone(),
+                        reason: error.to_string(),
+                    })?;
             }
         }
 

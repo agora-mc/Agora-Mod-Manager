@@ -19,41 +19,46 @@ use crate::snapshot::{self, RestoreOutcome, Snapshot};
 
 pub struct SnapshotService {
     ctx: Ctx,
-    /// The tracked roots a Minecraft instance's snapshot covers. Core no longer
-    /// knows them; the Minecraft package declares them and the adapter passes
-    /// them here. A generic game instance ignores this and declares its own.
-    minecraft_entries: Vec<String>,
 }
 
 impl SnapshotService {
     pub fn new(ctx: Ctx) -> Self {
-        Self {
-            ctx,
-            minecraft_entries: Vec::new(),
-        }
+        Self { ctx }
     }
 
-    /// Supply the Minecraft tracked-entry set (declared by the Minecraft
-    /// package) for this service. Without it, a Minecraft snapshot is refused
-    /// rather than taken against an empty scope.
-    pub fn with_minecraft_entries(mut self, entries: &[&str]) -> Self {
-        self.minecraft_entries = entries.iter().map(|entry| (*entry).to_string()).collect();
-        self
-    }
-
-    fn require_minecraft_entries(&self) -> LauncherResult<Vec<&str>> {
-        let entries = if self.minecraft_entries.is_empty() {
-            &self.ctx.minecraft_snapshot_entries
-        } else {
-            &self.minecraft_entries
+    /// The folders the Minecraft package declared (MASTER_SPEC §32.7).
+    ///
+    /// Core holds no folder list of its own, so a registry whose Minecraft package declares no
+    /// snapshot scope captures and restores nothing and says why.
+    fn require_minecraft_entries(&self) -> LauncherResult<Vec<String>> {
+        let game = agora_game_api::GameId::minecraft();
+        let declared = self
+            .ctx
+            .games
+            .package_for(&game)
+            .and_then(|package| package.snapshot_scope(&game));
+        let Some(scope) = declared else {
+            return Err(LauncherError::Generic {
+                code: "ERR_SNAPSHOT_SCOPE".into(),
+                message: "no package declares the folders a Minecraft snapshot covers, so nothing \
+                          was captured or restored"
+                    .into(),
+            });
         };
+        let entries: Vec<String> = scope
+            .tracked_entries()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         if entries.is_empty() {
             return Err(LauncherError::Generic {
                 code: "ERR_SNAPSHOT_SCOPE".into(),
-                message: "the Minecraft snapshot scope was not supplied by this front end".into(),
+                message: "the declared Minecraft snapshot scope is empty, so nothing was captured \
+                          or restored"
+                    .into(),
             });
         }
-        Ok(entries.iter().map(String::as_str).collect())
+        Ok(entries)
     }
 
     /// Whether `instance_id` is a generic game instance rather than a
@@ -96,7 +101,8 @@ impl SnapshotService {
             return Ok(snapshot);
         }
 
-        let entries = self.require_minecraft_entries()?;
+        let declared = self.require_minecraft_entries()?;
+        let entries: Vec<&str> = declared.iter().map(String::as_str).collect();
 
         let snapshot = snapshot::create_snapshot_with_origin(
             &instance_dir,
@@ -164,7 +170,8 @@ impl SnapshotService {
             return Ok(outcome.outcome);
         }
 
-        let entries = self.require_minecraft_entries()?;
+        let declared = self.require_minecraft_entries()?;
+        let entries: Vec<&str> = declared.iter().map(String::as_str).collect();
         // A snapshot can carry another instance's manifest (an imported backup,
         // a clone's source). The restore replaces state, never identity.
         let identity =
@@ -369,6 +376,78 @@ mod tests {
         );
     }
 
+    /// A registry whose Minecraft package declares the scope these fixtures model, so the service
+    /// reads the declaration the way a real package supplies it.
+    fn registry() -> std::sync::Arc<crate::game_registry::GameRegistry> {
+        use crate::game_registry::{GameRegistry, PackageSource};
+        use agora_game_api::{
+            DeploymentStrategy, GameDefinition, GameId, GamePackage, PackageDefinition,
+            SnapshotScope,
+        };
+
+        struct Declaring(PackageDefinition);
+
+        impl GamePackage for Declaring {
+            fn definition(&self) -> &PackageDefinition {
+                &self.0
+            }
+
+            fn snapshot_scope(&self, game: &GameId) -> Option<SnapshotScope> {
+                game.is_minecraft()
+                    .then(|| SnapshotScope::declared(TRACKED, Some(PRELAUNCH)).unwrap())
+            }
+        }
+
+        let game = GameDefinition {
+            id: GameId::minecraft(),
+            name: "Minecraft: Java Edition".into(),
+            extends: None,
+            stores: Vec::new(),
+            version_sources: Vec::new(),
+            deployment: DeploymentStrategy::Redirect,
+            content_rules: Vec::new(),
+            content_layout: None,
+            framework_ids: Vec::new(),
+            tool_ids: Vec::new(),
+            launch: None,
+            user_files: Vec::new(),
+            save_paths: Vec::new(),
+            linked_archive_patterns: Vec::new(),
+            declared_writes: Vec::new(),
+            copy_patterns: Vec::new(),
+            excluded_paths: Vec::new(),
+            load_orders: Vec::new(),
+            launch_alternatives: Vec::new(),
+            runtime_files: Vec::new(),
+            save_location: Vec::new(),
+            ini_checks: Vec::new(),
+            mo2_game_name: None,
+            import_ids: Default::default(),
+            session: Default::default(),
+        };
+        let package = PackageDefinition {
+            id: "test.minecraft".into(),
+            version: semver::Version::new(0, 1, 0),
+            api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
+            parents: Vec::new(),
+            games: vec![game],
+            frameworks: Vec::new(),
+            tools: Vec::new(),
+            game_templates: Default::default(),
+            behaviours: None,
+        };
+        let mut builder = GameRegistry::builder();
+        builder
+            .add(
+                PackageSource::Compiled {
+                    crate_name: "test".into(),
+                },
+                std::sync::Arc::new(Declaring(package)),
+            )
+            .unwrap();
+        std::sync::Arc::new(builder.build())
+    }
+
     /// The guard that removes the data root, then the service, its context and the instance id. The
     /// guard comes first so that it drops last, after the database handles the others hold.
     fn service() -> (RemoveOnDrop, SnapshotService, Ctx, String) {
@@ -378,7 +457,7 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let guard = RemoveOnDrop::new(root.clone());
-        let ctx = Ctx::for_testing(root);
+        let ctx = Ctx::for_testing(root).with_games(registry());
         crate::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
         let instance_id = "demo".to_string();
         let dir = ctx.paths.instance_dir(&instance_id).unwrap();
@@ -386,12 +465,7 @@ mod tests {
         fs::write(dir.join("mods").join("a.jar"), b"original").unwrap();
         fs::create_dir_all(dir.join("saves").join("world")).unwrap();
         fs::write(dir.join("saves").join("world").join("level.dat"), b"world").unwrap();
-        (
-            guard,
-            SnapshotService::new(ctx.clone()).with_minecraft_entries(TRACKED),
-            ctx,
-            instance_id,
-        )
+        (guard, SnapshotService::new(ctx.clone()), ctx, instance_id)
     }
 
     #[test]

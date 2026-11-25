@@ -2718,13 +2718,7 @@ async fn async_main() {
             agora_core::plugins::official::RegistryTrust::production(),
             &local_state_options,
         ) {
-            Ok((ctx, warnings, report)) => (
-                ctx.with_minecraft_snapshot_entries(
-                    agora_game_minecraft::snapshot_scope::tracked_entries(),
-                ),
-                warnings,
-                report,
-            ),
+            Ok((ctx, warnings, report)) => (ctx, warnings, report),
             Err(error) => {
                 progress.log("error", &format!("Core initialization failed: {error}"));
                 eprintln!("Error initializing Agora core: {error}");
@@ -18669,9 +18663,6 @@ mod tests {
         let mut games = agora_core::game_registry::GameRegistry::builder();
         agora_game_minecraft::register_into(&mut games).unwrap();
         let (ctx, _) = agora_core::ctx::CoreContext::initialize(paths.clone(), games).unwrap();
-        let ctx = ctx.with_minecraft_snapshot_entries(
-            agora_game_minecraft::snapshot_scope::tracked_entries(),
-        );
         let progress = super::CliProgressSink::new(&root.join("cli.log"), false).unwrap();
 
         let entry_id = "20200101T000000Z-test";

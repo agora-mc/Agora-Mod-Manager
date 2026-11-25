@@ -44,29 +44,53 @@ impl GamePackage for TestPackage {
     fn definition(&self) -> &PackageDefinition {
         &self.0
     }
+
+    /// The Minecraft game declares the snapshot scope these fixtures model (MASTER_SPEC §32.7).
+    fn snapshot_scope(&self, game: &GameId) -> Option<agora_game_api::SnapshotScope> {
+        game.is_minecraft()
+            .then(|| agora_game_api::SnapshotScope::declared(MINECRAFT, None).unwrap())
+    }
+}
+
+/// A Minecraft game, registered so a Minecraft snapshot has the declaration core now reads.
+fn minecraft_definition() -> GameDefinition {
+    let mut def = skyrim_definition();
+    def.id = GameId::minecraft();
+    def.name = "Minecraft: Java Edition".into();
+    def.stores = Vec::new();
+    def.content_rules = Vec::new();
+    def.load_orders = Vec::new();
+    def.user_files = Vec::new();
+    def.save_paths = Vec::new();
+    def.save_location = Vec::new();
+    def.ini_checks = Vec::new();
+    def.declared_writes = Vec::new();
+    def
 }
 
 fn registry(def: &GameDefinition) -> Arc<GameRegistry> {
     let mut builder = GameRegistry::builder();
-    let package = PackageDefinition {
-        id: format!("test.{}", def.id),
-        version: semver::Version::new(0, 1, 0),
-        api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
-        parents: vec![],
-        game_templates: Default::default(),
-        behaviours: None,
-        games: vec![def.clone()],
-        frameworks: vec![],
-        tools: vec![],
-    };
-    builder
-        .add(
-            PackageSource::Compiled {
-                crate_name: "test".into(),
-            },
-            Arc::new(TestPackage(package)),
-        )
-        .unwrap();
+    for def in [def.clone(), minecraft_definition()] {
+        let package = PackageDefinition {
+            id: format!("test.{}", def.id),
+            version: semver::Version::new(0, 1, 0),
+            api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
+            parents: vec![],
+            game_templates: Default::default(),
+            behaviours: None,
+            games: vec![def.clone()],
+            frameworks: vec![],
+            tools: vec![],
+        };
+        builder
+            .add(
+                PackageSource::Compiled {
+                    crate_name: "test".into(),
+                },
+                Arc::new(TestPackage(package)),
+            )
+            .unwrap();
+    }
     Arc::new(builder.build())
 }
 
@@ -119,9 +143,7 @@ impl Harness {
         let lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let data = TempDir::new().unwrap();
         let def = definition();
-        let ctx = CoreContext::for_testing(data.path().join("app_data"))
-            .with_games(registry(&def))
-            .with_minecraft_snapshot_entries(MINECRAFT);
+        let ctx = CoreContext::for_testing(data.path().join("app_data")).with_games(registry(&def));
         agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
         let id = "skyrim-test".to_string();
         let harness = Self {
@@ -658,9 +680,7 @@ fn restore_to_lkg_round_trips_files_and_rules() {
 // -- backups ------------------------------------------------------------------------------------
 
 fn fresh_context(def: &GameDefinition, root: &std::path::Path) -> CoreContext {
-    let ctx = CoreContext::for_testing(root.join("app_data"))
-        .with_games(registry(def))
-        .with_minecraft_snapshot_entries(MINECRAFT);
+    let ctx = CoreContext::for_testing(root.join("app_data")).with_games(registry(def));
     agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
     ctx
 }

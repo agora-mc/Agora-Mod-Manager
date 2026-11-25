@@ -22,6 +22,12 @@ impl GamePackage for MinecraftPackage {
         }
         recognize_minecraft_download(file_name, entries)
     }
+
+    /// The folders a Minecraft snapshot owns (MASTER_SPEC §32.7). Minecraft is the game that
+    /// knows them; core reads this declaration instead of holding a list of its own.
+    fn snapshot_scope(&self, game: &GameId) -> Option<agora_game_api::SnapshotScope> {
+        game.is_minecraft().then(crate::snapshot_scope::declaration)
+    }
 }
 
 /// Recognise Minecraft content by what is inside the archive, never by its name alone.

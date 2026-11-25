@@ -47,6 +47,14 @@ pub fn tracked_entries() -> &'static [&'static str] {
     TRACKED_ENTRIES
 }
 
+/// The scope this package declares to core (MASTER_SPEC §32.7): the folders a snapshot of a
+/// Minecraft instance owns, checked by the same rules every other package's declaration is.
+/// Core reads this instead of holding a Minecraft folder list of its own.
+pub fn declaration() -> agora_game_api::SnapshotScope {
+    agora_game_api::SnapshotScope::declared(TRACKED_ENTRIES, Some(PRELAUNCH_TRACKED_ENTRIES))
+        .expect("build bug: the Minecraft snapshot scope is refused")
+}
+
 /// The tracked-entry set a mandatory pre-launch snapshot captures.
 pub fn prelaunch_tracked_entries() -> &'static [&'static str] {
     PRELAUNCH_TRACKED_ENTRIES
