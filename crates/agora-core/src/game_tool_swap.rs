@@ -294,18 +294,6 @@ fn link_target(link: &Path) -> Option<PathBuf> {
     std::fs::read_link(link).ok()
 }
 
-/// Compare two paths the way Windows does: case-insensitively, without the `\\?\` prefix.
-pub fn same_path(a: &Path, b: &Path) -> bool {
-    fn norm(p: &Path) -> String {
-        let s = p.to_string_lossy();
-        let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
-        let s = s.replace('/', "\\");
-        let s = s.trim_end_matches('\\');
-        fold_path_case(s)
-    }
-    norm(a) == norm(b)
-}
-
 /// What a path is, in words for a message.
 pub fn describe_folder(path: &Path) -> String {
     if is_reparse_point(path) {
@@ -682,23 +670,23 @@ pub fn check_journal_shape(journal: &SwapJournal, loc: &SwapLocation) -> Result<
             journal.run
         ));
     }
-    if !same_path(&journal.install_dir, &loc.install) {
+    if !agora_game_api::same_spelling(&journal.install_dir, &loc.install) {
         return Err("its install folder is not the instance's install folder".into());
     }
-    if !same_path(&journal.real_data, &loc.install.join("Data")) {
+    if !agora_game_api::same_spelling(&journal.real_data, &loc.install.join("Data")) {
         return Err("its Data folder is not the install folder's Data".into());
     }
-    if !same_path(
+    if !agora_game_api::same_spelling(
         &journal.aside,
         &loc.install.join(format!("{ASIDE_PREFIX}{}", journal.run)),
     ) {
         return Err("its aside folder is not Data's sibling named for this run".into());
     }
-    if !same_path(&journal.swap_dir, &loc.swap_dir) {
+    if !agora_game_api::same_spelling(&journal.swap_dir, &loc.swap_dir) {
         return Err("its swap folder is not the instance's swap folder".into());
     }
     let expected = game_tool_copy::copy_dir_for(journal.copy_kind, loc, &journal.run);
-    if !same_path(&journal.copy_dir, &expected) {
+    if !agora_game_api::same_spelling(&journal.copy_dir, &expected) {
         return Err(format!(
             "its copy folder is not where a {} copy goes",
             journal.copy_kind.as_str()
@@ -949,11 +937,11 @@ mod tests {
 
     #[test]
     fn paths_compare_without_case_or_the_extended_prefix() {
-        assert!(same_path(
+        assert!(agora_game_api::same_spelling(
             Path::new(r"\\?\C:\Games\Data\"),
             Path::new(r"c:/games/data")
         ));
-        assert!(!same_path(
+        assert!(!agora_game_api::same_spelling(
             Path::new(r"C:\Games\Data"),
             Path::new(r"C:\Games\Data2")
         ));

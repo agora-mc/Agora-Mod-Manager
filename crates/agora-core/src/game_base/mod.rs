@@ -1414,14 +1414,17 @@ static BASE_ROOTS_LOCK: Mutex<()> = Mutex::new(());
 /// Remember a bases root a build is about to use, so removal can later tell a folder Agora made
 /// from one a hand-edited record names. The data folder's own `bases` folder needs no entry.
 fn register_base_root(paths: &AppPaths, root: &Path) -> Result<(), BaseError> {
-    if same_path(root, &paths.bases_dir()) {
+    if agora_game_api::same_folder(root, &paths.bases_dir()) {
         return Ok(());
     }
     let _guard = BASE_ROOTS_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut roots = read_base_roots(paths)?;
-    if roots.iter().any(|known| same_path(known, root)) {
+    if roots
+        .iter()
+        .any(|known| agora_game_api::same_folder(known, root))
+    {
         return Ok(());
     }
     roots.push(root.to_path_buf());
@@ -1431,33 +1434,6 @@ fn register_base_root(paths: &AppPaths, root: &Path) -> Result<(), BaseError> {
     std::fs::write(&tmp, serde_json::to_string_pretty(&roots)?)?;
     std::fs::rename(&tmp, &file)?;
     Ok(())
-}
-
-/// Path equality by components (so a `.` component does not matter), ignoring ASCII case on
-/// Windows.
-fn same_path(a: &Path, b: &Path) -> bool {
-    let mut left = a.components();
-    let mut right = b.components();
-    loop {
-        match (left.next(), right.next()) {
-            (None, None) => return true,
-            (Some(x), Some(y)) => {
-                let (x, y) = (
-                    x.as_os_str().to_string_lossy(),
-                    y.as_os_str().to_string_lossy(),
-                );
-                let equal = if cfg!(windows) {
-                    fold_path_case(&x) == fold_path_case(&y)
-                } else {
-                    x == y
-                };
-                if !equal {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-    }
 }
 
 /// Remove staging folders a build or deploy left behind, when the process that made them is no
@@ -1575,7 +1551,7 @@ pub(crate) fn trusted_base_folder(
     let folder = roots
         .iter()
         .map(|root| root.join(base_id))
-        .find(|candidate| same_path(candidate, &manifest.location))
+        .find(|candidate| agora_game_api::same_folder(candidate, &manifest.location))
         .ok_or_else(|| refuse("does not point at a base folder Agora made"))?;
     let overlaps_source = folder.starts_with(&manifest.source_location)
         || manifest.source_location.starts_with(&folder);
@@ -1932,7 +1908,7 @@ pub fn repair_framework(
     }
     // Copying a file onto itself zeroes it. A base whose source install is its own folder cannot
     // be repaired by copying, so nothing is written.
-    if same_path(&manifest.location, &manifest.source_location) {
+    if agora_game_api::same_folder(&manifest.location, &manifest.source_location) {
         return Err(BaseError::Other(format!(
             "refusing to repair {}: the base folder and its source install are the same folder ({})",
             framework.name,
@@ -1963,7 +1939,7 @@ pub fn repair_framework(
             None => manifest.location.join(required),
         };
         let source = manifest.source_location.join(required);
-        if same_path(&source, &destination) {
+        if agora_game_api::same_folder(&source, &destination) {
             return Err(BaseError::Other(format!(
                 "refusing to repair {required}: its source and destination are the same file ({})",
                 source.display()

@@ -21,15 +21,11 @@ use std::path::Path;
 use std::time::Duration;
 use sysinfo::{Pid, System};
 
+/// Whether the OS reports the executable the identity recorded: the game contract's path
+/// comparison, because a recorded path is a spelling that may name a resolved target or a file
+/// that is already gone.
 fn executable_paths_match(expected: &Path, observed: &Path) -> bool {
-    match (expected.canonicalize(), observed.canonicalize()) {
-        (Ok(expected), Ok(observed)) => expected == observed,
-        (Err(_), Err(_)) => {
-            expected.to_string_lossy().replace('\\', "/")
-                == observed.to_string_lossy().replace('\\', "/")
-        }
-        _ => false,
-    }
+    agora_game_api::same_folder(expected, observed)
 }
 
 // ---------------------------------------------------------------------------
@@ -587,6 +583,29 @@ mod tests {
             &expected,
             &dir.path().join("other")
         ));
+    }
+
+    #[test]
+    fn unavailable_paths_are_compared_by_spelling_with_case_folded() {
+        // The fall-back is the comparison module's spelling rule, which folds case the way the disk
+        // does: an executable path that no longer exists is still recognisably the one recorded.
+        let dir = tempfile::tempdir().unwrap();
+        let expected = dir.path().join("missing").join("Game.exe");
+        let same = format!(r"{}/missing\game.EXE", dir.path().display());
+        assert!(executable_paths_match(&expected, Path::new(&same)));
+    }
+
+    #[test]
+    fn paths_that_both_resolve_are_compared_by_target_not_by_spelling() {
+        // Two files that exist are two targets even when a case-insensitive disk would call their
+        // names one: the comparison of what the OS reported is exact.
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        let other = dir.path().join("other");
+        std::fs::write(&game, b"game").unwrap();
+        std::fs::write(&other, b"other").unwrap();
+        assert!(executable_paths_match(&game, &game));
+        assert!(!executable_paths_match(&game, &other));
     }
 
     #[test]

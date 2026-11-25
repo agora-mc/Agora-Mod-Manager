@@ -7,7 +7,8 @@
 //! consumer these tests speak for.
 
 use agora_game_api::{
-    is_link, join_under, resolve_destination, same_spelling, same_target, PathError, RelPath,
+    is_link, join_under, resolve_destination, same_folder, same_spelling, same_target, PathError,
+    RelPath,
 };
 use std::path::{Path, PathBuf};
 
@@ -192,6 +193,19 @@ fn a_resolved_destination_drops_a_dot_component_and_keeps_the_file_name() {
         resolved,
         resolve_destination(&root.path().join("mods").join("a.jar")).unwrap(),
         "a '.' component names the same destination"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn one_folder_reached_through_a_link_is_one_folder() {
+    let root = temp_dir();
+    let real = root.path().join("real");
+    std::fs::create_dir_all(real.join("mods")).unwrap();
+    std::os::unix::fs::symlink(&real, root.path().join("alias")).unwrap();
+    assert!(
+        same_folder(&real.join("mods"), &root.path().join("alias").join("mods")),
+        "two spellings of one folder are one folder once the link is resolved"
     );
 }
 

@@ -411,6 +411,25 @@ fn collision_key(name: &str) -> String {
     fold_path_case(&full)
 }
 
+/// Whether two paths are one folder or file, spelled either way: the same target when both exist,
+/// the same spelling when neither does, and not the same when only one does.
+///
+/// This is the question a caller asks when it has to find something it recorded earlier and the
+/// thing may be gone: a base folder named in a manifest, an executable the OS reports for a
+/// process. Comparing what exists resolves a symlinked or junctioned parent once, so one folder
+/// does not look like two, and it stays exact where the disk is case-sensitive. Two paths that are
+/// both gone can only be compared by spelling, which folds case the way the disk does.
+///
+/// A path that is gone is compared as a spelling, so two such paths that differ only in invalid
+/// UTF-8 compare equal. Callers that delete or signal still confirm identity — see [`same_spelling`].
+pub fn same_folder(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => same_target(&left, &right),
+        (Err(_), Err(_)) => same_spelling(left, right),
+        _ => false,
+    }
+}
+
 /// A path could not be used safely on disk.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PathError {
@@ -880,6 +899,26 @@ mod tests {
             !same_target(left, Path::new("data/mods/a.jar")),
             "exact comparison keeps a case difference, which on a case-sensitive disk is two files"
         );
+    }
+
+    #[test]
+    fn two_paths_that_are_both_gone_are_compared_by_spelling() {
+        assert!(same_folder(
+            Path::new("/gone/One/mods"),
+            Path::new("/gone/one/MODS")
+        ));
+        assert!(!same_folder(
+            Path::new("/gone/One/mods"),
+            Path::new("/gone/One/mods2")
+        ));
+    }
+
+    #[test]
+    fn a_path_that_exists_is_not_the_same_as_one_that_does_not() {
+        assert!(!same_folder(
+            Path::new("."),
+            Path::new("./a-folder-that-is-not-there")
+        ));
     }
 
     #[test]
