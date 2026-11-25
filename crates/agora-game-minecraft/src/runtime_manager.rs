@@ -1613,30 +1613,13 @@ pub fn remove_runtime(runtimes_root: &Path, root_dir: &Path) -> LauncherResult<(
         .canonicalize()
         .unwrap_or_else(|_| root_dir.to_path_buf());
 
-    // Reject symlink/junction targets: ensure none of the components in
-    // root_dir is a symlink or reparse point. We check by reading the
-    // metadata of root_dir itself without following symlinks.
-    if let Ok(meta) = std::fs::symlink_metadata(root_dir) {
-        #[cfg(unix)]
-        {
-            if meta.file_type().is_symlink() {
-                return Err(LauncherError::Generic {
-                    code: "ERR_RUNTIME_REMOVE_SYMLINK".into(),
-                    message: "Cannot remove: target path is a symlink.".into(),
-                });
-            }
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            if meta.file_attributes() & 0x400 != 0 {
-                // FILE_ATTRIBUTE_REPARSE_POINT
-                return Err(LauncherError::Generic {
-                    code: "ERR_RUNTIME_REMOVE_SYMLINK".into(),
-                    message: "Cannot remove: target path is a junction/symlink.".into(),
-                });
-            }
-        }
+    // Reject a target that is a link: removing through one would delete what it points at. A cloud
+    // placeholder or a deduplicated file is the folder it is named as, so it is removable.
+    if agora_game_api::redirects_a_name(root_dir) {
+        return Err(LauncherError::Generic {
+            code: "ERR_RUNTIME_REMOVE_SYMLINK".into(),
+            message: "Cannot remove: target path is a symlink or junction.".into(),
+        });
     }
 
     if !resolved_target.starts_with(&resolved_root) {

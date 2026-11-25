@@ -310,8 +310,8 @@ fn is_excluded_source_name(name: &str, is_directory: bool) -> bool {
     agora_core::helpers::is_excluded_source_name(name, is_directory)
 }
 
-fn unsafe_filesystem_entry(path: &Path, file_type: &std::fs::FileType) -> bool {
-    agora_core::helpers::unsafe_filesystem_entry(path, file_type)
+fn unsafe_filesystem_entry(path: &Path) -> bool {
+    agora_core::helpers::unsafe_filesystem_entry(path)
 }
 
 use sha2::Digest;
@@ -355,7 +355,7 @@ fn copy_payload_control(
             };
 
             // Never follow symlinks, junctions, or reparse points.
-            if unsafe_filesystem_entry(&entry.path(), &file_type) {
+            if unsafe_filesystem_entry(&entry.path()) {
                 continue;
             }
 
@@ -428,7 +428,7 @@ fn hash_payload(root: &Path) -> Result<Vec<InstanceImportFileRecord>, String> {
         for entry in entries {
             let entry = entry.map_err(|error| error.to_string())?;
             let file_type = entry.file_type().map_err(|error| error.to_string())?;
-            if unsafe_filesystem_entry(&entry.path(), &file_type) {
+            if unsafe_filesystem_entry(&entry.path()) {
                 continue;
             }
             let path = entry.path();
@@ -597,7 +597,7 @@ fn inventory_directory(
             Err(_) => continue,
         };
 
-        if unsafe_filesystem_entry(&entry.path(), &ft) || (!ft.is_file() && !ft.is_dir()) {
+        if unsafe_filesystem_entry(&entry.path()) || (!ft.is_file() && !ft.is_dir()) {
             continue;
         }
 
@@ -701,7 +701,7 @@ fn hash_content_entry(path: &Path) -> LauncherResult<String> {
         code: "ERR_IMPORT_HASH".into(),
         message: error.to_string(),
     })?;
-    if unsafe_filesystem_entry(path, &metadata.file_type()) {
+    if unsafe_filesystem_entry(path) {
         return Err(LauncherError::Generic {
             code: "ERR_IMPORT_UNSAFE_PATH".into(),
             message: format!("Refusing to hash symlink {}", path.display()),
@@ -729,7 +729,7 @@ fn hash_content_entry(path: &Path) -> LauncherResult<String> {
                     code: "ERR_IMPORT_HASH".into(),
                     message: error.to_string(),
                 })?;
-                if unsafe_filesystem_entry(&entry.path(), &file_type) {
+                if unsafe_filesystem_entry(&entry.path()) {
                     continue;
                 }
                 if file_type.is_dir() {
@@ -2827,7 +2827,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
         let src_child = entry.path();
         let dst_child = dst.join(&fname);
 
-        if unsafe_filesystem_entry(&entry.path(), &ft) {
+        if unsafe_filesystem_entry(&entry.path()) {
             continue;
         }
         if ft.is_dir() {

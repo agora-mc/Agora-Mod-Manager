@@ -189,15 +189,13 @@ pub fn is_regular_file(path: &Path) -> Result<(), ProfileIssue> {
         ));
     }
 
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if meta.file_attributes() & 0x400 != 0 {
-            return Err(ProfileIssue::corrupt(
-                Some(path.to_path_buf()),
-                "Path is a reparse point / symlink".to_string(),
-            ));
-        }
+    // A link is not a regular file, whatever it points at: one rule with the rest of Agora, so a
+    // cloud placeholder is verified like any other file.
+    if agora_game_api::redirects_a_name(path) {
+        return Err(ProfileIssue::corrupt(
+            Some(path.to_path_buf()),
+            "Path is a link: it redirects a name".to_string(),
+        ));
     }
 
     Ok(())

@@ -497,24 +497,13 @@ pub fn is_excluded_source_name(name: &str, is_directory: bool) -> bool {
                 .any(|excluded| lower == excluded.to_ascii_lowercase()))
 }
 
-pub fn unsafe_filesystem_entry(path: &Path, file_type: &std::fs::FileType) -> bool {
-    if file_type.is_symlink() {
-        return true;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        if std::fs::symlink_metadata(path)
-            .map(|metadata| metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
-            .unwrap_or(true)
-        {
-            return true;
-        }
-    }
-    // Silence unused warning on non-Windows when path is unused.
-    let _ = path;
-    false
+/// Whether an entry is a link that redirects a name, so copying it would leave the tree.
+///
+/// One rule with the rest of Agora: a symbolic link, a junction and a mount point are refused, and a
+/// cloud placeholder (OneDrive) or a deduplicated file is an ordinary file. A path that cannot be
+/// asked about counts as one, because that is the answer a copy cannot follow.
+pub fn unsafe_filesystem_entry(path: &Path) -> bool {
+    agora_game_api::redirects_a_name(path)
 }
 
 pub fn hash_file_sha256(path: &Path) -> std::io::Result<String> {

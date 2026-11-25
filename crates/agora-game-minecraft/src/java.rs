@@ -470,24 +470,11 @@ pub fn detect_mojang_jres(minecraft_dir: &Path) -> Vec<JavaInstallation> {
             };
 
             if ft.is_dir() {
-                // Skip symlink/reparse-point dirs to prevent escape.
-                let meta = match entry.metadata() {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                #[cfg(unix)]
-                {
-                    if meta.file_type().is_symlink() {
-                        continue;
-                    }
-                }
-                #[cfg(windows)]
-                {
-                    use std::os::windows::fs::MetadataExt;
-                    // Reparse point check (includes junctions/symlinks).
-                    if meta.file_attributes() & 0x400 /* FILE_ATTRIBUTE_REPARSE_POINT */ != 0 {
-                        continue;
-                    }
+                // Skip a folder that is a link out of the tree, for the one reason every walk in
+                // Agora skips one: a redirection is not the folder it is named as. A cloud
+                // placeholder is an ordinary folder.
+                if agora_game_api::redirects_a_name(&entry.path()) {
+                    continue;
                 }
                 dir_count += 1;
                 if dir_count <= MOJANG_MAX_DIRS {

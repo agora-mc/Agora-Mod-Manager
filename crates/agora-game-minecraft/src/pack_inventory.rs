@@ -53,9 +53,7 @@ pub fn collect_pack_inventory(instance_dir: &Path) -> Result<Vec<InstancePackFil
     // single file at root
     let options_path = instance_dir.join(PACK_ROOT_FILE);
     if let Ok(meta) = std::fs::symlink_metadata(&options_path) {
-        if meta.is_file()
-            && !agora_core::helpers::unsafe_filesystem_entry(&options_path, &meta.file_type())
-        {
+        if meta.is_file() && !agora_core::helpers::unsafe_filesystem_entry(&options_path) {
             if let Ok(sha256) = agora_core::helpers::hash_file_sha256(&options_path) {
                 files.push(InstancePackFile {
                     relative_path: PACK_ROOT_FILE.to_string(),
@@ -111,7 +109,7 @@ fn collect_under(instance_dir: &Path, subdir: &str, out: &mut Vec<InstancePackFi
                 Err(_) => continue,
             };
             let path = entry.path();
-            if agora_core::helpers::unsafe_filesystem_entry(&path, &ft) {
+            if agora_core::helpers::unsafe_filesystem_entry(&path) {
                 continue;
             }
             // We don't apply is_excluded_source_name here: pack-contributable

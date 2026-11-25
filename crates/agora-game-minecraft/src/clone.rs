@@ -17,10 +17,6 @@ enum EntryKind {
         #[cfg_attr(not(windows), allow(dead_code))]
         directory: bool,
     },
-    // Reparse points are a Windows-only concept, so no other target
-    // constructs this variant.
-    #[cfg_attr(not(windows), allow(dead_code))]
-    UnrecognizedReparse,
     Unsupported,
 }
 
@@ -149,7 +145,6 @@ pub fn clone_instance(
         EntryKind::Directory => {}
         EntryKind::File => return Err(format!("Source {:?} is not a directory", src_dir)),
         EntryKind::Symlink { .. } => return Err(link_policy_error(src_dir)),
-        EntryKind::UnrecognizedReparse => return Err(reparse_policy_error(src_dir)),
         EntryKind::Unsupported => return Err(unsupported_entry_error(src_dir)),
     }
 
@@ -257,9 +252,6 @@ fn copy_entry(
                     })?;
                     continue;
                 }
-                EntryKind::UnrecognizedReparse => {
-                    return Err(reparse_policy_error(&item.src));
-                }
                 EntryKind::Unsupported => {
                     return Err(unsupported_entry_error(&item.src));
                 }
@@ -313,9 +305,6 @@ fn copy_entry(
             EntryKind::Symlink { .. } => {
                 return Err(link_policy_error(&item.src));
             }
-            EntryKind::UnrecognizedReparse => {
-                return Err(reparse_policy_error(&item.src));
-            }
             EntryKind::Unsupported => {
                 return Err(unsupported_entry_error(&item.src));
             }
@@ -368,48 +357,14 @@ fn inspect_entry(path: &Path) -> Result<EntryKind, String> {
         .map_err(|error| format!("Cannot inspect source entry {:?}: {error}", path))?;
     let file_type = metadata.file_type();
 
-    #[cfg(unix)]
-    if file_type.is_symlink() {
-        return Ok(EntryKind::Symlink { directory: false });
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::{FileTypeExt, MetadataExt};
-
-        if file_type.is_symlink() || file_type.is_symlink_dir() || file_type.is_symlink_file() {
-            return Ok(EntryKind::Symlink {
-                directory: file_type.is_symlink_dir(),
-            });
-        }
-
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            // Cloud providers use reparse points for placeholders, but those
-            // are not path redirections.  These attributes are the standard
-            // recall/pinning indicators exposed by the Windows filesystem.
-            const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
-            const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
-            const FILE_ATTRIBUTE_PINNED: u32 = 0x0008_0000;
-            const FILE_ATTRIBUTE_UNPINNED: u32 = 0x0010_0000;
-            const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
-            const CLOUD_ATTRIBUTES: u32 = FILE_ATTRIBUTE_OFFLINE
-                | FILE_ATTRIBUTE_RECALL_ON_OPEN
-                | FILE_ATTRIBUTE_PINNED
-                | FILE_ATTRIBUTE_UNPINNED
-                | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
-
-            if metadata.file_attributes() & CLOUD_ATTRIBUTES != 0 {
-                if file_type.is_dir() {
-                    return Ok(EntryKind::Directory);
-                }
-                if file_type.is_file() {
-                    return Ok(EntryKind::File);
-                }
-            }
-
-            return Ok(EntryKind::UnrecognizedReparse);
-        }
+    // One rule with the rest of Agora: a link that redirects a name (a symbolic link, a junction,
+    // a mount point) is cloned as a link to the same target, and a reparse point that carries
+    // data (a cloud placeholder, a deduplicated file) is the file or folder it is. The tag
+    // decides, so a cloud tag this code never listed is ordinary too.
+    if agora_game_api::redirects_a_name(path) {
+        return Ok(EntryKind::Symlink {
+            directory: metadata.is_dir(),
+        });
     }
 
     if file_type.is_dir() {
@@ -512,13 +467,6 @@ fn link_policy_error(path: &Path) -> String {
     )
 }
 
-fn reparse_policy_error(path: &Path) -> String {
-    format!(
-        "Refusing to clone an unrecognised Windows reparse point at {:?}; exclude that content with its copy_* preference, or use a supported link-based clone mode",
-        path
-    )
-}
-
 fn unsupported_entry_error(path: &Path) -> String {
     format!(
         "Unsupported filesystem entry at {:?}; exclude that content with its copy_* preference or replace the fifo, socket, device, or other unsupported entry",
@@ -556,7 +504,6 @@ fn copy_optional_manifest(
         EntryKind::Directory => Err(format!(
             "Cannot copy {name}: expected a file but found a directory at {src:?}"
         )),
-        EntryKind::UnrecognizedReparse => Err(reparse_policy_error(src)),
         EntryKind::Unsupported => Err(unsupported_entry_error(src)),
     }
 }
