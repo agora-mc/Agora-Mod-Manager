@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 /// Expected schema version for the mutable local SQLite database.
 /// Migrations are applied sequentially on startup.
-pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 29;
+pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 30;
 
 /// How many pre-migration database backups are kept.
 pub const LOCAL_STATE_BACKUP_RETENTION: usize = 3;
@@ -1115,6 +1115,11 @@ const MIGRATIONS: &[MigrationStep] = &[
         name: "plugin package journal and ledger process identity",
         run: migrate_v29,
     },
+    MigrationStep {
+        version: 30,
+        name: "committed plugin game packages",
+        run: migrate_v30,
+    },
 ];
 
 /// Apply every step up to `target`, skipping any already recorded.
@@ -2043,6 +2048,15 @@ fn migrate_v29(conn: &Connection) -> anyhow::Result<()> {
         "launch_history",
         "game_process_json",
         "ALTER TABLE launch_history ADD COLUMN game_process_json TEXT",
+    )
+}
+
+fn migrate_v30(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(
+        conn,
+        "plugin_installs",
+        "game_packages_json",
+        "ALTER TABLE plugin_installs ADD COLUMN game_packages_json TEXT",
     )
 }
 

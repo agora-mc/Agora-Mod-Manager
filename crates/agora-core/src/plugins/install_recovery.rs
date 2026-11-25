@@ -155,6 +155,7 @@ impl InstallJournal {
         );
 
         let tx = conn.unchecked_transaction().map_err(sql_error)?;
+        store::backfill_game_packages(&tx, id)?;
         let previous = store::InstallSnapshot::capture(&tx, id)?;
         if old.is_some() {
             let record = previous.as_ref().ok_or_else(|| {
@@ -356,6 +357,7 @@ pub(in crate::plugins) fn uninstall(
             None
         };
     let tx = conn.unchecked_transaction().map_err(sql_error)?;
+    store::backfill_game_packages(&tx, id)?;
     let record =
         store::install_row(&tx, id)?.ok_or_else(|| io_error("the install record disappeared"))?;
     let mut journal = InstallJournal {
@@ -940,7 +942,11 @@ fn apply(
             !drop_started || stashed.is_none(),
             "the stash and its deletion folder are both occupied",
         )?;
-        if resolution == InstallResolution::Restore && !drop_started {
+        if resolution == InstallResolution::Restore {
+            require(
+                !drop_started,
+                "The previous version was already being removed. The new version stays installed. Run without --restore to finish cleanup.",
+            )?;
             let stash = layout
                 .rollback
                 .as_ref()
@@ -988,11 +994,6 @@ fn apply(
             delete_journal(conn, &journal)?;
             cut(InstallCrashPoint::JournalDeleted);
             remove_if_present(&layout.marker)?;
-            if resolution == InstallResolution::Restore {
-                return Err(io_error(format!(
-                    "The previous stash for plugin {id} was already being dropped. Cleanup finished and version {new_version} stays installed."
-                )));
-            }
             let kept = if resolution == InstallResolution::KeepAside && present(&layout.kept)? {
                 format!(" The previous version is at {}.", layout.kept.display())
             } else {
@@ -1486,7 +1487,7 @@ mod tests {
     }
 
     #[test]
-    fn round_two_restore_never_publishes_a_partly_dropped_stash() {
+    fn round_three_restore_refusal_leaves_a_partly_dropped_stash_and_journal_unchanged() {
         let restore = |f: &Fixture| {
             f.service
                 .recover_interrupted_installs(Some(&f.id), InstallResolution::Restore)
@@ -1510,15 +1511,34 @@ mod tests {
             assert!(!f.stash().is_dir());
             std::fs::remove_file(partially_dropped.join("auxiliary.txt")).unwrap();
             if explicit_restore {
-                assert!(
-                    matches!(restore(&f).as_slice(), [(_, InstallRecovery::NeedsHand(why))] if why.contains("stash") && why.contains("already being dropped"))
+                let journal = journal_document(&f.conn, &f.id).unwrap().unwrap();
+                let payload = std::fs::read(partially_dropped.join("main.js")).unwrap();
+                let refused = restore(&f);
+                assert_eq!(
+                    journal_document(&f.conn, &f.id).unwrap().as_deref(),
+                    Some(journal.as_str())
                 );
-            } else {
-                assert!(f
-                    .restart()
-                    .iter()
-                    .any(|line| line.contains("Finished the interrupted install")));
+                assert_eq!(
+                    std::fs::read(partially_dropped.join("main.js")).unwrap(),
+                    payload
+                );
+                assert_eq!(
+                    store::get(&f.conn, &f.id)
+                        .unwrap()
+                        .unwrap()
+                        .manifest
+                        .version
+                        .to_string(),
+                    "2.0.0"
+                );
+                assert!(
+                    matches!(refused.as_slice(), [(_, InstallRecovery::NeedsHand(why))] if why.contains("already being removed") && why.contains("Run without --restore"))
+                );
             }
+            assert!(f
+                .restart()
+                .iter()
+                .any(|line| line.contains("Finished the interrupted install")));
             f.assert_agreement("2.0.0", "// new package");
             assert!(!partially_dropped.is_dir());
             assert!(f.restart().is_empty());

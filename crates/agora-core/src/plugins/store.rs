@@ -22,7 +22,7 @@ use agora_plugin_api::distribution::PublicKey;
 use agora_plugin_api::manifest::{PluginId, PluginManifest};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Which kind of stored value a key belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +235,61 @@ pub fn get(conn: &Connection, plugin_id: &PluginId) -> LauncherResult<Option<Plu
         .find(|record| record.id() == plugin_id))
 }
 
+/// Declarations in manifest order with their paths. Keep raw JSON so templates and
+/// inherited store products can still be resolved when a plugin's files are in flight.
+pub(crate) type GamePackageDeclarations = Vec<(String, serde_json::Value)>;
+
+pub(crate) fn committed_game_packages(
+    conn: &Connection,
+    id: &PluginId,
+) -> LauncherResult<GamePackageDeclarations> {
+    let text = conn
+        .query_row(
+            "SELECT game_packages_json FROM plugin_installs WHERE plugin_id = ?1",
+            params![id.as_str()],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(db_error)?
+        .flatten();
+    match text {
+        Some(text) => serde_json::from_str(&text).map_err(db_error),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn encode_game_packages(manifest: &PluginManifest, folder: &Path) -> LauncherResult<String> {
+    let mut packages = GamePackageDeclarations::new();
+    for contribution in &manifest.contributions.game_packages {
+        // Regular startup reports invalid declarations. They have no loadable game claims.
+        if let Ok(package) =
+            crate::game_registry::inherit::read_game_package(folder, &contribution.path)
+        {
+            packages.push((contribution.path.clone(), package));
+        }
+    }
+    serde_json::to_string(&packages).map_err(db_error)
+}
+
+/// An install from before schema 30 still has its committed files at the start
+/// of its first change. Save its declarations before publishing the journal.
+pub(super) fn backfill_game_packages(conn: &Connection, id: &PluginId) -> LauncherResult<()> {
+    let Some(record) = install_row(conn, id)? else {
+        return Ok(());
+    };
+    if record.game_packages_json.is_some() || record.install_dir.is_empty() {
+        return Ok(());
+    }
+    let manifest = serde_json::from_str(&record.manifest_json).map_err(db_error)?;
+    let json = encode_game_packages(&manifest, Path::new(&record.install_dir))?;
+    conn.execute(
+        "UPDATE plugin_installs SET game_packages_json = ?2 WHERE plugin_id = ?1",
+        params![id.as_str(), json],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
 /// The exact install row, including grants and state that cannot be reconstructed from a manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct InstallRow {
@@ -249,12 +304,14 @@ pub(super) struct InstallRow {
     updated_at: String,
     data_version: i64,
     last_error: Option<String>,
+    #[serde(default)]
+    game_packages_json: Option<String>,
 }
 
 pub(super) fn install_row(conn: &Connection, id: &PluginId) -> LauncherResult<Option<InstallRow>> {
     conn.query_row(
         "SELECT version, install_dir, manifest_json, granted_capabilities, source_kind,
-                source_path, enabled, installed_at, updated_at, data_version, last_error
+                source_path, enabled, installed_at, updated_at, data_version, last_error, game_packages_json
          FROM plugin_installs WHERE plugin_id = ?1",
         params![id.as_str()],
         |row| {
@@ -270,6 +327,7 @@ pub(super) fn install_row(conn: &Connection, id: &PluginId) -> LauncherResult<Op
                 updated_at: row.get(8)?,
                 data_version: row.get(9)?,
                 last_error: row.get(10)?,
+                game_packages_json: row.get(11)?,
             })
         },
     )
@@ -310,7 +368,8 @@ impl InstallSnapshot {
             .execute(
                 "UPDATE plugin_installs SET version = ?2, install_dir = ?3, manifest_json = ?4,
                  granted_capabilities = ?5, source_kind = ?6, source_path = ?7, enabled = ?8,
-                 installed_at = ?9, updated_at = ?10, data_version = ?11, last_error = ?12
+                 installed_at = ?9, updated_at = ?10, data_version = ?11, last_error = ?12,
+                 game_packages_json = ?13
              WHERE plugin_id = ?1",
                 params![
                     id.as_str(),
@@ -324,7 +383,8 @@ impl InstallSnapshot {
                     record.installed_at,
                     record.updated_at,
                     record.data_version,
-                    record.last_error
+                    record.last_error,
+                    record.game_packages_json
                 ],
             )
             .map_err(db_error)?;
@@ -368,6 +428,7 @@ pub fn upsert(
     now: &str,
 ) -> LauncherResult<()> {
     let manifest_json = serde_json::to_string(manifest).map_err(db_error)?;
+    let game_packages_json = encode_game_packages(manifest, install_dir)?;
     let granted_json = serde_json::to_string(
         &granted
             .iter()
@@ -383,8 +444,8 @@ pub fn upsert(
     conn.execute(
         "INSERT INTO plugin_installs
              (plugin_id, version, manifest_json, granted_capabilities, source_kind, source_path,
-              install_dir, enabled, installed_at, updated_at, data_version, last_error)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, NULL)
+              install_dir, enabled, installed_at, updated_at, data_version, last_error, game_packages_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, NULL, ?11)
          ON CONFLICT(plugin_id) DO UPDATE SET
              version = excluded.version,
              manifest_json = excluded.manifest_json,
@@ -395,7 +456,8 @@ pub fn upsert(
              enabled = excluded.enabled,
              updated_at = excluded.updated_at,
              data_version = excluded.data_version,
-             last_error = NULL",
+             last_error = NULL,
+             game_packages_json = excluded.game_packages_json",
         params![
             manifest.id.as_str(),
             manifest.version.to_string(),
@@ -407,6 +469,7 @@ pub fn upsert(
             enabled as i64,
             now,
             manifest.data_version as i64,
+            game_packages_json,
         ],
     )
     .map_err(db_error)?;

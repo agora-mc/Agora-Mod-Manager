@@ -2417,6 +2417,141 @@ async fn official_plugins_register_before_community_ones() {
     }
 }
 
+#[tokio::test]
+async fn round_three_a_pending_official_upgrade_reserves_its_committed_games_and_products() {
+    check_pending_official_claims(false).await;
+}
+
+#[tokio::test]
+async fn round_three_a_pending_upgrade_backfills_claims_for_an_older_install() {
+    check_pending_official_claims(true).await;
+}
+
+async fn check_pending_official_claims(from_older_schema: bool) {
+    let world = World::new();
+    let skyrim = GameId::new("skyrim-se").unwrap();
+    let v1 = package_zip_with(
+        PLUGIN,
+        "1.0.0",
+        game_package_in_steam("skyrim-se", "489830"),
+        "game:define",
+        "",
+    );
+    world.publish(vec![(Release::of("1.0.0", "current", &v1), v1.clone())]);
+    installed(
+        world
+            .service
+            .install_official(PLUGIN, true, &world.fetcher)
+            .await
+            .unwrap(),
+    );
+
+    for (id, package) in [
+        ("aaaa.game-claim", game_package_in_steam("skyrim-se", "42")),
+        (
+            "aaab.product-claim",
+            game_package_in_steam("other-skyrim", "489830"),
+        ),
+        ("aaac.unrelated", game_package_in_steam("unrelated", "43")),
+    ] {
+        world
+            .service
+            .install_package_bytes(
+                &package_zip_with(id, "1.0.0", package, "game:define", ""),
+                true,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        world.start().0.games.source_for(&skyrim),
+        Some(&PackageSource::Plugin {
+            plugin_id: PLUGIN.into()
+        })
+    );
+
+    if from_older_schema {
+        // A record preserved from schema 29 has no saved declarations yet.
+        let conn = agora_core::db::local_state_connection(&world.paths().local_state_db()).unwrap();
+        assert_eq!(
+            conn.execute(
+                "UPDATE plugin_installs SET game_packages_json = NULL WHERE plugin_id = ?1",
+                [PLUGIN],
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    // v2 deliberately changes both claims. Inspecting its uncommitted files cannot recover v1's claims.
+    let v2 = package_zip_with(
+        PLUGIN,
+        "2.0.0",
+        game_package_in_steam("replacement-skyrim", "44"),
+        "game:define",
+        "",
+    );
+    world.publish(vec![
+        (Release::of("1.0.0", "previous", &v1), v1),
+        (Release::of("2.0.0", "current", &v2), v2),
+    ]);
+    let paths = world.paths();
+    let during = Arc::new(Mutex::new(None));
+    let observed = during.clone();
+    world
+        .ctx
+        .test_seams
+        .set_install_hook(Some(Arc::new(move |point| {
+            if point == InstallCrashPoint::FilesPublished {
+                let (ctx, warnings) = CoreContext::initialize_with_registry_trust(
+                    paths.clone(),
+                    GameRegistry::builder(),
+                    trust(),
+                )
+                .unwrap();
+                *observed.lock().unwrap() = Some((ctx, warnings));
+            }
+        })));
+    installed(
+        world
+            .service
+            .update_official(PLUGIN, true, &world.fetcher)
+            .await
+            .unwrap(),
+    );
+    world.ctx.test_seams.set_install_hook(None);
+
+    let (ctx, warnings) = during
+        .lock()
+        .unwrap()
+        .take()
+        .expect("FilesPublished seam ran");
+    assert!(
+        ctx.games.game(&GameId::new("unrelated").unwrap()).is_some(),
+        "the unrelated plugin still loads"
+    );
+    for name in ["skyrim-se", "other-skyrim", "replacement-skyrim"] {
+        assert!(
+            ctx.games.game(&GameId::new(name).unwrap()).is_none(),
+            "{name} registered during the pause: {warnings:?}"
+        );
+    }
+    for claimant in ["aaaa.game-claim", "aaab.product-claim"] {
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains(claimant) && warning.contains("reserved")),
+            "{warnings:?}"
+        );
+    }
+    let stable = world.start().0;
+    for name in ["skyrim-se", "other-skyrim", "replacement-skyrim"] {
+        assert!(
+            stable.games.game(&GameId::new(name).unwrap()).is_some(),
+            "the v1 claim for {name} should no longer block it"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Two script switches
 // ---------------------------------------------------------------------------

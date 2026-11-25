@@ -278,8 +278,8 @@ impl CoreContext {
                             mut records,
                             pending,
                         } = snapshot;
-                        records.retain(|record| !pending.contains_key(record.id().as_str()));
-                        warnings.extend(pending.into_values());
+
+                        warnings.extend(pending.values().cloned());
                         // Official plugins register first. A game id or a store
                         // product id goes to whoever claims it first, and the
                         // records come back in plugin-id order, so without this
@@ -307,6 +307,34 @@ impl CoreContext {
                                     .granted
                                     .contains(agora_plugin_api::Capability::GameDefine)
                             {
+                                continue;
+                            }
+                            if pending.contains_key(record.id().as_str()) {
+                                match crate::plugins::store::committed_game_packages(
+                                    &guard,
+                                    record.id(),
+                                ) {
+                                    Ok(declarations) => {
+                                        inputs.extend(declarations.into_iter().map(
+                                            |(path, json)| crate::game_registry::PackageInput {
+                                                source:
+                                                    crate::game_registry::PackageSource::Plugin {
+                                                        plugin_id: record.id().to_string(),
+                                                    },
+                                                blocked: true,
+                                                label: format!(
+                                                    "Plugin {}, committed game package {path}",
+                                                    record.id()
+                                                ),
+                                                json,
+                                            },
+                                        ));
+                                    }
+                                    Err(error) => warnings.push(format!(
+                                        "Cannot read committed game packages for {}: {error}",
+                                        record.id()
+                                    )),
+                                }
                                 continue;
                             }
                             has_entrypoint.insert(
@@ -349,40 +377,17 @@ impl CoreContext {
                             };
 
                             for pkg_contrib in &record.manifest.contributions.game_packages {
-                                // Validated at install, but the stored manifest is
-                                // user-writable: never read outside the plugin.
-                                let Ok(rel) = agora_game_api::RelPath::new(&pkg_contrib.path)
-                                else {
-                                    warnings.push(format!(
-                                        "Plugin {}: game package path {:?} leaves the plugin folder; skipped",
-                                        record.id(),
-                                        pkg_contrib.path
-                                    ));
-                                    continue;
-                                };
-                                let file_path = record.install_dir.join(rel.as_str());
-                                let content = match std::fs::read_to_string(&file_path) {
-                                    Ok(c) => c,
-                                    Err(err) => {
-                                        warnings.push(format!(
-                                            "Plugin {}: cannot read game package {}: {err}",
-                                            record.id(),
-                                            file_path.display()
-                                        ));
-                                        continue;
-                                    }
-                                };
-                                let json: serde_json::Value = match serde_json::from_str(&content) {
+                                let json = match crate::game_registry::inherit::read_game_package(
+                                    &record.install_dir,
+                                    &pkg_contrib.path,
+                                ) {
                                     Ok(json) => json,
-                                    Err(err) => {
-                                        warnings.push(format!(
-                                            "Plugin {}: failed to parse game package {}: {err}",
-                                            record.id(),
-                                            file_path.display()
-                                        ));
+                                    Err(error) => {
+                                        warnings.push(format!("Plugin {}: {error}", record.id()));
                                         continue;
                                     }
                                 };
+                                let file_path = record.install_dir.join(&pkg_contrib.path);
                                 inputs.push(crate::game_registry::PackageInput {
                                     source: crate::game_registry::PackageSource::Plugin {
                                         plugin_id: record.id().to_string(),
@@ -399,6 +404,21 @@ impl CoreContext {
                         }
 
                         drop(guard);
+
+                        let from_pending = |source: &crate::game_registry::PackageSource| matches!(source, crate::game_registry::PackageSource::Plugin { plugin_id } if pending.contains_key(plugin_id));
+                        if inputs.iter().any(|input| from_pending(&input.source)) {
+                            // Resolve committed declarations for reservations, then remove them
+                            // before resolving any packages that will actually register.
+                            let (committed, _) =
+                                crate::game_registry::inherit::resolve(inputs.clone());
+                            for package in committed
+                                .iter()
+                                .filter(|package| from_pending(&package.source))
+                            {
+                                game_builder.reserve_blocked(&package.definition);
+                            }
+                            inputs.retain(|input| !from_pending(&input.source));
+                        }
 
                         // All packages are read before any is resolved, so a parent may live in
                         // another plugin. A broken package warns with its chain and the others
