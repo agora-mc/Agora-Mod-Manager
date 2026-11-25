@@ -2,6 +2,7 @@
 
 use crate::clone::ClonePrefs;
 use crate::loader_service::LoaderService;
+use agora_core::db::instance_id_exists;
 use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::event_sink::{CoreEvent, EventStatus, ProgressEvent, ProgressPhase};
 use agora_core::models::{InstanceManifest, InstanceRow};
@@ -1291,7 +1292,7 @@ impl InstanceService {
                 .instance_dir(candidate)
                 .map(|dir| std::fs::symlink_metadata(dir).is_err())
                 .unwrap_or(false)
-                && !agora_core::db::instance_id_exists(&probe, candidate).unwrap_or(true)
+                && !instance_id_exists(&probe, candidate).unwrap_or(true)
         };
         match crate::recently_deleted::restore_entry(
             &self.ctx,
@@ -1408,11 +1409,9 @@ impl InstanceService {
             });
         }
         match self.connection().and_then(|conn| {
-            agora_core::db::instance_id_exists(&conn, &new_id).map_err(|error| {
-                LauncherError::Generic {
-                    code: "ERR_LOCAL_STATE_FAILED".into(),
-                    message: error.to_string(),
-                }
+            instance_id_exists(&conn, &new_id).map_err(|error| LauncherError::Generic {
+                code: "ERR_LOCAL_STATE_FAILED".into(),
+                message: error.to_string(),
             })
         }) {
             Ok(false) => {}
@@ -1822,11 +1821,9 @@ impl InstanceService {
         // The folder says nothing about another game's instance: an id can be in use with no
         // Minecraft folder of its own. One identity table means every game is asked.
         match self.connection().and_then(|conn| {
-            agora_core::db::instance_id_exists(&conn, &instance_id).map_err(|error| {
-                LauncherError::Generic {
-                    code: "ERR_LOCAL_STATE_FAILED".into(),
-                    message: error.to_string(),
-                }
+            instance_id_exists(&conn, &instance_id).map_err(|error| LauncherError::Generic {
+                code: "ERR_LOCAL_STATE_FAILED".into(),
+                message: error.to_string(),
             })
         }) {
             Ok(false) => {}
