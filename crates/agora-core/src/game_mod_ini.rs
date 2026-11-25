@@ -271,7 +271,7 @@ fn walk_overrides(root: &Path, rel: &Path, out: &mut Vec<String>) -> Result<(), 
                 source,
             }
         })?;
-        if is_reparse_point(&meta) {
+        if agora_game_api::redirects_a_name(&entry.path()) {
             return Err(ModIniError::Reparse { path: entry.path() });
         }
         let child = rel.join(entry.file_name());
@@ -285,18 +285,6 @@ fn walk_overrides(root: &Path, rel: &Path, out: &mut Vec<String>) -> Result<(), 
         }
     }
     Ok(())
-}
-
-fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        (meta.file_attributes() & 0x0000_0400) != 0
-    }
-    #[cfg(not(windows))]
-    {
-        meta.file_type().is_symlink()
-    }
 }
 
 /// Refuse a path under `instance_dir` when a symlink or junction on the way points outside it.
@@ -314,17 +302,18 @@ fn ensure_inside_instance(instance_dir: &Path, target: &Path) -> Result<(), ModI
     let mut current = instance_dir.to_path_buf();
     for component in relative.components() {
         current.push(component);
-        let meta = match std::fs::symlink_metadata(&current) {
-            Ok(meta) => meta,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-            Err(source) => {
-                return Err(ModIniError::Unreadable {
-                    path: current,
-                    source,
-                });
+        // Absent: nothing below it can be a link either. Any other failure is reported as itself,
+        // not as a link.
+        if let Err(source) = std::fs::symlink_metadata(&current) {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                break;
             }
-        };
-        if is_reparse_point(&meta) {
+            return Err(ModIniError::Unreadable {
+                path: current,
+                source,
+            });
+        }
+        if agora_game_api::redirects_a_name(&current) {
             return Err(ModIniError::Reparse { path: current });
         }
     }

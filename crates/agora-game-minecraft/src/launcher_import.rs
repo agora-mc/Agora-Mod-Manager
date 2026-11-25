@@ -245,23 +245,11 @@ fn detect_icon(candidate_path: &Path) -> Option<PathBuf> {
     None
 }
 
-fn unsafe_filesystem_entry(path: &Path, file_type: &std::fs::FileType) -> bool {
-    file_type.is_symlink() || is_reparse_point(path)
-}
-
-/// A junction or other reparse point, which `is_symlink` does not report. Unreadable counts as one.
-#[cfg(target_os = "windows")]
-fn is_reparse_point(path: &Path) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    std::fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
-        .unwrap_or(true)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn is_reparse_point(_path: &Path) -> bool {
-    false
+/// A link that redirects a name, from the game contract: a symbolic link, a junction or a mount
+/// point. A cloud placeholder or a deduplicated file is an ordinary file, and an entry that cannot
+/// be asked about counts as one.
+fn unsafe_filesystem_entry(path: &Path) -> bool {
+    agora_game_api::redirects_a_name(path)
 }
 
 /// Known non-loader Prism component UIDs that are safe to ignore.
@@ -368,7 +356,7 @@ fn inventory_payload(payload_root: &Path) -> Result<ContentInventory, String> {
                 Err(_) => continue,
             };
 
-            if unsafe_filesystem_entry(&entry.path(), &file_type) {
+            if unsafe_filesystem_entry(&entry.path()) {
                 continue;
             }
 
@@ -434,7 +422,7 @@ fn count_content_entries(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(0),
         Err(_) => return None,
     };
-    if unsafe_filesystem_entry(&folder, &meta.file_type()) || !meta.is_dir() {
+    if unsafe_filesystem_entry(&folder) || !meta.is_dir() {
         return Some(0);
     }
     let read_dir = std::fs::read_dir(&folder).ok()?;
@@ -442,7 +430,7 @@ fn count_content_entries(
     for entry in read_dir {
         let entry = entry.ok()?;
         let file_type = entry.file_type().ok()?;
-        if unsafe_filesystem_entry(&entry.path(), &file_type) {
+        if unsafe_filesystem_entry(&entry.path()) {
             continue;
         }
         if accept(&entry.file_name().to_string_lossy(), file_type.is_dir()) {

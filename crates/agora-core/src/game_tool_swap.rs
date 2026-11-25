@@ -42,8 +42,6 @@ pub const ASIDE_PREFIX: &str = "Data.agora-aside-";
 pub const COPY_PREFIX: &str = "Data.agora-copy-";
 /// Journal version 2 (junction swaps were version 1; recovery refuses those).
 pub const JOURNAL_VERSION: u32 = 2;
-#[cfg(windows)]
-const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SwapError {
@@ -265,23 +263,11 @@ pub fn read_journal(path: &Path) -> Result<SwapJournal, SwapError> {
     }
 }
 
-/// Whether a path is a junction, symbolic link or other reparse point. A missing path is not one.
+/// Whether a path is a link that redirects a name, from the game contract: a symbolic link, a
+/// junction or a mount point. A cloud placeholder or a deduplicated file is an ordinary folder, and
+/// a missing path redirects nothing.
 pub fn is_reparse_point(path: &Path) -> bool {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => is_reparse_meta(&meta),
-        Err(_) => false,
-    }
-}
-
-#[cfg(windows)]
-fn is_reparse_meta(meta: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn is_reparse_meta(meta: &std::fs::Metadata) -> bool {
-    meta.file_type().is_symlink()
+    agora_game_api::redirects_a_name(path)
 }
 
 #[cfg(windows)]
@@ -320,7 +306,7 @@ fn count_files(dir: &Path) -> usize {
         .map(|entry| {
             let path = entry.path();
             match std::fs::symlink_metadata(&path) {
-                Ok(meta) if meta.is_dir() && !is_reparse_meta(&meta) => count_files(&path),
+                Ok(meta) if meta.is_dir() && !is_reparse_point(&path) => count_files(&path),
                 Ok(_) => 1,
                 Err(_) => 0,
             }
