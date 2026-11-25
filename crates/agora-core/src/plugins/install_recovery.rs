@@ -934,18 +934,24 @@ fn apply(
     // startup refuses, and the reason the report gives, in the same words.
     refusal_to_touch_what_is_not_ours(capability.left_alone())?;
     // The checks every recovery runs, shared with the read-only report so it can never promise
-    // something a start would refuse. The identities come from the capability, which re-checked
-    // each folder's marker and OS identity when the decision was made.
-    let occupancy = Occupancy {
-        installed: capability.verified_identity(&layout.destination)?,
-        stashed: match &layout.rollback {
-            Some(path) => capability.verified_identity(path)?,
-            None => None,
+    // something a start would refuse. For an install, the identities come from the capability,
+    // which re-checked each folder's marker and OS identity when the decision was made. An
+    // uninstall moves only its own stash — through the capability, in `apply_uninstall` — and its
+    // package folder is compared by identity, because an install that runs from a development
+    // source owns no folder there.
+    let occupancy = match &journal.change {
+        PackageChange::Install { .. } => Occupancy {
+            installed: capability.verified_identity(&layout.destination)?,
+            stashed: match &layout.rollback {
+                Some(path) => capability.verified_identity(path)?,
+                None => None,
+            },
+            dropping: match &layout.rollback {
+                Some(_) => capability.verified_identity(&layout.dropping)?,
+                None => None,
+            },
         },
-        dropping: match &layout.rollback {
-            Some(_) => capability.verified_identity(&layout.dropping)?,
-            None => None,
-        },
+        PackageChange::Uninstall { .. } => Occupancy::read(&layout)?,
     };
     refusal_to_act(&journal, &layout, &occupancy)?;
     let PackageChange::Install { new, new_version } = &journal.change else {

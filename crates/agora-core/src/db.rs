@@ -3102,11 +3102,11 @@ pub fn instance_import_job_rows(conn: &Connection) -> anyhow::Result<Vec<Instanc
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
         // The instance's own name is read separately, so a row that cannot be parsed can still be
-        // reported as the row it is. An unreadable name is part of that row's error, never the
-        // row's absence.
-        let instance_id = match row.get::<_, String>(1) {
-            Ok(instance_id) => Some(instance_id),
-            Err(_) => None,
+        // reported as the row it is. A name this build cannot read is part of that row's error,
+        // never the row's absence.
+        let instance_id = match row.get::<_, rusqlite::types::Value>(1) {
+            Ok(rusqlite::types::Value::Text(instance_id)) => Some(instance_id),
+            _ => None,
         };
         out.push(InstanceImportRow {
             instance_id,
