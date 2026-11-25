@@ -19,7 +19,7 @@
 
 use agora_core::artifact_hash::{blank_asserted_hash, HashOrigin};
 use agora_core::ctx::Ctx;
-use agora_core::db::InstancePackGap;
+use agora_core::db::{local_state_connection, InstancePackGap};
 use agora_core::error::{HashConfirmation, LauncherError, LauncherResult};
 use agora_core::models::{
     InstalledMod, InstanceManifest, ModVersionCandidate, PackOrigin, PackPlatform,
@@ -1356,8 +1356,7 @@ pub fn finalize_pack_files(
     } else {
         Some(crate::pack_inventory::pack_content_hash(&files))
     };
-    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())
-        .map_err(|e| e.to_string())?;
+    let conn = local_state_connection(&ctx.paths.local_state_db()).map_err(|e| e.to_string())?;
     agora_core::db::replace_instance_pack_files(&conn, instance_id, &files)
         .map_err(|e| e.to_string())?;
 
@@ -1474,8 +1473,7 @@ fn gap_for(outcome: &PackEntryOutcome) -> Option<InstancePackGap> {
 }
 
 fn record_pack_gaps(ctx: &Ctx, instance_id: &str, gaps: &[InstancePackGap]) -> Result<(), String> {
-    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())
-        .map_err(|e| e.to_string())?;
+    let conn = local_state_connection(&ctx.paths.local_state_db()).map_err(|e| e.to_string())?;
     agora_core::db::replace_instance_pack_gaps(&conn, instance_id, gaps).map_err(|e| e.to_string())
 }
 
@@ -1687,7 +1685,7 @@ pub async fn retry_agora_pack_entries_with(
         .iter()
         .map(|o| (o.entry.filename.clone(), o.name.clone()))
         .collect();
-    let merged = agora_core::db::local_state_connection(&ctx.paths.local_state_db())
+    let merged = local_state_connection(&ctx.paths.local_state_db())
         .and_then(|conn| agora_core::db::list_instance_pack_gaps(&conn, instance_id))
         .map_err(|e| e.to_string())
         .map(|current| {
@@ -2214,7 +2212,7 @@ mod tests {
             pack_icon_url: None,
             template_id: None,
         };
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         agora_core::db::upsert_instance(
             &conn,
             crate::GAME_ID,
@@ -3455,7 +3453,7 @@ mod tests {
     /// is on, so only the toggle stands in the way.
     fn modrinth_off_ctx() -> (Ctx, std::path::PathBuf) {
         let (ctx, root) = temp_ctx_with_instance();
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         agora_core::db::set_setting(&conn, "modrinth_enabled", &serde_json::json!(false)).unwrap();
         agora_core::db::set_setting(&conn, "network_modrinth_enabled", &serde_json::json!(true))
             .unwrap();
@@ -3480,7 +3478,7 @@ mod tests {
             "the one-time allow lets Modrinth through for this import"
         );
 
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         assert_eq!(
             agora_core::db::get_setting(&conn, "modrinth_enabled").unwrap(),
             Some(serde_json::json!(false)),
@@ -3493,7 +3491,7 @@ mod tests {
     #[test]
     fn allowing_modrinth_once_still_respects_the_privacy_switch() {
         let (ctx, root) = modrinth_off_ctx();
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         agora_core::db::set_setting(&conn, "network_modrinth_enabled", &serde_json::json!(false))
             .unwrap();
         drop(conn);
@@ -3658,7 +3656,7 @@ mod tests {
     }
 
     fn gaps_of(ctx: &Ctx) -> Vec<InstancePackGap> {
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         agora_core::db::list_instance_pack_gaps(&conn, "inst").unwrap()
     }
 
