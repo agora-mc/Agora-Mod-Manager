@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -4994,6 +4995,58 @@ class TestPathRuleGuard(unittest.TestCase):
                 {"crates/core/src/mod.rs": source}, {"validators": {}, "comparisons": {}}, ()
             )
             self.assertEqual(failed, 1, body)
+
+    def test_the_budget_baseline_is_the_branch_point_not_head(self):
+        # A pull request is many commits: code in one, budget in the next. HEAD only sees the
+        # last one, so the copy at the branch point is what the check compares against.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def git(*args):
+                subprocess.run(
+                    ["git", *args], cwd=root, check=True, capture_output=True, text=True
+                )
+
+            git("init", "-q", "-b", "master")
+            (root / "a.txt").write_text("one\n", encoding="utf-8")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "add", "a.txt")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base")
+            branch_point = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            git("update-ref", "refs/remotes/origin/master", branch_point)
+            (root / "a.txt").write_text("two\n", encoding="utf-8")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "raised")
+
+            with mock.patch.object(cak, "REPO_ROOT", root):
+                self.assertEqual(cak.budget_baseline_ref(), branch_point)
+                # And with no remote to ask, the parent of HEAD is the baseline.
+                git("update-ref", "-d", "refs/remotes/origin/master")
+                self.assertEqual(cak.budget_baseline_ref(), branch_point)
+
+    def test_a_budget_file_that_is_new_at_the_baseline_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def git(*args):
+                subprocess.run(
+                    ["git", *args], cwd=root, check=True, capture_output=True, text=True
+                )
+
+            git("init", "-q", "-b", "master")
+            (root / "a.txt").write_text("one\n", encoding="utf-8")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "add", "a.txt")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base")
+            budget_file = root / "path_rules_budget.json"
+            budget_file.write_text("{}", encoding="utf-8")
+            with mock.patch.object(cak, "REPO_ROOT", root), mock.patch.object(
+                cak, "PATH_RULES_BUDGET", budget_file
+            ):
+                self.assertIsNone(cak.committed_budget())
 
     def test_a_raised_budget_fails_against_the_committed_baseline(self):
         # Code and budget raised together in one commit is what this catches: the file agrees with

@@ -1254,16 +1254,49 @@ def count_path_comparisons_in(path: Path) -> int:
     return count_path_comparisons(path.read_text(encoding="utf-8", errors="replace"))
 
 
+def budget_baseline_ref() -> str | None:
+    """The commit the budget is compared against: where this branch left `origin/master`.
+
+    Comparing with `HEAD` only sees the last commit, and a pull request is many commit
+    boundaries: raising the code in one commit and the budget in the next would pass both
+    comparisons separately. The branch point is the copy a reviewer already has, so it is the one
+    that decides. Outside a clone with a remote — a tarball, a first commit — the parent of `HEAD`
+    is the best that can be had, and `None` (no baseline, with a note) is the honest answer when
+    there is no parent either.
+    """
+    for args in (
+        ["merge-base", "HEAD", "origin/master"],
+        ["rev-parse", "--verify", "HEAD^"],
+    ):
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    return None
+
+
 def committed_budget() -> dict[str, Any] | None:
-    """The budget as the last commit has it, or `None` when there is no git to ask.
+    """The budget as the branch point has it, or `None` when there is no git to ask.
 
     The budget may only go down, and a comparison against the file's own numbers cannot see a
     commit that raised code and budget together. The committed copy can: a raised number is a
-    raised number, whatever the working tree says.
+    raised number, whatever the working tree says. `None` also covers a baseline commit that did
+    not have the file yet: the caller says so rather than inventing a number.
     """
+    reference = budget_baseline_ref()
+    if reference is None:
+        return None
     try:
         result = subprocess.run(
-            ["git", "show", f"HEAD:{PATH_RULES_BUDGET.relative_to(REPO_ROOT).as_posix()}"],
+            ["git", "show", f"{reference}:{PATH_RULES_BUDGET.relative_to(REPO_ROOT).as_posix()}"],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
@@ -1293,15 +1326,17 @@ def check_path_rules() -> None:
     problems: list[str] = []
     report: list[str] = []
 
-    # The budget only goes down. Raising it in the same commit as the code it counts would otherwise
-    # pass, because the file and the code would agree; the committed copy does not agree. The one
-    # exception is a change to the counting rule itself, which says so by bumping `rule`: then the
-    # numbers are re-taken from the truth and the reviewer sees the rule diff beside them.
+    # The budget only goes down. Raising it in the same change as the code it counts would otherwise
+    # pass, because the file and the code would agree; the copy at the branch point does not agree,
+    # and it stays the same for every commit of the pull request, so raising the code in one commit
+    # and the budget in the next is caught too. The one exception is a change to the counting rule
+    # itself, which says so by bumping `rule`: then the numbers are re-taken from the truth and the
+    # reviewer sees the rule diff beside them.
     committed = committed_budget()
     if committed is None:
         print(
-            "note: no committed budget to compare against (no git, or the file is new); "
-            "the only-goes-down rule is unchecked this run",
+            "note: no committed budget to compare against (no git, no parent commit, or the file "
+            "is new at the branch point); the only-goes-down rule is unchecked this run",
             file=sys.stderr,
         )
     elif budget.get("rule") != committed.get("rule"):
