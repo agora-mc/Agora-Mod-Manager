@@ -1075,4 +1075,44 @@ mod tests {
         assert!(!after.layers.layers()[0].enabled, "content:b turned off");
         assert!(after.layers.layers()[1].enabled, "content:a kept on");
     }
+
+    #[test]
+    fn a_profile_written_before_schema_32_applies_the_same() {
+        let s = setup();
+        create_game_profile(&s.ctx, "test-instance", &s.def, "base").unwrap();
+        // Rewrite the record in the shape code before schema 32 wrote: one game's state, flat,
+        // with no `sections` map. This is data from before the slice, read by the code after it.
+        let saved = loadout::read_profile(&s.dir, "base").unwrap();
+        let legacy = serde_json::json!({
+            "name": saved.name,
+            "enabled_mods": saved.enabled_mods,
+            "created_at": saved.created_at,
+            "covers": saved.covers,
+            "items": saved.items,
+            "game": saved.game,
+        });
+        let profiles_dir = loadout::loadouts_dir(&s.dir);
+        fs::create_dir_all(&profiles_dir).unwrap();
+        fs::write(profiles_dir.join("base.json"), legacy.to_string()).unwrap();
+
+        // Change everything the profile covers, then apply the old record.
+        let mut manifest = game_instance::get_manifest(&s.ctx, "test-instance").unwrap();
+        let mut layers = manifest.layers.layers().to_vec();
+        layers[0].enabled = false;
+        manifest.layers = agora_game_api::LayerStack::new(layers).unwrap();
+        manifest.saves = SavesChoice::Own;
+        crate::game_deploy::write_instance_manifest_atomic(&s.ctx, "test-instance", &manifest)
+            .unwrap();
+        fs::write(s.dir.join("user/Plugins.txt"), b"*C.esp\n").unwrap();
+
+        apply_game_profile_with_undo(&s.ctx, "test-instance", &s.def, "base", false).unwrap();
+
+        let restored = game_instance::get_manifest(&s.ctx, "test-instance").unwrap();
+        assert!(restored.layers.layers()[0].enabled);
+        assert_eq!(restored.saves, SavesChoice::Shared);
+        assert_eq!(
+            fs::read(s.dir.join("user/Plugins.txt")).unwrap(),
+            b"*A.esp\n*B.esp\n"
+        );
+    }
 }
