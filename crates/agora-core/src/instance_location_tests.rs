@@ -596,6 +596,7 @@ fn base_removal_keeps_base_when_state_db_metadata_fails() {
                 std::fs::metadata(path)
             }
         },
+        |path| std::fs::remove_file(path),
     );
     assert!(
         base_dir.is_dir(),
@@ -632,6 +633,7 @@ fn base_removal_still_reads_recently_deleted_when_the_state_db_is_missing() {
                 std::fs::metadata(path)
             }
         },
+        |path| std::fs::remove_file(path),
     );
     assert!(
         matches!(&removal, Err(BaseError::InUse { instances }) if instances == &vec!["pinned".to_string()]),

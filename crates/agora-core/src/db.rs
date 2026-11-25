@@ -9,6 +9,12 @@ use std::sync::Arc;
 /// Migrations are applied sequentially on startup.
 pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 31;
 
+/// The game whose columns `minecraft_instances` holds.
+///
+/// Core holds the schema, so it holds the one name that says which detail table belongs to which
+/// identity; what the game *is* stays in its package.
+pub const MINECRAFT_GAME: &str = "minecraft";
+
 /// How many pre-migration database backups are kept.
 pub const LOCAL_STATE_BACKUP_RETENTION: usize = 3;
 
@@ -2514,19 +2520,45 @@ fn migrate_v31(conn: &Connection) -> anyhow::Result<()> {
 
          DROP TABLE IF EXISTS user_instances;
          DROP TABLE IF EXISTS game_instances;
-
-         CREATE TRIGGER IF NOT EXISTS launch_history_instance_gone
-             AFTER DELETE ON instances
-         BEGIN
-             DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
-             DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
-             DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
-             DELETE FROM crash_log_results WHERE instance_id = OLD.instance_id;
-             DELETE FROM crash_save_backups WHERE instance_id = OLD.instance_id;
-             DELETE FROM plugin_load_order_rules WHERE instance_id = OLD.instance_id;
-         END;",
+",
     )?;
+    conn.execute_batch(instance_delete_trigger())?;
+    conn.execute_batch(instance_detail_guards())?;
     Ok(())
+}
+
+/// The triggers that keep a detail row and its identity agreeing about the game (§32.7).
+///
+/// Two instance tables became one, so the old promise that a row cannot describe another game's
+/// instance has to be stated: `minecraft_instances` only for a Minecraft identity,
+/// `game_instance_bases` only for one that is not Minecraft (Minecraft has no base), and an
+/// identity's game cannot be changed to contradict a detail row it already has.
+fn instance_detail_guards() -> &'static str {
+    "CREATE TRIGGER IF NOT EXISTS minecraft_detail_needs_a_minecraft_instance
+         BEFORE INSERT ON minecraft_instances
+     BEGIN
+         SELECT RAISE(ABORT, 'a minecraft_instances row needs an instance whose game is minecraft')
+         WHERE NOT EXISTS (SELECT 1 FROM instances
+                            WHERE instances.instance_id = NEW.instance_id
+                              AND instances.game = 'minecraft');
+     END;
+     CREATE TRIGGER IF NOT EXISTS base_detail_needs_a_game_instance
+         BEFORE INSERT ON game_instance_bases
+     BEGIN
+         SELECT RAISE(ABORT, 'a game_instance_bases row needs an instance of a game that uses a base; a Minecraft instance has none')
+         WHERE NOT EXISTS (SELECT 1 FROM instances
+                            WHERE instances.instance_id = NEW.instance_id)
+            OR EXISTS (SELECT 1 FROM minecraft_instances
+                        WHERE minecraft_instances.instance_id = NEW.instance_id);
+     END;
+     CREATE TRIGGER IF NOT EXISTS instance_game_change_needs_its_detail
+         BEFORE UPDATE OF game ON instances
+     BEGIN
+         SELECT RAISE(ABORT, 'this instance has minecraft detail columns, so its game must stay minecraft')
+         WHERE NEW.game <> 'minecraft'
+           AND EXISTS (SELECT 1 FROM minecraft_instances
+                        WHERE minecraft_instances.instance_id = NEW.instance_id);
+     END;"
 }
 
 /// True when the database has a table (not a view) of that name.
@@ -2684,14 +2716,25 @@ pub fn set_setting(conn: &Connection, key: &str, value: &serde_json::Value) -> a
     Ok(())
 }
 
-/// Insert or update an instance row.
 /// Insert or update an instance: its identity row in `instances`, and the Minecraft
 /// columns in `minecraft_instances`.
 ///
 /// `game` is the identity's game id, which only the caller knows (the identity table is
 /// shared by every game). The detail row's foreign key means an instance whose identity
 /// could not be written fails here rather than existing in half a database.
+///
+/// Only Minecraft is accepted, because the columns written here are Minecraft's: a
+/// different game's instance gets its identity and its own detail row elsewhere, so a
+/// mismatched `game` is refused before anything is written rather than producing an
+/// identity that contradicts the detail row the database's triggers allow.
 pub fn upsert_instance(conn: &Connection, game: &str, row: &InstanceRow) -> anyhow::Result<()> {
+    if game != MINECRAFT_GAME {
+        anyhow::bail!(
+            "instance {} belongs to game {game}, but this is the Minecraft instance record; \
+             refusing to write Minecraft columns onto it",
+            row.instance_id
+        );
+    }
     conn.execute(
         "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at, total_play_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -4285,6 +4328,46 @@ mod tests {
         assert_eq!(results[0].confirm_count, 2);
         assert_eq!(results[1].mod_id, "mod_b");
         assert_eq!(results[1].confirm_count, 1);
+    }
+
+    #[test]
+    fn upsert_instance_refuses_another_game_before_writing_anything() {
+        let (conn, _path) = test_db();
+        let row = InstanceRow {
+            instance_id: "skyrim-pack".into(),
+            name: "Skyrim pack".into(),
+            minecraft_version: "1.21.1".into(),
+            loader: "fabric".into(),
+            loader_version: "0.16.9".into(),
+            is_modpack: false,
+            is_locked: false,
+            last_launched_at: None,
+            jvm_memory_mb: 4096,
+            jvm_memory_mode: "manual".into(),
+            jvm_gc: "auto".into(),
+            jvm_custom_args: String::new(),
+            jvm_always_pre_touch: false,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            java_path: None,
+            java_incompatible_override: false,
+            icon_path: None,
+            launch_mode_override: "delegated".into(),
+            import_source: None,
+            total_play_ms: 0,
+        };
+        let error = upsert_instance(&conn, "skyrim", &row)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("skyrim"), "{error}");
+        assert!(error.contains("skyrim-pack"), "{error}");
+        let identities: i64 = conn
+            .query_row("SELECT COUNT(*) FROM instances", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(identities, 0, "the refusal happens before the write");
+        let details: i64 = conn
+            .query_row("SELECT COUNT(*) FROM minecraft_instances", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(details, 0);
     }
 
     #[test]

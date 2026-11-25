@@ -505,3 +505,70 @@ fn a_game_instance_still_restores_from_recently_deleted_after_the_migration() {
         1
     );
 }
+
+#[test]
+fn the_database_refuses_a_detail_row_that_contradicts_the_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = old_database(tmp.path());
+    init_local_state_db(&path).unwrap();
+    let conn = local_state_connection(&path).unwrap();
+
+    // A Minecraft detail row for an instance of another game.
+    conn.execute(
+        "INSERT INTO instances (instance_id, game, name) VALUES ('skyrim-2', 'skyrim-se', 'Riften 2')",
+        [],
+    )
+    .unwrap();
+    let error = conn
+        .execute(
+            "INSERT INTO minecraft_instances (instance_id, minecraft_version, loader, loader_version)
+             VALUES ('skyrim-2', '1.21', 'fabric', '0.16')",
+            [],
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("minecraft"),
+        "the refusal says which detail row does not belong: {error}"
+    );
+
+    // A base record for a Minecraft instance.
+    let error = conn
+        .execute(
+            "INSERT INTO game_instance_bases (instance_id, base_json) VALUES ('mc-pack', '{}')",
+            [],
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("Minecraft"),
+        "the refusal says which detail row does not belong: {error}"
+    );
+
+    // And the matching pairs still work, in both directions.
+    conn.execute(
+        "INSERT INTO game_instance_bases (instance_id, base_json) VALUES ('skyrim-2', '{}')",
+        [],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "INSERT INTO minecraft_instances (instance_id, minecraft_version, loader,
+                                              loader_version)
+             VALUES ('mc-2', '1.21', 'vanilla', '')",
+            [],
+        )
+        .is_err(),
+        "a detail row with no identity row is refused by the foreign key"
+    );
+
+    // Changing an identity's game to one that contradicts its detail row is refused too.
+    let error = conn
+        .execute(
+            "UPDATE instances SET game = 'skyrim-se' WHERE instance_id = 'mc-pack'",
+            [],
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("minecraft"),
+        "the refusal names the row that would be orphaned: {error}"
+    );
+}
