@@ -877,8 +877,18 @@ pub fn inspect_local_state(db_path: &Path) -> LocalStateInspection {
         Ok(kept) => inspection.kept_aside = kept,
         Err(error) => inspection.kept_aside_error = Some(error.to_string()),
     }
-    if !db_path.exists() {
-        return inspection;
+    match agora_game_api::probe::probe(db_path) {
+        // The one answer that means there is no database: a first run.
+        agora_game_api::probe::Probe::Absent => return inspection,
+        // Anything else that went wrong is "could not read", never "not created yet".
+        agora_game_api::probe::Probe::CantTell(error) => {
+            inspection.integrity = LocalStateIntegrity::Unreadable(format!(
+                "{} could not be examined ({error})",
+                db_path.display()
+            ));
+            return inspection;
+        }
+        agora_game_api::probe::Probe::Present(_) => {}
     }
     inspection.integrity = match check_integrity(db_path, IntegrityAccess::ReadOnly) {
         Ok(Integrity::Ok) => LocalStateIntegrity::Ok,

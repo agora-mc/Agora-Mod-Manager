@@ -1275,8 +1275,9 @@ fn refusal_to_act(
 /// One plugin-install journal as the read-only report sees it (MASTER_SPEC §32.11).
 #[derive(Debug, Clone)]
 pub struct InstallJournalReport {
-    /// The plugin the journal covers.
-    pub plugin_id: PluginId,
+    /// The plugin the journal covers, exactly as the journal spells it: a row whose id is not a
+    /// plugin id is reported as that row rather than dropped from the listing.
+    pub plugin_id: String,
     /// Where the journal is: the database row, or the file an older build left.
     pub path: PathBuf,
     /// This kind's own state, when the journal was readable.
@@ -1306,12 +1307,34 @@ pub fn journal_report(
     view: &dyn ProcessView,
 ) -> LauncherResult<Vec<InstallJournalReport>> {
     let locks = LockManager::new(paths.locks_root());
-    let ids = match conn {
-        Some(conn) => interrupted_installs(conn, paths)?,
-        None => legacy_journal_ids(paths)?,
+    let journals = match conn {
+        Some(conn) => stored_journals(conn, paths)?,
+        None => legacy_journal_ids(paths)?
+            .into_iter()
+            .map(StoredJournal::Ours)
+            .collect(),
     };
     let mut out = Vec::new();
-    for id in ids {
+    for journal in journals {
+        let id = match journal {
+            StoredJournal::Ours(id) => id,
+            // One row this build cannot read is that row's answer, not the listing's.
+            StoredJournal::Unreadable { id, why } => {
+                out.push(InstallJournalReport {
+                    plugin_id: id.clone(),
+                    path: paths.local_state_db(),
+                    state: None,
+                    outcome: recovery::RecoveryOutcome::NeedsHand,
+                    reason: format!(
+                        "The journal's plugin id \"{id}\" is not a plugin id ({why}), so no \
+                         command can act on this row. It is reported as itself; the other journals \
+                         are still listed. Nothing was changed."
+                    ),
+                    command: None,
+                });
+                continue;
+            }
+        };
         let legacy_only = match conn {
             Some(conn) => journal_document(conn, &id)?.is_none(),
             None => true,
@@ -1340,37 +1363,57 @@ pub fn journal_report(
             &NoContentProof,
             view,
         );
-        let (outcome, reason) = match decision {
+        let (outcome, reason, command_works) = match decision {
             recovery::ReadOnlyDecision::Nothing => (
                 recovery::RecoveryOutcome::NothingToDo,
                 "The journal is already settled: recovery has nothing to do.".to_string(),
+                true,
             ),
-            recovery::ReadOnlyDecision::Busy(why) => (recovery::RecoveryOutcome::Busy, why),
+            recovery::ReadOnlyDecision::Busy(why) => (recovery::RecoveryOutcome::Busy, why, true),
             recovery::ReadOnlyDecision::NeedsHand(why) => {
-                (recovery::RecoveryOutcome::NeedsHand, why)
+                (recovery::RecoveryOutcome::NeedsHand, why, true)
             }
             recovery::ReadOnlyDecision::WouldAct(journal, left_alone) => {
                 match would_do(&journal, &left_alone, paths) {
-                    Ok((direction, state)) => (
+                    Ok(WouldDo::Act(direction, state)) => (
                         match direction {
                             InstallDirection::Finish => recovery::RecoveryOutcome::WouldFinish,
                             InstallDirection::Undo => recovery::RecoveryOutcome::WouldUndo,
                         },
                         describe(direction, state),
+                        true,
                     ),
-                    // The handler would refuse, for the same reason startup gives.
-                    Err(error) => (recovery::RecoveryOutcome::NeedsHand, error.to_string()),
+                    // The handler would refuse because a path cannot be proven to be this
+                    // operation's. No command overrides that, so the report offers none and says
+                    // what to check instead.
+                    Ok(WouldDo::NotOurs(why)) => (
+                        recovery::RecoveryOutcome::NeedsHand,
+                        format!(
+                            "{why} Check that path and the ownership marker it names: they must be \
+                             there and name this operation. There is no Agora command that \
+                             overrides this yet, and nothing was changed."
+                        ),
+                        false,
+                    ),
+                    // A package that is not where the journal says: the same reason startup gives,
+                    // and `agora plugin recover` is the way out of it.
+                    Ok(WouldDo::Refuses(why)) => {
+                        (recovery::RecoveryOutcome::NeedsHand, why, true)
+                    }
+                    Err(error) => (recovery::RecoveryOutcome::NeedsHand, error.to_string(), true),
                 }
             }
         };
         let command = match outcome {
+            // A busy journal has no command: the next start retries it.
             recovery::RecoveryOutcome::Busy | recovery::RecoveryOutcome::NothingToDo => None,
+            _ if !command_works => None,
             // The explicit escape hatch for a journal and stash no database knows about.
             _ if legacy_only => Some(format!("agora plugin recover {id} --keep-aside --yes")),
             _ => Some(format!("agora plugin recover {id} --yes")),
         };
         out.push(InstallJournalReport {
-            plugin_id: id,
+            plugin_id: id.to_string(),
             path,
             state,
             outcome,
@@ -1381,7 +1424,48 @@ pub fn journal_report(
     Ok(out)
 }
 
-/// What a start would do with a decided journal: the direction, and the state it read.
+/// One journal the database holds, as far as its id can be read.
+enum StoredJournal {
+    /// A journal this build can name, so it can be read and decided.
+    Ours(PluginId),
+    /// A row whose plugin id this build cannot read, with the reason. Startup fails loudly on it
+    /// ([`interrupted_installs`]); the report lists it as itself and goes on.
+    Unreadable {
+        id: String,
+        why: String,
+    },
+}
+
+/// Every journal id the database holds, each one's own trouble with it, then the legacy ones.
+fn stored_journals(conn: &Connection, paths: &AppPaths) -> LauncherResult<Vec<StoredJournal>> {
+    let mut journals = std::collections::BTreeMap::new();
+    for id in store::journal_ids(conn)? {
+        let journal = match PluginId::parse(&id) {
+            Ok(parsed) => StoredJournal::Ours(parsed),
+            Err(error) => StoredJournal::Unreadable {
+                id: id.clone(),
+                why: error.message,
+            },
+        };
+        journals.insert(id, journal);
+    }
+    for id in legacy_journal_ids(paths)? {
+        journals.insert(id.to_string(), StoredJournal::Ours(id));
+    }
+    Ok(journals.into_values().collect())
+}
+
+/// What the handler would do with a journal the decision handed it.
+enum WouldDo {
+    /// It would act: the direction it takes, and the state it read.
+    Act(InstallDirection, PluginInstallState),
+    /// It refuses, because a path cannot be proven to be this operation's own.
+    NotOurs(String),
+    /// It refuses, because a package is not where the journal says it is.
+    Refuses(String),
+}
+
+/// What a start would do with a decided journal.
 ///
 /// The payload comes from the document the decision validated, and the refusal checks run on the
 /// folders the journal names — the same ones, in the same order, that [`apply`] uses.
@@ -1389,16 +1473,20 @@ fn would_do(
     journal: &recovery::Journal<PluginInstallState>,
     left_alone: &[(PathBuf, String)],
     paths: &AppPaths,
-) -> LauncherResult<(InstallDirection, PluginInstallState)> {
+) -> LauncherResult<WouldDo> {
     let payload: InstallJournal = journal
         .payload()
         .map_err(|problem| io_error(format!("its own fields are not readable: {problem}")))?;
-    refusal_to_touch_what_is_not_ours(left_alone)?;
+    if let Err(error) = refusal_to_touch_what_is_not_ours(left_alone) {
+        return Ok(WouldDo::NotOurs(error.to_string()));
+    }
     let layout = payload.layout(paths)?;
     let occupancy = Occupancy::read(&layout)?;
-    refusal_to_act(&payload, &layout, &occupancy)?;
+    if let Err(error) = refusal_to_act(&payload, &layout, &occupancy) {
+        return Ok(WouldDo::Refuses(error.to_string()));
+    }
     let state = payload.envelope.state;
-    Ok((direction(state), state))
+    Ok(WouldDo::Act(direction(state), state))
 }
 
 /// One sentence for what recovery would do, in that state's own words.

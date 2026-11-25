@@ -336,11 +336,92 @@ fn an_install_whose_marker_was_removed_needs_a_hand_with_startups_reason() {
         .and_then(|rest| rest.split(" Run `").next())
         .unwrap_or_default()
         .trim_end_matches('.');
-    assert_eq!(
-        entry.reason.trim_end_matches('.'),
-        startup_reason,
-        "the report repeats startup's reason word for word:\nreport: {}\nstartup: {startup}",
+    assert!(
+        entry.reason.starts_with(startup_reason),
+        "the report repeats startup's reason first:\nreport: {}\nstartup: {startup}",
         entry.reason
+    );
+    assert_eq!(
+        entry.command, None,
+        "no command overrides a path whose ownership cannot be proven: {entry:?}"
+    );
+    assert!(
+        entry.reason.contains("Check")
+            && entry.reason.contains(".owner-"),
+        "the reason says what to check, naming the marker: {entry:?}"
+    );
+    assert!(
+        entry.reason.contains("no Agora command"),
+        "and says there is no override yet: {entry:?}"
+    );
+}
+
+/// A journal row whose plugin id is not a plugin id is reported as that row; the journals beside it
+/// are still listed.
+#[test]
+fn a_row_whose_plugin_id_is_not_a_plugin_id_is_reported_as_that_row() {
+    let (_dir, paths) = data_root();
+    init_database(&paths);
+    interrupted_install(&paths, InstallCrashPoint::Extracted);
+    {
+        let conn = agora_core::db::local_state_connection(&paths.local_state_db()).unwrap();
+        conn.execute(
+            "INSERT INTO plugin_install_journal (plugin_id, document) VALUES (?1, ?2)",
+            rusqlite::params!["Not A Plugin Id", "{}"],
+        )
+        .unwrap();
+    }
+
+    let report = report(&paths);
+    let journals = entries_of(&report, JournalKind::PluginInstall);
+    assert!(
+        report
+            .not_searched
+            .iter()
+            .all(|missing| missing.kind != JournalKind::PluginInstall),
+        "one bad row does not make the kind unsearchable: {:?}",
+        report.not_searched
+    );
+    assert_eq!(journals.len(), 2, "{journals:?}");
+    let good = journals
+        .iter()
+        .find(|entry| entry.resource == PLUGIN)
+        .expect("the readable journal is still listed");
+    assert_eq!(good.outcome, RecoveryOutcome::WouldUndo, "{good:?}");
+    let bad = journals
+        .iter()
+        .find(|entry| entry.resource == "Not A Plugin Id")
+        .expect("the unreadable row is listed as itself");
+    assert_eq!(bad.outcome, RecoveryOutcome::NeedsHand, "{bad:?}");
+    assert_eq!(bad.command, None, "{bad:?}");
+    assert!(
+        bad.reason.contains("not a plugin id"),
+        "the row's own error is reported: {bad:?}"
+    );
+}
+
+/// A database path that cannot be examined is "could not read", never "not created yet": an error
+/// is not an absence.
+#[test]
+fn a_database_path_that_cannot_be_examined_is_not_reported_as_absent() {
+    let (_dir, paths) = data_root();
+    let db = if cfg!(windows) {
+        // A name Windows refuses to look up.
+        paths.root().join("local_state<db")
+    } else {
+        // A path that runs through a regular file.
+        let plain = paths.root().join("plain");
+        std::fs::write(&plain, b"x").unwrap();
+        plain.join("local_state.db")
+    };
+
+    let inspection = agora_core::db::inspect_local_state(&db);
+    assert!(
+        matches!(
+            inspection.integrity,
+            agora_core::db::LocalStateIntegrity::Unreadable(_)
+        ),
+        "a path that cannot be examined is unreadable, not missing: {inspection:?}"
     );
 }
 
