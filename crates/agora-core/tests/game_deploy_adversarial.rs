@@ -402,6 +402,57 @@ fn probe_hostile_instance_id_creates_nothing() {
     assert!(!tmp.path().join("escape").exists());
 }
 
+/// A folder link the ordinary user can make: a junction on Windows (no administrator rights), a
+/// symbolic link elsewhere.
+fn make_folder_link(link: &Path, target: &Path) {
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("cmd runs");
+        assert!(
+            output.status.success(),
+            "mklink /J failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[cfg(not(windows))]
+    std::os::unix::fs::symlink(target, link).expect("symlink");
+}
+
+#[test]
+fn probe_a_link_in_the_writable_layer_is_not_deployed() {
+    let tmp = TempDir::new().unwrap();
+    let (ctx, def, inst) = setup(&tmp);
+    let item = add_content_folder(&ctx, "M", &[("a.txt", b"a")]);
+    add_content(&ctx, &inst.instance_id, &item, None, None).unwrap();
+    // The game leaves a link in the instance's writable layer, pointing outside the instance.
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), b"not a game file").unwrap();
+    let writable = ctx
+        .paths
+        .instance_dir(&inst.instance_id)
+        .unwrap()
+        .join("writable");
+    std::fs::create_dir_all(&writable).unwrap();
+    std::fs::write(writable.join("mine.txt"), b"the game wrote this").unwrap();
+    make_folder_link(&writable.join("elsewhere"), &outside);
+    let p = plan(&ctx, &inst.instance_id, &def, DeployMode::Links).unwrap();
+    let paths: Vec<String> = p.files.iter().map(|f| f.path.to_string()).collect();
+    assert!(
+        !paths.iter().any(|path| path.starts_with("elsewhere")),
+        "a link in the writable layer deployed what it points at: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|path| path == "mine.txt"),
+        "the writable layer's own file went missing: {paths:?}"
+    );
+}
+
 #[test]
 fn probe_a_minecraft_instance_does_not_block_content_removal() {
     let tmp = TempDir::new().unwrap();

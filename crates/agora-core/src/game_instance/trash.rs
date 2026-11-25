@@ -119,8 +119,11 @@ fn db_err(error: impl std::fmt::Display) -> InstanceError {
 // Link-safe helpers (the same rules Minecraft's recently deleted area uses)
 // ---------------------------------------------------------------------------
 
-fn is_link(metadata: &std::fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
+/// Whether `path` is a link that redirects a name, from the game contract: a symbolic link, a
+/// junction or a mount point. A cloud placeholder or a deduplicated file is an ordinary file, so a
+/// save folder on OneDrive is read like any other.
+fn is_link(path: &Path) -> bool {
+    agora_game_api::redirects_a_name(path)
 }
 
 fn remove_link(path: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
@@ -142,7 +145,7 @@ fn tree_size(root: &Path) -> std::io::Result<u64> {
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             let metadata = std::fs::symlink_metadata(entry.path())?;
-            if is_link(&metadata) {
+            if is_link(&entry.path()) {
                 continue;
             }
             if metadata.is_dir() {
@@ -195,7 +198,7 @@ fn detach_links(root: &Path) -> std::io::Result<Vec<RemovedLink>> {
                 let entry = entry?;
                 let path = entry.path();
                 let metadata = std::fs::symlink_metadata(&path)?;
-                if is_link(&metadata) {
+                if is_link(&path) {
                     #[cfg(windows)]
                     let (target, junction, is_dir) = {
                         use std::os::windows::fs::FileTypeExt;
@@ -234,7 +237,7 @@ fn detach_links(root: &Path) -> std::io::Result<Vec<RemovedLink>> {
 
 fn is_plain_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
-        .map(|m| !is_link(&m) && m.is_dir())
+        .map(|m| !is_link(path) && m.is_dir())
         .unwrap_or(false)
 }
 

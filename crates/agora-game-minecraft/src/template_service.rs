@@ -241,7 +241,7 @@ pub fn list_capturable_files(instance_dir: &Path) -> Result<Vec<CapturableFile>,
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
-        if helpers::unsafe_filesystem_entry(&path, &metadata.file_type()) || !metadata.is_file() {
+        if helpers::unsafe_filesystem_entry(&path) || !metadata.is_file() {
             continue;
         }
         out.push(CapturableFile {
@@ -277,7 +277,7 @@ fn walk_capturable(
         let file_type = entry
             .file_type()
             .map_err(|e| format!("Cannot stat {}: {e}", path.display()))?;
-        if helpers::unsafe_filesystem_entry(&path, &file_type) {
+        if helpers::unsafe_filesystem_entry(&path) {
             continue;
         }
         let name = entry.file_name();
@@ -430,7 +430,7 @@ pub fn create_template(
             let src = join_validated(source_root, relative_path)?;
             let metadata = fs::symlink_metadata(&src)
                 .map_err(|e| format!("Cannot read '{relative_path}': {e}"))?;
-            if helpers::unsafe_filesystem_entry(&src, &metadata.file_type()) {
+            if helpers::unsafe_filesystem_entry(&src) {
                 return Err(format!("'{relative_path}' is not a regular file."));
             }
             if !metadata.is_file() {
@@ -547,7 +547,7 @@ pub fn apply_template_files(root: &Path, id: &str, dest_dir: &Path) -> Result<us
             // reason to abort: apply what is there and report the count.
             Err(_) => continue,
         };
-        if helpers::unsafe_filesystem_entry(&src, &metadata.file_type()) || !metadata.is_file() {
+        if helpers::unsafe_filesystem_entry(&src) || !metadata.is_file() {
             continue;
         }
         let dst = join_validated(dest_dir, &file.relative_path)?;

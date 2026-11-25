@@ -326,10 +326,10 @@ impl EvidenceStore {
                 path: entry.path(),
                 source,
             })?;
-            if crate::content_store::is_reparse_point_or_symlink(&metadata) {
+            if crate::content_store::is_reparse_point_or_symlink(&entry.path()) {
                 report.skipped.push(RetentionSkip {
                     path: entry.path(),
-                    reason: "a reparse point is never followed or removed".to_string(),
+                    reason: "a link that points elsewhere is never followed or removed".to_string(),
                 });
                 continue;
             }
@@ -521,12 +521,12 @@ fn copy_folder(
                     continue;
                 }
             };
-            if crate::content_store::is_reparse_point_or_symlink(&metadata) {
+            if crate::content_store::is_reparse_point_or_symlink(&path) {
                 copied.problems.push(CopyProblem {
                     source_id: found.source_id.clone(),
                     name: relative_name(&found.path, &path),
                     kind: CopyProblemKind::ReparseSkipped,
-                    detail: "a junction or symlink inside the folder was not followed".to_string(),
+                    detail: "a link inside the folder was not followed".to_string(),
                 });
                 continue;
             }
@@ -719,21 +719,21 @@ fn copy_file(
     }
     let remaining = limits.max_total_bytes.saturating_sub(state.bytes);
 
-    // Check again, now, in case the file became a junction or symlink since collection. A small
-    // window remains between this check and `open`; that is acceptable because this code only
-    // reads the source and never writes through it.
+    // Check again, now, in case the file became a link since collection. A small window remains
+    // between this check and `open`; that is acceptable because this code only reads the source and
+    // never writes through it.
     match std::fs::symlink_metadata(source_path) {
-        Ok(metadata) if crate::content_store::is_reparse_point_or_symlink(&metadata) => {
+        Ok(_) if crate::content_store::is_reparse_point_or_symlink(source_path) => {
             copied.problems.push(CopyProblem {
                 source_id: found.source_id.clone(),
                 name: artifact.name.clone(),
                 kind: CopyProblemKind::ReparseSkipped,
-                detail: "the file became a junction or symlink before it was copied".to_string(),
+                detail: "the file became a link before it was copied".to_string(),
             });
             unavailable(
                 &mut artifact,
                 copied,
-                "the file became a junction or symlink before it could be copied",
+                "the file became a link before it could be copied",
             );
             return Ok(Some(artifact));
         }
@@ -988,7 +988,7 @@ fn measure_tree(folder: &Path, report: &mut RetentionReport) -> (u64, bool) {
                     continue;
                 }
             };
-            if crate::content_store::is_reparse_point_or_symlink(&metadata) {
+            if crate::content_store::is_reparse_point_or_symlink(&entry.path()) {
                 has_reparse = true;
                 continue;
             }
@@ -1043,10 +1043,10 @@ fn remove_tree_inside(root_real: &Path, path: &Path) -> (u64, Vec<RetentionSkip>
                     continue;
                 }
             };
-            if crate::content_store::is_reparse_point_or_symlink(&metadata) {
+            if crate::content_store::is_reparse_point_or_symlink(&path) {
                 skipped.push(RetentionSkip {
                     path,
-                    reason: "a reparse point is never followed or removed".to_string(),
+                    reason: "a link that points elsewhere is never followed or removed".to_string(),
                 });
                 continue;
             }

@@ -267,7 +267,7 @@ impl ModCache {
             return Err("refusing to remove through a link".into());
         }
         match fs::symlink_metadata(&dir) {
-            Ok(meta) if meta.file_type().is_dir() && !is_link_like(&meta) => {
+            Ok(meta) if meta.is_dir() && !is_link_like(&dir) => {
                 fs::remove_dir_all(&dir).map_err(|e| format!("failed to remove entry: {e}"))
             }
             Ok(_) => Err("refusing to remove a non-directory cache entry".into()),
@@ -533,7 +533,7 @@ pub(crate) fn plain_path_under(root: &Path, target: &Path) -> bool {
             _ => return false,
         }
         match fs::symlink_metadata(&current) {
-            Ok(meta) if is_link_like(&meta) => return false,
+            Ok(_) if is_link_like(&current) => return false,
             Ok(_) => {}
             // Not there yet: nothing further down can be a link.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
@@ -543,17 +543,10 @@ pub(crate) fn plain_path_under(root: &Path, target: &Path) -> bool {
     true
 }
 
-pub(crate) fn is_link_like(meta: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        // FILE_ATTRIBUTE_REPARSE_POINT: junctions and symlinks.
-        meta.file_attributes() & 0x400 != 0 || meta.file_type().is_symlink()
-    }
-    #[cfg(not(windows))]
-    {
-        meta.file_type().is_symlink()
-    }
+pub(crate) fn is_link_like(path: &Path) -> bool {
+    // One rule with the rest of Agora: a link that redirects a name is refused and a cloud
+    // placeholder or a deduplicated file is an ordinary file.
+    agora_game_api::redirects_a_name(path)
 }
 
 #[cfg(test)]

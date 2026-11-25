@@ -13,6 +13,7 @@ pub mod host;
 pub mod id;
 pub mod layer;
 pub mod package;
+pub mod path;
 pub mod probe;
 
 pub use condition::*;
@@ -21,6 +22,7 @@ pub use host::*;
 pub use id::*;
 pub use layer::*;
 pub use package::*;
+pub use path::*;
 pub use probe::*;
 
 pub const GAME_API_VERSION: semver::Version = semver::Version::new(0, 1, 0);

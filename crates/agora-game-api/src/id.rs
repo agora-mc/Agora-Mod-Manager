@@ -229,124 +229,6 @@ impl StoreId {
     }
 }
 
-/// A validated path relative to a game, instance or base root.
-///
-/// Ensures the path cannot escape its root: backslashes are normalized to `/`,
-/// `..` components are rejected, drive letters and absolute paths are rejected,
-/// and null bytes are rejected. Empty string `""` represents the root directory itself.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct RelPath(String);
-
-/// A relative path was absolute, contained a drive letter, or attempted to leave its root.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("invalid relative path {0:?}: must be relative and stay inside its root, no '..', no drive letters, no absolute paths")]
-pub struct RelPathError(pub String);
-
-impl RelPath {
-    pub fn new(value: impl Into<String>) -> Result<Self, RelPathError> {
-        let value = value.into();
-        let normalized = value.replace('\\', "/");
-        if normalized.starts_with('/')
-            || normalized.contains('\0')
-            || normalized.contains(':')
-            || normalized.split('/').any(|part| part == "..")
-        {
-            return Err(RelPathError(value));
-        }
-        Ok(Self(normalized))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl TryFrom<String> for RelPath {
-    type Error = RelPathError;
-    fn try_from(value: String) -> Result<Self, RelPathError> {
-        Self::new(value)
-    }
-}
-
-impl TryFrom<&str> for RelPath {
-    type Error = RelPathError;
-    fn try_from(value: &str) -> Result<Self, RelPathError> {
-        Self::new(value)
-    }
-}
-
-impl From<RelPath> for String {
-    fn from(path: RelPath) -> String {
-        path.0
-    }
-}
-
-impl fmt::Display for RelPath {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl AsRef<str> for RelPath {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::ops::Deref for RelPath {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::borrow::Borrow<str> for RelPath {
-    fn borrow(&self) -> &str {
-        &self.0
-    }
-}
-
-impl PartialEq<str> for RelPath {
-    fn eq(&self, other: &str) -> bool {
-        self.0 == other
-    }
-}
-
-impl PartialEq<&str> for RelPath {
-    fn eq(&self, other: &&str) -> bool {
-        self.0 == *other
-    }
-}
-
-impl PartialEq<String> for RelPath {
-    fn eq(&self, other: &String) -> bool {
-        self.0 == *other
-    }
-}
-
-impl PartialEq<RelPath> for str {
-    fn eq(&self, other: &RelPath) -> bool {
-        self == other.0.as_str()
-    }
-}
-
-impl PartialEq<RelPath> for &str {
-    fn eq(&self, other: &RelPath) -> bool {
-        *self == other.0.as_str()
-    }
-}
-
-impl PartialEq<RelPath> for String {
-    fn eq(&self, other: &RelPath) -> bool {
-        self == &other.0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,26 +275,6 @@ mod tests {
     }
 
     #[test]
-    fn rel_path_validation_and_normalization() {
-        for bad in [
-            "/abs", "\\abs", "../x", "a/../b", "a\\..\\b", "C:/x", "D:\\x", "a\0b",
-        ] {
-            assert!(RelPath::new(bad).is_err(), "{bad:?} must be rejected");
-        }
-
-        assert_eq!(RelPath::new("").unwrap().as_str(), "");
-        assert_eq!(
-            RelPath::new("Data\\SKSE\\Plugins").unwrap().as_str(),
-            "Data/SKSE/Plugins"
-        );
-        assert_eq!(
-            RelPath::new("Data/SKSE/Plugins").unwrap().as_str(),
-            "Data/SKSE/Plugins"
-        );
-        assert_eq!(RelPath::new("a..b/c").unwrap().as_str(), "a..b/c");
-    }
-
-    #[test]
     fn try_from_validates_newtypes() {
         assert!(GameId::try_from("../etc".to_string()).is_err());
         assert_eq!(
@@ -424,11 +286,6 @@ mod tests {
                 .unwrap()
                 .as_str(),
             "minecraft:mod"
-        );
-        assert!(RelPath::try_from("../escape".to_string()).is_err());
-        assert_eq!(
-            RelPath::try_from("mods\\sub".to_string()).unwrap().as_str(),
-            "mods/sub"
         );
     }
 }

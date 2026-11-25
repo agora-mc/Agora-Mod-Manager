@@ -324,9 +324,9 @@ pub fn collect_sources(
                 }
             };
 
-            if crate::content_store::is_reparse_point_or_symlink(&metadata) {
-                // Never follow a junction or symlink out of the folder. Note it, then leave it
-                // alone; a swept folder had the same rule.
+            if crate::content_store::is_reparse_point_or_symlink(&path) {
+                // Never follow a link out of the folder. Note it, then leave it alone; a swept
+                // folder had the same rule.
                 let modified_at = modified_rfc3339(&path);
                 collection.seen.push(SeenArtifact {
                     plugin_id: spec.plugin_id.to_string(),
@@ -464,12 +464,12 @@ pub(crate) fn folder_below_trusted_root(
     for part in relative.split('/').filter(|part| !part.is_empty()) {
         current.push(part);
         match std::fs::symlink_metadata(&current) {
-            Ok(metadata) => {
-                if crate::content_store::is_reparse_point_or_symlink(&metadata) {
+            Ok(_) => {
+                if crate::content_store::is_reparse_point_or_symlink(&current) {
                     return Err((
                         SourceProblemKind::ReparsePoint,
                         format!(
-                            "`{}` is a junction or symlink below the trusted root",
+                            "`{}` is a link that points elsewhere below the trusted root",
                             current.display()
                         ),
                     ));
