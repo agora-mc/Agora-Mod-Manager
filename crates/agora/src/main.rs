@@ -5544,6 +5544,9 @@ async fn run_snapshots_command(
                 if let Some(warning) = &outcome.cleanup_warning {
                     println!("  Note: {warning}");
                 }
+                for notice in &outcome.notices {
+                    println!("  Note: {notice}");
+                }
                 if let Some(preserved) = &outcome.preserved_recovery_dir {
                     println!("  Recovery material from an earlier interrupted restore was kept at {preserved}");
                 }

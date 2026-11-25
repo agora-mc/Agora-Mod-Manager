@@ -26,6 +26,18 @@ impl SnapshotService {
         Self { ctx }
     }
 
+    /// The game `instance_id` belongs to, from the identity table every instance has a row in
+    /// (MASTER_SPEC §32.7). An instance with no row is a Minecraft one, the same rule the rest of
+    /// this service uses; a database that cannot be read is cannot-tell, never a guess.
+    fn instance_game(&self, instance_id: &str) -> LauncherResult<agora_game_api::GameId> {
+        crate::game_instance::game_of(&self.ctx, instance_id)
+            .map(|game| game.unwrap_or_else(agora_game_api::GameId::minecraft))
+            .map_err(|error| LauncherError::Generic {
+                code: "ERR_LOCAL_STATE_FAILED".into(),
+                message: format!("cannot tell which game '{instance_id}' belongs to: {error}"),
+            })
+    }
+
     /// The folders the package of `instance_id`'s game declared (MASTER_SPEC §32.7).
     ///
     /// Core holds no game's folder list: the instance's own game decides, so a generic game that
@@ -34,12 +46,7 @@ impl SnapshotService {
     /// game that declares nothing, or is not installed, is refused with `ERR_SNAPSHOT_SCOPE` rather
     /// than captured against an empty scope.
     fn declared_scope(&self, instance_id: &str) -> LauncherResult<Vec<String>> {
-        let game = crate::game_instance::game_of(&self.ctx, instance_id)
-            .map_err(|error| LauncherError::Generic {
-                code: "ERR_LOCAL_STATE_FAILED".into(),
-                message: format!("cannot tell which game '{instance_id}' belongs to: {error}"),
-            })?
-            .unwrap_or_else(agora_game_api::GameId::minecraft);
+        let game = self.instance_game(instance_id)?;
         let declared = self
             .ctx
             .games
@@ -209,6 +216,19 @@ impl SnapshotService {
 
         let outcome = snapshot::restore_snapshot(&instance_dir, snapshot_id, &entries)
             .map_err(snapshot_error)?;
+        let mut outcome = outcome;
+        // A snapshot owns what it captured. A folder this game no longer declares is restored
+        // anyway, and the result says which, so the person restoring is not left guessing about
+        // state that came back from outside the current scope (MASTER_SPEC §32.7).
+        let game = self.instance_game(instance_id)?;
+        for root in &outcome.restored_roots {
+            if !declared.iter().any(|declared| declared == root) {
+                outcome.notices.push(format!(
+                    "folder '{root}' is no longer tracked by {}; restored from the snapshot anyway",
+                    game.as_str()
+                ));
+            }
+        }
         self.restore_manifest_identity(instance_id, identity.as_ref())?;
         self.sync_row_from_restored_manifest(instance_id)?;
 
@@ -487,6 +507,43 @@ mod tests {
             .create(&id, None)
             .expect_err("no declaration, no snapshot");
         assert!(refused.to_string().contains("scope-game"), "{refused}");
+    }
+
+    /// A snapshot owns what it captured, so a folder the game no longer declares is still
+    /// restored — and the result says so, naming the folder and the game, instead of doing it
+    /// quietly (MASTER_SPEC §32.7).
+    #[test]
+    fn a_restore_reports_a_folder_the_game_no_longer_tracks() {
+        let (_root, service, ctx, id) = service();
+        let dir = ctx.paths.instance_dir(&id).unwrap();
+        fs::create_dir_all(dir.join("characters")).unwrap();
+        fs::write(dir.join("characters").join("hero.sav"), b"level 1").unwrap();
+        // Captured while the folder was part of the scope; the package no longer declares it.
+        let taken =
+            snapshot::create_snapshot_scoped(&dir, Some("older scope"), &["mods", "characters"])
+                .unwrap();
+        fs::write(dir.join("characters").join("hero.sav"), b"level 9").unwrap();
+
+        let outcome = service.restore(&id, &taken.id).unwrap();
+
+        assert_eq!(
+            fs::read(dir.join("characters").join("hero.sav")).unwrap(),
+            b"level 1",
+            "the snapshot owns what it captured"
+        );
+        let noticed = outcome
+            .notices
+            .iter()
+            .find(|notice| notice.contains("characters"))
+            .expect("the restore reports the folder it no longer tracks");
+        assert!(
+            noticed.contains("no longer tracked") && noticed.contains("minecraft"),
+            "{noticed}"
+        );
+        assert!(
+            noticed.contains("restored from the snapshot anyway"),
+            "{noticed}"
+        );
     }
 
     #[test]

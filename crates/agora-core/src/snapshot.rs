@@ -452,6 +452,11 @@ pub struct RestoreOutcome {
     /// takes one), so the restore itself can be undone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undo_snapshot_id: Option<String>,
+    /// Things the person restoring should know about what the restore did, in words they can read.
+    /// A folder the snapshot covers but the game no longer declares is restored anyway and named
+    /// here (MASTER_SPEC §32.7), never restored quietly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2048,6 +2053,7 @@ fn restore_snapshot_impl(
         cleanup_warning,
         preserved_recovery_dir: preserved_recovery_dir.map(|path| path.display().to_string()),
         undo_snapshot_id: None,
+        notices: Vec::new(),
     })
 }
 

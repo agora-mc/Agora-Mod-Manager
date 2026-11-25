@@ -29,7 +29,7 @@ use crate::loadout::game::GameLoadoutRules;
 use crate::lock_manager::LockResource;
 use crate::snapshot::{
     self, RestoreCoverageKind, RestoreOutcome, Snapshot, SnapshotAux, SnapshotInputFile,
-    SnapshotOrigin,
+    SnapshotOrigin, LOADOUTS_SCOPE_ROOT,
 };
 
 /// The instance manifest is always part of a game instance's state.
@@ -234,6 +234,32 @@ fn read_state_file(dir: &Path, relative: &str) -> Result<Option<Vec<u8>>, String
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("cannot read '{}': {error}", path.display())),
     }
+}
+
+/// The roots a game still declares as snapshot state, for reporting a restore of a snapshot that
+/// covers more than the game tracks today (MASTER_SPEC §32.7): the first path component of every
+/// state file its definition names, the loadout store, and every declared folder.
+fn tracked_roots(definition: &GameDefinition) -> BTreeSet<String> {
+    let mut roots: BTreeSet<String> = declared_state_paths(definition)
+        .iter()
+        .map(|path| path.split('/').next().unwrap_or_default().to_string())
+        .collect();
+    roots.insert(LOADOUTS_SCOPE_ROOT.to_string());
+    for folder in definition
+        .snapshot
+        .iter()
+        .flat_map(|scope| scope.tracked.iter())
+    {
+        roots.insert(
+            folder
+                .as_str()
+                .split('/')
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+    roots
 }
 
 /// The state files, as data. A missing declared file is recorded as absent.
@@ -1087,6 +1113,17 @@ pub fn restore_locked(
         cleanup_warning: None,
         preserved_recovery_dir: None,
         undo_snapshot_id: Some(undo.id.clone()),
+        // A root this game no longer tracks is still restored, and named here (MASTER_SPEC §32.7).
+        notices: roots_of(&restored)
+            .into_iter()
+            .filter(|root| !tracked_roots(definition).contains(root))
+            .map(|root| {
+                format!(
+                    "folder '{root}' is no longer tracked by {}; restored from the snapshot anyway",
+                    definition.id.as_str()
+                )
+            })
+            .collect(),
     };
     Ok(GameRestoreOutcome {
         outcome,

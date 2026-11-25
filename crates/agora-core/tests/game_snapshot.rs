@@ -1393,3 +1393,30 @@ fn a_declared_folder_that_is_a_file_refuses_the_capture() {
         "{refused}"
     );
 }
+
+#[test]
+fn a_restore_reports_a_folder_the_game_no_longer_declares() {
+    let h = Harness::new();
+    let declaring = definition_declaring(&["characters"]);
+    let extras = h.dir().join("characters");
+    std::fs::create_dir_all(&extras).unwrap();
+    std::fs::write(extras.join("hero.sav"), b"level 1").unwrap();
+    let taken =
+        game_snapshot::create(&h.ctx, &h.id, &declaring, None, SnapshotOrigin::User).unwrap();
+    std::fs::write(extras.join("hero.sav"), b"level 9").unwrap();
+
+    // The package changed and no longer declares the folder; the snapshot still owns it.
+    let outcome =
+        game_snapshot::restore(&h.ctx, &h.id, &h.def, &taken.id, false).expect("restored anyway");
+    assert_eq!(std::fs::read(extras.join("hero.sav")).unwrap(), b"level 1");
+    let noticed = outcome
+        .outcome
+        .notices
+        .iter()
+        .find(|notice| notice.contains("characters"))
+        .expect("the restore reports the folder it no longer tracks");
+    assert!(
+        noticed.contains("no longer tracked") && noticed.contains("skyrim-se"),
+        "{noticed}"
+    );
+}

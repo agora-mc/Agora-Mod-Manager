@@ -707,6 +707,8 @@ Instance delete, restore, and purge can also report that the lock is busy.
 
 A restore replaces tracked instance state. Preserve valuable worlds separately and verify the intended snapshot ID before restoring. Every restore takes a pre-restore snapshot first, so the restore itself can be undone by restoring that `pre-restore-…` entry.
 
+A snapshot owns what it captured. When a snapshot covers a folder the game's package no longer declares as snapshot state, `snapshots restore` restores it anyway and prints a `Note:` line naming the folder and the game, so state that came back from outside the current scope is never silent. The same line appears in `--output json` as an entry in the result's `notices` array.
+
 Agora's automatic pre-launch recovery snapshot is optimized for mod, configuration, and layout recovery and does not include `saves/`. Full manual and transactional snapshots use a broader scope, but no local snapshot system should be the only backup for an irreplaceable world.
 
 `snapshots lkg` prints the snapshot that last launched well and how the last launch ended. `snapshots lkg-diff` lists the files that changed since it (a reordered plugin list and a changed INI each appear as a modified state file) and, for a game instance, the content items and load-after lists that changed. `snapshots restore-lkg` restores that snapshot through the normal guarded restore, taking an undo snapshot first. A launch promotes its pre-launch snapshot only when the session ends successfully — a clean exit after the minimum runtime with no crash evidence. A crash, a cancelled run, an unknown ending, or a run too short to count never promotes.
