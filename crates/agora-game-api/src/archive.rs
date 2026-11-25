@@ -168,6 +168,10 @@ pub struct ArchiveEntry {
     pub size: u64,
     /// The compressed size, where the format stores one per entry.
     pub compressed: Option<u64>,
+    /// The Unix mode the archive records, where it records one. Extraction keeps the executable
+    /// bit and drops everything else (`setuid`, `setgid`, sticky), because a runtime's `bin/java`
+    /// that cannot be executed is a broken install and a downloaded `setuid` binary is worse.
+    pub unix_mode: Option<u32>,
 }
 
 /// An entry the caller was told about instead of given a file.
@@ -374,6 +378,9 @@ pub enum ArchiveError {
     /// The RAR reader refused the archive or one entry.
     #[error("cannot read RAR archive '{path}': {reason}")]
     Rar { path: String, reason: String },
+    /// The caller's own operation was cancelled, so the extraction stopped between entries.
+    #[error("extracting '{path}' was cancelled")]
+    Cancelled { path: String },
 }
 
 impl ArchiveError {
@@ -817,6 +824,7 @@ impl SafeArchive {
                 },
                 size: entry.size,
                 compressed: None,
+                unix_mode: None,
             })
             .collect())
     }
@@ -851,6 +859,7 @@ impl SafeArchive {
                 kind,
                 size: entry.size(),
                 compressed: Some(entry.compressed_size()),
+                unix_mode: entry.unix_mode(),
             });
         }
         Ok(entries)
@@ -881,6 +890,7 @@ impl SafeArchive {
                 kind,
                 size: entry.size,
                 compressed: None,
+                unix_mode: sevenz_unix_mode(entry),
             });
         }
         Ok(entries)
@@ -972,6 +982,20 @@ impl SafeArchive {
         dest: &Path,
         policy: NamePolicy,
         select: &mut dyn FnMut(&str) -> Select,
+    ) -> Result<ExtractReport, ArchiveError> {
+        self.extract_checked(dest, policy, select, &|| false)
+    }
+
+    /// [`SafeArchive::extract_where`] for a caller whose operation a person can stop: `cancelled` is
+    /// asked before every entry, and an answer of `true` ends the extraction with
+    /// [`ArchiveError::Cancelled`] after the entries already written stay written (the caller's
+    /// staging directory is thrown away, as it was before the bytes arrived).
+    pub fn extract_checked(
+        &mut self,
+        dest: &Path,
+        policy: NamePolicy,
+        select: &mut dyn FnMut(&str) -> Select,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<ExtractReport, ArchiveError> {
         self.written_so_far.clear();
         let path = self.label();
@@ -1079,6 +1103,9 @@ impl SafeArchive {
         let mut report = ExtractReport::default();
         let mut remaining_total = self.limits.max_total_bytes;
         for (strict, name, declared) in plan {
+            if cancelled() {
+                return Err(ArchiveError::Cancelled { path: path.clone() });
+            }
             let target = join_under(dest, &strict).map_err(|error| match error {
                 PathError::UnsafePath { reason, .. } => ArchiveError::UnsafeNames {
                     path: path.clone(),
@@ -1120,6 +1147,7 @@ impl SafeArchive {
             };
             let written = self.copy_entry(&name, declared, &mut out)?;
             remaining_total = remaining_total.saturating_sub(written);
+            keep_executable_bit(&target, self.entry_mode(&name));
             self.written_so_far.push(strict.as_str().to_string());
             report.written.push(strict.as_str().to_string());
             report.bytes_written += written;
@@ -1132,6 +1160,14 @@ impl SafeArchive {
     /// leave nothing behind after a refusal deletes these.
     pub fn written_so_far(&self) -> &[String] {
         &self.written_so_far
+    }
+
+    /// The Unix mode an entry recorded, where it recorded one.
+    fn entry_mode(&self, name: &str) -> Option<u32> {
+        self.entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .and_then(|entry| entry.unix_mode)
     }
 }
 
@@ -1149,6 +1185,26 @@ struct CopyContext {
     /// Whether the declared size is the archive's own binary header, which the bytes must match. A
     /// RAR listing is a text report from a process, so its numbers bound the read rather than pin it.
     exact: bool,
+}
+
+/// Keep the one permission bit a downloaded archive is allowed to set.
+///
+/// A game runtime's `bin/java` has to be executable, so the bit travels with the file. Everything
+/// else in the mode is dropped: `setuid`, `setgid` and sticky bits from an archive would let a
+/// downloaded file run as whoever unpacks it, which no launcher should arrange.
+fn keep_executable_bit(path: &Path, mode: Option<u32>) {
+    #[cfg(unix)]
+    {
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o755));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no mode to keep: an `.exe` is executable by its extension.
+        let _ = (path, mode);
+    }
 }
 
 /// The compression ratio of one entry. A zero compressed size that declares bytes means the archive
@@ -1335,6 +1391,7 @@ fn list_tar(
             kind,
             size: entry.size(),
             compressed: None,
+            unix_mode: Some(entry.header().mode().unwrap_or(0o644)),
         });
     }
     Ok(entries)
@@ -1383,8 +1440,16 @@ fn zip_entry_kind<R: Read + ?Sized>(entry: &zip::read::ZipFile<'_, R>, name: &st
     EntryKind::File
 }
 
-fn claims_to_be_a_link(entry: &sevenz_rust2::ArchiveEntry) -> bool {
+/// The Unix mode a 7z entry stores, in the high half of its Windows attributes, where it stores one.
+fn sevenz_unix_mode(entry: &sevenz_rust2::ArchiveEntry) -> Option<u32> {
     if !entry.has_windows_attributes {
+        return None;
+    }
+    let mode = (entry.windows_attributes >> 16) as u32;
+    (mode != 0).then_some(mode)
+}
+
+fn claims_to_be_a_link(entry: &sevenz_rust2::ArchiveEntry) -> bool {    if !entry.has_windows_attributes {
         return false;
     }
     let attributes = entry.windows_attributes;

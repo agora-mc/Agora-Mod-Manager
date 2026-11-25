@@ -734,3 +734,60 @@ fn a_callers_rule_can_refuse_the_whole_extraction() {
     assert!(error.to_string().contains("config/setup.exe"));
     drop(dir);
 }
+
+// ---------------------------------------------------------------------------
+// A runtime's executable bit, and an operation a person can stop
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_tar_entry_that_recorded_an_executable_mode_keeps_it() {
+    let (dir, dest) = extract_dir();
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(6);
+    header.set_mode(0o755);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "bin/java", &b"binary"[..])
+        .unwrap();
+    let bytes = builder.into_inner().unwrap();
+
+    let mut archive = SafeArchive::open_bytes(bytes, ArchiveLimits::RUNTIME).unwrap();
+    archive.extract(&dest, NamePolicy::Refuse).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let written = std::fs::metadata(dest.join("bin/java")).unwrap();
+        assert_eq!(written.permissions().mode() & 0o111, 0o111);
+    }
+    drop(dir);
+}
+
+#[test]
+fn a_cancelled_extraction_stops_between_entries() {
+    let (dir, dest) = extract_dir();
+    let mut archive = SafeArchive::open_bytes(
+        zip_bytes(&[
+            ("a/first.txt", b"one"),
+            ("a/second.txt", b"two"),
+            ("a/third.txt", b"three"),
+        ]),
+        ArchiveLimits::PACK,
+    )
+    .unwrap();
+    let asked = std::cell::Cell::new(0u32);
+    let error = archive
+        .extract_checked(&dest, NamePolicy::Refuse, &mut |_| Select::Write, &|| {
+            asked.set(asked.get() + 1);
+            asked.get() > 2
+        })
+        .unwrap_err();
+    assert!(matches!(error, ArchiveError::Cancelled { .. }), "{error:?}");
+    assert_eq!(
+        archive.written_so_far().len(),
+        2,
+        "the two entries before the stop are written and reported, so the caller can throw its \
+         staging directory away"
+    );
+    drop(dir);
+}
