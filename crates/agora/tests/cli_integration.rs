@@ -8727,3 +8727,42 @@ fn doctor_reports_a_corrupt_account_store_and_points_at_repair() {
         "the report names the repair command: {parsed}"
     );
 }
+
+#[test]
+fn a_migration_that_refuses_says_which_rows_in_the_error_the_user_reads() {
+    // A schema-30 database with one instance id in both old tables: the merge cannot choose, so
+    // it stops. What the player reads is the CLI's stderr, so the report naming both rows has to
+    // survive the whole error chain: the step's report, the runner's context, core startup's
+    // message and the CLI's line.
+    let (_tmp, data_dir) = temp_data_dir();
+    {
+        let db_path = data_dir.join("local_state.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        agora_core::db::run_migrations_to(&conn, 30).unwrap();
+        conn.execute_batch(
+            "INSERT INTO user_instances
+                 (instance_id, name, minecraft_version, loader, loader_version, created_at)
+             VALUES ('shared-id', 'Minecraft one', '1.21', 'fabric', '0.16.0',
+                     '2026-01-01T00:00:00Z');
+             INSERT INTO game_instances (instance_id, game, name, base_json, created_at)
+             VALUES ('shared-id', 'skyrim-se', 'Skyrim one', '{\"Unpinned\":{\"install\":\
+                      \"steam:1\",\"reason\":\"test\"}}', '2026-02-02T00:00:00Z');",
+        )
+        .unwrap();
+    }
+
+    let output = run_agora(&data_dir, &["paths"]);
+    assert!(
+        !output.status.success(),
+        "the migration refuses and the CLI exits non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("shared-id"),
+        "the id the report names reaches the user: {stderr}"
+    );
+    assert!(
+        stderr.contains("Minecraft one") && stderr.contains("Skyrim one"),
+        "both rows the report names reach the user: {stderr}"
+    );
+}

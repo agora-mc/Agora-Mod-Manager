@@ -202,7 +202,11 @@ impl CoreContext {
                     return known.clone();
                 }
                 let msg = format!(
-                    "Failed to initialize local state database at {}: {e}",
+                    // `{e:#}` and not `{e}`: the outermost message says only *that* a step
+                    // failed, and the report underneath it names the rows that stopped it (an id
+                    // in both old tables, a row that would change owner). That report is what
+                    // the player can act on, so it has to survive as far as the screen.
+                    "Failed to initialize local state database at {}: {e:#}",
                     db_path.display()
                 );
                 // Log the path without secrets or token data.
