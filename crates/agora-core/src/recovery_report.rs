@@ -239,7 +239,8 @@ fn import_journals(
             state: Some(job.state.clone()),
             outcome: RecoveryOutcome::Undecided,
             reason: None,
-            command: Some("agora list-instances".into()),
+            // Nothing to run: the next start's import recovery settles this on its own.
+            command: None,
         };
         // The folder recovery proves ownership with: the staging folder, or the promoted instance
         // folder while an update is in flight. An unreadable marker is a hand, not a guess.
@@ -276,10 +277,11 @@ fn import_journals(
             Ok(Some(_)) => match locks.probe(&LockResource::Instance(job.instance_id.clone())) {
                 LockProbe::Held(_) => {
                     entry.outcome = RecoveryOutcome::Busy;
-                    entry.reason = Some(format!(
-                        "Another Agora holds the instance's lock right now, so the import may still \
-                         be running. Nothing would be done."
-                    ));
+                    entry.reason = Some(
+                        "Another Agora holds the instance's lock right now, so the import may \
+                         still be running. Nothing would be done."
+                            .into(),
+                    );
                 }
                 LockProbe::CantTell(why) => {
                     entry.outcome = RecoveryOutcome::NeedsHand;

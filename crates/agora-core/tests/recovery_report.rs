@@ -96,10 +96,10 @@ fn data_root() -> (tempfile::TempDir, AppPaths) {
     (dir, paths)
 }
 
-fn entry<'a>(
-    report: &'a agora_core::recovery_report::RecoveryReport,
+fn entry(
+    report: &agora_core::recovery_report::RecoveryReport,
     kind: JournalKind,
-) -> &'a agora_core::recovery_report::JournalEntry {
+) -> &agora_core::recovery_report::JournalEntry {
     report
         .entries
         .iter()

@@ -534,7 +534,12 @@ impl LockManager {
                 let _ = platform::unlock(&file);
                 LockProbe::Free
             }
-            Ok(false) => LockProbe::Held(read_lock_metadata(&lock_path).ok()),
+            Ok(false) => match read_lock_metadata(&lock_path) {
+                Ok(metadata) => LockProbe::Held(Some(metadata)),
+                // The lock is held; its owner record could not be read. The holder cannot be
+                // named, which the report says rather than guessing who it is.
+                Err(_) => LockProbe::Held(None),
+            },
             // Could not tell; a lock that cannot be asked is not evidence that nobody holds it.
             Err(error) => LockProbe::CantTell(format!(
                 "the lock file {} could not be asked ({error})",
