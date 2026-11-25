@@ -1048,6 +1048,11 @@ pub fn catch_up(ctx: &Ctx, instance_id: &str, live: LivePacks<'_>) -> CatchUpRep
     let provably_gone = crate::instance_runtime::game_is_provably_gone(&ctx.paths, instance_id);
     let mut caught = Vec::new();
     for session in open {
+        if session.game_process.as_ref().is_some_and(|process| {
+            ctx.process_check(process) != crate::process_identity::ProcessCheck::Gone
+        }) {
+            continue;
+        }
         if let (Some(pid), Some(started)) = (session.owner_pid, session.owner_start) {
             if session_ledger::Owner::is_alive(pid, started as u64) {
                 continue;

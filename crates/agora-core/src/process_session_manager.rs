@@ -119,16 +119,24 @@ impl ProcessSessionManager {
     ///
     /// Steps:
     /// 1. Session lookup + PID match check.
-    /// 2. OS identity check via `process_identity::check`, whose "could not tell" is
+    /// 2. OS identity check via `process_identity::check_exact_with`, whose "could not tell" is
     ///    treated as "may still be running": nothing is signalled and the session is kept.
     /// 3. Mark session as `user_cancelled`.
-    /// 4. Platform-appropriate process kill (`taskkill /F /T` on Windows,
-    ///    `kill -9` on Unix).
+    /// 4. Terminate each verified process in the tree.
     /// 5. Remove the session on success; revert `user_cancelled` on failure.
     ///
     /// Returns `Err(ProcessStale)` when the OS process no longer matches the
     /// captured identity — the stale session is removed automatically.
     pub fn terminate(&self, session_id: u64, expected_pid: u32) -> LauncherResult<()> {
+        self.terminate_with(session_id, expected_pid, &process_identity::OsProcesses)
+    }
+
+    pub(crate) fn terminate_with(
+        &self,
+        session_id: u64,
+        expected_pid: u32,
+        view: &dyn process_identity::ProcessView,
+    ) -> LauncherResult<()> {
         // Phase 1 — snapshot session under lock, verify PID.
         let session = {
             let map = self.sessions.read().map_err(|_| LauncherError::Generic {
@@ -154,13 +162,19 @@ impl ProcessSessionManager {
         // Phase 2 — verify OS identity outside the session lock. Only a process proven gone is
         // dropped, and only a process proven alive is signalled: a lookup that failed proves
         // nothing, so the session is kept and the caller is told.
-        match process_identity::check(&session.process_identity) {
+        if session.process_identity.pid != session.pid {
+            return Err(LauncherError::Generic {
+                code: "ERR_PID_MISMATCH".into(),
+                message: format!("Session {session_id} has mismatched recorded process IDs"),
+            });
+        }
+        match process_identity::check_exact_with(&session.process_identity, view) {
             process_identity::ProcessCheck::Alive => {}
             process_identity::ProcessCheck::Gone => {
                 self.remove(session_id);
                 return Err(LauncherError::ProcessStale {
                     pid: session.pid,
-                    detail: "Process no longer exists in the OS process table".into(),
+                    detail: "The OS process no longer matches the recorded identity".into(),
                 });
             }
             process_identity::ProcessCheck::CantTell(why) => {
@@ -190,8 +204,11 @@ impl ProcessSessionManager {
         }
 
         // Phase 4 — kill.
-        let kill_result = Self::kill_pid(session.pid);
-
+        let kill_result = if process_identity::terminate_tree(&[&session.process_identity]) == 0 {
+            Err("no verified process could be terminated")
+        } else {
+            Ok(())
+        };
         match kill_result {
             Ok(()) => {
                 self.remove(session_id);
@@ -213,37 +230,6 @@ impl ProcessSessionManager {
                     code: "ERR_KILL_FAILED".into(),
                     message: format!("Could not terminate PID {}: {error}", session.pid),
                 })
-            }
-        }
-    }
-
-    /// Perform the OS-level process kill.
-    fn kill_pid(pid: u32) -> Result<(), String> {
-        #[cfg(target_os = "windows")]
-        {
-            let mut command = std::process::Command::new("taskkill");
-            command.args(["/PID", &pid.to_string(), "/F", "/T"]);
-            // Prevent an empty command prompt window from flashing on kill.
-            crate::helpers::hide_console_window(&mut command);
-            let output = command
-                .output()
-                .map_err(|e| format!("Failed to spawn taskkill: {e}"))?;
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-            }
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let output = std::process::Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .output()
-                .map_err(|e| format!("Failed to spawn kill: {e}"))?;
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
             }
         }
     }

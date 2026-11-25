@@ -87,7 +87,7 @@ pub struct PluginRecord {
 
 /// The publisher URL, keys, and anti-replay state recorded for an installed
 /// plugin's update channel.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustRecord {
     pub url: String,
     pub keys: Vec<PublicKey>,
@@ -193,6 +193,120 @@ pub fn get(conn: &Connection, plugin_id: &PluginId) -> LauncherResult<Option<Plu
     Ok(list(conn)?
         .into_iter()
         .find(|record| record.id() == plugin_id))
+}
+
+/// The exact install row, including grants and state that cannot be reconstructed from a manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct InstallRow {
+    pub version: String,
+    pub install_dir: String,
+    manifest_json: String,
+    granted_capabilities: String,
+    source_kind: String,
+    source_path: Option<String>,
+    enabled: i64,
+    installed_at: String,
+    updated_at: String,
+    data_version: i64,
+    last_error: Option<String>,
+}
+
+pub(super) fn install_row(conn: &Connection, id: &PluginId) -> LauncherResult<Option<InstallRow>> {
+    conn.query_row(
+        "SELECT version, install_dir, manifest_json, granted_capabilities, source_kind,
+                source_path, enabled, installed_at, updated_at, data_version, last_error
+         FROM plugin_installs WHERE plugin_id = ?1",
+        params![id.as_str()],
+        |row| {
+            Ok(InstallRow {
+                version: row.get(0)?,
+                install_dir: row.get(1)?,
+                manifest_json: row.get(2)?,
+                granted_capabilities: row.get(3)?,
+                source_kind: row.get(4)?,
+                source_path: row.get(5)?,
+                enabled: row.get(6)?,
+                installed_at: row.get(7)?,
+                updated_at: row.get(8)?,
+                data_version: row.get(9)?,
+                last_error: row.get(10)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(db_error)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct InstallSnapshot {
+    pub record: InstallRow,
+    trust: Option<TrustRecord>,
+    consent: Option<(i64, String, Option<String>)>,
+}
+
+impl InstallSnapshot {
+    pub fn capture(conn: &Connection, id: &PluginId) -> LauncherResult<Option<Self>> {
+        let Some(record) = install_row(conn, id)? else {
+            return Ok(None);
+        };
+        let consent = conn.query_row(
+            "SELECT allowed, decided_at, code_hash FROM plugin_script_consent WHERE plugin_id = ?1",
+            params![id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().map_err(db_error)?;
+        Ok(Some(Self {
+            record,
+            consent,
+            trust: get_trust(conn, id)?,
+        }))
+    }
+
+    pub fn restore(&self, conn: &Connection, id: &PluginId) -> LauncherResult<()> {
+        let record = &self.record;
+        let updated = conn
+            .execute(
+                "UPDATE plugin_installs SET version = ?2, install_dir = ?3, manifest_json = ?4,
+                 granted_capabilities = ?5, source_kind = ?6, source_path = ?7, enabled = ?8,
+                 installed_at = ?9, updated_at = ?10, data_version = ?11, last_error = ?12
+             WHERE plugin_id = ?1",
+                params![
+                    id.as_str(),
+                    record.version,
+                    record.install_dir,
+                    record.manifest_json,
+                    record.granted_capabilities,
+                    record.source_kind,
+                    record.source_path,
+                    record.enabled,
+                    record.installed_at,
+                    record.updated_at,
+                    record.data_version,
+                    record.last_error
+                ],
+            )
+            .map_err(db_error)?;
+        if updated != 1 {
+            return Err(db_error(format!(
+                "plugin {id} has no install row to restore"
+            )));
+        }
+        if let Some(trust) = &self.trust {
+            put_trust(conn, id, &trust.url, &trust.keys)?;
+            conn.execute(
+                "UPDATE plugin_trust SET highest_sequence = ?2, last_checked_at = ?3, last_result = ?4
+                 WHERE plugin_id = ?1",
+                params![id.as_str(), trust.highest_sequence, trust.last_checked_at, trust.last_result],
+            ).map_err(db_error)?;
+        } else {
+            clear_trust(conn, id)?;
+        }
+        if let Some((allowed, decided_at, hash)) = &self.consent {
+            set_script_consent(conn, id, *allowed != 0, hash.as_deref(), decided_at)?;
+        } else {
+            clear_script_consent(conn, id)?;
+        }
+        Ok(())
+    }
 }
 
 /// Insert or replace an install record.

@@ -625,7 +625,8 @@ pub fn wrap(ctx: &Ctx, live: &LivePacks<'_>, command: &[String]) -> Result<WrapO
         per_user_files: mounts,
     };
 
-    let session_id = crate::session_ledger::record_launch(ctx, &instance_id, &definition, &store);
+    let session_id =
+        crate::session_ledger::record_launch(ctx, &instance_id, &definition, &store, None);
     let started = std::time::Instant::now();
     let outcome = linux_view::native().view_and_run(ctx, &definition, &request);
 

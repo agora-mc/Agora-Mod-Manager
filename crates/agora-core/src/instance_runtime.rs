@@ -32,7 +32,7 @@
 use crate::app_paths::AppPaths;
 use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
-use crate::lock_manager::{LockGuard, LockRefusal, LockResource};
+use crate::lock_manager::{LockGuard, LockManager, LockRefusal, LockResource};
 use crate::process_identity::{self, ProcessCheck, ProcessIdentity};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -200,20 +200,71 @@ fn write_running(
 
 /// Release the lease.
 ///
-/// A `generation` clears only a matching lease, so a stale exit handler cannot
-/// release a newer launch. `None` forces the release — the explicit escape
-/// hatch for a `Starting` lease the user has confirmed is dead.
+/// A supplied generation must match. A running lease is released only after
+/// the process and its job have been shown to be gone.
 pub fn clear(paths: &AppPaths, instance_id: &str, generation: Option<&str>) -> LauncherResult<()> {
-    let path = lease_path(paths, instance_id)?;
-    if let Some(generation) = generation {
-        match read(paths, instance_id) {
-            Ok(Some(lease)) if lease.generation != generation => return Ok(()),
-            // An unreadable lease is not ours to interpret, so leave it.
-            Err(_) => return Ok(()),
-            _ => {}
-        }
+    let _lock = LockManager::new(paths.locks_root()).acquire(
+        LockResource::Instance(instance_id.to_string()),
+        "clear-runtime-lease",
+    )?;
+    clear_holding(paths, instance_id, generation, None)
+}
+
+fn clear_holding(
+    paths: &AppPaths,
+    instance_id: &str,
+    generation: Option<&str>,
+    exited_child: Option<u32>,
+) -> LauncherResult<()> {
+    let Some(lease) = read(paths, instance_id)? else {
+        return Ok(());
+    };
+    if generation.is_some_and(|generation| lease.generation != generation) {
+        return Ok(());
     }
-    match fs::remove_file(&path) {
+    if lease.state == RuntimeState::Running
+        && !lease.identity.as_ref().is_some_and(|identity| {
+            (exited_child == Some(identity.pid) && identity.job.is_none())
+                || process_identity::check(identity) == ProcessCheck::Gone
+        })
+    {
+        return Ok(());
+    }
+    remove_lease(paths, instance_id)
+}
+
+/// Release a matching direct-launch lease after waiting successfully on its child handle.
+/// A job still needs its own liveness check, since its other members can outlive that child.
+pub fn clear_after_child_exit(
+    paths: &AppPaths,
+    instance_id: &str,
+    generation: &str,
+    pid: u32,
+) -> LauncherResult<()> {
+    let _lock = LockManager::new(paths.locks_root()).acquire(
+        LockResource::Instance(instance_id.to_string()),
+        "clear-runtime-lease",
+    )?;
+    clear_holding(paths, instance_id, Some(generation), Some(pid))
+}
+
+/// Release a matching Starting lease when spawning fails. The launcher still holds the instance lock.
+pub fn clear_failed_start(
+    paths: &AppPaths,
+    instance_id: &str,
+    generation: &str,
+    _lock: &LockGuard,
+) -> LauncherResult<()> {
+    if read(paths, instance_id)?.is_some_and(|lease| {
+        lease.generation == generation && lease.state == RuntimeState::Starting
+    }) {
+        remove_lease(paths, instance_id)?;
+    }
+    Ok(())
+}
+
+fn remove_lease(paths: &AppPaths, instance_id: &str) -> LauncherResult<()> {
+    match fs::remove_file(lease_path(paths, instance_id)?) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(LauncherError::Generic {
@@ -282,7 +333,7 @@ pub fn check_idle(paths: &AppPaths, instance_id: &str) -> LauncherResult<()> {
                 }
                 // The recorded process is provably gone — pid, start time, and executable no
                 // longer match — so the lease is stale.
-                ProcessCheck::Gone => clear(paths, instance_id, Some(&lease.generation))?,
+                ProcessCheck::Gone => remove_lease(paths, instance_id)?,
                 ProcessCheck::CantTell(why) => {
                     return Err(LauncherError::Generic {
                         code: "ERR_RUNTIME_LEASE_UNREADABLE".into(),
@@ -632,7 +683,7 @@ fn clear_stale_lease(ctx: &Ctx, instance_id: &str) -> LauncherResult<()> {
         (RuntimeState::Running, Some(identity))
             if ctx.process_check(identity) == ProcessCheck::Gone =>
         {
-            clear(&ctx.paths, instance_id, Some(&lease.generation))
+            remove_lease(&ctx.paths, instance_id)
         }
         _ => Ok(()),
     }
@@ -838,6 +889,13 @@ fn ledger_session_running(ctx: &Ctx, instance_id: &str) -> Result<bool, String> 
         return Ok(false);
     }
     for session in &open {
+        if let Some(process) = &session.game_process {
+            match ctx.process_check(process) {
+                ProcessCheck::Alive => return Ok(true),
+                ProcessCheck::CantTell(why) => return Err(why),
+                ProcessCheck::Gone => continue,
+            }
+        }
         if let (Some(pid), Some(started)) = (session.owner_pid, session.owner_start) {
             if crate::session_ledger::Owner::is_alive(pid, started as u64) {
                 return Ok(true);
@@ -864,7 +922,7 @@ pub fn stop_game(ctx: &Ctx, instance_id: &str) -> LauncherResult<u32> {
         .into_iter()
         .find(|session| session.instance_id == instance_id)
     {
-        sessions.terminate(session.session_id, session.pid)?;
+        sessions.terminate_with(session.session_id, session.pid, &*ctx.process_view())?;
         return Ok(session.pid);
     }
     let not_running = || LauncherError::Generic {
@@ -896,7 +954,7 @@ pub fn stop_game(ctx: &Ctx, instance_id: &str) -> LauncherResult<u32> {
         attached: false,
         user_cancelled: false,
     })?;
-    let result = sessions.terminate(session_id, pid);
+    let result = sessions.terminate_with(session_id, pid, &*ctx.process_view());
     // The session existed only to run the checks; nothing in this process waits on its exit.
     sessions.remove(session_id);
     sessions.take_user_stop(session_id);
@@ -934,6 +992,27 @@ mod tests {
 
         let error = check_idle(&paths, "demo").unwrap_err();
         assert!(format!("{error:?}").contains("ERR_INSTANCE_RUNNING"));
+        clear(&paths, "demo", Some(&generation)).unwrap();
+        clear(&paths, "demo", None).unwrap();
+        assert!(read(&paths, "demo").unwrap().is_some());
+    }
+
+    #[test]
+    fn an_unverified_running_lease_needs_a_liveness_or_child_exit_witness() {
+        let (paths, _tmp) = paths();
+        let generation = publish_starting(&paths, "demo").unwrap();
+        let identity = ProcessIdentity {
+            pid: 1234,
+            start_time: 0,
+            expected_exe: None,
+            job: None,
+        };
+        publish_running(&paths, "demo", &generation, identity).unwrap();
+        clear(&paths, "demo", Some(&generation)).unwrap();
+        clear_after_child_exit(&paths, "demo", &generation, 4321).unwrap();
+        assert!(read(&paths, "demo").unwrap().is_some());
+        clear_after_child_exit(&paths, "demo", &generation, 1234).unwrap();
+        assert!(read(&paths, "demo").unwrap().is_none());
     }
 
     /// The launcher dying does not prove the game did, so a half-published
@@ -1424,7 +1503,6 @@ mod tests {
     /// made to happen.
     struct StandInTable {
         answer: process_identity::Lookup,
-        table_readable: bool,
         job: Result<usize, String>,
     }
 
@@ -1432,12 +1510,44 @@ mod tests {
         fn lookup(&self, _pid: u32) -> process_identity::Lookup {
             self.answer.clone()
         }
-        fn table_answered(&self) -> bool {
-            self.table_readable
-        }
         fn job_members(&self, _job: &str) -> Result<usize, String> {
             self.job.clone()
         }
+    }
+
+    #[test]
+    fn a_live_job_with_a_reused_parent_pid_blocks_mutation_and_refuses_stop() {
+        let (ctx, _tmp) = guard_ctx();
+        let identity = ProcessIdentity {
+            pid: u32::MAX - 2,
+            start_time: 42,
+            expected_exe: Some("game.exe".into()),
+            job: Some(r"Local\agora-session-0123456789abcdef".into()),
+        };
+        let generation = publish_starting(&ctx.paths, "demo").unwrap();
+        publish_running(&ctx.paths, "demo", &generation, identity).unwrap();
+        ctx.test_seams
+            .set_process_view(Some(std::sync::Arc::new(StandInTable {
+                answer: process_identity::Lookup::Found {
+                    start_time: 43,
+                    exe: Some("other.exe".into()),
+                    zombie: false,
+                    exited: false,
+                },
+                job: Ok(1),
+            })));
+        assert!(matches!(
+            may_mutate(&ctx, "demo", "test"),
+            MayMutate::Busy { .. }
+        ));
+        let hits = ctx.test_seams.process_view_hits();
+        let error = stop_game(&ctx, "demo").unwrap_err();
+        assert!(
+            matches!(error, LauncherError::ProcessStale { .. }),
+            "{error:?}"
+        );
+        assert!(ctx.test_seams.process_view_hits() > hits);
+        assert!(read(&ctx.paths, "demo").unwrap().is_some());
     }
 
     /// The three ways the OS can decline to answer, each of which used to be read as "gone".
@@ -1449,16 +1559,16 @@ mod tests {
                     answer: process_identity::Lookup::CantTell(
                         "the process table could not be read".into(),
                     ),
-                    table_readable: true,
                     job: Ok(0),
                 },
                 None,
             ),
             (
-                "a process table that listed nothing",
+                "a targeted refresh that returned no entry",
                 StandInTable {
-                    answer: process_identity::Lookup::Absent,
-                    table_readable: false,
+                    answer: process_identity::Lookup::CantTell(
+                        "the targeted refresh returned no entry".into(),
+                    ),
                     job: Ok(0),
                 },
                 None,
@@ -1467,7 +1577,6 @@ mod tests {
                 "a job query that failed",
                 StandInTable {
                     answer: process_identity::Lookup::Absent,
-                    table_readable: true,
                     job: Err("the job object could not be opened".into()),
                 },
                 // A job name, so the job query is the thing that fails.

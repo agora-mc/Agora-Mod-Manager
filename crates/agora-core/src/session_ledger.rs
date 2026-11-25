@@ -967,9 +967,15 @@ impl Owner {
         }
     }
 
-    /// Whether the same process is still running.
+    /// Whether the watcher may still be running.
     pub fn is_alive(pid: u32, started: u64) -> bool {
-        start_time_of(pid).is_some_and(|now| now == started)
+        use crate::process_identity::{self, ProcessCheck, ProcessIdentity};
+        process_identity::check(&ProcessIdentity {
+            pid,
+            start_time: started,
+            expected_exe: None,
+            job: None,
+        }) != ProcessCheck::Gone
     }
 }
 
@@ -1036,14 +1042,27 @@ pub fn begin(
     manifest: &LaunchManifest,
     owner: Owner,
 ) -> anyhow::Result<String> {
+    begin_with_process(conn, instance_id, started_at, manifest, owner, None)
+}
+
+/// Open a session with the identity captured when the game was spawned.
+pub fn begin_with_process(
+    conn: &Connection,
+    instance_id: &str,
+    started_at: &str,
+    manifest: &LaunchManifest,
+    owner: Owner,
+    process: Option<&crate::process_identity::ProcessIdentity>,
+) -> anyhow::Result<String> {
     let session_id = uuid::Uuid::new_v4().simple().to_string();
     let tx = conn.unchecked_transaction()?;
     let hash = store_manifest(&tx, instance_id, manifest)?;
+    let process = process.map(serde_json::to_string).transpose()?;
     tx.execute(
         "INSERT INTO launch_history
              (instance_id, started_at, enabled_mod_count, session_id, manifest_hash,
-              owner_pid, owner_start)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+              owner_pid, owner_start, game_process_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             instance_id,
             started_at,
@@ -1051,7 +1070,8 @@ pub fn begin(
             session_id,
             hash,
             owner.pid,
-            owner.started as i64
+            owner.started as i64,
+            process,
         ],
     )?;
     tx.commit()?;
@@ -1260,6 +1280,7 @@ pub struct OpenSession {
     pub owner_pid: Option<u32>,
     pub owner_start: Option<i64>,
     pub stop_requested: bool,
+    pub game_process: Option<crate::process_identity::ProcessIdentity>,
 }
 
 /// This instance's open sessions, newest first.
@@ -1268,7 +1289,7 @@ pub fn open_sessions_for_instance(
     instance_id: &str,
 ) -> anyhow::Result<Vec<OpenSession>> {
     let mut stmt = conn.prepare(
-        "SELECT session_id, instance_id, started_at, owner_pid, owner_start, stop_requested
+        "SELECT session_id, instance_id, started_at, owner_pid, owner_start, stop_requested, game_process_json
            FROM launch_history
           WHERE instance_id = ?1 AND session_id IS NOT NULL AND ended_at IS NULL
           ORDER BY started_at DESC, id DESC",
@@ -1282,10 +1303,29 @@ pub fn open_sessions_for_instance(
                 owner_pid: row.get(3)?,
                 owner_start: row.get(4)?,
                 stop_requested: row.get::<_, i64>(5)? != 0,
+                game_process: read_game_process(row, 6)?,
             })
         })?
         .collect::<Result<_, _>>()?;
     Ok(rows)
+}
+
+fn read_game_process(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<crate::process_identity::ProcessIdentity>> {
+    let process: Option<String> = row.get(index)?;
+    process
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
 }
 
 /// Close one open session whose owner is gone, as `ClosedUnknown` (or `Stopped` when the player
@@ -1390,7 +1430,15 @@ pub fn close_orphans(
     .len())
 }
 
-type OpenSessionRow = (i64, String, String, Option<u32>, Option<i64>, bool);
+type OpenSessionRow = (
+    i64,
+    String,
+    String,
+    Option<u32>,
+    Option<i64>,
+    bool,
+    Option<crate::process_identity::ProcessIdentity>,
+);
 
 fn close_unwatched(
     conn: &Connection,
@@ -1401,7 +1449,7 @@ fn close_unwatched(
     game_may_be_running: &dyn Fn(&str) -> bool,
 ) -> anyhow::Result<Vec<ClosedSession>> {
     let mut stmt = conn.prepare(
-        "SELECT id, session_id, instance_id, owner_pid, owner_start, stop_requested
+        "SELECT id, session_id, instance_id, owner_pid, owner_start, stop_requested, game_process_json
            FROM launch_history
           WHERE session_id IS NOT NULL AND ended_at IS NULL
             AND (?1 IS NULL OR instance_id = ?1)",
@@ -1415,11 +1463,17 @@ fn close_unwatched(
                 row.get(3)?,
                 row.get(4)?,
                 row.get::<_, i64>(5)? != 0,
+                read_game_process(row, 6)?,
             ))
         })?
         .collect::<Result<_, _>>()?;
     let mut closed = Vec::new();
-    for (row_id, session_id, instance_id, pid, started, stop_requested) in open {
+    for (row_id, session_id, instance_id, pid, started, stop_requested, process) in open {
+        if process.as_ref().is_some_and(|process| {
+            crate::process_identity::check(process) != crate::process_identity::ProcessCheck::Gone
+        }) {
+            continue;
+        }
         if let (Some(pid), Some(started)) = (pid, started) {
             if owner_alive(pid, started as u64) {
                 continue;
@@ -1565,6 +1619,7 @@ pub fn record_launch(
     instance_id: &str,
     definition: &GameDefinition,
     store: &StoreId,
+    process: Option<&crate::process_identity::ProcessIdentity>,
 ) -> Option<String> {
     let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).ok()?;
@@ -1573,7 +1628,15 @@ pub fn record_launch(
             user_files_session_running(ctx, instance_id)
         });
         let manifest = build_manifest(ctx, instance_id, definition, store);
-        begin(&conn, instance_id, &now, &manifest, Owner::current()).ok()
+        begin_with_process(
+            &conn,
+            instance_id,
+            &now,
+            &manifest,
+            Owner::current(),
+            process,
+        )
+        .ok()
     }));
     attempt.ok().flatten()
 }

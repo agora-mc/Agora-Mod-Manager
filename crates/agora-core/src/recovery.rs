@@ -122,6 +122,14 @@ pub enum PathProof {
         /// Where the marker is, next to or inside the path it proves.
         at: PathBuf,
     },
+    /// A marker and the identities captured by the writer before moving folders.
+    /// Several identities can occupy a destination across a recoverable rename.
+    MarkedIdentity {
+        /// The marker shared by the operation's paths.
+        at: PathBuf,
+        /// Identities allowed at this path when it is occupied.
+        identities: Vec<PathIdentity>,
+    },
     /// The path is a folder whose own record (its manifest, a marker inside it) names what this
     /// journal recorded. Only the feature knows where that record is, so it verifies this proof
     /// itself through [`ContentProof`].
@@ -227,16 +235,13 @@ pub fn write<T: Serialize>(path: &Path, journal: &T) -> LauncherResult<()> {
             path.display()
         )));
     }
-    std::fs::rename(&tmp, path).map_err(|e| {
+    durable_rename(&tmp, path, true).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         journal_error(format!(
             "could not publish the journal {}: {e}",
             path.display()
         ))
     })?;
-    if let Some(parent) = path.parent() {
-        sync_directory(parent);
-    }
     Ok(())
 }
 
@@ -257,26 +262,62 @@ pub fn write_marker(path: &Path, operation_id: &str) -> LauncherResult<()> {
             .map_err(|e| journal_error(format!("could not create {}: {e}", parent.display())))?;
     }
     let body = serde_json::json!({ "format": ENVELOPE_FORMAT, MARKER_OPERATION_KEY: operation_id });
-    let bytes = serde_json::to_vec_pretty(&body)
-        .map_err(|e| journal_error(format!("could not write the marker: {e}")))?;
-    std::fs::write(path, &bytes).map_err(|e| {
-        journal_error(format!(
-            "could not write the marker {}: {e}",
-            path.display()
-        ))
-    })
+    write(path, &body)
 }
 
-/// Flush a directory entry where the platform supports it, so a rename is durable.
-#[cfg(unix)]
-fn sync_directory(dir: &Path) {
-    if let Ok(handle) = std::fs::File::open(dir) {
-        let _ = handle.sync_all();
+pub(crate) fn sync_parent(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
-#[cfg(not(unix))]
-fn sync_directory(_dir: &Path) {}
+/// Move a directory and persist the changed entries before advancing a journal.
+pub(crate) fn rename_directory(from: &Path, to: &Path) -> std::io::Result<()> {
+    durable_rename(from, to, false)
+}
+
+fn durable_rename(from: &Path, to: &Path, replace: bool) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+        let wide = |path: &Path| -> std::io::Result<Vec<u16>> {
+            Ok(std::path::absolute(path)?
+                .as_os_str()
+                .encode_wide()
+                .chain([0])
+                .collect())
+        };
+        let source = wide(from)?;
+        let destination = wide(to)?;
+        let flags = MOVEFILE_WRITE_THROUGH
+            | if replace {
+                MOVEFILE_REPLACE_EXISTING
+            } else {
+                0
+            };
+        // SAFETY: both paths are nul-terminated and live through the call.
+        if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = replace;
+        std::fs::rename(from, to)?;
+    }
+    sync_parent(to)?;
+    if from.parent() != to.parent() {
+        sync_parent(from)?;
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Reading
@@ -376,12 +417,16 @@ pub fn read<S: JournalState>(path: &Path) -> JournalRead<S> {
             )))
         }
     };
-    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+    read_document(&bytes, &path.display().to_string())
+}
+
+/// Validate a journal document read from any store.
+pub(crate) fn read_document<S: JournalState>(bytes: &[u8], location: &str) -> JournalRead<S> {
+    let value: serde_json::Value = match serde_json::from_slice(bytes) {
         Ok(value) => value,
         Err(error) => {
             return JournalRead::Unusable(JournalProblem::Malformed(format!(
-                "{} is not JSON: {error}",
-                path.display()
+                "{location} is not JSON: {error}"
             )))
         }
     };
@@ -391,15 +436,13 @@ pub fn read<S: JournalState>(path: &Path) -> JournalRead<S> {
         }
         Some(format) if format < u64::from(ENVELOPE_FORMAT) => {
             return JournalRead::Unusable(JournalProblem::Malformed(format!(
-                "{} names format {format}, which is not one Agora wrote",
-                path.display()
+                "{location} names format {format}, which is not one Agora wrote"
             )))
         }
         Some(_) => {}
         None => {
             return JournalRead::Unusable(JournalProblem::Malformed(format!(
-                "{} names no format version",
-                path.display()
+                "{location} names no format version"
             )))
         }
     }
@@ -407,8 +450,7 @@ pub fn read<S: JournalState>(path: &Path) -> JournalRead<S> {
         Ok(envelope) => envelope,
         Err(error) => {
             return JournalRead::Unusable(JournalProblem::Malformed(format!(
-                "{} is not a complete journal: {error}",
-                path.display()
+                "{location} is not a complete journal: {error}"
             )))
         }
     };
@@ -419,8 +461,7 @@ pub fn read<S: JournalState>(path: &Path) -> JournalRead<S> {
     }
     if envelope.operation_id.is_empty() {
         return JournalRead::Unusable(JournalProblem::Malformed(format!(
-            "{} names no operation",
-            path.display()
+            "{location} names no operation"
         )));
     }
     JournalRead::Valid(Box::new(Journal {
@@ -481,7 +522,7 @@ pub fn writer_liveness(
 /// keeps the same name. Acting only on what the decision verified closes that window: the identity
 /// is read again immediately before anything is touched, and a path that is no longer the same one
 /// is refused and reported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PathIdentity {
     /// The volume (or device) and file (or inode) the OS reported for the path.
     File {
@@ -494,17 +535,16 @@ pub enum PathIdentity {
 
 /// What is at `path`: `Ok(None)` when nothing is, so a path that has never existed is not an
 /// error; `Err` when the OS would not say, which is never read as "nothing is there".
-fn path_identity(path: &Path) -> std::io::Result<Option<PathIdentity>> {
-    // Absent is an answer; anything else the OS refuses is "could not tell", never "nothing there".
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    }
+pub(crate) fn path_identity(path: &Path) -> std::io::Result<Option<PathIdentity>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let metadata = std::fs::symlink_metadata(path)?;
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() => metadata,
+            Ok(_) => return Err(std::io::Error::other("expected a plain directory")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
         Ok(Some(PathIdentity::File {
             volume: metadata.dev(),
             file: metadata.ino(),
@@ -516,18 +556,29 @@ fn path_identity(path: &Path) -> std::io::Result<Option<PathIdentity>> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::HANDLE;
         use windows_sys::Win32::Storage::FileSystem::{
-            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         };
         // A directory can only be opened by handle with backup semantics; the handle is what names
         // the file on disk, whatever its name is now.
-        let file = std::fs::OpenOptions::new()
+        let file = match std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)?;
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: `file` is open for the call, and `info` is a valid out-parameter.
         if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
             return Err(std::io::Error::last_os_error());
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+            || info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(std::io::Error::other("expected a plain directory"));
         }
         Ok(Some(PathIdentity::File {
             volume: u64::from(info.dwVolumeSerialNumber),
@@ -633,6 +684,24 @@ pub fn decide<S: JournalState>(
     proof: &dyn ContentProof,
     view: &dyn crate::process_identity::ProcessView,
 ) -> Decision<'static, S> {
+    decide_reading(
+        locks,
+        resource,
+        Some(journal_path),
+        || read(journal_path),
+        proof,
+        view,
+    )
+}
+
+pub(crate) fn decide_reading<S: JournalState>(
+    locks: &LockManager,
+    resource: &LockResource,
+    journal_path: Option<&Path>,
+    read: impl FnOnce() -> JournalRead<S>,
+    proof: &dyn ContentProof,
+    view: &dyn crate::process_identity::ProcessView,
+) -> Decision<'static, S> {
     let lock = match locks.acquire_with_timeout_typed(
         resource.clone(),
         RECOVERY_OPERATION,
@@ -647,7 +716,7 @@ pub fn decide<S: JournalState>(
         // is not a lock name): nothing was learned about any holder.
         Err(LockRefusal::Unavailable(error)) => return Decision::NeedsHand(error.to_string()),
     };
-    match examine(resource, journal_path, proof, view) {
+    match examine(resource, read(), proof, view, None) {
         Examined::Nothing => Decision::Nothing,
         Examined::Busy(why) => Decision::Busy(why),
         Examined::NeedsHand(why) => Decision::NeedsHand(why),
@@ -672,7 +741,27 @@ pub fn decide_holding<'a, S: JournalState>(
     proof: &dyn ContentProof,
     view: &dyn crate::process_identity::ProcessView,
 ) -> Decision<'a, S> {
-    match examine(resource, journal_path, proof, view) {
+    decide_holding_reading(
+        lock,
+        resource,
+        Some(journal_path),
+        || read(journal_path),
+        proof,
+        view,
+        None,
+    )
+}
+
+pub(crate) fn decide_holding_reading<'a, S: JournalState>(
+    lock: &'a LockGuard,
+    resource: &LockResource,
+    journal_path: Option<&Path>,
+    read: impl FnOnce() -> JournalRead<S>,
+    proof: &dyn ContentProof,
+    view: &dyn crate::process_identity::ProcessView,
+    writer_operation: Option<&str>,
+) -> Decision<'a, S> {
+    match examine(resource, read(), proof, view, writer_operation) {
         Examined::Nothing => Decision::Nothing,
         // This caller holds the lock, so no live writer can be working on the same operation:
         // the record contradicts the lock, which is a hand, not permission.
@@ -712,17 +801,16 @@ struct Ready<S> {
 /// touched; the lock is the caller's business (see [`decide`] and [`decide_holding`]).
 fn examine<S: JournalState>(
     resource: &LockResource,
-    journal_path: &Path,
+    journal_read: JournalRead<S>,
     proof: &dyn ContentProof,
     view: &dyn crate::process_identity::ProcessView,
+    writer_operation: Option<&str>,
 ) -> Examined<S> {
-    let journal = match read::<S>(journal_path) {
+    let journal = match journal_read {
         JournalRead::Absent => return Examined::Nothing,
         JournalRead::Unusable(problem) => {
             return Examined::NeedsHand(format!(
-                "A journal for this operation is at {} and {problem}, so Agora cannot tell what it \
-                 changed. Nothing was changed; the journal was kept so it can be looked at.",
-                journal_path.display()
+                "The journal for this operation cannot be used: {problem}."
             ))
         }
         JournalRead::Valid(journal) => journal,
@@ -739,7 +827,13 @@ fn examine<S: JournalState>(
         }
     }
 
-    match writer_liveness(envelope.writer.as_ref(), view) {
+    // The writer holding the lock can authorize actions for its own operation.
+    let liveness = if writer_operation == Some(envelope.operation_id.as_str()) {
+        WriterLiveness::Gone
+    } else {
+        writer_liveness(envelope.writer.as_ref(), view)
+    };
+    match liveness {
         WriterLiveness::Alive => {
             let pid = match envelope.writer.as_ref() {
                 Some(writer) => writer.pid.to_string(),
@@ -764,22 +858,24 @@ fn examine<S: JournalState>(
     let mut markers = Vec::new();
     for entry in &envelope.owned {
         let marker = match &entry.proof {
-            PathProof::Marker { at } => match marker_verdict(at, &envelope.operation_id) {
-                MarkerVerdict::Ours => {
-                    markers.push(at.clone());
-                    Some(at.clone())
-                }
-                MarkerVerdict::NotOurs(why) => {
-                    left_alone.push((entry.path.clone(), why));
-                    continue;
-                }
-                MarkerVerdict::CantTell(why) => {
-                    return Examined::NeedsHand(format!(
+            PathProof::Marker { at } | PathProof::MarkedIdentity { at, .. } => {
+                match marker_verdict(at, &envelope.operation_id) {
+                    MarkerVerdict::Ours => {
+                        markers.push(at.clone());
+                        Some(at.clone())
+                    }
+                    MarkerVerdict::NotOurs(why) => {
+                        left_alone.push((entry.path.clone(), why));
+                        continue;
+                    }
+                    MarkerVerdict::CantTell(why) => {
+                        return Examined::NeedsHand(format!(
                         "A path this journal owns cannot be checked: {why}. Nothing was changed; \
                          the journal was kept."
                     ))
+                    }
                 }
-            },
+            }
             PathProof::Content => match proof.prove(&entry.path) {
                 ProofResult::Proven => None,
                 ProofResult::NotOwned(why) => {
@@ -807,6 +903,15 @@ fn examine<S: JournalState>(
                 ))
             }
         };
+        if let PathProof::MarkedIdentity { identities, .. } = &entry.proof {
+            if identity.is_some_and(|identity| !identities.contains(&identity)) {
+                left_alone.push((
+                    entry.path.clone(),
+                    "its directory identity differs from the journal".into(),
+                ));
+                continue;
+            }
+        }
         owned.push(VerifiedPath {
             path: entry.path.clone(),
             identity,
@@ -889,7 +994,7 @@ pub struct RecoveryCapability<'a, S> {
     /// Held for the capability's whole life; dropped last.
     lock: LockHold<'a>,
     /// The journal this capability was issued from, deleted by [`Self::finish`].
-    journal_path: PathBuf,
+    journal_path: Option<PathBuf>,
     /// The journal as it was read and validated: the one read the decision made.
     journal: Box<Journal<S>>,
     /// The paths whose proof matched, with what the OS said they were then: the only paths the
@@ -911,10 +1016,10 @@ enum LockHold<'a> {
 
 impl<'a, S> RecoveryCapability<'a, S> {
     /// The capability for one examined journal, under `hold`.
-    fn under(hold: LockHold<'a>, journal_path: &Path, ready: Ready<S>) -> Self {
+    fn under(hold: LockHold<'a>, journal_path: Option<&Path>, ready: Ready<S>) -> Self {
         RecoveryCapability {
             lock: hold,
-            journal_path: journal_path.to_path_buf(),
+            journal_path: journal_path.map(Path::to_path_buf),
             journal: ready.journal,
             owned: ready.owned,
             left_alone: ready.left_alone,
@@ -967,20 +1072,22 @@ impl<'a, S> RecoveryCapability<'a, S> {
     }
 
     /// Where the journal this capability came from lives.
-    pub fn journal_path(&self) -> &Path {
-        &self.journal_path
+    pub fn journal_path(&self) -> Option<&Path> {
+        self.journal_path.as_deref()
     }
 
     /// Remove an owned folder.
     pub fn remove_dir(&mut self, path: &Path) -> LauncherResult<()> {
-        self.require_owned(path)?;
+        if self.verified_identity(path)?.is_none() {
+            return Ok(());
+        }
         match std::fs::remove_dir_all(path) {
             Ok(()) => {
-                self.refresh(path)?;
+                self.set_identity(path, None);
                 Ok(())
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.refresh(path)?;
+                self.set_identity(path, None);
                 Ok(())
             }
             Err(error) => Err(journal_error(format!(
@@ -992,17 +1099,21 @@ impl<'a, S> RecoveryCapability<'a, S> {
 
     /// Rename between two owned paths.
     pub fn rename(&mut self, from: &Path, to: &Path) -> LauncherResult<()> {
-        self.require_owned(from)?;
-        self.require_owned(to)?;
-        std::fs::rename(from, to).map_err(|error| {
+        if self.verified_identity(to)?.is_some() {
+            return Err(refused(format!("{} is occupied", to.display())));
+        }
+        let identity = self
+            .verified_identity(from)?
+            .ok_or_else(|| refused(format!("{} is absent", from.display())))?;
+        rename_directory(from, to).map_err(|error| {
             journal_error(format!(
                 "could not move {} to {}: {error}",
                 from.display(),
                 to.display()
             ))
         })?;
-        self.refresh(from)?;
-        self.refresh(to)?;
+        self.set_identity(from, None);
+        self.set_identity(to, Some(identity));
         Ok(())
     }
 
@@ -1085,6 +1196,10 @@ impl<'a, S> RecoveryCapability<'a, S> {
     /// A marker that cannot be removed is reported; the journal is still deleted, because the
     /// operation is over and a journal left behind would be recovered again over a finished job.
     pub fn finish(self) -> LauncherResult<()> {
+        let journal_path = self
+            .journal_path
+            .as_deref()
+            .ok_or_else(|| journal_error("the journal must be finished in its own store".into()))?;
         let mut first_error = None;
         for marker in &self.markers {
             match std::fs::remove_file(marker) {
@@ -1100,13 +1215,13 @@ impl<'a, S> RecoveryCapability<'a, S> {
                 }
             }
         }
-        match std::fs::remove_file(&self.journal_path) {
+        match std::fs::remove_file(journal_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(journal_error(format!(
                     "could not remove the journal {}: {error}",
-                    self.journal_path.display()
+                    journal_path.display()
                 )))
             }
         }
@@ -1121,7 +1236,7 @@ impl<'a, S> RecoveryCapability<'a, S> {
     /// Two re-checks, because the decision was made a moment ago and the disk can have moved since:
     /// a marker that no longer names this operation, and a path whose OS identity is not the one
     /// verified. Either is a refusal, and nothing is touched.
-    fn require_owned(&self, path: &Path) -> LauncherResult<()> {
+    pub(crate) fn verified_identity(&self, path: &Path) -> LauncherResult<Option<PathIdentity>> {
         let Some(owned) = self
             .owned
             .iter()
@@ -1152,19 +1267,22 @@ impl<'a, S> RecoveryCapability<'a, S> {
         })?;
         match (owned.identity, now) {
             // The same folder the decision verified, or a path that is still not there.
-            (Some(wanted), Some(found)) if wanted == found => Ok(()),
-            (Some(_), None) | (None, None) => Ok(()),
+            (wanted, found) if wanted == found => Ok(found),
             (None, Some(_)) => Err(refused(format!(
                 "{} did not exist when recovery decided what to do and is there now, so it is not \
                  a path this recovery verified",
                 path.display()
             ))),
-            (Some(_), Some(_)) => Err(refused(format!(
+            _ => Err(refused(format!(
                 "{} is not the folder recovery verified: it was removed and another one created in \
                  its place",
                 path.display()
             ))),
         }
+    }
+
+    fn require_owned(&self, path: &Path) -> LauncherResult<()> {
+        self.verified_identity(path).map(|_| ())
     }
 
     /// Record what the OS says about `path` now, after this capability moved or removed it: a
@@ -1176,6 +1294,11 @@ impl<'a, S> RecoveryCapability<'a, S> {
                 path.display()
             ))
         })?;
+        self.set_identity(path, identity);
+        Ok(())
+    }
+
+    fn set_identity(&mut self, path: &Path, identity: Option<PathIdentity>) {
         if let Some(owned) = self
             .owned
             .iter_mut()
@@ -1183,7 +1306,6 @@ impl<'a, S> RecoveryCapability<'a, S> {
         {
             owned.identity = identity;
         }
-        Ok(())
     }
 }
 
@@ -1312,7 +1434,6 @@ mod tests {
     /// test can make happen (MASTER_SPEC §32.13).
     struct StandInTable {
         answer: process_identity::Lookup,
-        table_readable: bool,
         job: Result<usize, String>,
     }
 
@@ -1321,7 +1442,6 @@ mod tests {
         fn without_the_pid() -> Self {
             Self {
                 answer: process_identity::Lookup::Absent,
-                table_readable: true,
                 job: Ok(0),
             }
         }
@@ -1335,7 +1455,6 @@ mod tests {
                     zombie: false,
                     exited: false,
                 },
-                table_readable: true,
                 job: Ok(0),
             }
         }
@@ -1344,9 +1463,6 @@ mod tests {
     impl process_identity::ProcessView for StandInTable {
         fn lookup(&self, _pid: u32) -> process_identity::Lookup {
             self.answer.clone()
-        }
-        fn table_answered(&self) -> bool {
-            self.table_readable
         }
         fn job_members(&self, _job: &str) -> Result<usize, String> {
             self.job.clone()
@@ -1379,9 +1495,11 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_process_table_is_not_proof_that_the_writer_is_gone() {
+    fn an_empty_targeted_refresh_is_not_proof_that_the_writer_is_gone() {
         let table = StandInTable {
-            table_readable: false,
+            answer: process_identity::Lookup::CantTell(
+                "the targeted refresh returned no entry".into(),
+            ),
             ..StandInTable::without_the_pid()
         };
         let answer = writer_liveness(Some(&recorded_writer()), &table);
@@ -1407,7 +1525,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pid_that_is_not_in_a_table_that_was_read_is_gone() {
+    fn a_pid_the_os_reports_absent_is_gone() {
         let table = StandInTable::without_the_pid();
         assert_eq!(
             writer_liveness(Some(&recorded_writer()), &table),

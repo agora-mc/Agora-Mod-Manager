@@ -26,6 +26,75 @@ fn agora(data_dir: &Path, args: &[&str]) -> std::process::Output {
         .expect("run agora")
 }
 
+#[test]
+fn plugin_restore_reaches_the_committed_journal_before_startup_recovery() {
+    use agora_core::plugins::{install::InstallCrashPoint, service::PluginService};
+    use std::io::Write;
+
+    fn package(version: &str) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("agora-plugin.json", options).unwrap();
+        let manifest = serde_json::json!({
+            "manifest": 1, "id": "test.recovery", "name": "Recovery Test",
+            "version": version, "license": "MIT", "apiRange": ">=0.1, <0.2",
+            "entrypoint": "main.js"
+        });
+        zip.write_all(manifest.to_string().as_bytes()).unwrap();
+        zip.start_file("main.js", options).unwrap();
+        write!(zip, "// version {version}").unwrap();
+        zip.finish().unwrap().into_inner()
+    }
+
+    let data = tempfile::tempdir().unwrap();
+    let ctx = agora_core::ctx::CoreContext::for_testing(data.path().to_path_buf());
+    ctx.paths.create_required_dirs().unwrap();
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let service = PluginService::headless(
+        ctx.clone(),
+        std::sync::Arc::new(agora_plugin_host::QuickJsHost::new()),
+    );
+    service
+        .install_package_bytes(&package("1.0.0"), true)
+        .unwrap();
+    ctx.test_seams
+        .set_install_crash(Some(InstallCrashPoint::Committed));
+    let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        service
+            .install_package_bytes(&package("2.0.0"), true)
+            .unwrap();
+    }));
+    ctx.test_seams.set_install_crash(None);
+    assert!(crash.is_err_and(|panic| panic
+        .downcast_ref::<String>()
+        .is_some_and(|message| message.contains("cut this plugin install short at Committed"))));
+    conn.execute(
+        "UPDATE plugin_install_journal SET document = json_set(document, '$.writer.pid', ?1)
+         WHERE plugin_id = ?2",
+        rusqlite::params![u32::MAX - 2, "test.recovery"],
+    )
+    .unwrap();
+    let args = ["plugin", "recover", "test.recovery", "--restore"];
+    assert!(!agora(data.path(), &args).status.success());
+    let output = agora(data.path(), &[&args[..], &["--yes"]].concat());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Recovered plugin test.recovery"));
+    let id = agora_plugin_api::PluginId::parse("test.recovery").unwrap();
+    let row = agora_core::plugins::store::get(&conn, &id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.manifest.version.to_string(), "1.0.0");
+    assert_eq!(
+        std::fs::read_to_string(row.install_dir.join("main.js")).unwrap(),
+        "// version 1.0.0"
+    );
+}
+
 /// The subcommands a `--help` page lists under `Commands:`, without `help`.
 fn subcommands(help: &str) -> Vec<String> {
     let Some(start) = help.find("\nCommands:\n") else {

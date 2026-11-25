@@ -581,13 +581,15 @@ mod tests {
         agora_core::instance_runtime::clear(&paths, "demo", None).unwrap();
 
         // A launch whose process is alive counts as running too.
-        let identity = agora_core::process_identity::capture(std::process::id()).unwrap();
-        agora_core::instance_runtime::publish_running(&paths, "demo", "gen-test", identity)
+        let mut identity = agora_core::process_identity::capture(std::process::id()).unwrap();
+        agora_core::instance_runtime::publish_running(&paths, "demo", "gen-test", identity.clone())
             .unwrap();
         let cancel = service.cancel("demo").unwrap_err();
         assert_eq!(cancel.code(), "ERR_INSTANCE_RUNNING");
         assert_eq!(enabled_files(&dir), on_before);
-        agora_core::instance_runtime::clear(&paths, "demo", None).unwrap();
+        identity.pid = u32::MAX - 2;
+        agora_core::instance_runtime::publish_running(&paths, "demo", "gen-test", identity)
+            .unwrap();
 
         // Once the game is gone, the same cancel goes through.
         service.cancel("demo").unwrap();

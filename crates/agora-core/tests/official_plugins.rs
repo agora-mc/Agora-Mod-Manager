@@ -13,7 +13,7 @@ use agora_core::app_paths::AppPaths;
 use agora_core::ctx::CoreContext;
 use agora_core::error::LauncherResult;
 use agora_core::game_registry::{GameRegistry, PackageSource};
-use agora_core::plugins::install::PluginInstallState;
+use agora_core::plugins::install::InstallCrashPoint;
 use agora_core::plugins::official::{tree_digest, zip_tree_digest};
 use agora_core::plugins::{
     Consent, NoopUiSink, OfficialCatalog, OfficialInstallState, OfficialStatus, PackageFetcher,
@@ -3120,47 +3120,32 @@ async fn a_differently_signed_update_is_flagged_and_asks_about_its_code_again() 
     );
 }
 
-/// The journal an install leaves when the process dies partway through it (MASTER_SPEC §32.11),
-/// and the worker that wrote it pointed at a process the system does not have: this test's process
-/// has not died, so its own identity would read as a live writer and recovery would leave the
-/// journal alone.
-fn crash_journal(world: &World, previous: Option<&str>, new: &str, state: PluginInstallState) {
-    use agora_core::plugins::install::{install_journal_path, InstallJournal};
-    let id = PluginId::parse(PLUGIN).unwrap();
-    let paths = world.paths();
-    let mut journal = InstallJournal::begin(
-        &paths,
-        &id,
-        previous.is_some(),
-        previous.map(str::to_string),
-        new.to_string(),
+fn crash_install(world: &World, version: &str, point: InstallCrashPoint) {
+    let ctx = CoreContext::for_testing(world.root().to_path_buf());
+    let service = PluginService::headless(ctx.clone(), Arc::new(QuickJsHost::new()));
+    ctx.test_seams.set_install_crash(Some(point));
+    let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        service
+            .install_package_bytes(&fixture_zip(version), true)
+            .unwrap();
+    }));
+    assert!(crash.is_err_and(
+        |panic| panic.downcast_ref::<String>().is_some_and(
+            |message| message.contains(&format!("cut this plugin install short at {point:?}"))
+        )
+    ));
+    let conn = agora_core::db::local_state_connection(&world.paths().local_state_db()).unwrap();
+    conn.execute(
+        "UPDATE plugin_install_journal
+         SET document = json_set(document, '$.writer', json(?2))
+         WHERE plugin_id = ?1",
+        rusqlite::params![
+            PLUGIN,
+            r#"{"pid":4294967293,"start_time":1,"expected_exe":null}"#
+        ],
     )
     .unwrap();
-    journal.start(&paths).unwrap();
-    match state {
-        PluginInstallState::Starting => {}
-        PluginInstallState::Stashed => journal.advance(&paths, state).unwrap(),
-        PluginInstallState::Extracted | PluginInstallState::Committed => {
-            journal
-                .advance(&paths, PluginInstallState::Stashed)
-                .unwrap();
-            journal
-                .advance(&paths, PluginInstallState::Extracted)
-                .unwrap();
-            if state == PluginInstallState::Committed {
-                journal
-                    .advance(&paths, PluginInstallState::Committed)
-                    .unwrap();
-            }
-        }
-    }
-    let path = install_journal_path(&paths, &id);
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    value["writer"] = serde_json::json!({"pid": u32::MAX, "start_time": 1, "expected_exe": null});
-    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
 }
-
 #[tokio::test]
 async fn a_crash_mid_install_restores_the_previous_version_at_startup() {
     let world = World::new();
@@ -3169,21 +3154,9 @@ async fn a_crash_mid_install_restores_the_previous_version_at_startup() {
         .install_package_bytes(&fixture_zip("1.0.0"), true)
         .unwrap();
 
-    // The half-done state: the old files are in the rollback folder, the new
-    // ones are unpacked, but the record still names v1 — and the install's
-    // journal says how far it got.
+    crash_install(&world, "2.0.0", InstallCrashPoint::Extracted);
     let installed = world.installed_dir();
     let rollback = world.paths().plugin_rollback_root().join(PLUGIN);
-    std::fs::create_dir_all(rollback.parent().unwrap()).unwrap();
-    std::fs::rename(&installed, &rollback).unwrap();
-    agora_core::plugins::install::extract_package(&fixture_zip("2.0.0"), &installed).unwrap();
-    crash_journal(
-        &world,
-        Some("1.0.0"),
-        "2.0.0",
-        PluginInstallState::Extracted,
-    );
-
     let (ctx, warnings) = world.start();
     assert!(
         warnings.iter().any(|w| w.contains("Recovered")),
@@ -3215,23 +3188,8 @@ async fn a_finished_install_left_in_the_rollback_folder_is_just_cleaned_up() {
         .service
         .install_package_bytes(&fixture_zip("1.0.0"), true)
         .unwrap();
-    world
-        .service
-        .install_package_bytes(&fixture_zip("2.0.0"), true)
-        .unwrap();
-
-    // The record says v2, v2 is on disk, and the install wrote its commit witness; only the
-    // stashed v1 and the journal it had not deleted yet are left.
+    crash_install(&world, "2.0.0", InstallCrashPoint::Committed);
     let rollback = world.paths().plugin_rollback_root().join(PLUGIN);
-    std::fs::create_dir_all(rollback.parent().unwrap()).unwrap();
-    agora_core::plugins::install::extract_package(&fixture_zip("1.0.0"), &rollback).unwrap();
-    crash_journal(
-        &world,
-        Some("1.0.0"),
-        "2.0.0",
-        PluginInstallState::Committed,
-    );
-
     let (ctx, _) = world.start();
     assert!(!rollback.exists());
     assert!(ctx.games.game(&GameId::new(GAME).unwrap()).is_some());

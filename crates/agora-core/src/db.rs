@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 /// Expected schema version for the mutable local SQLite database.
 /// Migrations are applied sequentially on startup.
-pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 28;
+pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 29;
 
 /// How many pre-migration database backups are kept.
 pub const LOCAL_STATE_BACKUP_RETENTION: usize = 3;
@@ -1110,6 +1110,11 @@ const MIGRATIONS: &[MigrationStep] = &[
         name: "pre-touch column",
         run: migrate_v28,
     },
+    MigrationStep {
+        version: 29,
+        name: "plugin install journal and ledger process identity",
+        run: migrate_v29,
+    },
 ];
 
 /// Apply every step up to `target`, skipping any already recorded.
@@ -2022,6 +2027,22 @@ fn migrate_v28(conn: &Connection) -> anyhow::Result<()> {
         "user_instances",
         "jvm_always_pre_touch",
         "ALTER TABLE user_instances ADD COLUMN jvm_always_pre_touch INTEGER NOT NULL DEFAULT 1",
+    )
+}
+
+fn migrate_v29(conn: &Connection) -> anyhow::Result<()> {
+    // First installs need a journal before they have a plugin record.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS plugin_install_journal (
+             plugin_id TEXT PRIMARY KEY,
+             document TEXT NOT NULL
+         );",
+    )?;
+    add_column_if_missing(
+        conn,
+        "launch_history",
+        "game_process_json",
+        "ALTER TABLE launch_history ADD COLUMN game_process_json TEXT",
     )
 }
 

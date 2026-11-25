@@ -2154,7 +2154,13 @@ fn kill_from(dir: &Path) {
     for process in sys.processes().values() {
         if let Some(exe) = process.exe() {
             if game_launch::is_subpath(exe, dir) {
-                process.kill();
+                let identity = crate::process_identity::ProcessIdentity {
+                    pid: process.pid().as_u32(),
+                    start_time: process.start_time(),
+                    expected_exe: Some(exe.to_string_lossy().into_owned()),
+                    job: None,
+                };
+                let _ = crate::process_identity::signal_verified(&identity, || process.kill());
             }
         }
     }

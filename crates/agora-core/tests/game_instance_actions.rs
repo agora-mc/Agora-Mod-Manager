@@ -1442,20 +1442,33 @@ fn stop_finds_and_stops_a_session_recorded_only_in_the_ledger() {
             .spawn()
             .expect("spawn sleeper")
     };
-    let pid = child.id();
-    let mut system = sysinfo::System::new();
-    let spid = sysinfo::Pid::from_u32(pid);
-    system.refresh_process(spid);
-    let started = system.process(spid).expect("child process").start_time();
+    let identity = agora_core::process_identity::capture(child.id()).expect("child identity");
     let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).expect("db");
     session_ledger::begin(
         &conn,
         "grounded-1",
         "2026-01-01T00:00:00Z",
         &LaunchManifest::default(),
-        Owner { pid, started },
+        Owner {
+            pid: identity.pid,
+            started: identity.start_time,
+        },
     )
-    .expect("open ledger session");
+    .expect("legacy ledger session without a game identity");
+    assert!(game_instance::stop(&f.ctx, "grounded-1", &definition()).is_err());
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the watcher's PID is not a stop target"
+    );
+    session_ledger::begin_with_process(
+        &conn,
+        "grounded-1",
+        "2026-01-01T00:00:01Z",
+        &LaunchManifest::default(),
+        Owner::current(),
+        Some(&identity),
+    )
+    .expect("open ledger session with the original game identity");
     drop(conn);
 
     let stopped = game_instance::stop(&f.ctx, "grounded-1", &definition()).expect("stop");

@@ -16,6 +16,7 @@
 //! result.  No global or async state is involved.
 
 use crate::error::{LauncherError, LauncherResult};
+use std::collections::HashSet;
 use std::time::Duration;
 use sysinfo::{Pid, System};
 
@@ -139,7 +140,7 @@ pub enum Lookup {
         /// The process has exited while something still holds a handle to it (Windows).
         exited: bool,
     },
-    /// The pid is not in the table, and the table was read.
+    /// The OS positively reported that this PID is absent.
     Absent,
     /// The table could not be read for this pid.
     CantTell(String),
@@ -153,9 +154,6 @@ pub enum Lookup {
 pub trait ProcessView: Send + Sync {
     /// The OS record for `pid`.
     fn lookup(&self, pid: u32) -> Lookup;
-    /// Whether a full refresh of the table listed anything. An empty table is not a machine with
-    /// nothing running: it is a table that gave no answer.
-    fn table_answered(&self) -> bool;
     /// How many processes the named job still holds.
     fn job_members(&self, job: &str) -> Result<usize, String>;
 }
@@ -168,7 +166,12 @@ impl ProcessView for OsProcesses {
         let mut system = System::new();
         system.refresh_process(Pid::from_u32(pid));
         let Some(process) = system.process(Pid::from_u32(pid)) else {
-            return Lookup::Absent;
+            return match pid_absent(pid) {
+                true => Lookup::Absent,
+                false => {
+                    Lookup::CantTell(format!("the targeted lookup could not identify pid {pid}"))
+                }
+            };
         };
         // On Unix a killed process stays in the table as a zombie until its parent reaps it; it is
         // not running.
@@ -190,10 +193,6 @@ impl ProcessView for OsProcesses {
         }
     }
 
-    fn table_answered(&self) -> bool {
-        listed_processes() > 0
-    }
-
     fn job_members(&self, job: &str) -> Result<usize, String> {
         crate::process_job::members(job)
     }
@@ -213,25 +212,8 @@ pub fn check(identity: &ProcessIdentity) -> ProcessCheck {
     check_with(identity, &OsProcesses)
 }
 
-/// What `view` says about `identity`.
-///
-/// The rules, in order, and each one only ever makes the answer more cautious:
-///
-/// * an identity with no pid or no start time was never captured from a running process, so
-///   nothing can be looked up: `CantTell`;
-/// * a job that still holds processes proves liveness even after the parent exited: `Alive`; a job
-///   query that fails proves nothing: `CantTell`;
-/// * a failed lookup is `CantTell`, never `Gone`;
-/// * a pid that is not in a table that *was* read is `Gone`; a pid missing from an empty table is
-///   `CantTell`, because an empty table is no answer;
-/// * a different start time, a different executable, a zombie or an exited process is `Gone`.
+/// Check whether the process or any members of its job can still use the resource.
 pub fn check_with(identity: &ProcessIdentity, view: &dyn ProcessView) -> ProcessCheck {
-    if identity.pid == 0 || identity.start_time == 0 {
-        return ProcessCheck::CantTell(format!(
-            "the recorded process (pid {}) has no usable identity",
-            identity.pid
-        ));
-    }
     if let Some(job) = identity.job.as_deref() {
         match view.job_members(job) {
             Ok(count) if count > 0 => return ProcessCheck::Alive,
@@ -243,46 +225,173 @@ pub fn check_with(identity: &ProcessIdentity, view: &dyn ProcessView) -> Process
             }
         }
     }
+    check_pid(identity, view, false)
+}
+
+/// Check the exact process before signalling it. Job membership proves nothing about its PID.
+pub fn check_exact_with(identity: &ProcessIdentity, view: &dyn ProcessView) -> ProcessCheck {
+    check_pid(identity, view, true)
+}
+
+fn check_pid(
+    identity: &ProcessIdentity,
+    view: &dyn ProcessView,
+    require_exe: bool,
+) -> ProcessCheck {
+    let unknown = || {
+        ProcessCheck::CantTell(format!(
+            "pid {} has no usable process identity",
+            identity.pid
+        ))
+    };
+    if identity.pid == 0 || identity.start_time == 0 {
+        return unknown();
+    }
     match view.lookup(identity.pid) {
+        Lookup::Absent => ProcessCheck::Gone,
         Lookup::CantTell(why) => ProcessCheck::CantTell(why),
-        Lookup::Absent => {
-            if view.table_answered() {
-                ProcessCheck::Gone
-            } else {
-                ProcessCheck::CantTell(
-                    "the system process list could not be read, so a recorded process cannot be \
-                     shown to be gone"
-                        .into(),
-                )
-            }
-        }
         Lookup::Found {
             start_time,
             exe,
             zombie,
             exited,
         } => {
-            if zombie {
+            if zombie || exited {
                 return ProcessCheck::Gone;
             }
-            // The strongest reuse detector.
+            if start_time == 0 {
+                return unknown();
+            }
             if start_time != identity.start_time {
                 return ProcessCheck::Gone;
             }
-            if exited {
-                return ProcessCheck::Gone;
-            }
-            // Compare the executable when both sides have it: missing OS data does not reject on
-            // its own, because the start time is the authoritative check.
-            if let (Some(expected), Some(current)) = (&identity.expected_exe, &exe) {
-                let normalised = |s: &str| s.replace('\\', "/");
-                if normalised(current) != normalised(expected) {
-                    return ProcessCheck::Gone;
+            match (&identity.expected_exe, &exe) {
+                (Some(expected), Some(current)) => {
+                    if current.replace('\\', "/") != expected.replace('\\', "/") {
+                        return ProcessCheck::Gone;
+                    }
                 }
+                _ if require_exe => return unknown(),
+                _ => {}
             }
             ProcessCheck::Alive
         }
     }
+}
+
+#[cfg(windows)]
+fn pid_absent(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: the handle is closed when OpenProcess succeeds. For a nonzero PID, an
+    // invalid parameter means the PID is absent. Access denied leaves liveness unknown.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return pid != 0 && GetLastError() == ERROR_INVALID_PARAMETER;
+        }
+        CloseHandle(handle);
+        false
+    }
+}
+
+#[cfg(unix)]
+fn pid_absent(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    // SAFETY: signal 0 queries existence without sending a signal.
+    (unsafe { libc::kill(pid, 0) == -1 })
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn pid_absent(_pid: u32) -> bool {
+    false
+}
+
+/// Verify again immediately before a PID-directed action. On Windows the open handle keeps
+/// the PID bound to the same process until the action returns.
+pub(crate) fn signal_verified<T>(
+    identity: &ProcessIdentity,
+    signal: impl FnOnce() -> T,
+) -> Result<T, String> {
+    #[cfg(windows)]
+    let _handle = {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: a successful OpenProcess returns an owned handle.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, identity.pid) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        unsafe { OwnedHandle::from_raw_handle(handle.cast()) }
+    };
+    match check_exact_with(identity, &OsProcesses) {
+        ProcessCheck::Alive => Ok(signal()),
+        ProcessCheck::Gone => Err(format!(
+            "pid {} no longer matches the recorded process",
+            identity.pid
+        )),
+        ProcessCheck::CantTell(error) => Err(error),
+    }
+}
+/// End every verified process and every descendant it started, children after parents. Returns
+/// how many processes were actually signalled.
+pub(crate) fn terminate_tree(roots: &[&ProcessIdentity]) -> usize {
+    let mut system = System::new();
+    system.refresh_processes();
+
+    let mut queue: Vec<ProcessIdentity> = roots
+        .iter()
+        .filter(|identity| check_exact_with(identity, &OsProcesses) == ProcessCheck::Alive)
+        .map(|identity| (*identity).clone())
+        .collect();
+
+    let mut seen: HashSet<Pid> = HashSet::new();
+    let mut targets = Vec::new();
+    while let Some(identity) = queue.pop() {
+        let pid = Pid::from_u32(identity.pid);
+        if !seen.insert(pid) {
+            continue;
+        }
+        let Some(process) = system.process(pid).filter(|process| {
+            process.start_time() == identity.start_time
+                && process.exe() == identity.expected_exe.as_deref().map(std::path::Path::new)
+        }) else {
+            continue;
+        };
+        let start_time = process.start_time();
+        targets.push(identity);
+        for (child_pid, child) in system.processes() {
+            // A child cannot be older than its parent: an older one only names a parent that has
+            // since exited and whose pid was reused.
+            if child.parent() == Some(pid) && child.start_time() >= start_time {
+                queue.push(ProcessIdentity {
+                    pid: child_pid.as_u32(),
+                    start_time: child.start_time(),
+                    expected_exe: child.exe().map(|exe| exe.to_string_lossy().into_owned()),
+                    job: None,
+                });
+            }
+        }
+    }
+
+    let mut ended = 0;
+    for identity in targets {
+        let pid = Pid::from_u32(identity.pid);
+        if let Some(process) = system.process(pid) {
+            if signal_verified(&identity, || {
+                crate::process_job::terminate_process_for_stop(identity.pid) || process.kill()
+            }) == Ok(true)
+            {
+                ended += 1;
+            }
+        }
+    }
+    ended
 }
 
 #[cfg(windows)]
