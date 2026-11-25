@@ -1325,6 +1325,68 @@ fn definition_declaring(folders: &[&str]) -> GameDefinition {
     def
 }
 
+/// A definition that declares which of its folders the mandatory pre-launch snapshot captures.
+fn definition_declaring_prelaunch(tracked: &[&str], prelaunch: &[&str]) -> GameDefinition {
+    let mut def = definition();
+    def.snapshot = Some(
+        agora_game_api::SnapshotScope::declared(tracked, Some(prelaunch))
+            .expect("the folders are usable"),
+    );
+    def
+}
+
+/// The documented example: `tracked: [characters, config]`, `prelaunch: [config]`.
+fn prelaunch_entries(dir: &std::path::Path, snapshot_id: &str) -> Vec<String> {
+    snapshot::snapshot_file_entries(dir, snapshot_id)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.relative_path)
+        .collect()
+}
+
+#[test]
+fn launch_captures_only_the_declared_prelaunch_folders() {
+    let h = Harness::new();
+    let def = definition_declaring_prelaunch(&["characters", "config"], &["config"]);
+    std::fs::create_dir_all(h.dir().join("characters")).unwrap();
+    std::fs::write(h.dir().join("characters/hero.sav"), b"level 1").unwrap();
+    std::fs::create_dir_all(h.dir().join("config")).unwrap();
+    std::fs::write(h.dir().join("config/a.toml"), b"config v1").unwrap();
+
+    let point = game_snapshot::prepare_launch(&h.ctx, &h.id, &def).expect("the launch point");
+    let captured = prelaunch_entries(&h.dir(), &point.snapshot_id);
+
+    assert!(
+        captured.iter().any(|path| path == "config/a.toml"),
+        "a pre-launch folder is captured: {captured:?}"
+    );
+    assert!(
+        !captured.iter().any(|path| path.starts_with("characters")),
+        "a folder the package did not list for pre-launch is not captured: {captured:?}"
+    );
+    // The state a launch point exists for is still captured.
+    assert!(
+        captured.iter().any(|path| path == "user/Plugins.txt"),
+        "the declared state files are still captured: {captured:?}"
+    );
+}
+
+#[test]
+fn a_tracked_folder_that_cannot_be_read_does_not_block_launch() {
+    let h = Harness::new();
+    let def = definition_declaring_prelaunch(&["characters", "config"], &["config"]);
+    // A file where the package declares a folder: capturing that folder refuses.
+    std::fs::write(h.dir().join("characters"), b"not a folder").unwrap();
+
+    let point = game_snapshot::prepare_launch(&h.ctx, &h.id, &def)
+        .expect("a folder this launch does not capture cannot block it");
+    let captured = prelaunch_entries(&h.dir(), &point.snapshot_id);
+    assert!(
+        !captured.iter().any(|path| path.starts_with("characters")),
+        "{captured:?}"
+    );
+}
+
 #[test]
 fn a_declared_snapshot_folder_is_captured_and_restored() {
     let h = Harness::new();
@@ -1420,3 +1482,41 @@ fn a_restore_reports_a_folder_the_game_no_longer_declares() {
         "{noticed}"
     );
 }
+
+#[test]
+fn the_undo_of_a_restore_that_wrote_a_retired_folder_puts_it_back() {
+    let h = Harness::new();
+    let declaring = definition_declaring(&["characters"]);
+    let extras = h.dir().join("characters");
+    std::fs::create_dir_all(&extras).unwrap();
+    std::fs::write(extras.join("hero.sav"), b"level 1").unwrap();
+    let taken =
+        game_snapshot::create(&h.ctx, &h.id, &declaring, None, SnapshotOrigin::User).unwrap();
+
+    // The game writes, and the package stops declaring the folder.
+    std::fs::write(extras.join("hero.sav"), b"level 9").unwrap();
+    std::fs::write(extras.join("new.sav"), b"created since").unwrap();
+
+    let outcome =
+        game_snapshot::restore(&h.ctx, &h.id, &h.def, &taken.id, false).expect("restored anyway");
+    assert_eq!(std::fs::read(extras.join("hero.sav")).unwrap(), b"level 1");
+    assert_eq!(
+        std::fs::read(extras.join("new.sav")).unwrap(),
+        b"created since",
+        "a file created since the snapshot stays"
+    );
+
+    // Undoing the restore puts back what the restore replaced, in the folder the game dropped.
+    game_snapshot::restore(&h.ctx, &h.id, &h.def, &outcome.undo_snapshot_id, false)
+        .expect("the undo point holds the retired folder too");
+    assert_eq!(
+        std::fs::read(extras.join("hero.sav")).unwrap(),
+        b"level 9",
+        "the undo snapshot covers everything the restore touched"
+    );
+    assert_eq!(
+        std::fs::read(extras.join("new.sav")).unwrap(),
+        b"created since"
+    );
+}
+

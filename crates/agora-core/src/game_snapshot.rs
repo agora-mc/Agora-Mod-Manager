@@ -253,11 +253,20 @@ fn tracked_paths(definition: &GameDefinition) -> BTreeSet<String> {
     paths
 }
 
+/// Which of the declared folders a capture reads: all of them, or only those the mandatory
+/// pre-launch snapshot is meant to hold (MASTER_SPEC §32.7).
+#[derive(Clone, Copy)]
+enum DeclaredFolders {
+    All,
+    Prelaunch,
+}
+
 /// The state files, as data. A missing declared file is recorded as absent.
 fn capture_files(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
+    folders: DeclaredFolders,
 ) -> Result<Vec<SnapshotInputFile>, String> {
     let dir = ctx
         .paths
@@ -266,13 +275,23 @@ fn capture_files(
     let mut paths = declared_state_paths(definition);
     paths.extend(loadout_state_paths(&dir)?);
     // The folders the game's package declares as snapshot state. A game that declares none keeps
-    // the per-file scope its definition implies.
-    for folder in definition
-        .snapshot
-        .iter()
-        .flat_map(|scope| scope.tracked.iter())
-    {
-        paths.extend(folder_state_paths(&dir, folder.as_str())?);
+    // the per-file scope its definition implies. A launch point reads only the pre-launch list: a
+    // game's saves folder is not something a launch has to read to be able to start, and reading it
+    // must not be able to stop one.
+    let declared: Vec<&str> = match folders {
+        DeclaredFolders::All => definition
+            .snapshot
+            .iter()
+            .flat_map(|scope| scope.tracked_entries())
+            .collect(),
+        DeclaredFolders::Prelaunch => definition
+            .snapshot
+            .iter()
+            .flat_map(|scope| scope.prelaunch_entries())
+            .collect(),
+    };
+    for folder in declared {
+        paths.extend(folder_state_paths(&dir, folder)?);
     }
     let mut files = Vec::with_capacity(paths.len());
     for relative in paths {
@@ -412,7 +431,7 @@ pub fn create_locked(
         .instance_dir(instance_id)
         .map_err(|e| e.to_string())?;
     refuse_if_pending(&dir, None)?;
-    let files = capture_files(ctx, instance_id, definition)?;
+    let files = capture_files(ctx, instance_id, definition, DeclaredFolders::All)?;
     let data = capture_data(ctx, instance_id, definition)?;
     let aux = aux_for(&data)?;
     snapshot::create_snapshot_from_data(&dir, label, &files, origin, &aux)
@@ -557,6 +576,60 @@ fn newest_comparable_snapshot(
     Ok(Some((newest, data)))
 }
 
+/// The files a restore's undo point must hold: the state the restore will replace.
+///
+/// That is the folders the game declares today, plus every folder the snapshot being restored
+/// records as its scope. The second half matters for a folder the game no longer declares: the
+/// restore writes it, so the undo point has to hold its current contents or undoing the restore
+/// cannot put them back.
+fn capture_files_in_scope(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    recorded: &[String],
+) -> Result<Vec<SnapshotInputFile>, String> {
+    let dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| e.to_string())?;
+    let mut files = capture_files(ctx, instance_id, definition, DeclaredFolders::All)?;
+    let captured: std::collections::BTreeSet<&str> =
+        files.iter().map(|file| file.relative_path.as_str()).collect();
+    let mut extra = Vec::new();
+    for folder in recorded {
+        // A recorded scope entry is a folder or a single file, and the manifest does not say which:
+        // probe, and read it for what it is. An unreadable one is cannot-tell, never "nothing there"
+        // (MASTER_SPEC §32.13).
+        let root = dir.join(Path::new(folder));
+        let paths = match agora_game_api::probe(&root) {
+            agora_game_api::Probe::Present(agora_game_api::PresentKind::Directory) => {
+                folder_state_paths(&dir, folder)?
+            }
+            agora_game_api::Probe::Present(_) => vec![folder.clone()],
+            agora_game_api::Probe::Absent => Vec::new(),
+            agora_game_api::Probe::CantTell(error) => {
+                return Err(format!(
+                    "cannot tell whether the snapshot's folder '{}' is there: {error}",
+                    root.display()
+                ))
+            }
+        };
+        for path in paths {
+            if !captured.contains(path.as_str()) && !extra.contains(&path) {
+                extra.push(path);
+            }
+        }
+    }
+    for relative in extra {
+        snapshot::validate_relative_path(&relative)?;
+        files.push(SnapshotInputFile {
+            contents: read_state_file(&dir, &relative)?,
+            relative_path: relative,
+        });
+    }
+    Ok(files)
+}
+
 /// Take the recovery point a launch may promote. The state is captured before
 /// the game starts; an unchanged state reuses the newest snapshot rather than
 /// writing another copy of the same state.
@@ -578,7 +651,7 @@ pub fn prepare_launch(
         .map_err(|e| e.to_string())?;
     refuse_if_pending(&dir, None)?;
 
-    let current_files = capture_files(ctx, instance_id, definition)?;
+    let current_files = capture_files(ctx, instance_id, definition, DeclaredFolders::Prelaunch)?;
     let current_data = capture_data(ctx, instance_id, definition)?;
     let current = live_fingerprint(&current_files, &current_data);
 
@@ -752,7 +825,7 @@ pub fn diff_against_snapshot(
         .map_err(|e| e.to_string())?;
 
     let reference = snapshot::snapshot_file_index(&dir, snapshot_id)?;
-    let current_files = capture_files(ctx, instance_id, definition)?;
+    let current_files = capture_files(ctx, instance_id, definition, DeclaredFolders::All)?;
     let current_data = capture_data(ctx, instance_id, definition)?;
     let current = capture_files_as_entries(&current_files);
     let files = lkg::compute_diff(&reference, &current, Some(snapshot_id.to_string()), None);
@@ -1022,10 +1095,12 @@ pub fn restore_locked(
     let tracked_refs: Vec<&str> = tracked.iter().map(String::as_str).collect();
 
     // The undo point records the current state, including the current rules, so
-    // undoing the restore puts back everything the restore replaces.
+    // undoing the restore puts back everything the restore replaces: the folders this game
+    // declares today, and every folder the snapshot records as its scope, which is what a restore
+    // actually writes - including one the game no longer declares.
     let current = capture_data(ctx, instance_id, definition)?;
     let undo_aux = aux_for(&current)?;
-    let current_files = capture_files(ctx, instance_id, definition)?;
+    let current_files = capture_files_in_scope(ctx, instance_id, definition, &recorded)?;
     let undo = snapshot::create_snapshot_from_data(
         &dir,
         Some(&pre_restore_label(chrono::Utc::now())),
