@@ -1157,7 +1157,7 @@ impl LauncherImportService {
             let taken = |id: &str| {
                 used_ids.iter().any(|used| used == id)
                     || conn.as_ref().is_some_and(|connection| {
-                        agora_core::db::instance_id_exists(connection, id).unwrap_or(true)
+                        db::instance_id_exists(connection, id).unwrap_or(true)
                     })
             };
             // Also check existing instance names, so a new copy does not take another's.
@@ -2865,6 +2865,8 @@ fn push_blocker_lines(lines: &mut Vec<String>, blockers: &[health::Blocker]) {
 
 #[cfg(test)]
 mod tests {
+    use super::db::{init_local_state_db, instance_id_exists, local_state_connection};
+
     #[test]
     fn blocker_lines_are_deduplicated_across_scans() {
         let blocker = |msg: &str| health::Blocker {
@@ -2908,7 +2910,7 @@ mod tests {
         let tmp = test_tmp("ctx");
         let _ = std::fs::create_dir_all(&tmp);
         let ctx = crate::testing_context(tmp);
-        let _ = agora_core::db::init_local_state_db(&ctx.paths.local_state_db());
+        let _ = init_local_state_db(&ctx.paths.local_state_db());
         ctx
     }
 
@@ -3091,8 +3093,8 @@ mod tests {
         // refused it. The other game's folder need not exist for its id to be taken.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("local_state.db");
-        agora_core::db::init_local_state_db(&path).unwrap();
-        let conn = agora_core::db::local_state_connection(&path).unwrap();
+        init_local_state_db(&path).unwrap();
+        let conn = local_state_connection(&path).unwrap();
         conn.execute(
             "INSERT INTO instances (instance_id, game, name, created_at)
              VALUES ('riften', 'skyrim-se', 'Riften', '2026-01-01T00:00:00Z')",
@@ -3102,7 +3104,7 @@ mod tests {
 
         let candidate = make_candidate("Riften");
         let id = resolve_destination_id(&candidate, Some("Riften"), |id| {
-            agora_core::db::instance_id_exists(&conn, id).unwrap_or(true)
+            instance_id_exists(&conn, id).unwrap_or(true)
         });
         assert_eq!(
             id, "riften-1",
