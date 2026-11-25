@@ -255,3 +255,33 @@ fn a_base_row_needs_an_identity_that_is_not_minecraft() {
         "the refusal says which detail row is in the way: {error}"
     );
 }
+
+#[test]
+fn a_detail_row_that_cannot_be_written_inside_a_callers_transaction_leaves_no_identity_row() {
+    let (_tmp, _path, conn) = database();
+    conn.execute_batch(
+        "CREATE TRIGGER refuse_minecraft_detail BEFORE INSERT ON minecraft_instances
+         BEGIN
+             SELECT RAISE(ABORT, 'the detail row is refused');
+         END;",
+    )
+    .unwrap();
+
+    // A caller that already holds a transaction gets the same promise as one that does not:
+    // the failed detail write takes the identity write with it, so the caller's commit
+    // publishes neither half.
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let error = upsert_instance(&conn, "minecraft", &instance_row("new-instance"))
+        .expect_err("the detail write fails");
+    assert!(
+        error.to_string().contains("the detail row is refused"),
+        "{error}"
+    );
+    conn.execute_batch("COMMIT").unwrap();
+
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM instances"),
+        0,
+        "half an instance reached the caller's commit: no identity row may survive"
+    );
+}

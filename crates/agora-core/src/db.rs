@@ -3015,8 +3015,11 @@ pub fn upsert_instance(conn: &Connection, game: &str, row: &InstanceRow) -> anyh
 /// An instance is two rows (§32.7): the identity, and its game's detail row. A writer that
 /// committed them separately could fail between them and leave an identity with no detail row —
 /// half an instance, which lists and cannot be launched. A caller that already holds a
-/// transaction keeps its own larger unit atomic: nesting a `BEGIN` would fail, and a savepoint
-/// would commit into a transaction the caller may still roll back.
+/// transaction keeps its own larger unit atomic: nesting a `BEGIN` would fail, so the write gets
+/// a savepoint instead, which the caller's commit or rollback then publishes or drops with
+/// everything else. Without it the two halves would still be one statement each in the caller's
+/// transaction, and a failed detail write would be committed as an identity row by a caller that
+/// handled the error and went on.
 pub(crate) fn in_one_transaction<T, E>(
     conn: &Connection,
     write: impl FnOnce(&Connection) -> Result<T, E>,
@@ -3025,7 +3028,19 @@ where
     E: From<rusqlite::Error>,
 {
     if !conn.is_autocommit() {
-        return write(conn);
+        conn.execute_batch("SAVEPOINT agora_instance_write")?;
+        return match write(conn) {
+            Ok(value) => {
+                conn.execute_batch("RELEASE agora_instance_write")?;
+                Ok(value)
+            }
+            Err(error) => {
+                // A rollback that cannot run is the more serious problem, so it is what the
+                // caller is told: an active savepoint would commit with the caller's work.
+                conn.execute_batch("ROLLBACK TO agora_instance_write; RELEASE agora_instance_write")?;
+                Err(error)
+            }
+        };
     }
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let value = write(&tx)?;
