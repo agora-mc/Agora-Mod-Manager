@@ -1550,11 +1550,16 @@ pub(crate) fn trusted_base_folder(
         .map(|root| root.join(base_id))
         .find(|candidate| agora_game_api::same_spelling(candidate, &manifest.location))
         .ok_or_else(|| refuse("does not point at a base folder Agora made"))?;
-    let folder_real = resolved_for_removal(&folder).ok_or_else(|| {
-        refuse("names a base folder that could not be resolved, so it was not removed")
+    let folder_real = resolved_for_removal(&folder).map_err(|why| {
+        refuse(&format!(
+            "names a base folder that could not be resolved ({why}), so it was not removed"
+        ))
     })?;
-    let source_real = resolved_for_removal(&manifest.source_location).ok_or_else(|| {
-        refuse("names a source install that could not be resolved, so whether the base is inside it could not be told")
+    let source_real = resolved_for_removal(&manifest.source_location).map_err(|why| {
+        refuse(&format!(
+            "names a source install that could not be resolved ({why}), so whether the base is \
+             inside it could not be told"
+        ))
     })?;
     let overlaps_source =
         folder_real.starts_with(&source_real) || source_real.starts_with(&folder_real);
@@ -1565,13 +1570,10 @@ pub(crate) fn trusted_base_folder(
 }
 
 /// A path resolved once, for a decision about deleting it: the part that exists is canonicalized and
-/// the part that does not is appended as written. `None` when that cannot be done, which a caller
-/// about to delete must treat as "do not".
-fn resolved_for_removal(path: &Path) -> Option<PathBuf> {
-    match agora_game_api::resolve_destination(path) {
-        Ok(resolved) => Some(resolved),
-        Err(_) => None,
-    }
+/// the part that does not is appended as written. An error means it cannot be done, which a caller
+/// about to delete must treat as "do not", and the reason is reported rather than dropped.
+fn resolved_for_removal(path: &Path) -> Result<PathBuf, String> {
+    agora_game_api::resolve_destination(path).map_err(|error| error.to_string())
 }
 
 /// The game instances pinned to `base_id`. Fails closed: if the instance table
