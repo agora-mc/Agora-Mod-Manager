@@ -233,7 +233,11 @@ A new or renamed Tauri command also needs `python scripts/check_tauri_bindings.p
   about to touch the disk use `agora_game_api::RelPath::strict`, `StrictRelPath`, `FileName` and
   `join_under`; path comparison uses `same_spelling`, `same_target`, `compare_folder` and
   `resolve_destination` in `crates/agora-game-api/src/path.rs`. A count that falls must be written
-  back, and one that rises fails `check_architecture.py`. The validator count is a name and body
+  back, and one that rises fails `check_architecture.py`. A helper that decides whether a path is a
+  link is a validator too, because it decides whether a name may be used: `is_link` and
+  `redirects_a_name` in `path.rs` are the one rule (a symbolic link, a junction and a mount point
+  redirect a name; a cloud placeholder and a deduplicated file are ordinary files), and a private
+  copy of it is counted like any other path validator. The validator count is a name and body
   heuristic, so it counts a few harmless functions; that errs toward counting, and a slice that
   deletes or renames one lowers the number. The comparison count matches `fold_path_case(`,
   `canonicalize(` (a free function too) and `components(`, and it follows `use … as …` aliases of

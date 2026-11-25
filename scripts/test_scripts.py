@@ -4846,6 +4846,25 @@ class TestPathRuleGuard(unittest.TestCase):
         )
         self.assertEqual(failed, 1)
 
+    def test_a_private_link_helper_is_counted_as_a_path_validator(self):
+        # A link check decides whether a name may be used, which is the same decision as a path
+        # validator and must not be re-implemented: one rule lives in agora-game-api.
+        for name in ("is_reparse_point", "is_reparse_meta", "is_link_like", "check_symlink"):
+            source = (
+                f"fn {name}(path: &std::path::Path) -> bool {{\n"
+                "    std::fs::symlink_metadata(path)\n"
+                "        .map(|m| m.file_type().is_symlink())\n"
+                "        .unwrap_or(false)\n"
+                "}\n"
+            )
+            failed, stderr = self._run(
+                {"crates/core/src/mod.rs": source},
+                {"validators": {}, "comparisons": {}},
+                (),
+            )
+            self.assertEqual(failed, 1, f"{name} was not counted")
+            self.assertIn("crates/core/src/mod.rs: 1 private path validator(s)", stderr)
+
     def test_a_test_fixture_that_names_a_validator_is_not_counted(self):
         source = (
             "#[cfg(test)]\n"

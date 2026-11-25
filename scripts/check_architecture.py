@@ -1127,7 +1127,10 @@ PATH_VALIDATOR_VERB = re.compile(
     r"^(is|validate|check|assert|safe|sanitize|normalize|normalise|clean|lexical)_"
 )
 PATH_VALIDATOR_NOUN = re.compile(
-    r"(path|entry|component|relative|filename|file_name|rel_path|name|folder)"
+    r"(path|entry|component|relative|filename|file_name|rel_path|name|folder"
+    # A link helper decides whether a name may be used, which is the same decision as a path
+    # validator and should have the same one home. Counting them keeps a private copy visible.
+    r"|link|reparse|symlink)"
 )
 # Tokens a function that reasons about escaping has and a name check does not. A validator renamed
 # off the verb list is still found by these, which is the point: renaming is not a way out. Only
