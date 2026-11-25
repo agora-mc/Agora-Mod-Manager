@@ -1332,7 +1332,9 @@ fn read_manifest_file(path: &Path) -> Result<BaseManifest, String> {
 /// ids are lowercase letters, digits, `.`, `-` and `_`, and start with the game id. `.` and `..`
 /// pass the character test, so the first and last characters are checked too: a leading dot is a
 /// relative path, and Windows drops a trailing dot from a folder name. Windows device names
-/// (`nul`, `con.txt`) are not folders at all.
+/// (`nul`, `con.txt`) are not folders at all: the rule for them is the game contract's
+/// [`agora_game_api::is_windows_device_name`], so a base folder and an entry Agora writes are held
+/// to one rule.
 pub fn is_plain_base_id(base_id: &str) -> bool {
     let chars_ok = base_id
         .chars()
@@ -1343,35 +1345,11 @@ pub fn is_plain_base_id(base_id: &str) -> bool {
         .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
     let ends_ok = base_id.chars().last().is_some_and(|c| c != '.');
     let stem = base_id.split('.').next().unwrap_or_default();
-    base_id.len() <= 200 && chars_ok && starts_ok && ends_ok && !is_windows_device_name(stem)
-}
-
-fn is_windows_device_name(stem: &str) -> bool {
-    matches!(
-        stem,
-        "con"
-            | "prn"
-            | "aux"
-            | "nul"
-            | "com1"
-            | "com2"
-            | "com3"
-            | "com4"
-            | "com5"
-            | "com6"
-            | "com7"
-            | "com8"
-            | "com9"
-            | "lpt1"
-            | "lpt2"
-            | "lpt3"
-            | "lpt4"
-            | "lpt5"
-            | "lpt6"
-            | "lpt7"
-            | "lpt8"
-            | "lpt9"
-    )
+    base_id.len() <= 200
+        && chars_ok
+        && starts_ok
+        && ends_ok
+        && !agora_game_api::is_windows_device_name(stem)
 }
 
 /// The bases roots outside the data folder that builds here created, from `bases/roots.json`. No
@@ -1414,14 +1392,14 @@ static BASE_ROOTS_LOCK: Mutex<()> = Mutex::new(());
 /// Remember a bases root a build is about to use, so removal can later tell a folder Agora made
 /// from one a hand-edited record names. The data folder's own `bases` folder needs no entry.
 fn register_base_root(paths: &AppPaths, root: &Path) -> Result<(), BaseError> {
-    if is_same_folder(root, &paths.bases_dir()) {
+    if proven_one_folder(root, &paths.bases_dir()) {
         return Ok(());
     }
     let _guard = BASE_ROOTS_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut roots = read_base_roots(paths)?;
-    if roots.iter().any(|known| is_same_folder(known, root)) {
+    if roots.iter().any(|known| proven_one_folder(known, root)) {
         return Ok(());
     }
     roots.push(root.to_path_buf());
@@ -1524,15 +1502,10 @@ fn live_process_ids() -> std::collections::HashSet<u32> {
     system.processes().keys().map(|pid| pid.as_u32()).collect()
 }
 
-/// The folder to delete for `base_id`, derived from folders Agora knows rather than from the path
-/// a record states: `<root>/<base_id>` for the data folder's `bases` folder or a root a build
-/// registered. The record's location only has to agree with it. A manifest is a user-writable
-/// file, so a record that names any other folder is refused and nothing is deleted. The base
-/// folder must also not overlap the install it was built from.
 /// Whether two paths are provably one folder. A pair that cannot be resolved is **not** the same:
 /// a caller that would otherwise copy a file onto itself, or delete a folder it cannot identify,
 /// refuses instead.
-fn is_same_folder(one: &Path, other: &Path) -> bool {
+fn proven_one_folder(one: &Path, other: &Path) -> bool {
     matches!(
         agora_game_api::compare_folder(one, other),
         agora_game_api::PathRelation::Same
@@ -1541,7 +1514,7 @@ fn is_same_folder(one: &Path, other: &Path) -> bool {
 
 /// Whether two paths are provably two different folders. "Could not tell" is not one of them, so a
 /// caller about to copy one onto the other refuses.
-fn is_distinct_folder(one: &Path, other: &Path) -> bool {
+fn proven_two_folders(one: &Path, other: &Path) -> bool {
     matches!(
         agora_game_api::compare_folder(one, other),
         agora_game_api::PathRelation::Different
@@ -1595,7 +1568,10 @@ pub(crate) fn trusted_base_folder(
 /// the part that does not is appended as written. `None` when that cannot be done, which a caller
 /// about to delete must treat as "do not".
 fn resolved_for_removal(path: &Path) -> Option<PathBuf> {
-    agora_game_api::resolve_destination(path).ok()
+    match agora_game_api::resolve_destination(path) {
+        Ok(resolved) => Some(resolved),
+        Err(_) => None,
+    }
 }
 
 /// The game instances pinned to `base_id`. Fails closed: if the instance table
@@ -1946,7 +1922,7 @@ pub fn repair_framework(
     // Copying a file onto itself zeroes it. A base whose source install is its own folder cannot
     // be repaired by copying, so nothing is written — and a pair that cannot be resolved is refused
     // for the same reason: it might be one folder.
-    if !is_distinct_folder(&manifest.location, &manifest.source_location) {
+    if !proven_two_folders(&manifest.location, &manifest.source_location) {
         return Err(BaseError::Other(format!(
             "refusing to repair {}: the base folder and its source install are the same folder, or \
              could not be told apart ({})",
@@ -1978,7 +1954,7 @@ pub fn repair_framework(
             None => manifest.location.join(required),
         };
         let source = manifest.source_location.join(required);
-        if !is_distinct_folder(&source, &destination) {
+        if !proven_two_folders(&source, &destination) {
             return Err(BaseError::Other(format!(
                 "refusing to repair {required}: its source and destination are the same file or \
                  could not be told apart ({})",

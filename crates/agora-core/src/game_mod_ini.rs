@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use agora_game_api::{fold_path_case, Layer, LayerSource, RelPath};
+use agora_game_api::{fold_path_case, same_spelling, Layer, LayerSource, RelPath};
 use serde::Serialize;
 
 use crate::content_store::{self, ContentFile};
@@ -161,17 +161,17 @@ fn mounted_path(layer: &Layer, file: &ContentFile) -> Option<RelPath> {
     RelPath::new(mounted).ok()
 }
 
-/// The path a person typed, with Windows separators made forward slashes.
-fn normalize_input(path: &str) -> String {
-    path.replace('\\', "/")
-}
-
-fn same_path(left: &str, right: &str) -> bool {
-    if cfg!(windows) {
-        fold_path_case(left) == fold_path_case(right)
-    } else {
-        left == right
-    }
+/// The path a person typed, with Windows separators made forward slashes, held to the spelling a
+/// listed row has: every component is a name. A `.`, a `..` or an empty component is refused rather
+/// than tidied away, so the value compared is the value written, and a spelling no mod ships is
+/// reported rather than redirected to one that is close.
+fn normalize_input(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    let every_component_is_a_name = normalized
+        .split('/')
+        .all(|part| !part.is_empty() && part != "." && part != "..");
+    (every_component_is_a_name && !normalized.is_empty() && !normalized.contains('\0'))
+        .then_some(normalized)
 }
 
 fn key(path: &str) -> String {
@@ -422,10 +422,12 @@ pub fn list_mod_inis(ctx: &Ctx, instance_id: &str) -> Result<Vec<ModIni>, ModIni
 }
 
 fn listed_row(ctx: &Ctx, instance_id: &str, path: &str) -> Result<ModIni, ModIniError> {
-    let normalized = normalize_input(path);
+    let normalized = normalize_input(path).ok_or_else(|| ModIniError::UnknownPath {
+        path: path.to_string(),
+    })?;
     list_mod_inis(ctx, instance_id)?
         .into_iter()
-        .find(|row| same_path(&row.path, &normalized))
+        .find(|row| same_spelling(Path::new(&row.path), Path::new(&normalized)))
         .ok_or_else(|| ModIniError::UnknownPath {
             path: path.to_string(),
         })
@@ -533,7 +535,7 @@ fn winning_mod_file(
             let Some(rel) = mounted_path(layer, file) else {
                 continue;
             };
-            if same_path(rel.as_str(), path) {
+            if same_spelling(Path::new(rel.as_str()), Path::new(path)) {
                 winner = Some((item.item_id.clone(), item.name.clone(), file.clone()));
             }
         }

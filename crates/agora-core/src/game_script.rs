@@ -366,10 +366,12 @@ fn check_write_path(path: &str) -> Result<RelPath, ScriptReadError> {
 
 /// Whether `meta` is a reparse point (a symlink or a Windows junction).
 ///
-/// On Windows a junction is not reported by `is_symlink`, but it is a reparse
-/// point. Microsoft documents `FILE_ATTRIBUTE_REPARSE_POINT` as the attribute
-/// every reparse point carries:
+/// `is_symlink` alone is not enough on every toolchain, so the attribute is asked for directly.
+/// Microsoft documents `FILE_ATTRIBUTE_REPARSE_POINT` as the attribute every reparse point carries:
 /// <https://learn.microsoft.com/windows/win32/fileio/file-attribute-constants>
+/// (On this machine's Rust 1.100 / Windows 11, `symlink_metadata(..).file_type()` happens to report
+/// a junction as a symlink; the attribute is what the answer may rest on, because the std behaviour
+/// is not documented for junctions.)
 fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {

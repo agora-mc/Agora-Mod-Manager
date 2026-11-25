@@ -227,6 +227,33 @@ fn the_extension_is_matched_without_case_but_other_files_are_not_listed() {
 }
 
 #[test]
+fn a_path_typed_in_another_case_names_its_row_only_where_the_disk_folds_case() {
+    // The comparison is the game contract's spelling rule, so an edit reaches the row a player meant
+    // on NTFS (which folds case) and does not reach a different file on a disk that does not. Windows
+    // and the default macOS volume fold; Linux does not.
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp);
+    let a = add_item(
+        &ctx,
+        "Mod A",
+        &[("Data/Config.ini", b"[S]\r\nk=v\r\n")],
+    );
+    make_instance(&ctx, "inst-a", vec![layer("mod-a", &a, true)]);
+
+    let folded = cfg!(windows) || cfg!(target_os = "macos");
+    let outcome = game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "data/config.INI", "S", "k", "w");
+    assert_eq!(
+        outcome.is_ok(),
+        folded,
+        "a case difference is one name only where the disk says so: {outcome:?}"
+    );
+    if folded {
+        let copy = override_file(&ctx, "inst-a", "Data/Config.ini");
+        assert_eq!(std::fs::read(&copy).unwrap(), b"[S]\r\nk=w\r\n".as_slice());
+    }
+}
+
+#[test]
 fn writing_makes_only_the_instances_copy_and_reset_goes_back_to_the_mod() {
     let tmp = TempDir::new().unwrap();
     let ctx = context(&tmp);
