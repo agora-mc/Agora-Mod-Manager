@@ -1932,8 +1932,7 @@ mod tests {
 
     // -- the capability acts on what it verified (MASTER_SPEC §32.11) --------------------------
 
-    /// A folder removed and another created in its place keeps the same name but is not the folder
-    /// the decision verified. The capability must refuse it, and leave it alone.
+    /// Swapping a different folder into the verified path makes the capability refuse to act.
     #[test]
     fn a_folder_swapped_after_the_decision_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -1960,9 +1959,10 @@ mod tests {
             other => panic!("expected a capability, got {other:?}"),
         };
 
-        // Between the decision and the action: the folder is replaced by another one with the same
-        // name.
-        std::fs::remove_dir_all(&owned).unwrap();
+        // Keep the original alive so the replacement must have a different identity.
+        // Delete-and-recreate can reuse the inode, which file identity cannot distinguish.
+        let original = dir.path().join("original");
+        std::fs::rename(&owned, &original).unwrap();
         std::fs::create_dir_all(owned.join("someone-elses")).unwrap();
 
         let refused = capability
@@ -1973,6 +1973,7 @@ mod tests {
             owned.join("someone-elses").is_dir(),
             "the folder that was not verified was touched"
         );
+        assert!(original.join("ours").is_dir());
     }
 
     /// A marker replaced after the decision is refused: the proof is re-checked, not remembered.

@@ -17,8 +17,20 @@
 
 use crate::error::{LauncherError, LauncherResult};
 use std::collections::HashSet;
+use std::path::Path;
 use std::time::Duration;
 use sysinfo::{Pid, System};
+
+fn executable_paths_match(expected: &Path, observed: &Path) -> bool {
+    match (expected.canonicalize(), observed.canonicalize()) {
+        (Ok(expected), Ok(observed)) => expected == observed,
+        (Err(_), Err(_)) => {
+            expected.to_string_lossy().replace('\\', "/")
+                == observed.to_string_lossy().replace('\\', "/")
+        }
+        _ => false,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Capture
@@ -30,12 +42,7 @@ use sysinfo::{Pid, System};
 /// start_time, this returns `Err(ProcessCaptureFailed)`.
 pub fn capture(pid: u32) -> LauncherResult<ProcessIdentity> {
     let mut previous = capture_once(pid)?;
-    let parent_exe = std::env::current_exe().ok().map(|path| {
-        path.canonicalize()
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/")
-    });
+    let parent_exe = std::env::current_exe().ok();
 
     // On Unix the PID becomes visible between fork and exec. A single sample
     // can therefore still report the parent's executable even though the
@@ -49,16 +56,18 @@ pub fn capture(pid: u32) -> LauncherResult<ProcessIdentity> {
             // Retain the last valid sample so its waiter can classify the exit.
             Err(_) => return Ok(previous),
         };
-        let still_parent_image = parent_exe.as_deref().is_some_and(|parent| {
-            current
-                .expected_exe
-                .as_deref()
-                .is_some_and(|exe| exe.replace('\\', "/") == parent)
-        });
-        if current.start_time == previous.start_time
-            && current.expected_exe == previous.expected_exe
-            && !still_parent_image
-        {
+        let current_exe = current.expected_exe.as_deref().map(Path::new);
+        let previous_exe = previous.expected_exe.as_deref().map(Path::new);
+        let still_parent_image = parent_exe
+            .as_deref()
+            .zip(current_exe)
+            .is_some_and(|(parent, exe)| executable_paths_match(parent, exe));
+        let image_settled = match (previous_exe, current_exe) {
+            (Some(previous), Some(current)) => executable_paths_match(previous, current),
+            (None, None) => true,
+            _ => false,
+        };
+        if current.start_time == previous.start_time && image_settled && !still_parent_image {
             return Ok(current);
         }
         previous = current;
@@ -166,6 +175,10 @@ impl ProcessView for OsProcesses {
         let mut system = System::new();
         system.refresh_process(Pid::from_u32(pid));
         let Some(process) = system.process(Pid::from_u32(pid)) else {
+            #[cfg(target_os = "macos")]
+            if let Some(exited) = lookup_unreaped_exit(pid) {
+                return exited;
+            }
             return match pid_absent(pid) {
                 true => Lookup::Absent,
                 false => {
@@ -267,7 +280,7 @@ fn check_pid(
             }
             match (&identity.expected_exe, &exe) {
                 (Some(expected), Some(current)) => {
-                    if current.replace('\\', "/") != expected.replace('\\', "/") {
+                    if !executable_paths_match(Path::new(expected), Path::new(current)) {
                         return ProcessCheck::Gone;
                     }
                 }
@@ -277,6 +290,39 @@ fn check_pid(
             ProcessCheck::Alive
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn lookup_unreaped_exit(pid: u32) -> Option<Lookup> {
+    // A PID too large for pid_t cannot name a process; the caller then asks pid_absent.
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return None;
+    };
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // sysinfo asks for BSD info with arg=0, which omits zombies. Signal 0 can
+    // still see their PIDs. Ask Darwin for the status including unreaped exits.
+    // SAFETY: the buffer has the size and type required by PROC_PIDTBSDINFO.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            1,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read != size {
+        return None;
+    }
+    // SAFETY: the OS returned a complete proc_bsdinfo.
+    let info = unsafe { info.assume_init() };
+    (info.pbi_status == libc::SZOMB).then_some(Lookup::Found {
+        start_time: info.pbi_start_tvsec,
+        exe: None,
+        zombie: true,
+        exited: false,
+    })
 }
 
 #[cfg(windows)]
@@ -359,7 +405,12 @@ pub(crate) fn terminate_tree(roots: &[&ProcessIdentity]) -> usize {
         }
         let Some(process) = system.process(pid).filter(|process| {
             process.start_time() == identity.start_time
-                && process.exe() == identity.expected_exe.as_deref().map(std::path::Path::new)
+                && identity
+                    .expected_exe
+                    .as_deref()
+                    .map(Path::new)
+                    .zip(process.exe())
+                    .is_some_and(|(expected, observed)| executable_paths_match(expected, observed))
         }) else {
             continue;
         };
@@ -486,6 +537,59 @@ mod tests {
     }
 
     #[test]
+    fn test_exact_check_accepts_equivalent_executable_path() {
+        let (mut child, mut identity) = spawn_test_child();
+        let exe = Path::new(identity.expected_exe.as_deref().unwrap());
+        let alias = exe
+            .parent()
+            .unwrap()
+            .join(".")
+            .join(exe.file_name().unwrap());
+        assert_ne!(alias.as_os_str(), exe.as_os_str());
+        identity.expected_exe = Some(alias.to_str().unwrap().to_owned());
+
+        let checked = check_exact_with(&identity, &OsProcesses);
+        let signalled = signal_verified(&identity, || true);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(checked, ProcessCheck::Alive);
+        assert_eq!(signalled, Ok(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_paths_match_through_a_symlinked_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let game = real.join("game");
+        let other = real.join("other");
+        std::fs::write(&game, b"game").unwrap();
+        std::fs::write(&other, b"other").unwrap();
+
+        assert!(executable_paths_match(&game, &alias.join("game")));
+        assert!(!executable_paths_match(&game, &alias.join("other")));
+        // This spelling normalizes to the real path, but cannot itself be resolved on Unix.
+        let unresolved = dir.path().join(r"real\game");
+        assert!(!executable_paths_match(&game, &unresolved));
+        assert!(!executable_paths_match(&unresolved, &game));
+    }
+
+    #[test]
+    fn executable_paths_fall_back_to_normalized_text_when_both_are_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = dir.path().join("missing").join("game");
+        let same = format!(r"{}/missing\game", dir.path().display());
+        assert!(executable_paths_match(&expected, Path::new(&same)));
+        assert!(!executable_paths_match(
+            &expected,
+            &dir.path().join("other")
+        ));
+    }
+
+    #[test]
     fn test_capture_nonexistent_pid() {
         let result = capture(u32::MAX);
         assert!(result.is_err(), "capture of nonexistent PID should fail");
@@ -573,5 +677,23 @@ mod tests {
             ProcessCheck::Gone,
             "a killed and reaped child must read as gone, never alive"
         );
+    }
+
+    #[test]
+    fn test_check_killed_unreaped_child_is_gone() {
+        let (mut child, identity) = spawn_test_child();
+        let before = check(&identity);
+        child.kill().expect("kill the child");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let after = loop {
+            let result = check(&identity);
+            if result == ProcessCheck::Gone || std::time::Instant::now() >= deadline {
+                break result;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        child.wait().expect("reap the child");
+        assert_eq!(before, ProcessCheck::Alive);
+        assert_eq!(after, ProcessCheck::Gone);
     }
 }
