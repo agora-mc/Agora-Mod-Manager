@@ -17,9 +17,9 @@
 //! rule is reported where it is used ([`join_under`] is that place), never silently dropped.
 
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::game::fold_path_case;
 
@@ -558,26 +558,32 @@ pub fn resolve_destination(path: &Path) -> Result<PathBuf, PathError> {
     }
 }
 
-/// Whether two paths are two spellings of one path: case ignored, `/` and `\` ignored, `.` ignored.
+/// Whether two paths are two spellings of one path.
 ///
-/// This is the question a journal asks about a path it recorded earlier, and the one a list of
-/// roots asks before adding a root twice. It says nothing about where the two point: a link and its
-/// target are different spellings of different targets, and callers that delete or overwrite must
-/// still confirm the identity of what they act on.
+/// The root and the prefix are part of the spelling and are compared as their own part, so a
+/// relative path is never the absolute path that ends the same way, and a share is not a folder
+/// chain. The verbatim forms of one path are one path (`\\?\C:\x` is `C:\x`, `\\?\UNC\server\share\x`
+/// is `\\server\share\x`). A `.` component names the folder it sits in and is ignored; everything
+/// else is compared component by component, as native name bytes, never through a lossy string, so
+/// two names that differ only in invalid UTF-8 are two names.
 ///
-/// A path that is not valid UTF-8 is compared through its lossy spelling, so two such paths that
-/// differ only in the invalid bytes compare equal. That errs toward "the same", which only costs a
-/// refusal or a skipped duplicate; [`same_target`] is the lossless one.
+/// Case is ignored only where this platform's disk ignores it — Windows and the default macOS
+/// volume — because on Linux two names that differ in case are two files.
+///
+/// This is the question a journal asks about a path it recorded earlier, and the one a list of roots
+/// asks before adding a root twice. It says nothing about where the two point: a link and its target
+/// are different spellings of different targets, and callers that delete or overwrite must confirm
+/// the identity of what they act on — see [`compare_folder`].
 pub fn same_spelling(left: &Path, right: &Path) -> bool {
-    spelling_parts(left) == spelling_parts(right)
-}
-
-fn spelling_parts(path: &Path) -> Vec<String> {
-    let text = strip_verbatim(path).to_string_lossy().into_owned();
-    text.split(['/', '\\'])
-        .filter(|part| !part.is_empty() && *part != ".")
-        .map(fold_path_case)
-        .collect()
+    let mut left = left.components().filter(is_named_part);
+    let mut right = right.components().filter(is_named_part);
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return true,
+            (Some(left), Some(right)) if spelling_eq(left, right) => {}
+            _ => return false,
+        }
+    }
 }
 
 /// Whether two **canonical** paths are the same target: component by component, exactly, losslessly.
@@ -587,42 +593,114 @@ fn spelling_parts(path: &Path) -> Vec<String> {
 /// case-insensitive disk two spellings of one file resolve to one value, so a difference here means
 /// two different things on disk.
 pub fn same_target(left: &Path, right: &Path) -> bool {
-    let (left, right) = (strip_verbatim(left), strip_verbatim(right));
     let mut left = left.components();
     let mut right = right.components();
     loop {
         match (left.next(), right.next()) {
             (None, None) => return true,
-            (Some(left), Some(right)) if left.as_os_str() == right.as_os_str() => {}
+            (Some(left), Some(right)) => match (left, right) {
+                (Component::Prefix(left), Component::Prefix(right)) => {
+                    if !prefix_kind_eq(left.kind(), right.kind()).0 {
+                        return false;
+                    }
+                }
+                (Component::RootDir, Component::RootDir) => {}
+                (Component::ParentDir, Component::ParentDir) => {}
+                (Component::Normal(left), Component::Normal(right)) => {
+                    if !name_bytes_eq(left, right) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            },
             _ => return false,
         }
     }
 }
 
-/// A path without the Windows `\\?\` prefix, which names no folder of its own.
-///
-/// Stripped on every platform, so a path a Windows journal recorded compares the same everywhere.
-/// The `\\?\UNC\server\share` form is not rebuilt into `\\server\share`: it keeps its own spelling,
-/// which only costs a "not the same" answer on a UNC path that arrives both ways.
-#[cfg(unix)]
-fn strip_verbatim(path: &Path) -> Cow<'_, Path> {
-    use std::os::unix::ffi::OsStrExt;
-    const VERBATIM: &[u8] = br"\\?\";
-    match path.as_os_str().as_bytes().strip_prefix(VERBATIM) {
-        Some(rest) => Cow::Owned(PathBuf::from(std::ffi::OsStr::from_bytes(rest))),
-        None => Cow::Borrowed(path),
+/// Whether this platform's filesystem compares names by case: Windows (NTFS) and the default macOS
+/// volume do, Linux and the BSDs do not.
+const FOLDS_CASE: bool = cfg!(windows) || cfg!(target_os = "macos");
+
+/// Whether a component is part of what a path names: a `.` component is not.
+fn is_named_part(component: &Component<'_>) -> bool {
+    !matches!(component, Component::CurDir)
+}
+
+/// Whether two components are one component under the spelling rule.
+fn spelling_eq(left: Component<'_>, right: Component<'_>) -> bool {
+    match (left, right) {
+        (Component::Prefix(left), Component::Prefix(right)) => {
+            prefix_kind_eq(left.kind(), right.kind()).0
+        }
+        (Component::RootDir, Component::RootDir) => true,
+        (Component::ParentDir, Component::ParentDir) => true,
+        (Component::Normal(left), Component::Normal(right)) => name_eq(left, right),
+        _ => false,
     }
 }
 
-#[cfg(windows)]
-fn strip_verbatim(path: &Path) -> Cow<'_, Path> {
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    // `\\?\` as UTF-16: backslash, backslash, question mark, backslash.
-    const VERBATIM: &[u16] = &[0x5C, 0x5C, 0x3F, 0x5C];
-    let units: Vec<u16> = path.as_os_str().encode_wide().collect();
-    match units.strip_prefix(VERBATIM) {
-        Some(rest) => Cow::Owned(PathBuf::from(std::ffi::OsString::from_wide(rest))),
-        None => Cow::Borrowed(path),
+/// Whether one name is the other under the spelling rule: exactly, or folded where the disk folds
+/// case. A name that is not valid UTF-8 can only be compared exactly.
+fn name_eq(left: &OsStr, right: &OsStr) -> bool {
+    if name_bytes_eq(left, right) {
+        return true;
+    }
+    if !FOLDS_CASE {
+        return false;
+    }
+    match (left.to_str(), right.to_str()) {
+        (Some(left), Some(right)) => fold_path_case(left) == fold_path_case(right),
+        _ => false,
+    }
+}
+
+/// Whether one name is the other, byte for byte (wide character for wide character on Windows). No
+/// lossy conversion: a name that is not valid UTF-8 never meets another one this way unless it is
+/// the same name.
+fn name_bytes_eq(left: &OsStr, right: &OsStr) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        left.as_bytes() == right.as_bytes()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        left.encode_wide().eq(right.encode_wide())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        left == right
+    }
+}
+
+/// Whether two prefixes name the same root: a drive letter, a UNC server and share, or a device
+/// namespace. Returns whether they are the same, and whether the comparison had to fold case (which
+/// only a case-insensitive disk allows).
+fn prefix_kind_eq(left: std::path::Prefix<'_>, right: std::path::Prefix<'_>) -> (bool, bool) {
+    use std::path::Prefix;
+    // The drive letter is compared without its case on every platform: `C:` and `c:` are one drive.
+    match (left, right) {
+        (Prefix::Disk(left), Prefix::Disk(right))
+        | (Prefix::Disk(left), Prefix::VerbatimDisk(right))
+        | (Prefix::VerbatimDisk(left), Prefix::Disk(right))
+        | (Prefix::VerbatimDisk(left), Prefix::VerbatimDisk(right)) => {
+            (left.eq_ignore_ascii_case(&right), true)
+        }
+        (Prefix::UNC(left_server, left_share), Prefix::UNC(right_server, right_share))
+        | (Prefix::UNC(left_server, left_share), Prefix::VerbatimUNC(right_server, right_share))
+        | (Prefix::VerbatimUNC(left_server, left_share), Prefix::UNC(right_server, right_share))
+        | (
+            Prefix::VerbatimUNC(left_server, left_share),
+            Prefix::VerbatimUNC(right_server, right_share),
+        ) => (
+            name_eq(left_server, right_server) && name_eq(left_share, right_share),
+            FOLDS_CASE,
+        ),
+        (Prefix::Verbatim(left), Prefix::Verbatim(right))
+        | (Prefix::DeviceNS(left), Prefix::DeviceNS(right)) => (name_eq(left, right), FOLDS_CASE),
+        _ => (false, false),
     }
 }
 
@@ -919,6 +997,69 @@ mod tests {
             Path::new("."),
             Path::new("./a-folder-that-is-not-there")
         ));
+    }
+
+    #[test]
+    fn a_spelling_keeps_its_root() {
+        // A relative path is never the absolute path that ends the same way: the root is part of
+        // the spelling, not something a comparison may drop.
+        assert!(!same_spelling(
+            Path::new("/home/user/mods"),
+            Path::new("home/user/mods")
+        ));
+        assert!(!same_spelling(Path::new("mods"), Path::new("/mods")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_share_is_a_prefix_rather_than_a_folder_chain() {
+        assert!(!same_spelling(
+            Path::new(r"\\server\share\x"),
+            Path::new("server/share/x")
+        ));
+        assert!(same_spelling(
+            Path::new(r"\\server\share\x"),
+            Path::new(r"\\SERVER\Share\X")
+        ));
+        // The verbatim and UNC spellings of one share are one share.
+        assert!(same_spelling(
+            Path::new(r"\\?\UNC\server\share\x"),
+            Path::new(r"\\server\share\x")
+        ));
+        assert!(same_spelling(
+            Path::new(r"\\?\C:\instances\one"),
+            Path::new(r"c:/instances/one")
+        ));
+        // A drive-relative path is not the rooted one.
+        assert!(!same_spelling(Path::new(r"C:x"), Path::new(r"C:\x")));
+        assert!(!same_spelling(Path::new(r"C:\x"), Path::new(r"D:\x")));
+    }
+
+    #[test]
+    fn case_is_folded_only_where_the_disk_folds_it() {
+        // Windows and the default macOS volume compare names case-insensitively; Linux and the BSDs
+        // do not, so two names that differ in case are two files there.
+        let folded = cfg!(windows) || cfg!(target_os = "macos");
+        assert_eq!(
+            same_spelling(
+                Path::new("/games/Mods/A.jar"),
+                Path::new("/games/mods/a.jar")
+            ),
+            folded
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_is_not_utf8_is_not_collapsed_into_another() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        // Two names that differ only in a byte that is not UTF-8: a lossy spelling would make them
+        // one name, which is the bug this comparison must not have.
+        let one = Path::new(OsStr::from_bytes(b"/games/mod\xff"));
+        let other = Path::new(OsStr::from_bytes(b"/games/mod\xfe"));
+        assert!(!same_spelling(one, other));
+        assert!(same_spelling(one, one));
     }
 
     #[test]
