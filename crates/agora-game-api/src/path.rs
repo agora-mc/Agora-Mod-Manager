@@ -973,8 +973,8 @@ pub fn resolve_destination(path: &Path) -> Result<PathBuf, PathError> {
 /// are different spellings of different targets, and callers that delete or overwrite must confirm
 /// the identity of what they act on — see [`compare_folder`].
 pub fn same_spelling(left: &Path, right: &Path) -> bool {
-    let mut left = left.components().filter(is_named_part);
-    let mut right = right.components().filter(is_named_part);
+    let mut left = comparable_components(left).into_iter();
+    let mut right = comparable_components(right).into_iter();
     loop {
         match (left.next(), right.next()) {
             (None, None) => return true,
@@ -991,8 +991,8 @@ pub fn same_spelling(left: &Path, right: &Path) -> bool {
 /// case-insensitive disk two spellings of one file resolve to one value, so a difference here means
 /// two different things on disk.
 pub fn same_target(left: &Path, right: &Path) -> bool {
-    let mut left = left.components();
-    let mut right = right.components();
+    let mut left = comparable_components(left).into_iter();
+    let mut right = comparable_components(right).into_iter();
     loop {
         match (left.next(), right.next()) {
             (None, None) => return true,
@@ -1020,9 +1020,35 @@ pub fn same_target(left: &Path, right: &Path) -> bool {
 /// volume do, Linux and the BSDs do not.
 const FOLDS_CASE: bool = cfg!(windows) || cfg!(target_os = "macos");
 
-/// Whether a component is part of what a path names: a `.` component is not.
-fn is_named_part(component: &Component<'_>) -> bool {
-    !matches!(component, Component::CurDir)
+/// The components a comparison walks.
+///
+/// A `.` component is not a name, so it is not part. A UNC prefix names its own root: Rust
+/// emits an implicit `RootDir` after the ordinary `\\server\share` form and none after
+/// `\\?\UNC\server\share`, so the root that follows a UNC prefix is folded into the prefix and
+/// the two spellings of one share are one share. A drive-relative `C:x` keeps its missing root,
+/// because there the root decides which file the name means.
+fn comparable_components(path: &Path) -> Vec<Component<'_>> {
+    let mut parts: Vec<Component<'_>> = Vec::new();
+    let mut after_share = false;
+    for component in path.components() {
+        if matches!(component, Component::CurDir) {
+            continue;
+        }
+        if after_share && matches!(component, Component::RootDir) {
+            after_share = false;
+            continue;
+        }
+        after_share = matches!(
+            component,
+            Component::Prefix(prefix)
+                if matches!(
+                    prefix.kind(),
+                    std::path::Prefix::UNC(..) | std::path::Prefix::VerbatimUNC(..)
+                )
+        );
+        parts.push(component);
+    }
+    parts
 }
 
 /// Whether two components are one component under the spelling rule.
@@ -1441,6 +1467,41 @@ mod tests {
             Path::new("home/user/mods")
         ));
         assert!(!same_spelling(Path::new("mods"), Path::new("/mods")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_bare_share_root_names_the_same_folder_as_its_verbatim_form() {
+        // The share itself, with no folder below it. Rust gives the ordinary form an implicit root
+        // and the verbatim form none, so a comparison that walks components sees an extra one on
+        // one side; the prefix and its root are one part, and it is the same part either way.
+        for (plain, verbatim) in [
+            (r"\\server\share", r"\\?\UNC\server\share"),
+            (r"\\server\share\", r"\\?\UNC\server\share\"),
+            (r"\\server\share", r"\\?\UNC\server\share\"),
+        ] {
+            assert!(
+                same_spelling(Path::new(plain), Path::new(verbatim)),
+                "{plain} and {verbatim} are one share"
+            );
+            assert!(
+                same_target(Path::new(plain), Path::new(verbatim)),
+                "{plain} and {verbatim} are one target"
+            );
+        }
+        // The share is still not a folder in it, and two shares are two shares.
+        assert!(!same_spelling(
+            Path::new(r"\\server\share"),
+            Path::new(r"\\server\share\mods")
+        ));
+        assert!(!same_target(
+            Path::new(r"\\server\share"),
+            Path::new(r"\\server\share\mods")
+        ));
+        assert!(!same_spelling(
+            Path::new(r"\\server\share"),
+            Path::new(r"\\server\other")
+        ));
     }
 
     #[cfg(windows)]
