@@ -1241,11 +1241,11 @@ impl LauncherImportService {
                             "Agora copy was modified; offering a new copy instead of update"
                                 .to_string(),
                         );
-                        let id = resolve_destination_id(candidate, Some(&requested_name), &taken);
+                        let id = resolve_destination_id(candidate, Some(&requested_name), taken);
                         (ItemAction::New, id, requested_name.clone(), None)
                     }
                 } else {
-                    let id = resolve_destination_id(candidate, Some(&requested_name), &taken);
+                    let id = resolve_destination_id(candidate, Some(&requested_name), taken);
                     (ItemAction::New, id, requested_name.clone(), None)
                 };
 
