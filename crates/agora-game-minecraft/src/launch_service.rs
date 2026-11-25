@@ -9,7 +9,7 @@ use agora_core::app_paths::AppPaths;
 use agora_core::ctx::Ctx;
 use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::instance_runtime;
-use agora_core::lkg::LaunchOutcome;
+use agora_core::lkg::{classify_launch, LaunchEvents, LaunchOutcome};
 use agora_core::lock_manager::{LockGuard, LockResource};
 use agora_core::models::InstanceManifest;
 use agora_core::network::NetworkPolicy;
@@ -1196,7 +1196,7 @@ impl LaunchService {
                 // The delegated launcher does not expose the game PID or exit code.
                 // A clean-shutdown log marker is the only safe success signal.
                 if log.lines().any(|line| line.contains("Stopping!")) {
-                    break agora_core::lkg::classify_launch(&agora_core::lkg::LaunchEvents {
+                    break classify_launch(&LaunchEvents {
                         exit_code: Some(0),
                         runtime_ms: started.elapsed().as_millis() as u64,
                         was_user_cancelled: false,
