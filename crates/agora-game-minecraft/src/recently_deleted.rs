@@ -3,9 +3,14 @@
 //! Deleting an instance does not destroy it. The instance folder is renamed
 //! (same volume, atomic) into `<data>/recently-deleted/<entry-id>/instance`,
 //! next to an `entry.json` that records the instance's database rows
-//! (`user_instances` plus everything that cascades from it: import provenance,
-//! pack file inventory, launch history, update cache). Restoring puts the
-//! folder and those rows back, so the instance behaves exactly as before.
+//! (its `instances` identity row, its `minecraft_instances` columns, and
+//! everything that cascades from them: import provenance, pack file inventory,
+//! launch history, update cache). Restoring puts the folder and those rows
+//! back, so the instance behaves exactly as before.
+//!
+//! An entry written before instances had one identity table (§32.7) holds a
+//! `user_instances` row instead. It is translated when the entry is read, so an
+//! entry from before the change still restores.
 //!
 //! A cleanup pass hands entries older than the retention window (the host's
 //! "Recently deleted" setting, which every game shares), or beyond
@@ -254,6 +259,31 @@ fn db_err(error: impl std::fmt::Display) -> LauncherError {
 /// instance.
 const PERMISSION_TABLES: &[&str] = &["mcp_approval_grants"];
 
+/// The table every instance's rows hang from: one identity row per instance,
+/// whatever game it belongs to (§32.7).
+const ROOT_TABLE: &str = "instances";
+
+/// The table that held a Minecraft instance's identity and columns before
+/// §32.7. An entry from before then still holds its row, so it is translated
+/// on the way back in.
+const LEGACY_ROOT_TABLE: &str = "user_instances";
+
+/// This package's game id, which a translated legacy row needs: the old table
+/// held one game's instances and never said which.
+const GAME_ID: &str = crate::GAME_ID;
+
+/// Where each column of a legacy `user_instances` row belongs now: the identity
+/// table, or the Minecraft detail table.
+const IDENTITY_COLUMNS: &[&str] = &[
+    "instance_id",
+    "game",
+    "name",
+    "created_at",
+    "last_launched_at",
+    "total_play_ms",
+    "last_played_at",
+];
+
 /// How a table is tied to an instance: directly by an `instance_id` column, or
 /// through a foreign key to a table that is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,15 +365,12 @@ pub(crate) fn instance_tables(conn: &Connection) -> LauncherResult<Vec<TableSpec
         .iter()
         .filter(|t| columns[*t].iter().any(|c| c == "instance_id"))
         .collect();
-    if !direct.iter().any(|t| *t == "user_instances") {
-        return Err(err(
-            "ERR_INSTANCE_DELETE",
-            "user_instances has no instance_id.",
-        ));
+    if !direct.iter().any(|t| *t == ROOT_TABLE) {
+        return Err(err("ERR_INSTANCE_DELETE", "instances has no instance_id."));
     }
     let mut placed: Vec<TableSpec> = vec![TableSpec {
-        table: "user_instances".into(),
-        columns: columns["user_instances"].clone(),
+        table: ROOT_TABLE.into(),
+        columns: columns[ROOT_TABLE].clone(),
         via: None,
     }];
     let is_placed = |placed: &Vec<TableSpec>, t: &str| placed.iter().any(|s| s.table == t);
@@ -351,7 +378,7 @@ pub(crate) fn instance_tables(conn: &Connection) -> LauncherResult<Vec<TableSpec
     let mut remaining: Vec<&String> = direct
         .iter()
         .copied()
-        .filter(|t| *t != "user_instances")
+        .filter(|t| *t != ROOT_TABLE)
         .collect();
     while !remaining.is_empty() {
         let ready = remaining.iter().position(|t| {
@@ -519,14 +546,111 @@ pub(crate) fn delete_instance_rows(conn: &Connection, instance_id: &str) -> Laun
     tx.commit().map_err(db_err)
 }
 
+/// Translate an entry written before instances had one identity table.
+///
+/// Such an entry holds a `user_instances` row (identity columns and Minecraft
+/// columns in one table) and, beside it, an empty `game_instances` row, which
+/// is a table this build no longer has. The row is placed where its columns
+/// live now, and a dump for a table that no longer exists is dropped only when
+/// it holds no rows: an entry with rows nobody can place is refused, never
+/// partly restored. An entry written by this build is returned unchanged.
+fn translate_legacy_dumps(dumps: &[TableDump]) -> LauncherResult<Vec<TableDump>> {
+    let is_legacy = dumps
+        .iter()
+        .any(|dump| dump.table == LEGACY_ROOT_TABLE || dump.table == "game_instances");
+    if !is_legacy {
+        return Ok(dumps.to_vec());
+    }
+    let mut out: Vec<TableDump> = Vec::new();
+    let mut legacy_root: Option<Vec<Vec<Json>>> = None;
+    for dump in dumps {
+        match dump.table.as_str() {
+            LEGACY_ROOT_TABLE => {
+                let mut identity_columns: Vec<String> = Vec::new();
+                let mut detail_columns: Vec<String> = Vec::new();
+                let mut identity_rows = Vec::new();
+                let mut detail_rows = Vec::new();
+                for row in &dump.rows {
+                    let mut identity_row = Vec::new();
+                    let mut detail_row = Vec::new();
+                    for (column, value) in dump.columns.iter().zip(row.iter()) {
+                        if IDENTITY_COLUMNS.contains(&column.as_str()) {
+                            identity_columns.push(column.clone());
+                            identity_row.push(value.clone());
+                        } else {
+                            detail_columns.push(column.clone());
+                            detail_row.push(value.clone());
+                        }
+                    }
+                    identity_rows.push(identity_row);
+                    detail_rows.push(detail_row);
+                }
+                // A column list is the same for every captured row, so the first row decides it.
+                if dump.rows.len() > 1 {
+                    return Err(err(
+                        "ERR_INSTANCE_RESTORE",
+                        "Entry holds more than one instance row.",
+                    ));
+                }
+                if !dump.rows.is_empty() {
+                    if !identity_columns.iter().any(|c| c == "game") {
+                        let at = dump
+                            .columns
+                            .iter()
+                            .position(|c| c == "instance_id")
+                            .map_or(0, |i| i + 1);
+                        identity_columns.insert(at, "game".to_string());
+                        for row in &mut identity_rows {
+                            row.insert(at, Json::String(GAME_ID.to_string()));
+                        }
+                    }
+                    legacy_root = Some(identity_rows.clone());
+                }
+                out.push(TableDump {
+                    table: ROOT_TABLE.to_string(),
+                    columns: identity_columns,
+                    via: None,
+                    rows: identity_rows,
+                });
+                if !detail_columns.is_empty() {
+                    out.push(TableDump {
+                        table: "minecraft_instances".to_string(),
+                        columns: detail_columns,
+                        via: None,
+                        rows: detail_rows,
+                    });
+                }
+            }
+            "game_instances" => {
+                // A separate id namespace: this table could only ever hold a row for a
+                // different instance, never the one in the entry.
+                if !dump.rows.is_empty() {
+                    return Err(err(
+                        "ERR_INSTANCE_RESTORE",
+                        "Entry holds game instance rows Agora cannot place.",
+                    ));
+                }
+            }
+            _ => out.push(dump.clone()),
+        }
+    }
+    if legacy_root.is_none() {
+        return Err(err("ERR_INSTANCE_RESTORE", "Entry has no instance row."));
+    }
+    // Keep the root table first: its row is the parent of every other row.
+    out.sort_by_key(|dump| u8::from(dump.table != ROOT_TABLE));
+    Ok(out)
+}
+
 /// Check an entry's captured rows against the live schema and the entry's own
 /// identity before anything is written: known tables and columns only, the
 /// same link shape, well-formed values, and every row belongs to this
 /// instance. The entry is data, never instructions.
 fn validate_dump(conn: &Connection, dumps: &[TableDump], original_id: &str) -> LauncherResult<()> {
+    let dumps = translate_legacy_dumps(dumps)?;
     let specs = instance_tables(conn)?;
     let mut saw_instance_row = false;
-    for dump in dumps {
+    for dump in &dumps {
         let spec = specs
             .iter()
             .find(|s| s.table == dump.table)
@@ -565,7 +689,7 @@ fn validate_dump(conn: &Connection, dumps: &[TableDump], original_id: &str) -> L
                 }
             }
         }
-        if dump.table == "user_instances" {
+        if dump.table == ROOT_TABLE {
             if dump.rows.len() != 1 {
                 return Err(err(
                     "ERR_INSTANCE_RESTORE",
@@ -592,14 +716,15 @@ pub(crate) fn replay_db_state(
     new_name: Option<&str>,
 ) -> LauncherResult<()> {
     validate_dump(conn, dumps, original_id)?;
+    let dumps = translate_legacy_dumps(dumps)?;
     let renamed = new_id != original_id;
     let tx = conn.transaction().map_err(db_err)?;
-    for dump in dumps {
+    for dump in &dumps {
         if dump.rows.is_empty() || (renamed && PERMISSION_TABLES.contains(&dump.table.as_str())) {
             continue;
         }
         let id_col = dump.columns.iter().position(|c| c == "instance_id");
-        let name_col = (dump.table == "user_instances")
+        let name_col = (dump.table == ROOT_TABLE)
             .then(|| dump.columns.iter().position(|c| c == "name"))
             .flatten();
         let sql = format!(
@@ -1039,7 +1164,7 @@ pub(crate) fn reconcile(root: &Path, conn: &mut Connection, instances_root: &Pat
         let Some(dumped_created) = stored
             .db
             .iter()
-            .find(|d| d.table == "user_instances")
+            .find(|d| d.table == ROOT_TABLE || d.table == LEGACY_ROOT_TABLE)
             .and_then(|d| {
                 let col = d.columns.iter().position(|c| c == "created_at")?;
                 d.rows.first()?.get(col)?.as_str().map(str::to_owned)
@@ -1049,7 +1174,7 @@ pub(crate) fn reconcile(root: &Path, conn: &mut Connection, instances_root: &Pat
         };
         let live_created: Option<String> = conn
             .query_row(
-                "SELECT created_at FROM user_instances WHERE instance_id = ?1",
+                "SELECT created_at FROM instances WHERE instance_id = ?1",
                 [&id],
                 |row| row.get(0),
             )

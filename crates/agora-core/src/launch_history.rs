@@ -148,7 +148,7 @@ pub fn finish_launch(
     // still open, so finishing the same launch twice cannot count it twice.
     if let Some(played) = duration_ms.filter(|ms| *ms > 0) {
         conn.execute(
-            "UPDATE user_instances
+            "UPDATE instances
                 SET total_play_ms = total_play_ms + ?2
               WHERE instance_id = (SELECT instance_id FROM launch_history
                                     WHERE id = ?1 AND outcome IS NULL)",
@@ -169,7 +169,7 @@ pub fn finish_launch(
 pub fn total_play_ms(conn: &Connection, instance_id: &str) -> anyhow::Result<i64> {
     Ok(conn
         .query_row(
-            "SELECT total_play_ms FROM user_instances WHERE instance_id = ?1",
+            "SELECT total_play_ms FROM instances WHERE instance_id = ?1",
             params![instance_id],
             |row| row.get(0),
         )

@@ -1615,7 +1615,7 @@ fn instances_pinning_base_with(
         Ok(_) => {
             let conn = rusqlite::Connection::open(&db_path).map_err(|e| unreadable(&e))?;
             let mut stmt = conn
-                .prepare("SELECT instance_id, base_json FROM game_instances")
+                .prepare("SELECT instance_id, base_json FROM game_instance_bases")
                 .map_err(|e| unreadable(&e))?;
             let rows = stmt
                 .query_map([], |row| {

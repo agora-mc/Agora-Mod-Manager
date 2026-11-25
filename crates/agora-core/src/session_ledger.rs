@@ -1143,7 +1143,7 @@ fn record_play_time_ms(
         })
         .unwrap_or_else(|_| ended_at.to_string());
     conn.execute(
-        "UPDATE game_instances
+        "UPDATE instances
             SET total_play_ms = total_play_ms + ?1,
                 last_played_at = ?2
           WHERE instance_id = ?3",

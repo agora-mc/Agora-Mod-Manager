@@ -668,8 +668,13 @@ mod tests {
         };
         let conn = crate::db::local_state_connection(&paths.local_state_db()).unwrap();
         conn.execute(
-            "INSERT INTO game_instances (instance_id, game, name, base_json, created_at, total_play_ms)
-             VALUES ('generic-1', 'test-game', 'Generic', ?1, '2026-11-06T00:00:00Z', 1234)",
+            "INSERT INTO instances (instance_id, game, name, created_at, total_play_ms)
+             VALUES ('generic-1', 'test-game', 'Generic', '2026-11-06T00:00:00Z', 1234)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO game_instance_bases (instance_id, base_json) VALUES ('generic-1', ?1)",
             [serde_json::to_string(&base).unwrap()],
         )
         .unwrap();

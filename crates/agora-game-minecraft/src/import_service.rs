@@ -718,7 +718,7 @@ impl ImportService {
             }
         };
 
-        if let Err(error) = agora_core::db::upsert_instance(&conn, &row) {
+        if let Err(error) = agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row) {
             let _ = rollback();
             op.fail(error.to_string());
             return Err(LauncherError::Generic {

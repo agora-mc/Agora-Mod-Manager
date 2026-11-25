@@ -1928,7 +1928,7 @@ impl LauncherImportService {
                     }
                 };
 
-                if let Err(e) = agora_core::db::upsert_instance(&conn, &row) {
+                if let Err(e) = agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row) {
                     let _ = std::fs::rename(&final_dir, &staging);
                     let _ = rollback_staging();
                     return Err(LauncherError::Generic {
@@ -2230,7 +2230,7 @@ impl LauncherImportService {
                     total_play_ms: 0,
                 };
 
-                if let Err(e) = agora_core::db::upsert_instance(&conn, &row) {
+                if let Err(e) = agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row) {
                     // Restore from quarantine, then remove failed staging.
                     let _ = std::fs::rename(&final_dir, &staging);
                     if quarantine.exists() {
@@ -2271,7 +2271,8 @@ impl LauncherImportService {
 
                 if let Err(e) = replace_instance_import(&conn, &import_record, &file_inventory) {
                     if let Some(previous_row) = &previous_row {
-                        let _ = agora_core::db::upsert_instance(&conn, previous_row);
+                        let _ =
+                            agora_core::db::upsert_instance(&conn, crate::GAME_ID, previous_row);
                     }
                     let _ = std::fs::rename(&final_dir, &staging);
                     if quarantine.exists() {

@@ -1627,7 +1627,7 @@ impl InstanceService {
                 return Err(error);
             }
         };
-        if let Err(error) = agora_core::db::upsert_instance(&conn, &new_row) {
+        if let Err(error) = agora_core::db::upsert_instance(&conn, crate::GAME_ID, &new_row) {
             let _ = std::fs::remove_dir_all(&dest_dir);
             op.fail(error.to_string());
             return Err(LauncherError::Generic {
@@ -1945,7 +1945,7 @@ impl InstanceService {
                 return Err(error);
             }
         };
-        if let Err(error) = agora_core::db::upsert_instance(&conn, &row) {
+        if let Err(error) = agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row) {
             let _ = std::fs::remove_dir_all(&dir);
             op.fail(error.to_string());
             return Err(LauncherError::Generic {

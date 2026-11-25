@@ -1677,7 +1677,7 @@ fn commit_migration_db(
         .map_err(|e| format!("local state failed: {e}"))?;
     let affected = conn
         .execute(
-            "UPDATE user_instances
+            "UPDATE minecraft_instances
              SET minecraft_version = ?1,
                  loader_version = ?2
              WHERE instance_id = ?3

@@ -1906,7 +1906,7 @@ mod tests {
         for (stored, expected_selection) in fixtures {
             let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
             conn.execute(
-                "UPDATE user_instances SET jvm_gc = ?1 WHERE instance_id = ?2",
+                "UPDATE minecraft_instances SET jvm_gc = ?1 WHERE instance_id = ?2",
                 rusqlite::params![stored, "gc-fixture"],
             )
             .unwrap();

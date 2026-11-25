@@ -306,8 +306,8 @@ pub fn clone_instance(
     }
 
     let inserted = conn.execute(
-        "INSERT INTO game_instances (instance_id, game, name, base_json, created_at, last_launched_at)
-         VALUES (?1, ?2, ?3, ?4, datetime('now'), NULL)",
+        "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
+         VALUES (?1, ?2, ?3, datetime('now'), NULL)",
         rusqlite::params![
             &new_id,
             definition.id.as_str(),
