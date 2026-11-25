@@ -1351,14 +1351,16 @@ fn run_migration_steps(
             );
         }
         let arrived_broken = if step.foreign_keys_off {
-            // Recorded before the rebuild, so the check after it reports what this step broke
-            // rather than a reference that was already broken when the database arrived.
             conn.execute_batch("PRAGMA foreign_keys = OFF")?;
-            let broken = foreign_key_violations(conn)?;
             // From here on, every way out of this iteration — the pragma restore included —
             // leaves the connection as the caller lent it: no transaction open, foreign keys on.
+            // Installed before the check below, because that check reads the database it arrived
+            // with and can fail on a database damaged badly enough (a foreign key naming a
+            // parent column that is not unique errors instead of listing rows).
             restore = Some(ConnectionRestore { conn });
-            broken
+            // Recorded before the rebuild, so the check after it reports what this step broke
+            // rather than a reference that was already broken when the database arrived.
+            foreign_key_violations(conn)?
         } else {
             Vec::new()
         };
@@ -5317,5 +5319,35 @@ mod tests {
         drop(other);
         assert_connection_restored(&conn, "a busy database");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_check_that_cannot_run_before_the_rebuild_restores_the_connection() {
+        // The database arrived with a child whose foreign key cannot be checked at all: the
+        // parent column it names is not unique, so `PRAGMA foreign_key_check` errors instead of
+        // listing rows. The runner records what it arrived with before it opens a transaction,
+        // and that is where a database this damaged stops it.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE loose_parent (name TEXT NOT NULL);
+             CREATE TABLE mismatched_child (
+                 id INTEGER PRIMARY KEY,
+                 parent_name TEXT REFERENCES loose_parent(name)
+             );",
+        )
+        .unwrap();
+        let steps = [MigrationStep {
+            version: 1,
+            name: "rebuild behind a check that cannot run",
+            foreign_keys_off: true,
+            run: a_good_step,
+        }];
+        let error = run_migration_steps(&conn, &steps, 1)
+            .expect_err("the initial check cannot run on this database");
+        assert!(
+            format!("{error:#}").contains("foreign key mismatch"),
+            "{error:#}"
+        );
+        assert_connection_restored(&conn, "a check that cannot run");
     }
 }
