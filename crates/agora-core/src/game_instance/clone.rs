@@ -73,7 +73,7 @@ fn copy_tree(source: &Path, destination: &Path, relative: &Path) -> Result<(), I
         let from = entry.path();
         let to = destination.join(&name);
         let metadata = std::fs::symlink_metadata(&from)?;
-        if is_reparse_point_or_symlink(&metadata) {
+        if is_reparse_point_or_symlink(&from) {
             return Err(InstanceError::Other(format!(
                 "'{}' is a link; Agora will not clone an instance whose files point outside it.",
                 from.display()

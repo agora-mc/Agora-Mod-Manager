@@ -364,28 +364,14 @@ fn check_write_path(path: &str) -> Result<RelPath, ScriptReadError> {
     Ok(rel)
 }
 
-/// Whether `meta` is a reparse point (a symlink or a Windows junction).
-///
-/// `is_symlink` alone is not enough on every toolchain, so the attribute is asked for directly.
-/// Microsoft documents `FILE_ATTRIBUTE_REPARSE_POINT` as the attribute every reparse point carries:
-/// <https://learn.microsoft.com/windows/win32/fileio/file-attribute-constants>
-/// (On this machine's Rust 1.100 / Windows 11, `symlink_metadata(..).file_type()` happens to report
-/// a junction as a symlink; the attribute is what the answer may rest on, because the std behaviour
-/// is not documented for junctions.)
-fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        meta.file_type().is_symlink()
-    }
+/// Whether `path` is a link that redirects a name, from the game contract: a symbolic link, a
+/// junction or a mount point. A cloud placeholder or a deduplicated file is an ordinary file, so a
+/// script folder on OneDrive is read like any other.
+fn is_reparse_point(path: &Path) -> bool {
+    agora_game_api::redirects_a_name(path)
 }
 
-/// Refuse if any component of `path` below `root` is a reparse point.
+/// Refuse if any component of `path` below `root` is a link that redirects a name.
 ///
 /// Checked component by component, so a junction *mid path* is caught as well
 /// as one at the leaf. A path that does not exist yet is fine as long as the
@@ -395,7 +381,7 @@ fn reject_reparse_chain(root: &Path, rel: &str) -> Result<(), ScriptReadError> {
     for part in rel.split('/').filter(|part| !part.is_empty()) {
         current.push(part);
         match std::fs::symlink_metadata(&current) {
-            Ok(meta) if is_reparse_point(&meta) => {
+            Ok(_) if is_reparse_point(&current) => {
                 return Err(refusal(
                     "reparse_point",
                     "a link in that path is not followed, so it is refused",
@@ -719,10 +705,11 @@ impl GameReads for GameViewReads {
                 return Ok(serde_json::json!({ "entries": [], "cut": false }));
             };
             for entry in read_dir.flatten() {
-                let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                let path = entry.path();
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
                     continue;
                 };
-                if is_reparse_point(&meta) {
+                if is_reparse_point(&path) {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -795,10 +782,11 @@ impl GameReads for GameViewReads {
             for entry in read_dir.flatten() {
                 // A reparse point inside the listed directory is not shown at
                 // all: listing it would invite a script to read it next.
-                let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                let path = entry.path();
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
                     continue;
                 };
-                if is_reparse_point(&meta) {
+                if is_reparse_point(&path) {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -893,7 +881,7 @@ impl GameReads for GameViewReads {
                     .filter(|part| !part.is_empty())
                     .fold(root.clone(), |path, part| path.join(part));
                 match std::fs::symlink_metadata(&base) {
-                    Ok(meta) if is_reparse_point(&meta) => {
+                    Ok(_) if is_reparse_point(&base) => {
                         return Err(refusal(
                             "reparse_point",
                             format!("`{folder}` passes through a link, which is not followed"),
@@ -978,7 +966,7 @@ fn stage_candidate(
     let game_path = view_path(folder, relative);
     let meta = std::fs::symlink_metadata(source)
         .map_err(|_| refusal("unreadable", format!("`{game_path}` could not be read")))?;
-    if is_reparse_point(&meta) || !meta.is_file() {
+    if is_reparse_point(source) || !meta.is_file() {
         return Err(refusal(
             "reparse_point",
             format!("`{game_path}` is not a regular file, so it is not staged"),
@@ -1052,7 +1040,7 @@ fn stage_file(
                     format!("`{game_path}` could not be checked after staging"),
                 )
             })?;
-            if is_reparse_point(&meta) || !meta.is_file() || expected != &staged {
+            if is_reparse_point(dest) || !meta.is_file() || expected != &staged {
                 let _ = std::fs::remove_file(dest);
                 return Err(refusal(
                     "staging_failed",
@@ -1097,7 +1085,7 @@ fn stage_file(
                     format!("`{game_path}` could not be checked after staging"),
                 )
             })?;
-            if is_reparse_point(&meta) || !meta.is_file() {
+            if is_reparse_point(dest) || !meta.is_file() {
                 let _ = std::fs::remove_file(dest);
                 return Err(refusal(
                     "staging_failed",
@@ -1165,13 +1153,14 @@ where
             format!("{prefix}/{name}")
         };
         let game_path = view_path(game_dir, &name);
-        let meta = std::fs::symlink_metadata(entry.path()).map_err(|_| {
+        let entry_path = entry.path();
+        let meta = std::fs::symlink_metadata(&entry_path).map_err(|_| {
             refusal(
                 "unreadable",
                 format!("`{game_path}` could not be read in this instance's view"),
             )
         })?;
-        if is_reparse_point(&meta) {
+        if is_reparse_point(&entry_path) {
             continue;
         }
         if meta.is_dir() {
@@ -1333,10 +1322,11 @@ pub fn instance_reads_with_budget(
                     continue;
                 };
                 for entry in read_dir.flatten() {
-                    let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                    let entry_path = entry.path();
+                    let Ok(meta) = std::fs::symlink_metadata(&entry_path) else {
                         continue;
                     };
-                    if is_reparse_point(&meta) {
+                    if is_reparse_point(&entry_path) {
                         continue;
                     }
                     let name = entry.file_name().to_string_lossy().to_string();
@@ -1453,14 +1443,15 @@ fn directory_size(root: &Path, stop_at: u64) -> u64 {
         if total >= stop_at {
             break;
         }
-        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+        let entry_path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&entry_path) else {
             continue;
         };
-        if is_reparse_point(&meta) {
+        if is_reparse_point(&entry_path) {
             continue;
         }
         if meta.is_dir() {
-            total = total.saturating_add(directory_size(&entry.path(), stop_at - total));
+            total = total.saturating_add(directory_size(&entry_path, stop_at - total));
         } else {
             total = total.saturating_add(meta.len());
         }

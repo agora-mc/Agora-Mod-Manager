@@ -390,16 +390,15 @@ pub(crate) fn now_unix_ms() -> i64 {
 /// the same ones. See [`agora_game_api::is_windows_device_name`].
 pub use agora_game_api::is_windows_device_name;
 
-pub(crate) fn is_reparse_point_or_symlink(metadata: &std::fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        (metadata.file_attributes() & 0x0000_0400) != 0
-    }
-    #[cfg(not(windows))]
-    {
-        metadata.file_type().is_symlink()
-    }
+/// Whether `path` is a link that redirects a name, from the game contract: a symbolic link, a
+/// junction or a mount point. A cloud placeholder or a deduplicated file is an ordinary file, so a
+/// library that lives on OneDrive imports like any other.
+///
+/// NOTE: an archive's *stored attributes* are not a path. A 7z entry carries the reparse-point bit
+/// and no tag, so an archive entry that claims one is refused as unclassifiable — see
+/// [`list_sevenz_entries`].
+pub(crate) fn is_reparse_point_or_symlink(path: &std::path::Path) -> bool {
+    agora_game_api::redirects_a_name(path)
 }
 
 /// The strict path rule the game contract owns: an archive entry becomes a file name only when
@@ -770,13 +769,20 @@ fn list_sevenz_entries(archive_path: &Path) -> Result<Vec<ListedArchiveEntry>, C
         }
         if entry.has_windows_attributes {
             let attrs = entry.windows_attributes;
+            // An archive stores the reparse *attribute* and not the tag, so an entry that claims to
+            // be one cannot be classified: a link and a cloud placeholder look alike here, and a
+            // link would point outside the store. Unclassifiable is refused, and the message says
+            // which kind of entry to look for.
             let is_reparse_point = (attrs & 0x0400) != 0;
             let unix_mode = (attrs >> 16) as u16;
             let is_unix_symlink = (unix_mode & 0o170000) == 0o120000;
             if is_reparse_point || is_unix_symlink {
                 return Err(ContentError::InvalidPath {
                     path: entry.name.clone(),
-                    reason: "symlinks or reparse points are not allowed".into(),
+                    reason: "an archive entry that claims to be a link (a reparse point) is not \
+                             allowed: its tag is not stored, so it cannot be told from one that \
+                             redirects"
+                        .into(),
                 });
             }
         }
@@ -1180,10 +1186,10 @@ pub(crate) fn collect_folder_files(
 
             let rel_str = entry_rel.to_string_lossy().replace('\\', "/");
 
-            if is_reparse_point_or_symlink(&meta) {
+            if is_reparse_point_or_symlink(&abs_path) {
                 return Err(ContentError::InvalidPath {
                     path: rel_str,
-                    reason: "symlinks or reparse points are not allowed".into(),
+                    reason: "a link that points elsewhere is not allowed in a stored folder".into(),
                 });
             }
 
@@ -1242,10 +1248,10 @@ pub fn add_file(
             ContentError::Io(e)
         }
     })?;
-    if is_reparse_point_or_symlink(&meta) {
+    if is_reparse_point_or_symlink(file_path) {
         return Err(ContentError::InvalidPath {
             path: file_path.display().to_string(),
-            reason: "symlinks or reparse points are not allowed".into(),
+            reason: "a link that points elsewhere is not a file to store".into(),
         });
     }
     if !meta.is_file() {

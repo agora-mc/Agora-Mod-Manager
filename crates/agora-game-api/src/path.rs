@@ -736,6 +736,24 @@ pub fn is_link(path: &Path) -> Result<bool, PathError> {
     }
 }
 
+/// [`is_link`] for a caller whose only choices are to skip the entry or to refuse it.
+///
+/// This is the shape every walk, loader and deployer needs, so the one rule has one home. A cloud
+/// placeholder or a deduplicated file is an ordinary file everywhere; a symbolic link, a junction
+/// and a mount point are refused everywhere.
+///
+/// A path that is genuinely absent redirects nothing — there is no name there to redirect, and the
+/// write that follows reports its own error. Every other path that cannot be read counts as a
+/// redirection: that is the answer a caller cannot follow. A dangling link is not absent, so it is
+/// still refused.
+pub fn redirects_a_name(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        // A path that cannot be asked about may be a link; following it is the failure.
+        Ok(_) => is_link(path).unwrap_or(true),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 /// Whether the reparse tag of a Windows reparse point wraps another name, which is what makes a
 /// symbolic link, a junction and a mount point redirections. `IsReparseTagNameSurrogate` is the
 /// documented test: the tag's `0x2000_0000` bit.

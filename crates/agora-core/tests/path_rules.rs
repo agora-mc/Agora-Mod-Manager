@@ -7,8 +7,8 @@
 //! consumer these tests speak for.
 
 use agora_game_api::{
-    compare_folder, is_link, join_under, resolve_destination, same_spelling, same_target,
-    PathError, PathRelation, RelPath, ReparseTag,
+    compare_folder, is_link, join_under, redirects_a_name, resolve_destination, same_spelling,
+    same_target, PathError, PathRelation, RelPath, ReparseTag,
 };
 use std::path::{Path, PathBuf};
 
@@ -43,7 +43,9 @@ fn a_root_that_is_missing_is_not_a_place_to_write() {
     let root = temp_dir();
     let rel = RelPath::strict("mods/a.jar").unwrap();
     match join_under(&root.path().join("gone"), &rel) {
-        Err(PathError::NotAFolder { reason, .. }) => assert!(reason.contains("missing"), "{reason}"),
+        Err(PathError::NotAFolder { reason, .. }) => {
+            assert!(reason.contains("missing"), "{reason}")
+        }
         other => panic!("a missing root is an error, not a path: {other:?}"),
     }
 }
@@ -133,6 +135,15 @@ fn joining_refuses_a_junction_on_the_way() {
         !outside.path().join("a.jar").exists(),
         "nothing was written through the junction"
     );
+}
+
+#[cfg(windows)]
+/// A folder link the ordinary user can make, on either platform.
+fn make_link(link: &Path, target: &Path) {
+    #[cfg(windows)]
+    make_junction(link, target);
+    #[cfg(not(windows))]
+    std::os::unix::fs::symlink(target, link).expect("a symbolic link");
 }
 
 #[cfg(windows)]
@@ -322,7 +333,10 @@ fn a_root_that_is_a_link_is_written_through_at_its_real_name() {
     let rel = RelPath::strict("mods/a.jar").unwrap();
     let joined = join_under(&root.path().join("instance"), &rel)
         .expect("a linked root is a folder to write into");
-    assert_eq!(joined, real.path().canonicalize().unwrap().join("mods/a.jar"));
+    assert_eq!(
+        joined,
+        real.path().canonicalize().unwrap().join("mods/a.jar")
+    );
     std::fs::write(&joined, b"x").unwrap();
     assert_eq!(
         std::fs::read(real.path().join("mods").join("a.jar")).unwrap(),
@@ -353,7 +367,10 @@ fn a_root_that_is_a_junction_is_written_through_at_its_real_name() {
     let rel = RelPath::strict("mods/a.jar").unwrap();
     let joined = join_under(&root.path().join("instance"), &rel)
         .expect("a junctioned root is a folder to write into");
-    assert_eq!(joined, real.path().canonicalize().unwrap().join("mods/a.jar"));
+    assert_eq!(
+        joined,
+        real.path().canonicalize().unwrap().join("mods/a.jar")
+    );
     std::fs::write(&joined, b"x").unwrap();
     assert_eq!(
         std::fs::read(real.path().join("mods").join("a.jar")).unwrap(),
@@ -403,6 +420,28 @@ fn a_plain_folder_is_not_a_link() {
     assert!(
         !same_spelling(root.path(), &root.path().join("mods")),
         "different folders are different spellings"
+    );
+}
+
+#[test]
+fn a_path_that_is_not_there_redirects_nothing() {
+    // The answer every walk and writer asks for: a name that does not exist yet redirects nothing,
+    // and the write that follows reports its own refusal. Treating it as a redirection refused the
+    // ordinary case — an instance whose icon folder has not been made yet.
+    let root = temp_dir();
+    assert!(!redirects_a_name(&root.path().join("not-there")));
+    assert!(!redirects_a_name(
+        &root.path().join("not-there").join("deeper")
+    ));
+    // A link that is there but points at nothing is a link, not an absent name.
+    let target = root.path().join("gone");
+    std::fs::create_dir_all(&target).unwrap();
+    let link = root.path().join("dangling");
+    make_link(&link, &target);
+    std::fs::remove_dir(&target).unwrap();
+    assert!(
+        redirects_a_name(&link),
+        "a dangling link still redirects the name"
     );
 }
 

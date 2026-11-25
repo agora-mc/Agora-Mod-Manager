@@ -475,11 +475,13 @@ fn check_extracted_tree(root: &Path, plan: &RarPlan) -> Result<(), ContentError>
             } else {
                 format!("{rel}/{name}")
             };
-            let meta = std::fs::symlink_metadata(entry.path())?;
-            if is_reparse_point_or_symlink(&meta) {
+            let entry_path = entry.path();
+            let meta = std::fs::symlink_metadata(&entry_path)?;
+            if is_reparse_point_or_symlink(&entry_path) {
                 return Err(ContentError::InvalidPath {
                     path: child_rel,
-                    reason: "extracted as a symlink or reparse point, which is not allowed".into(),
+                    reason: "extracted as a link that points elsewhere, which is not allowed"
+                        .into(),
                 });
             }
             if meta.is_dir() {

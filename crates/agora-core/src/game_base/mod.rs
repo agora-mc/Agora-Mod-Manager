@@ -322,16 +322,8 @@ pub fn get_modified_unix_ms(metadata: &std::fs::Metadata) -> i64 {
     }
 }
 
-fn is_reparse_point_or_symlink(metadata: &std::fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        (metadata.file_attributes() & 0x0000_0400) != 0
-    }
-    #[cfg(not(windows))]
-    {
-        metadata.file_type().is_symlink()
-    }
+fn is_reparse_point_or_symlink(path: &Path) -> bool {
+    agora_game_api::redirects_a_name(path)
 }
 
 /// Pure volume decision function for checking whether hardlinking is supported.
@@ -428,8 +420,8 @@ fn walk_source_dir(
             }
         };
 
-        if is_reparse_point_or_symlink(&meta) {
-            skipped.push(format!("{rel_str}: symlink or junction"));
+        if is_reparse_point_or_symlink(&abs_path) {
+            skipped.push(format!("{rel_str}: a link that points elsewhere"));
             continue;
         }
 
@@ -1086,7 +1078,7 @@ fn walk_base_dir(base_root: &Path, rel_dir: &Path, out: &mut Vec<String>) {
             continue;
         };
 
-        if is_reparse_point_or_symlink(&meta) {
+        if is_reparse_point_or_symlink(&abs_path) {
             out.push(rel_str);
             continue;
         }
@@ -2060,7 +2052,7 @@ fn remove_damaged_base(
     let folder = paths.bases_dir().join(base_id);
     match std::fs::symlink_metadata(&folder) {
         Ok(metadata) => {
-            if is_reparse_point_or_symlink(&metadata) || !metadata.is_dir() {
+            if is_reparse_point_or_symlink(&folder) || !metadata.is_dir() {
                 return Err(BaseError::Other(format!(
                     "refusing to remove {}: it is not a plain folder",
                     folder.display()

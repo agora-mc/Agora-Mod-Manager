@@ -132,25 +132,11 @@ fn copy_icon(
     relative_icon_path(&destination, instance_dir)
 }
 
-/// Whether `path` is a symlink, junction, or any other Windows reparse point. Checked with
-/// `symlink_metadata`, so a link is seen as itself rather than followed.
+/// Whether `path` is a link that redirects a name, from the game contract: a symbolic link, a
+/// junction or a mount point. A cloud placeholder or a deduplicated file is an ordinary file, so an
+/// instance kept in a OneDrive folder keeps its icon.
 fn is_link_or_reparse(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        // FILE_ATTRIBUTE_REPARSE_POINT covers junctions and mount points too.
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return true;
-        }
-    }
-    false
+    agora_game_api::redirects_a_name(path)
 }
 
 /// Refuse when any folder between `instance_dir` and `parent` is a link, since creating or writing

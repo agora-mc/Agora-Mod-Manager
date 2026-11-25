@@ -296,16 +296,11 @@ fn now_unix_ms() -> i64 {
     }
 }
 
-fn is_reparse_point_or_symlink(metadata: &std::fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        (metadata.file_attributes() & 0x0000_0400) != 0
-    }
-    #[cfg(not(windows))]
-    {
-        metadata.file_type().is_symlink()
-    }
+/// Whether `path` is a link that redirects a name, from the game contract: a symbolic link, a
+/// junction or a mount point. A cloud placeholder or a deduplicated file is an ordinary file, so a
+/// library on OneDrive deploys like any other.
+fn is_reparse_point_or_symlink(path: &Path) -> bool {
+    agora_game_api::redirects_a_name(path)
 }
 
 pub(crate) fn write_instance_manifest_atomic(
@@ -743,10 +738,11 @@ fn plan_inner(
     // overrides; one that exists but cannot be read is an error, never an empty layer.
     let overrides_dir = instance_dir.join("overrides");
     match std::fs::symlink_metadata(&overrides_dir) {
-        Ok(meta) => {
-            if is_reparse_point_or_symlink(&meta) {
+        Ok(_meta) => {
+            if is_reparse_point_or_symlink(&overrides_dir) {
                 return Err(DeployError::Other(format!(
-                    "refusing to deploy {}: a symlink or junction under overrides/ is not allowed",
+                    "refusing to deploy {}: a link that points outside the instance is not allowed \
+                     under overrides/",
                     overrides_dir.display()
                 )));
             }
@@ -1084,7 +1080,9 @@ fn walk_generated_dir(
         let entry = entry?;
         let abs_path = entry.path();
         let meta = entry.metadata()?;
-        if is_reparse_point_or_symlink(&meta) {
+        // Asked of the entry itself, not of what `metadata()` followed: a link inside a layer would
+        // otherwise deploy the folder it points at.
+        if is_reparse_point_or_symlink(&abs_path) {
             continue;
         }
         if staged
@@ -1133,7 +1131,8 @@ fn walk_writable_dir(
         let entry = entry?;
         let abs_path = entry.path();
         let meta = entry.metadata()?;
-        if is_reparse_point_or_symlink(&meta) {
+        // Asked of the entry itself, not of what `metadata()` followed.
+        if is_reparse_point_or_symlink(&abs_path) {
             continue;
         }
         let file_name = entry.file_name();
@@ -1187,9 +1186,10 @@ fn walk_overrides_dir(
         let entry = entry?;
         let abs_path = entry.path();
         let meta = std::fs::symlink_metadata(&abs_path)?;
-        if is_reparse_point_or_symlink(&meta) {
+        if is_reparse_point_or_symlink(&abs_path) {
             return Err(DeployError::Other(format!(
-                "refusing to deploy {}: a symlink or junction under overrides/ is not allowed",
+                "refusing to deploy {}: a link that points outside the instance is not allowed \
+                 under overrides/",
                 abs_path.display()
             )));
         }
@@ -1249,7 +1249,7 @@ fn read_overlay_whiteouts(writable_dir: &Path) -> Result<Vec<String>, DeployErro
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let meta = entry.metadata()?;
-            if is_reparse_point_or_symlink(&meta) {
+            if is_reparse_point_or_symlink(&entry.path()) {
                 continue;
             }
             let name = entry.file_name();
@@ -1295,7 +1295,7 @@ fn read_whiteout_markers(writable_dir: &Path) -> Result<Vec<String>, DeployError
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let meta = entry.metadata()?;
-            if is_reparse_point_or_symlink(&meta) {
+            if is_reparse_point_or_symlink(&entry.path()) {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
@@ -1412,10 +1412,11 @@ fn refuse_reparse_on_the_way(root: &Path, target: &Path) -> Result<(), DeployErr
     for component in relative.components() {
         current.push(component);
         match std::fs::symlink_metadata(&current) {
-            Ok(meta) => {
-                if is_reparse_point_or_symlink(&meta) {
+            Ok(_meta) => {
+                if is_reparse_point_or_symlink(&current) {
                     return Err(DeployError::Other(format!(
-                        "refusing to use {}: a symlink or junction under overrides/ is not allowed",
+                        "refusing to use {}: a link that points outside the instance is not allowed \
+                         under overrides/",
                         current.display()
                     )));
                 }
@@ -2143,7 +2144,7 @@ fn farm_sizes(root: &Path) -> std::collections::HashMap<String, u64> {
             let Ok(meta) = entry.metadata() else {
                 continue;
             };
-            if is_reparse_point_or_symlink(&meta) {
+            if is_reparse_point_or_symlink(&entry.path()) {
                 continue;
             }
             let key = if rel.is_empty() {
@@ -2551,7 +2552,8 @@ fn walk_farm(
         let entry = entry?;
         let abs_path = entry.path();
         let meta = entry.metadata()?;
-        if is_reparse_point_or_symlink(&meta) {
+        // Asked of the entry itself, not of what `metadata()` followed.
+        if is_reparse_point_or_symlink(&abs_path) {
             continue;
         }
         let child_rel = rel.join(entry.file_name());
@@ -2968,7 +2970,7 @@ fn is_plain_path(path: &str) -> bool {
 /// there yet. Removing or placing through a link would act outside the farm.
 fn folder_is_plain(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta.is_dir() && !is_reparse_point_or_symlink(&meta),
+        Ok(meta) => meta.is_dir() && !is_reparse_point_or_symlink(path),
         Err(e) => e.kind() == std::io::ErrorKind::NotFound,
     }
 }

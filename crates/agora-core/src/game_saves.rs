@@ -360,15 +360,16 @@ pub(crate) fn validate_own_template(
     Ok(())
 }
 
-/// Check `path` and the components between it and `root` without following a symbolic link or
-/// Windows reparse point. `root` and everything above it is trusted: a moved Documents folder or a
-/// system temp folder can be a link there. A link below `root` could redirect a write and is refused.
+/// Check `path` and the components between it and `root` without following a link that redirects a
+/// name (a symbolic link, a junction, a mount point; the game contract's rule). `root` and
+/// everything above it is trusted: a moved Documents folder or a system temp folder can be a link
+/// there. A link below `root` could redirect a write and is refused.
 pub(crate) fn checked_metadata(path: &Path, root: &Path) -> Result<Option<Metadata>, SavesError> {
     let at_root = paths_eq_case_insensitive(path, root);
     let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) if !at_root && is_reparse_point_or_symlink(&metadata) => {
+        Ok(_) if !at_root && is_reparse_point_or_symlink(path) => {
             return Err(SavesError::Other(format!(
-                "{} is a link or reparse point",
+                "{} is a link that points elsewhere",
                 path.display()
             )));
         }
@@ -390,9 +391,9 @@ pub(crate) fn checked_metadata(path: &Path, root: &Path) -> Result<Option<Metada
             break;
         }
         match fs::symlink_metadata(component) {
-            Ok(metadata) if is_reparse_point_or_symlink(&metadata) => {
+            Ok(_) if is_reparse_point_or_symlink(component) => {
                 return Err(SavesError::Other(format!(
-                    "{} is a link or reparse point",
+                    "{} is a link that points elsewhere",
                     component.display()
                 )));
             }

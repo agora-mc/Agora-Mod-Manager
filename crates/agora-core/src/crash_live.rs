@@ -906,7 +906,7 @@ fn folder_crash_files(found: &FoundArtifact) -> Vec<crate::crash_engine::CrashFi
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
-            if crate::content_store::is_reparse_point_or_symlink(&metadata) {
+            if crate::content_store::is_reparse_point_or_symlink(&path) {
                 continue;
             }
             if metadata.is_dir() {

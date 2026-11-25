@@ -218,12 +218,12 @@ pub fn sweep(
                         continue;
                     }
                 };
-                if crate::content_store::is_reparse_point_or_symlink(&metadata) {
+                if crate::content_store::is_reparse_point_or_symlink(&path) {
                     result.problems.push(SweepProblem {
                         root: root.name.clone(),
                         path,
                         kind: SweepProblemKind::ReparseSkipped,
-                        detail: "a junction or symlink is never followed".to_string(),
+                        detail: "a link that points elsewhere is never followed".to_string(),
                     });
                     continue;
                 }
