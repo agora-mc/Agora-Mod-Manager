@@ -246,7 +246,7 @@ pub fn init_local_state_db_with(
             }
         }
     } else if db_path.exists() {
-        match check_integrity(db_path)? {
+        match check_integrity(db_path, IntegrityAccess::Startup)? {
             Integrity::Ok => {}
             Integrity::Corrupt(reason) => {
                 write_recovery_marker(db_path, &recovery_marker, &identity)?;
@@ -437,14 +437,39 @@ fn is_definite_corruption(error: &rusqlite::Error) -> bool {
     )
 }
 
+/// The same question for an error that may have been wrapped on its way out of the check.
+fn anyhow_is_definite_corruption(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<rusqlite::Error>()
+        .is_some_and(is_definite_corruption)
+}
+
+/// Who is asking for the integrity check, because the answer differs.
+///
+/// A **report** may not change the file it reports on, so it opens the database read-only. A
+/// **startup** check cannot: a database a crash left with a hot journal has to be rolled back by its
+/// first writer, and a read-only connection is refused that, so startup would see "unreadable" where
+/// it used to see a recoverable file. That would change what startup does, which is not a reporting
+/// decision to make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntegrityAccess {
+    /// Read the file without writing to it, for a report.
+    ReadOnly,
+    /// May roll back a hot journal, for the startup safety net.
+    Startup,
+}
+
 /// Run `PRAGMA quick_check` and report whether the file is usable.
 ///
 /// quick_check reads every page and its b-tree links but not indexes. It is
 /// the same shape as `integrity_check` at a fraction of the cost, which is why
 /// startup can afford it on every open.
-fn check_integrity(db_path: &Path) -> anyhow::Result<Integrity> {
-    let result: rusqlite::Result<Vec<String>> = (|| {
-        let conn = Connection::open(db_path)?;
+fn check_integrity(db_path: &Path, access: IntegrityAccess) -> anyhow::Result<Integrity> {
+    let result: anyhow::Result<Vec<String>> = (|| {
+        let conn = match access {
+            IntegrityAccess::ReadOnly => local_state_connection_read_only(db_path)?,
+            IntegrityAccess::Startup => Connection::open(db_path)?,
+        };
         let mut statement = conn.prepare("PRAGMA quick_check")?;
         let mut rows = statement.query([])?;
         let mut problems = Vec::new();
@@ -459,8 +484,10 @@ fn check_integrity(db_path: &Path) -> anyhow::Result<Integrity> {
     match result {
         Ok(problems) if problems.is_empty() => Ok(Integrity::Ok),
         Ok(problems) => Ok(Integrity::Corrupt(problems.join("; "))),
-        Err(error) if is_definite_corruption(&error) => Ok(Integrity::Corrupt(error.to_string())),
-        Err(error) => Err(error.into()),
+        Err(error) if anyhow_is_definite_corruption(&error) => {
+            Ok(Integrity::Corrupt(error.to_string()))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -579,7 +606,7 @@ fn recover_pending_database(
     marker: &Path,
 ) -> anyhow::Result<Option<CorruptRecovery>> {
     if db_path.exists() {
-        match check_integrity(db_path)? {
+        match check_integrity(db_path, IntegrityAccess::Startup)? {
             Integrity::Ok => {
                 // The restore already happened; the marker outlived it.
                 clear_recovery_marker(marker);
@@ -700,7 +727,7 @@ fn backup_before_migration(
         .ok_or_else(|| anyhow::anyhow!("backup path is not valid UTF-8"))?;
     conn.execute("VACUUM INTO ?1", rusqlite::params![destination_text])
         .map_err(|error| anyhow::anyhow!("writing {} failed: {error}", destination.display()))?;
-    match check_integrity(&destination)? {
+    match check_integrity(&destination, IntegrityAccess::Startup)? {
         Integrity::Ok => {}
         Integrity::Corrupt(reason) => {
             let _ = std::fs::remove_file(&destination);
@@ -853,17 +880,89 @@ pub fn inspect_local_state(db_path: &Path) -> LocalStateInspection {
     if !db_path.exists() {
         return inspection;
     }
-    inspection.integrity = match check_integrity(db_path) {
+    inspection.integrity = match check_integrity(db_path, IntegrityAccess::ReadOnly) {
         Ok(Integrity::Ok) => LocalStateIntegrity::Ok,
         Ok(Integrity::Corrupt(reason)) => LocalStateIntegrity::Corrupt(reason),
         Err(error) => LocalStateIntegrity::Unreadable(error.to_string()),
     };
     if matches!(inspection.integrity, LocalStateIntegrity::Ok) {
-        inspection.schema_version = Connection::open(db_path)
+        // Read-only: reading the schema version must not roll back or checkpoint anything.
+        inspection.schema_version = local_state_connection_read_only(db_path)
             .ok()
             .and_then(|conn| schema_version(&conn).ok());
     }
     inspection
+}
+
+/// Whether a database recovery is waiting for the next start (MASTER_SPEC §32.11).
+///
+/// Written before a damaged file is moved aside, so an unfinished restore is visible instead of an
+/// absent database looking like a first run. Read here without touching it: the report only says
+/// what startup will do about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingDatabaseRecovery {
+    /// No marker beside the database: nothing is waiting.
+    None,
+    /// A marker written for this very database: the next start finishes the restore.
+    Pending {
+        /// The marker file.
+        marker: PathBuf,
+        /// Whether an identity file sits beside it, which is what makes a marker this database's.
+        identity_present: bool,
+    },
+    /// A marker is there but could not be read, or belongs to another database: startup leaves it
+    /// alone and reports it, so saying anything about the restore would be a guess.
+    CantTell {
+        /// The marker file.
+        marker: PathBuf,
+        /// Why nothing can be said about it.
+        reason: String,
+    },
+}
+
+/// Read the pending-recovery marker beside the database, changing nothing.
+pub fn pending_database_recovery(db_path: &Path) -> PendingDatabaseRecovery {
+    let marker = recovery_marker_path(db_path);
+    let text = match std::fs::read_to_string(&marker) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return PendingDatabaseRecovery::None
+        }
+        Err(error) => {
+            return PendingDatabaseRecovery::CantTell {
+                marker,
+                reason: error.to_string(),
+            }
+        }
+    };
+    let identity = match std::fs::read_to_string(identity_path(db_path)) {
+        Ok(identity) => identity.trim().to_string(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return PendingDatabaseRecovery::CantTell {
+                marker,
+                reason: format!("its identity could not be read ({error})"),
+            }
+        }
+    };
+    match serde_json::from_str::<RecoveryMarker>(&text) {
+        Ok(record) if !identity.is_empty() && marker_belongs_to(&record, &identity, db_path) => {
+            PendingDatabaseRecovery::Pending {
+                marker,
+                identity_present: true,
+            }
+        }
+        Ok(_) => PendingDatabaseRecovery::CantTell {
+            marker,
+            reason: "it is not from this database, so startup leaves it alone and restores no \
+                     backup"
+                .into(),
+        },
+        Err(error) => PendingDatabaseRecovery::CantTell {
+            marker,
+            reason: format!("it could not be read ({error})"),
+        },
+    }
 }
 
 fn list_kept_aside(db_path: &Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -916,7 +1015,7 @@ fn restore_newest_backup(db_path: &Path) -> anyhow::Result<Option<PathBuf>> {
             unreadable = Some(error.into());
             continue;
         }
-        match check_integrity(&candidate) {
+        match check_integrity(&candidate, IntegrityAccess::Startup) {
             Ok(Integrity::Ok) => {
                 let _ = std::fs::remove_file(sidecar_path(db_path, "-wal"));
                 let _ = std::fs::remove_file(sidecar_path(db_path, "-shm"));
@@ -2976,23 +3075,62 @@ pub fn list_instance_import_jobs(conn: &Connection) -> anyhow::Result<Vec<Instan
                 created_at, updated_at
          FROM instance_import_jobs ORDER BY created_at",
     )?;
-    let rows = statement.query_map([], |row| {
-        Ok(InstanceImportJob {
-            job_id: row.get(0)?,
-            instance_id: row.get(1)?,
-            launcher_kind: row.get(2)?,
-            source_instance_key: row.get(3)?,
-            staging_path: row.get(4)?,
-            final_path: row.get(5)?,
-            quarantine_path: row.get(6)?,
-            state: row.get(7)?,
-            plan_fingerprint: row.get(8)?,
-            error: row.get(9)?,
-            created_at: row.get(10)?,
-            updated_at: row.get(11)?,
-        })
-    })?;
+    let rows = statement.query_map([], row_to_import_job)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// One `instance_import_jobs` row, as far as it can be read.
+///
+/// A row this build cannot parse is that row's problem, never the listing's: the other rows are
+/// real journals, and one bad row must not hide them.
+pub struct InstanceImportRow {
+    /// The instance the row names, when even that column is readable.
+    pub instance_id: Option<String>,
+    /// The job, or why this row cannot be read.
+    pub job: std::result::Result<InstanceImportJob, String>,
+}
+
+/// Every `instance_import_jobs` row, each one's own trouble kept with it.
+pub fn instance_import_job_rows(conn: &Connection) -> anyhow::Result<Vec<InstanceImportRow>> {
+    let mut statement = conn.prepare(
+        "SELECT job_id, instance_id, launcher_kind, source_instance_key,
+                staging_path, final_path, quarantine_path, state, plan_fingerprint, error,
+                created_at, updated_at
+         FROM instance_import_jobs ORDER BY created_at",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        // The instance's own name is read separately, so a row that cannot be parsed can still be
+        // reported as the row it is. An unreadable name is part of that row's error, never the
+        // row's absence.
+        let instance_id = match row.get::<_, String>(1) {
+            Ok(instance_id) => Some(instance_id),
+            Err(_) => None,
+        };
+        out.push(InstanceImportRow {
+            instance_id,
+            job: row_to_import_job(row).map_err(|error| error.to_string()),
+        });
+    }
+    Ok(out)
+}
+
+fn row_to_import_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<InstanceImportJob> {
+    Ok(InstanceImportJob {
+        job_id: row.get(0)?,
+        instance_id: row.get(1)?,
+        launcher_kind: row.get(2)?,
+        source_instance_key: row.get(3)?,
+        staging_path: row.get(4)?,
+        final_path: row.get(5)?,
+        quarantine_path: row.get(6)?,
+        state: row.get(7)?,
+        plan_fingerprint: row.get(8)?,
+        error: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
 }
 
 // ---------------------------------------------------------------------------

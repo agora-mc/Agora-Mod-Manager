@@ -10,37 +10,45 @@
 //!
 //! A report must not change what it reports on. Nothing here takes an operation's lock
 //! ([`LockManager::probe`] asks without taking), writes, renames or deletes a file, clears a stale
-//! lease, migrates the database or switches its journal mode. The database is opened with
-//! `SQLITE_OPEN_READ_ONLY` for the journals it holds. The proof that this holds is a test that
-//! snapshots the whole data root — file list, sizes and bytes — around the report.
+//! lease, migrates the database or switches its journal mode. Every "is it there?" is
+//! [`agora_game_api::probe`], so a path that is a directory, unreadable or a dangling link is
+//! reported as unreadable rather than skipped. The database is opened with `SQLITE_OPEN_READ_ONLY`
+//! for the journals it holds. The proof that this holds is a test that snapshots the whole data root
+//! — file list, sizes and bytes — around the report.
 //!
 //! # Fail closed
 //!
 //! A journal that cannot be read is listed with its path and its error, never skipped. A kind whose
-//! journals cannot be enumerated at all (a database this build does not know, a table that cannot be
-//! read, a folder that cannot be listed) is reported in
-//! [`RecoveryReport::not_searched`] with the reason — never as "no journals". A missing database is
-//! named as such: it is not the same as having no journals.
+//! journals cannot be enumerated at all is reported in [`RecoveryReport::not_searched`] with the
+//! reason — never as "no journals" — and one kind failing never speaks for another. A missing
+//! database is named as such, and the journals an earlier build left in `plugins/previous/` are
+//! still listed, because they do not need one.
 //!
-//! # Which journals, and why not all of them are decided
+//! # Which journals, and why some are not decided
 //!
 //! * **plugin installs** and **launcher imports** live in the local database;
-//! * **tool swaps** and **user-files sessions** are files under the data root.
+//! * **tool swaps** and **user-files sessions** are files under the data root;
+//! * **a pending database recovery** and **Recently deleted restores** are markers rather than
+//!   journals, and they are startup blockers all the same.
 //!
 //! The plugin install decides through the one recovery decision
-//! ([`crate::recovery::decide_readonly`]), so its answer is the answer the next start would give.
+//! ([`crate::recovery::decide_readonly`]) *and* its own refusal checks
+//! (`plugins::install::journal_report`), so its answer is the answer the next start would give.
 //! The other kinds still keep their own recovery code (§32.11 D1 moves them onto the envelope one
 //! at a time); this report therefore says [`RecoveryOutcome::Undecided`] for them rather than
 //! re-implementing their rules a second time, and reports only what it can prove without them: that
-//! a journal's lock is held (busy), and that a journal could not be read at all.
+//! a journal's lock is held — or that it could not be asked, which may mean the same thing — and
+//! that a journal could not be read at all.
 
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use agora_game_api::probe::{probe, PresentKind, Probe};
+use serde::{Deserialize, Serialize};
 
 use crate::app_paths::AppPaths;
 use crate::lock_manager::{LockManager, LockProbe, LockResource};
 use crate::process_identity::{OsProcesses, ProcessView};
+
 pub use crate::recovery::RecoveryOutcome;
 
 type Result<T> = std::result::Result<T, String>;
@@ -57,6 +65,10 @@ pub enum JournalKind {
     ToolSwap,
     /// Game files swapped in for a run.
     UserFiles,
+    /// The database's own crash recovery: a damaged file moved aside, its restore unfinished.
+    DatabaseRecovery,
+    /// A delete or a restore into, or out of, Recently deleted.
+    RecentlyDeleted,
 }
 
 impl JournalKind {
@@ -67,6 +79,8 @@ impl JournalKind {
             JournalKind::InstanceImport => "instance-import",
             JournalKind::ToolSwap => "tool-swap",
             JournalKind::UserFiles => "user-files",
+            JournalKind::DatabaseRecovery => "database-recovery",
+            JournalKind::RecentlyDeleted => "recently-deleted",
         }
     }
 }
@@ -76,7 +90,7 @@ impl JournalKind {
 #[serde(rename_all = "camelCase")]
 pub struct JournalEntry {
     pub kind: JournalKind,
-    /// What the journal covers: the plugin id, the instance id, or the game and store.
+    /// What the journal covers: the plugin id, the instance id, the game and store, or the file.
     pub resource: String,
     /// Where the journal is: its file, or the local database that holds its row.
     pub path: String,
@@ -85,7 +99,7 @@ pub struct JournalEntry {
     /// What recovery would do.
     pub outcome: RecoveryOutcome,
     /// Why, in a sentence — including the parse error of a journal that could not be read.
-    pub reason: Option<String>,
+    pub reason: String,
     /// The command that resolves or overrides this journal now, when there is one.
     pub command: Option<String>,
 }
@@ -97,6 +111,10 @@ pub struct KindNotSearched {
     pub kind: JournalKind,
     /// Why nothing could be said about this kind's journals. Never "there are none".
     pub reason: String,
+    /// Whether this is something a person has to look at — a kind that could not be read — rather
+    /// than a fact about a data root that is simply new (there is no database yet, so nothing has
+    /// been written in it). Only a blocking kind counts as a problem.
+    pub blocking: bool,
 }
 
 /// The whole read-only recovery report.
@@ -113,8 +131,12 @@ pub struct RecoveryReport {
 
 impl RecoveryReport {
     /// Whether anything here needs a person before the next start can settle it.
+    ///
+    /// A kind that could not be read counts: it may be hiding the journal that blocks startup, and
+    /// "could not tell" is never the same as "nothing found". A kind with nothing in it yet does
+    /// not: a fresh data root is not a problem.
     pub fn needs_a_hand(&self) -> bool {
-        !self.not_searched.is_empty()
+        self.not_searched.iter().any(|missing| missing.blocking)
             || self
                 .entries
                 .iter()
@@ -136,54 +158,104 @@ pub fn report(paths: &AppPaths) -> RecoveryReport {
 /// "could not tell" happen.
 pub fn report_with(paths: &AppPaths, view: &dyn ProcessView) -> RecoveryReport {
     let mut report = RecoveryReport::default();
-    if let Err(reason) = read_database_journals(paths, view, &mut report) {
-        // Both database kinds are reached through the same file, so a database that cannot be
-        // read leaves both of them unknown. Saying so beats saying nothing.
-        for kind in [JournalKind::PluginInstall, JournalKind::InstanceImport] {
-            report.not_searched.push(KindNotSearched {
-                kind,
-                reason: reason.clone(),
-            });
-        }
-    }
+    let pending = database_recovery(paths, &mut report);
+    database_journals(
+        paths,
+        view,
+        &mut report,
+        pending_claims_restore(paths, &pending),
+    );
     file_journals(paths, &mut report);
+    recently_deleted(paths, &mut report);
     report
 }
 
-/// Read the database-held journals, read-only. Returns the reason the database could not be asked,
-/// and never stops the file-based kinds from being listed.
-fn read_database_journals(
+// ---------------------------------------------------------------------------
+// The local database
+// ---------------------------------------------------------------------------
+
+/// What could be done with the local database file.
+enum DatabaseAccess {
+    /// Nothing at the path.
+    Missing,
+    /// An open, read-only connection.
+    Usable(Box<rusqlite::Connection>),
+    /// Something is there but could not be used, with the reason.
+    CantTell(String),
+}
+
+/// Open the local database read-only, changing nothing.
+fn database(paths: &AppPaths) -> DatabaseAccess {
+    let db = paths.local_state_db();
+    match probe(&db) {
+        Probe::Absent => DatabaseAccess::Missing,
+        Probe::CantTell(error) => DatabaseAccess::CantTell(format!(
+            "{} could not be examined ({error}). The plugin-install and import journals are \
+             unknown, which is not the same as there being none.",
+            db.display()
+        )),
+        Probe::Present(kind) if kind != PresentKind::File => DatabaseAccess::CantTell(format!(
+            "{} is not a plain file, so the plugin-install and import journals are unknown.",
+            db.display()
+        )),
+        Probe::Present(_) => match crate::db::local_state_connection_read_only(&db) {
+            Ok(conn) => match crate::db::recorded_schema_version(&conn) {
+                // A schema this build does not know may give these tables meanings it does not
+                // share. Reading them anyway would read rows as this version, which is exactly what
+                // the next start refuses to do.
+                Ok(version) if version > crate::db::LOCAL_STATE_SCHEMA_VERSION => {
+                    DatabaseAccess::CantTell(format!(
+                        "The database was written by a newer Agora (schema {version}; this build \
+                         supports up to {}), so its journals are not read as this version's.",
+                        crate::db::LOCAL_STATE_SCHEMA_VERSION
+                    ))
+                }
+                Ok(_) => DatabaseAccess::Usable(Box::new(conn)),
+                Err(error) => DatabaseAccess::CantTell(format!(
+                    "The database's schema version could not be read ({error})."
+                )),
+            },
+            Err(error) => DatabaseAccess::CantTell(format!(
+                "{} could not be opened read-only ({error}). The plugin-install and import journals \
+                 are unknown, which is not the same as there being none.",
+                db.display()
+            )),
+        },
+    }
+}
+
+/// The database-held journals, each kind reporting its own trouble.
+fn database_journals(
     paths: &AppPaths,
     view: &dyn ProcessView,
     report: &mut RecoveryReport,
-) -> Result<()> {
-    let db = paths.local_state_db();
-    if !db.is_file() {
-        report
-            .notes
-            .push("No local database yet, so there are no plugin-install or import journals. The next start creates it.".into());
-        return Ok(());
+    recovery_pending: bool,
+) {
+    let locks = LockManager::new(paths.locks_root());
+    let access = database(paths);
+    let (conn, reason): (Option<rusqlite::Connection>, Option<String>) = match access {
+        DatabaseAccess::Usable(conn) => (Some(*conn), None),
+        DatabaseAccess::Missing => (
+            None,
+            Some(if recovery_pending {
+                "There is no local database file beside its recovery marker: the next start \
+                 finishes that recovery before it reads any journal."
+                    .to_string()
+            } else {
+                "No local database yet: the next start creates it, and the plugin-install and \
+                 import journals live in it."
+                    .to_string()
+            }),
+        ),
+        DatabaseAccess::CantTell(reason) => (None, Some(reason)),
+    };
+    if let Some(reason) = &reason {
+        report.notes.push(reason.clone());
     }
-    let conn = crate::db::local_state_connection_read_only(&db).map_err(|error| {
-        format!(
-            "{} could not be opened read-only ({error}), so the plugin-install and import journals \
-             are unknown — which is not the same as there being none.",
-            db.display()
-        )
-    })?;
-    // A schema this build does not know may give these tables meanings it does not share. Asking
-    // anyway would read rows as this version, which is exactly what the next start refuses to do.
-    let version = crate::db::recorded_schema_version(&conn)
-        .map_err(|error| format!("The database's schema version could not be read ({error})."))?;
-    if version > crate::db::LOCAL_STATE_SCHEMA_VERSION {
-        return Err(format!(
-            "The database was written by a newer Agora (schema {version}; this build supports up \
-             to {}), so its journals are not read as this version's.",
-            crate::db::LOCAL_STATE_SCHEMA_VERSION
-        ));
-    }
-    let mut first_error: Option<String> = None;
-    match crate::plugins::install::journal_report(&conn, paths, view) {
+    // Plugin installs: the database's rows when there is one, and always the journals an earlier
+    // build left in `plugins/previous/`, which need no database at all. Without a database the
+    // kind is still reported as not searched — the legacy stashes are listed, the rows cannot be.
+    match crate::plugins::install::journal_report(conn.as_ref(), paths, view) {
         Ok(journals) => {
             for journal in journals {
                 report.entries.push(JournalEntry {
@@ -192,270 +264,383 @@ fn read_database_journals(
                     path: journal.path.display().to_string(),
                     state: journal.state.map(|state| state.as_str().to_string()),
                     outcome: journal.outcome,
-                    command: (journal.outcome != RecoveryOutcome::NothingToDo)
-                        .then(|| format!("agora plugin recover {} --yes", journal.plugin_id)),
                     reason: journal.reason,
+                    command: journal.command,
+                });
+            }
+            if let Some(reason) = &reason {
+                report.not_searched.push(KindNotSearched {
+                    kind: JournalKind::PluginInstall,
+                    reason: reason.clone(),
+                    blocking: !is_new_data_root(reason),
                 });
             }
         }
-        Err(error) => {
-            first_error = Some(format!(
-                "The plugin-install journals could not be read ({error})."
-            ));
-        }
+        Err(error) => report.not_searched.push(KindNotSearched {
+            kind: JournalKind::PluginInstall,
+            reason: format!("The plugin-install journals could not be listed ({error})."),
+            blocking: true,
+        }),
     }
-    match import_journals(&conn, paths) {
+    // Launcher imports are only readable through the database.
+    let Some(conn) = conn else {
+        let reason = reason.unwrap_or_else(|| "The local database could not be read.".into());
+        report.not_searched.push(KindNotSearched {
+            kind: JournalKind::InstanceImport,
+            blocking: !is_new_data_root(&reason),
+            reason,
+        });
+        return;
+    };
+    match import_journals(&conn, paths, &locks) {
         Ok(entries) => report.entries.extend(entries),
-        Err(reason) => first_error = first_error.or(Some(reason)),
-    }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
+        Err(reason) => report.not_searched.push(KindNotSearched {
+            kind: JournalKind::InstanceImport,
+            reason,
+            blocking: true,
+        }),
     }
 }
 
-/// The launcher-import journals, decided read-only.
+/// How the reason for an unread database-backed kind starts when the data root is simply new.
+const NEW_DATA_ROOT: &str = "No local database yet";
+
+/// Whether a reason for "not searched" is simply that this data root is new.
 ///
-/// This repeats the two questions the import recovery asks (`launcher_import_service.rs`,
-/// `recover_one_job`) and nothing else: is the instance's lock held (a live import may still be
-/// running), and did the import commit? Recovery commits by writing the import record and the
-/// instance row together, so a job whose row is still there was never committed: its files are
-/// rolled back, while a committed job only has its staging folder tidied. Keeping this in step with
-/// that function is exactly the reason §32.11 D1 moves launcher import onto the envelope and the one
-/// decision; until then, this is the second place that rule is written.
+/// A data root with no database has had no plugin installed and no instance imported, so nothing is
+/// hidden by not reading it. Everything else — a file that cannot be read, a schema this build does
+/// not know — may be hiding a journal, and is a problem.
+fn is_new_data_root(reason: &str) -> bool {
+    reason.starts_with(NEW_DATA_ROOT)
+}
+
+/// The launcher-import journals, listed with their facts and **no prediction**.
+///
+/// This deliberately does not decide them. Their recovery (`launcher_import_service.rs`,
+/// `recover_one_job`) asks more questions than a journal row answers — the runtime lease, the
+/// quarantine folder a failed update left, which marker each folder carries — and a second copy of
+/// those rules here already drifted from them once. Until launcher import moves onto the envelope
+/// (MASTER_SPEC §32.11 D1) the report says what it can see: which import, at which phase, over which
+/// folders, and that the next start settles it.
 fn import_journals(
     conn: &rusqlite::Connection,
     paths: &AppPaths,
-) -> std::result::Result<Vec<JournalEntry>, String> {
-    let jobs = crate::db::list_instance_import_jobs(conn)
+    locks: &LockManager,
+) -> Result<Vec<JournalEntry>> {
+    let rows = crate::db::instance_import_job_rows(conn)
         .map_err(|error| format!("The import journals could not be read ({error})."))?;
-    let locks = LockManager::new(paths.locks_root());
     let mut entries = Vec::new();
-    for job in jobs {
+    for row in rows {
+        let job = match row.job {
+            Ok(job) => job,
+            // One unreadable row is that row's answer, not the listing's: the other rows are still
+            // journals a person wants to see.
+            Err(error) => {
+                entries.push(JournalEntry {
+                    resource: row
+                        .instance_id
+                        .unwrap_or_else(|| "a row that cannot be read".to_string()),
+                    kind: JournalKind::InstanceImport,
+                    path: paths.local_state_db().display().to_string(),
+                    state: None,
+                    outcome: RecoveryOutcome::NeedsHand,
+                    reason: format!(
+                        "This row of the import journal cannot be read ({error}), so neither what \
+                         it covers nor what the next start would do with it is known. Nothing was \
+                         changed."
+                    ),
+                    command: None,
+                });
+                continue;
+            }
+        };
         let mut entry = JournalEntry {
             kind: JournalKind::InstanceImport,
             resource: job.instance_id.clone(),
-            path: paths.local_state_db().display().to_string(),
+            // The folder recovery works in, which is what a person can look at.
+            path: job.staging_path.clone(),
             state: Some(job.state.clone()),
             outcome: RecoveryOutcome::Undecided,
-            reason: None,
-            // Nothing to run: the next start's import recovery settles this on its own.
+            reason: format!(
+                "An import of instance {} is at \"{}\", over the staging folder {} and the instance \
+                 folder {}. The next start settles it; if it keeps appearing, that import is stuck \
+                 and nothing has been changed.",
+                job.instance_id, job.state, job.staging_path, job.final_path
+            ),
             command: None,
         };
-        // The folder recovery proves ownership with: the staging folder, or the promoted instance
-        // folder while an update is in flight. An unreadable marker is a hand, not a guess.
-        let staging = PathBuf::from(&job.staging_path);
-        if !staging.starts_with(paths.staging_root()) {
-            entry.outcome = RecoveryOutcome::NeedsHand;
-            entry.reason = Some(format!(
-                "It names a staging folder outside the staging root ({}), which recovery refuses \
-                 to touch.",
-                staging.display()
-            ));
-            entries.push(entry);
-            continue;
-        }
-        match read_import_marker(&staging) {
-            Ok(None) => {
-                entry.outcome = RecoveryOutcome::NeedsHand;
-                entry.reason = Some(format!(
-                    "Its staging folder {} is not marked as this job's, so recovery keeps it and \
-                     reports it rather than guessing.",
-                    staging.display()
-                ));
-                entry.path = staging.display().to_string();
-            }
-            Ok(Some(job_id)) if job_id != job.job_id => {
-                entry.outcome = RecoveryOutcome::NeedsHand;
-                entry.reason = Some(format!(
-                    "Its staging folder {} is marked as another job's ({}), so recovery keeps it.",
-                    staging.display(),
-                    job_id
-                ));
-                entry.path = staging.join(IMPORT_MARKER).display().to_string();
-            }
-            Ok(Some(_)) => match locks.probe(&LockResource::Instance(job.instance_id.clone())) {
-                LockProbe::Held(_) => {
-                    entry.outcome = RecoveryOutcome::Busy;
-                    entry.reason = Some(
-                        "Another Agora holds the instance's lock right now, so the import may \
-                         still be running. Nothing would be done."
-                            .into(),
-                    );
-                }
-                LockProbe::CantTell(why) => {
-                    entry.outcome = RecoveryOutcome::NeedsHand;
-                    entry.reason = Some(format!(
-                        "Agora could not tell whether another operation holds the instance's lock \
-                         ({why}), so it will not say what recovery would do."
-                    ));
-                }
-                LockProbe::Free => {
-                    let committed = import_committed(conn, &job)?;
-                    if committed {
-                        entry.outcome = RecoveryOutcome::WouldFinish;
-                        entry.reason = Some(
-                            "The instance and its import record are both in place, so recovery would \
-                             only tidy the staging folder."
-                                .into(),
-                        );
-                    } else {
-                        entry.outcome = RecoveryOutcome::WouldUndo;
-                        entry.reason = Some(format!(
-                            "The import never committed (state \"{}\"), so recovery would roll its \
-                             files back and keep anything it cannot prove is the job's.",
-                            job.state
-                        ));
+        // The one thing that needs no rules from that kind: a running import holds the instance's
+        // lock for its whole life, so a held lock — or one that cannot be asked about — means the
+        // import may still be running, whatever its journal says.
+        match locks.probe(&LockResource::Instance(job.instance_id.clone())) {
+            LockProbe::Held(metadata) => {
+                entry.outcome = RecoveryOutcome::Busy;
+                entry.reason = format!(
+                    "Another Agora holds this instance's lock right now{}, so an import or a run \
+                     may still be using these folders. Nothing would be done; the next start \
+                     retries.",
+                    match metadata {
+                        Some(metadata) => format!(
+                            " ({} on {}, operation: {})",
+                            metadata.program, metadata.hostname, metadata.operation
+                        ),
+                        None => String::new(),
                     }
-                }
-            },
-            Err(reason) => {
-                entry.outcome = RecoveryOutcome::NeedsHand;
-                entry.reason = Some(format!(
-                    "Its ownership marker {} could not be read: {reason}. Recovery keeps the folder \
-                     and reports it rather than acting on a guess.",
-                    staging.join(IMPORT_MARKER).display()
-                ));
-                entry.path = staging.join(IMPORT_MARKER).display().to_string();
+                );
             }
+            LockProbe::CantTell(why) => {
+                entry.outcome = RecoveryOutcome::Busy;
+                entry.reason = format!(
+                    "Agora could not tell whether this instance's lock is held ({why}), so an \
+                     import may still be running. Nothing was changed."
+                );
+            }
+            LockProbe::Free => {}
         }
         entries.push(entry);
     }
     Ok(entries)
 }
 
-/// The ownership marker the import writes inside its staging folder
-/// (`launcher_import_service.rs`, `IMPORT_OWNER_MARKER`), read without changing it.
-const IMPORT_MARKER: &str = ".agora-import-owner.json";
+// ---------------------------------------------------------------------------
+// The database's own recovery
+// ---------------------------------------------------------------------------
 
-/// The job id the marker names: `None` when there is no marker, an error when it cannot be read.
-fn read_import_marker(dir: &Path) -> Result<Option<String>> {
-    let path = dir.join(IMPORT_MARKER);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.to_string()),
-    };
-    let value: serde_json::Value =
-        serde_json::from_str(&text).map_err(|error| format!("not JSON: {error}"))?;
-    value
-        .get("job_id")
-        .and_then(serde_json::Value::as_str)
-        .map(|id| Ok(Some(id.to_string())))
-        .unwrap_or_else(|| Err("it names no job".into()))
-}
-
-/// Whether the import reached its commit point: the instance row and its import record, both
-/// present, is what the import writes together at the end.
-fn import_committed(
-    conn: &rusqlite::Connection,
-    job: &crate::db::InstanceImportJob,
-) -> std::result::Result<bool, String> {
-    let record = crate::db::get_instance_import(conn, &job.instance_id)
-        .map_err(|error| format!("The import record could not be read ({error})."))?;
-    let instance = crate::db::get_instance(conn, &job.instance_id)
-        .map_err(|error| format!("The instance record could not be read ({error})."))?;
-    Ok(
-        record.is_some_and(|record| record.source_fingerprint == job.plan_fingerprint)
-            && instance.is_some(),
-    )
-}
-
-/// The journals that are files: tool swaps and user-files sessions.
-fn file_journals(paths: &AppPaths, report: &mut RecoveryReport) {
-    let swaps = match read_journals_in(paths.tool_swaps_root(), Some("json")) {
-        Ok(paths) => paths,
-        Err(reason) => {
-            report.not_searched.push(KindNotSearched {
-                kind: JournalKind::ToolSwap,
-                reason,
+/// The pending database recovery, listed as the startup blocker it is.
+///
+/// Returns whether a recovery is genuinely pending, so the "no database yet" note can say the truth
+/// instead of promising that the next start creates one.
+fn database_recovery(paths: &AppPaths, report: &mut RecoveryReport) -> bool {
+    let db = paths.local_state_db();
+    match crate::db::pending_database_recovery(&db) {
+        crate::db::PendingDatabaseRecovery::None => false,
+        crate::db::PendingDatabaseRecovery::Pending {
+            marker,
+            identity_present,
+        } => {
+            report.entries.push(JournalEntry {
+                kind: JournalKind::DatabaseRecovery,
+                resource: db
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| db.display().to_string()),
+                path: marker.display().to_string(),
+                state: Some("restore-pending".into()),
+                outcome: RecoveryOutcome::WouldFinish,
+                reason: format!(
+                    "The recovery marker was written before a damaged database was moved aside{}. \
+                     The next start finishes the restore: it checks the database, keeps a damaged \
+                     file aside (never deleting it), and restores the newest backup that passes the \
+                     check — or starts with a fresh database when none does.",
+                    if identity_present {
+                        ", and its identity file is beside it so the marker is this database's"
+                    } else {
+                        ""
+                    }
+                ),
+                command: None,
             });
-            Vec::new()
+            true
         }
-    };
-    for path in swaps {
-        let name = file_stem(&path);
-        report
-            .entries
-            .push(file_entry(JournalKind::ToolSwap, name, &path));
+        crate::db::PendingDatabaseRecovery::CantTell { marker, reason } => {
+            report.entries.push(JournalEntry {
+                kind: JournalKind::DatabaseRecovery,
+                resource: db
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| db.display().to_string()),
+                path: marker.display().to_string(),
+                state: Some("restore-pending".into()),
+                outcome: RecoveryOutcome::NeedsHand,
+                reason: format!(
+                    "A database recovery marker is beside {} and {reason}. Nothing was restored and \
+                     nothing was changed.",
+                    db.display()
+                ),
+                command: None,
+            });
+            false
+        }
+    }
+}
+
+/// Whether a pending recovery explains an absent database file.
+fn pending_claims_restore(_paths: &AppPaths, pending: &bool) -> bool {
+    *pending
+}
+// ---------------------------------------------------------------------------
+// Journals that are files
+// ---------------------------------------------------------------------------
+
+/// Tool swaps and user-files sessions: files, each with the game/store lock its writer holds.
+fn file_journals(paths: &AppPaths, report: &mut RecoveryReport) {
+    let locks = LockManager::new(paths.locks_root());
+    match read_children(paths.tool_swaps_root(), Some("json")) {
+        Ok(found) => {
+            for path in found {
+                report
+                    .entries
+                    .push(file_entry(JournalKind::ToolSwap, &path, &locks));
+            }
+        }
+        Err(reason) => report.not_searched.push(KindNotSearched {
+            kind: JournalKind::ToolSwap,
+            reason,
+            blocking: true,
+        }),
     }
     // `<data>/user-files/<game>_<store>/journal.json`, the same place `AppPaths` names.
-    let root = paths.user_files_root();
-    let dirs = match read_journals_in(root.clone(), None) {
-        Ok(dirs) => dirs,
-        Err(reason) => {
-            report.not_searched.push(KindNotSearched {
-                kind: JournalKind::UserFiles,
-                reason,
-            });
-            Vec::new()
+    match read_children(paths.user_files_root(), None) {
+        Ok(dirs) => {
+            for dir in dirs {
+                report.entries.push(file_entry(
+                    JournalKind::UserFiles,
+                    &dir.join("journal.json"),
+                    &locks,
+                ));
+            }
         }
-    };
-    for dir in dirs {
-        let journal = dir.join("journal.json");
-        if !journal.is_file() {
-            continue;
-        }
-        report.entries.push(file_entry(
-            JournalKind::UserFiles,
-            file_stem(&dir),
-            &journal,
-        ));
+        Err(reason) => report.not_searched.push(KindNotSearched {
+            kind: JournalKind::UserFiles,
+            reason,
+            blocking: true,
+        }),
     }
 }
 
 /// A file-based journal, reported as far as it can be proven without its kind's own rules.
-fn file_entry(kind: JournalKind, resource: String, path: &Path) -> JournalEntry {
+///
+/// The one thing that needs no rules is its lock: while a game's store lock is held, a run is using
+/// those files, and that is busy whatever the journal says. No command is printed: the explicit
+/// restore commands for these kinds need a registered game, and this report does not get to promise
+/// a command it has not been able to run.
+fn file_entry(kind: JournalKind, path: &Path, locks: &LockManager) -> JournalEntry {
     let mut entry = JournalEntry {
         kind,
-        resource,
+        resource: path
+            .parent()
+            .and_then(|dir| dir.file_name())
+            .or_else(|| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string()),
         path: path.display().to_string(),
         state: None,
         outcome: RecoveryOutcome::Undecided,
-        reason: Some(format!(
+        reason: format!(
             "This build does not report a decision for {} journals yet; the next start's recovery \
              decides it with that kind's own rules.",
             kind.as_str()
-        )),
+        ),
         command: None,
     };
-    match std::fs::read_to_string(path) {
-        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(document) => {
-                // Whatever the kind records about how far it got, said in its own words.
-                entry.state = document
-                    .get("state")
-                    .or_else(|| document.get("version"))
-                    .and_then(|value| {
-                        value
-                            .as_str()
-                            .map(str::to_string)
-                            .or_else(|| value.as_u64().map(|version| format!("version {version}")))
-                    });
-            }
-            Err(error) => {
-                entry.outcome = RecoveryOutcome::NeedsHand;
-                entry.state = None;
-                entry.reason = Some(format!(
-                    "The journal is not JSON, so nothing about it can be acted on: {error}"
-                ));
-            }
-        },
-        Err(error) => {
+    let document = match read_journal_file(path) {
+        Ok(document) => document,
+        Err(reason) => {
             entry.outcome = RecoveryOutcome::NeedsHand;
-            entry.reason = Some(format!("The journal could not be read: {error}"));
+            entry.reason = reason;
+            return entry;
+        }
+    };
+    // Whatever the kind records about how far it got, said in its own words.
+    entry.state = document
+        .get("state")
+        .or_else(|| document.get("version"))
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| value.as_u64().map(|version| format!("version {version}")))
+        });
+    match lock_of(&document) {
+        Ok(Some(resource)) => match locks.probe(&resource) {
+            LockProbe::Held(metadata) => {
+                entry.outcome = RecoveryOutcome::Busy;
+                entry.reason = match metadata {
+                    Some(metadata) => format!(
+                        "Another Agora holds this session's lock right now ({} on {}, operation: \
+                         {}), so a run is using these files. Nothing would be done; the next start \
+                         retries.",
+                        metadata.program, metadata.hostname, metadata.operation
+                    ),
+                    None => "Another Agora holds this session's lock right now, so a run is using \
+                             these files. Nothing would be done; the next start retries."
+                        .into(),
+                };
+                return entry;
+            }
+            LockProbe::CantTell(why) => {
+                entry.outcome = RecoveryOutcome::Busy;
+                entry.reason = format!(
+                    "Agora could not tell whether a run holds this session's lock ({why}), so it \
+                     may be running. Nothing was changed."
+                );
+                return entry;
+            }
+            LockProbe::Free => {}
+        },
+        Ok(None) => {}
+        Err(reason) => {
+            entry.outcome = RecoveryOutcome::NeedsHand;
+            entry.reason = reason;
+            return entry;
         }
     }
+    entry.command = None;
     entry
 }
 
-/// The journals in `dir`: files with `suffix` when one is given, the folder's own subdirectories
+/// The lock a tool-swap or user-files journal's writer holds, from the game and store it records.
+fn lock_of(document: &serde_json::Value) -> Result<Option<LockResource>> {
+    let game = document.get("game").and_then(serde_json::Value::as_str);
+    let store = document.get("store").and_then(serde_json::Value::as_str);
+    let (Some(game), Some(store)) = (game, store) else {
+        return Ok(None);
+    };
+    let game_id = agora_game_api::GameId::new(game)
+        .map_err(|error| format!("It records a game that is not a game id: {error}."))?;
+    let store_id = agora_game_api::StoreId::new(store)
+        .map_err(|error| format!("It records a store that is not a store id: {error}."))?;
+    Ok(Some(LockResource::GameUserFiles(game_id, store_id)))
+}
+
+/// Read one journal file, or say why it cannot be read.
+///
+/// A path that is a directory, a link, or anything else that is not a readable file is an answer of
+/// "unreadable", never a reason to skip the entry.
+fn read_journal_file(path: &Path) -> std::result::Result<serde_json::Value, String> {
+    match probe(path) {
+        Probe::Absent => Err(format!(
+            "{} is not there any more, so what it held is unknown.",
+            path.display()
+        )),
+        Probe::CantTell(error) => Err(format!(
+            "{} could not be examined ({error}), so it was not read.",
+            path.display()
+        )),
+        Probe::Present(kind) if kind != PresentKind::File && kind != PresentKind::Symlink => {
+            Err(format!(
+                "{} is a {}, not a journal file, so nothing about it can be acted on.",
+                path.display(),
+                match kind {
+                    PresentKind::Directory => "folder",
+                    _ => "special file",
+                }
+            ))
+        }
+        Probe::Present(_) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|error| format!("{} could not be read: {error}", path.display()))?;
+            serde_json::from_str(&text).map_err(|error| {
+                format!("The journal is not JSON, so nothing about it can be acted on: {error}")
+            })
+        }
+    }
+}
+
+/// The entries in `dir`: files with `suffix` when one is given, the folder's own children
 /// otherwise. A folder that is not there is an empty list; one that cannot be listed is an error,
 /// never "nothing found".
-fn read_journals_in(
-    dir: PathBuf,
-    suffix: Option<&str>,
-) -> std::result::Result<Vec<PathBuf>, String> {
+fn read_children(dir: PathBuf, suffix: Option<&str>) -> std::result::Result<Vec<PathBuf>, String> {
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -479,21 +664,187 @@ fn read_journals_in(
             }
         };
         let path = entry.path();
-        let matches = match suffix {
-            Some(suffix) => path.extension().is_some_and(|found| found == suffix),
-            None => path.is_dir(),
-        };
-        if matches {
-            found.push(path);
+        // By name, not by kind: a journal path that is a directory or a link is an entry the report
+        // must list as unreadable, not one it may drop.
+        if let Some(suffix) = suffix {
+            if !path.extension().is_some_and(|found| found == suffix) {
+                continue;
+            }
         }
+        found.push(path);
     }
     found.sort();
     Ok(found)
 }
 
-/// A journal's file name without its extension, for the resource it covers.
-fn file_stem(path: &Path) -> String {
-    path.file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
+// ---------------------------------------------------------------------------
+// Recently deleted
+// ---------------------------------------------------------------------------
+
+/// A deleted instance's `entry.json`, as far as the report needs it.
+///
+/// The entry is written with camelCase field names; the row and the version around it are not
+/// read here, so a change to them cannot make this unreadable to the report.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletedEntryFile {
+    #[serde(default)]
+    instance_id: String,
+    #[serde(default)]
+    name: String,
+}
+
+/// The `restoring.json` a restore writes before it moves anything.
+#[derive(Debug, Deserialize)]
+struct RestoringFile {
+    #[serde(default)]
+    new_id: String,
+    #[serde(default)]
+    new_name: String,
+}
+
+/// Entries in Recently deleted: a restore that a crash cut in half is a startup blocker, and a
+/// plain kept entry is something the user can still bring back.
+fn recently_deleted(paths: &AppPaths, report: &mut RecoveryReport) {
+    let root = paths.recently_deleted_games_root();
+    let dirs = match read_children(root.clone(), None) {
+        Ok(dirs) => dirs,
+        Err(reason) => {
+            report.not_searched.push(KindNotSearched {
+                kind: JournalKind::RecentlyDeleted,
+                reason,
+                blocking: true,
+            });
+            return;
+        }
+    };
+    for dir in dirs {
+        let entry_file = dir.join("entry.json");
+        let restoring = match read_json::<RestoringFile>(&dir.join("restoring.json")) {
+            Ok(found) => found,
+            Err(reason) => {
+                report.entries.push(JournalEntry {
+                    kind: JournalKind::RecentlyDeleted,
+                    resource: name_of(&dir),
+                    path: dir.join("restoring.json").display().to_string(),
+                    state: Some("restoring".into()),
+                    outcome: RecoveryOutcome::NeedsHand,
+                    reason: format!("Its restore was started and cannot be read: {reason}"),
+                    command: None,
+                });
+                continue;
+            }
+        };
+        let deleted = read_json::<DeletedEntryFile>(&entry_file);
+        let resource = match (&deleted, &restoring) {
+            (Ok(Some(entry)), _) if !entry.instance_id.is_empty() => entry.instance_id.clone(),
+            _ => name_of(&dir),
+        };
+        let (state, outcome, reason) = match restoring {
+            Some(restoring) => {
+                let target = if restoring.new_name.is_empty() {
+                    restoring.new_id.clone()
+                } else {
+                    format!("{} ({})", restoring.new_name, restoring.new_id)
+                };
+                (
+                    Some("restoring".to_string()),
+                    RecoveryOutcome::WouldFinish,
+                    format!(
+                        "A restore of this entry was started and cut off; the next start finishes \
+                         it as {} (or calls it off, keeping the files in Recently deleted, when the \
+                         folders do not match what the entry recorded).",
+                        if target.is_empty() {
+                            "the instance it recorded".to_string()
+                        } else {
+                            target
+                        }
+                    ),
+                )
+            }
+            None => {
+                // A kept entry whose own record cannot be read is not "nothing to do": the files
+                // are there but nothing can be told about them, and no restore can bring them back.
+                if let Err(reason) = &deleted {
+                    report.entries.push(JournalEntry {
+                        kind: JournalKind::RecentlyDeleted,
+                        resource: name_of(&dir),
+                        path: dir.display().to_string(),
+                        state: Some("kept".into()),
+                        outcome: RecoveryOutcome::NeedsHand,
+                        reason: format!(
+                            "A deleted instance is held here and its record cannot be read: \
+                             {reason}. No restore was started, so nothing is pending, and the \
+                             files are left exactly as they are."
+                        ),
+                        command: None,
+                    });
+                    continue;
+                }
+                let what = match &deleted {
+                    Ok(Some(entry)) if !entry.name.is_empty() => {
+                        format!("instance {} (\"{}\")", resource, entry.name)
+                    }
+                    _ => format!("instance {resource}"),
+                };
+                (
+                    Some("kept".to_string()),
+                    RecoveryOutcome::NothingToDo,
+                    format!(
+                        "A deleted {what} is held here until it expires; nothing is pending. Bring \
+                         it back with `agora instance restore {}`.",
+                        name_of(&dir)
+                    ),
+                )
+            }
+        };
+        report.entries.push(JournalEntry {
+            kind: JournalKind::RecentlyDeleted,
+            resource,
+            path: if entry_file_is_there(&entry_file) {
+                entry_file.display().to_string()
+            } else {
+                dir.display().to_string()
+            },
+            state,
+            outcome,
+            reason,
+            command: None,
+        });
+    }
+}
+
+/// A folder's own name, for the resource a marker covers when its record is unreadable.
+fn name_of(dir: &Path) -> String {
+    dir.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string())
+}
+
+/// Read a JSON file: `None` when it is not there, an error when it cannot be read or parsed.
+fn read_json<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> std::result::Result<Option<T>, String> {
+    match probe(path) {
+        Probe::Absent => Ok(None),
+        Probe::CantTell(error) => Err(format!(
+            "{} could not be examined ({error})",
+            path.display()
+        )),
+        Probe::Present(kind) if kind != PresentKind::File && kind != PresentKind::Symlink => {
+            Err(format!("{} is not a file", path.display()))
+        }
+        Probe::Present(_) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|error| format!("{} could not be read ({error})", path.display()))?;
+            serde_json::from_str(&text)
+                .map(Some)
+                .map_err(|error| format!("{} is not readable JSON ({error})", path.display()))
+        }
+    }
+}
+
+/// Whether an entry's own record is a readable file, for naming the path the report points at.
+fn entry_file_is_there(path: &Path) -> bool {
+    matches!(probe(path), Probe::Present(PresentKind::File))
 }

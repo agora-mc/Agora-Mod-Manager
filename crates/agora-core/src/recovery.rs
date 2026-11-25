@@ -699,13 +699,23 @@ impl RecoveryOutcome {
 pub enum ReadOnlyDecision<S> {
     /// No journal: nothing to do, nothing to report.
     Nothing,
-    /// The operation's lock is held, or its recorded writer may still be running.
+    /// The operation's lock is held — or could not be asked about — or its recorded writer may
+    /// still be running.
     Busy(String),
     /// Something about this journal cannot be decided safely, with the reason.
     NeedsHand(String),
     /// Recovery *would* act on this journal, through the capability [`decide`] would hand out. The
-    /// journal is the one that was validated; nothing here can act on it.
-    WouldAct(Box<Journal<S>>),
+    /// journal is the one that was validated, with the paths whose proof did not match: recovery
+    /// leaves those alone, and a handler refuses to act while any is there. Nothing here can act.
+    WouldAct(Box<Journal<S>>, Vec<(PathBuf, String)>),
+}
+
+/// The reason a handler gives when it cannot tell whether the writer is still running.
+fn liveness_hand(reason: &str) -> String {
+    format!(
+        "The journal cannot say whether the operation is still running: {reason}. Nothing was \
+         changed; the journal was kept."
+    )
 }
 
 /// Who holds a lock, in words for a report.
@@ -794,6 +804,8 @@ pub(crate) fn decide_reading<S: JournalState>(
     match examine(resource, read(), proof, view, None) {
         Examined::Nothing => Decision::Nothing,
         Examined::Busy(why) => Decision::Busy(why),
+        // Acting on "could not tell" is worse than not acting: the handler gets a hand.
+        Examined::CantTellLiveness(why) => Decision::NeedsHand(liveness_hand(&why)),
         Examined::NeedsHand(why) => Decision::NeedsHand(why),
         Examined::Ready(ready) => Decision::Act(Box::new(RecoveryCapability::under(
             LockHold::Owned(lock),
@@ -811,12 +823,14 @@ pub(crate) fn decide_reading<S: JournalState>(
 ///
 /// * the operation's lock is **probed**, not taken: a held lock is [`ReadOnlyDecision::Busy`], and
 ///   the lock file, its directory and its owner record are left exactly as they were;
-/// * a lock that cannot be asked at all is [`ReadOnlyDecision::NeedsHand`], because a journal whose
-///   owner cannot be asked about may still be running.
+/// * a lock that cannot be asked at all is also [`ReadOnlyDecision::Busy`]: a journal whose owner
+///   cannot be asked about may still be running, and "may still be running" is what busy says.
 ///
-/// A writer that may still be alive, or a liveness answer of "could not tell", is
-/// [`ReadOnlyDecision::Busy`] or [`ReadOnlyDecision::NeedsHand`] respectively — never
-/// [`ReadOnlyDecision::WouldAct`]. `view` is the process table the writer's liveness is read from.
+/// A writer that may still be alive is busy; a liveness answer of "could not tell" is busy too, for
+/// the same reason — never [`ReadOnlyDecision::WouldAct`]. A caller that must *act* turns "could not
+/// tell" into a hand instead ([`Examined::CantTellLiveness`]), because acting on an unknown is
+/// worse than not acting; a report only has to be honest that the operation may be running. `view`
+/// is the process table the writer's liveness is read from.
 pub fn decide_readonly<S: JournalState>(
     locks: &LockManager,
     resource: &LockResource,
@@ -828,17 +842,23 @@ pub fn decide_readonly<S: JournalState>(
         LockProbe::Held(metadata) => {
             ReadOnlyDecision::Busy(holder_text(resource, metadata.as_ref()))
         }
-        LockProbe::CantTell(why) => ReadOnlyDecision::NeedsHand(format!(
-            "Agora could not tell whether another operation holds this journal's lock, so it will \
-             not say what recovery would do: {why}. Nothing was changed."
+        LockProbe::CantTell(why) => ReadOnlyDecision::Busy(format!(
+            "Agora could not tell whether another operation holds this journal's lock, so the \
+             operation may still be running: {why}. Nothing was changed."
         )),
         LockProbe::Free => match examine(resource, read(), proof, view, None) {
             Examined::Nothing => ReadOnlyDecision::Nothing,
             Examined::Busy(why) => ReadOnlyDecision::Busy(why),
+            // The operation may still be running, which is what a report says "busy" for.
+            Examined::CantTellLiveness(why) => ReadOnlyDecision::Busy(format!(
+                "The journal cannot say whether the operation is still running, so it may still be \
+                 going: {why}. Nothing was changed."
+            )),
             Examined::NeedsHand(why) => ReadOnlyDecision::NeedsHand(why),
             // The journal is valid, its writer is gone and its paths are proven, so [`decide`]
-            // would hand out a capability. This caller gets the journal, not the capability.
-            Examined::Ready(ready) => ReadOnlyDecision::WouldAct(ready.journal),
+            // would hand out a capability. This caller gets what the decision learned — the
+            // journal and the paths whose proof did not match — and nothing it can act with.
+            Examined::Ready(ready) => ReadOnlyDecision::WouldAct(ready.journal, ready.left_alone),
         },
     }
 }
@@ -885,6 +905,7 @@ pub(crate) fn decide_holding_reading<'a, S: JournalState>(
              does not agree with the lock; nothing was changed and the journal was kept."
         )),
         Examined::NeedsHand(why) => Decision::NeedsHand(why),
+        Examined::CantTellLiveness(why) => Decision::NeedsHand(liveness_hand(&why)),
         Examined::Ready(ready) => Decision::Act(Box::new(RecoveryCapability::under(
             LockHold::Borrowed(lock),
             journal_path,
@@ -900,6 +921,9 @@ enum Examined<S> {
     /// [`Decision::Busy`]; a caller that already held it treats it as a hand, because its own lock
     /// rules out a live writer and the record therefore contradicts itself.
     Busy(String),
+    /// The journal cannot say whether its writer is still running. A caller that must act needs a
+    /// hand; a report says busy, because the operation may be running.
+    CantTellLiveness(String),
     NeedsHand(String),
     Ready(Ready<S>),
 }
@@ -959,12 +983,7 @@ fn examine<S: JournalState>(
                  may still be going. Nothing was changed."
             ));
         }
-        WriterLiveness::CantTell(reason) => {
-            return Examined::NeedsHand(format!(
-                "The journal cannot say whether the operation is still running: {reason}. Nothing \
-                 was changed; the journal was kept."
-            ))
-        }
+        WriterLiveness::CantTell(reason) => return Examined::CantTellLiveness(reason),
         WriterLiveness::Gone => {}
     }
 
