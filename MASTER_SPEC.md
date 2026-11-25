@@ -539,20 +539,42 @@ The `local_state.db` database is created on first run and is never replaced by t
 
 Stores: active sidebar tab, last-selected Minecraft version, JVM defaults, UI theme, notification preferences, telemetry opt-in, MCP server port, cached registry release tag, Modrinth integration toggle, AI/MCP integration toggle.
 
-#### Table: `user_instances`
+#### Table: `instances`
+One row per instance, whatever game it belongs to (§32.7). A Minecraft instance also has a
+`minecraft_instances` row, and every other game's instance a `game_instance_bases` row; both are
+keyed by `instance_id` and cascade with it. Every other table that refers to an instance points
+here.
+
 | Column | Type | Description |
 |---|---|---|
 | `instance_id` | TEXT | PRIMARY KEY (e.g., `"my-survival-pack"`) |
+| `game` | TEXT | Game id: `minecraft`, `skyrim-se`, another package's id |
 | `name` | TEXT | User-chosen display name |
+| `created_at` | TEXT | ISO timestamp |
+| `last_launched_at` | TEXT | ISO timestamp; used for crash detection |
+| `total_play_ms` | INTEGER | Lifetime time in the game, in milliseconds |
+| `last_played_at` | TEXT | ISO timestamp of the last session's end |
+
+#### Table: `minecraft_instances` (Minecraft's columns)
+| Column | Type | Description |
+|---|---|---|
+| `instance_id` | TEXT | PRIMARY KEY, references `instances` |
 | `minecraft_version` | TEXT | |
 | `loader` | TEXT | `fabric`, `neoforge`, `quilt`, `forge` |
 | `loader_version` | TEXT | |
 | `is_modpack` | BOOLEAN | Built from a curated pack manifest? |
 | `is_locked` | BOOLEAN | 1 = immutable manifest enforced |
-| `last_launched_at` | TEXT | ISO timestamp; used for crash detection |
 | `jvm_memory_mb` | INTEGER | User-selected RAM allocation in MB |
 | `jvm_gc` | TEXT | `g1gc`, `zgc`, `shenandoah`, `custom` |
 | `jvm_custom_args` | TEXT | Extra JVM flags from text box |
+| `java_path` | TEXT | Per-instance Java override |
+| `icon_path` | TEXT | Agora-owned relative icon path |
+
+#### Table: `game_instance_bases` (any other game's base record)
+| Column | Type | Description |
+|---|---|---|
+| `instance_id` | TEXT | PRIMARY KEY, references `instances` |
+| `base_json` | TEXT | The instance's `BaseReference` |
 
 *Note: Detailed per-mod state lives in each instance's `instance_manifest.json` file rather than SQLite, for exportability and simplicity.*
 

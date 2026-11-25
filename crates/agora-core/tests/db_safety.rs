@@ -650,11 +650,9 @@ fn a_database_written_by_todays_schema_migrates_cleanly() {
     {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
-            "INSERT INTO instances (instance_id, game, name)
-             VALUES ('kept-instance', 'minecraft', 'Kept');
-             INSERT INTO minecraft_instances
-                 (instance_id, minecraft_version, loader, loader_version)
-             VALUES ('kept-instance', '1.21', 'vanilla', '');",
+            "INSERT INTO user_instances (instance_id, name, minecraft_version, loader,
+                                         loader_version)
+             VALUES ('kept-instance', 'Kept', '1.21', 'vanilla', '');",
         )
         .unwrap();
     }

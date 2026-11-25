@@ -542,11 +542,7 @@ fn write_instance(ctx: &CoreContext, manifest: &GameInstanceManifest) -> PathBuf
     conn.execute(
         "INSERT INTO instances (instance_id, game, name, created_at, total_play_ms)
          VALUES (?1, ?2, ?3, '2026-11-06T00:00:00Z', 0)",
-        rusqlite::params![
-            manifest.instance_id,
-            manifest.game.as_str(),
-            manifest.name,
-        ],
+        rusqlite::params![manifest.instance_id, manifest.game.as_str(), manifest.name,],
     )
     .unwrap();
     conn.execute(

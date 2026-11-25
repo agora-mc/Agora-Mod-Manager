@@ -2452,11 +2452,8 @@ mod tests {
         .unwrap();
         let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
 
-        conn.execute(
-            "DELETE FROM instances WHERE instance_id = 'skyrim'",
-            [],
-        )
-        .unwrap();
+        conn.execute("DELETE FROM instances WHERE instance_id = 'skyrim'", [])
+            .unwrap();
         conn.execute("DELETE FROM instances WHERE instance_id = 'mc'", [])
             .unwrap();
         assert_eq!(

@@ -2050,10 +2050,12 @@ fn migrate_v23(conn: &Connection) -> anyhow::Result<()> {
     // promise that history cannot outlive the instance (deleting either kind of instance
     // deletes its rows and manifests). Manifests are stored once per distinct manifest.
     // The triggers go first: replaying this step over a database that already has them would
-    // otherwise fail when the table they name is dropped.
+    // otherwise fail when the table they name is dropped. That includes step 31's trigger on
+    // `instances`, which names `launch_history` too and is put back at the end of the step.
     conn.execute_batch(
         "DROP TRIGGER IF EXISTS launch_history_minecraft_instance_gone;
          DROP TRIGGER IF EXISTS launch_history_game_instance_gone;
+         DROP TRIGGER IF EXISTS launch_history_instance_gone;
          DROP TABLE IF EXISTS launch_history_v23;
          CREATE TABLE launch_history_v23 (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2107,7 +2109,29 @@ fn migrate_v23(conn: &Connection) -> anyhow::Result<()> {
              DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
          END;",
     )?;
+    // Put back the promise on the one identity table when this step is replayed over a
+    // database that step 31 already migrated.
+    if table_exists(conn, "instances")? {
+        conn.execute_batch(instance_delete_trigger())?;
+    }
     Ok(())
+}
+
+/// The trigger that keeps an instance's history from outliving it, on the one identity table.
+///
+/// Step 31 creates it; step 23 puts it back when it is replayed over a database that step 31
+/// already migrated (the migration tests replay history that way).
+fn instance_delete_trigger() -> &'static str {
+    "CREATE TRIGGER IF NOT EXISTS launch_history_instance_gone
+         AFTER DELETE ON instances
+     BEGIN
+         DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+         DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+         DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
+         DELETE FROM crash_log_results WHERE instance_id = OLD.instance_id;
+         DELETE FROM crash_save_backups WHERE instance_id = OLD.instance_id;
+         DELETE FROM plugin_load_order_rules WHERE instance_id = OLD.instance_id;
+     END;"
 }
 
 fn migrate_v24(conn: &Connection) -> anyhow::Result<()> {
@@ -3738,6 +3762,22 @@ mod tests {
         (conn, path)
     }
 
+    /// Helper: a database as an earlier release wrote it, for a test that replays a step.
+    ///
+    /// Replaying a step means deleting its version row, which only describes a database that
+    /// predates that step's successor: an old step cannot be re-run over a schema whose tables
+    /// it no longer has.
+    fn test_db_at(version: i64) -> (Connection, PathBuf) {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("agora-test-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test db folder");
+        let path = dir.join("local_state.db");
+        let conn = Connection::open(&path).expect("failed to open test db");
+        run_migrations_to(&conn, version).expect("failed to build the old test db");
+        (conn, path)
+    }
+
     fn a_good_step(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch("CREATE TABLE kept (value TEXT); INSERT INTO kept VALUES ('yes');")?;
         Ok(())
@@ -3890,7 +3930,7 @@ mod tests {
     fn retiring_curated_only_keeps_live_browsing_off() {
         // Someone who had switched curated-only on wanted no live third-party
         // browsing. Dropping the switch must not hand that back to them.
-        let (conn, path) = test_db();
+        let (conn, path) = test_db_at(30);
         set_setting(&conn, "browse_curated_only", &serde_json::json!(true)).unwrap();
         set_setting(&conn, "modrinth_enabled", &serde_json::json!(true)).unwrap();
         set_setting(&conn, "technic_enabled", &serde_json::json!(true)).unwrap();
@@ -3915,7 +3955,7 @@ mod tests {
     fn retiring_curated_only_leaves_an_opted_in_user_alone() {
         // Curated-only off means the per-source toggles were already the whole
         // story; they must survive the key being dropped.
-        let (conn, path) = test_db();
+        let (conn, path) = test_db_at(30);
         set_setting(&conn, "browse_curated_only", &serde_json::json!(false)).unwrap();
         set_setting(&conn, "modrinth_enabled", &serde_json::json!(true)).unwrap();
         conn.execute("DELETE FROM schema_version WHERE version >= 10", [])
@@ -4355,7 +4395,7 @@ mod tests {
 
         // Verify java columns exist
         let cols: Vec<String> = conn
-            .prepare("PRAGMA table_info(user_instances)")
+            .prepare("PRAGMA table_info(minecraft_instances)")
             .unwrap()
             .query_map([], |row| row.get::<_, String>(1))
             .unwrap()

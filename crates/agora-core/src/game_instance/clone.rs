@@ -307,7 +307,7 @@ pub fn clone_instance(
 
     // The identity row and the base record it is keyed from go together: a clone whose pin
     // was not published would look like an instance nothing pins.
-    let inserted = (|| -> anyhow::Result<()> {
+    let inserted = (|| -> Result<(), InstanceError> {
         conn.execute(
             "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
              VALUES (?1, ?2, ?3, datetime('now'), NULL)",
@@ -321,7 +321,7 @@ pub fn clone_instance(
     })();
     if let Err(error) = inserted {
         rollback(clone_save_folder.as_deref());
-        return Err(error.into());
+        return Err(error);
     }
 
     Ok(ClonedInstance {

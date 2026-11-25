@@ -327,18 +327,17 @@ fn remove_base_refuses_pinned_base_naming_instances_and_succeeds_after_both_dele
 }
 
 #[test]
-fn delete_refuses_id_that_only_exists_in_user_instances_and_leaves_folder_alone() {
+fn delete_refuses_a_minecraft_instance_and_leaves_its_folder_alone() {
     let tmp = TempDir::new().unwrap();
     let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
     agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
 
     let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-    conn.execute(
+    conn.execute_batch(
         "INSERT INTO instances (instance_id, game, name)
          VALUES ('mc-vanilla', 'minecraft', 'Vanilla MC');
          INSERT INTO minecraft_instances (instance_id, minecraft_version, loader, loader_version)
-         VALUES ('mc-vanilla', '1.21', 'vanilla', '')",
-        [],
+         VALUES ('mc-vanilla', '1.21', 'vanilla', '');",
     )
     .unwrap();
 

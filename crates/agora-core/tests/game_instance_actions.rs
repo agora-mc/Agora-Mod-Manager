@@ -853,11 +853,15 @@ fn a_delete_cut_off_before_the_row_went_can_still_be_restored() {
         .expect("a connection");
     conn.execute(
         "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
-         VALUES ('grounded-1', 'skyrim-se', 'Grounded', datetime('now'), NULL);
-         INSERT INTO game_instance_bases (instance_id, base_json) VALUES ('grounded-1', ?1)",
-        [serde_json::to_string(&source.base).expect("a base")],
+         VALUES ('grounded-1', 'skyrim-se', 'Grounded', datetime('now'), NULL)",
+        [],
     )
     .expect("the stale row");
+    conn.execute(
+        "INSERT INTO game_instance_bases (instance_id, base_json) VALUES ('grounded-1', ?1)",
+        [serde_json::to_string(&source.base).expect("a base")],
+    )
+    .expect("the stale row's base");
 
     let restored = trash::restore(&f.ctx, &entry_id, None);
     assert!(
@@ -1220,8 +1224,12 @@ fn a_committed_restore_cut_off_before_tidy_is_tidied_without_rewriting() {
         .expect("a connection");
     conn.execute(
         "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
-         VALUES ('grounded-1', 'skyrim-se', 'Renamed', datetime('now'), NULL);
-         INSERT INTO game_instance_bases (instance_id, base_json) VALUES ('grounded-1', ?1)",
+         VALUES ('grounded-1', 'skyrim-se', 'Renamed', datetime('now'), NULL)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO game_instance_bases (instance_id, base_json) VALUES ('grounded-1', ?1)",
         [serde_json::to_string(&manifest("grounded-1", "Grounded").base).unwrap()],
     )
     .unwrap();
@@ -1258,11 +1266,8 @@ fn a_stale_restore_marker_does_not_claim_a_reused_destination() {
     let before = std::fs::read(foreign.join("instance_manifest.json")).unwrap();
     let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db())
         .expect("a connection");
-    conn.execute(
-        "DELETE FROM instances WHERE instance_id = 'target-id'",
-        [],
-    )
-    .unwrap();
+    conn.execute("DELETE FROM instances WHERE instance_id = 'target-id'", [])
+        .unwrap();
     drop(conn);
 
     // A different instance whose restore was cut off after the files moved out of the entry.

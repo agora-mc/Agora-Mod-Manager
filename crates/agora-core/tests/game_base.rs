@@ -1082,10 +1082,7 @@ fn a_rebuild_refuses_when_an_instance_moves_to_trash_before_the_pin_recheck() {
     .unwrap();
     conn.execute(
         "INSERT INTO game_instance_bases (instance_id, base_json) VALUES (?1, ?2)",
-        rusqlite::params![
-            "pinned-instance",
-            serde_json::to_string(&base_ref).unwrap()
-        ],
+        rusqlite::params!["pinned-instance", serde_json::to_string(&base_ref).unwrap()],
     )
     .unwrap();
 

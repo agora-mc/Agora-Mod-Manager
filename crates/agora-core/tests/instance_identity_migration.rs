@@ -96,9 +96,11 @@ fn count(conn: &Connection, sql: &str) -> i64 {
 }
 
 fn version(conn: &Connection) -> i64 {
-    conn.query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |r| {
-        r.get(0)
-    })
+    conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+        [],
+        |r| r.get(0),
+    )
     .unwrap()
 }
 
@@ -117,8 +119,14 @@ fn every_row_survives_the_migration_with_its_references() {
 
     let conn = local_state_connection(&path).unwrap();
     assert_eq!(version(&conn), LOCAL_STATE_SCHEMA_VERSION);
-    assert!(!table_exists(&conn, "user_instances"), "the old table is gone");
-    assert!(!table_exists(&conn, "game_instances"), "the old table is gone");
+    assert!(
+        !table_exists(&conn, "user_instances"),
+        "the old table is gone"
+    );
+    assert!(
+        !table_exists(&conn, "game_instances"),
+        "the old table is gone"
+    );
 
     // One identity row per instance, whatever game it belongs to.
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM instances"), 2);
@@ -262,7 +270,11 @@ fn a_colliding_id_stops_the_migration_and_keeps_the_old_database() {
 
     // Nothing was changed: the old tables, their rows and the recorded version are intact.
     let conn = Connection::open(&path).unwrap();
-    assert_eq!(version(&conn), 30, "the last good version is still recorded");
+    assert_eq!(
+        version(&conn),
+        30,
+        "the last good version is still recorded"
+    );
     assert!(table_exists(&conn, "user_instances"));
     assert!(table_exists(&conn, "game_instances"));
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM user_instances"), 1);
@@ -285,10 +297,8 @@ fn an_interrupted_migration_leaves_the_old_database_usable() {
     // crash mid-step would leave if the step were not one transaction.
     {
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
-            "CREATE VIEW instance_imports_v31 AS SELECT 1 AS instance_id;",
-        )
-        .unwrap();
+        conn.execute_batch("CREATE VIEW instance_imports_v31 AS SELECT 1 AS instance_id;")
+            .unwrap();
     }
 
     let error = init_local_state_db(&path).expect_err("the rebuild cannot finish");
@@ -300,7 +310,10 @@ fn an_interrupted_migration_leaves_the_old_database_usable() {
 
     let conn = Connection::open(&path).unwrap();
     assert_eq!(version(&conn), 30, "the version is not advanced");
-    assert!(table_exists(&conn, "user_instances"), "the old table is back");
+    assert!(
+        table_exists(&conn, "user_instances"),
+        "the old table is back"
+    );
     assert_eq!(
         count(&conn, "SELECT COUNT(*) FROM user_instances"),
         1,
@@ -314,7 +327,8 @@ fn an_interrupted_migration_leaves_the_old_database_usable() {
     drop(conn);
     {
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("DROP VIEW instance_imports_v31;").unwrap();
+        conn.execute_batch("DROP VIEW instance_imports_v31;")
+            .unwrap();
     }
     init_local_state_db(&path).expect("the retried migration runs");
     let conn = Connection::open(&path).unwrap();
@@ -334,7 +348,10 @@ fn deleting_one_instance_removes_its_rows_and_only_those() {
 
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM instances"), 1);
     assert_eq!(
-        count(&conn, "SELECT COUNT(*) FROM instances WHERE instance_id = 'skyrim-pack'"),
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM instances WHERE instance_id = 'skyrim-pack'"
+        ),
         1
     );
     // Everything that belonged to the deleted instance went with it: the detail row by
@@ -445,8 +462,11 @@ fn a_game_instance_still_restores_from_recently_deleted_after_the_migration() {
         serde_json::to_vec_pretty(&entry_json).unwrap(),
     )
     .unwrap();
-    conn.execute("DELETE FROM instances WHERE instance_id = 'skyrim-pack'", [])
-        .unwrap();
+    conn.execute(
+        "DELETE FROM instances WHERE instance_id = 'skyrim-pack'",
+        [],
+    )
+    .unwrap();
     assert_eq!(
         count(&conn, "SELECT COUNT(*) FROM game_instance_bases"),
         0,
