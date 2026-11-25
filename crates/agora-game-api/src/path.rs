@@ -739,6 +739,8 @@ fn link_from_metadata(path: &Path, metadata: &std::fs::Metadata) -> Result<bool,
     }
     #[cfg(not(windows))]
     {
+        // Only Windows needs the path, to read the reparse tag.
+        let _ = path;
         Ok(metadata.file_type().is_symlink())
     }
 }
