@@ -421,8 +421,9 @@ fn trusted_bases_root(
     base_manifest: &BaseManifest,
     base_id: &str,
 ) -> Result<PathBuf, DeployError> {
-    let folder = crate::game_base::trusted_base_folder(&ctx.paths, base_manifest, base_id)
-        .map_err(|error| DeployError::Other(error.to_string()))?;
+    let (folder, _resolved) =
+        crate::game_base::trusted_base_folder(&ctx.paths, base_manifest, base_id)
+            .map_err(|error| DeployError::Other(error.to_string()))?;
     folder
         .parent()
         .map(Path::to_path_buf)

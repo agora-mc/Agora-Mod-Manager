@@ -1516,16 +1516,17 @@ fn proven_two_folders(one: &Path, other: &Path) -> bool {
 /// The folder a record names, or a refusal: it has to be a base folder Agora made, and it may not
 /// be the install it was built from.
 ///
-/// The record matches by **spelling**, as it always has: a record whose `location` is some other
-/// path that happens to resolve to the base folder — an alias, a link, a junction — is not a record
-/// Agora wrote, and deleting through it is exactly what this refuses. The overlap with the source
-/// install is then checked on **resolved** values, because a source install that is a link to the
-/// base folder overlaps it even though no spelling of it looks like the base's.
+/// Ownership is **resolved identity**, not spelling: a record whose `location` is an alias of one
+/// of Agora's base folders — the same folder through a link or a junction — names that folder,
+/// because the folder is what a caller acts on. Two answers, and one concrete one: the folder as
+/// spelled, and that same folder resolved once, which is the value a caller about to delete must
+/// use. A location that only differs in spelling from a base folder Agora never made, or a pair
+/// that cannot be resolved at all, is refused.
 pub(crate) fn trusted_base_folder(
     paths: &AppPaths,
     manifest: &BaseManifest,
     base_id: &str,
-) -> Result<PathBuf, BaseError> {
+) -> Result<(PathBuf, PathBuf), BaseError> {
     let refuse = |why: &str| {
         BaseError::Other(format!(
             "refusing to remove {}: the record for base {base_id} {why}",
@@ -1540,7 +1541,12 @@ pub(crate) fn trusted_base_folder(
     let folder = roots
         .iter()
         .map(|root| root.join(base_id))
-        .find(|candidate| agora_game_api::same_spelling(candidate, &manifest.location))
+        .find(|candidate| {
+            matches!(
+                agora_game_api::compare_folder(candidate, &manifest.location),
+                agora_game_api::PathRelation::Same
+            )
+        })
         .ok_or_else(|| refuse("does not point at a base folder Agora made"))?;
     let folder_real = resolved_for_removal(&folder).map_err(|why| {
         refuse(&format!(
@@ -1558,7 +1564,7 @@ pub(crate) fn trusted_base_folder(
     if overlaps_source {
         return Err(refuse("points at the install it was built from"));
     }
-    Ok(folder)
+    Ok((folder, folder_real))
 }
 
 /// A path resolved once, for a decision about deleting it: the part that exists is canonicalized and
@@ -1819,9 +1825,11 @@ pub(crate) fn remove_base_with(
     let text = std::fs::read_to_string(&manifest_path)?;
     match serde_json::from_str::<BaseManifest>(&text) {
         Ok(manifest) => {
-            let folder = trusted_base_folder(paths, &manifest, base_id)?;
-            if folder.exists() {
-                std::fs::remove_dir_all(&folder)?;
+            // Delete the value that was checked: the folder resolved once, not the spelling the
+            // record happened to use.
+            let (_folder, resolved) = trusted_base_folder(paths, &manifest, base_id)?;
+            if resolved.exists() {
+                std::fs::remove_dir_all(&resolved)?;
             }
             let _ = std::fs::remove_file(&manifest_path);
             Ok(())

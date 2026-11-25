@@ -2253,9 +2253,10 @@ fn link_folder(link: &std::path::Path, target: &std::path::Path) {
 }
 
 #[test]
-fn a_record_that_reaches_the_base_through_a_link_is_refused() {
+fn a_record_that_names_the_base_through_a_link_removes_the_folder_it_resolved_to() {
     // The record's `location` is a link to the base folder rather than the folder Agora made. That
-    // is not a record Agora wrote, and deleting through it is exactly what removal must not do.
+    // is one folder written another way, and ownership is decided on resolved identity, so the
+    // removal takes the folder it resolved to — once, at its real name — and not the link.
     let tmp = TempDir::new().unwrap();
     let (paths, root, base_id) = build_in_other_root(&tmp, "alias");
     let real = root.join(&base_id);
@@ -2273,14 +2274,15 @@ fn a_record_that_reaches_the_base_through_a_link_is_refused() {
     )
     .unwrap();
 
+    remove_base(&paths, &base_id).expect("the record names the base folder, through a link");
     assert!(
-        remove_base(&paths, &base_id).is_err(),
-        "a record that only reaches the base through a link must be refused"
+        !real.exists(),
+        "the folder the link resolved to is the one removed"
     );
-    assert_eq!(
-        std::fs::read(real.join("keep.txt")).unwrap(),
-        b"keep me",
-        "the base folder Agora made survives"
+    assert!(!manifest_path.exists(), "the record goes with it");
+    assert!(
+        std::fs::symlink_metadata(&alias).is_ok() && !alias.exists(),
+        "the link itself is left alone and dangles"
     );
 }
 
