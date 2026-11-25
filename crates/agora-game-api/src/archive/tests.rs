@@ -639,3 +639,53 @@ fn a_rar_reader_that_cannot_list_is_fail_closed() {
         other => panic!("unexpected error {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// A caller's own rule
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_callers_rule_can_leave_entries_out_and_the_reason_comes_back() {
+    let (dir, dest) = extract_dir();
+    let mut archive = SafeArchive::open_bytes(
+        zip_bytes(&[("config/a.toml", b"a"), ("mods/b.jar", b"b")]),
+        ArchiveLimits::PACK,
+    )
+    .unwrap();
+    let report = archive
+        .extract_where(&dest, NamePolicy::Refuse, &mut |name| {
+            if name.starts_with("config/") {
+                Select::Write
+            } else {
+                Select::LeaveOut("not in a folder this importer accepts".to_string())
+            }
+        })
+        .unwrap();
+    assert_eq!(report.written, vec!["config/a.toml".to_string()]);
+    assert_eq!(report.skipped.len(), 1);
+    assert_eq!(report.skipped[0].name, "mods/b.jar");
+    assert!(report.skipped[0].reason.contains("not in a folder"));
+    drop(dir);
+}
+
+#[test]
+fn a_callers_rule_can_refuse_the_whole_extraction() {
+    let (dir, dest) = extract_dir();
+    let mut archive = SafeArchive::open_bytes(
+        zip_bytes(&[("config/a.toml", b"a"), ("config/setup.exe", b"b")]),
+        ArchiveLimits::PACK,
+    )
+    .unwrap();
+    let error = archive
+        .extract_where(&dest, NamePolicy::Refuse, &mut |name| {
+            if name.ends_with(".exe") {
+                Select::Refuse("an executable has no place in a config folder".to_string())
+            } else {
+                Select::Write
+            }
+        })
+        .unwrap_err();
+    assert!(matches!(error, ArchiveError::Refused { .. }), "{error:?}");
+    assert!(error.to_string().contains("config/setup.exe"));
+    drop(dir);
+}

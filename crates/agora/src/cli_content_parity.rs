@@ -320,7 +320,16 @@ pub enum PackParityCmd {
     /// Extract a pack's overrides zip into an instance, with the same safety checks an import
     /// uses (allowed folders only, size limits, no path tricks).
     #[command(name = "extract-overrides")]
-    ExtractOverrides { instance: String, zip: PathBuf },
+    ExtractOverrides {
+        instance: String,
+        zip: PathBuf,
+        /// Extract the entries that can be written and list the ones left out, instead of refusing
+        /// the whole archive. An entry whose name a disk cannot hold (a Windows reserved name, a
+        /// trailing dot or space, a case collision) stops the extraction by default, and the refusal
+        /// names every offending entry and why.
+        #[arg(long)]
+        without_unwritable_names: bool,
+    },
     /// Install a catalog entry that pins one version of a content provider's modpack, as a new
     /// instance.
     #[command(name = "install-catalog")]
@@ -421,9 +430,23 @@ pub async fn run_pack(
                 .collect();
             print_table(&["Mod", "Version", "Source", "Status"], &table);
         }
-        PackParityCmd::ExtractOverrides { instance, zip } => {
+        PackParityCmd::ExtractOverrides {
+            instance,
+            zip,
+            without_unwritable_names,
+        } => {
             let dest = require_instance(ctx, &instance)?;
-            let result = agora_game_minecraft::override_sanitizer::extract_overrides(&zip, &dest)?;
+            let names = if without_unwritable_names {
+                agora_game_api::NamePolicy::WithoutThem
+            } else {
+                agora_game_api::NamePolicy::Refuse
+            };
+            let result = agora_game_minecraft::override_sanitizer::extract_overrides_with_inputs(
+                &zip,
+                &dest,
+                agora_game_minecraft::override_sanitizer::OverridePolicy::from_settings(ctx),
+                names,
+            )?;
             if json {
                 return print_json(&result);
             }
@@ -432,10 +455,10 @@ pub async fn run_pack(
                 result.extracted.len(),
                 result.total_bytes_written
             );
-            if !result.skipped.is_empty() {
-                println!("Skipped (not allowed in an instance):");
-                for path in &result.skipped {
-                    println!("  {path}");
+            if !result.left_out.is_empty() {
+                println!("Left out:");
+                for entry in &result.left_out {
+                    println!("  {} - {}", entry.path, entry.reason);
                 }
             }
         }

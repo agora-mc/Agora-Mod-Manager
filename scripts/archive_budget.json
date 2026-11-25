@@ -10,7 +10,6 @@
     "crates/agora-game-minecraft/src/installed_profile.rs": 1,
     "crates/agora-game-minecraft/src/jar_metadata.rs": 6,
     "crates/agora-game-minecraft/src/launch_planner.rs": 1,
-    "crates/agora-game-minecraft/src/override_sanitizer.rs": 1,
     "crates/agora-game-minecraft/src/pack_update.rs": 3,
     "crates/agora-game-minecraft/src/runtime_manager.rs": 3,
     "crates/agora-game-minecraft/src/server_export.rs": 1,

@@ -630,7 +630,15 @@ export interface RegistryStatus {
 export interface ExtractionResult {
   extracted: string[];
   skipped: string[];
+  /** The same entries as `skipped`, each with the reason it was left out. */
+  left_out: LeftOutEntry[];
   total_bytes_written: number;
+}
+
+/** One entry a pack import did not write, and why. */
+export interface LeftOutEntry {
+  path: string;
+  reason: string;
 }
 
 export interface CreateInstanceRequest {
@@ -1265,8 +1273,24 @@ export interface ConnectivitySnapshot {
 }
 export const getConnectivityStatus = () =>
   invoke<ConnectivitySnapshot>('get_connectivity_status');
-export const extractOverrides = (zipPath: string, instanceId: string) =>
-  invoke<ExtractionResult>('extract_overrides', { zipPath, instanceId });
+/**
+ * Extract a pack's overrides into an instance.
+ *
+ * An entry whose name a disk cannot hold (a Windows reserved name, a trailing dot or space, a case
+ * collision) stops the extraction by default, and the error names each one. Pass
+ * `withoutUnwritableNames` to write the usable entries instead: the entries left out come back in
+ * `leftOut`, so the screen can list them and the person who asked knows what they gave up.
+ */
+export const extractOverrides = (
+  zipPath: string,
+  instanceId: string,
+  withoutUnwritableNames = false,
+) =>
+  invoke<ExtractionResult>('extract_overrides', {
+    zipPath,
+    instanceId,
+    withoutUnwritableNames,
+  });
 
 export type ControlifyOfferDecision =
   | 'offer'

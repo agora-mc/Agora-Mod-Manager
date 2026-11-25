@@ -191,6 +191,22 @@ pub struct ExtractReport {
     pub bytes_written: u64,
 }
 
+/// What an extraction does with one entry, when the caller has a rule of its own.
+///
+/// A caller's rules — a pack's whitelist of folders, a rule that only the top-level file is taken —
+/// are not the reader's business, but they must not become a second place where paths are decided.
+/// So the caller answers with one of these, and the reader keeps doing the writing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Select {
+    /// Write it, under the reader's own name rules.
+    Write,
+    /// Leave it out, and tell the caller why. It comes back in [`ExtractReport::skipped`].
+    LeaveOut(String),
+    /// Refuse the whole extraction: this entry is not one the caller will accept at all. The
+    /// message is the reason.
+    Refuse(String),
+}
+
 /// What an extraction does with an entry whose name a disk cannot hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NamePolicy {
@@ -339,6 +355,13 @@ pub enum ArchiveError {
     /// An entry the archive says is a link.
     #[error("'{path}' entry '{entry}' is a link, which Agora never extracts")]
     LinkEntry { path: String, entry: String },
+    /// A caller's own rule refused an entry outright, so the whole extraction stops.
+    #[error("'{path}' entry '{entry}' is refused: {reason}")]
+    Refused {
+        path: String,
+        entry: String,
+        reason: String,
+    },
     /// The destination could not be used.
     #[error("cannot extract into '{path}': {reason}")]
     Destination { path: String, reason: String },
@@ -438,6 +461,8 @@ pub struct SafeArchive {
     entries: Vec<ArchiveEntry>,
     total_declared: u64,
     rar: Option<Box<dyn RarReader>>,
+    /// The paths the last extraction wrote, kept when it then failed, so a caller can clean up.
+    written_so_far: Vec<String>,
 }
 
 impl SafeArchive {
@@ -531,6 +556,7 @@ impl SafeArchive {
             entries: Vec::new(),
             total_declared: 0,
             rar,
+            written_so_far: Vec::new(),
         };
         let entries = archive.list()?;
         archive.entries = entries;
@@ -939,6 +965,22 @@ impl SafeArchive {
         dest: &Path,
         policy: NamePolicy,
     ) -> Result<ExtractReport, ArchiveError> {
+        self.extract_where(dest, policy, &mut |_| Select::Write)
+    }
+
+    /// [`SafeArchive::extract`] with the caller's own rule about which entries it wants. The rule
+    /// answers per entry (see [`Select`]); the reader still owns every path decision and every write,
+    /// so a caller's rule cannot become a second path validator.
+    ///
+    /// The entries a caller leaves out, and the entries whose names a disk cannot hold, both come
+    /// back in [`ExtractReport::skipped`] with their reasons, so nothing disappears quietly.
+    pub fn extract_where(
+        &mut self,
+        dest: &Path,
+        policy: NamePolicy,
+        select: &mut dyn FnMut(&str) -> Select,
+    ) -> Result<ExtractReport, ArchiveError> {
+        self.written_so_far.clear();
         let path = self.label();
         std::fs::create_dir_all(dest).map_err(|error| ArchiveError::Destination {
             path: dest.display().to_string(),
@@ -947,6 +989,9 @@ impl SafeArchive {
 
         let mut plan: Vec<(StrictRelPath, String, u64)> = Vec::new();
         let mut skipped: Vec<SkippedEntry> = Vec::new();
+        // Only the names a disk cannot hold make the refusal: an entry the caller's own rule leaves
+        // out is the caller's decision, and is reported rather than refused.
+        let mut unwritable: Vec<SkippedEntry> = Vec::new();
         for entry in &self.entries {
             match entry.kind {
                 EntryKind::Directory => continue,
@@ -958,8 +1003,23 @@ impl SafeArchive {
                 }
                 EntryKind::File => {}
             }
+            let wanted = select(&entry.name);
+            if let Select::Refuse(reason) = wanted {
+                return Err(ArchiveError::Refused {
+                    path: path.clone(),
+                    entry: entry.name.clone(),
+                    reason,
+                });
+            }
             match classify_entry_name(&entry.name) {
-                EntryName::Writable(strict) => plan.push((strict, entry.name.clone(), entry.size)),
+                EntryName::Writable(strict) => match wanted {
+                    Select::Write => plan.push((strict, entry.name.clone(), entry.size)),
+                    Select::LeaveOut(reason) => skipped.push(SkippedEntry {
+                        name: entry.name.clone(),
+                        reason,
+                    }),
+                    Select::Refuse(_) => unreachable!("answered above"),
+                },
                 EntryName::Escapes { reason } => {
                     return Err(ArchiveError::Escapes {
                         path: path.clone(),
@@ -967,10 +1027,14 @@ impl SafeArchive {
                         reason,
                     })
                 }
-                EntryName::Unwritable { reason } => skipped.push(SkippedEntry {
-                    name: entry.name.clone(),
-                    reason,
-                }),
+                EntryName::Unwritable { reason } => {
+                    let left_out = SkippedEntry {
+                        name: entry.name.clone(),
+                        reason,
+                    };
+                    unwritable.push(left_out.clone());
+                    skipped.push(left_out);
+                }
             }
         }
 
@@ -999,18 +1063,20 @@ impl SafeArchive {
                         });
                     };
                     let (_, name, _) = plan.remove(index);
-                    skipped.push(SkippedEntry {
+                    let left_out = SkippedEntry {
                         name,
                         reason: error.reason(),
-                    });
+                    };
+                    unwritable.push(left_out.clone());
+                    skipped.push(left_out);
                 }
             }
         }
 
-        if !skipped.is_empty() && policy == NamePolicy::Refuse {
+        if !unwritable.is_empty() && policy == NamePolicy::Refuse {
             return Err(ArchiveError::UnsafeNames {
                 path: path.clone(),
-                entries: skipped,
+                entries: unwritable,
             });
         }
 
@@ -1058,11 +1124,18 @@ impl SafeArchive {
             };
             let written = self.copy_entry(&name, declared, &mut out)?;
             remaining_total = remaining_total.saturating_sub(written);
+            self.written_so_far.push(strict.as_str().to_string());
             report.written.push(strict.as_str().to_string());
             report.bytes_written += written;
         }
         report.skipped = skipped;
         Ok(report)
+    }
+
+    /// The paths an extraction wrote, including a run that then failed: a caller that promises to
+    /// leave nothing behind after a refusal deletes these.
+    pub fn written_so_far(&self) -> &[String] {
+        &self.written_so_far
     }
 }
 
@@ -1368,8 +1441,7 @@ impl Write for Sink<'_> {
         let after = self.written.saturating_add(buffer.len() as u64);
         let over_declared = self.context.exact && after > self.context.declared;
         if over_declared || after > self.context.limit {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "entry delivered more bytes than it declared",
             ));
         }
@@ -1398,13 +1470,10 @@ impl Write for CountingFile<'_> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         let after = self.written.saturating_add(buffer.len() as u64);
         if after > self.remaining_total {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "extraction passed the {} bytes a {} archive may hold",
-                    self.preset_total, self.preset
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "extraction passed the {} bytes a {} archive may hold",
+                self.preset_total, self.preset
+            )));
         }
         if let Err(error) = self.file.write_all(buffer) {
             return Err(std::io::Error::new(

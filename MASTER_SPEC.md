@@ -5591,6 +5591,23 @@ three path comparators.
   so it carries Windows-only tests). Limits on entry count, total and per-entry size and compression
   ratio, in named presets (pack, backup, plugin package, jar metadata, runtime, mod archive), today's
   values carried over and listed.
+  - It lives in `agora-game-api::archive`, because core and the game packages both read archives and
+    neither may own the other (§26.12); `agora-game-api` may therefore depend on the four decoders
+    (`zip`, `sevenz-rust2`, `tar`, `flate2`) on the same terms as `regex` for the crash contract:
+    plain libraries, no runtime, already in the workspace.
+  - RAR has no usable in-process decoder, and starting a process is not this contract's job, so the
+    reader declares a `RarReader` seam that core fills in with Windows' own `tar.exe`. A RAR archive
+    read without one is an error, never an empty listing.
+  - An entry name is not a file name until something writes it. Extraction goes through `join_under`
+    and `validate_path_set`. A name that escapes the root (`..`, absolute, a drive letter) is always
+    refused; a name a disk cannot hold (a Windows reserved name, a trailing dot or space, `:`, an
+    illegal character, two names a case-insensitive disk stores as one) is refused by default with
+    every offending entry named, and a caller may instead extract without them, in which case they
+    come back in the result so the CLI and the desktop can list them. User-facing imports wire that
+    opt-in (`agora pack extract-overrides --without-unwritable-names`); internal extractions never
+    skip silently.
+  - Its guard counts direct archive opens per file, in `scripts/archive_budget.json`, and the count
+    only goes down.
 - **Guard:** private path validators, direct archive opens outside the reader, and path comparisons
   outside the comparison module (in recovery, trust and staging code) are counted.
 

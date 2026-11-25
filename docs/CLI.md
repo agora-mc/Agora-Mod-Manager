@@ -656,7 +656,7 @@ Minecraft only loads data packs from inside a world, so Agora copies enabled dat
 | `agora pack discard <REVIEW_ID>` | Throw away the copy `pack review` staged, when you decide not to import it |
 | `agora pack retry <INSTANCE> <PACK_FILE> [--entry <FILENAME>]... [--allow-modrinth-once] [--install-anyway]` | Try an Agora pack's mods again on the instance its import made (after turning Modrinth on, say); mods already installed are skipped |
 | `agora pack mods <PACK>` | List the mods in a catalog pack |
-| `agora pack extract-overrides <INSTANCE> <ZIP>` | Extract a pack's overrides zip into an instance with the import's safety checks |
+| `agora pack extract-overrides <INSTANCE> <ZIP> [--without-unwritable-names]` | Extract a pack's overrides zip into an instance with the import's safety checks. An entry whose name a disk cannot hold stops the extraction and the refusal names each one and why: a Windows reserved name (`config/aux.dds`), a trailing dot or space, a `:`, or two entries a case-insensitive disk stores as one file. `--without-unwritable-names` is the explicit answer to that refusal: the entries that can be written are, and the output lists every entry that was not, with the reason. Nothing is ever dropped without its name and reason |
 | `agora pack install-catalog <ITEM> [--name <NAME>] [--accept-changed] [--allow-unverified]` | Install a catalog entry that pins a provider's modpack, as a new instance |
 | `agora import launchers [--root <DIR>]` | List Prism, CurseForge and Modrinth instances that can be imported |
 | `agora import plan <KEY>... [--root <DIR>] [--name <NAME>] [--no-settings]` | Show what importing launcher instances would copy; prints a plan fingerprint |

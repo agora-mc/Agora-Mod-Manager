@@ -54,7 +54,6 @@
     "crates/agora-game-minecraft/src/launcher_import.rs": 7,
     "crates/agora-game-minecraft/src/launcher_import_service.rs": 1,
     "crates/agora-game-minecraft/src/mod_cache.rs": 1,
-    "crates/agora-game-minecraft/src/override_sanitizer.rs": 1,
     "crates/agora-game-minecraft/src/pack_merge.rs": 1,
     "crates/agora-game-minecraft/src/pack_update.rs": 1,
     "crates/agora-game-minecraft/src/prune_service.rs": 3,
