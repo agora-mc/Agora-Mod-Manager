@@ -268,6 +268,9 @@ pub fn generate_instance_id_from_name(name: &str) -> String {
 
 /// The one insert a new game instance uses, whether it came from an install,
 /// a clone, a restored deletion or an imported backup.
+///
+/// The identity row and the base record it is keyed from go together: a failed base write leaves
+/// no identity row behind, rather than an instance that lists and has no base.
 fn insert_instance_row(
     conn: &rusqlite::Connection,
     instance_id: &str,
@@ -275,16 +278,18 @@ fn insert_instance_row(
     name: &str,
     base: &BaseReference,
 ) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
-         VALUES (?1, ?2, ?3, datetime('now'), NULL)",
-        rusqlite::params![instance_id, game.as_str(), name],
-    )?;
-    conn.execute(
-        "INSERT INTO game_instance_bases (instance_id, base_json) VALUES (?1, ?2)",
-        rusqlite::params![instance_id, serde_json::to_string(base).unwrap_or_default()],
-    )?;
-    Ok(())
+    crate::db::in_one_transaction(conn, |conn| {
+        conn.execute(
+            "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
+             VALUES (?1, ?2, ?3, datetime('now'), NULL)",
+            rusqlite::params![instance_id, game.as_str(), name],
+        )?;
+        conn.execute(
+            "INSERT INTO game_instance_bases (instance_id, base_json) VALUES (?1, ?2)",
+            rusqlite::params![instance_id, serde_json::to_string(base).unwrap_or_default()],
+        )?;
+        Ok(())
+    })
 }
 
 fn check_id_exists(
@@ -294,14 +299,8 @@ fn check_id_exists(
 ) -> Result<bool, InstanceError> {
     // Only "no row" means free: a query that fails must not read as "unused". One
     // identity table means one question, which covers both kinds of instance.
-    if conn
-        .query_row(
-            "SELECT 1 FROM instances WHERE instance_id = ?1",
-            [candidate],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some()
+    if crate::db::instance_id_exists(conn, candidate)
+        .map_err(|error| InstanceError::Other(error.to_string()))?
     {
         return Ok(true);
     }

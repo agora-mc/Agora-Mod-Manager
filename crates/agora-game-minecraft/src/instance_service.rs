@@ -1284,12 +1284,14 @@ impl InstanceService {
             }
         };
         let paths = &self.ctx.paths;
+        // One identity table means one question, whatever game owns the id. A database that
+        // cannot answer is not permission, so an unreadable answer counts as taken.
         let free = |candidate: &str| {
             paths
                 .instance_dir(candidate)
                 .map(|dir| std::fs::symlink_metadata(dir).is_err())
                 .unwrap_or(false)
-                && matches!(agora_core::db::get_instance(&probe, candidate), Ok(None))
+                && !agora_core::db::instance_id_exists(&probe, candidate).unwrap_or(true)
         };
         match crate::recently_deleted::restore_entry(
             &self.ctx,
@@ -1395,7 +1397,8 @@ impl InstanceService {
         };
         drop(conn);
 
-        // Check destination does not exist before acquiring the ordered locks.
+        // Check destination does not exist before acquiring the ordered locks. The folder is
+        // not the whole answer: another game's instance can own the id with no folder here.
         let dest_dir = self.ctx.paths.instance_dir(&new_id)?;
         if dest_dir.exists() {
             op.fail(format!("An instance named '{new_id}' already exists."));
@@ -1403,6 +1406,28 @@ impl InstanceService {
                 code: "ERR_INSTANCE_EXISTS".into(),
                 message: format!("An instance named '{new_id}' already exists."),
             });
+        }
+        match self.connection().and_then(|conn| {
+            agora_core::db::instance_id_exists(&conn, &new_id).map_err(|error| {
+                LauncherError::Generic {
+                    code: "ERR_LOCAL_STATE_FAILED".into(),
+                    message: error.to_string(),
+                }
+            })
+        }) {
+            Ok(false) => {}
+            Ok(true) => {
+                let message = format!("The id '{new_id}' already belongs to another instance.");
+                op.fail(message.clone());
+                return Err(LauncherError::Generic {
+                    code: "ERR_INSTANCE_EXISTS".into(),
+                    message,
+                });
+            }
+            Err(error) => {
+                op.fail(error.to_string());
+                return Err(error);
+            }
         }
 
         // Acquire source and destination locks in a stable order so reverse
@@ -1793,6 +1818,33 @@ impl InstanceService {
                 code: "ERR_INSTANCE_EXISTS".into(),
                 message: format!("An instance named '{instance_id}' already exists."),
             });
+        }
+        // The folder says nothing about another game's instance: an id can be in use with no
+        // Minecraft folder of its own. One identity table means every game is asked.
+        match self.connection().and_then(|conn| {
+            agora_core::db::instance_id_exists(&conn, &instance_id).map_err(|error| {
+                LauncherError::Generic {
+                    code: "ERR_LOCAL_STATE_FAILED".into(),
+                    message: error.to_string(),
+                }
+            })
+        }) {
+            Ok(false) => {}
+            Ok(true) => {
+                let message = format!(
+                    "The id '{instance_id}' already belongs to an instance of another game."
+                );
+                op.fail(message.clone());
+                return Err(LauncherError::Generic {
+                    code: "ERR_INSTANCE_EXISTS".into(),
+                    message,
+                });
+            }
+            Err(error) => {
+                // A database that cannot answer is not permission: nothing was created.
+                op.fail(error.to_string());
+                return Err(error);
+            }
         }
         let staging_dir = self
             .ctx

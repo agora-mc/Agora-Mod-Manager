@@ -2808,3 +2808,61 @@ fn stale_staging_whose_owner_is_gone_is_swept_and_a_live_ones_is_kept() {
     assert!(!deploy_dead.exists());
     assert!(deploy_live.exists());
 }
+
+#[test]
+fn a_failed_base_record_leaves_no_identity_row() {
+    use agora_core::ctx::CoreContext;
+    use agora_core::game_instance;
+
+    // An instance is its identity row and its base record; the base write is the one that
+    // fails here. Half an instance lists and has nothing to launch, so neither row may stay.
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("23"));
+    build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let ctx = CoreContext::for_testing(tmp.path().join("data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    {
+        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_base_record BEFORE INSERT ON game_instance_bases
+             BEGIN
+                 SELECT RAISE(ABORT, 'the base record is refused');
+             END;",
+        )
+        .unwrap();
+    }
+
+    let created = game_instance::create(
+        &ctx,
+        &install,
+        &test_definition(),
+        "Never half",
+        Some("never-half".into()),
+        BaseMode::Linked,
+        &|_| {},
+    );
+    assert!(created.is_err(), "the base record is refused: {created:?}");
+
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let identities: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM instances WHERE instance_id = 'never-half'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        identities, 0,
+        "the identity row was rolled back with the base record"
+    );
+}
