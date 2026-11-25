@@ -192,13 +192,33 @@ impl LoadoutProfile {
     }
 }
 
+/// A profile as the CLI and the desktop show it: the state it records, flat.
+///
+/// This is the shape front ends have always printed, so their output does not change with the
+/// stored format. Writing goes through [`LoadoutProfile::to_stored`], which files the same state
+/// under the instance's game.
+impl Serialize for LoadoutProfile {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        LegacyProfile {
+            name: self.name.clone(),
+            enabled_mods: self.enabled_mods.clone(),
+            created_at: self.created_at.clone(),
+            covers: self.covers.clone(),
+            items: self.items.clone(),
+            game: self.game.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
 /// The game an instance belongs to, read from its manifest so a loadout written before records
 /// named their game is filed under the right section.
 ///
-/// The manifest is the only place that knows before the database is open: a Minecraft instance's
-/// manifest is `InstanceManifest`, and a game instance's is `GameInstanceManifest`, which names its
-/// game. A manifest that is neither is cannot-tell, and the loadout is reported rather than guessed
-/// at.
+/// The manifest is the only place that knows before the database is open: a game instance's
+/// manifest names its `game`, and a Minecraft instance's carries `minecraft_version`. This reads
+/// those two markers and nothing else — it is not a load of the manifest, so it neither heals nor
+/// rewrites one. A manifest that is neither is cannot-tell, and the loadout is reported rather than
+/// guessed at.
 fn manifest_game_id(instance_dir: &Path) -> Result<String, String> {
     let path = instance_dir.join("instance_manifest.json");
     let bytes = fs::read(&path).map_err(|e| {
@@ -207,17 +227,22 @@ fn manifest_game_id(instance_dir: &Path) -> Result<String, String> {
             path.display()
         )
     })?;
-    if let Ok(manifest) =
-        serde_json::from_slice::<crate::game_instance::GameInstanceManifest>(&bytes)
-    {
-        return Ok(manifest.game.as_str().to_string());
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        format!(
+            "{} is not a manifest this code can read ({e}), so the loadouts filed under it cannot \
+             be migrated to schema {}",
+            path.display(),
+            LOADOUT_SCHEMA_VERSION
+        )
+    })?;
+    if let Some(game) = value.get("game").and_then(serde_json::Value::as_str) {
+        return Ok(game.to_string());
     }
-    if serde_json::from_slice::<InstanceManifest>(&bytes).is_ok() {
+    if value.get("minecraft_version").is_some() {
         return Ok(agora_game_api::GameId::MINECRAFT.to_string());
     }
     Err(format!(
-        "{} is not a manifest this code can read, so the loadouts filed under it cannot be \
-         migrated to schema {}",
+        "{} names no game, so the loadouts filed under it cannot be migrated to schema {}",
         path.display(),
         LOADOUT_SCHEMA_VERSION
     ))
