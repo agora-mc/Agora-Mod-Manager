@@ -551,9 +551,11 @@ pub(crate) fn delete_instance_rows(conn: &Connection, instance_id: &str) -> Laun
 /// Such an entry holds a `user_instances` row (identity columns and Minecraft
 /// columns in one table) and, beside it, an empty `game_instances` row, which
 /// is a table this build no longer has. The row is placed where its columns
-/// live now, and a dump for a table that no longer exists is dropped only when
-/// it holds no rows: an entry with rows nobody can place is refused, never
-/// partly restored. An entry written by this build is returned unchanged.
+/// live now — the identity columns in `instances`, the rest in
+/// `minecraft_instances`, and its id in both, because the detail row's key is
+/// its foreign key — and a dump for a table that no longer exists is dropped
+/// only when it holds no rows: an entry with rows nobody can place is refused,
+/// never partly restored. An entry written by this build is returned unchanged.
 fn translate_legacy_dumps(dumps: &[TableDump]) -> LauncherResult<Vec<TableDump>> {
     let is_legacy = dumps
         .iter()
@@ -574,10 +576,14 @@ fn translate_legacy_dumps(dumps: &[TableDump]) -> LauncherResult<Vec<TableDump>>
                     let mut identity_row = Vec::new();
                     let mut detail_row = Vec::new();
                     for (column, value) in dump.columns.iter().zip(row.iter()) {
+                        // The primary key is the key of both tables now: the identity row's id
+                        // and, through the foreign key, the detail row's.
+                        let is_key = column == "instance_id";
                         if IDENTITY_COLUMNS.contains(&column.as_str()) {
                             identity_columns.push(column.clone());
                             identity_row.push(value.clone());
-                        } else {
+                        }
+                        if is_key || !IDENTITY_COLUMNS.contains(&column.as_str()) {
                             detail_columns.push(column.clone());
                             detail_row.push(value.clone());
                         }
@@ -1203,3 +1209,7 @@ pub(crate) fn reconcile(root: &Path, conn: &mut Connection, instances_root: &Pat
     }
     repaired
 }
+
+#[cfg(test)]
+#[path = "recently_deleted_legacy_tests.rs"]
+mod legacy_entry_tests;
