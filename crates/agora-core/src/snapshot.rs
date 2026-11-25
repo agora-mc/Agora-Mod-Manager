@@ -2579,7 +2579,7 @@ fn restore_files_into_place(
     restore_id: &str,
     journal: &mut RestoreJournal,
 ) -> Result<(), String> {
-    use agora_game_api::{probe, Probe, StrictRelPath};
+    use agora_game_api::{join_under, probe, Probe, StrictRelPath};
 
     for entry in &manifest.files {
         if entry.relative_path.split('/').next() != Some(root) {
@@ -2591,7 +2591,8 @@ fn restore_files_into_place(
                 entry.relative_path, error.reason
             )
         })?;
-        let destination = instance_dir.join(strict.as_str());
+        let destination = join_under(instance_dir, &strict)
+            .map_err(|error| format!("refusing to restore '{}': {error}", entry.relative_path))?;
 
         match probe(&destination) {
             Probe::Absent => {}
