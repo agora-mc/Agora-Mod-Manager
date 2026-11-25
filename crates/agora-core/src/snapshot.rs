@@ -1953,6 +1953,9 @@ fn restore_snapshot_impl(
         original: original.clone(),
         target: coverage.roots().to_vec(),
         committed: false,
+        retired: Vec::new(),
+        moved_files: Vec::new(),
+        restored_files: Vec::new(),
     };
     journal.write(instance_dir)?;
     let marker_path = instance_dir.join(RESTORE_MARKER);
@@ -1960,8 +1963,30 @@ fn restore_snapshot_impl(
         .map_err(|e| format!("failed to write restore marker: {e}"))?;
 
     let staged_roots = snapshot_roots(&manifest);
+    // A root the snapshot covers but the game no longer declares belongs to the snapshot, not to
+    // the game. Restoring it file by file leaves whatever the game wrote there since the capture in
+    // place; moving the folder aside and deleting the backup afterwards would take those files with
+    // it. A root that is only partly declared (`state`, with `state/config` declared) is restored
+    // the same way, because the unit a manifest records is the root: the snapshot's files come back
+    // and files created since stay. A manifest written before snapshots recorded their scope has no
+    // scope of its own, so its roots are judged by the declaration in force today - the closest
+    // thing to what it captured - and its inferred roots are handled exactly as above.
+    let retired: Vec<String> = covered
+        .iter()
+        .filter(|root| {
+            manifest
+                .files
+                .iter()
+                .filter(|entry| entry.relative_path.split('/').next() == Some(root.as_str()))
+                .any(|entry| !scope_contains(known_roots, &entry.relative_path))
+        })
+        .cloned()
+        .collect();
     let mut moved_current = Vec::new();
     for entry_name in &covered {
+        if retired.contains(entry_name) {
+            continue;
+        }
         let src = instance_dir.join(entry_name);
         if fs::symlink_metadata(&src).is_ok() {
             let dst = pre_dir.join(entry_name);
@@ -1970,7 +1995,16 @@ fn restore_snapshot_impl(
             }
             if let Err(error) = fs::rename(&src, &dst) {
                 let rollback =
-                    rollback_restore(instance_dir, &pre_dir, &[], &moved_current, &restore_id);
+                    rollback_restore(
+                        instance_dir,
+                        &pre_dir,
+                        &[],
+                        &moved_current,
+                        &restore_id,
+                        &retired,
+                        &journal.moved_files,
+                        &journal.restored_files,
+                    );
                 let _ = fs::remove_dir_all(&extract_dir);
                 let _ = fs::remove_file(restore_journal_path(instance_dir));
                 return Err(combine_restore_error(
@@ -1982,8 +2016,45 @@ fn restore_snapshot_impl(
         }
     }
 
+    journal.retired = retired.clone();
+    journal.write(instance_dir)?;
+
     let mut promoted = Vec::new();
     for entry_name in &covered {
+        if retired.contains(entry_name) {
+            // Restore this root's captured files one by one, through the strict path rules, and
+            // keep a per-file backup so a failure puts each one back exactly.
+            match restore_files_into_place(
+                instance_dir,
+                &extract_dir,
+                &manifest,
+                entry_name,
+                &pre_dir,
+                &restore_id,
+                &mut journal,
+            ) {
+                Ok(()) => promoted.push(entry_name.clone()),
+                Err(error) => {
+                    let rollback = rollback_restore(
+                        instance_dir,
+                        &pre_dir,
+                        &promoted,
+                        &moved_current,
+                        &restore_id,
+                        &retired,
+                        &journal.moved_files,
+                        &journal.restored_files,
+                    );
+                    let _ = fs::remove_dir_all(&extract_dir);
+                    let _ = fs::remove_file(restore_journal_path(instance_dir));
+                    return Err(combine_restore_error(
+                        format!("failed to restore {entry_name}: {error}"),
+                        rollback,
+                    ));
+                }
+            }
+            continue;
+        }
         // A covered root with no staged content is one the snapshot recorded
         // as absent. Moving it aside above already produced that state.
         if !staged_roots.contains(entry_name.as_str()) {
@@ -2004,6 +2075,9 @@ fn restore_snapshot_impl(
                 &promoted,
                 &moved_current,
                 &restore_id,
+                &retired,
+                &journal.moved_files,
+                &journal.restored_files,
             );
             let _ = fs::remove_dir_all(&extract_dir);
             let _ = fs::remove_file(restore_journal_path(instance_dir));
@@ -2161,6 +2235,9 @@ fn recover_interrupted_restore(instance_dir: &Path) -> Result<Option<PathBuf>, S
         &displace,
         &backed_up,
         &format!("interrupted-{}", journal.restore_id),
+        &journal.retired,
+        &journal.moved_files,
+        &journal.restored_files,
     )?;
     if pre_dir.exists() {
         fs::remove_dir_all(&pre_dir)
@@ -2441,6 +2518,131 @@ pub(crate) fn validate_snapshot_id(snapshot_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether a declared folder is `path` or holds it, comparing component by component with the
+/// platform's case rule (MASTER_SPEC §32.3).
+///
+/// This is the question a restore asks about a captured file and about a snapshot root: a
+/// declaration of `state/config` covers `state/config/a.toml` and the root `state/config`, and a
+/// declaration of `characters` covers the root `characters` and every file under it.
+pub(crate) fn scope_contains(declared: &[&str], path: &str) -> bool {
+    declared.iter().any(|folder| {
+        agora_game_api::same_spelling(Path::new(folder), Path::new(path))
+            || is_under(Path::new(path), Path::new(folder))
+    })
+}
+
+/// Whether a snapshot root is owned by the declaration in force, at that root or at any depth.
+///
+/// A declared folder covers a root it holds (`state/config` covers the root `state/config`), and a
+/// root covers a declared folder it holds (`state` covers a declaration of `state/config`), because
+/// the root is the unit a manifest records.
+#[cfg(test)]
+pub(crate) fn scope_covers_root(declared: &[&str], root: &str) -> bool {
+    scope_contains(declared, root)
+        || declared
+            .iter()
+            .any(|folder| is_under(Path::new(folder), Path::new(root)))
+}
+
+/// Whether `path` is inside `folder` (strictly, not equal).
+fn is_under(path: &Path, folder: &Path) -> bool {
+    let mut path = path.components().peekable();
+    for component in folder.components() {
+        match path.next() {
+            Some(part) if agora_game_api::same_spelling(
+                Path::new(&part.as_os_str().to_string_lossy().to_string()),
+                Path::new(&component.as_os_str().to_string_lossy().to_string()),
+            ) => {}
+            _ => return false,
+        }
+    }
+    path.next().is_some()
+}
+
+/// Restore the captured files of one root into place, one file at a time.
+///
+/// Used for a root the game no longer declares: the folder stays where it is, every file the
+/// snapshot captured comes back, and files created since the snapshot are left alone. Each file
+/// that is about to be replaced is moved into the restore's backup folder first, so a failure puts
+/// it back; the journal records both halves so an interrupted process can do the same.
+///
+/// The write goes through [`agora_game_api::join_under`] with a [`StrictRelPath`]: a folder on the
+/// way that a link has replaced since the capture refuses the write instead of landing outside the
+/// instance.
+#[allow(clippy::too_many_arguments)]
+fn restore_files_into_place(
+    instance_dir: &Path,
+    extract_dir: &Path,
+    manifest: &SnapshotManifest,
+    root: &str,
+    pre_dir: &Path,
+    restore_id: &str,
+    journal: &mut RestoreJournal,
+) -> Result<(), String> {
+    use agora_game_api::{probe, Probe, StrictRelPath};
+
+    for entry in &manifest.files {
+        if entry.relative_path.split('/').next() != Some(root) {
+            continue;
+        }
+        let strict = StrictRelPath::new(entry.relative_path.clone()).map_err(|error| {
+            format!(
+                "the snapshot records '{}', which cannot be written: {}",
+                entry.relative_path, error.reason
+            )
+        })?;
+        let destination = instance_dir.join(strict.as_str());
+
+        match probe(&destination) {
+            Probe::Absent => {}
+            Probe::Present(_) => {
+                // Keep the file this is about to replace, so a failure or an interruption puts the
+                // exact bytes back.
+                let backup = pre_dir.join(&entry.relative_path);
+                if let Some(parent) = backup.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("failed to create restore backup folder: {e}"))?;
+                }
+                fs::rename(&destination, &backup).map_err(|e| {
+                    format!(
+                        "failed to back up {} before restoring it: {e}",
+                        entry.relative_path
+                    )
+                })?;
+                journal.moved_files.push(entry.relative_path.clone());
+                journal.write(instance_dir)?;
+            }
+            Probe::CantTell(error) => {
+                return Err(format!(
+                    "cannot tell what is at {}, so nothing was restored there: {error}",
+                    destination.display()
+                ))
+            }
+        }
+
+        if entry.absent {
+            // The snapshot recorded that this file did not exist. A file-by-file restore removes it
+            // rather than leaving what the game wrote there since.
+            continue;
+        }
+
+        let source = extract_dir.join(&entry.relative_path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+        fs::copy(&source, &destination).map_err(|e| {
+            format!(
+                "failed to restore {} (restore {restore_id}): {e}",
+                entry.relative_path
+            )
+        })?;
+        journal.restored_files.push(entry.relative_path.clone());
+        journal.write(instance_dir)?;
+    }
+    Ok(())
+}
+
 fn snapshot_roots(manifest: &SnapshotManifest) -> HashSet<&str> {
     manifest
         .files
@@ -2622,6 +2824,17 @@ struct RestoreJournal {
     /// Set once every promotion has landed. Before this, recovery rolls back;
     /// after it, recovery only finishes cleanup.
     committed: bool,
+    /// Roots restored file by file because the game no longer declares them. They were never moved
+    /// aside as a folder, so rollback and recovery put individual files back rather than a root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retired: Vec<String>,
+    /// File paths (relative to the instance) whose previous contents were moved into
+    /// `.agora_pre_restore` before a retired root was restored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    moved_files: Vec<String>,
+    /// File paths (relative to the instance) a retired root's restore has written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    restored_files: Vec<String>,
 }
 
 impl RestoreJournal {
@@ -2685,12 +2898,16 @@ pub(crate) fn atomic_write_pub(path: &Path, contents: &[u8]) -> Result<(), Strin
 /// partially promoted snapshot entries are first moved aside.  If rollback
 /// itself fails, both the backup and displaced paths are retained and named in
 /// the returned error so recovery never silently loses the protected state.
+#[allow(clippy::too_many_arguments)]
 fn rollback_restore(
     instance_dir: &Path,
     pre_dir: &Path,
     promoted: &[String],
     moved_current: &[String],
     restore_id: &str,
+    retired: &[String],
+    moved_files: &[String],
+    restored_files: &[String],
 ) -> Result<(), String> {
     let failed_dir = instance_dir.join(format!(".agora_failed_restore_{restore_id}"));
     fs::create_dir_all(&failed_dir)
@@ -2698,6 +2915,11 @@ fn rollback_restore(
 
     let mut errors = Vec::new();
     for entry_name in promoted.iter().rev() {
+        // A retired root was never moved aside as a folder: only its individual files were
+        // touched, and they are put back below.
+        if retired.iter().any(|root| root == entry_name) {
+            continue;
+        }
         let live = instance_dir.join(entry_name);
         if live.exists() {
             let displaced = failed_dir.join(entry_name);
@@ -2732,6 +2954,57 @@ fn rollback_restore(
         }
         if let Err(e) = fs::rename(&backup, &live) {
             errors.push(format!("could not restore original {entry_name}: {e}"));
+        }
+    }
+
+    // The files of a retired root, undone one at a time: the partial copy goes to the failure
+    // folder and the file it replaced comes back from the backup, so the folder keeps both its
+    // untouched files and its exact bytes.
+    for relative in restored_files.iter().rev() {
+        let Ok(strict) = agora_game_api::StrictRelPath::new(relative.clone()) else {
+            errors.push(format!("cannot undo the restored file {relative}"));
+            continue;
+        };
+        let Ok(live) = agora_game_api::join_under(instance_dir, &strict) else {
+            errors.push(format!("cannot undo the restored file {relative}"));
+            continue;
+        };
+        if agora_game_api::probe(&live).is_absent() {
+            continue;
+        }
+        let displaced = failed_dir.join(relative);
+        if let Some(parent) = displaced.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                errors.push(format!("could not prepare displacement for {relative}: {e}"));
+                continue;
+            }
+        }
+        if let Err(e) = fs::rename(&live, &displaced) {
+            errors.push(format!("could not displace restored file {relative}: {e}"));
+        }
+    }
+    for relative in moved_files.iter().rev() {
+        let backup = pre_dir.join(relative);
+        let Ok(strict) = agora_game_api::StrictRelPath::new(relative.clone()) else {
+            errors.push(format!("cannot put back the backed-up file {relative}"));
+            continue;
+        };
+        let Ok(live) = agora_game_api::join_under(instance_dir, &strict) else {
+            errors.push(format!("cannot put back the backed-up file {relative}"));
+            continue;
+        };
+        if !backup.exists() {
+            errors.push(format!("rollback backup is missing for {relative}"));
+            continue;
+        }
+        if let Some(parent) = live.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                errors.push(format!("could not prepare {relative} for rollback: {e}"));
+                continue;
+            }
+        }
+        if let Err(e) = fs::rename(&backup, &live) {
+            errors.push(format!("could not restore original {relative}: {e}"));
         }
     }
 
@@ -4044,6 +4317,9 @@ mod tests {
                 state: RootState::Directory,
             }],
             committed: false,
+            retired: Vec::new(),
+            moved_files: Vec::new(),
+            restored_files: Vec::new(),
         }
         .write(&inst)
         .unwrap();
@@ -4089,6 +4365,9 @@ mod tests {
                 state: RootState::Directory,
             }],
             committed: false,
+            retired: Vec::new(),
+            moved_files: Vec::new(),
+            restored_files: Vec::new(),
         }
         .write(&inst)
         .unwrap();
@@ -4232,6 +4511,32 @@ mod tests {
             fs::read(inst.join("saves").join("world1").join("level.dat")).unwrap(),
             b"w"
         );
+    }
+
+    /// The scope comparison a restore and the "no longer tracked" notice both ask: a declared
+    /// folder covers itself and everything under it, compared component by component.
+    #[test]
+    fn scope_comparison_follows_path_components() {
+        let declared = ["state/config", "characters"];
+        assert!(scope_contains(&declared, "characters"));
+        assert!(scope_contains(&declared, "characters/hero.sav"));
+        assert!(scope_contains(&declared, "characters/nested/deep.sav"));
+        assert!(scope_contains(&declared, "state/config/a.toml"));
+        // A sibling that shares a prefix with a declared folder is a different folder.
+        assert!(!scope_contains(&declared, "characters-old/hero.sav"));
+        assert!(!scope_contains(&declared, "state"));
+        assert!(!scope_contains(&declared, "state/configs/a.toml"));
+
+        // The case rule is the platform's, not this machine's assumption.
+        assert!(scope_contains(&declared, "CHARACTERS/hero.sav"));
+        assert!(scope_contains(&declared, "State/Config/a.toml"));
+
+        // A root is owned by the declaration when the declaration covers it or holds it.
+        assert!(scope_covers_root(&declared, "characters"));
+        assert!(scope_covers_root(&declared, "state"));
+        assert!(scope_covers_root(&declared, "state/config"));
+        assert!(!scope_covers_root(&declared, "mods"));
+        assert!(!scope_covers_root(&declared, "characters-old"));
     }
 
     fn write_test_archive(path: &Path, entries: &[(&str, &[u8])]) {
