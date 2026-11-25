@@ -346,8 +346,7 @@ fn an_install_whose_marker_was_removed_needs_a_hand_with_startups_reason() {
         "no command overrides a path whose ownership cannot be proven: {entry:?}"
     );
     assert!(
-        entry.reason.contains("Check")
-            && entry.reason.contains(".owner-"),
+        entry.reason.contains("Check") && entry.reason.contains(".owner-"),
         "the reason says what to check, naming the marker: {entry:?}"
     );
     assert!(
@@ -689,7 +688,10 @@ fn a_user_files_folder_without_a_journal_is_not_a_journal() {
         entries_of(&report, JournalKind::UserFiles).is_empty(),
         "a folder with no journal.json is not a user-files journal: {report:?}"
     );
-    assert!(!report.needs_a_hand(), "and it is not a hand either: {report:?}");
+    assert!(
+        !report.needs_a_hand(),
+        "and it is not a hand either: {report:?}"
+    );
 }
 
 /// A `journal.json` that is there but cannot be read as a journal is listed, never dropped with it.
@@ -922,7 +924,10 @@ fn an_interrupted_trash_restore_is_undecided_not_a_prediction() {
     let entry = entry(&report, JournalKind::RecentlyDeleted);
     assert_eq!(entry.resource, "entry-1", "the entry is named by its id");
     assert_eq!(entry.outcome, RecoveryOutcome::Undecided, "{entry:?}");
-    assert_eq!(entry.command, None, "this build decides no command: {entry:?}");
+    assert_eq!(
+        entry.command, None,
+        "this build decides no command: {entry:?}"
+    );
     assert!(
         entry.reason.contains("instance deleted-one"),
         "the facts name the instance it covers: {entry:?}"
@@ -1018,7 +1023,10 @@ fn an_empty_trash_folder_has_nothing_pending_and_says_what_is_missing() {
     let entry = entry(&report, JournalKind::RecentlyDeleted);
     assert_eq!(entry.resource, "entry-1");
     assert_eq!(entry.outcome, RecoveryOutcome::NothingToDo, "{entry:?}");
-    assert_eq!(entry.command, None, "there is nothing to restore: {entry:?}");
+    assert_eq!(
+        entry.command, None,
+        "there is nothing to restore: {entry:?}"
+    );
     assert!(
         entry.reason.contains("entry.json") && entry.reason.contains("restoring.json"),
         "the note says which files are missing: {entry:?}"

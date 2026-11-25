@@ -1397,10 +1397,12 @@ pub fn journal_report(
                     ),
                     // A package that is not where the journal says: the same reason startup gives,
                     // and `agora plugin recover` is the way out of it.
-                    Ok(WouldDo::Refuses(why)) => {
-                        (recovery::RecoveryOutcome::NeedsHand, why, true)
-                    }
-                    Err(error) => (recovery::RecoveryOutcome::NeedsHand, error.to_string(), true),
+                    Ok(WouldDo::Refuses(why)) => (recovery::RecoveryOutcome::NeedsHand, why, true),
+                    Err(error) => (
+                        recovery::RecoveryOutcome::NeedsHand,
+                        error.to_string(),
+                        true,
+                    ),
                 }
             }
         };
@@ -1430,10 +1432,7 @@ enum StoredJournal {
     Ours(PluginId),
     /// A row whose plugin id this build cannot read, with the reason. Startup fails loudly on it
     /// ([`interrupted_installs`]); the report lists it as itself and goes on.
-    Unreadable {
-        id: String,
-        why: String,
-    },
+    Unreadable { id: String, why: String },
 }
 
 /// Every journal id the database holds, each one's own trouble with it, then the legacy ones.

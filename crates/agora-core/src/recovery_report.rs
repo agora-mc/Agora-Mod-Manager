@@ -800,10 +800,9 @@ fn deleted_entry(dir: &Path, locks: &LockManager) -> JournalEntry {
     };
     // The instance's lock first: while a run holds it, nothing about this entry is decided. With no
     // instance it can name there is no lock to ask, and the facts already say what is known.
-    let probed = match &instance {
-        Some(instance) => Some(locks.probe(&LockResource::Instance(instance.clone()))),
-        None => None,
-    };
+    let probed = instance
+        .as_ref()
+        .map(|instance| locks.probe(&LockResource::Instance(instance.clone())));
     match probed {
         Some(LockProbe::Held(metadata)) => {
             listed.outcome = RecoveryOutcome::Busy;
