@@ -739,120 +739,69 @@ pub fn validate_entry_path(name: &str) -> LauncherResult<()> {
 // Rollback
 // ---------------------------------------------------------------------------
 
-/// Move an installed plugin's files aside so a failed replacement can undo.
-pub fn stash_for_rollback(install_dir: &Path, rollback_dir: &Path) -> LauncherResult<()> {
-    if rollback_dir.exists() {
-        std::fs::remove_dir_all(rollback_dir)
-            .map_err(|e| io_error(format!("could not clear {}: {e}", rollback_dir.display())))?;
+/// Flush a freshly unpacked package — every file, then every directory — to the disk.
+///
+/// Unpacking writes through the OS cache, and a record saying a plugin is installed is only true
+/// if the files it names survive a power loss. This runs before the record is written, so a crash
+/// in the window leaves the previous version in place (and recoverable from the journal) rather
+/// than a record pointing at files that were never written.
+///
+/// Windows flushes files through handles opened for writing. The publisher uses a write-through
+/// rename for the directory. On Unix, each directory is synced after its children.
+pub fn flush_tree(root: &Path) -> LauncherResult<()> {
+    let entries = std::fs::read_dir(root)
+        .map_err(|e| io_error(format!("could not read {}: {e}", root.display())))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| io_error(format!("could not read {}: {e}", root.display())))?;
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|e| io_error(format!("could not examine {}: {e}", path.display())))?;
+        if kind.is_dir() {
+            flush_tree(&path)?;
+        } else if kind.is_file() {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.sync_all())
+                .map_err(|e| {
+                    io_error(format!(
+                        "could not flush {} to the disk: {e}",
+                        path.display()
+                    ))
+                })?;
+        }
     }
-    if let Some(parent) = rollback_dir.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| io_error(format!("could not create {}: {e}", parent.display())))?;
+    #[cfg(unix)]
+    {
+        std::fs::File::open(root)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| {
+                io_error(format!(
+                    "could not flush {} to the disk: {e}",
+                    root.display()
+                ))
+            })?;
     }
-    std::fs::rename(install_dir, rollback_dir)
-        .map_err(|e| io_error(format!("could not set aside the previous version: {e}")))
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+    }
+    Ok(())
 }
 
-/// Put stashed files back after a failed replacement.
-pub fn restore_rollback(rollback_dir: &Path, install_dir: &Path) -> LauncherResult<()> {
-    if install_dir.exists() {
-        let _ = std::fs::remove_dir_all(install_dir);
-    }
-    std::fs::rename(rollback_dir, install_dir)
-        .map_err(|e| io_error(format!("could not restore the previous version: {e}")))
-}
-
-/// Finish or undo an install that a crash interrupted.
-///
-/// An install moves the previous version into the rollback folder, unpacks the
-/// new one, then writes the record. If the process stops in between, the old
-/// files are stranded in the rollback folder and the record still points at a
-/// directory that may be missing, so the plugin (and its game) disappears.
-///
-/// Runs before the records are read. For each stashed folder: if the record
-/// already names the version that is on disk, the install finished and the
-/// stashed copy is stale; otherwise the previous version is put back. Both
-/// outcomes remove the rollback folder, so running it again does nothing.
-///
-/// Two processes: an install holds the plugin-install lock for its whole swap, so a starting
-/// process never waits on it — when the lock is held, the stashed folders belong to a live
-/// install in another Agora process and are left alone, reported, not recovered underneath it.
-pub fn recover_interrupted_installs(
-    conn: &rusqlite::Connection,
-    paths: &crate::app_paths::AppPaths,
-) -> LauncherResult<Vec<String>> {
-    let mut warnings = Vec::new();
-    let locks = crate::lock_manager::LockManager::new(paths.locks_root());
-    let _guard = match locks.acquire_with_timeout(
-        crate::lock_manager::LockResource::PluginInstall,
-        "plugin-install-recover",
-        std::time::Duration::ZERO,
-        None,
-    ) {
-        Ok(guard) => guard,
-        Err(error) => {
-            return Ok(vec![format!(
-                "Interrupted plugin installs were left alone: another Agora holds the \
-                 plugin-install lock right now ({error}). Nothing was changed."
-            )]);
-        }
-    };
-    let rollback_root = paths.plugin_rollback_root();
-    let read = match std::fs::read_dir(&rollback_root) {
-        Ok(read) => read,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(warnings),
-        Err(error) => {
-            return Err(io_error(format!(
-                "could not read {}: {error}",
-                rollback_root.display()
-            )))
-        }
-    };
-    for item in read {
-        let item =
-            item.map_err(|e| io_error(format!("could not read {}: {e}", rollback_root.display())))?;
-        if !item.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let name = item.file_name();
-        let Some(id) = name.to_str().and_then(|name| PluginId::parse(name).ok()) else {
-            continue;
-        };
-        let rollback = rollback_root.join(id.as_str());
-        let destination = paths.plugin_packages_root().join(id.as_str());
-        let record = store::get(conn, &id)?;
-        let finished = record.as_ref().is_some_and(|record| {
-            !store::is_tombstone(record)
-                && installed_version(&destination)
-                    .is_some_and(|version| version == record.manifest.version.to_string())
-        });
-        if finished {
-            // The new version was recorded; the stashed copy did not need to
-            // come back.
-            std::fs::remove_dir_all(&rollback)
-                .map_err(|e| io_error(format!("could not clear {}: {e}", rollback.display())))?;
-            continue;
-        }
-        let restoring = installed_version(&rollback);
-        restore_rollback(&rollback, &destination)?;
-        warnings.push(format!(
-            "Recovered plugin {} from an interrupted install; the previous version{} is back.",
-            id,
-            restoring
-                .map(|version| format!(" ({version})"))
-                .unwrap_or_default()
-        ));
-    }
-    Ok(warnings)
-}
-
-/// The version a folder's manifest names, if it has a readable one.
-fn installed_version(folder: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(folder.join(MANIFEST_FILENAME)).ok()?;
-    PluginManifest::parse(&text)
-        .ok()
-        .map(|manifest| manifest.version.to_string())
-}
+// ---------------------------------------------------------------------------
+#[path = "install_recovery.rs"]
+mod journal;
+pub(super) use journal::{
+    check_for_interrupted_install, settle_before_install, uninstall, InstallJournal,
+};
+pub use journal::{
+    crash_point, install_journal_path, recover_interrupted_installs,
+    recover_interrupted_installs_with, resolve_installs, resolve_installs_at_startup,
+    InstallCrashPoint, InstallRecovery, InstallResolution, PluginInstallState,
+};
 
 /// The directory a package version is installed into.
 pub fn package_dir(packages_root: &Path, plugin_id: &agora_plugin_api::PluginId) -> PathBuf {
@@ -1047,20 +996,6 @@ pub fn widens_capabilities(granted: &CapabilitySet, manifest: &PluginManifest) -
         .collect()
 }
 
-/// Remove an installed package's files. Development folders are never touched.
-pub fn remove_package_files(source: &PluginSource, install_dir: &Path) -> LauncherResult<()> {
-    if source.is_development() {
-        // The user's own working copy. Removing the plugin from Agora must not
-        // remove the code they are writing.
-        return Ok(());
-    }
-    if install_dir.exists() {
-        std::fs::remove_dir_all(install_dir)
-            .map_err(|e| io_error(format!("could not remove {}: {e}", install_dir.display())))?;
-    }
-    Ok(())
-}
-
 /// Re-export so callers do not have to reach into `store` for this one type.
 pub use super::store::PluginSource as Source;
 
@@ -1241,27 +1176,6 @@ mod tests {
     }
 
     #[test]
-    fn removing_a_development_plugin_never_deletes_the_authors_folder() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("main.js"), "x").unwrap();
-        let source = PluginSource::Development {
-            path: dir.path().to_path_buf(),
-        };
-        remove_package_files(&source, dir.path()).unwrap();
-        assert!(dir.path().join("main.js").is_file());
-    }
-
-    #[test]
-    fn removing_an_installed_package_deletes_its_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let install = dir.path().join("acme.one");
-        std::fs::create_dir_all(&install).unwrap();
-        std::fs::write(install.join("main.js"), "x").unwrap();
-        remove_package_files(&PluginSource::Package, &install).unwrap();
-        assert!(!install.exists());
-    }
-
-    #[test]
     fn an_update_asking_for_a_new_capability_is_reported_as_widening() {
         let granted =
             CapabilitySet::from_capabilities([agora_plugin_api::Capability::InstanceRead]);
@@ -1417,65 +1331,5 @@ mod tests {
             vec!["instance:read".to_string(), "content:read".to_string()]
         );
         assert!(preview.requires_capability_consent());
-    }
-
-    /// Two processes: while another Agora process holds the plugin-install lock (it is mid
-    /// install), startup recovery leaves the stashed previous version alone and says so; once
-    /// the lock is free, the next pass puts it back.
-    #[test]
-    fn recovery_leaves_stashed_plugins_alone_while_another_process_installs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = crate::app_paths::AppPaths::from_root(tmp.path().join("data"));
-        paths.create_required_dirs().unwrap();
-        crate::db::init_local_state_db(&paths.local_state_db()).unwrap();
-        let conn = crate::db::local_state_connection(&paths.local_state_db()).unwrap();
-
-        // The state a crashed install leaves: previous version stashed in the rollback
-        // folder, no record naming the version on disk.
-        let rollback = paths.plugin_rollback_root().join("acme.one");
-        std::fs::create_dir_all(&rollback).unwrap();
-        std::fs::write(
-            rollback.join(MANIFEST_FILENAME),
-            manifest_json("acme.one").replace("\"1.0.0\"", "\"0.9.0\""),
-        )
-        .unwrap();
-        let destination = paths.plugin_packages_root().join("acme.one");
-        std::fs::create_dir_all(paths.plugin_packages_root()).unwrap();
-
-        // A second lock manager on the same locks root is what another process sees.
-        let other_process = crate::lock_manager::LockManager::new(paths.locks_root());
-        let held = other_process
-            .acquire(
-                crate::lock_manager::LockResource::PluginInstall,
-                "plugin-install",
-            )
-            .expect("the live install takes the lock");
-
-        let warnings = recover_interrupted_installs(&conn, &paths).unwrap();
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("left alone") && w.contains("plugin-install")),
-            "the skip is reported: {warnings:?}"
-        );
-        assert!(rollback.is_dir(), "the stashed version is untouched");
-        assert!(
-            !destination.exists(),
-            "nothing was restored underneath the live install"
-        );
-
-        drop(held);
-        let warnings = recover_interrupted_installs(&conn, &paths).unwrap();
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("Recovered plugin acme.one")),
-            "recovered once the lock is free: {warnings:?}"
-        );
-        assert!(!rollback.exists(), "the rollback folder is gone");
-        assert!(
-            installed_version(&destination).as_deref() == Some("0.9.0"),
-            "the previous version is back"
-        );
     }
 }

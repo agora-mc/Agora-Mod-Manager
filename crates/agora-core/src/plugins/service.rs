@@ -69,6 +69,13 @@ pub struct Consent {
     pub previewed_digest: Option<String>,
 }
 
+fn plugin_install_db_error(error: rusqlite::Error) -> LauncherError {
+    LauncherError::Generic {
+        code: "ERR_LOCAL_STATE_FAILED".into(),
+        message: error.to_string(),
+    }
+}
+
 impl Consent {
     /// Permissions granted, but the plugin's code is not allowed to run.
     pub fn without_code() -> Self {
@@ -969,16 +976,22 @@ impl PluginService {
     /// Re-read the install records and work out what can run.
     pub fn reload(&self) -> LauncherResult<()> {
         let conn = self.inner.conn()?;
-        let records = store::list(&conn)?;
+        let snapshot = store::load_snapshot(&conn)?;
         // A plugin that is official, or borrows an official id, and does not
         // verify is blocked outright: it is not runnable, and the status says
         // why. An error reading the records is an error here, not "nothing is
         // blocked".
-        let official = super::official::verify_installed(
-            &conn,
+        let official = super::official::verify_snapshot(
+            &snapshot,
             self.inner.ctx.paths.root(),
             &self.inner.registry_trust,
         )?;
+        let store::PluginLoadSnapshot {
+            guard,
+            records,
+            pending,
+        } = snapshot;
+        drop(guard);
         let blocked: BTreeMap<String, String> = official
             .iter()
             .filter_map(|(id, status)| match status {
@@ -1004,6 +1017,9 @@ impl PluginService {
         }
         let resolution =
             registry::resolve_with_blocks(records, &agora_plugin_api::HOST_API_VERSION, &blocked);
+        for reason in pending.into_values() {
+            eprintln!("[plugins] {reason}");
+        }
         if let Ok(mut slot) = self.inner.resolution.write() {
             *slot = resolution;
         }
@@ -1092,6 +1108,12 @@ impl PluginService {
         let Ok(conn) = self.inner.conn() else {
             return BTreeMap::new();
         };
+        let Ok(guard) = store::guard_package_reads(&conn) else {
+            return BTreeMap::new();
+        };
+        let Ok(pending) = store::journal_ids(&guard) else {
+            return BTreeMap::new();
+        };
         let answers = match store::list_script_consent(&conn) {
             Ok(answers) => answers,
             Err(e) => {
@@ -1112,6 +1134,9 @@ impl PluginService {
         let mut out = BTreeMap::new();
         for resolved in &resolution.plugins {
             let id = resolved.id();
+            if pending.iter().any(|value| value == id.as_str()) {
+                continue;
+            }
             let manifest = &resolved.record.manifest;
             let state = if manifest.is_declarative_only() {
                 CodeConsentState::NoCode
@@ -1499,7 +1524,15 @@ impl PluginService {
         bytes: &[u8],
         consent: impl Into<Consent>,
     ) -> LauncherResult<PluginSummary> {
-        let consent = consent.into();
+        self.install_package_with_provenance(bytes, consent.into(), None)
+    }
+
+    pub(super) fn install_package_with_provenance(
+        &self,
+        bytes: &[u8],
+        consent: Consent,
+        provenance: Option<&store::OfficialProvenance>,
+    ) -> LauncherResult<PluginSummary> {
         if let Some(expected) = consent.previewed_digest.as_deref() {
             if install::package_digest(bytes) != expected {
                 return Err(preview_changed());
@@ -1511,14 +1544,26 @@ impl PluginService {
 
         let destination =
             install::package_dir(&self.inner.ctx.paths.plugin_packages_root(), &manifest.id);
-        let rollback = self
-            .inner
-            .ctx
-            .paths
-            .plugin_rollback_root()
-            .join(manifest.id.as_str());
-
-        let conn = self.inner.conn()?;
+        let lock = self.inner.ctx.lock_manager.acquire(
+            crate::lock_manager::LockResource::PluginInstall,
+            "plugin-install",
+        )?;
+        let mut conn = self.inner.conn()?;
+        if let Some(line) = install::settle_before_install(
+            &conn,
+            &self.inner.ctx.paths,
+            &manifest.id,
+            &lock,
+            &*self.inner.ctx.process_view(),
+        )? {
+            logs::append(
+                &self.inner.logs_root,
+                &manifest.id,
+                agora_plugin_api::protocol::LogLevel::Info,
+                &line,
+            );
+            self.reload()?;
+        }
         let previous = store::get(&conn, &manifest.id)?;
         let live = self.existing_install(Some(&manifest.id));
         // The keys pinned at install. A package naming different keys is a
@@ -1557,115 +1602,117 @@ impl PluginService {
             }
         }
 
-        // The whole swap — stash, extract, record — runs under the plugin-install lock, so a
-        // second Agora process starting up cannot "recover" this live install from under it:
-        // startup recovery takes the same lock and never waits on it.
-        let _install_lock = self.inner.ctx.lock_manager.acquire(
-            crate::lock_manager::LockResource::PluginInstall,
-            "plugin-install",
-        )?;
-
-        let had_files = destination.exists();
-        if had_files {
-            install::stash_for_rollback(&destination, &rollback)?;
-        }
-
-        if let Err(error) = install::extract_package(bytes, &destination) {
-            if had_files {
-                // Best effort: if this also fails the user is told, rather
-                // than being left believing the old version is back.
-                install::restore_rollback(&rollback, &destination)?;
-            }
-            return Err(error);
-        }
-
-        // Read from the files that were just written, before the record says
-        // the install happened, so a failure here still rolls back cleanly.
-        let new_code_digest = match install::script_digest(&manifest, &destination) {
-            Ok(digest) => digest,
-            Err(error) => {
-                if had_files {
-                    let _ = std::fs::remove_dir_all(&destination);
-                    install::restore_rollback(&rollback, &destination)?;
-                } else {
-                    let _ = std::fs::remove_dir_all(&destination);
-                }
-                return Err(error);
-            }
-        };
-
-        // Updating something the user had switched off must not switch it back
-        // on. Only a first install defaults to enabled; a replacement inherits
-        // the state the user chose, and a reinstall over a tombstone is a
-        // first install again.
-        let enabled = match &previous {
-            Some(record) if !store::is_tombstone(record) => record.enabled,
-            _ => true,
-        };
-
-        if let Err(error) = store::upsert(
+        let ctx = &self.inner.ctx;
+        let mut journal = install::InstallJournal::begin(
             &conn,
-            &manifest,
-            &granted,
-            &PluginSource::Package,
-            &destination,
-            enabled,
-            &now(&self.inner.ctx),
-        ) {
-            // The files are already swapped. Leaving them there would put the
-            // new version on disk under the old version's record — the install
-            // would look like it never happened while the code on disk had in
-            // fact changed.
-            if had_files {
-                let _ = std::fs::remove_dir_all(&destination);
-                install::restore_rollback(&rollback, &destination)?;
+            &ctx.paths,
+            &manifest.id,
+            manifest.version.to_string(),
+        )?;
+        install::crash_point(ctx, install::InstallCrashPoint::JournalWritten);
+        let result = (|| -> LauncherResult<()> {
+            journal.swap_files(&conn, ctx, &lock, bytes)?;
+            if let Some(provenance) = provenance {
+                let unpacked = super::official::tree_digest(&destination).map_err(|error| {
+                    LauncherError::Generic {
+                        code: "ERR_OFFICIAL_PLUGIN_RECORD".into(),
+                        message: format!(
+                            "Could not verify the unpacked files for `{}`: {error}",
+                            manifest.id
+                        ),
+                    }
+                })?;
+                if unpacked != provenance.tree_sha256 {
+                    return Err(LauncherError::Generic {
+                        code: "ERR_OFFICIAL_PLUGIN_TREE".into(),
+                        message: format!(
+                            "The unpacked files for `{}` differ from the signed catalog",
+                            manifest.id
+                        ),
+                    });
+                }
+            }
+            let new_code_digest = install::script_digest(&manifest, &destination)?;
+            let tx = conn.transaction().map_err(plugin_install_db_error)?;
+            // Updating something the user had switched off must not switch it back
+            // on. Only a first install defaults to enabled; a replacement inherits
+            // the state the user chose, and a reinstall over a tombstone is a
+            // first install again.
+            let enabled = match &previous {
+                Some(record) if !store::is_tombstone(record) => record.enabled,
+                _ => true,
+            };
+
+            store::upsert(
+                &tx,
+                &manifest,
+                &granted,
+                &PluginSource::Package,
+                &destination,
+                enabled,
+                &now(ctx),
+            )?;
+            install::crash_point(ctx, install::InstallCrashPoint::Recorded);
+            if let Some(provenance) = provenance {
+                store::set_official(&tx, &manifest.id, provenance)?;
+            }
+            // Pinned at the moment consent was given, and only then. A package
+            // that declares no update source clears any previous pin rather than
+            // inheriting it, so a plugin cannot acquire an update channel by
+            // shipping a version that simply omits the file.
+            match &contents.update_source {
+                Some(source) => store::put_trust(&tx, &manifest.id, &source.url, &source.keys)?,
+                None => store::clear_trust(&tx, &manifest.id)?,
+            }
+
+            // Whether its code may run is tied to the code it was given for. A
+            // replacement with the same entrypoint keeps the answer already given;
+            // a version that newly has code, changed code, or a plugin never
+            // answered for, is denied until the user allows it. A version with no
+            // code clears the answer, so code that comes back later asks again.
+            let first_install = previous.as_ref().is_none_or(store::is_tombstone);
+            if manifest.is_declarative_only() {
+                store::clear_script_consent(&tx, &manifest.id)?;
             } else {
-                let _ = std::fs::remove_dir_all(&destination);
+                let previous_runs_code = previous
+                    .as_ref()
+                    .filter(|record| !store::is_tombstone(record))
+                    .is_some_and(|record| !record.manifest.is_declarative_only());
+                let previous_digest = if first_install {
+                    None
+                } else {
+                    store::script_consent_code_hash(&tx, &manifest.id)?
+                };
+                let code_is_new =
+                    first_install || !previous_runs_code || previous_digest != new_code_digest;
+                if code_is_new || publisher_changed {
+                    store::set_script_consent(
+                        &tx,
+                        &manifest.id,
+                        consent.scripts,
+                        new_code_digest.as_deref(),
+                        &now(&self.inner.ctx),
+                    )?;
+                }
+            }
+
+            journal.advance(&tx, install::PluginInstallState::Committed)?;
+            install::crash_point(ctx, install::InstallCrashPoint::CommitMarked);
+            tx.commit().map_err(plugin_install_db_error)?;
+            install::crash_point(ctx, install::InstallCrashPoint::Committed);
+            Ok(())
+        })();
+        let settled = journal.finish(&conn, ctx, &lock);
+        if let Err(error) = result {
+            if let Err(recovery) = settled {
+                return Err(LauncherError::Generic {
+                    code: error.code(),
+                    message: format!("{error}. The install was interrupted: {recovery}"),
+                });
             }
             return Err(error);
         }
-        let _ = std::fs::remove_dir_all(&rollback);
-
-        // Pinned at the moment consent was given, and only then. A package
-        // that declares no update source clears any previous pin rather than
-        // inheriting it, so a plugin cannot acquire an update channel by
-        // shipping a version that simply omits the file.
-        match &contents.update_source {
-            Some(source) => store::put_trust(&conn, &manifest.id, &source.url, &source.keys)?,
-            None => store::clear_trust(&conn, &manifest.id)?,
-        }
-
-        // Whether its code may run is tied to the code it was given for. A
-        // replacement with the same entrypoint keeps the answer already given;
-        // a version that newly has code, changed code, or a plugin never
-        // answered for, is denied until the user allows it. A version with no
-        // code clears the answer, so code that comes back later asks again.
-        let first_install = previous.as_ref().is_none_or(store::is_tombstone);
-        if manifest.is_declarative_only() {
-            store::clear_script_consent(&conn, &manifest.id)?;
-        } else {
-            let previous_runs_code = previous
-                .as_ref()
-                .filter(|record| !store::is_tombstone(record))
-                .is_some_and(|record| !record.manifest.is_declarative_only());
-            let previous_digest = if first_install {
-                None
-            } else {
-                store::script_consent_code_hash(&conn, &manifest.id)?
-            };
-            let code_is_new =
-                first_install || !previous_runs_code || previous_digest != new_code_digest;
-            if code_is_new || publisher_changed {
-                store::set_script_consent(
-                    &conn,
-                    &manifest.id,
-                    consent.scripts,
-                    new_code_digest.as_deref(),
-                    &now(&self.inner.ctx),
-                )?;
-            }
-        }
-
+        settled?;
         self.reload()?;
         self.summary(&manifest.id)
     }
@@ -1739,6 +1786,21 @@ impl PluginService {
     pub fn restorable_data(&self, plugin_id: &PluginId) -> Option<store::CheckpointSummary> {
         let conn = self.inner.conn().ok()?;
         store::latest_checkpoint(&conn, plugin_id).ok().flatten()
+    }
+
+    /// Finish or undo an install that a crash interrupted, for `agora plugin recover`
+    /// (MASTER_SPEC §32.11).
+    ///
+    /// `None` resolves every interrupted install the way the startup pass does. A person's answer to
+    /// one that needs a hand is [`install::InstallResolution::Restore`] (put the previous version
+    /// back, replacing what is in the plugin's folder now) or
+    /// [`install::InstallResolution::Discard`] (keep what is installed, drop the stashed copy).
+    pub fn recover_interrupted_installs(
+        &self,
+        plugin_id: Option<&PluginId>,
+        resolution: install::InstallResolution,
+    ) -> LauncherResult<Vec<(PluginId, install::InstallRecovery)>> {
+        install::resolve_installs(&self.inner.ctx, plugin_id, resolution)
     }
 
     /// Put a plugin's stored data back to its most recent checkpoint.
@@ -2051,7 +2113,18 @@ impl PluginService {
         let accept_capabilities = consent.capabilities;
         let manifest = install::read_folder_manifest(folder)?;
 
+        let lock = self.inner.ctx.lock_manager.acquire(
+            crate::lock_manager::LockResource::PluginInstall,
+            "plugin-add-folder",
+        )?;
         let conn = self.inner.conn()?;
+        install::check_for_interrupted_install(
+            &conn,
+            &self.inner.ctx.paths,
+            &manifest.id,
+            &lock,
+            &*self.inner.ctx.process_view(),
+        )?;
         let live = self.existing_install(Some(&manifest.id));
         self.guard_consent(&manifest, live.as_ref(), accept_capabilities, false)?;
 
@@ -2261,17 +2334,27 @@ impl PluginService {
 
     /// Remove a plugin. `purge_data` is a separate decision from removing it.
     pub fn uninstall(&self, plugin_id: &PluginId, purge_data: bool) -> LauncherResult<()> {
-        self.deactivate(plugin_id)?;
+        let lock = self.inner.ctx.lock_manager.acquire(
+            crate::lock_manager::LockResource::PluginInstall,
+            "plugin-uninstall",
+        )?;
         let conn = self.inner.conn()?;
+        install::check_for_interrupted_install(
+            &conn,
+            &self.inner.ctx.paths,
+            plugin_id,
+            &lock,
+            &*self.inner.ctx.process_view(),
+        )?;
+        self.deactivate(plugin_id)?;
         let Some(record) = store::get(&conn, plugin_id)? else {
             return Err(LauncherError::Generic {
                 code: "ERR_PLUGIN_NOT_FOUND".into(),
                 message: format!("`{plugin_id}` is not installed"),
             });
         };
-        install::remove_package_files(&record.source, &record.install_dir)?;
+        install::uninstall(&conn, &self.inner.ctx, &lock, &record, purge_data)?;
         logs::remove(&self.inner.logs_root, plugin_id);
-        store::remove(&conn, plugin_id, purge_data)?;
         self.reload()
     }
 

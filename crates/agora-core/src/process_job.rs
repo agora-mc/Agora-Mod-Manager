@@ -142,14 +142,23 @@ pub fn attach(child: &Child) -> Option<String> {
 
 /// How many processes are still in the named job. A job that no longer exists has none.
 pub fn active(name: &str) -> usize {
+    members(name).unwrap_or(0)
+}
+
+/// How many processes are still in the named job, or why the job could not be asked.
+///
+/// A job that is gone holds none, which is an answer. A job that exists but could not be opened or
+/// queried is **not** zero: that is "could not tell", and a caller that reads it as zero decides a
+/// launch is over while it runs (MASTER_SPEC §32.13).
+pub fn members(name: &str) -> Result<usize, String> {
     #[cfg(windows)]
     {
-        windows::active(name)
+        windows::members(name)
     }
     #[cfg(not(windows))]
     {
         let _ = name;
-        0
+        Ok(0)
     }
 }
 
@@ -307,16 +316,24 @@ mod windows {
         Some(unsafe { info.assume_init() }.ActiveProcesses as usize)
     }
 
-    pub(super) fn active(name: &str) -> usize {
-        let count = match open(name) {
-            Ok(Some(job)) => active_in(&job).unwrap_or(0),
-            _ => 0,
+    pub(super) fn members(name: &str) -> Result<usize, String> {
+        let count = match open(name)? {
+            Some(job) => match active_in(&job) {
+                Some(count) => count,
+                None => {
+                    return Err(format!(
+                        "'{name}' exists but its process count could not be read"
+                    ))
+                }
+            },
+            // The job is gone, which is an answer: nothing is left in it.
+            None => 0,
         };
         if count == 0 {
             // Nothing left in it: the job can go.
             forget(name);
         }
-        count
+        Ok(count)
     }
 
     pub(super) fn terminate(name: &str) -> Result<usize, String> {

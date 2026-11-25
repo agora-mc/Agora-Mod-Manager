@@ -2526,7 +2526,8 @@ pub fn launch_with(
 
     // 7. Open the session ledger row: what this launch ran with. Best effort by construction;
     //    a launch is never blocked or failed by its own bookkeeping.
-    let session_id = crate::session_ledger::record_launch(ctx, id, definition, &store);
+    let session_id =
+        crate::session_ledger::record_launch(ctx, id, definition, &store, Some(&launched.identity));
     if let Err(error) =
         crate::game_snapshot::record_launch_point(ctx, id, session_id.as_deref(), &launch_point)
     {

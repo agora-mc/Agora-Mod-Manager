@@ -1726,6 +1726,44 @@ enum PluginCmd {
         )]
         allow_scripts: bool,
     },
+    /// Finish or undo a plugin install or uninstall interrupted by a crash (MASTER_SPEC §32.11).
+    ///
+    /// With no id, recovers every plugin whose install was interrupted, doing only what the
+    /// journal proves is safe, and lists what needs a hand.
+    ///
+    /// `--restore` puts a verified previous version back and saves the replacement in a separate
+    /// folder. `--discard` drops the verified stash after a committed install. `--keep-aside`
+    /// preserves both copies and can also archive a legacy stash. These directions require --yes.
+    Recover {
+        /// Plugin id. Omit to recover every interrupted install the safe way.
+        id: Option<String>,
+        #[arg(
+            long,
+            requires = "id",
+            conflicts_with = "discard",
+            conflicts_with = "keep_aside",
+            help = "Restore the verified previous version and keep its replacement aside"
+        )]
+        restore: bool,
+        #[arg(
+            long,
+            requires = "id",
+            conflicts_with = "keep_aside",
+            help = "Drop the verified stash for a committed install"
+        )]
+        discard: bool,
+        #[arg(
+            long,
+            requires = "id",
+            help = "Preserve both copies, including any legacy stash"
+        )]
+        keep_aside: bool,
+        #[arg(
+            long,
+            help = "Confirm the direction given by --restore, --discard or --keep-aside"
+        )]
+        yes: bool,
+    },
     /// Put a plugin's stored data back to the copy kept before its last
     /// data-shape change.
     ///
@@ -2642,17 +2680,36 @@ async fn async_main() {
         return;
     }
 
+    let local_state_options = agora_core::db::LocalStateOpenOptions {
+        accept_newer_schema: cli.fresh_database,
+        accept_missing_backup: cli.migrate_without_backup,
+        ..Default::default()
+    };
+    // An explicit direction must reach the journal before startup can act on it.
+    if let Commands::Plugin {
+        action: action @ PluginCmd::Recover { .. },
+    } = &cli.command
+    {
+        if let Err(error) = run_plugin_recovery(action, &paths, &local_state_options, json) {
+            let code = exit_code_from_error(&error);
+            if json {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({ "error": error.to_string(), "exitCode": code })
+                );
+            } else {
+                eprintln!("Error: {error}");
+            }
+            std::process::exit(code);
+        }
+        return;
+    }
     // A refused compiled package is a build bug, not user input. Skyrim is not
     // compiled in: it arrives through the installed official plugin.
     let mut registry_builder = agora_core::game_registry::GameRegistry::builder();
     agora_game_minecraft::register_into(&mut registry_builder)
         .expect("build bug: the Minecraft package was refused");
 
-    let local_state_options = agora_core::db::LocalStateOpenOptions {
-        accept_newer_schema: cli.fresh_database,
-        accept_missing_backup: cli.migrate_without_backup,
-        ..Default::default()
-    };
     let (ctx, warnings, _startup_report) =
         match agora_core::ctx::CoreContext::initialize_with_local_state_options(
             paths.clone(),
@@ -3571,6 +3628,112 @@ fn offline_sign(
     Ok(())
 }
 
+fn run_plugin_recovery(
+    action: &PluginCmd,
+    paths: &agora_core::app_paths::AppPaths,
+    options: &agora_core::db::LocalStateOpenOptions,
+    json: bool,
+) -> anyhow::Result<()> {
+    let PluginCmd::Recover {
+        id,
+        restore,
+        discard,
+        keep_aside,
+        yes,
+    } = action
+    else {
+        unreachable!("called for plugin recover")
+    };
+    use agora_core::plugins::install::{InstallRecovery, InstallResolution};
+    let plugin_id = match id.as_deref() {
+        Some(raw) => Some(parse_plugin_id(raw)?),
+        None => None,
+    };
+    let resolution = if *restore {
+        InstallResolution::Restore
+    } else if *discard {
+        InstallResolution::Discard
+    } else if *keep_aside {
+        InstallResolution::KeepAside
+    } else {
+        InstallResolution::Automatic
+    };
+    if resolution != InstallResolution::Automatic && !*yes {
+        let direction = if *restore {
+            "puts the verified previous version back and moves the replacement aside"
+        } else if *discard {
+            "keeps what is installed and drops the stashed previous version, so going back \
+                     to it is no longer possible"
+        } else {
+            "resolves the install while preserving both copies, including any legacy stash"
+        };
+        println!("This {direction}.");
+        println!("Nothing was changed. Add --yes once the person using this computer has agreed.");
+        std::process::exit(1);
+    }
+    let outcomes = agora_core::plugins::install::resolve_installs_at_startup(
+        paths,
+        plugin_id.as_ref(),
+        resolution,
+        options,
+    )?;
+    let mut needs_hand = false;
+    if !json
+        && outcomes
+            .iter()
+            .all(|(_, outcome)| outcome == &InstallRecovery::None)
+    {
+        println!("No plugin install was interrupted.");
+    }
+    for (_, outcome) in &outcomes {
+        match outcome {
+            InstallRecovery::None => {}
+            InstallRecovery::Done(line) => {
+                if !json {
+                    println!("{line}");
+                }
+            }
+            InstallRecovery::NeedsHand(line) => {
+                needs_hand = true;
+                eprintln!("{line}");
+            }
+            InstallRecovery::Busy(line) => {
+                needs_hand = true;
+                eprintln!("{line}");
+            }
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "outcomes": outcomes
+                    .iter()
+                    .map(|(plugin, outcome)| {
+                        let (state, line) = match outcome {
+                            InstallRecovery::None => ("nothing", None),
+                            InstallRecovery::Done(line) => ("done", Some(line.clone())),
+                            InstallRecovery::NeedsHand(line) => {
+                                ("needs-hand", Some(line.clone()))
+                            }
+                            InstallRecovery::Busy(line) => ("busy", Some(line.clone())),
+                        };
+                        serde_json::json!({
+                            "plugin": plugin.as_str(),
+                            "state": state,
+                            "message": line,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            }))?
+        );
+    }
+    if needs_hand {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 async fn run_plugin_command(
     service: &PluginService,
     action: PluginCmd,
@@ -3851,6 +4014,7 @@ async fn run_plugin_command(
                 }
             }
         }
+        PluginCmd::Recover { .. } => unreachable!("plugin recovery runs before core startup"),
         PluginCmd::RestoreData { id, yes } => {
             let plugin_id = parse_plugin_id(&id)?;
             let Some(checkpoint) = service.restorable_data(&plugin_id) else {
@@ -8963,6 +9127,7 @@ async fn run_command(
                             &instance_id,
                             game_def,
                             &store,
+                            Some(&launched.identity),
                         );
                         if let Err(error) = agora_core::game_snapshot::record_launch_point(
                             ctx,

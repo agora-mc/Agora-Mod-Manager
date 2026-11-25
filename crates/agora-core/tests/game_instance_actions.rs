@@ -437,7 +437,7 @@ fn stop_ends_agoras_process_tree_and_not_an_unrelated_process() {
         "the session was not added to the play time: {stopped:?}"
     );
     assert!(
-        process_identity::verify(&identity).is_err(),
+        process_identity::check(&identity) == process_identity::ProcessCheck::Gone,
         "the stopped game is still alive"
     );
     if let Some((pid, start_time)) = child {
@@ -453,7 +453,7 @@ fn stop_ends_agoras_process_tree_and_not_an_unrelated_process() {
         "the normal session end did not run (the journal is still there)"
     );
     assert!(
-        process_identity::verify(&innocent_identity).is_ok(),
+        process_identity::check(&innocent_identity) == process_identity::ProcessCheck::Alive,
         "a process Agora did not start was killed"
     );
 
@@ -979,9 +979,21 @@ fn stop_ends_the_game_after_its_launcher_has_exited() {
     let mut launched = launch_loader_that_exits();
     let (game_pid, game_start) = ping_started_by(launched.pid());
     let _ = launched.child.wait();
-    assert!(
-        process_identity::verify(&launched.identity).is_err(),
+    // The loader itself has exited (its pid is either gone or an exited process the OS still
+    // lists), but the job it made still holds the game it started. So the same identity reads
+    // gone without the job and alive with it: callers must end the job rather than signal a pid
+    // that may belong to someone else (MASTER_SPEC §32.13).
+    let mut loader_only = launched.identity.clone();
+    loader_only.job = None;
+    assert_eq!(
+        process_identity::check(&loader_only),
+        process_identity::ProcessCheck::Gone,
         "the loader is meant to have exited"
+    );
+    assert_eq!(
+        process_identity::check(&launched.identity),
+        process_identity::ProcessCheck::Alive,
+        "the job the loader made still holds the game"
     );
     assert!(is_alive(game_pid, game_start), "the game must outlive it");
     assert!(
@@ -1011,7 +1023,7 @@ fn stop_ends_the_game_after_its_launcher_has_exited() {
         "play time not recorded: {stopped:?}"
     );
     assert!(
-        process_identity::verify(&innocent_identity).is_ok(),
+        process_identity::check(&innocent_identity) == process_identity::ProcessCheck::Alive,
         "a process outside the job was ended"
     );
     let _ = innocent.kill();
@@ -1036,7 +1048,7 @@ fn a_recorded_job_cannot_reach_a_process_that_merely_reuses_a_pid() {
     let result = game_instance::stop(&f.ctx, "grounded-1", &definition());
     assert!(result.is_err(), "{result:?}");
     assert!(
-        process_identity::verify(&stranger_identity).is_ok(),
+        process_identity::check(&stranger_identity) == process_identity::ProcessCheck::Alive,
         "a process whose pid was reused was ended"
     );
     let _ = stranger.kill();
@@ -1430,24 +1442,44 @@ fn stop_finds_and_stops_a_session_recorded_only_in_the_ledger() {
             .spawn()
             .expect("spawn sleeper")
     };
-    let pid = child.id();
-    let mut system = sysinfo::System::new();
-    let spid = sysinfo::Pid::from_u32(pid);
-    system.refresh_process(spid);
-    let started = system.process(spid).expect("child process").start_time();
+    let identity = agora_core::process_identity::capture(child.id()).expect("child identity");
     let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).expect("db");
     session_ledger::begin(
         &conn,
         "grounded-1",
         "2026-01-01T00:00:00Z",
         &LaunchManifest::default(),
-        Owner { pid, started },
+        Owner {
+            pid: identity.pid,
+            started: identity.start_time,
+        },
     )
-    .expect("open ledger session");
+    .expect("legacy ledger session without a game identity");
+    assert!(game_instance::stop(&f.ctx, "grounded-1", &definition()).is_err());
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the watcher's PID is not a stop target"
+    );
+    let session = session_ledger::begin_with_process(
+        &conn,
+        "grounded-1",
+        "2026-01-01T00:00:01Z",
+        &LaunchManifest::default(),
+        Owner::current(),
+        Some(&identity),
+    )
+    .expect("open ledger session with the original game identity");
     drop(conn);
 
     let stopped = game_instance::stop(&f.ctx, "grounded-1", &definition()).expect("stop");
     assert_eq!(stopped.instance_id, "grounded-1");
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).unwrap();
+    assert!(
+        session_ledger::get(&conn, &session)
+            .unwrap()
+            .unwrap()
+            .stop_requested
+    );
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -1461,6 +1493,48 @@ fn stop_finds_and_stops_a_session_recorded_only_in_the_ledger() {
             }
         }
     }
+}
+
+#[test]
+fn round_two_unverified_ledger_stop_does_not_record_a_stop_request() {
+    use agora_core::session_ledger::{self, LaunchManifest, Owner};
+    struct Inconclusive;
+    impl process_identity::ProcessView for Inconclusive {
+        fn lookup(&self, _pid: u32) -> process_identity::Lookup {
+            process_identity::Lookup::CantTell("target was not verified".into())
+        }
+        fn job_members(&self, _job: &str) -> Result<usize, String> {
+            Ok(0)
+        }
+    }
+    let f = Fixture::new();
+    write_instance(&f.ctx, &manifest("grounded-1", "Grounded"));
+    let conn = agora_core::db::local_state_connection(&f.ctx.paths.local_state_db()).unwrap();
+    session_ledger::begin_with_process(
+        &conn,
+        "grounded-1",
+        "2026-01-01T00:00:00Z",
+        &LaunchManifest::default(),
+        Owner::current(),
+        Some(&ProcessIdentity {
+            pid: u32::MAX - 2,
+            start_time: 1,
+            expected_exe: Some("unknown.exe".into()),
+            job: None,
+        }),
+    )
+    .unwrap();
+    assert!(
+        !session_ledger::open_sessions_for_instance(&conn, "grounded-1").unwrap()[0].stop_requested
+    );
+    f.ctx
+        .test_seams
+        .set_process_view(Some(Arc::new(Inconclusive)));
+    assert!(game_instance::stop(&f.ctx, "grounded-1", &definition()).is_err());
+    assert!(f.ctx.test_seams.process_view_hits() > 0);
+    assert!(
+        !session_ledger::open_sessions_for_instance(&conn, "grounded-1").unwrap()[0].stop_requested
+    );
 }
 
 #[test]

@@ -5,16 +5,14 @@
 //! started — and only those. A process the journal does not name is never touched, so a copy the
 //! player started themselves survives.
 
-use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use agora_game_api::{GameDefinition, StoreId};
-use sysinfo::{Pid, System};
 
 use crate::ctx::Ctx;
 use crate::game_instance::{self, InstanceError};
 use crate::game_user_files;
-use crate::process_identity::{self, ProcessIdentity};
+use crate::process_identity::{self, ProcessCheck, ProcessIdentity};
 use crate::process_job;
 
 /// How long a stop waits for the processes it ended to actually go.
@@ -218,25 +216,24 @@ fn stop_ledger_session(
     definition: &GameDefinition,
     session: &crate::session_ledger::OpenSession,
 ) -> Result<Option<StopOutcome>, InstanceError> {
-    let (Some(pid), Some(started)) = (session.owner_pid, session.owner_start) else {
+    let Some(identity) = &session.game_process else {
         return Ok(None);
     };
-    if started < 0 || !crate::session_ledger::Owner::is_alive(pid, started as u64) {
+    if ctx.process_check(identity) == ProcessCheck::Gone {
         return Ok(None);
     }
-    crate::session_ledger::record_stop(ctx, instance_id);
-    let identity = ProcessIdentity {
-        pid,
-        start_time: started as u64,
-        expected_exe: None,
-        job: None,
-    };
-    let roots = vec![&identity];
-    let processes_ended = terminate_tree(&roots);
+    let jobs: Vec<&str> = identity.job.as_deref().into_iter().collect();
+    let mut processes_ended = 0;
+    for job in &jobs {
+        processes_ended += process_job::terminate(job).map_err(InstanceError::Other)?;
+    }
+    let roots = [identity];
+    processes_ended += process_identity::terminate_tree(&roots);
     if processes_ended == 0 {
         return Err(InstanceError::NotStartedByAgora(instance_id.to_string()));
     }
-    wait_until_gone(&roots, &[], STOP_TIMEOUT)?;
+    crate::session_ledger::record_stop(ctx, instance_id);
+    wait_until_gone(&roots, &jobs, STOP_TIMEOUT)?;
     let ended = end_session_if_journal(ctx, instance_id, definition)?;
     let play_time_ms = if let Some(end) = ended {
         end.play_time_ms
@@ -324,10 +321,12 @@ fn stop_journal_session(
         .filter_map(|identity| identity.job.as_deref())
         .collect();
     let in_jobs: usize = jobs.iter().map(|job| process_job::active(job)).sum();
+    // A process whose liveness cannot be checked may still be running, so it counts here: the
+    // refusal this guards says "Agora did not start this", which a failed lookup cannot support.
     let alive: Vec<&ProcessIdentity> = details
         .processes
         .iter()
-        .filter(|identity| process_identity::verify(identity).is_ok())
+        .filter(|identity| !matches!(process_identity::check(identity), ProcessCheck::Gone))
         .collect();
     if in_jobs == 0 && alive.is_empty() {
         return Err(InstanceError::NotStartedByAgora(instance_id.to_string()));
@@ -339,7 +338,7 @@ fn stop_journal_session(
     for job in &jobs {
         processes_ended += process_job::terminate(job).map_err(InstanceError::Other)?;
     }
-    processes_ended += terminate_tree(&alive);
+    processes_ended += process_identity::terminate_tree(&alive);
     wait_until_gone(&alive, &jobs, STOP_TIMEOUT)?;
 
     let ended = end_session_once_gone(STOP_TIMEOUT, || end_session(ctx, definition, &store))?;
@@ -381,58 +380,6 @@ fn end_session_once_gone<T>(
     }
 }
 
-/// A process to end: its pid and the start time that proves it is the same process.
-type Target = (Pid, u64);
-
-/// End every verified process and every descendant it started, children after parents. Returns
-/// how many processes were actually signalled.
-fn terminate_tree(roots: &[&ProcessIdentity]) -> usize {
-    let mut system = System::new();
-    system.refresh_processes();
-
-    let mut queue: Vec<Pid> = roots
-        .iter()
-        .filter(|identity| process_identity::verify(identity).is_ok())
-        .map(|identity| Pid::from_u32(identity.pid))
-        .collect();
-
-    let mut seen: HashSet<Pid> = HashSet::new();
-    let mut targets: Vec<Target> = Vec::new();
-    while let Some(pid) = queue.pop() {
-        if !seen.insert(pid) {
-            continue;
-        }
-        let Some(process) = system.process(pid) else {
-            continue;
-        };
-        let start_time = process.start_time();
-        targets.push((pid, start_time));
-        for (child_pid, child) in system.processes() {
-            // A child cannot be older than its parent: an older one only names a parent that has
-            // since exited and whose pid was reused.
-            if child.parent() == Some(pid) && child.start_time() >= start_time {
-                queue.push(*child_pid);
-            }
-        }
-    }
-
-    let mut ended = 0;
-    for (pid, start_time) in targets {
-        // Refresh right before the kill: a pid that was reused by another process is left alone.
-        system.refresh_process(pid);
-        if let Some(process) = system.process(pid) {
-            if process.start_time() == start_time
-                // Ended with Agora's stop code where the platform has one, so a Stop never looks
-                // like a crash's exit code 1.
-                && (process_job::terminate_process_for_stop(pid.as_u32()) || process.kill())
-            {
-                ended += 1;
-            }
-        }
-    }
-    ended
-}
-
 /// Wait until none of the given identities matches a live process, or the timeout expires.
 fn wait_until_gone(
     roots: &[&ProcessIdentity],
@@ -441,10 +388,17 @@ fn wait_until_gone(
 ) -> Result<(), InstanceError> {
     let deadline = Instant::now() + timeout;
     loop {
+        // Only a process proven gone counts as ended: one that cannot be checked may still be
+        // running, so the wait goes on until the deadline (and says so). The same holds for a job
+        // whose members could not be counted: a job query that failed is not an empty job.
         if roots
             .iter()
-            .all(|identity| process_identity::verify(identity).is_err())
-            && jobs.iter().all(|job| process_job::active(job) == 0)
+            .all(|identity| process_identity::check(identity) == ProcessCheck::Gone)
+            && jobs.iter().all(|job| {
+                process_job::members(job)
+                    .map(|count| count == 0)
+                    .unwrap_or(false)
+            })
         {
             return Ok(());
         }

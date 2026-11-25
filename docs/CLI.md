@@ -786,6 +786,10 @@ agora plugin disable <PLUGIN_ID>
 agora plugin remove <PLUGIN_ID>
 agora plugin remove <PLUGIN_ID> --purge-data
 agora plugin restore-data <PLUGIN_ID> [--yes]
+agora plugin recover [PLUGIN_ID]
+agora plugin recover <PLUGIN_ID> --restore --yes
+agora plugin recover <PLUGIN_ID> --discard --yes
+agora plugin recover <PLUGIN_ID> --keep-aside --yes
 agora plugin log <PLUGIN_ID> --lines 200
 agora plugin disable-all
 agora plugin run <PLUGIN_ID> <COMMAND> [--args <JSON>]
@@ -919,7 +923,19 @@ signs an update document in place. The document does not need a `signatures` blo
 
 See `docs/plugins/publishing.md` for what the signature does and does not prove.
 
-`plugin restore-data <ID>` puts a plugin's saved data back to the copy Agora kept before its last data-shape change. It always asks first (`--yes` skips the question), and it discards anything the plugin wrote since that copy, so it is a deliberate recovery step, not an undo for an ordinary update. `plugin enable` and `plugin disable` change only the installed plugin's enabled state. `plugin remove` removes the plugin and its log while keeping plugin data by default; add `--purge-data` only when that separate data-removal decision is intended. Removing a development plugin never deletes its source folder. `plugin log` reads the requested number of recent lines, defaulting to 200. `plugin disable-all` is the recovery path: it stops and disables every currently enabled plugin without removing installations or stored data.
+`plugin restore-data <ID>` puts a plugin's saved data back to the copy Agora kept before its last data-shape change. It always asks first (`--yes` skips the question), and it discards anything the plugin wrote since that copy, so it is a deliberate recovery step, not an undo for an ordinary update.
+
+`plugin recover [ID]` resolves an install or uninstall that a crash cut short (MASTER_SPEC §32.11). The plugin record and the journal commit together in SQLite. Startup completes committed changes and restores the previous package for uncommitted changes. During an uninstall, the package is moved aside before the commit. `plugin recover` runs before automatic startup recovery and accepts these explicit directions for one plugin.
+
+- `--restore --yes` puts the verified stash back and moves the replacement to a separate folder. After a commit, the old plugin record and the restore decision commit together before the files move.
+- `--discard --yes` keeps the committed package and deletes its verified stash. This removes the copy used to go back to the previous version.
+- `--keep-aside --yes` preserves both copies. For a committed install or a legacy stash, it names the archive where the stash was moved. For an install interrupted before commit, it puts the verified previous package back and keeps the replacement aside.
+
+All three exit non-zero without `--yes`, having changed nothing.
+
+An install or update takes the plugin-install lock and checks for an earlier journal before starting. It logs any recovery it performs. An unresolved journal or legacy stash blocks removal. A journal whose folder identities cannot be verified is kept for inspection.
+
+`plugin enable` and `plugin disable` change only the installed plugin's enabled state. `plugin remove` removes the plugin and its log while keeping plugin data by default; add `--purge-data` only when that separate data-removal decision is intended. Removing a development plugin never deletes its source folder. `plugin log` reads the requested number of recent lines, defaulting to 200. `plugin disable-all` is the recovery path: it stops and disables every currently enabled plugin without removing installations or stored data.
 
 ### Launching
 

@@ -864,7 +864,8 @@ impl Drop for StartingMarkGuard<'_> {
 
 /// Check whether a journal's session is still running.
 /// A session is running if any recorded process identity is still alive
-/// (`process_identity::verify`) or any process runs from the recorded folder
+/// (`process_identity::check`, where anything but `Gone` counts) or any process runs from the
+/// recorded folder
 /// (`processes_running_from`).
 pub fn is_session_running(journal: &Journal) -> bool {
     if session_running_apart_from_starting(journal) {
@@ -876,17 +877,26 @@ pub fn is_session_running(journal: &Journal) -> bool {
 /// Whether the launcher that swapped these files in is still alive. It is the only record of a
 /// launch that has not spawned the game yet, so it says "starting", not "a game is running".
 fn starting_launcher_verifies(journal: &Journal) -> bool {
-    journal
-        .starting_launcher
-        .as_ref()
-        .is_some_and(|launcher| process_identity::verify(launcher).is_ok())
+    // A launcher whose liveness cannot be checked may still be starting the game, so only a
+    // provably gone one stops counting.
+    journal.starting_launcher.as_ref().is_some_and(|launcher| {
+        !matches!(
+            process_identity::check(launcher),
+            process_identity::ProcessCheck::Gone
+        )
+    })
 }
 
 /// The session's own processes, and any process running from its game folder. A launch that has
 /// swapped in but has not recorded its game yet is not counted here.
 fn session_running_apart_from_starting(journal: &Journal) -> bool {
     for proc in &journal.processes {
-        if process_identity::verify(proc).is_ok() {
+        // "May still be running": a process that cannot be checked counts, because recovering
+        // files underneath a live game is the failure this whole check exists to prevent.
+        if !matches!(
+            process_identity::check(proc),
+            process_identity::ProcessCheck::Gone
+        ) {
             return true;
         }
         // The launcher may be gone while a game it started lives on: the job it was launched in
@@ -933,7 +943,7 @@ pub fn spawning_without_dead_process(journal: &Journal) -> bool {
         && !journal
             .processes
             .iter()
-            .any(|process| process_identity::verify(process).is_err())
+            .any(|process| process_identity::check(process) == process_identity::ProcessCheck::Gone)
 }
 
 /// [`spawning_without_dead_process`] for session details read without the full journal.
@@ -942,7 +952,7 @@ pub fn details_spawning_without_dead_process(details: &SessionDetails) -> bool {
         && !details
             .processes
             .iter()
-            .any(|process| process_identity::verify(process).is_err())
+            .any(|process| process_identity::check(process) == process_identity::ProcessCheck::Gone)
 }
 
 /// The needs-a-hand line for a session in its spawning window.
@@ -1403,11 +1413,12 @@ fn restore_locked_mode(
     // proves nothing: the previous session's exit watcher or the Restore command would put the
     // player's files back under the next launch. Only that launch may give up its own start, with
     // `finish_starting_launch`, when its spawn fails.
-    if journal
-        .starting_launcher
-        .as_ref()
-        .is_some_and(|launcher| process_identity::verify(launcher).is_ok())
-    {
+    if journal.starting_launcher.as_ref().is_some_and(|launcher| {
+        !matches!(
+            process_identity::check(launcher),
+            process_identity::ProcessCheck::Gone
+        )
+    }) {
         return Err(UserFilesError::CannotRestoreRunning {
             instance: journal.instance_id.clone(),
         });

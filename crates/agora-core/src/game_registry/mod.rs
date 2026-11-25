@@ -65,10 +65,10 @@ pub enum GameRegistryError {
     NoGamesDefined { package_id: String },
     #[error("game id {game_id} is already registered")]
     GameAlreadyRegistered { game_id: GameId },
-    #[error("game id {game_id} is held by an installed official plugin that is blocked")]
+    #[error("game id {game_id} is reserved by an installed plugin that could not be loaded")]
     GameReservedByBlockedPlugin { game_id: GameId },
     #[error(
-        "store product ({store}, {product}) is held by an installed official plugin that is blocked"
+        "store product ({store}, {product}) is reserved by an installed plugin that could not be loaded"
     )]
     StoreProductReservedByBlockedPlugin { store: StoreId, product: String },
     #[error("store product ({store}, {product}) is already claimed by game {claimed_by}")]
@@ -134,20 +134,15 @@ pub struct GameRegistryBuilder {
     packages: Vec<(PackageSource, Arc<dyn GamePackage>)>,
     games: BTreeMap<GameId, (usize, GameDefinition)>,
     store_products: HashMap<(StoreId, String), GameId>,
-    /// Game ids and store products an installed-but-blocked official plugin
-    /// still holds. They are not loaded, but nobody else may claim them: the
-    /// id belongs to that install until it is removed.
+    /// Game IDs and store products still held by an installed plugin whose
+    /// claims are reserved for this session.
     reserved_games: BTreeSet<GameId>,
     reserved_store_products: BTreeSet<(StoreId, String)>,
     services: Vec<Arc<dyn CompiledServices>>,
 }
 
 impl GameRegistryBuilder {
-    /// Keep a blocked official plugin's game ids out of other packages' reach.
-    ///
-    /// The package is not registered (its files did not verify), but the ids it
-    /// declares stay reserved while the plugin is installed, so a community
-    /// package cannot take over a game by shadowing a blocked official one.
+    /// Reserve the game IDs and store products of a package skipped during loading.
     pub fn reserve_blocked(&mut self, package: &agora_game_api::PackageDefinition) {
         for game in &package.games {
             self.reserved_games.insert(game.id.clone());

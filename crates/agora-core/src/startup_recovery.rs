@@ -22,8 +22,10 @@
 //! ([`plugins::install::recover_interrupted_installs`]): it must finish before the plugin
 //! records are read to build the context's game registry, so `CoreContext::initialize` runs it
 //! during construction and returns its lines as startup warnings, which every adapter already
-//! reports. The local database's own recovery likewise runs when the database is opened, inside
-//! context construction, and its result comes back in the startup report.
+//! reports. It decides through [`crate::recovery::decide`], the one recovery decision every
+//! journal moves onto (MASTER_SPEC §32.11). The local database's own recovery likewise runs when
+//! the database is opened, inside context construction, and its result comes back in the startup
+//! report.
 //!
 //! Journals that are recovered lazily instead of here, on purpose: the content-store conversion
 //! journal is finished at the next conversion of the same instance (it needs that instance's

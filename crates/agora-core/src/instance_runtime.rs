@@ -14,7 +14,7 @@
 //! So ownership has to track the *game*, not the launcher. The lease records
 //! the game's OS-level [`ProcessIdentity`] — pid plus start time plus
 //! executable — which
-//! [`process_identity::verify`](crate::process_identity::verify) checks
+//! [`process_identity::check`](crate::process_identity::check) answers
 //! fail-closed against pid reuse.
 //!
 //! # The starting window
@@ -32,8 +32,8 @@
 use crate::app_paths::AppPaths;
 use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
-use crate::lock_manager::{LockGuard, LockRefusal, LockResource};
-use crate::process_identity::{self, ProcessIdentity};
+use crate::lock_manager::{LockGuard, LockManager, LockRefusal, LockResource};
+use crate::process_identity::{self, ProcessCheck, ProcessIdentity};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -200,20 +200,71 @@ fn write_running(
 
 /// Release the lease.
 ///
-/// A `generation` clears only a matching lease, so a stale exit handler cannot
-/// release a newer launch. `None` forces the release — the explicit escape
-/// hatch for a `Starting` lease the user has confirmed is dead.
+/// A supplied generation must match. A running lease is released only after
+/// the process and its job have been shown to be gone.
 pub fn clear(paths: &AppPaths, instance_id: &str, generation: Option<&str>) -> LauncherResult<()> {
-    let path = lease_path(paths, instance_id)?;
-    if let Some(generation) = generation {
-        match read(paths, instance_id) {
-            Ok(Some(lease)) if lease.generation != generation => return Ok(()),
-            // An unreadable lease is not ours to interpret, so leave it.
-            Err(_) => return Ok(()),
-            _ => {}
-        }
+    let _lock = LockManager::new(paths.locks_root()).acquire(
+        LockResource::Instance(instance_id.to_string()),
+        "clear-runtime-lease",
+    )?;
+    clear_holding(paths, instance_id, generation, None)
+}
+
+fn clear_holding(
+    paths: &AppPaths,
+    instance_id: &str,
+    generation: Option<&str>,
+    exited_child: Option<u32>,
+) -> LauncherResult<()> {
+    let Some(lease) = read(paths, instance_id)? else {
+        return Ok(());
+    };
+    if generation.is_some_and(|generation| lease.generation != generation) {
+        return Ok(());
     }
-    match fs::remove_file(&path) {
+    if lease.state == RuntimeState::Running
+        && !lease.identity.as_ref().is_some_and(|identity| {
+            (exited_child == Some(identity.pid) && identity.job.is_none())
+                || process_identity::check(identity) == ProcessCheck::Gone
+        })
+    {
+        return Ok(());
+    }
+    remove_lease(paths, instance_id)
+}
+
+/// Release a matching direct-launch lease after waiting successfully on its child handle.
+/// A job still needs its own liveness check, since its other members can outlive that child.
+pub fn clear_after_child_exit(
+    paths: &AppPaths,
+    instance_id: &str,
+    generation: &str,
+    pid: u32,
+) -> LauncherResult<()> {
+    let _lock = LockManager::new(paths.locks_root()).acquire(
+        LockResource::Instance(instance_id.to_string()),
+        "clear-runtime-lease",
+    )?;
+    clear_holding(paths, instance_id, Some(generation), Some(pid))
+}
+
+/// Release a matching Starting lease when spawning fails. The launcher still holds the instance lock.
+pub fn clear_failed_start(
+    paths: &AppPaths,
+    instance_id: &str,
+    generation: &str,
+    _lock: &LockGuard,
+) -> LauncherResult<()> {
+    if read(paths, instance_id)?.is_some_and(|lease| {
+        lease.generation == generation && lease.state == RuntimeState::Starting
+    }) {
+        remove_lease(paths, instance_id)?;
+    }
+    Ok(())
+}
+
+fn remove_lease(paths: &AppPaths, instance_id: &str) -> LauncherResult<()> {
+    match fs::remove_file(lease_path(paths, instance_id)?) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(LauncherError::Generic {
@@ -229,7 +280,10 @@ pub fn clear(paths: &AppPaths, instance_id: &str, generation: Option<&str>) -> L
 pub fn game_is_provably_gone(paths: &AppPaths, instance_id: &str) -> bool {
     match read(paths, instance_id) {
         Ok(Some(lease)) => match (lease.state, lease.identity) {
-            (RuntimeState::Running, Some(identity)) => process_identity::verify(&identity).is_err(),
+            // Provably gone, not merely unlooked-up: a failed check proves nothing.
+            (RuntimeState::Running, Some(identity)) => {
+                process_identity::check(&identity) == ProcessCheck::Gone
+            }
             _ => false,
         },
         _ => false,
@@ -258,26 +312,40 @@ fn indeterminate_message(instance_id: &str) -> String {
 
 /// Establish that no game is using this instance.
 ///
-/// Call while holding the instance lock, before any mutation.
+/// Call while holding the instance lock, before any mutation. A lease whose game cannot be looked
+/// up is not cleared: a question that got no answer proves nothing, so it refuses.
 pub fn check_idle(paths: &AppPaths, instance_id: &str) -> LauncherResult<()> {
     let Some(lease) = read(paths, instance_id)? else {
         return Ok(());
     };
     match (lease.state, &lease.identity) {
         (RuntimeState::Running, Some(identity)) => {
-            if process_identity::verify(identity).is_ok() {
-                return Err(LauncherError::Generic {
-                    code: "ERR_INSTANCE_RUNNING".into(),
-                    message: format!(
-                        "Minecraft is still running for '{instance_id}' (pid {}). Close the game \
-                         before changing this instance.",
-                        identity.pid
-                    ),
-                });
+            match process_identity::check(identity) {
+                ProcessCheck::Alive => {
+                    return Err(LauncherError::Generic {
+                        code: "ERR_INSTANCE_RUNNING".into(),
+                        message: format!(
+                            "Minecraft is still running for '{instance_id}' (pid {}). Close the \
+                             game before changing this instance.",
+                            identity.pid
+                        ),
+                    })
+                }
+                // The recorded process is provably gone — pid, start time, and executable no
+                // longer match — so the lease is stale.
+                ProcessCheck::Gone => remove_lease(paths, instance_id)?,
+                ProcessCheck::CantTell(why) => {
+                    return Err(LauncherError::Generic {
+                        code: "ERR_RUNTIME_LEASE_UNREADABLE".into(),
+                        message: format!(
+                            "The launch record of '{instance_id}' records pid {}, which could not \
+                             be checked ({why}), so it is not possible to tell whether the game is \
+                             running. {INDETERMINATE_GUIDANCE}",
+                            identity.pid
+                        ),
+                    })
+                }
             }
-            // The recorded process is provably gone — pid, start time, and
-            // executable no longer match — so the lease is stale.
-            clear(paths, instance_id, Some(&lease.generation))?;
             Ok(())
         }
         // Recorded as running but with nothing to verify: the same
@@ -319,17 +387,24 @@ pub fn game_activity(ctx: &Ctx, instance_id: &str) -> GameActivity {
     match read(&ctx.paths, instance_id) {
         Err(error) => return GameActivity::CouldNotTell(error.to_string()),
         Ok(Some(lease)) => match (lease.state, &lease.identity) {
-            (RuntimeState::Running, Some(identity))
-                if process_identity::verify(identity).is_ok() =>
-            {
-                return GameActivity::Running;
-            }
-            // A launch with nothing to verify was recorded but never finished starting. It blocks
-            // mutation exactly as `check_idle` says it must, but there is no game to close.
+            (RuntimeState::Running, Some(identity)) => match ctx.process_check(identity) {
+                ProcessCheck::Alive => return GameActivity::Running,
+                // Provably gone, so the lease is stale: what else is using the instance is the
+                // next question.
+                ProcessCheck::Gone => {}
+                // The record is there and the OS gave no answer: not Idle, and not a game to close
+                // either.
+                ProcessCheck::CantTell(why) => {
+                    return GameActivity::CouldNotTell(format!(
+                        "the launch record of '{instance_id}' records pid {}, which could not be \
+                         checked ({why})",
+                        identity.pid
+                    ))
+                }
+            },
             (RuntimeState::Running, None) | (RuntimeState::Starting, _) => {
                 return GameActivity::Starting;
             }
-            _ => {}
         },
         Ok(None) => {}
     }
@@ -508,6 +583,12 @@ fn decide(
         // so the answer is can't-tell, not "busy".
         Err(LockRefusal::Unavailable(error)) => return MayMutate::CantTell { error },
     };
+    // Held, so this process is the one that may write: a lease whose game is provably gone is
+    // stale, and clearing it here (rather than while asking) keeps the question read-only. A lease
+    // that cannot be released is can't-tell, never permission.
+    if let Err(error) = clear_stale_lease(ctx, instance_id) {
+        return MayMutate::CantTell { error };
+    }
     if !allow_while_running {
         if let Some(refusal) = refusal(liveness_answer(ctx, instance_id)) {
             return refusal;
@@ -532,9 +613,11 @@ fn refusal(answer: Liveness) -> Option<MayMutate> {
     }
 }
 
-/// The one liveness decision, answered by the records that exist.
+/// The one liveness decision, answered by the records that exist. It only reads: a question about
+/// who is using an instance must not change the answer, so a stale lease is cleared later, by the
+/// holder of the lock ([`clear_stale_lease`]).
 fn liveness_answer(ctx: &Ctx, instance_id: &str) -> Liveness {
-    match lease_answer(&ctx.paths, instance_id) {
+    match lease_answer(ctx, instance_id) {
         Liveness::Free => activity_answer(ctx, instance_id),
         refusal => refusal,
     }
@@ -545,31 +628,39 @@ fn liveness_answer(ctx: &Ctx, instance_id: &str) -> Liveness {
 /// The lease is asked first because it is the record that keeps its own error codes — a live game
 /// is `ERR_INSTANCE_RUNNING` and a launch with nothing to verify is `ERR_INSTANCE_LAUNCH_INDETERMINATE`
 /// — and because those codes are what the UI shows.
-fn lease_answer(paths: &AppPaths, instance_id: &str) -> Liveness {
-    let lease = match read(paths, instance_id) {
+///
+/// It never clears anything: a stale lease is still a lease until the process that may change the
+/// instance holds the lock (see [`clear_stale_lease`]). A lease whose recorded game cannot be
+/// looked up is can't-tell, never "gone".
+fn lease_answer(ctx: &Ctx, instance_id: &str) -> Liveness {
+    let lease = match read(&ctx.paths, instance_id) {
         Ok(Some(lease)) => lease,
         Ok(None) => return Liveness::Free,
         Err(error) => return Liveness::CantTell(error),
     };
     match (lease.state, &lease.identity) {
-        (RuntimeState::Running, Some(identity)) => {
-            if process_identity::verify(identity).is_ok() {
-                return Liveness::Busy(LauncherError::Generic {
-                    code: "ERR_INSTANCE_RUNNING".into(),
-                    message: format!(
-                        "Minecraft is still running for '{instance_id}' (pid {}). Close the game \
-                         before changing this instance.",
-                        identity.pid
-                    ),
-                });
-            }
-            // The recorded process is provably gone — pid, start time, and executable no longer
-            // match — so the lease is stale. If it cannot be released, nothing was proved.
-            match clear(paths, instance_id, Some(&lease.generation)) {
-                Ok(()) => Liveness::Free,
-                Err(error) => Liveness::CantTell(error),
-            }
-        }
+        (RuntimeState::Running, Some(identity)) => match ctx.process_check(identity) {
+            ProcessCheck::Alive => Liveness::Busy(LauncherError::Generic {
+                code: "ERR_INSTANCE_RUNNING".into(),
+                message: format!(
+                    "Minecraft is still running for '{instance_id}' (pid {}). Close the game \
+                     before changing this instance.",
+                    identity.pid
+                ),
+            }),
+            // Provably gone: the lease is stale, and the holder of the lock clears it. Nothing is
+            // known about anything else, so the next record is asked.
+            ProcessCheck::Gone => Liveness::Free,
+            ProcessCheck::CantTell(why) => Liveness::CantTell(LauncherError::Generic {
+                code: "ERR_RUNTIME_LEASE_UNREADABLE".into(),
+                message: format!(
+                    "The launch record of '{instance_id}' records pid {}, which could not be \
+                     checked ({why}), so it is not possible to tell whether the game is running. \
+                     {INDETERMINATE_GUIDANCE}",
+                    identity.pid
+                ),
+            }),
+        },
         // Recorded as running but with nothing to verify: the same indeterminate case as Starting.
         (RuntimeState::Running, None) | (RuntimeState::Starting, _) => {
             Liveness::CantTell(LauncherError::Generic {
@@ -577,6 +668,24 @@ fn lease_answer(paths: &AppPaths, instance_id: &str) -> Liveness {
                 message: indeterminate_message(instance_id),
             })
         }
+    }
+}
+
+/// Release a lease whose recorded game is provably gone.
+///
+/// Only the holder of the instance lock calls this, after taking it: a question about the instance
+/// must not write, and two processes asking at once must not both rewrite the same lease.
+fn clear_stale_lease(ctx: &Ctx, instance_id: &str) -> LauncherResult<()> {
+    let Some(lease) = read(&ctx.paths, instance_id)? else {
+        return Ok(());
+    };
+    match (lease.state, &lease.identity) {
+        (RuntimeState::Running, Some(identity))
+            if ctx.process_check(identity) == ProcessCheck::Gone =>
+        {
+            remove_lease(&ctx.paths, instance_id)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -700,6 +809,10 @@ impl InstanceGuard {
             }
             Err(LockRefusal::Unavailable(error)) => return MayMutate::CantTell { error },
         };
+        // Held, so this process is the one that may write (see [`decide`]).
+        if let Err(error) = clear_stale_lease(ctx, instance_id) {
+            return MayMutate::CantTell { error };
+        }
         if !allow_while_running {
             if let Some(refusal) = refusal(liveness_answer(ctx, instance_id)) {
                 return refusal;
@@ -776,6 +889,13 @@ fn ledger_session_running(ctx: &Ctx, instance_id: &str) -> Result<bool, String> 
         return Ok(false);
     }
     for session in &open {
+        if let Some(process) = &session.game_process {
+            match ctx.process_check(process) {
+                ProcessCheck::Alive => return Ok(true),
+                ProcessCheck::CantTell(why) => return Err(why),
+                ProcessCheck::Gone => continue,
+            }
+        }
         if let (Some(pid), Some(started)) = (session.owner_pid, session.owner_start) {
             if crate::session_ledger::Owner::is_alive(pid, started as u64) {
                 return Ok(true);
@@ -802,7 +922,7 @@ pub fn stop_game(ctx: &Ctx, instance_id: &str) -> LauncherResult<u32> {
         .into_iter()
         .find(|session| session.instance_id == instance_id)
     {
-        sessions.terminate(session.session_id, session.pid)?;
+        sessions.terminate_with(session.session_id, session.pid, &*ctx.process_view())?;
         return Ok(session.pid);
     }
     let not_running = || LauncherError::Generic {
@@ -834,7 +954,7 @@ pub fn stop_game(ctx: &Ctx, instance_id: &str) -> LauncherResult<u32> {
         attached: false,
         user_cancelled: false,
     })?;
-    let result = sessions.terminate(session_id, pid);
+    let result = sessions.terminate_with(session_id, pid, &*ctx.process_view());
     // The session existed only to run the checks; nothing in this process waits on its exit.
     sessions.remove(session_id);
     sessions.take_user_stop(session_id);
@@ -872,6 +992,27 @@ mod tests {
 
         let error = check_idle(&paths, "demo").unwrap_err();
         assert!(format!("{error:?}").contains("ERR_INSTANCE_RUNNING"));
+        clear(&paths, "demo", Some(&generation)).unwrap();
+        clear(&paths, "demo", None).unwrap();
+        assert!(read(&paths, "demo").unwrap().is_some());
+    }
+
+    #[test]
+    fn an_unverified_running_lease_needs_a_liveness_or_child_exit_witness() {
+        let (paths, _tmp) = paths();
+        let generation = publish_starting(&paths, "demo").unwrap();
+        let identity = ProcessIdentity {
+            pid: 1234,
+            start_time: 0,
+            expected_exe: None,
+            job: None,
+        };
+        publish_running(&paths, "demo", &generation, identity).unwrap();
+        clear(&paths, "demo", Some(&generation)).unwrap();
+        clear_after_child_exit(&paths, "demo", &generation, 4321).unwrap();
+        assert!(read(&paths, "demo").unwrap().is_some());
+        clear_after_child_exit(&paths, "demo", &generation, 1234).unwrap();
+        assert!(read(&paths, "demo").unwrap().is_none());
     }
 
     /// The launcher dying does not prove the game did, so a half-published
@@ -1354,5 +1495,204 @@ mod tests {
             "{error:?}"
         );
         assert!(ctx.process_session_manager.list().is_empty());
+    }
+
+    // -- liveness may not turn "could not tell" into "gone" (MASTER_SPEC §32.13) ---------------
+
+    /// A process table a test writes the answers of, so each source of "could not tell" can be
+    /// made to happen.
+    struct StandInTable {
+        answer: process_identity::Lookup,
+        job: Result<usize, String>,
+    }
+
+    impl process_identity::ProcessView for StandInTable {
+        fn lookup(&self, _pid: u32) -> process_identity::Lookup {
+            self.answer.clone()
+        }
+        fn job_members(&self, _job: &str) -> Result<usize, String> {
+            self.job.clone()
+        }
+    }
+
+    #[test]
+    fn a_live_job_with_a_reused_parent_pid_blocks_mutation_and_refuses_stop() {
+        let (ctx, _tmp) = guard_ctx();
+        let identity = ProcessIdentity {
+            pid: u32::MAX - 2,
+            start_time: 42,
+            expected_exe: Some("game.exe".into()),
+            job: Some(r"Local\agora-session-0123456789abcdef".into()),
+        };
+        let generation = publish_starting(&ctx.paths, "demo").unwrap();
+        publish_running(&ctx.paths, "demo", &generation, identity).unwrap();
+        ctx.test_seams
+            .set_process_view(Some(std::sync::Arc::new(StandInTable {
+                answer: process_identity::Lookup::Found {
+                    start_time: 43,
+                    exe: Some("other.exe".into()),
+                    zombie: false,
+                    exited: false,
+                },
+                job: Ok(1),
+            })));
+        assert!(matches!(
+            may_mutate(&ctx, "demo", "test"),
+            MayMutate::Busy { .. }
+        ));
+        let hits = ctx.test_seams.process_view_hits();
+        let error = stop_game(&ctx, "demo").unwrap_err();
+        assert!(
+            matches!(error, LauncherError::ProcessStale { .. }),
+            "{error:?}"
+        );
+        assert!(ctx.test_seams.process_view_hits() > hits);
+        assert!(read(&ctx.paths, "demo").unwrap().is_some());
+    }
+
+    /// The three ways the OS can decline to answer, each of which used to be read as "gone".
+    fn cant_tell_tables() -> Vec<(&'static str, StandInTable, Option<String>)> {
+        vec![
+            (
+                "a lookup that failed",
+                StandInTable {
+                    answer: process_identity::Lookup::CantTell(
+                        "the process table could not be read".into(),
+                    ),
+                    job: Ok(0),
+                },
+                None,
+            ),
+            (
+                "a targeted refresh that returned no entry",
+                StandInTable {
+                    answer: process_identity::Lookup::CantTell(
+                        "the targeted refresh returned no entry".into(),
+                    ),
+                    job: Ok(0),
+                },
+                None,
+            ),
+            (
+                "a job query that failed",
+                StandInTable {
+                    answer: process_identity::Lookup::Absent,
+                    job: Err("the job object could not be opened".into()),
+                },
+                // A job name, so the job query is the thing that fails.
+                Some(r"Local\agora-session-0123456789abcdef".into()),
+            ),
+        ]
+    }
+
+    /// A lease whose recorded game cannot be looked up must refuse a change, with the code the UI
+    /// matches on, and must leave the lease exactly as it was: a question does not write.
+    #[test]
+    fn a_game_that_cannot_be_checked_refuses_a_change_and_clears_nothing() {
+        for (label, table, job) in cant_tell_tables() {
+            let (ctx, _tmp) = guard_ctx();
+            let mut identity = process_identity::capture_self().expect("this test process");
+            identity.job = job;
+            let generation = publish_starting(&ctx.paths, "demo").unwrap();
+            publish_running(&ctx.paths, "demo", &generation, identity.clone()).unwrap();
+            let lease = lease_path(&ctx.paths, "demo").unwrap();
+
+            ctx.test_seams
+                .set_process_view(Some(std::sync::Arc::new(table)));
+
+            match may_mutate_within(&ctx, "demo", "test", std::time::Duration::from_millis(150)) {
+                MayMutate::CantTell { error } => {
+                    assert_eq!(
+                        error.code(),
+                        "ERR_RUNTIME_LEASE_UNREADABLE",
+                        "{label} must refuse as an unreadable launch record, not as a running game"
+                    );
+                }
+                other => {
+                    panic!("{label} must be can't-tell, not permission and not busy: {other:?}")
+                }
+            }
+            assert!(
+                lease.exists(),
+                "{label}: refusing a change wrote to the instance's lease"
+            );
+            assert_eq!(
+                ctx.test_seams.process_view_hits(),
+                1,
+                "{label}: the seam was not consulted, so the test proved nothing"
+            );
+            ctx.test_seams.set_process_view(None);
+        }
+    }
+
+    /// The same three answers reach the game-activity report as "could not tell", never as idle.
+    #[test]
+    fn game_activity_reports_could_not_tell_for_every_unanswered_check() {
+        for (label, table, job) in cant_tell_tables() {
+            let (ctx, _tmp) = guard_ctx();
+            let mut identity = process_identity::capture_self().expect("this test process");
+            identity.job = job;
+            let generation = publish_starting(&ctx.paths, "demo").unwrap();
+            publish_running(&ctx.paths, "demo", &generation, identity).unwrap();
+
+            ctx.test_seams
+                .set_process_view(Some(std::sync::Arc::new(table)));
+
+            match game_activity(&ctx, "demo") {
+                GameActivity::CouldNotTell(why) => assert!(
+                    why.contains("could not be checked"),
+                    "{label}: the report must say what failed: {why}"
+                ),
+                other => panic!("{label} must not read as idle or running: {other:?}"),
+            }
+            ctx.test_seams.set_process_view(None);
+        }
+    }
+
+    /// A stale lease is cleared by the holder of the lock, and by nobody else: an operation that
+    /// cannot get the lock leaves it alone, because the answer to "who is using this" must not
+    /// change what is on disk.
+    #[test]
+    fn a_stale_lease_is_only_cleared_by_the_holder_of_the_lock() {
+        let (ctx, _tmp) = guard_ctx();
+        let me = process_identity::capture_self().expect("this test process");
+        let gone = ProcessIdentity {
+            pid: u32::MAX - 2,
+            ..me
+        };
+        let generation = publish_starting(&ctx.paths, "demo").unwrap();
+        publish_running(&ctx.paths, "demo", &generation, gone).unwrap();
+        let lease = lease_path(&ctx.paths, "demo").unwrap();
+        assert!(lease.exists());
+
+        // Another Agora process holds the instance lock.
+        let held = crate::lock_manager::LockManager::new(ctx.paths.locks_root())
+            .acquire_typed(
+                LockResource::Instance("demo".to_string()),
+                "another-operation",
+            )
+            .expect("the other operation takes the lock");
+        match may_mutate_within(&ctx, "demo", "test", std::time::Duration::from_millis(150)) {
+            MayMutate::Busy {
+                cause: BusyCause::Lock,
+                ..
+            } => {}
+            other => panic!("a held lock is busy: {other:?}"),
+        }
+        assert!(
+            lease.exists(),
+            "a change that could not take the lock cleared the stale lease: the question wrote"
+        );
+        drop(held);
+
+        // With the lock free the same call is the holder, so the stale lease goes.
+        match may_mutate(&ctx, "demo", "test") {
+            MayMutate::Yes(_) => {}
+            other => panic!("a stale lease with the lock free permits the change: {other:?}"),
+        }
+        assert!(
+            !lease.exists(),
+            "the holder of the lock did not clear the stale lease"
+        );
     }
 }

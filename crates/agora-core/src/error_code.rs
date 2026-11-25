@@ -355,6 +355,7 @@ error_codes! {
     PluginsLock = "ERR_PLUGINS_LOCK", GuardAndLocks, 1;
     ProcessCaptureFailed = "ERR_PROCESS_CAPTURE_FAILED", GuardAndLocks, 100;
     ProcessStale = "ERR_PROCESS_STALE", GuardAndLocks, 101;
+    ProcessUnchecked = "ERR_PROCESS_UNCHECKED", GuardAndLocks, 1;
     RuntimeLease = "ERR_RUNTIME_LEASE", GuardAndLocks, 1;
     RuntimeLeaseUnreadable = "ERR_RUNTIME_LEASE_UNREADABLE", GuardAndLocks, 1;
     SessionAlreadyExists = "ERR_SESSION_ALREADY_EXISTS", GuardAndLocks, 1;
@@ -830,6 +831,8 @@ error_codes! {
     MigrationRejected = "ERR_MIGRATION_REJECTED", Recovery, 1;
     MigrationState = "ERR_MIGRATION_STATE", Recovery, 1;
     MigrationUnresolvable = "ERR_MIGRATION_UNRESOLVABLE", Recovery, 1;
+    RecoveryJournal = "ERR_RECOVERY_JOURNAL", Recovery, 1;
+    RecoveryRefused = "ERR_RECOVERY_REFUSED", Recovery, 1;
     // ---- Other ----
     AppDataDir = "ERR_APP_DATA_DIR", Other, 1;
     AppPaths = "ERR_APP_PATHS", Other, 1;

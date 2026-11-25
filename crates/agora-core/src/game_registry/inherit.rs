@@ -13,6 +13,19 @@ use crate::game_registry::PackageSource;
 use agora_game_api::PackageDefinition;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
+
+/// Read one game package declaration under its plugin's own folder.
+pub(crate) fn read_game_package(folder: &Path, relative_path: &str) -> Result<Value, String> {
+    let relative = agora_game_api::RelPath::new(relative_path).map_err(|_| {
+        format!("game package path {relative_path:?} leaves the plugin folder; skipped")
+    })?;
+    let path = folder.join(relative.as_str());
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read game package {}: {error}", path.display()))?;
+    serde_json::from_str(&text)
+        .map_err(|error| format!("failed to parse game package {}: {error}", path.display()))
+}
 
 /// One package read from a plugin, before inheritance is resolved.
 #[derive(Debug, Clone)]

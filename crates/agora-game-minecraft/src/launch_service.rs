@@ -648,10 +648,11 @@ impl LaunchService {
             let lease_generation =
                 instance_runtime::publish_starting(&self.ctx.paths, &request.instance_id)?;
             if let Err(error) = progress.handoff(&request.identity) {
-                let _ = instance_runtime::clear(
+                let _ = instance_runtime::clear_failed_start(
                     &self.ctx.paths,
                     &request.instance_id,
-                    Some(&lease_generation),
+                    &lease_generation,
+                    &lock,
                 );
                 return Err(error);
             }
@@ -933,10 +934,11 @@ impl LaunchService {
             Ok(child) => child,
             Err(error) => {
                 // Nothing was spawned, so the lease is definitively ours to drop.
-                let _ = instance_runtime::clear(
+                let _ = instance_runtime::clear_failed_start(
                     &self.ctx.paths,
                     &request.instance_id,
-                    Some(&lease_generation),
+                    &lease_generation,
+                    &lock,
                 );
                 return Err(error);
             }
@@ -1031,10 +1033,11 @@ impl LaunchService {
         // above the lease is deliberately left in place: we no longer know
         // whether the process is alive, and `check_idle` will verify the
         // recorded identity and clear it once the process is provably gone.
-        let _ = instance_runtime::clear(
+        let _ = instance_runtime::clear_after_child_exit(
             &self.ctx.paths,
             &request.instance_id,
-            Some(&lease_generation),
+            &lease_generation,
+            pid,
         );
 
         // The game already ran to completion, so a failed LKG write must not
@@ -1214,11 +1217,15 @@ impl LaunchService {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         };
 
-        // The delegated session this monitor owned has ended (or hit its
-        // twelve-hour cap), so its runtime lease must end too. A superseded
-        // monitor leaves the lease to the newer session.
+        // The monitor can end while the game is still running. The lease is
+        // released only when its recorded process and job are proven gone.
         if !superseded {
-            let _ = instance_runtime::clear(&ctx.paths, instance_id, None);
+            if let Ok(Some(lease)) = instance_runtime::read(&ctx.paths, instance_id) {
+                if lease.state == instance_runtime::RuntimeState::Running {
+                    let _ =
+                        instance_runtime::clear(&ctx.paths, instance_id, Some(&lease.generation));
+                }
+            }
         }
 
         // A newer session for this instance already owns the LKG state.
@@ -1664,11 +1671,15 @@ fn upgrade_delegated_lease(ctx: &Ctx, instance_id: &str, game_dir: &Path) {
         return;
     };
     if lease.identity.as_ref().is_some_and(|identity| {
-        process_identity::verify(identity).is_ok()
-            && identity
-                .expected_exe
-                .as_deref()
-                .is_some_and(|exe| exe.to_ascii_lowercase().contains("java"))
+        // "May still be running" keeps the lease as it is: an answer the OS did not give is not
+        // evidence that this identity is stale (MASTER_SPEC §32.13).
+        !matches!(
+            process_identity::check(identity),
+            process_identity::ProcessCheck::Gone
+        ) && identity
+            .expected_exe
+            .as_deref()
+            .is_some_and(|exe| exe.to_ascii_lowercase().contains("java"))
     }) {
         return;
     }

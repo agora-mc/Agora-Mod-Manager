@@ -119,15 +119,24 @@ impl ProcessSessionManager {
     ///
     /// Steps:
     /// 1. Session lookup + PID match check.
-    /// 2. OS identity verification via `process_identity::verify`.
+    /// 2. OS identity check via `process_identity::check_exact_with`, whose "could not tell" is
+    ///    treated as "may still be running": nothing is signalled and the session is kept.
     /// 3. Mark session as `user_cancelled`.
-    /// 4. Platform-appropriate process kill (`taskkill /F /T` on Windows,
-    ///    `kill -9` on Unix).
+    /// 4. Terminate each verified process in the tree.
     /// 5. Remove the session on success; revert `user_cancelled` on failure.
     ///
     /// Returns `Err(ProcessStale)` when the OS process no longer matches the
     /// captured identity — the stale session is removed automatically.
     pub fn terminate(&self, session_id: u64, expected_pid: u32) -> LauncherResult<()> {
+        self.terminate_with(session_id, expected_pid, &process_identity::OsProcesses)
+    }
+
+    pub(crate) fn terminate_with(
+        &self,
+        session_id: u64,
+        expected_pid: u32,
+        view: &dyn process_identity::ProcessView,
+    ) -> LauncherResult<()> {
         // Phase 1 — snapshot session under lock, verify PID.
         let session = {
             let map = self.sessions.read().map_err(|_| LauncherError::Generic {
@@ -150,10 +159,34 @@ impl ProcessSessionManager {
             session.clone()
         };
 
-        // Phase 2 — verify OS identity outside the session lock.
-        if let Err(stale_err) = process_identity::verify(&session.process_identity) {
-            self.remove(session_id);
-            return Err(stale_err);
+        // Phase 2 — verify OS identity outside the session lock. Only a process proven gone is
+        // dropped, and only a process proven alive is signalled: a lookup that failed proves
+        // nothing, so the session is kept and the caller is told.
+        if session.process_identity.pid != session.pid {
+            return Err(LauncherError::Generic {
+                code: "ERR_PID_MISMATCH".into(),
+                message: format!("Session {session_id} has mismatched recorded process IDs"),
+            });
+        }
+        match process_identity::check_exact_with(&session.process_identity, view) {
+            process_identity::ProcessCheck::Alive => {}
+            process_identity::ProcessCheck::Gone => {
+                self.remove(session_id);
+                return Err(LauncherError::ProcessStale {
+                    pid: session.pid,
+                    detail: "The OS process no longer matches the recorded identity".into(),
+                });
+            }
+            process_identity::ProcessCheck::CantTell(why) => {
+                return Err(LauncherError::Generic {
+                    code: "ERR_PROCESS_UNCHECKED".into(),
+                    message: format!(
+                        "Session {session_id} records pid {}, which could not be checked ({why}), \
+                         so it was not signalled. Nothing was stopped.",
+                        session.pid
+                    ),
+                });
+            }
         }
 
         // Phase 3 — mark user_cancelled.
@@ -171,8 +204,11 @@ impl ProcessSessionManager {
         }
 
         // Phase 4 — kill.
-        let kill_result = Self::kill_pid(session.pid);
-
+        let kill_result = if process_identity::terminate_tree(&[&session.process_identity]) == 0 {
+            Err("no verified process could be terminated")
+        } else {
+            Ok(())
+        };
         match kill_result {
             Ok(()) => {
                 self.remove(session_id);
@@ -194,37 +230,6 @@ impl ProcessSessionManager {
                     code: "ERR_KILL_FAILED".into(),
                     message: format!("Could not terminate PID {}: {error}", session.pid),
                 })
-            }
-        }
-    }
-
-    /// Perform the OS-level process kill.
-    fn kill_pid(pid: u32) -> Result<(), String> {
-        #[cfg(target_os = "windows")]
-        {
-            let mut command = std::process::Command::new("taskkill");
-            command.args(["/PID", &pid.to_string(), "/F", "/T"]);
-            // Prevent an empty command prompt window from flashing on kill.
-            crate::helpers::hide_console_window(&mut command);
-            let output = command
-                .output()
-                .map_err(|e| format!("Failed to spawn taskkill: {e}"))?;
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-            }
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let output = std::process::Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .output()
-                .map_err(|e| format!("Failed to spawn kill: {e}"))?;
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
             }
         }
     }
@@ -373,18 +378,37 @@ mod tests {
 
     #[test]
     fn test_terminate_stale_process_removes_session() {
-        // Use a PID that definitely does not exist.
+        // A PID that definitely does not exist, with a start time the OS cannot match: provably
+        // gone, so the session is dropped without being signalled.
+        let mgr = ProcessSessionManager::new();
+        let session = make_session(1, u32::MAX);
+        mgr.register(session).unwrap();
+
+        let result = mgr.terminate(1, u32::MAX);
+        match result {
+            Err(LauncherError::ProcessStale { .. }) => {}
+            other => panic!("a provably gone process is a stale session: {other:?}"),
+        }
+        // Session must be removed on stale.
+        assert!(mgr.get(1).is_none());
+    }
+
+    /// An identity that was never captured cannot be checked, and "could not check" is not
+    /// "gone": the session is kept and nothing is signalled (MASTER_SPEC §32.13).
+    #[test]
+    fn test_terminate_unchecked_process_keeps_the_session_and_signals_nothing() {
         let mgr = ProcessSessionManager::new();
         let mut session = make_session(1, u32::MAX);
-        // The identity must match — set a start_time that won't match any process.
         session.process_identity.start_time = 0;
         mgr.register(session).unwrap();
 
         let result = mgr.terminate(1, u32::MAX);
-        // Should get ProcessStale because start_time=0 won't match anything
-        assert!(result.is_err());
-        // Session must be removed on stale.
-        assert!(mgr.get(1).is_none());
+        let error = result.expect_err("an unverifiable identity is not signalled");
+        assert_eq!(error.code(), "ERR_PROCESS_UNCHECKED");
+        assert!(
+            mgr.get(1).is_some(),
+            "a session that could not be checked was dropped"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -400,22 +424,16 @@ mod tests {
     #[test]
     fn test_terminate_for_instance_mismatched_pid_rejected() {
         let mgr = ProcessSessionManager::new();
-        let mut s = make_session(1, 100);
+        let mut s = make_session(1, u32::MAX);
         s.instance_id = "inst-a".into();
         mgr.register(s).unwrap();
-        // terminate_for_instance calls terminate(session_id, pid) which checks
-        // the stored PID. The stored pid=100 must match the one we registered.
-        // The terminate() checks PID match first — it will look up session 1,
-        // find pid=100, and compare with the pid in the session (also 100).
-        // But terminate() also calls process_identity::verify which will fail
-        // for pid=100 if it doesn't exist. So we test the PID mismatch case
-        // with a well-known PID that exists (the current process).
-        // Actually we test with PID mismatch edge: in the stored session pid=100,
-        // terminate(session_id=1, expected_pid=100) — the stored and expected
-        // match at 100. Then verify fails because pid 100 doesn't exist.
-        let result = mgr.terminate_for_instance("inst-a");
-        // verify will fail (ProcessStale) — session gets removed
-        assert!(result.is_err());
+        // `terminate_for_instance` passes the session's own pid to `terminate`, so the PID check
+        // that it reaches is the identity check: this pid does not exist, so the session is
+        // provably stale and removed without being signalled.
+        let error = mgr
+            .terminate_for_instance("inst-a")
+            .expect_err("a stale session is not signalled");
+        assert_eq!(error.code(), "ERR_PROCESS_STALE");
         assert!(mgr.get(1).is_none());
     }
 
@@ -431,10 +449,16 @@ mod tests {
         s2.process_identity.start_time = 0;
         mgr.register(s2).unwrap();
 
-        let result = mgr.terminate_for_instance("inst-a");
-        // stale -> removed
-        assert!(result.is_err());
-        assert!(mgr.get(1).is_none());
+        // A session whose process cannot be checked is kept, not dropped, and the instance's
+        // stop reports why (MASTER_SPEC §32.13).
+        let error = mgr
+            .terminate_for_instance("inst-a")
+            .expect_err("an unchecked process is not signalled");
+        assert_eq!(error.code(), "ERR_PROCESS_UNCHECKED");
+        assert!(
+            mgr.get(1).is_some(),
+            "a session that could not be checked was dropped"
+        );
         // inst-b session remains
         assert!(mgr.get(2).is_some());
     }
