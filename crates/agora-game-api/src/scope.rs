@@ -4,7 +4,7 @@
 //! captures and restores exactly what it names. A game that declares nothing gets no automatic
 //! snapshot rather than a guessed one — the caller is told, and the instance is left alone.
 
-use crate::{RelPath, RelPathError};
+use crate::RelPath;
 use serde::{Deserialize, Serialize};
 
 /// The folders a snapshot of this game's instance captures, in the package's own words.
@@ -126,10 +126,10 @@ fn parse_folders(list: &str, folders: &[&str]) -> Result<Vec<RelPath>, SnapshotS
     folders
         .iter()
         .map(|folder| {
-            RelPath::new(*folder).map_err(|RelPathError(value)| {
+            RelPath::new(*folder).map_err(|error| {
                 SnapshotScopeError(format!(
-                    "its {list} list names '{value}', which is absolute, leaves the instance or \
-                     carries a drive letter"
+                    "its {list} list names '{}', which is refused: {}",
+                    error.value, error.reason
                 ))
             })
         })
