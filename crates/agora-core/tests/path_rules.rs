@@ -20,23 +20,32 @@ fn temp_dir() -> tempfile::TempDir {
 fn joining_under_a_root_returns_the_path_it_checked() {
     let root = temp_dir();
     std::fs::create_dir_all(root.path().join("mods")).unwrap();
+    // The answer is under the **resolved** root, which is what the write will touch: on Windows
+    // that is the `\\?\` form `canonicalize` returns.
+    let resolved = root.path().canonicalize().unwrap();
 
     let rel = RelPath::strict("mods/a.jar").unwrap();
     assert_eq!(
         join_under(root.path(), &rel).unwrap(),
-        root.path().join("mods").join("a.jar")
+        resolved.join("mods").join("a.jar")
     );
 
     // A file that does not exist yet is the ordinary case for a write, and so is a folder below it.
     let deep = RelPath::strict("mods/sub/dir/b.jar").unwrap();
     assert_eq!(
         join_under(root.path(), &deep).unwrap(),
-        root.path()
-            .join("mods")
-            .join("sub")
-            .join("dir")
-            .join("b.jar")
+        resolved.join("mods").join("sub").join("dir").join("b.jar")
     );
+}
+
+#[test]
+fn a_root_that_is_missing_is_not_a_place_to_write() {
+    let root = temp_dir();
+    let rel = RelPath::strict("mods/a.jar").unwrap();
+    match join_under(&root.path().join("gone"), &rel) {
+        Err(PathError::NotAFolder { reason, .. }) => assert!(reason.contains("missing"), "{reason}"),
+        other => panic!("a missing root is an error, not a path: {other:?}"),
+    }
 }
 
 #[test]
@@ -302,29 +311,63 @@ fn resolving_refuses_a_path_under_a_file() {
 
 #[cfg(unix)]
 #[test]
-fn joining_refuses_a_root_that_is_itself_a_link() {
+fn a_root_that_is_a_link_is_written_through_at_its_real_name() {
+    // Users put an instance on another drive with a link, and Agora's own shared folders are links.
+    // The root is resolved once, so the write lands in the folder it really names.
     let root = temp_dir();
     let real = temp_dir();
+    std::fs::create_dir_all(real.path().join("mods")).unwrap();
     std::os::unix::fs::symlink(real.path(), root.path().join("instance")).unwrap();
+
     let rel = RelPath::strict("mods/a.jar").unwrap();
-    match join_under(&root.path().join("instance"), &rel) {
-        Err(PathError::LinkOnTheWay { .. }) => {}
-        other => panic!("the root itself is a link, so nothing is written through it: {other:?}"),
+    let joined = join_under(&root.path().join("instance"), &rel)
+        .expect("a linked root is a folder to write into");
+    assert_eq!(joined, real.path().canonicalize().unwrap().join("mods/a.jar"));
+    std::fs::write(&joined, b"x").unwrap();
+    assert_eq!(
+        std::fs::read(real.path().join("mods").join("a.jar")).unwrap(),
+        b"x",
+        "the write landed where the link points"
+    );
+
+    // A link *inside* the root is still a redirection, whichever folder it is spelled under.
+    let outside = temp_dir();
+    std::os::unix::fs::symlink(outside.path(), real.path().join("inner")).unwrap();
+    let inside = RelPath::strict("inner/a.jar").unwrap();
+    match join_under(&root.path().join("instance"), &inside) {
+        Err(PathError::LinkOnTheWay { path, .. }) => assert_eq!(path, "inner"),
+        other => panic!("a link inside a linked root is still refused, got {other:?}"),
     }
 }
 
 #[cfg(windows)]
 #[test]
-fn joining_refuses_a_root_that_is_itself_a_junction() {
+fn a_root_that_is_a_junction_is_written_through_at_its_real_name() {
+    // Users junction an instance folder onto another drive, and Agora's own shared folders are
+    // junctions. The root is resolved once, so the write lands in the folder it really names.
     let root = temp_dir();
     let real = temp_dir();
+    std::fs::create_dir_all(real.path().join("mods")).unwrap();
     make_junction(&root.path().join("instance"), real.path());
+
     let rel = RelPath::strict("mods/a.jar").unwrap();
-    match join_under(&root.path().join("instance"), &rel) {
-        Err(PathError::LinkOnTheWay { .. }) => {}
-        other => {
-            panic!("the root itself is a junction, so nothing is written through it: {other:?}")
-        }
+    let joined = join_under(&root.path().join("instance"), &rel)
+        .expect("a junctioned root is a folder to write into");
+    assert_eq!(joined, real.path().canonicalize().unwrap().join("mods/a.jar"));
+    std::fs::write(&joined, b"x").unwrap();
+    assert_eq!(
+        std::fs::read(real.path().join("mods").join("a.jar")).unwrap(),
+        b"x",
+        "the write landed where the junction points"
+    );
+
+    // A junction *inside* the root is still a redirection, whichever folder it is spelled under.
+    let outside = temp_dir();
+    make_junction(&real.path().join("inner"), outside.path());
+    let inside = RelPath::strict("inner/a.jar").unwrap();
+    match join_under(&root.path().join("instance"), &inside) {
+        Err(PathError::LinkOnTheWay { path, .. }) => assert_eq!(path, "inner"),
+        other => panic!("a junction inside a linked root is still refused, got {other:?}"),
     }
 }
 

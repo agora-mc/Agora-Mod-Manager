@@ -589,11 +589,15 @@ pub enum PathError {
 /// dot, a reserved name) cannot reach a write without being converted where it is reported. What
 /// this adds to `root.join(rel)` at run time:
 ///
-/// * the root itself is a folder Agora made — not a link that points somewhere else, not a file, and
-///   not missing;
-/// * nothing on the way is a link that redirects a name (a symbolic link, a junction, a mount
-///   point). A reparse point that carries data instead of redirecting — a cloud placeholder, a
-///   deduplicated file — is written through, because it is not a redirection;
+/// * the root is resolved **once**, and the result is a path under the resolved root. A folder the
+///   user linked onto another drive — a junction, a symbolic link, a shared folder that Agora
+///   made — is written through at its real name, and every check below is about the folder the
+///   write will actually land in. A root that cannot be resolved is an error: a write must not
+///   guess where it goes, and a missing root is reported as missing;
+/// * the resolved root is a folder;
+/// * below the root, nothing on the way is a link that redirects a name (a symbolic link, a
+///   junction, a mount point). A reparse point that carries data instead of redirecting — a cloud
+///   placeholder, a deduplicated file — is written through, because it is not a redirection;
 /// * nothing on the way is a file where the path continues.
 ///
 /// **This is a path check, not a handle, and the answer is only good while the caller holds the
@@ -618,10 +622,12 @@ pub enum PathError {
 /// let _ = join_under(Path::new("root"), &"mods/a.jar");
 /// ```
 pub fn join_under(root: &Path, rel: &StrictRelPath) -> Result<PathBuf, PathError> {
-    // The root is the caller's own choice, and it has to be a folder Agora made rather than a link
-    // that points somewhere else: everything joined under it is written through it.
-    let root_metadata = match std::fs::symlink_metadata(root) {
-        Ok(metadata) => metadata,
+    // The root is the caller's own choice, and it may be a link: users junction an instance folder
+    // onto another drive, and Agora's own shared folders are links. Resolving it once is what keeps
+    // the answer honest — the path returned is under the folder the write lands in, and the checks
+    // below are about that folder.
+    let resolved_root = match root.canonicalize() {
+        Ok(resolved) => resolved,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(PathError::NotAFolder {
                 path: root.display().to_string(),
@@ -635,13 +641,16 @@ pub fn join_under(root: &Path, rel: &StrictRelPath) -> Result<PathBuf, PathError
             })
         }
     };
-    if is_a_reparse_point(&root_metadata) && is_link(root)? {
-        return Err(PathError::LinkOnTheWay {
-            path: root.display().to_string(),
-            link: root.display().to_string(),
-        });
-    }
-    if !root_metadata.is_dir() {
+    let root_is_a_folder = match std::fs::metadata(&resolved_root) {
+        Ok(metadata) => metadata.is_dir(),
+        Err(error) => {
+            return Err(PathError::Unreadable {
+                path: root.display().to_string(),
+                error: error.to_string(),
+            })
+        }
+    };
+    if !root_is_a_folder {
         return Err(PathError::NotAFolder {
             path: root.display().to_string(),
             reason: "it is not a folder".to_string(),
@@ -649,7 +658,7 @@ pub fn join_under(root: &Path, rel: &StrictRelPath) -> Result<PathBuf, PathError
     }
 
     let parts: Vec<&str> = rel.as_str().split('/').collect();
-    let mut joined = root.to_path_buf();
+    let mut joined = resolved_root;
     let mut walked = String::new();
     let mut parent_is_a_folder = true;
     for (index, part) in parts.iter().enumerate() {
