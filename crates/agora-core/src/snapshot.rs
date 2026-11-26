@@ -1405,34 +1405,45 @@ pub(crate) fn create_snapshot_full_with_pause(
         entry: LiveFileIndexEntry,
         sha256: String,
         size: u64,
-        reuse: bool,
+        /// The staged bytes of a new or changed file: staged, hashed and synced once, here, outside
+        /// the store lock. A file the cache says is unchanged needs none of that.
+        staged: Option<crate::content_store::StagedObject>,
     }
+    let paths = snapshot_store_paths(instance_dir);
     let mut planned: Vec<Planned> = Vec::with_capacity(current.len());
     for entry in current {
-        let cached = previous.get(&entry.relative_path);
-        let reused = cached
-            .filter(|cached| {
-                cached.size == entry.size
-                    && cached.modified_ns == entry.modified_ns
-                    && cached.file_identity == entry.file_identity
-                    && snapshot_blob_is_available(instance_dir, &cached.sha256, cached.size)
-            })
-            .map(|cached| (cached.sha256.clone(), cached.size));
-        match reused {
-            Some((sha256, size)) => planned.push(Planned {
+        let cached = previous.get(&entry.relative_path).filter(|cached| {
+            cached.size == entry.size
+                && cached.modified_ns == entry.modified_ns
+                && cached.file_identity == entry.file_identity
+        });
+        match cached {
+            // What the cache says is not the same question as what the store holds: the object may
+            // have been collected since the cache was written, and this capture has published no
+            // record yet. So the cache decides only what has to be staged; the store is asked
+            // again, under its lock, before the capture leans on an object it did not place.
+            Some(cached) => planned.push(Planned {
                 entry,
-                sha256,
-                size,
-                reuse: true,
+                sha256: cached.sha256.clone(),
+                size: cached.size,
+                staged: None,
             }),
             None => {
-                let sha256 = hash_live_file(instance_dir, &entry.relative_path)?;
-                let size = entry.size;
+                let source = instance_dir.join(Path::new(&entry.relative_path));
+                let staged = crate::content_store::stage_object_from_file(&paths, &source)
+                    .map_err(|e| e.to_string())?;
+                if staged.size != entry.size {
+                    return Err(format!(
+                        "{} changed while it was being captured (the walk saw {} bytes, reading it \
+                         got {}); take the snapshot again",
+                        entry.relative_path, entry.size, staged.size
+                    ));
+                }
                 planned.push(Planned {
                     entry,
-                    sha256,
-                    size,
-                    reuse: false,
+                    sha256: staged.sha256.clone(),
+                    size: staged.size,
+                    staged: Some(staged),
                 });
             }
         }
@@ -1445,11 +1456,8 @@ pub(crate) fn create_snapshot_full_with_pause(
     }
 
     let hashes: Vec<String> = planned.iter().map(|plan| plan.sha256.clone()).collect();
-    let pending = crate::content_store::pending::begin_pending_use(
-        &snapshot_store_paths(instance_dir),
-        &hashes,
-        "snapshot capture",
-    )?;
+    let pending =
+        crate::content_store::pending::begin_pending_use(&paths, &hashes, "snapshot capture")?;
 
     let mut files: Vec<SnapshotFileEntry> = Vec::with_capacity(planned.len());
     let mut live_index = Vec::with_capacity(planned.len());
@@ -1460,21 +1468,28 @@ pub(crate) fn create_snapshot_full_with_pause(
             entry,
             sha256,
             size,
-            reuse,
+            staged,
         } = plan;
-        if !reuse {
-            let source = instance_dir.join(Path::new(&entry.relative_path));
-            let (placed_hash, placed_size) = crate::content_store::place_object_from_file(
-                &snapshot_store_paths(instance_dir),
-                &source,
-            )
-            .map_err(|e| e.to_string())?;
-            if placed_hash != sha256 || placed_size != size {
-                return Err(format!(
-                    "{} changed while it was being captured (expected {sha256} of {size} bytes, \
-                     stored {placed_hash} of {placed_size}); take the snapshot again",
-                    entry.relative_path
-                ));
+        match staged {
+            Some(staged) => staged.place(&paths).map_err(|e| e.to_string())?,
+            None => {
+                // Nothing was staged, so this capture is reusing an object already in a store. Ask
+                // the store, not the cache: a collection is free to have taken it before this
+                // capture registered anything, and a manifest that names a blob nobody placed is a
+                // restore that cannot happen. Placing it again is the answer.
+                if !snapshot_blob_is_available(instance_dir, &sha256, size) {
+                    let source = instance_dir.join(Path::new(&entry.relative_path));
+                    let (placed_hash, placed_size) =
+                        crate::content_store::place_object_from_file(&paths, &source)
+                            .map_err(|e| e.to_string())?;
+                    if placed_hash != sha256 || placed_size != size {
+                        return Err(format!(
+                            "{} changed while it was being captured (expected {sha256} of {size} \
+                             bytes, stored {placed_hash} of {placed_size}); take the snapshot again",
+                            entry.relative_path
+                        ));
+                    }
+                }
             }
         }
         let mut entry = entry;
@@ -1511,10 +1526,11 @@ pub(crate) fn create_snapshot_full_with_pause(
 
     let manifest_json = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| format!("failed to serialize manifest: {e}"))?;
-    atomic_write(&snapshot_manifest_path(instance_dir, &id), &manifest_json)?;
-    // The manifest names every object this capture reused or added, so the objects are in use on
-    // their own account from here.
-    pending.published();
+    // The manifest names every object this capture reused or added, so publishing it and dropping
+    // the pending record happen under one hold of the store lock: a collection sees the record or
+    // the manifest, and never the moment in between.
+    pending
+        .published(|| atomic_write(&snapshot_manifest_path(instance_dir, &id), &manifest_json))?;
     let _ = write_live_file_index_cache(instance_dir, live_index);
     // Reuse the fingerprint produced by the same traversal that built the
     // snapshot. This removes the former second full tree walk.
@@ -1637,8 +1653,8 @@ pub fn create_snapshot_from_data(
     };
     let manifest_json = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| format!("failed to serialize manifest: {e}"))?;
-    atomic_write(&snapshot_manifest_path(instance_dir, &id), &manifest_json)?;
-    pending.published();
+    pending
+        .published(|| atomic_write(&snapshot_manifest_path(instance_dir, &id), &manifest_json))?;
     mark_snapshot_ready(instance_dir)?;
     Ok(snapshot)
 }

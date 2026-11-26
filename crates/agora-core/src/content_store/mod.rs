@@ -32,7 +32,8 @@ use sha2::{Digest, Sha256};
 
 use crate::app_paths::AppPaths;
 use crate::ctx::Ctx;
-use crate::lock_manager::LockResource;
+use crate::lock_manager::{LockManager, LockResource};
+use crate::process_identity;
 
 pub use crate::game_base::VerifyDepth;
 pub use place::{
@@ -626,7 +627,17 @@ fn clean_staging_dir(paths: &AppPaths) {
     let mut to_remove = Vec::new();
     for entry in entries {
         match entry {
-            Ok(entry) => to_remove.push(entry.path()),
+            Ok(entry) => {
+                // A staging folder is named `<pid>-<uuid>`. A writer in another thread, or in
+                // another process, stages its bytes before it takes the store lock, so its folder
+                // can be here while it is still filling it: sweeping it would delete a file
+                // another writer is about to place. A folder whose owner is still running, or
+                // whose name cannot be read as one, stays.
+                if staging_entry_belongs_to_a_running_process(&entry.file_name()) {
+                    continue;
+                }
+                to_remove.push(entry.path());
+            }
             Err(error) => {
                 eprintln!("[content] staging sweep skipped: an entry could not be listed: {error}");
                 return;
@@ -640,6 +651,22 @@ fn clean_staging_dir(paths: &AppPaths) {
             let _ = std::fs::remove_file(&p);
         }
     }
+}
+
+/// Whether a staging folder's name says a process that is still running owns it. Anything this
+/// cannot read as a live process's folder — a name it does not understand, a process it cannot
+/// ask about — answers yes, which keeps the folder.
+fn staging_entry_belongs_to_a_running_process(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return true;
+    };
+    let Some((pid, _)) = name.split_once('-') else {
+        return true;
+    };
+    let Ok(pid) = pid.parse::<u32>() else {
+        return true;
+    };
+    process_identity::capture(pid).is_ok()
 }
 
 fn hash_file_path(path: &Path) -> Result<String, std::io::Error> {
@@ -676,6 +703,11 @@ pub(super) fn hash_file_counting(path: &Path) -> Result<(String, u64), std::io::
 
 /// Copy `src` to `dst` while hashing the bytes, reading through `buf`. Returns the bytes copied and
 /// their SHA-256 (lowercase hex).
+///
+/// The staged bytes are synced before this returns, so every path that stages through here — an
+/// added item's files, a folder add, one object on its way in — has them durable before the rename
+/// that gives them their name. A crash between the write and the rename must not leave an object
+/// that reads back as the content it is not.
 fn copy_and_hash(src: &Path, dst: &Path, buf: &mut [u8]) -> Result<(u64, String), std::io::Error> {
     use std::io::Write;
     let mut file_in = std::fs::File::open(src)?;
@@ -691,6 +723,7 @@ fn copy_and_hash(src: &Path, dst: &Path, buf: &mut [u8]) -> Result<(u64, String)
         staged_out.write_all(&buf[..n])?;
         hasher.update(&buf[..n]);
     }
+    staged_out.sync_all()?;
     Ok((bytes_written, format!("{:x}", hasher.finalize())))
 }
 
@@ -1334,20 +1367,75 @@ pub(crate) fn place_object_from_file(
     paths: &AppPaths,
     source: &Path,
 ) -> Result<(String, u64), ContentError> {
+    let staged = stage_object_from_file(paths, source)?;
+    let (sha256, size) = (staged.sha256.clone(), staged.size);
+    staged.place(paths)?;
+    Ok((sha256, size))
+}
+
+/// One file's bytes on their way into the store: written into this writer's own staging folder,
+/// hashed in the same pass, and synced, all before the content-store lock is taken.
+///
+/// Staging outside the lock is what keeps a capture or an import from holding the store lock for
+/// the length of a file copy. Only the question "is a trustworthy object already here?" and the
+/// rename that answers it need the lock, and [`StagedObject::place`] takes it for both at once.
+pub(crate) struct StagedObject {
+    /// Removes this writer's staging folder when the bytes are placed, or when the placement
+    /// fails: the folder is that writer's while the object is on its way in.
+    _guard: StagingGuard,
+    staged_path: PathBuf,
+    pub(crate) sha256: String,
+    pub(crate) size: u64,
+}
+
+/// Stage one file for [`StagedObject::place`], hashing it as it is written.
+pub(crate) fn stage_object_from_file(
+    paths: &AppPaths,
+    source: &Path,
+) -> Result<StagedObject, ContentError> {
     let staging_dir = new_object_staging_dir(paths)?;
-    let mut guard = StagingGuard::new(&staging_dir);
+    let guard = StagingGuard::new(&staging_dir);
     let staged_path = staging_dir.join("object");
     let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
     let (size, sha256) = copy_and_hash(source, &staged_path, &mut buffer)?;
-    sync_staged_object(&staged_path)?;
-    place_staged(paths, staged_path, size, sha256.clone())?;
-    guard.active = false;
-    let _ = std::fs::remove_dir_all(&staging_dir);
-    Ok((sha256, size))
+    Ok(StagedObject {
+        _guard: guard,
+        staged_path,
+        sha256,
+        size,
+    })
+}
+
+impl StagedObject {
+    /// Put these bytes in the store. The content-store lock is held from the question "is a
+    /// trustworthy object with these bytes already here?" through the rename (or the decision not
+    /// to rename), so two writers of one hash cannot both decide to place it, and a collection
+    /// cannot free the object between the answer and the placement.
+    pub(crate) fn place(self, paths: &AppPaths) -> Result<(), ContentError> {
+        let manager = LockManager::new(paths.locks_root());
+        let _lock = manager.acquire(LockResource::ContentStore, "content-place")?;
+        place_staged(
+            paths,
+            self.staged_path.clone(),
+            self.size,
+            self.sha256.clone(),
+        )?;
+        Ok(())
+    }
 }
 
 /// [`place_object_from_file`] for bytes already in memory, such as a captured state file.
 pub(crate) fn place_object_from_bytes(
+    paths: &AppPaths,
+    bytes: &[u8],
+) -> Result<(String, u64), ContentError> {
+    let manager = LockManager::new(paths.locks_root());
+    let _lock = manager.acquire(LockResource::ContentStore, "content-place")?;
+    place_object_from_bytes_locked(paths, bytes)
+}
+
+/// [`place_object_from_bytes`] for a caller that already holds the content-store lock.
+pub(crate) fn place_object_from_bytes_locked(
     paths: &AppPaths,
     bytes: &[u8],
 ) -> Result<(String, u64), ContentError> {
@@ -1803,7 +1891,7 @@ pub fn store_object_bytes(ctx: &Ctx, bytes: &[u8]) -> Result<String, ContentErro
 
 /// [`store_object_bytes`] for a caller that already holds the content-store lock.
 pub(crate) fn store_object_bytes_locked(ctx: &Ctx, bytes: &[u8]) -> Result<String, ContentError> {
-    place_object_from_bytes(&ctx.paths, bytes).map(|(sha256, _)| sha256)
+    place_object_from_bytes_locked(&ctx.paths, bytes).map(|(sha256, _)| sha256)
 }
 
 /// Read a stored object's bytes, refusing a hash that is not an object name and an object that no

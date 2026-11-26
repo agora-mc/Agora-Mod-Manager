@@ -175,15 +175,14 @@ pub(crate) fn collect(
     let mut keep: HashSet<String> = HashSet::new();
     let mut owners = Owners::default();
 
-    // Every owner record, listing and pending record is read before anything is deleted. A read
+    // Every pending record, owner record and listing is read before anything is deleted. A read
     // that fails is a refusal, not a half-finished collection: the report says which path stopped
     // it, and every object stays where it is.
-    if let Err(error) = owners.read_items(paths, &mut keep, &mut report) {
-        report.refusals.push(error);
-    }
-    if let Err(error) = owners.read_instances(paths, request, &mut keep, &mut report) {
-        report.refusals.push(error);
-    }
+    //
+    // The pending records are read first on purpose. A writer publishes its owner record and drops
+    // its pending record under one hold of the store lock this collection is holding, so reading
+    // the records before the owners means the collection sees one or the other — never a writer
+    // whose record is already gone and whose owner record it read a moment too early.
     let stale = match read_pending(paths, identity, &mut report) {
         Ok((live_hashes, stale)) => {
             keep.extend(live_hashes);
@@ -194,6 +193,12 @@ pub(crate) fn collect(
             Vec::new()
         }
     };
+    if let Err(error) = owners.read_items(paths, &mut keep, &mut report) {
+        report.refusals.push(error);
+    }
+    if let Err(error) = owners.read_instances(paths, request, &mut keep, &mut report) {
+        report.refusals.push(error);
+    }
 
     // Every object time, in both stores, before the first delete: an unreadable time keeps
     // everything rather than being guessed at.

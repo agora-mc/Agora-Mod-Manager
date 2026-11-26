@@ -428,3 +428,31 @@ fn removing_an_unused_item_keeps_every_object_another_item_uses() {
     assert!(verification.problems.is_empty(), "{verification:?}");
     assert!(get_item(&ctx, &used_id).is_ok());
 }
+
+/// A staging folder belongs to the writer filling it until its bytes are placed. Another writer's
+/// sweep runs under the store lock while that writer is still staging, so it must leave the folder
+/// alone; a folder whose process is gone is the only kind it may remove (MASTER_SPEC §32.8).
+#[test]
+fn a_sweep_keeps_the_staging_folder_of_a_running_writer() {
+    let (_tmp, ctx) = test_ctx();
+    let staging = ctx.paths.content_staging_dir();
+    std::fs::create_dir_all(&staging).unwrap();
+    let live = staging.join(format!("{}-{}", std::process::id(), "live"));
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::write(live.join("object"), b"half copied").unwrap();
+    // A pid no process can have: nothing is running as it.
+    let dead = staging.join("4294967294-dead");
+    std::fs::create_dir_all(&dead).unwrap();
+    std::fs::write(dead.join("object"), b"left over").unwrap();
+
+    add_bytes(&ctx, "after-the-sweep", b"mod bytes");
+
+    assert!(
+        live.join("object").is_file(),
+        "a sweep deleted the folder a running writer is filling"
+    );
+    assert!(
+        !dead.exists(),
+        "a sweep kept the folder of a process that is not running"
+    );
+}

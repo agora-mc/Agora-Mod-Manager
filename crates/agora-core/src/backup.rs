@@ -1271,6 +1271,9 @@ pub fn import_backup(
     // re-import of the same artifact is idempotent; a different snapshot
     // trying to claim the same id is suspicious.
     let dest_manifest_path = crate::snapshot::snapshot_manifest_path(instance_dir, &snapshot_id);
+    // Whether this import has a manifest to publish: a re-import of the same artifact finds one
+    // already on disk and publishes nothing.
+    let mut publish_manifest = false;
     if dest_manifest_path.exists() {
         // If the existing manifest's file index matches the backup's, treat it
         // as already imported and skip object-store repopulation — the store
@@ -1299,6 +1302,7 @@ pub fn import_backup(
             ));
         }
     } else {
+        publish_manifest = true;
         // Populate the object store from the staged files.  Each staged file is
         // hashed (again) and handed to the store's one writer, which stages, syncs and commits it
         // under the same rules a content item's own files take.
@@ -1330,11 +1334,20 @@ pub fn import_backup(
 
         // Write the SnapshotManifest `list_snapshots` and `snapshot_file_index`
         // expect. A game-instance backup also restores the state it carries.
-        let snapshot_manifest_json = build_snapshot_manifest_json(&manifest)?;
-        crate::snapshot::atomic_write_pub(&dest_manifest_path, snapshot_manifest_json.as_bytes())?;
     }
-    // The imported snapshot's manifest names every object the import reused or added.
-    pending.published();
+    // The imported snapshot's manifest names every object the import reused or added, so writing
+    // it and dropping the pending record happen under one hold of the store lock: a collection
+    // sees the record or the manifest, never neither (MASTER_SPEC §32.8).
+    pending.published(|| {
+        if publish_manifest {
+            let snapshot_manifest_json = build_snapshot_manifest_json(&manifest)?;
+            crate::snapshot::atomic_write_pub(
+                &dest_manifest_path,
+                snapshot_manifest_json.as_bytes(),
+            )?;
+        }
+        Ok(())
+    })?;
 
     // Import stops here, at the snapshot store. It deliberately does not
     // promote anything into the live instance.
@@ -2214,6 +2227,27 @@ fn import_game_backup(
         );
     }
 
+    // Every object this import will reuse or add is registered before anything is checked, let
+    // alone written: a backup without bundled content bytes reuses objects the store already
+    // holds, and a collection running between that check and the manifest that names them would
+    // free them from under the import (MASTER_SPEC §32.8).
+    let imported_hashes: Vec<String> = manifest
+        .files
+        .iter()
+        .filter(|entry| !entry.absent)
+        .map(|entry| entry.sha256.to_ascii_lowercase())
+        .chain(
+            content_objects(&manifest.content_items)
+                .into_keys()
+                .map(|hash| hash.to_ascii_lowercase()),
+        )
+        .collect();
+    let pending = crate::content_store::pending::begin_pending_use(
+        &crate::snapshot::snapshot_store_paths(instance_dir),
+        &imported_hashes,
+        "backup import",
+    )?;
+
     // Everything is checked before the first write.
     let mut missing = Vec::new();
     for item in &manifest.content_items {
@@ -2400,6 +2434,7 @@ fn import_game_backup(
         return Err(error);
     }
 
+    let mut pending = Some(pending);
     let write_result: Result<(), String> = (|| {
         fs::create_dir_all(instance_dir)
             .map_err(|error| format!("failed to create instance directory: {error}"))?;
@@ -2407,28 +2442,6 @@ fn import_game_backup(
             .map_err(|error| format!("failed to create snapshots dir: {error}"))?;
         fs::create_dir_all(crate::snapshot::snapshot_objects_dir(instance_dir))
             .map_err(|error| format!("failed to create snapshot object store: {error}"))?;
-
-        // The objects this import is about to reuse or add are registered before the first one
-        // lands: the manifest that names them is published at the end of this block, and a
-        // collection running in between must keep them (MASTER_SPEC §32.8).
-        let imported_hashes: Vec<String> = manifest
-            .files
-            .iter()
-            .filter(|entry| !entry.absent)
-            .map(|entry| entry.sha256.to_ascii_lowercase())
-            .chain(
-                manifest
-                    .includes_content_bytes
-                    .then(|| content_objects(&manifest.content_items).into_keys())
-                    .into_iter()
-                    .flatten(),
-            )
-            .collect();
-        let pending = crate::content_store::pending::begin_pending_use(
-            &crate::snapshot::snapshot_store_paths(instance_dir),
-            &imported_hashes,
-            "backup import",
-        )?;
 
         for entry in &manifest.files {
             if entry.absent {
@@ -2473,24 +2486,35 @@ fn import_game_backup(
             }
         }
 
-        for item in &manifest.content_items {
-            let dest = content_item_path_for(instance_dir, &item.item_id);
-            if dest.is_file() {
-                continue;
-            }
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| format!("failed to create content items dir: {error}"))?;
-            }
-            let bytes = serde_json::to_vec_pretty(item).map_err(|error| {
-                format!("failed to serialize content item {}: {error}", item.item_id)
-            })?;
-            crate::snapshot::atomic_write_pub(&dest, &bytes)?;
-        }
+        // The item records and the snapshot manifest are what name the objects this import placed
+        // or reused. They are published inside the hold the pending record is dropped in, so a
+        // collection sees the record or the owner records, never neither (MASTER_SPEC §32.8).
+        pending
+            .take()
+            .expect("the import publishes its record once")
+            .published(|| {
+                for item in &manifest.content_items {
+                    let dest = content_item_path_for(instance_dir, &item.item_id);
+                    if dest.is_file() {
+                        continue;
+                    }
+                    if let Some(parent) = dest.parent() {
+                        fs::create_dir_all(parent).map_err(|error| {
+                            format!("failed to create content items dir: {error}")
+                        })?;
+                    }
+                    let bytes = serde_json::to_vec_pretty(item).map_err(|error| {
+                        format!("failed to serialize content item {}: {error}", item.item_id)
+                    })?;
+                    crate::snapshot::atomic_write_pub(&dest, &bytes)?;
+                }
 
-        let snapshot_manifest_json = build_snapshot_manifest_json(manifest)?;
-        crate::snapshot::atomic_write_pub(&dest_manifest_path, snapshot_manifest_json.as_bytes())?;
-        pending.published();
+                let snapshot_manifest_json = build_snapshot_manifest_json(manifest)?;
+                crate::snapshot::atomic_write_pub(
+                    &dest_manifest_path,
+                    snapshot_manifest_json.as_bytes(),
+                )
+            })?;
         Ok(())
     })();
 

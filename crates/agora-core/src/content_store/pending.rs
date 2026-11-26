@@ -62,6 +62,7 @@ impl PendingRecord {
 /// A pending record this process wrote, removed when the operation finishes or fails.
 #[derive(Debug)]
 pub(crate) struct PendingGuard {
+    paths: AppPaths,
     path: PathBuf,
     active: bool,
 }
@@ -73,11 +74,40 @@ impl PendingGuard {
         &self.path
     }
 
-    /// The owner record is published: the objects this operation used are in use on their own
-    /// account now.
-    pub(crate) fn published(mut self) {
-        let _ = std::fs::remove_file(&self.path);
+    /// Publish the owner record that names these objects, then drop this record, under one hold of
+    /// the content-store lock.
+    ///
+    /// A collection lists the owners and the pending records while it holds that lock, so both
+    /// steps being inside one hold is what makes the handoff total: it sees the pending record, or
+    /// it sees the published owners, and never neither. Dropping the record before the owner
+    /// lands, or outside the hold, leaves exactly that gap.
+    pub(crate) fn published<T>(
+        mut self,
+        publish: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let manager = LockManager::new(self.paths.locks_root());
+        let _lock = manager
+            .acquire(LockResource::ContentStore, "pending-publish")
+            .map_err(|error| {
+                format!(
+                    "cannot publish the record that names the objects this operation used: {error}"
+                )
+            })?;
         self.active = false;
+        let published = match publish() {
+            Ok(published) => published,
+            Err(error) => {
+                // Nothing names the objects now, so the record goes with the operation: they are
+                // an operation's leftovers, not a live operation's.
+                let _ = std::fs::remove_file(&self.path);
+                return Err(error);
+            }
+        };
+        // A record left behind only keeps objects a later collection would free, so a failure to
+        // remove it is not worth failing a published operation over: the next collection that
+        // finds this process gone clears it and says so.
+        let _ = std::fs::remove_file(&self.path);
+        Ok(published)
     }
 }
 
@@ -93,9 +123,12 @@ impl Drop for PendingGuard {
 
 /// Write a pending record naming `hashes` before this operation reuses or adds any of them.
 ///
-/// The record is written under the content-store lock, which is released before this returns: the
-/// lock is not reentrant, and an operation that already holds it (a content add) publishes its owner
-/// record inside that one hold and needs no record at all.
+/// The record is written under the content-store lock, which is released before this returns: an
+/// operation that reads owners, or places objects one at a time, then re-reads or re-asks under the
+/// lock for each step. What the record buys is the window between decisions — a collection that
+/// runs between two placements keeps every hash the record names, so the answer to "is this object
+/// here?" cannot change under the operation. An operation that publishes its owner record inside
+/// one continuous hold of the store lock (a content add) needs no record at all.
 pub(crate) fn begin_pending_use(
     paths: &AppPaths,
     hashes: &[String],
@@ -146,7 +179,11 @@ fn write_pending_record(
         let _ = std::fs::remove_file(&temp);
         format!("cannot publish {}: {error}", path.display())
     })?;
-    Ok(PendingGuard { path, active: true })
+    Ok(PendingGuard {
+        paths: paths.clone(),
+        path,
+        active: true,
+    })
 }
 
 #[cfg(test)]
@@ -176,7 +213,12 @@ mod tests {
         let guard = begin_pending_use(&paths, &["a".repeat(64)], "test").unwrap();
         let path = guard.path().to_path_buf();
         assert!(path.is_file());
-        guard.published();
+        guard
+            .published(|| {
+                // The owner record would be written here, inside the same hold.
+                Ok(())
+            })
+            .unwrap();
         assert!(!path.exists());
     }
 }
