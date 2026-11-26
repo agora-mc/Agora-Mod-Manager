@@ -548,6 +548,56 @@ mod tests {
         );
     }
 
+    /// A retired folder is restored by the same wholesale mechanism as a tracked one, so a file
+    /// created since the capture goes with the folder it sits in — and the undo point, sized to the
+    /// recorded scope, puts it back (MASTER_SPEC §32.7).
+    #[test]
+    fn the_undo_of_a_restore_that_replaced_a_retired_folder_brings_back_its_new_files() {
+        let (_root, service, ctx, id) = service();
+        let dir = ctx.paths.instance_dir(&id).unwrap();
+        fs::create_dir_all(dir.join("characters")).unwrap();
+        fs::write(dir.join("characters").join("hero.sav"), b"level 1").unwrap();
+        // Captured while the folder was part of the scope; the package no longer declares it.
+        let taken =
+            snapshot::create_snapshot_scoped(&dir, Some("older scope"), &["mods", "characters"])
+                .unwrap();
+        fs::write(dir.join("characters").join("hero.sav"), b"level 9").unwrap();
+        fs::write(dir.join("characters").join("new.sav"), b"created since").unwrap();
+
+        service.restore(&id, &taken.id).unwrap();
+
+        assert_eq!(
+            fs::read(dir.join("characters").join("hero.sav")).unwrap(),
+            b"level 1"
+        );
+        assert!(
+            !dir.join("characters").join("new.sav").exists(),
+            "the folder comes back the way the snapshot captured it"
+        );
+
+        let undo = snapshot::list_snapshots(&dir)
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| {
+                snapshot
+                    .label
+                    .as_deref()
+                    .is_some_and(|label| label.starts_with("pre-restore-"))
+            })
+            .expect("undo snapshot was not created");
+        service.restore(&id, &undo.id).unwrap();
+
+        assert_eq!(
+            fs::read(dir.join("characters").join("new.sav")).unwrap(),
+            b"created since",
+            "the undo covers the recorded scope, so the file the restore replaced is back"
+        );
+        assert_eq!(
+            fs::read(dir.join("characters").join("hero.sav")).unwrap(),
+            b"level 9"
+        );
+    }
+
     #[test]
     fn restore_takes_an_undo_snapshot_scoped_to_what_it_replaces() {
         let (_root, service, ctx, id) = service();

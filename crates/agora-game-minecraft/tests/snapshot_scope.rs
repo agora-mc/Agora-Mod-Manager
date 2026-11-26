@@ -166,3 +166,46 @@ fn a_restore_touches_only_the_declared_folders() {
     assert_eq!(restored, declared);
     assert!(outcome.preserved_roots.is_empty());
 }
+
+/// The pack-update rollback: the snapshot's scope comes from what the merge plans to write, so a
+/// folder the package does not track is inside it. A failed update that wrote `scripts/new.zs`
+/// must leave the instance as it was, not with the failed update's file beside the restored one
+/// (MASTER_SPEC §32.7).
+#[test]
+fn a_pack_rollback_removes_a_file_written_to_a_folder_the_package_does_not_track() {
+    let dir = instance();
+    let tracked = agora_game_minecraft::snapshot_scope::tracked_entries();
+    // What `apply_merge` does before it touches the instance: the tracked entries plus the roots
+    // the plan will write.
+    write(dir.path(), "scripts/old.zs", b"shipped before");
+    let scope =
+        snapshot::recovery_scope_for_writes(tracked, ["scripts/old.zs", "scripts/new.zs"]).unwrap();
+    assert!(
+        scope.iter().any(|root| root == "scripts"),
+        "the plan's writes bring scripts/ into the recovery scope: {scope:?}"
+    );
+    let scope_refs: Vec<&str> = scope.iter().map(String::as_str).collect();
+    let taken =
+        snapshot::create_snapshot_scoped(dir.path(), Some("pack-merge"), &scope_refs).unwrap();
+
+    // The merge writes, then fails somewhere later in the protected region.
+    write(dir.path(), "scripts/old.zs", b"the update's version");
+    write(
+        dir.path(),
+        "scripts/new.zs",
+        b"the failed update's new script",
+    );
+    write(dir.path(), "mods/a.jar", b"the update's jar");
+
+    snapshot::restore_snapshot(dir.path(), &taken.id, tracked).unwrap();
+
+    assert!(
+        !dir.path().join("scripts/new.zs").exists(),
+        "the rollback removes the file the failed update created"
+    );
+    assert_eq!(
+        fs::read(dir.path().join("scripts/old.zs")).unwrap(),
+        b"shipped before"
+    );
+    assert_eq!(fs::read(dir.path().join("mods/a.jar")).unwrap(), b"mod a");
+}

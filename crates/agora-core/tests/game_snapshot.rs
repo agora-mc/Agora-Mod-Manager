@@ -1519,3 +1519,34 @@ fn the_undo_of_a_restore_that_wrote_a_retired_folder_puts_it_back() {
         b"created since"
     );
 }
+
+/// Undo removes a file the restore created.
+///
+/// A data restore writes the files its manifest lists, so undoing it has to record the ones that
+/// were not there: a file the restore created, left behind by the undo, is state the user cannot
+/// get rid of (MASTER_SPEC §32.7).
+#[test]
+fn the_undo_of_a_restore_removes_a_file_the_restore_created() {
+    let h = Harness::new();
+    let def = definition_declaring(&["characters"]);
+    let extras = h.dir().join("characters");
+    std::fs::create_dir_all(&extras).unwrap();
+    std::fs::write(extras.join("hero.sav"), b"level 1").unwrap();
+    let taken = game_snapshot::create(&h.ctx, &h.id, &def, None, SnapshotOrigin::User).unwrap();
+
+    std::fs::remove_file(extras.join("hero.sav")).unwrap();
+    let outcome = game_snapshot::restore(&h.ctx, &h.id, &def, &taken.id, false)
+        .expect("the snapshot owns a folder it declared");
+    assert_eq!(
+        std::fs::read(extras.join("hero.sav")).unwrap(),
+        b"level 1",
+        "the restore puts the captured file back"
+    );
+
+    game_snapshot::restore(&h.ctx, &h.id, &def, &outcome.undo_snapshot_id, false)
+        .expect("the undo point reads back");
+    assert!(
+        !extras.join("hero.sav").exists(),
+        "the undo removes the file the restore created"
+    );
+}

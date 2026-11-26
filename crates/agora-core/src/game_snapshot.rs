@@ -1105,7 +1105,26 @@ pub fn restore_locked(
     // actually writes - including one the game no longer declares.
     let current = capture_data(ctx, instance_id, definition)?;
     let undo_aux = aux_for(&current)?;
-    let current_files = capture_files_in_scope(ctx, instance_id, definition, &recorded)?;
+    let mut current_files = capture_files_in_scope(ctx, instance_id, definition, &recorded)?;
+    // A restore writes every file its manifest lists, so undoing it has to record the ones that are
+    // not there now: without the absent entry the undo leaves behind a file the restore created,
+    // and the instance keeps state the user cannot get rid of (MASTER_SPEC §32.7). An entry the
+    // snapshot records as absent is a removal, and what it removes is in the capture above.
+    let present: std::collections::BTreeSet<String> = current_files
+        .iter()
+        .map(|file| file.relative_path.clone())
+        .collect();
+    let missing_now: Vec<String> = snapshot::snapshot_file_entries(&dir, snapshot_id)?
+        .into_iter()
+        .filter(|entry| !entry.absent && !present.contains(&entry.relative_path))
+        .map(|entry| entry.relative_path)
+        .collect();
+    for relative_path in missing_now {
+        current_files.push(snapshot::SnapshotInputFile {
+            relative_path,
+            contents: None,
+        });
+    }
     let undo = snapshot::create_snapshot_from_data(
         &dir,
         Some(&pre_restore_label(chrono::Utc::now())),
