@@ -1946,10 +1946,12 @@ fn restore_snapshot_impl(
         match agora_game_api::probe(path) {
             agora_game_api::Probe::Present(_) => found = true,
             agora_game_api::Probe::Absent => {}
-            agora_game_api::Probe::CantTell(error) => return Err(format!(
+            agora_game_api::Probe::CantTell(error) => {
+                return Err(format!(
                 "cannot tell what is at {}, so snapshot {snapshot_id} cannot be checked: {error}",
                 path.display()
-            )),
+            ))
+            }
         }
     }
     if !found {
