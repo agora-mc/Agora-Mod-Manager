@@ -16832,6 +16832,8 @@ mod tests {
             "ERR_PROCESS_CAPTURE_FAILED" => 100,
             "ERR_PROCESS_STALE" => 101,
             "ERR_USER_DECISION_REQUIRED" => 71,
+            // Declared after the registry (MASTER_SPEC 32.3); frozen here like the rest.
+            "ERR_ZIP_UNSAFE_NAMES" => 30,
             _ => 1,
         }
     }
@@ -16851,15 +16853,15 @@ mod tests {
             );
         }
 
-        // The old table classified 51 codes. If the registry stops declaring one
-        // of them the loop above cannot notice, so the count is pinned too.
+        // The old table classified 51 codes, plus one declared since. If the registry stops
+        // declaring one of them the loop above cannot notice, so the count is pinned too.
         let classified = agora_core::error_code::ALL
             .iter()
             .filter(|code| pre_registry_exit_table(code.as_str()) != 1)
             .count();
         assert_eq!(
-            classified, 51,
-            "the old table classified 51 codes; the registry declares {classified} of them"
+            classified, 52,
+            "the table classifies 52 codes; the registry declares {classified} of them"
         );
 
         // A string no declaration holds is still unclassified, not a new code.
