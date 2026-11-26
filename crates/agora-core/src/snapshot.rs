@@ -4711,8 +4711,14 @@ mod tests {
         // The case rule is the platform's: case-insensitive where the file system is (Windows,
         // macOS), exact on Linux.
         let insensitive = !cfg!(target_os = "linux");
-        assert_eq!(scope_contains(&declared, "CHARACTERS/hero.sav"), insensitive);
-        assert_eq!(scope_contains(&declared, "State/Config/a.toml"), insensitive);
+        assert_eq!(
+            scope_contains(&declared, "CHARACTERS/hero.sav"),
+            insensitive
+        );
+        assert_eq!(
+            scope_contains(&declared, "State/Config/a.toml"),
+            insensitive
+        );
 
         // A path mapped inside a folder does not own that folder: `user` is not tracked just
         // because `user/Plugins.txt` is (MASTER_SPEC §32.7).
