@@ -941,15 +941,19 @@ pub fn missing_content(ctx: &Ctx, refs: &[String]) -> Vec<String> {
     missing
 }
 
-/// Keep the live instance's id and name after a snapshot wrote its manifest.
-/// A snapshot captured from another instance (an imported backup, a clone's
-/// source) may carry a different identity; restoring its state must not rename
-/// the instance or change its id.
+/// Keep the live instance's id, name and base after a snapshot wrote its manifest.
+///
+/// A snapshot captured from another instance (an imported backup, a clone's source) may carry a
+/// different identity; restoring its state must not rename the instance or change its id. Nor may
+/// it move the instance onto another base: a snapshot records the mod setup, while which game files
+/// the instance plays on is the live row's business, and a manifest that named the snapshot's base
+/// would disagree with the row about what the instance is pinned to (MASTER_SPEC §32.8). The row is
+/// the authority; an instance with no row keeps what its own live manifest said.
 fn restore_manifest_identity(
     ctx: &Ctx,
     instance_id: &str,
     instance_dir: &Path,
-    identity: Option<&(String, String)>,
+    identity: Option<&(String, Option<String>, agora_game_api::BaseReference)>,
 ) -> Result<(), String> {
     let manifest_path = instance_dir.join(INSTANCE_MANIFEST_ROOT);
     if !manifest_path.is_file() {
@@ -959,18 +963,23 @@ fn restore_manifest_identity(
         .map_err(|error| format!("cannot read the restored manifest: {error}"))?;
     let mut manifest: GameInstanceManifest = serde_json::from_str(&text)
         .map_err(|error| format!("the restored manifest cannot be read: {error}"))?;
-    let (wanted_id, wanted_name) = match identity {
-        Some((id, name)) => (id.as_str(), Some(name.as_str())),
-        None => (instance_id, None),
-    };
+    let wanted_id = identity
+        .map(|(id, _, _)| id.as_str())
+        .unwrap_or(instance_id);
     let mut changed = false;
     if manifest.instance_id != wanted_id {
         manifest.instance_id = wanted_id.to_string();
         changed = true;
     }
-    if let Some(name) = wanted_name {
-        if manifest.name != name {
-            manifest.name = name.to_string();
+    if let Some((_, Some(name), _)) = identity {
+        if manifest.name != *name {
+            manifest.name = name.clone();
+            changed = true;
+        }
+    }
+    if let Some((_, _, base)) = identity {
+        if manifest.base != *base {
+            manifest.base = base.clone();
             changed = true;
         }
     }
@@ -1058,17 +1067,17 @@ pub fn restore_locked(
         .paths
         .instance_dir(instance_id)
         .map_err(|e| e.to_string())?;
-    // A restore replaces the manifest, but never the instance's identity. The
-    // row is the authority; fall back to the live manifest for an instance that
-    // has not been registered yet.
+    // A restore replaces the manifest, but never the instance's identity or the base it plays on.
+    // The row is the authority; fall back to the live manifest for an instance that has not been
+    // registered yet.
     let identity = game_instance::get(ctx, instance_id)
         .ok()
         .flatten()
-        .map(|record| (record.instance_id, record.name))
+        .map(|record| (record.instance_id, Some(record.name), record.base))
         .or_else(|| {
             game_instance::get_manifest(ctx, instance_id)
                 .ok()
-                .map(|manifest| (manifest.instance_id, manifest.name))
+                .map(|manifest| (manifest.instance_id, None, manifest.base))
         });
 
     let forced_while_not_idle = match activity_is_running(ctx, instance_id) {

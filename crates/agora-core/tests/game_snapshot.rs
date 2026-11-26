@@ -1611,3 +1611,53 @@ fn the_undo_of_a_restore_leaves_a_file_beside_a_mapped_one_alone() {
         "and the file the snapshot did record comes back"
     );
 }
+
+/// A snapshot records the mod setup, not which game files the instance plays on: that is the live
+/// row's business. A snapshot taken while the instance was pinned to one base must not move a
+/// restored instance onto it, or the manifest and the row would disagree about the base an
+/// instance is pinned to.
+#[test]
+fn a_restore_keeps_the_live_rows_base_in_the_manifest() {
+    let h = Harness::new();
+    let runtime = h.manifest().runtime_identity.unwrap();
+    let pinned = |id: &str| BaseReference::Pinned {
+        id: id.into(),
+        runtime: runtime.clone(),
+        mode: agora_game_api::BaseMode::Linked,
+    };
+
+    // The snapshot is taken while the instance is pinned to the old base.
+    let mut manifest = h.manifest();
+    manifest.base = pinned("base-old");
+    h.write_manifest(&manifest);
+    let snap =
+        game_snapshot::create(&h.ctx, &h.id, &h.def, Some("base"), SnapshotOrigin::User).unwrap();
+
+    // The row and the live manifest now name the base it was rebuilt onto.
+    let mut manifest = h.manifest();
+    manifest.base = pinned("base-new");
+    h.write_manifest(&manifest);
+    let conn = agora_core::db::local_state_connection(&h.ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "UPDATE game_instance_bases SET base_json = ?1 WHERE instance_id = ?2",
+        rusqlite::params![serde_json::to_string(&pinned("base-new")).unwrap(), h.id],
+    )
+    .unwrap();
+    drop(conn);
+
+    game_snapshot::restore(&h.ctx, &h.id, &h.def, &snap.id, false).unwrap();
+
+    let base = h.manifest().base;
+    assert!(
+        matches!(&base, BaseReference::Pinned { id, .. } if id == "base-new"),
+        "the restore put the snapshot's base back into the manifest, against the row: {base:?}"
+    );
+    let row = agora_core::game_instance::get(&h.ctx, &h.id)
+        .unwrap()
+        .expect("the row")
+        .base;
+    assert!(
+        matches!(&row, BaseReference::Pinned { id, .. } if id == "base-new"),
+        "the row still names the base it was pinned to: {row:?}"
+    );
+}
