@@ -187,15 +187,6 @@ impl CoreContext {
         // 2. Fatal: initialize / migrate local_state.db.
         let db_path = paths.local_state_db();
         let test_seams = crate::test_seams::TestSeams::default();
-        // Every adapter reaches the network through this context, so this is
-        // the one place the outbound policy has to be installed. Until it is,
-        // `network_gate` denies — a missing policy must not read as consent.
-        crate::network_gate::install(Arc::new(
-            crate::network_gate::SettingsGate::with_context_seams(
-                db_path.clone(),
-                test_seams.clone(),
-            ),
-        ));
         let local_state_report = crate::db::init_local_state_db_with(&db_path, local_state_options)
             .map_err(|e| {
                 // A typed error already says what happened and what the player
@@ -679,6 +670,15 @@ impl CoreContext {
             test_seams,
         };
         ctx.extensions.insert(behaviour_runtime);
+
+        // 6b. Install the outbound policy now that the context exists. Every adapter reaches the
+        //     network through this context, so this is the one place it has to be installed;
+        //     until it is, `network_gate` denies, and a missing policy must not read as consent.
+        //     The gate reads through this context's settings cache, so a second process's
+        //     Lockdown reaches the next request here (§32.9).
+        crate::network_gate::install(Arc::new(crate::network_gate::SettingsGate::for_context(
+            &ctx,
+        )));
 
         // 7. Let game packages load their catalogs from the signed registry
         //    (or fall back to embedded data when there is none).

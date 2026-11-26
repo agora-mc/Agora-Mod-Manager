@@ -2,20 +2,245 @@ use rusqlite::Connection;
 
 use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
-/// One settings cache per context, shared by its clones.
+/// How long loaded settings are trusted when the version has not changed.
+///
+/// The version catches every write Agora makes. This period is the backstop for one it does
+/// not: a settings row changed by something else (a hand edit, a restored older database) with
+/// no version bump is still noticed within half a minute (MASTER_SPEC §32.9).
+pub const SETTINGS_REFRESH_PERIOD: Duration = Duration::from_secs(30);
+
+/// The database, clock and test seams one settings read uses.
+///
+/// Passed in rather than read from a static, so a test's clock and seams reach the read on
+/// whatever thread it happens, and no other context sees them (§32.9).
+#[derive(Clone)]
+pub struct SettingsReads {
+    db_path: PathBuf,
+    clock: Arc<dyn crate::ctx::Clock>,
+    seams: crate::test_seams::TestSeams,
+}
+
+impl SettingsReads {
+    /// The reads a context makes: its own database, clock and seams.
+    pub fn of(ctx: &Ctx) -> Self {
+        Self {
+            db_path: ctx.paths.local_state_db(),
+            clock: Arc::clone(&ctx.clock),
+            seams: ctx.test_seams.clone(),
+        }
+    }
+
+    /// Reads with no seams and the wall clock, for a caller that only has a database path.
+    pub fn standalone(db_path: PathBuf) -> Self {
+        Self {
+            db_path,
+            clock: Arc::new(crate::ctx::WallClock),
+            seams: crate::test_seams::TestSeams::default(),
+        }
+    }
+}
+
+/// A settings version and the values read in the same snapshot as it.
+///
+/// Handed out by [`SettingsCache::load`]; holding one is holding a decision that was true when
+/// it was read, which is why the gate asks for a fresh one before every request.
+pub struct SettingsSnapshot {
+    version: i64,
+    checked_at: SystemTime,
+    values: HashMap<String, serde_json::Value>,
+}
+
+impl SettingsSnapshot {
+    /// The settings version these values were published with.
+    pub fn version(&self) -> i64 {
+        self.version
+    }
+
+    /// Whether Lockdown Mode forbids outbound requests in this snapshot.
+    ///
+    /// Reads as it does from the database: a value that is present but not understood denies
+    /// rather than being read as off.
+    pub fn lockdown_denies_network(&self) -> LauncherResult<bool> {
+        crate::db::lockdown_value_denies(self.value("network_lockdown_enabled"))
+    }
+
+    /// Whether the declared network switch `key` permits its request in this snapshot.
+    pub fn network_enabled(&self, key: &str) -> bool {
+        // Lockdown overrides every endpoint, exactly as it does when read from the database.
+        if self.lockdown_denies_network().unwrap_or(true) {
+            return false;
+        }
+        crate::db::switch_enabled(key, self.value(key))
+    }
+
+    fn value(&self, key: &str) -> Option<serde_json::Value> {
+        self.values.get(key).cloned()
+    }
+}
+
+/// One settings cache per context, shared by its clones (MASTER_SPEC §32.9).
+///
+/// A check reads the version on a retained connection — one single-row read — and reloads the
+/// values only when the version changed or the backstop period expired. The version and the
+/// values are read inside one read transaction, so a write that lands between the two reads
+/// cannot pair a new version with the values the user has just revoked.
+///
+/// A refresh that fails for any reason denies and forgets what it had: it never falls back to
+/// the last cached "allowed".
 #[derive(Default)]
 pub struct SettingsCache {
-    _stub: (),
+    state: Mutex<CacheState>,
+}
+
+#[derive(Default)]
+struct CacheState {
+    snapshot: Option<Arc<SettingsSnapshot>>,
+    /// The connection the version is read on, retained so a warm check costs one read and no
+    /// open. Dropped at every periodic refresh and after any read error, so a database file
+    /// that was replaced on disk is opened again rather than read through the old handle.
+    connection: Option<Connection>,
 }
 
 impl SettingsCache {
-    /// Check the database version and refresh the settings used by this context.
-    pub fn refresh(&self, _ctx: &Ctx) -> LauncherResult<()> {
-        Err(LauncherError::Generic {
-            code: "ERR_NETWORK_SETTINGS_UNREADABLE".into(),
-            message: "Settings cache refresh is not implemented".into(),
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Check the version and, when it changed, reload the settings this context uses.
+    ///
+    /// This is the admission check for a major action (§32.9): `Err` refuses the action and
+    /// says why.
+    pub fn refresh(&self, ctx: &Ctx) -> LauncherResult<()> {
+        self.load(&SettingsReads::of(ctx)).map(drop)
+    }
+
+    /// The settings as of now, reading the version and reloading only when they changed.
+    pub fn load(&self, reads: &SettingsReads) -> LauncherResult<Arc<SettingsSnapshot>> {
+        // A poisoned lock means a refresh panicked mid-read. The values it left are not a
+        // snapshot anybody verified, so they are dropped rather than trusted.
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let period = reads
+            .seams
+            .settings_refresh_period_override()
+            .unwrap_or(SETTINGS_REFRESH_PERIOD);
+        let now = reads.clock.now();
+        let expired = state.snapshot.as_ref().is_none_or(|snapshot| {
+            match now.duration_since(snapshot.checked_at) {
+                Ok(elapsed) => elapsed >= period,
+                // The clock moved backwards, so no elapsed time can be established. That is
+                // not evidence the period has not passed.
+                Err(_) => true,
+            }
+        });
+        if expired {
+            state.connection = None;
+        }
+        match read_settings(&mut state, reads, now, expired) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                state.snapshot = None;
+                state.connection = None;
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Read the version, and the values too when they can no longer be trusted.
+fn read_settings(
+    state: &mut CacheState,
+    reads: &SettingsReads,
+    now: SystemTime,
+    expired: bool,
+) -> LauncherResult<Arc<SettingsSnapshot>> {
+    if state.connection.is_none() {
+        reads
+            .seams
+            .settings_cache_event(crate::test_seams::SettingsCacheEvent::OpenConnection)
+            .map_err(|error| unreadable("could not open the settings database", &error))?;
+        state.connection = Some(
+            crate::db::local_state_connection(&reads.db_path)
+                .map_err(|error| unreadable("could not open the settings database", &error))?,
+        );
+    }
+    let conn = state
+        .connection
+        .as_ref()
+        .expect("the connection was opened above");
+    // One snapshot for both reads: a version read outside the transaction that reads the
+    // values could pair the new version with the old values, and so keep a permission the
+    // user has just revoked alive for the whole period.
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|error| unreadable("could not begin a settings read", &error))?;
+    let version = crate::db::settings_version(conn)
+        .map_err(|error| unreadable("could not read the settings version", &error))?;
+    reads
+        .seams
+        .settings_cache_event(crate::test_seams::SettingsCacheEvent::ReadVersion)
+        .map_err(|error| unreadable("could not read the settings version", &error))?;
+    let cached = state
+        .snapshot
+        .as_ref()
+        .filter(|snapshot| snapshot.version == version && !expired)
+        .cloned();
+    let snapshot = match cached {
+        Some(snapshot) => snapshot,
+        None => {
+            reads
+                .seams
+                .settings_cache_event(crate::test_seams::SettingsCacheEvent::BeforeValuesRead)
+                .map_err(|error| unreadable("could not read the settings", &error))?;
+            reads
+                .seams
+                .settings_cache_event(crate::test_seams::SettingsCacheEvent::ReadValues)
+                .map_err(|error| unreadable("could not read the settings", &error))?;
+            let values = load_values(conn).map_err(|error| {
+                unreadable("could not read the settings from the database", &error)
+            })?;
+            Arc::new(SettingsSnapshot {
+                version,
+                checked_at: now,
+                values,
+            })
+        }
+    };
+    drop(transaction);
+    state.snapshot = Some(Arc::clone(&snapshot));
+    Ok(snapshot)
+}
+
+/// Every stored setting, as the database holds it.
+///
+/// A value that is not readable JSON is `Null`, as [`crate::db::get_setting`] returns it, so a
+/// damaged value denies exactly as it does when read row by row.
+fn load_values(conn: &Connection) -> anyhow::Result<HashMap<String, serde_json::Value>> {
+    let rows = list(conn)?;
+    Ok(rows
+        .into_iter()
+        .map(|(key, text)| {
+            let value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+            (key, value)
         })
+        .collect())
+}
+
+/// The one refusal for a settings read that failed: it denies, and says what could not be read.
+fn unreadable(what: &str, error: &dyn std::fmt::Display) -> LauncherError {
+    LauncherError::Generic {
+        code: "ERR_NETWORK_SETTINGS_UNREADABLE".into(),
+        message: format!(
+            "Refusing: the settings could not be checked, so what the user permits is unknown \
+             ({what}: {error}). Try again once the settings database can be read."
+        ),
     }
 }
 
@@ -209,15 +434,15 @@ pub fn get(conn: &Connection, key: &str) -> anyhow::Result<Option<serde_json::Va
 
 /// Set a setting. The value string is parsed as JSON; if parsing fails it is
 /// stored as a plain JSON string.  Returns the stored JSON value.
+///
+/// Delegates the write to [`crate::db::set_setting`], so this path publishes the settings
+/// version in the same transaction as the value too. Two writers that each owned their own
+/// `INSERT` is how a settings write could land without a version and be ignored by every
+/// other process until the next backstop refresh.
 pub fn set(conn: &Connection, key: &str, value: &str) -> anyhow::Result<serde_json::Value> {
     let parsed: serde_json::Value =
         serde_json::from_str(value).unwrap_or(serde_json::Value::String(value.to_owned()));
-    let text = serde_json::to_string(&parsed)?;
-    conn.execute(
-        "INSERT INTO user_settings (key, value_json) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
-        rusqlite::params![key, text],
-    )?;
+    crate::db::set_setting(conn, key, &parsed)?;
     Ok(parsed)
 }
 

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 /// Expected schema version for the mutable local SQLite database.
 /// Migrations are applied sequentially on startup.
-pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 31;
+pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 32;
 
 /// The game whose columns `minecraft_instances` holds.
 ///
@@ -1102,10 +1102,27 @@ pub fn run_migrations_to(conn: &Connection, target: i64) -> anyhow::Result<Vec<S
     run_migration_steps(conn, MIGRATIONS, target)
 }
 
-/// Schema step 32 adds the settings version inside the migration transaction.
-#[allow(dead_code)] // Registered with the migration runner when step 32 is implemented.
-fn migrate_v32(_conn: &Connection) -> anyhow::Result<()> {
-    anyhow::bail!("schema step 32 has not been implemented")
+/// Schema step 32: the settings version (MASTER_SPEC §32.9).
+///
+/// One row, never deleted, holding a number every settings write bumps in the same
+/// transaction as the value. A reader compares that one number with the one it last loaded
+/// against, so the CLI and the desktop can see each other's Lockdown within one request
+/// instead of opening a connection and loading every setting per request.
+///
+/// The row starts at 1 rather than at the number of settings, because what matters is that
+/// it changes; the older rows have no version to preserve. It is created here, inside the
+/// migration transaction, so a database that fails to migrate does not have half a version.
+/// A write in a database that has no such table (a pre-32 migration step, which runs before
+/// this one) is not versioned; a write in a database that has the table but no row refuses.
+fn migrate_v32(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS settings_version (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             version INTEGER NOT NULL
+         );
+         INSERT OR IGNORE INTO settings_version (id, version) VALUES (1, 1);",
+    )?;
+    Ok(())
 }
 
 struct MigrationStep {
@@ -1305,6 +1322,12 @@ const MIGRATIONS: &[MigrationStep] = &[
         name: "one instance identity table",
         foreign_keys_off: true,
         run: migrate_v31,
+    },
+    MigrationStep {
+        version: 32,
+        name: "settings version",
+        foreign_keys_off: false,
+        run: migrate_v32,
     },
 ];
 
@@ -2807,9 +2830,84 @@ fn cross_namespace_orphans(conn: &Connection) -> anyhow::Result<Vec<String>> {
 }
 
 /// Read the settings version from the caller's database snapshot.
-/// A missing version row is a read failure.
-pub fn settings_version(_conn: &Connection) -> anyhow::Result<i64> {
-    anyhow::bail!("settings version read has not been implemented")
+///
+/// The number only means something together with the values read from the same snapshot, so
+/// callers that cache settings read both inside one transaction. A missing row is an error:
+/// it means the write that should have published a version did not, and guessing one would
+/// let a reader keep values the writer has already replaced.
+pub fn settings_version(conn: &Connection) -> anyhow::Result<i64> {
+    let version = conn.query_row(
+        "SELECT version FROM settings_version WHERE id = 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(version)
+}
+
+/// Publish a settings write: bump the version in the caller's transaction.
+///
+/// Called inside the transaction that writes the value, so a reader either sees both or
+/// neither. A database from before step 32 has no version row yet (the migration steps that
+/// write settings run before the table is created), and needs none. Once the table exists, a
+/// missing row is refused: a value nobody published a version for must not be read as current.
+fn bump_settings_version(conn: &Connection) -> anyhow::Result<()> {
+    if !table_exists(conn, "settings_version")? {
+        return Ok(());
+    }
+    let bumped = conn.execute(
+        "UPDATE settings_version SET version = version + 1 WHERE id = 1",
+        [],
+    )?;
+    if bumped != 1 {
+        anyhow::bail!(
+            "the settings version row is missing, so this settings write cannot publish a \
+             version other processes would see"
+        );
+    }
+    Ok(())
+}
+
+/// Run a settings write and its version bump as one transaction.
+///
+/// The value and the version must reach other processes together: a value committed without
+/// its version is a setting another process keeps ignoring, and a version without its value is
+/// a reload that finds the old one. Nested in a caller's transaction (the seeding run) it uses
+/// a savepoint, so the caller still commits once.
+fn with_settings_version(
+    conn: &Connection,
+    write: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let standalone = conn.is_autocommit();
+    if standalone {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+    } else {
+        conn.execute_batch("SAVEPOINT settings_write")?;
+    }
+    let outcome = write()
+        .and_then(|()| bump_settings_version(conn))
+        .and_then(|()| {
+            if standalone {
+                conn.execute_batch("COMMIT")?;
+            } else {
+                conn.execute_batch("RELEASE settings_write")?;
+            }
+            Ok(())
+        });
+    if let Err(error) = outcome {
+        // A vetoed COMMIT has already rolled the transaction back; anything else leaves it
+        // open, and a caller that keeps a half-written transaction is worse than one that
+        // rolls it back.
+        if conn.is_autocommit() {
+            return Err(error);
+        }
+        if standalone {
+            let _ = conn.execute_batch("ROLLBACK");
+        } else {
+            let _ = conn.execute_batch("ROLLBACK TO settings_write; RELEASE settings_write");
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Read a JSON-encoded setting from user_settings.
@@ -2844,14 +2942,25 @@ pub fn is_network_enabled(conn: &Connection, key: &str) -> bool {
     if is_lockdown_enabled(conn) {
         return false;
     }
-    match crate::settings_registry::read_bool(conn, key) {
-        Ok(Some(enabled)) => enabled,
-        Ok(None) => {
+    match get_setting(conn, key) {
+        Ok(raw) => switch_enabled(key, raw),
+        // Could not tell: that is not permission.
+        Err(_) => false,
+    }
+}
+
+/// Whether a declared network switch permits its request, from a value already read.
+///
+/// Shared by the readers that consult the database and by the settings cache (§32.9), so a
+/// cached answer and a freshly read one cannot disagree about what a stored value means. A key
+/// the registry does not declare as a boolean is a code bug: it is reported once and denied.
+pub fn switch_enabled(key: &str, raw: Option<serde_json::Value>) -> bool {
+    match crate::settings_registry::read_bool_from(key, raw) {
+        Some(enabled) => enabled,
+        None => {
             crate::settings_registry::report_undeclared_switch(key);
             false
         }
-        // Could not tell: that is not permission.
-        Err(_) => false,
     }
 }
 
@@ -2892,6 +3001,14 @@ pub fn lockdown_denies_network(conn: &Connection) -> crate::error::LauncherResul
             message: format!("Could not read the Lockdown Mode setting: {error}"),
         }
     })?;
+    lockdown_value_denies(raw)
+}
+
+/// Whether a read Lockdown Mode value forbids network access.
+///
+/// Shared by the per-request readers and by the settings cache (§32.9), so a cached answer and
+/// a freshly read one cannot disagree. A value that is present but not understood denies.
+pub fn lockdown_value_denies(raw: Option<serde_json::Value>) -> crate::error::LauncherResult<bool> {
     let Some(value) = raw else {
         return Ok(false);
     };
@@ -2919,14 +3036,20 @@ pub fn lockdown_denies_network(conn: &Connection) -> crate::error::LauncherResul
 }
 
 /// Upsert a JSON-encoded setting into user_settings.
+///
+/// The value and the settings version are committed together, so another process that checks
+/// the version before its next request sees this write or the previous one, never a value with
+/// a stale version.
 pub fn set_setting(conn: &Connection, key: &str, value: &serde_json::Value) -> anyhow::Result<()> {
     let text = serde_json::to_string(value)?;
-    conn.execute(
-        "INSERT INTO user_settings (key, value_json) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
-        rusqlite::params![key, text],
-    )?;
-    Ok(())
+    with_settings_version(conn, || {
+        conn.execute(
+            "INSERT INTO user_settings (key, value_json) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+            rusqlite::params![key, text],
+        )?;
+        Ok(())
+    })
 }
 
 /// Insert or update an instance: its identity row in `instances`, and the Minecraft

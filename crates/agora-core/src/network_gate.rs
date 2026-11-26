@@ -24,13 +24,16 @@
 //! forgets to install one loses network access, which is a bug that surfaces
 //! immediately, rather than losing lockdown, which is a bug nobody sees.
 //!
-//! The gate is read live rather than snapshotted at startup, so toggling
-//! lockdown takes effect on the next request — including in a second process
-//! sharing the same settings database.
+//! The gate reads the settings version before every request and reloads the values only when
+//! it changed, so toggling lockdown takes effect on the next request — including in a second
+//! process sharing the same settings database.
+//!
+//! A settings read that fails denies: an unreadable store cannot establish that the user
+//! permits the request, and the gate does not fall back to the last snapshot it read.
 
 use crate::error::{LauncherError, LauncherResult};
 use crate::http_client::ClientCategory;
-use crate::test_seams::{SettingsCacheEvent, TestSeams};
+use crate::settings::{SettingsCache, SettingsReads};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -69,37 +72,35 @@ impl NetworkGate for AllowAll {
     }
 }
 
-/// The production gate: Lockdown Mode plus the per-endpoint toggles, read from
-/// the local settings database on every request.
+/// The production gate: Lockdown Mode plus the per-endpoint toggles, read through the
+/// context's settings cache (§32.9).
+///
+/// The cache reads the settings version (one single-row read) before each request and reloads
+/// the values only when it changed, so a request costs one read instead of a connection and a
+/// full settings load. A refresh that fails denies: the gate never answers from the last
+/// snapshot it managed to read.
 pub struct SettingsGate {
-    db_path: PathBuf,
-    test_seams: Option<TestSeams>,
+    reads: SettingsReads,
+    cache: Arc<SettingsCache>,
 }
 
 impl SettingsGate {
+    /// A gate for a database path alone, with no seams and no shared cache.
+    ///
+    /// Test support, and the shape a caller that has nothing but a path needs; a context's
+    /// gate comes from [`Self::for_context`].
     pub fn new(db_path: PathBuf) -> Self {
         Self {
-            db_path,
-            test_seams: None,
+            reads: SettingsReads::standalone(db_path),
+            cache: Arc::new(SettingsCache::new()),
         }
     }
 
-    /// Construct the settings gate for a context, including its test seams.
+    /// The gate of a context: its database, its clock, its seams and its settings cache.
     pub fn for_context(ctx: &crate::ctx::Ctx) -> Self {
-        Self::with_context_seams(ctx.paths.local_state_db(), ctx.test_seams.clone())
-    }
-
-    pub(crate) fn with_context_seams(db_path: PathBuf, test_seams: TestSeams) -> Self {
         Self {
-            db_path,
-            test_seams: Some(test_seams),
-        }
-    }
-
-    fn observe(&self, event: SettingsCacheEvent) {
-        if let Some(seams) = &self.test_seams {
-            // The legacy reader reports I/O observations without fault substitution.
-            let _ = seams.settings_cache_event(event);
+            reads: SettingsReads::of(ctx),
+            cache: Arc::clone(&ctx.settings_cache),
         }
     }
 }
@@ -142,21 +143,16 @@ fn endpoint_setting(category: ClientCategory) -> Option<&'static str> {
 
 impl NetworkGate for SettingsGate {
     fn check(&self, category: ClientCategory) -> LauncherResult<()> {
-        self.observe(SettingsCacheEvent::OpenConnection);
-        let conn = crate::db::local_state_connection(&self.db_path).map_err(|error| {
-            // An unreadable settings store cannot establish that the user
-            // permits this request, so it does not.
-            LauncherError::Generic {
+        // A failed read is a refusal, and names what could not be read (§32.9, §32.13).
+        let settings = self
+            .cache
+            .load(&self.reads)
+            .map_err(|error| LauncherError::Generic {
                 code: "ERR_NETWORK_SETTINGS_UNREADABLE".into(),
-                message: format!(
-                    "Refusing a {category:?} request: the settings database could not be read, so \
-                     the network policy is unknown ({error})."
-                ),
-            }
-        })?;
+                message: format!("Refusing a {category:?} request: {error}"),
+            })?;
 
-        self.observe(SettingsCacheEvent::ReadValues);
-        if crate::db::lockdown_denies_network(&conn)? {
+        if settings.lockdown_denies_network()? {
             return Err(LauncherError::Generic {
                 code: "ERR_NETWORK_LOCKDOWN".into(),
                 message: format!(
@@ -167,7 +163,7 @@ impl NetworkGate for SettingsGate {
         }
 
         if let Some(key) = endpoint_setting(category) {
-            if !crate::db::is_network_enabled(&conn, key) {
+            if !settings.network_enabled(key) {
                 return Err(LauncherError::Generic {
                     code: "ERR_NETWORK_ENDPOINT_DISABLED".into(),
                     message: format!(
