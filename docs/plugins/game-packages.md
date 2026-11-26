@@ -426,10 +426,11 @@ names the game there.
 A snapshot scope is `{ "tracked": ["characters", "config"], "prelaunch": ["config"] }`. `tracked`
 lists the folders a snapshot of this game's instance captures and a restore replaces; `prelaunch`,
 when given, is the smaller set the mandatory pre-launch snapshot takes (it defaults to `tracked`).
-A folder naming the instance root, `..`, an absolute path or a malformed spelling is refused when
-the package loads, and a game that declares no scope snapshots only the state files its definition
-names (the instance manifest, the load orders, the user-file copies and the loadout store), as
-before.
+A folder naming the instance root, `..`, an absolute path, a malformed spelling or one the launcher
+owns (`.agora*`) is refused when the package loads, and so is a nested name (`state/config`): a
+snapshot records its scope as top-level roots, so nested snapshot folders are not supported yet. A
+game that declares no scope snapshots only the state files its definition names (the instance
+manifest, the load orders, the user-file copies and the loadout store), as before.
 
 A version source is `{ "kind": "executable", "path": "bin/game.exe" }`, `{ "kind": "store_record" }`
 or `{ "kind": "package_behaviour" }`. Only `executable` needs `path`.
