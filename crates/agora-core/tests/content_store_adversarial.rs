@@ -80,8 +80,6 @@ fn probe_windows_hostile_names_are_refused() {
         "foo.",
         "foo ",
         "a//b",
-        "./a",
-        "a/./b",
         "x:y",
         "../escape",
         "/abs",
@@ -94,6 +92,19 @@ fn probe_windows_hostile_names_are_refused() {
         let r = cs::add_archive(&c, &z, None);
         assert!(r.is_err(), "accepted hostile path {bad:?}");
         assert_nothing_left(&c);
+    }
+}
+
+/// A `.` component is not hostile: it names the folder it is in, so dropping it cannot leave the
+/// root and drops nothing (MASTER_SPEC §32.3). Zip tools write `./main.js` by the dozen.
+#[test]
+fn probe_a_dot_component_is_written_under_the_folder_it_names() {
+    for (entry, written) in [("./main.js", "main.js"), ("a/./b", "a/b")] {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = ctx(tmp.path());
+        let z = zip_with(&tmp.path().join("m.zip"), &[(entry, b"1")]);
+        let outcome = cs::add_archive(&c, &z, None).expect("a '.' component is not a refusal");
+        assert_eq!(outcome.item().files[0].path.as_str(), written);
     }
 }
 

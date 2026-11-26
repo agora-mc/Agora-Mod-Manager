@@ -324,15 +324,18 @@ fn test_refusal_empty_component() {
 }
 
 #[test]
-fn test_refusal_dot_component() {
+fn test_dot_component_names_the_folder_it_is_in() {
     let (_tmp, ctx) = test_ctx();
     let work = tempfile::tempdir().unwrap();
-    let zip_path = work.path().join("bad.zip");
+    let zip_path = work.path().join("dot.zip");
     create_zip(&zip_path, &[("a/./b.txt", b"content")]);
 
-    let res = add_archive(&ctx, &zip_path, None);
-    assert!(matches!(res, Err(ContentError::InvalidPath { .. })));
-    assert_store_empty(&ctx);
+    // MASTER_SPEC §32.3: a `.` component names the folder it is in and cannot leave the root, so
+    // the entry is written as `a/b.txt` rather than refused. Refusing it would refuse archives
+    // that unpack perfectly well — zip tools write `./main.js`, and a mod is a zip.
+    let out = add_archive(&ctx, &zip_path, None).expect("a '.' component is not a refusal");
+    assert_eq!(out.item().files.len(), 1);
+    assert_eq!(out.item().files[0].path.as_str(), "a/b.txt");
 }
 
 #[test]

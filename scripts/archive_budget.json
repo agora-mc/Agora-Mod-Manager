@@ -2,7 +2,6 @@
   "rule": 1,
   "opens": {
     "crates/agora-core/src/backup.rs": 6,
-    "crates/agora-core/src/content_store/mod.rs": 4,
     "crates/agora-core/src/snapshot.rs": 5,
     "crates/agora-game-minecraft/src/import.rs": 6,
     "crates/agora-game-minecraft/src/launch_planner.rs": 1,

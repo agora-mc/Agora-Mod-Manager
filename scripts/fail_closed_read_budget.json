@@ -27,7 +27,7 @@
   "directories": {
     "crates/agora-core/src/content_store": {
       "convert.rs": 1,
-      "mod.rs": 19,
+      "mod.rs": 18,
       "place.rs": 4,
       "protect.rs": 0,
       "rar.rs": 7

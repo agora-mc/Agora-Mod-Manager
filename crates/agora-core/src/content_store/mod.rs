@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use agora_game_api::{RelPath, StrictRelPath};
+use agora_game_api::{
+    classify_entry_name, ArchiveError, ArchiveLimits, EntryName, NamePolicy, RelPath, SafeArchive,
+    Select, StrictRelPath,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -605,6 +608,24 @@ fn hash_file_path(path: &Path) -> Result<String, std::io::Error> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// [`hash_file_path`] that also counts the bytes it hashed, so a file's size and its hash come from
+/// the same read of the same bytes.
+pub(super) fn hash_file_counting(path: &Path) -> Result<(String, u64), std::io::Error> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; HASH_BUFFER_SIZE];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        hasher.update(&buffer[..n]);
+    }
+    Ok((format!("{:x}", hasher.finalize()), total))
+}
+
 /// Copy `src` to `dst` while hashing the bytes, reading through `buf`. Returns the bytes copied and
 /// their SHA-256 (lowercase hex).
 fn copy_and_hash(src: &Path, dst: &Path, buf: &mut [u8]) -> Result<(u64, String), std::io::Error> {
@@ -666,144 +687,137 @@ struct StagedEntry {
     sha256: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArchiveFormat {
-    Zip,
-    SevenZ,
-    /// Read through Windows' own `tar.exe`; see `rar.rs`.
-    Rar,
+/// Open an archive with the one reader (MASTER_SPEC §32.3), under the store's own preset.
+///
+/// `GAME_MOD` carries the numbers the store enforced before the reader existed, and meant them:
+/// none for sizes, because a Skyrim texture or a BSA/BA2 mod is routinely past the limits a Technic
+/// pack is held to. What the store did check — each entry's path, a link, case-insensitive
+/// collisions, a password — is the reader's own rule, unchanged.
+///
+/// The RAR backend is the one core fills in (`rar.rs`); a zip, 7z or tar never touches it, and a
+/// RAR read where it cannot run is an error rather than an empty listing.
+fn open_archive(archive_path: &Path) -> Result<SafeArchive, ContentError> {
+    SafeArchive::open_with_rar(archive_path, ArchiveLimits::GAME_MOD, rar::rar_reader())
+        .map_err(archive_error)
 }
 
-/// The archive's format from its first bytes, never its extension.
-fn detect_archive_format(archive_path: &Path) -> Result<ArchiveFormat, ContentError> {
-    let mut f = std::fs::File::open(archive_path)?;
-    let mut magic = [0u8; 8];
-    let n = f.read(&mut magic)?;
-    if n >= 4 && (&magic[..4] == b"PK\x03\x04" || &magic[..4] == b"PK\x05\x06") {
-        Ok(ArchiveFormat::Zip)
-    } else if n >= 6 && magic[..6] == [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C] {
-        Ok(ArchiveFormat::SevenZ)
-    } else if rar::is_rar_magic(&magic[..n]) {
-        Ok(ArchiveFormat::Rar)
-    } else {
-        Err(ContentError::UnsupportedArchiveFormat)
+/// The reader's refusal, as the store's own error.
+///
+/// The store answers with the kinds it always has, so a caller that matched on them (a download
+/// watcher skipping a file that is not an archive, the desktop showing a reason) keeps working:
+/// what changed is which code decides, not what a person is told.
+fn archive_error(error: ArchiveError) -> ContentError {
+    match error {
+        ArchiveError::Unreadable {
+            path,
+            error: reason,
+        } if reason == "it is missing" => ContentError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("archive not found: {path}"),
+        )),
+        // Never an empty item, and never the store's path rules refusing a file that is simply not
+        // an archive this build reads.
+        ArchiveError::UnknownFormat { .. } => ContentError::UnsupportedArchiveFormat,
+        ArchiveError::PasswordProtected { .. } => ContentError::PasswordProtected,
+        ArchiveError::Corrupt { reason, .. } => ContentError::CorruptArchive(reason),
+        ArchiveError::EntrySizeLies {
+            entry, declared, ..
+        } => ContentError::EntryExceedsDeclaredSize {
+            path: entry,
+            declared,
+        },
+        ArchiveError::Escapes { entry, reason, .. } => ContentError::InvalidPath {
+            path: entry,
+            reason,
+        },
+        ArchiveError::LinkEntry { entry, .. } => ContentError::InvalidPath {
+            path: entry,
+            reason: "an archive entry that claims to be a link (a reparse point) is not allowed: \
+                     its tag is not stored, so it cannot be told from one that redirects"
+                .into(),
+        },
+        ArchiveError::DuplicateNames { names, .. } => ContentError::InvalidPath {
+            path: names.join(", "),
+            reason:
+                "the archive holds more than one entry with this name, and which one was meant \
+                     cannot be told"
+                    .into(),
+        },
+        ArchiveError::UnsafeNames { entries, .. } => {
+            let first = entries.into_iter().next();
+            match first {
+                Some(entry) => ContentError::InvalidPath {
+                    path: entry.name,
+                    reason: entry.reason,
+                },
+                None => ContentError::Other("an archive has entries a disk cannot hold".into()),
+            }
+        }
+        other => ContentError::CorruptArchive(other.to_string()),
     }
 }
 
-/// One file entry found while listing an archive, before anything is extracted.
-#[derive(Debug, Clone)]
-struct ListedArchiveEntry {
-    /// The entry's position in the archive, for zip extraction by index.
-    index: usize,
-    /// The name exactly as the archive stores it (7z matches entries by this).
-    name: String,
-    rel_path: StrictRelPath,
-    size: u64,
-}
+/// Read every file entry into the store's own staging folder, and hash it there.
+///
+/// One walk of the archive, in the archive's own order, with the one reader deciding every name, the
+/// path set, a link and the duplicates (§32.3); nothing is read twice and nothing is re-decided
+/// here. The free-space check comes first, on the bytes the archive *declares*: they are not
+/// trusted, but a declared total that cannot fit is refused before anything is written.
+///
+/// The bytes are hashed from the files the reader wrote, not from a count it reported, so an entry
+/// that delivered something other than what it declared cannot reach the object store.
+fn stage_archive(
+    ctx: &Ctx,
+    archive: &mut SafeArchive,
+) -> Result<(Vec<StagedEntry>, StagingGuard, PathBuf), ContentError> {
+    // Untrusted sizes: check free disk space.
+    let content_root = ctx.paths.content_root();
+    std::fs::create_dir_all(&content_root)?;
+    ensure_room_for_declared(&content_root, archive.total_declared_bytes())?;
 
-/// List a zip's file entries without reading their bytes, applying the store's path rules.
-fn list_zip_entries(archive_path: &Path) -> Result<Vec<ListedArchiveEntry>, ContentError> {
-    let file = std::fs::File::open(archive_path)?;
-    let mut zip =
-        zip::ZipArchive::new(file).map_err(|e| ContentError::CorruptArchive(format!("{e}")))?;
-    let mut listed = Vec::new();
-    for i in 0..zip.len() {
-        let entry = zip
-            .by_index(i)
-            .map_err(|e| ContentError::CorruptArchive(format!("{e}")))?;
-        let entry_name = entry
-            .name()
-            .map_err(|e| ContentError::CorruptArchive(format!("{e}")))?
-            .into_owned();
-        if entry.is_dir() || entry_name.ends_with('/') {
-            continue;
-        }
-        if let Some(mode) = entry.unix_mode() {
-            if (mode & 0o170000) == 0o120000 {
-                return Err(ContentError::InvalidPath {
-                    path: entry_name.clone(),
-                    reason: "zip symlink entry is not allowed".into(),
-                });
-            }
-        }
-        let rel_path = validate_entry_path(&entry_name)?;
-        listed.push(ListedArchiveEntry {
-            index: i,
-            name: entry_name,
+    // Staging directory setup, in the store's own staging area so placing an object is a rename.
+    let staging_root = ctx.paths.content_staging_dir();
+    std::fs::create_dir_all(&staging_root)?;
+    let unique = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
+    let staging_dir = staging_root.join(&unique);
+    std::fs::create_dir_all(&staging_dir)?;
+    // Made before the extraction, so an error half way through leaves nothing behind.
+    let guard = StagingGuard::new(&staging_dir);
+
+    let report = archive
+        .extract_checked(
+            &staging_dir,
+            NamePolicy::Refuse,
+            &mut |_| Select::Write,
+            &|| false,
+        )
+        .map_err(archive_error)?;
+    if report.written.is_empty() {
+        return Err(ContentError::EmptyItem);
+    }
+
+    let mut staged_entries = Vec::with_capacity(report.written.len());
+    for written in &report.written {
+        // A path the reader wrote is already under the strict rule; it is held to it again rather
+        // than trusted, and a path that fails is refused with its name.
+        let rel_path =
+            StrictRelPath::new(written.clone()).map_err(|error| ContentError::InvalidPath {
+                path: written.clone(),
+                reason: error.reason().to_string(),
+            })?;
+        let staged_path = staging_dir.join(written);
+        let (sha256, size) = hash_file_counting(&staged_path)?;
+        staged_entries.push(StagedEntry {
             rel_path,
-            size: entry.size(),
+            staged_path,
+            size,
+            sha256,
         });
     }
-    validate_path_set(
-        &listed
-            .iter()
-            .map(|entry| entry.rel_path.clone())
-            .collect::<Vec<_>>(),
-    )?;
-    Ok(listed)
+    Ok((staged_entries, guard, staging_dir))
 }
 
-/// List a 7z's file entries without reading their bytes, applying the store's path rules.
-fn list_sevenz_entries(archive_path: &Path) -> Result<Vec<ListedArchiveEntry>, ContentError> {
-    let archive = match sevenz_rust2::Archive::read(
-        &mut std::fs::File::open(archive_path)?,
-        &sevenz_rust2::Password::empty(),
-    ) {
-        Ok(a) => a,
-        Err(sevenz_rust2::Error::PasswordRequired | sevenz_rust2::Error::MaybeBadPassword(_)) => {
-            return Err(ContentError::PasswordProtected);
-        }
-        Err(e) => return Err(ContentError::CorruptArchive(format!("{e}"))),
-    };
-    for block in &archive.blocks {
-        for coder in &block.coders {
-            if coder.encoder_method_id() == [0x06, 0xF1, 0x07, 0x01] {
-                return Err(ContentError::PasswordProtected);
-            }
-        }
-    }
-    let mut listed = Vec::new();
-    for entry in &archive.files {
-        if entry.is_directory || entry.name.ends_with('/') || entry.is_anti_item {
-            continue;
-        }
-        if entry.has_windows_attributes {
-            let attrs = entry.windows_attributes;
-            // An archive stores the reparse *attribute* and not the tag, so an entry that claims to
-            // be one cannot be classified: a link and a cloud placeholder look alike here, and a
-            // link would point outside the store. Unclassifiable is refused, and the message says
-            // which kind of entry to look for.
-            let is_reparse_point = (attrs & 0x0400) != 0;
-            let unix_mode = (attrs >> 16) as u16;
-            let is_unix_symlink = (unix_mode & 0o170000) == 0o120000;
-            if is_reparse_point || is_unix_symlink {
-                return Err(ContentError::InvalidPath {
-                    path: entry.name.clone(),
-                    reason: "an archive entry that claims to be a link (a reparse point) is not \
-                             allowed: its tag is not stored, so it cannot be told from one that \
-                             redirects"
-                        .into(),
-                });
-            }
-        }
-        let rel_path = validate_entry_path(&entry.name)?;
-        listed.push(ListedArchiveEntry {
-            index: listed.len(),
-            name: entry.name.clone(),
-            rel_path,
-            size: entry.size,
-        });
-    }
-    validate_path_set(
-        &listed
-            .iter()
-            .map(|entry| entry.rel_path.clone())
-            .collect::<Vec<_>>(),
-    )?;
-    Ok(listed)
-}
-
-/// Every file entry in a zip, 7z or RAR archive, without extracting anything.
+/// Every file entry in a zip, 7z, tar, tar.gz or RAR archive, without extracting anything.
 ///
 /// This is the same reader `add_archive` uses, so recognition sees exactly the files an import
 /// would store, with the same path and symlink rules. The paths are relative, forward-slash and
@@ -815,15 +829,36 @@ pub fn list_archive_entries(archive_path: &Path) -> Result<Vec<String>, ContentE
             format!("archive not found: {}", archive_path.display()),
         )));
     }
-    let entries = match detect_archive_format(archive_path)? {
-        ArchiveFormat::Zip => list_zip_entries(archive_path)?,
-        ArchiveFormat::SevenZ => list_sevenz_entries(archive_path)?,
-        ArchiveFormat::Rar => rar::list_rar_entries(archive_path)?,
-    };
-    Ok(entries
-        .into_iter()
-        .map(|entry| entry.rel_path.as_str().to_string())
-        .collect())
+    let archive = open_archive(archive_path)?;
+    // The decision an import makes, made once here: names held to the strict rule, the set to one
+    // case-insensitive disk, and a link refused. Nothing is dropped quietly.
+    archive
+        .left_out_names(NamePolicy::Refuse)
+        .map_err(archive_error)?;
+    let mut paths = Vec::new();
+    for entry in archive.file_entries() {
+        match classify_entry_name(&entry.name) {
+            EntryName::Writable(strict) => paths.push(strict.as_str().to_string()),
+            EntryName::Escapes { reason } => {
+                return Err(ContentError::InvalidPath {
+                    path: entry.name.clone(),
+                    reason,
+                })
+            }
+            // `left_out_names` above refused these already; a name that became unwritable between
+            // the two decisions is refused here rather than dropped.
+            EntryName::Unwritable { reason } => {
+                return Err(ContentError::InvalidPath {
+                    path: entry.name.clone(),
+                    reason,
+                })
+            }
+        }
+    }
+    if paths.is_empty() {
+        return Err(ContentError::EmptyItem);
+    }
+    Ok(paths)
 }
 
 /// Whether the store already holds an item whose SHA-256 is `sha256`: an archive imported as that
@@ -921,202 +956,14 @@ pub(crate) fn add_archive_replacing_locked(
     let archive_sha256 = hash_file_path(archive_path)?;
     let archive_display_path = archive_path.to_string_lossy().to_string();
 
-    let format = detect_archive_format(archive_path)?;
-
-    let (staged_entries, mut guard, staging_dir) = match format {
-        ArchiveFormat::Zip => {
-            // 1. First pass: validate entry names, types, and collect declared sizes.
-            let listed = list_zip_entries(archive_path)?;
-            let declared_total_size: u64 = listed.iter().map(|entry| entry.size).sum();
-
-            // 2. Untrusted sizes: check free disk space
-            let content_root = ctx.paths.content_root();
-            std::fs::create_dir_all(&content_root)?;
-            ensure_room_for_declared(&content_root, declared_total_size)?;
-
-            // 3. Staging directory setup
-            let staging_root = ctx.paths.content_staging_dir();
-            std::fs::create_dir_all(&staging_root)?;
-            let unique = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
-            let staging_dir = staging_root.join(&unique);
-            std::fs::create_dir_all(&staging_dir)?;
-            let guard = StagingGuard::new(&staging_dir);
-
-            let file = std::fs::File::open(archive_path)?;
-            let mut zip = zip::ZipArchive::new(file)
-                .map_err(|e| ContentError::CorruptArchive(format!("{e}")))?;
-
-            // 4. Extract and stream-hash each file
-            let mut staged_entries = Vec::with_capacity(listed.len());
-            for (idx, listed_entry) in listed.iter().enumerate() {
-                let mut entry = zip
-                    .by_index(listed_entry.index)
-                    .map_err(|e| ContentError::CorruptArchive(format!("{e}")))?;
-                let rel_path = listed_entry.rel_path.clone();
-                let declared_size = listed_entry.size;
-
-                let staged_file_path = staging_dir.join(format!("obj_{idx}"));
-                use std::io::Write;
-                let mut staged_out = std::fs::File::create(&staged_file_path)?;
-
-                let mut hasher = Sha256::new();
-                let mut buf = [0u8; HASH_BUFFER_SIZE];
-                let mut bytes_written = 0u64;
-                let mut limited = (&mut entry).take(declared_size.saturating_add(1));
-
-                loop {
-                    let n = limited.read(&mut buf).map_err(|e| {
-                        ContentError::CorruptArchive(format!(
-                            "failed reading entry '{}': {e}",
-                            rel_path
-                        ))
-                    })?;
-                    if n == 0 {
-                        break;
-                    }
-                    bytes_written += n as u64;
-                    if bytes_written > declared_size {
-                        return Err(ContentError::EntryExceedsDeclaredSize {
-                            path: rel_path.to_string(),
-                            declared: declared_size,
-                        });
-                    }
-                    staged_out.write_all(&buf[..n])?;
-                    hasher.update(&buf[..n]);
-                }
-
-                let sha256 = format!("{:x}", hasher.finalize());
-                staged_entries.push(StagedEntry {
-                    rel_path,
-                    staged_path: staged_file_path,
-                    size: bytes_written,
-                    sha256,
-                });
-            }
-
-            (staged_entries, guard, staging_dir)
-        }
-        ArchiveFormat::Rar => rar::stage_rar(ctx, archive_path)?,
-        ArchiveFormat::SevenZ => {
-            let listed = list_sevenz_entries(archive_path)?;
-            let declared_total_size: u64 = listed.iter().map(|entry| entry.size).sum();
-            let validated_paths: Vec<StrictRelPath> =
-                listed.iter().map(|entry| entry.rel_path.clone()).collect();
-            let file_names: Vec<String> = listed.iter().map(|entry| entry.name.clone()).collect();
-
-            let content_root = ctx.paths.content_root();
-            std::fs::create_dir_all(&content_root)?;
-            ensure_room_for_declared(&content_root, declared_total_size)?;
-
-            let staging_root = ctx.paths.content_staging_dir();
-            std::fs::create_dir_all(&staging_root)?;
-            let unique = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
-            let staging_dir = staging_root.join(&unique);
-            std::fs::create_dir_all(&staging_dir)?;
-            let guard = StagingGuard::new(&staging_dir);
-
-            let name_to_idx: HashMap<String, usize> = file_names
-                .iter()
-                .enumerate()
-                .map(|(i, name)| (name.clone(), i))
-                .collect();
-
-            let mut staged_entries: Vec<Option<StagedEntry>> =
-                (0..file_names.len()).map(|_| None).collect();
-
-            let file = std::fs::File::open(archive_path)?;
-            let mut reader =
-                match sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty()) {
-                    Ok(r) => r,
-                    Err(
-                        sevenz_rust2::Error::PasswordRequired
-                        | sevenz_rust2::Error::MaybeBadPassword(_),
-                    ) => {
-                        return Err(ContentError::PasswordProtected);
-                    }
-                    Err(e) => return Err(ContentError::CorruptArchive(format!("{e}"))),
-                };
-
-            let extract_res = reader.for_each_entries(|entry, entry_reader| {
-                if entry.is_directory || entry.name.ends_with('/') || entry.is_anti_item {
-                    return Ok(true);
-                }
-                let Some(&idx) = name_to_idx.get(&entry.name) else {
-                    return Ok(true);
-                };
-
-                let rel_path = validated_paths[idx].clone();
-                let declared_size = entry.size;
-                let staged_file_path = staging_dir.join(format!("obj_{idx}"));
-                let mut staged_out =
-                    std::fs::File::create(&staged_file_path).map_err(sevenz_rust2::Error::from)?;
-
-                let mut hasher = Sha256::new();
-                let mut buf = [0u8; HASH_BUFFER_SIZE];
-                let mut bytes_written = 0u64;
-                let mut limited = entry_reader.take(declared_size.saturating_add(1));
-
-                use std::io::Write;
-                loop {
-                    let n = limited.read(&mut buf).map_err(|e| {
-                        sevenz_rust2::Error::Other(format!("READ_ERROR:{e}").into())
-                    })?;
-                    if n == 0 {
-                        break;
-                    }
-                    bytes_written += n as u64;
-                    if bytes_written > declared_size {
-                        return Err(sevenz_rust2::Error::Other(
-                            format!("EXCEEDS_DECLARED_SIZE:{}:{}", rel_path, declared_size).into(),
-                        ));
-                    }
-                    staged_out
-                        .write_all(&buf[..n])
-                        .map_err(sevenz_rust2::Error::from)?;
-                    hasher.update(&buf[..n]);
-                }
-
-                let sha256 = format!("{:x}", hasher.finalize());
-                staged_entries[idx] = Some(StagedEntry {
-                    rel_path,
-                    staged_path: staged_file_path,
-                    size: bytes_written,
-                    sha256,
-                });
-
-                Ok(true)
-            });
-
-            match extract_res {
-                Ok(()) => {}
-                Err(
-                    sevenz_rust2::Error::PasswordRequired
-                    | sevenz_rust2::Error::MaybeBadPassword(_),
-                ) => {
-                    return Err(ContentError::PasswordProtected);
-                }
-                Err(e) => {
-                    let s = e.to_string();
-                    if let Some(pos) = s.find("EXCEEDS_DECLARED_SIZE:") {
-                        let rest = &s[pos + "EXCEEDS_DECLARED_SIZE:".len()..];
-                        let parts: Vec<&str> = rest.split(':').collect();
-                        let path = parts[0].to_string();
-                        let declared = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
-                        return Err(ContentError::EntryExceedsDeclaredSize { path, declared });
-                    }
-                    return Err(ContentError::CorruptArchive(s));
-                }
-            }
-
-            let entries: Vec<StagedEntry> = staged_entries.into_iter().flatten().collect();
-            if entries.len() != file_names.len() {
-                return Err(ContentError::CorruptArchive(
-                    "not all declared files were extracted from archive".into(),
-                ));
-            }
-
-            (entries, guard, staging_dir)
-        }
+    // A RAR is read out of process, and its backend lists, extracts and checks through the same
+    // reader (`rar.rs`), so the whole import is handed to it. Every other format is read here, and
+    // one this build cannot read is refused by the reader rather than by a magic-number table here.
+    let (staged_entries, mut guard, staging_dir) = if rar::is_rar(archive_path)? {
+        rar::stage_rar(ctx, archive_path)?
+    } else {
+        let mut archive = open_archive(archive_path)?;
+        stage_archive(ctx, &mut archive)?
     };
 
     // 5. Store objects, record counts, compute item ID
