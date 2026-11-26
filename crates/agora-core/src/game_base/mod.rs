@@ -972,6 +972,40 @@ pub fn build_base_with_frameworks(
     // to stop a build taking a folder an instance is using, not to stop it making one.
     let final_base_dir = base_root.join(&base_id);
     let replacing = base_folder_present(&final_base_dir);
+    // A folder whose own marker says this build made it, with no record beside it, is a build cut
+    // short between placing the folder and publishing the record (MASTER_SPEC §32.8). Its pin is
+    // waiting for it, so the pinning check below would leave the base unbuildable and unremovable
+    // at once. The folder is this build's own output for this source, so the retry finishes the
+    // build: it verifies the folder the way a launch verifies a base, and publishes the record for
+    // it. A folder without the marker, or one holding files this source did not give, is somebody
+    // else's and is refused rather than adopted; a record that is there and damaged is its own
+    // case, and is still judged by the pinning check below.
+    let interrupted =
+        if replacing && record_missing && base_marker_matches(&final_base_dir, &base_id) {
+            let candidate = BaseManifest {
+                manifest_version: 1,
+                base_id: base_id.clone(),
+                runtime: runtime.clone(),
+                mode,
+                source_install: install.install_id.clone(),
+                source_product: Some(install.discovered.product.clone()),
+                source_location: source_dir.clone(),
+                location: final_base_dir.clone(),
+                created_unix_ms: now_unix_ms(),
+                files: base_files.clone(),
+                skipped: skipped.clone(),
+                incomplete_frameworks: incomplete_frameworks.clone(),
+            };
+            let verification = verify_base(
+                &candidate,
+                VerifyDepth::Full,
+                &|path| definition.is_declared_write(path),
+                &|path| definition.is_excluded(path),
+            );
+            verification.problems.is_empty().then_some(candidate)
+        } else {
+            None
+        };
     let _locations = if replacing {
         Some(locks.try_instance_locations("build-base").map_err(|error| {
             BaseError::Other(format!(
@@ -981,7 +1015,7 @@ pub fn build_base_with_frameworks(
     } else {
         None
     };
-    if replacing {
+    if replacing && interrupted.is_none() {
         let pinning = instances_pinning_base(paths, &base_id)?;
         if !pinning.is_empty() {
             return Err(BaseError::Other(format!(
@@ -989,6 +1023,26 @@ pub fn build_base_with_frameworks(
                 pinning.join(", ")
             )));
         }
+    }
+    if let Some(manifest) = interrupted {
+        // The folder is already what this build would have placed; the staging copy of the same
+        // files goes with the guard. The record is what was missing.
+        write_base_record(paths, &base_id, &unique, &manifest)?;
+        return Ok(BuildOutcome::Built {
+            linked_bytes: manifest
+                .files
+                .iter()
+                .filter(|file| file.linked)
+                .map(|file| file.size)
+                .sum(),
+            copied_bytes: manifest
+                .files
+                .iter()
+                .filter(|file| !file.linked)
+                .map(|file| file.size)
+                .sum(),
+            manifest,
+        });
     }
 
     // The marker travels with the staging folder, so the folder this build puts in place can be
@@ -1041,10 +1095,7 @@ pub fn build_base_with_frameworks(
         &base_root,
     );
 
-    let created_unix_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => d.as_millis() as i64,
-        Err(e) => -(e.duration().as_millis() as i64),
-    };
+    let created_unix_ms = now_unix_ms();
 
     let manifest = BaseManifest {
         manifest_version: 1,
@@ -1062,18 +1113,37 @@ pub fn build_base_with_frameworks(
     };
 
     // Write manifest (temp file + rename)
-    let manifests_dir = paths.base_manifests_dir();
-    std::fs::create_dir_all(&manifests_dir)?;
-    let tmp_manifest = manifests_dir.join(format!("{base_id}.json.tmp-{unique}"));
-    let manifest_bytes = serde_json::to_string_pretty(&manifest)?;
-    std::fs::write(&tmp_manifest, manifest_bytes)?;
-    std::fs::rename(&tmp_manifest, &manifest_path)?;
+    write_base_record(paths, &base_id, &unique, &manifest)?;
 
     Ok(BuildOutcome::Built {
         manifest,
         linked_bytes,
         copied_bytes,
     })
+}
+
+/// This moment, as the millisecond stamp a base record carries.
+fn now_unix_ms() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as i64,
+        Err(e) => -(e.duration().as_millis() as i64),
+    }
+}
+
+/// Publish a base's record: written beside it and renamed into place, so a reader sees either the
+/// previous record or this one and never half of either.
+fn write_base_record(
+    paths: &AppPaths,
+    base_id: &str,
+    unique: &str,
+    manifest: &BaseManifest,
+) -> Result<(), BaseError> {
+    let manifests_dir = paths.base_manifests_dir();
+    std::fs::create_dir_all(&manifests_dir)?;
+    let tmp_manifest = manifests_dir.join(format!("{base_id}.json.tmp-{unique}"));
+    std::fs::write(&tmp_manifest, serde_json::to_string_pretty(manifest)?)?;
+    std::fs::rename(&tmp_manifest, paths.base_manifest_path(base_id))?;
+    Ok(())
 }
 
 struct HashProgressContext<'a> {

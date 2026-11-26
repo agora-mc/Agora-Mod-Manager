@@ -3277,3 +3277,196 @@ fn a_removal_that_cannot_tell_whether_the_folder_is_there_removes_nothing() {
         "the record is kept, so the base stays listed"
     );
 }
+
+/// The state a build leaves when it is cut short between renaming its marked folder into place and
+/// publishing the record: a folder, no record, and — for a base an import is waiting for — a pin.
+/// Neither a build nor a removal could finish it: the retry saw a folder to replace and a pin on
+/// it, and refused. The folder carries this build's marker, so it is this build's own output: the
+/// retry verifies it and publishes the record.
+#[test]
+fn a_build_interrupted_after_placing_its_folder_finishes_on_retry() {
+    use agora_core::ctx::CoreContext;
+    use agora_core::game_instance::GameInstanceManifest;
+    use agora_game_api::BaseReference;
+
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("43"));
+    let RuntimeResolution::Identified { runtime, .. } = &install.runtime else {
+        panic!("the fixture install is identified");
+    };
+    let base_id = make_base_id(runtime);
+
+    let first = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .unwrap();
+    assert!(matches!(first, BuildOutcome::Built { .. }), "{first:?}");
+    // The crash: the folder is in place with its marker, the record never was written.
+    std::fs::remove_file(paths.base_manifest_path(&base_id)).unwrap();
+    assert!(paths
+        .bases_dir()
+        .join(&base_id)
+        .join(".agora-base.json")
+        .is_file());
+    assert!(!paths.base_manifest_path(&base_id).exists());
+
+    // The pin that has been waiting for this base all along.
+    let ctx = CoreContext::for_testing(tmp.path().join("data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let manifest = GameInstanceManifest::new(
+        runtime.game.clone(),
+        "imported",
+        "Imported",
+        Some(runtime.clone()),
+        BaseReference::Pinned {
+            id: base_id.clone(),
+            runtime: runtime.clone(),
+            mode: BaseMode::Linked,
+        },
+    );
+    let dir = ctx.paths.instance_dir("imported").unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("instance_manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
+         VALUES ('imported', ?1, 'Imported', datetime('now'), NULL)",
+        [runtime.game.as_str()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO game_instance_bases (instance_id, base_json) VALUES ('imported', ?1)",
+        [serde_json::to_string(&manifest.base).unwrap()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let retried = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .expect("a build interrupted after placing its folder finishes on retry");
+    assert!(
+        matches!(retried, BuildOutcome::Built { .. }),
+        "the retry published the record: {retried:?}"
+    );
+    assert!(
+        paths.base_manifest_path(&base_id).is_file(),
+        "the record is published for the folder that was there"
+    );
+    let listed = list_bases(&paths).unwrap();
+    assert!(
+        listed.iter().any(|entry| matches!(
+            entry,
+            BaseEntry::Readable(manifest) if manifest.manifest.base_id == base_id
+        )),
+        "the base is listed as readable, not damaged: {listed:?}"
+    );
+}
+
+/// The same folder without the build's marker is not this build's output: it is somebody else's
+/// folder under the base's name, and a pin waiting for the base still means it must not be
+/// replaced.
+#[test]
+fn a_build_does_not_adopt_an_unmarked_folder_for_a_waiting_pin() {
+    use agora_core::ctx::CoreContext;
+    use agora_core::game_instance::GameInstanceManifest;
+    use agora_game_api::BaseReference;
+
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("44"));
+    let RuntimeResolution::Identified { runtime, .. } = &install.runtime else {
+        panic!("the fixture install is identified");
+    };
+    let base_id = make_base_id(runtime);
+
+    let first = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .unwrap();
+    assert!(matches!(first, BuildOutcome::Built { .. }), "{first:?}");
+    std::fs::remove_file(paths.base_manifest_path(&base_id)).unwrap();
+    // No marker: not a folder this build can prove it made.
+    std::fs::remove_file(paths.bases_dir().join(&base_id).join(".agora-base.json")).unwrap();
+
+    let ctx = CoreContext::for_testing(tmp.path().join("data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let manifest = GameInstanceManifest::new(
+        runtime.game.clone(),
+        "imported",
+        "Imported",
+        Some(runtime.clone()),
+        BaseReference::Pinned {
+            id: base_id.clone(),
+            runtime: runtime.clone(),
+            mode: BaseMode::Linked,
+        },
+    );
+    let dir = ctx.paths.instance_dir("imported").unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("instance_manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
+         VALUES ('imported', ?1, 'Imported', datetime('now'), NULL)",
+        [runtime.game.as_str()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO game_instance_bases (instance_id, base_json) VALUES ('imported', ?1)",
+        [serde_json::to_string(&manifest.base).unwrap()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let refused = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    );
+    let error = format!(
+        "{}",
+        refused.expect_err("a folder this build cannot prove it made is not replaced")
+    );
+    assert!(
+        error.contains("imported"),
+        "the refusal names the instance the folder is kept for: {error}"
+    );
+    assert!(
+        paths.bases_dir().join(&base_id).is_dir(),
+        "the folder that may be somebody else's is left alone"
+    );
+}
