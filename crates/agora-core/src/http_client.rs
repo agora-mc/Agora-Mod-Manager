@@ -1194,6 +1194,10 @@ pub async fn checked_request_with_policy(
                     message: format!("Cannot resolve redirect Location: {location}"),
                 })?;
 
+            // A redirect is a new request: the answer the gate gave for the first hop does not
+            // carry over, and Lockdown may have been turned on while this one was in flight
+            // (MASTER_SPEC §32.9).
+            crate::network_gate::authorize(category)?;
             // Re-validate the redirect target against the same policies.
             let _ = check_request_url_resolving(
                 category,
@@ -1281,6 +1285,9 @@ pub async fn checked_send(
                 code: "ERR_INVALID_REDIRECT".into(),
                 message: "Cannot resolve redirect Location".into(),
             })?;
+        // Every hop asks the gate again: the first answer was about the first URL, and the
+        // policy may have changed while this request was in flight (§32.9).
+        crate::network_gate::authorize(category)?;
         check_request_url(category, next_url.as_str())?;
 
         match response.status().as_u16() {
@@ -1577,6 +1584,9 @@ pub async fn checked_request_with_headers(
                     message: format!("Cannot resolve redirect Location: {location}"),
                 })?;
 
+            // The next hop is a new request, so it asks the gate again: Lockdown may have been
+            // turned on while the first one was in flight (MASTER_SPEC §32.9).
+            crate::network_gate::authorize(category)?;
             let _ = check_request_url(category, next_url.as_str())?;
             remaining_redirects -= 1;
             current_url = next_url.to_string();
@@ -1659,6 +1669,8 @@ pub fn blocking_checked_request_with_policy(
                     message: format!("Cannot resolve redirect Location: {location}"),
                 })?;
 
+            // A blocking hop asks the gate again, exactly as the async one does (§32.9).
+            crate::network_gate::authorize(category)?;
             let _ = check_request_url_with_policy(category, next_url.as_str(), policy)?;
             remaining_redirects -= 1;
             current_url = next_url.to_string();
