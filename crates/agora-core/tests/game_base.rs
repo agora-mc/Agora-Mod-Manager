@@ -3278,6 +3278,115 @@ fn a_removal_that_cannot_tell_whether_the_folder_is_there_removes_nothing() {
     );
 }
 
+/// A link at `link` whose target is gone: a manifest or entry record that is a link, pointing at a
+/// drive or a folder that is not there any more. A file symlink is the shape a drive that went away
+/// leaves, so it is tried first; an account without the symlink privilege (no Developer Mode) gets
+/// a dangling directory junction instead, which needs none and makes the same point.
+fn dangling_link(target: &Path, link: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        if std::os::windows::fs::symlink_file(target, link).is_ok() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(target)?;
+        junction::create(target, link)?;
+        std::fs::remove_dir_all(target)
+    }
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+}
+
+/// A manifest that is a link is not a manifest that is absent. A link whose target is offline reads
+/// as "not found", and reading it that way let a base removal pass over the one record that said an
+/// instance pins the base — and then delete it. A link is named as a link and the base kept.
+#[test]
+fn a_manifest_that_is_a_link_keeps_its_base() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("51"));
+    let outcome = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+    let base_folder = paths.bases_dir().join(&base_id);
+    assert!(base_folder.is_dir());
+
+    // An instance folder with no row: its manifest, a link to somewhere that is gone, is the only
+    // record that it pins the base.
+    let orphan = paths.instances_root().join("orphan-instance");
+    std::fs::create_dir_all(&orphan).unwrap();
+    dangling_link(
+        &tmp.path().join("manifest-target"),
+        &orphan.join("instance_manifest.json"),
+    )
+    .unwrap();
+
+    let error = remove_base(&paths, &base_id)
+        .expect_err("a manifest Agora cannot read through a link must keep the base");
+    let message = format!("{error}");
+    assert!(
+        message.contains("instance_manifest.json"),
+        "the refusal names the manifest that is a link: {message}"
+    );
+    assert!(
+        message.contains("is a link"),
+        "the refusal says the record is a link, not that it failed to read: {message}"
+    );
+    assert!(base_folder.join(".agora-base.json").is_file());
+    assert!(paths.base_manifest_path(&base_id).is_file());
+}
+
+/// The same for a Recently deleted entry record: an `entry.json` that is a link to a place that is
+/// gone is not an entry that pins nothing. It is named, and the base is kept.
+#[test]
+fn an_entry_record_that_is_a_link_keeps_its_base() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("52"));
+    let outcome = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+    let base_folder = paths.bases_dir().join(&base_id);
+    assert!(base_folder.is_dir());
+
+    let entry = paths
+        .recently_deleted_games_root()
+        .join("20240101-000000_taken");
+    std::fs::create_dir_all(entry.join("instance")).unwrap();
+    dangling_link(&tmp.path().join("entry-target"), &entry.join("entry.json")).unwrap();
+
+    let error = remove_base(&paths, &base_id)
+        .expect_err("an entry record Agora cannot read through a link must keep the base");
+    let message = format!("{error}");
+    assert!(
+        message.contains("entry.json"),
+        "the refusal names the entry record that is a link: {message}"
+    );
+    assert!(
+        message.contains("is a link"),
+        "the refusal says the record is a link, not that it failed to read: {message}"
+    );
+    assert!(base_folder.join(".agora-base.json").is_file());
+    assert!(paths.base_manifest_path(&base_id).is_file());
+}
+
 /// The state a build leaves when it is cut short between renaming its marked folder into place and
 /// publishing the record: a folder, no record, and — for a base an import is waiting for — a pin.
 /// Neither a build nor a removal could finish it: the retry saw a folder to replace and a pin on

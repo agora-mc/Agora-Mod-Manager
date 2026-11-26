@@ -1818,6 +1818,38 @@ fn instances_pinning_base_with(
 /// not skipped, and a manifest that cannot be read is not passed over: the caller is about to
 /// delete a base, so "I could not tell" is never "nothing pins it". An entry with no manifest pins
 /// nothing (a Minecraft instance keeps none), which is the one absence this reads as absence.
+/// Read a record the pin scan needs: an instance manifest, or a Recently deleted entry record.
+///
+/// A record that is a link is refused by name. A link whose target is offline or on a drive that is
+/// not mounted reads as "not found", and reading it that way would pass over the one record that
+/// says an instance pins the base — and then the removal deletes the base (MASTER_SPEC §32.8).
+/// Only a clean `NotFound` on a path that is not a link means there is no record here.
+fn read_pin_record(path: &Path, base_id: &str) -> Result<Option<Vec<u8>>, BaseError> {
+    let cannot_tell = |why: &dyn std::fmt::Display| {
+        BaseError::Other(format!(
+            "cannot read {}{why}, so Agora cannot tell whether the record there uses base {base_id}; \
+             the base is kept",
+            path.display()
+        ))
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(_) if is_reparse_point_or_symlink(path) => Err(BaseError::Other(format!(
+            "{} is a link, so Agora cannot tell whether the record there uses base {base_id}; the \
+             base is kept",
+            path.display()
+        ))),
+        // Something that is not a file (a folder on the name) is not a record either, and what it
+        // holds cannot be read as one.
+        Ok(metadata) if !metadata.is_file() => Err(cannot_tell(&" is not a file")),
+        Ok(_) => match std::fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) => Err(cannot_tell(&format!(" ({error})"))),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(cannot_tell(&format!(" ({error})"))),
+    }
+}
+
 fn instance_manifests_pinning_base(
     paths: &AppPaths,
     base_id: &str,
@@ -1886,10 +1918,8 @@ fn instance_manifests_pinning_base(
                 }
             }
             let manifest_path = folder.join("instance_manifest.json");
-            let bytes = match std::fs::read(&manifest_path) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(unreadable(&manifest_path, &error)),
+            let Some(bytes) = read_pin_record(&manifest_path, base_id)? else {
+                continue;
             };
             let stored: serde_json::Value = serde_json::from_slice(&bytes)
                 .map_err(|error| unreadable(&manifest_path, &error))?;
@@ -1938,17 +1968,10 @@ fn trash_instances_pinning_base(paths: &AppPaths, base_id: &str) -> Result<Vec<S
         })?;
         let entry_path = entry.path();
         let record = entry_path.join("entry.json");
-        let text = match std::fs::read_to_string(&record) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(BaseError::Other(format!(
-                    "cannot read the deleted entry {}, so Agora cannot tell whether base {base_id} is in use: {error}",
-                    record.display()
-                )))
-            }
+        let Some(text) = read_pin_record(&record, base_id)? else {
+            continue;
         };
-        let stored: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+        let stored: serde_json::Value = serde_json::from_slice(&text).map_err(|error| {
             BaseError::Other(format!(
                 "cannot read the deleted entry {}, so Agora cannot tell whether base {base_id} is in use: {error}",
                 record.display()
