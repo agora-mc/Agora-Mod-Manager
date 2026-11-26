@@ -484,6 +484,37 @@ impl LockManager {
             .map(|state| state.operation.clone())
     }
 
+    /// Whether this manager holds the cross-process instance-locations lock right now.
+    fn holds_instance_locations(&self) -> bool {
+        let Ok(name) = LockResource::InstanceLocations.lock_name() else {
+            return false;
+        };
+        let lock_path = self.locks_root.join(format!("{name}.lock"));
+        self.held_operation(&lock_key(&lock_path)).is_some()
+    }
+
+    /// Refuse to take a lock while this manager holds instance-locations (MASTER_SPEC §32.8).
+    ///
+    /// The order is an instance or base lock first, then the content-store lock, then
+    /// instance-locations, and nothing at all while instance-locations is held. Every operation
+    /// that took the locks the other way round would let two of them each wait for a lock the
+    /// other holds, and the two answers a pinning scan reads (the live rows and both Recently
+    /// deleted roots) are only trustworthy while nothing can change between them. A wrong order
+    /// is a bug that only shows under load in a real run, so it stops the operation here in the
+    /// builds tests run and is a no-op in release ones.
+    ///
+    /// The check sees the locks of *this* manager. A manager stands for one operation's locks, so
+    /// this is the check the rule is about; the OS lock still refuses a second holder of
+    /// instance-locations, whichever manager asks.
+    fn refuse_lock_while_holding_locations(&self, resource: &LockResource, operation: &str) {
+        debug_assert!(
+            !self.holds_instance_locations(),
+            "lock order (MASTER_SPEC §32.8): '{operation}' asked for {resource:?} while this \
+             manager holds instance-locations. Take the instance or base lock first, then the \
+             content store, then instance-locations, and acquire nothing while it is held."
+        );
+    }
+
     /// The operation of the live holder of `resource`, when one holds it. A free
     /// lock is not a holder. Used to fail fast when the holder is a long tool
     /// run instead of waiting out the acquire timeout.
@@ -658,6 +689,7 @@ impl LockManager {
         timeout: Duration,
         cancel: Option<&CancellationToken>,
     ) -> Result<LockGuard, LockRefusal> {
+        self.refuse_lock_while_holding_locations(&resource, operation);
         let (lock_name, lock_path, key) =
             self.prepare(&resource).map_err(LockRefusal::Unavailable)?;
         let deadline = Instant::now() + timeout;
@@ -735,6 +767,7 @@ impl LockManager {
         timeout: Duration,
         cancel: Option<&CancellationToken>,
     ) -> Result<LockGuard, LockRefusal> {
+        self.refuse_lock_while_holding_locations(&resource, operation);
         let (lock_name, lock_path, key) =
             self.prepare(&resource).map_err(LockRefusal::Unavailable)?;
         let deadline = Instant::now() + timeout;

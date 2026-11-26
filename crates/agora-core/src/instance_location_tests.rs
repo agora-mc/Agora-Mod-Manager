@@ -692,3 +692,18 @@ fn user_snapshot_delete_waits_for_a_lock_released_within_the_wait() {
     releaser.join().unwrap();
     assert!(snapshot::list_snapshots(&instance_dir).unwrap().is_empty());
 }
+
+/// MASTER_SPEC §32.8: instance-locations is the last lock taken, and nothing is taken while it is
+/// held. A manager that holds it and asks for another lock is refused rather than left to wait on
+/// a lock another operation is waiting on the locations lock for.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "instance-locations")]
+fn taking_a_lock_while_holding_instance_locations_is_refused() {
+    let (_dir, ctx) = fixture();
+    let manager = LockManager::new(ctx.paths.locks_root());
+    let _held = manager.try_instance_locations("test holder").unwrap();
+    let _base = manager
+        .acquire(LockResource::Base("a-base".into()), "test waiter")
+        .unwrap();
+}
