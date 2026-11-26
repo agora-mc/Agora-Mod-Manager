@@ -17,6 +17,7 @@
   "crates/agora-core/src/http_client.rs::PROXY": {"category": "config", "why": "the proxy applies to every client built in the process, including ones built outside a context; it moves onto Ctx with the rest of the network configuration (32.9)"},
   "crates/agora-core/src/linux_view.rs::linux_impl::NATIVE": {"category": "constant", "why": "a stateless strategy value used as &'static; there is nothing per-context to carry"},
   "crates/agora-core/src/linux_view.rs::unsupported::UNSUPPORTED": {"category": "constant", "why": "a stateless strategy value used as &'static; there is nothing per-context to carry"},
+  "crates/agora-core/src/lock_manager.rs::LOCATION_HOLDERS": {"category": "guard", "why": "which threads hold instance-locations is a fact about the process's threads, not about one context: a guard can be dropped on a thread other than the one that took it, and a second LockManager in one thread must still be refused (MASTER_SPEC 32.8)"},
   "crates/agora-core/src/lock_manager.rs::PROGRAM_NAME": {"category": "config", "why": "the program name is stamped into every lock file of the process, which is how one process tells its locks from another's"},
   "crates/agora-core/src/log_sanitizer.rs::windows_user_re::RE": {"category": "cache", "why": "a compiled regex, kept once rather than per log line"},
   "crates/agora-core/src/log_sanitizer.rs::linux_home_re::RE": {"category": "cache", "why": "a compiled regex, kept once rather than per log line"},

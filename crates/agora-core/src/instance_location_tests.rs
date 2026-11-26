@@ -14,7 +14,7 @@ use crate::content_store::{self, ContentError};
 use crate::ctx::Ctx;
 use crate::game_base::{self, BaseError};
 use crate::game_instance::{self, trash, GameInstanceManifest};
-use crate::lock_manager::{LockGuard, LockManager, LockResource};
+use crate::lock_manager::{LockGuard, LockManager, LockRefusal, LockResource};
 use crate::snapshot::{self, SnapshotAux, SnapshotOrigin};
 use rusqlite::OptionalExtension;
 
@@ -108,10 +108,23 @@ fn instance(ctx: &Ctx, id: &str, item: Option<&str>) -> PathBuf {
     dir
 }
 
+/// Another operation's hold on instance-locations. It is taken on a thread of its own, because the
+/// order rule is per thread (MASTER_SPEC §32.8): a hold recorded against this thread would refuse
+/// this thread's own locks for the *order* instead of reporting the lock as busy, and the case
+/// under test is a lock somebody else holds. The guard comes back so a test can drop it when it
+/// wants the lock released.
 fn contend(ctx: &Ctx) -> LockGuard {
-    LockManager::new(ctx.paths.locks_root())
-        .acquire(LockResource::InstanceLocations, "test contender")
-        .unwrap()
+    let manager = LockManager::new(ctx.paths.locks_root());
+    let (ready, acquired) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let guard = manager
+            .acquire(LockResource::InstanceLocations, "test contender")
+            .unwrap();
+        ready.send(guard).unwrap();
+    });
+    acquired
+        .recv()
+        .expect("the contender thread holds the locations lock")
 }
 
 fn snapshot_move_race(restore: bool) {
@@ -720,18 +733,56 @@ fn user_snapshot_delete_waits_for_a_lock_released_within_the_wait() {
 }
 
 /// MASTER_SPEC §32.8: instance-locations is the last lock taken, and nothing is taken while it is
-/// held. A manager that holds it and asks for another lock is refused rather than left to wait on
-/// a lock another operation is waiting on the locations lock for.
-#[cfg(debug_assertions)]
+/// held. A thread that holds it and asks for another lock is refused with an error naming both
+/// locks — in every build, because the operation it would otherwise wait for is the one waiting
+/// for it, which is a deadlock and not a slow start.
 #[test]
-#[should_panic(expected = "instance-locations")]
 fn taking_a_lock_while_holding_instance_locations_is_refused() {
     let (_dir, ctx) = fixture();
     let manager = LockManager::new(ctx.paths.locks_root());
     let _held = manager.try_instance_locations("test holder").unwrap();
-    let _base = manager
-        .acquire(LockResource::Base("a-base".into()), "test waiter")
-        .unwrap();
+    let refusal = manager
+        .acquire_typed(LockResource::Base("a-base".into()), "test waiter")
+        .expect_err("a lock taken while instance-locations is held is the wrong order");
+    assert!(
+        matches!(refusal, LockRefusal::Unavailable(_)),
+        "the wrong order is not somebody holding the lock: {refusal:?}"
+    );
+    let error = refusal.into_launcher_error();
+    assert_eq!(error.code(), "ERR_LOCK_ORDER");
+    let message = error.to_string();
+    assert!(
+        message.contains("instance-locations") && message.contains("base-a-base"),
+        "the refusal names both locks: {message}"
+    );
+    // The order refusal took nothing: the locations lock is still the only one held, and it is
+    // still this thread's.
+    assert!(manager
+        .current_operation(&LockResource::Base("a-base".into()))
+        .is_none());
+}
+
+/// The hold is the *thread's*, not the process's: another operation holding instance-locations on
+/// a thread of its own is that operation's business. A library scan on a shared thread does not
+/// make an unrelated import on this one fail, and this thread still sees the locations lock as
+/// busy rather than as a wrong order.
+#[test]
+fn a_location_hold_on_another_thread_does_not_refuse_this_threads_locks() {
+    let (_dir, ctx) = fixture();
+    let held = contend(&ctx);
+    let manager = LockManager::new(ctx.paths.locks_root());
+    let base = manager
+        .acquire(
+            LockResource::Base("a-base".into()),
+            "an unrelated operation",
+        )
+        .expect("a hold on another thread is not this thread's hold");
+    drop(base);
+    let busy = manager
+        .try_instance_locations("a second scan")
+        .expect_err("the locations lock really is held, by the other thread");
+    assert_eq!(busy.code(), "ERR_LOCK_TIMEOUT", "{busy}");
+    drop(held);
 }
 
 /// A restore cut off just after its rename: the files are back under `instances/` with the

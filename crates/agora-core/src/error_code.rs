@@ -349,6 +349,7 @@ error_codes! {
     LockCancelled = "ERR_LOCK_CANCELLED", GuardAndLocks, 1;
     LockContested = "ERR_LOCK_CONTESTED", GuardAndLocks, 1;
     LockIo = "ERR_LOCK_IO", GuardAndLocks, 1;
+    LockOrder = "ERR_LOCK_ORDER", GuardAndLocks, 1;
     LockSnapshot = "ERR_LOCK_SNAPSHOT", GuardAndLocks, 1;
     LockTimeout = "ERR_LOCK_TIMEOUT", GuardAndLocks, 1;
     MojangLauncherRunning = "ERR_MOJANG_LAUNCHER_RUNNING", GuardAndLocks, 1;
