@@ -100,6 +100,9 @@ pub(crate) struct CollectReport {
     pub failures: Vec<String>,
     /// Names of pending records it found of processes that are provably gone, and removed.
     pub stale_pending: Vec<String>,
+    /// Things worth telling the person that are not failures: a dead operation's record this
+    /// collection cleared, an object kept because a live operation holds it.
+    pub notes: Vec<String>,
 }
 
 impl CollectReport {
@@ -110,28 +113,33 @@ impl CollectReport {
 
     /// One line for a person: what was reclaimed, or what was not and why.
     pub(crate) fn summary(&self) -> String {
-        if self.refused() {
-            return format!("kept every stored object: {}", self.refusals.join("; "));
-        }
         let mut parts = Vec::new();
-        if !self.deleted.is_empty() {
-            parts.push(format!("reclaimed {} object(s)", self.deleted.len()));
-        }
-        if !self.kept_recent.is_empty() {
+        if self.refused() {
             parts.push(format!(
-                "kept {} recent object(s) inside the grace period",
-                self.kept_recent.len()
+                "kept every stored object: {}",
+                self.refusals.join("; ")
             ));
+        } else {
+            if !self.deleted.is_empty() {
+                parts.push(format!("reclaimed {} object(s)", self.deleted.len()));
+            }
+            if !self.kept_recent.is_empty() {
+                parts.push(format!(
+                    "kept {} recent object(s) inside the grace period",
+                    self.kept_recent.len()
+                ));
+            }
+            if !self.stale_pending.is_empty() {
+                parts.push(format!(
+                    "cleared {} pending record(s) of operations that are no longer running",
+                    self.stale_pending.len()
+                ));
+            }
+            if !self.failures.is_empty() {
+                parts.push(format!("could not finish: {}", self.failures.join("; ")));
+            }
         }
-        if !self.stale_pending.is_empty() {
-            parts.push(format!(
-                "cleared {} pending record(s) of operations that are no longer running",
-                self.stale_pending.len()
-            ));
-        }
-        if !self.failures.is_empty() {
-            parts.push(format!("could not finish: {}", self.failures.join("; ")));
-        }
+        parts.extend(self.notes.iter().cloned());
         if parts.is_empty() {
             return "nothing to reclaim".into();
         }
@@ -706,8 +714,10 @@ fn read_pending(
         };
         match identity(&record.process) {
             ProcessCheck::Gone => {
-                report.failures.push(format!(
-                    "the pending record of '{}' (process {}) is left by an operation that is no \
+                // A record left by an operation that is provably gone is a note, not a failure:
+                // the collection cleared it, and nothing was kept on account of it.
+                report.notes.push(format!(
+                    "the pending record of '{}' (process {}) was left by an operation that is no \
                      longer running; its objects are no longer held by it",
                     record.operation, record.process.pid
                 ));

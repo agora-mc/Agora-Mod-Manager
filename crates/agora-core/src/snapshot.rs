@@ -3216,24 +3216,24 @@ pub(crate) fn delete_snapshot_collecting(
         snapshot_id,
         list_snapshot_scan_dir,
         &locations,
-        Some(&store),
+        &store,
         grace,
     )
 }
 
-/// Delete a snapshot whose caller already holds InstanceLocations, then collect.
+/// Delete a snapshot whose caller already holds InstanceLocations and the content-store lock, then
+/// collect.
 ///
-/// The guard is proof the non-reentrant lock is held: retention takes it once for a whole round and
-/// passes it to every delete, so no delete tries to take the lock again. `store` is the content
-/// store's guard when the caller holds it (delete and retention both take it before the locations,
-/// which is the collector's order); with `None` the collection asks for it without waiting, so a
-/// collection already running elsewhere is a refusal rather than a lock cycle.
+/// The guards are proof the non-reentrant locks are held: retention takes them once for a whole
+/// round and passes them to every delete, so no delete tries to take either again. Store first,
+/// then locations, is the collector's order, and a caller that has one without the other refuses
+/// rather than reaching for it here (MASTER_SPEC §32.8).
 pub(super) fn delete_snapshot_with(
     instance_dir: &Path,
     snapshot_id: &str,
     _list_dir: impl Fn(&Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>>,
     _locations: &LockGuard,
-    store: Option<&LockGuard>,
+    store: &LockGuard,
     grace: Option<std::time::Duration>,
 ) -> Result<(), String> {
     validate_snapshot_id(snapshot_id)?;
@@ -3260,11 +3260,7 @@ pub(super) fn delete_snapshot_with(
     let report = crate::content_store::collect::collect_at_instance(
         instance_dir,
         &crate::content_store::collect::CollectRequest {
-            store: if store.is_some() {
-                crate::content_store::collect::LockRequest::Held
-            } else {
-                crate::content_store::collect::LockRequest::Try
-            },
+            store: crate::content_store::collect::LockRequest::Held,
             locations: crate::content_store::collect::LockRequest::Held,
             grace,
             ignore_unreadable_snapshots: false,
@@ -3272,6 +3268,7 @@ pub(super) fn delete_snapshot_with(
         },
     )
     .map_err(|error| format!("snapshot {snapshot_id} was deleted, but {error}"))?;
+    let _ = store;
     if report.refused() {
         eprintln!(
             "snapshot {snapshot_id} was deleted; stored objects kept: {}",

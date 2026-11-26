@@ -589,7 +589,7 @@ pub(crate) fn run_retention_with_grace(
             id,
             crate::snapshot::list_snapshot_scan_dir,
             &locations,
-            Some(&store),
+            &store,
             grace,
         ) {
             errors.push(format!("{id}: {error}"));
