@@ -2518,6 +2518,9 @@ fn read_manifest_file(path: &Path, snapshot_id: &str) -> Result<SnapshotManifest
     Ok(manifest)
 }
 
+/// What a verification receipt beside a snapshot or an object is called, appended to its name.
+pub(crate) const VERIFIED_RECEIPT_SUFFIX: &str = ".agora-verified";
+
 /// Whether this file name looks like a snapshot manifest, as opposed to the helper files that live
 /// beside one (`live-file-index.json`, `mutation-journal.json`) or a verification receipt.
 ///
@@ -2636,6 +2639,18 @@ pub(crate) fn validate_snapshot_id(snapshot_id: &str) -> Result<(), String> {
         || snapshot_id.contains('\\')
     {
         return Err("invalid snapshot id".into());
+    }
+    // A manifest and the receipt beside an object are both `<name>.json` in the same folder. An id
+    // whose manifest is `<id>.json` ending in `.agora-verified` would read as a receipt, so the
+    // collection would skip the manifest and free the blobs it names (MASTER_SPEC §32.8).
+    if snapshot_id
+        .to_ascii_lowercase()
+        .ends_with(VERIFIED_RECEIPT_SUFFIX)
+    {
+        return Err(format!(
+            "invalid snapshot id {snapshot_id}: a snapshot whose id ends in {VERIFIED_RECEIPT_SUFFIX} \
+             would be read as the receipt beside an object, not as a snapshot"
+        ));
     }
     Ok(())
 }
@@ -4759,5 +4774,20 @@ mod tests {
             zip.write_all(contents).unwrap();
         }
         zip.finish().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+
+    /// A manifest and the receipt beside an object are both `<name>.json` in the same folder, so an
+    /// id that ends like a receipt would be read as a receipt: `list_snapshots` and the collector
+    /// would skip the manifest and free the blobs it names (MASTER_SPEC §32.8).
+    #[test]
+    fn a_snapshot_id_that_ends_like_a_receipt_is_refused() {
+        assert!(validate_snapshot_id("snap.agora-verified").is_err());
+        assert!(validate_snapshot_id("snap.AGORA-VERIFIED").is_err());
+        assert!(validate_snapshot_id("plain-id").is_ok());
     }
 }

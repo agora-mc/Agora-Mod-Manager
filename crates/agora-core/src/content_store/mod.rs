@@ -1862,7 +1862,13 @@ pub(crate) fn set_item_metadata_locked(
     item.provider = metadata.provider;
     item.provider_id = metadata.provider_id;
     item.provider_origin = metadata.provider_origin;
-    item.icon_sha256 = metadata.icon_sha256;
+    // An icon is recorded, never cleared by a stale copy. Every caller round-trips the icon it read
+    // before this hold, so writing that copy back would drop an icon another writer saved in
+    // between — and the item would then name no object while the icon object looked unreferenced
+    // (MASTER_SPEC §32.8).
+    if metadata.icon_sha256.is_some() {
+        item.icon_sha256 = metadata.icon_sha256;
+    }
     write_manifest_atomic(&ctx.paths, &item)?;
     Ok(item)
 }

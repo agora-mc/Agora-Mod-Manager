@@ -515,3 +515,44 @@ fn a_malformed_setting_is_an_error() {
     .unwrap();
     assert!(placement_mode(&ctx).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// 3b. A stale metadata write never clears an icon saved in the meantime
+// ---------------------------------------------------------------------------
+
+/// Callers round-trip the icon they read before taking the store lock. If one of them wrote that
+/// copy back, an icon another writer saved in between would vanish from the record while its
+/// object looked unreferenced (MASTER_SPEC §32.8).
+#[test]
+fn a_stale_metadata_write_does_not_clear_an_icon_saved_meanwhile() {
+    let (_tmp, ctx) = test_ctx();
+    let work = tempfile::tempdir().unwrap();
+    let file = work.path().join("mod.jar");
+    std::fs::write(&file, b"mod bytes").unwrap();
+    let item_id = add_file(&ctx, &file, Some("mod"), None)
+        .unwrap()
+        .item()
+        .item_id
+        .clone();
+
+    // What a caller read before the icon existed.
+    let stale = ItemMetadata {
+        description: Some("read before the icon".into()),
+        ..Default::default()
+    };
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend_from_slice(&[7u8; 16]);
+    assert!(
+        agora_core::library::save_icon(&ctx, &item_id, &png).unwrap(),
+        "the icon is an image and is saved"
+    );
+
+    set_item_metadata(&ctx, &item_id, stale).unwrap();
+
+    let after = get_item(&ctx, &item_id).unwrap();
+    assert!(
+        after.icon_sha256.is_some(),
+        "a stale copy cleared the icon another writer had just saved"
+    );
+    assert_eq!(after.description.as_deref(), Some("read before the icon"));
+}
