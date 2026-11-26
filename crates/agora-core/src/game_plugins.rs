@@ -907,6 +907,8 @@ pub fn sync_without_content_while_running(
     store: &StoreId,
     allow_while_running: bool,
 ) -> Result<Option<PluginSyncReport>, PluginListError> {
+    crate::settings::admit_major_action(ctx)
+        .map_err(|error| PluginListError::Other(error.to_string()))?;
     let guard = guard_for(ctx, instance_id, "plugins-sync", allow_while_running)?;
     sync_without_content_locked(ctx, &guard, definition, store)
 }

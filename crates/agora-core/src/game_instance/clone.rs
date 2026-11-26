@@ -128,6 +128,7 @@ pub fn clone_instance(
     definition: &GameDefinition,
     options: CloneOptions,
 ) -> Result<ClonedInstance, InstanceError> {
+    super::admit(ctx)?;
     let new_name = new_name.trim();
     if new_name.is_empty() {
         return Err(InstanceError::Other("Give the new instance a name.".into()));

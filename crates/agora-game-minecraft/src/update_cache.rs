@@ -403,6 +403,8 @@ fn sweep_result_still_current(before: &Option<String>, after: &Option<String>) -
 /// - All network work is bounded and best-effort; a cold start never awaits
 ///   this beyond spawning it.
 pub async fn sweep_all_updates(ctx: Ctx) -> Result<SweepSummary, String> {
+    agora_core::settings::admit_major_action(&ctx)
+        .map_err(|error| format!("the update sweep was refused: {error}"))?;
     // Phase 1: list instances on the background scheduler lane.
     let scheduler = ctx.task_scheduler.clone();
     let ctx_for_list = ctx.clone();

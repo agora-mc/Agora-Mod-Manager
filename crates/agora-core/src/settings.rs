@@ -244,6 +244,17 @@ fn unreadable(what: &str, error: &dyn std::fmt::Display) -> LauncherError {
     }
 }
 
+/// Refuse a major action whose settings could not be checked (MASTER_SPEC §32.9).
+///
+/// A major action changes what is on the player's disk or what leaves this machine, and the
+/// settings decide part of that: a pack file outside the usual folders is only allowed under
+/// reduced security mode, a runtime is only installed for the game it belongs to. Reading a
+/// stale answer is how an action proceeds on a permission the user has revoked, so a failed
+/// check refuses the action and says to try again rather than guessing.
+pub fn admit_major_action(ctx: &Ctx) -> LauncherResult<()> {
+    ctx.settings_cache.refresh(ctx)
+}
+
 // ---------------------------------------------------------------------------
 // SettingsService — core-owned typed service
 // ---------------------------------------------------------------------------

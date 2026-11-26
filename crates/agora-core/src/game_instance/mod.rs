@@ -401,6 +401,15 @@ fn hold_base_for_imported_pin(
     Ok(hold)
 }
 
+/// Refuse an instance action whose settings could not be checked (MASTER_SPEC §32.9).
+///
+/// Read-only views do not call this: listing and details must keep working when the settings
+/// database cannot be read, and they change nothing that the settings decide.
+pub(crate) fn admit(ctx: &Ctx) -> Result<(), InstanceError> {
+    crate::settings::admit_major_action(ctx)
+        .map_err(|error| InstanceError::Other(error.to_string()))
+}
+
 /// Create a generic game instance from an identified install.
 pub fn create(
     ctx: &Ctx,
@@ -435,6 +444,7 @@ pub fn create_with_options(
     options: crate::game_base::BuildOptions,
     progress: &(dyn Fn(BuildProgress) + Send + Sync),
 ) -> Result<GameInstanceRecord, InstanceError> {
+    admit(ctx)?;
     let runtime = match &install.runtime {
         RuntimeResolution::Identified { runtime, .. } => runtime.clone(),
         RuntimeResolution::Unidentified { reasons } => {
@@ -1100,6 +1110,7 @@ pub fn delete_with_options(
     id: &str,
     options: DeleteOptions,
 ) -> Result<DeleteOutcome, InstanceError> {
+    admit(ctx)?;
     // A delete changes the instance's records and folders, so it takes the same lock as every other
     // writer. While it is held nothing can deploy or launch the instance out from under it. A tool
     // run holds it for its whole run, so that case fails fast instead of waiting out the timeout.
@@ -1345,6 +1356,7 @@ pub fn record_launch(ctx: &Ctx, id: &str) -> Result<(), InstanceError> {
 
 /// Give a generic game instance a new name, in the list and in its manifest. The id never changes.
 pub fn rename(ctx: &Ctx, id: &str, name: &str) -> Result<(), InstanceError> {
+    admit(ctx)?;
     let name = name.trim();
     if name.is_empty() {
         return Err(InstanceError::Other("Give the instance a name.".into()));
@@ -2002,6 +2014,7 @@ pub fn prepare_launch_with(
     discover_fn: &dyn Fn() -> DiscoveryReport,
     launcher: &dyn Launcher,
 ) -> Result<PreparedLaunch, InstanceError> {
+    admit(ctx)?;
     let record = get(ctx, id)?.ok_or_else(|| InstanceError::NotFound(id.to_string()))?;
     let manifest = get_manifest(ctx, id)?;
     // A game that ships no launch recipe can ask its package's script for one.
@@ -2542,6 +2555,7 @@ pub fn launch_with(
     discover_fn: &dyn Fn() -> DiscoveryReport,
     launcher: &dyn Launcher,
 ) -> Result<LaunchedInstance, InstanceError> {
+    admit(ctx)?;
     let record = get(ctx, id)?.ok_or_else(|| InstanceError::NotFound(id.to_string()))?;
 
     // An interrupted tool swap is put back before the launch deploys or swaps anything (MASTER_SPEC §26.9).

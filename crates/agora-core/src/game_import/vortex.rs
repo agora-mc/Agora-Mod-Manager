@@ -2759,6 +2759,9 @@ fn run_planned(
     progress: &dyn Fn(ImportProgress),
     mod_to_item: &mut HashMap<String, String>,
 ) -> Result<VortexRunReport, Box<super::RunInnerError>> {
+    crate::settings::admit_major_action(ctx).map_err(|error| -> Box<super::RunInnerError> {
+        ImportError::Other(error.to_string()).into()
+    })?;
     // The speculative install used by the preview gets its real identity after --add-folder.
     let inventory = if plan.would_add_folder {
         let instance_name = plan.instance_name;

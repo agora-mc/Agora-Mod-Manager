@@ -281,6 +281,7 @@ impl LaunchService {
         request: LaunchRequest,
         progress: &dyn LaunchProgress,
     ) -> LauncherResult<LaunchResult> {
+        agora_core::settings::admit_major_action(&self.ctx)?;
         validate_instance_id(&request.instance_id)?;
         let lock = self
             .ctx
@@ -328,6 +329,7 @@ impl LaunchService {
         action: LaunchRecoveryAction,
         progress: &dyn LaunchProgress,
     ) -> LauncherResult<LaunchResult> {
+        agora_core::settings::admit_major_action(&self.ctx)?;
         validate_instance_id(&request.instance_id)?;
         let lock = self
             .ctx

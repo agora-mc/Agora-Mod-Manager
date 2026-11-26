@@ -261,6 +261,7 @@ async fn export_ready_server_impl(
     world: Option<&str>,
     allow_unverified_loader: bool,
 ) -> LauncherResult<ExportResult> {
+    agora_core::settings::admit_major_action(ctx)?;
     let id = core_api::paths::sanitize_id(instance_id);
     let instance_dir = ctx.paths.instance_dir(&id)?;
     if !instance_dir.is_dir() {

@@ -1533,6 +1533,7 @@ impl PluginService {
         consent: Consent,
         provenance: Option<&store::OfficialProvenance>,
     ) -> LauncherResult<PluginSummary> {
+        crate::settings::admit_major_action(&self.inner.ctx)?;
         if let Some(expected) = consent.previewed_digest.as_deref() {
             if install::package_digest(bytes) != expected {
                 return Err(preview_changed());
@@ -1905,6 +1906,7 @@ impl PluginService {
         plugin_id: &PluginId,
         consent: impl Into<Consent>,
     ) -> LauncherResult<UpdateOutcome> {
+        crate::settings::admit_major_action(&self.inner.ctx)?;
         let verdict = self.check_update(plugin_id).await?;
         let UpdateVerdict::Available {
             to,
@@ -2259,6 +2261,7 @@ impl PluginService {
     }
 
     pub fn set_enabled(&self, plugin_id: &PluginId, enabled: bool) -> LauncherResult<()> {
+        crate::settings::admit_major_action(&self.inner.ctx)?;
         let conn = self.inner.conn()?;
         let records = store::list(&conn)?;
         let name_of = |id: &PluginId| {
@@ -2334,6 +2337,7 @@ impl PluginService {
 
     /// Remove a plugin. `purge_data` is a separate decision from removing it.
     pub fn uninstall(&self, plugin_id: &PluginId, purge_data: bool) -> LauncherResult<()> {
+        crate::settings::admit_major_action(&self.inner.ctx)?;
         let lock = self.inner.ctx.lock_manager.acquire(
             crate::lock_manager::LockResource::PluginInstall,
             "plugin-uninstall",

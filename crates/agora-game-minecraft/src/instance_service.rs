@@ -492,6 +492,7 @@ impl InstanceService {
         custom_args: &str,
         memory_mode: &str,
     ) -> LauncherResult<()> {
+        agora_core::settings::admit_major_action(&self.ctx)?;
         let instance_id = self.validate_id(instance_id)?;
         if !crate::gc::memory_mb_is_possible(memory_mb) {
             return Err(LauncherError::Generic {

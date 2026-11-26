@@ -1483,6 +1483,8 @@ fn run_inner(
     only_enabled_mods: bool,
     check_space: bool,
 ) -> Result<RunDetail, Box<RunInnerError>> {
+    crate::settings::admit_major_action(ctx)
+        .map_err(|error| -> Box<RunInnerError> { ImportError::Other(error.to_string()).into() })?;
     let plan = plan(ctx, inventory, request)?;
     if check_space {
         let needed = single_copy_bytes(&plan, request.copy_saves);
