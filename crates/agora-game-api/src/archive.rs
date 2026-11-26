@@ -26,6 +26,8 @@ use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::path::{join_under, validate_path_set, PathError, PathSetError, RelPath, StrictRelPath};
 
 /// How much of one archive a job accepts.
@@ -58,11 +60,11 @@ use crate::path::{join_under, validate_path_set, PathError, PathSetError, RelPat
 pub struct ArchiveLimits {
     /// The job this preset is for, as it appears in a refusal.
     pub preset: &'static str,
-    /// Most file entries an archive may hold.
+    /// Most file entries an archive may hold. `0` does not check.
     pub max_entries: usize,
-    /// Most bytes one entry may declare, and then deliver.
+    /// Most bytes one entry may declare, and then deliver. `0` does not check.
     pub max_entry_bytes: u64,
-    /// Most bytes all entries together may declare, and then deliver.
+    /// Most bytes all entries together may declare, and then deliver. `0` does not check.
     pub max_total_bytes: u64,
     /// Most uncompressed bytes one compressed byte may become. `0` does not check.
     pub max_ratio: u64,
@@ -251,7 +253,7 @@ pub struct ArchiveEntry {
 }
 
 /// An entry the caller was told about instead of given a file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkippedEntry {
     /// The name as the archive stores it.
     pub name: String,
@@ -2581,7 +2583,10 @@ struct CountingFile<'a> {
 impl Write for CountingFile<'_> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         let after = self.written.saturating_add(buffer.len() as u64);
-        if after > self.remaining_total {
+        // A preset that names no total (`preset_total == 0`: `GAME_MOD`, `JAR_METADATA`) does not
+        // check, the same reading the count and the ratio get. `remaining_total == 0` alone cannot
+        // say so, because an archive that wrote exactly its cap leaves 0 there too.
+        if self.preset_total > 0 && after > self.remaining_total {
             return Err(std::io::Error::other(format!(
                 "extraction passed the {} bytes a {} archive may hold",
                 self.preset_total, self.preset

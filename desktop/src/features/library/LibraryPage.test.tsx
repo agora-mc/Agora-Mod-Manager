@@ -440,6 +440,7 @@ describe('LibraryPage', () => {
           item: { ...untied, fileCount: 1, gameIds: ['skyrim-se'], addedAtUnixMs: 1 },
           objectsNew: 1,
           objectsRestored: 0,
+          skipped: [],
         };
       }
       return base(command, args);
@@ -452,9 +453,53 @@ describe('LibraryPage', () => {
         sourcePath: 'D:/mods/odin.zip',
         name: null,
         gameId: 'skyrim-se',
+        withoutUnwritableNames: false,
       }),
     );
     expect(await screen.findByText('Added Odin Patch (1 file).')).toBeInTheDocument();
+  });
+
+  it('offers to add an archive without the files Windows cannot name', async () => {
+    const base = invokeMock.getMockImplementation()!;
+    let attempts = 0;
+    invokeMock.mockImplementation(async (command: string, args: unknown) => {
+      if (command === 'pick_open_file') return 'D:/mods/odin.zip';
+      if (command === 'games_content_add') {
+        const optIn = (args as { withoutUnwritableNames?: boolean }).withoutUnwritableNames;
+        if (!optIn) {
+          attempts += 1;
+          throw {
+            code: 'UNWRITABLE_NAMES',
+            message: "Data/con.txt could not be written: a Windows reserved name",
+            details: { entries: [{ name: 'Data/con.txt', reason: 'a Windows reserved name' }] },
+          };
+        }
+        return {
+          status: 'added',
+          item: { ...untied, fileCount: 1, gameIds: ['skyrim-se'], addedAtUnixMs: 1 },
+          objectsNew: 1,
+          objectsRestored: 0,
+          skipped: [{ name: 'Data/con.txt', reason: 'a Windows reserved name' }],
+        };
+      }
+      return base(command, args);
+    });
+    render(<ConfirmProvider><LibraryPage gameId="skyrim-se" gameName="Skyrim SE" /></ConfirmProvider>);
+    await screen.findByText('A lighting overhaul.');
+    fireEvent.click(screen.getByRole('button', { name: 'Add an archive…' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toHaveTextContent('Data/con.txt');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Add without them' }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith('games_content_add', {
+        sourcePath: 'D:/mods/odin.zip',
+        name: null,
+        gameId: 'skyrim-se',
+        withoutUnwritableNames: true,
+      }),
+    );
+    expect(await screen.findByText(/Data\/con\.txt/)).toBeInTheDocument();
+    expect(attempts).toBe(1);
   });
 
   it('says the library could not be read and offers a retry, rather than looking empty', async () => {

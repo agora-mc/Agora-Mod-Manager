@@ -5,10 +5,11 @@ use std::io::Write;
 use std::path::Path;
 
 use agora_core::content_store::{
-    add_archive, add_folder, protect, remove_item, verify_all, verify_item, AddOutcome,
-    ContentError, ProblemKind, Protection, VerifyDepth,
+    add_archive, add_archive_with_names, add_folder, protect, remove_item, verify_all, verify_item,
+    AddOutcome, ContentError, ProblemKind, Protection, VerifyDepth,
 };
 use agora_core::ctx::Ctx;
+use agora_game_api::NamePolicy;
 
 #[allow(dead_code)]
 #[path = "common/data_root.rs"]
@@ -319,20 +320,23 @@ fn test_refusal_empty_component() {
     create_zip(&zip_path, &[("a//b.txt", b"content")]);
 
     let res = add_archive(&ctx, &zip_path, None);
-    assert!(matches!(res, Err(ContentError::InvalidPath { .. })));
+    assert!(matches!(res, Err(ContentError::UnwritableNames { .. })));
     assert_store_empty(&ctx);
 }
 
 #[test]
-fn test_refusal_dot_component() {
+fn test_dot_component_names_the_folder_it_is_in() {
     let (_tmp, ctx) = test_ctx();
     let work = tempfile::tempdir().unwrap();
-    let zip_path = work.path().join("bad.zip");
+    let zip_path = work.path().join("dot.zip");
     create_zip(&zip_path, &[("a/./b.txt", b"content")]);
 
-    let res = add_archive(&ctx, &zip_path, None);
-    assert!(matches!(res, Err(ContentError::InvalidPath { .. })));
-    assert_store_empty(&ctx);
+    // MASTER_SPEC §32.3: a `.` component names the folder it is in and cannot leave the root, so
+    // the entry is written as `a/b.txt` rather than refused. Refusing it would refuse archives
+    // that unpack perfectly well — zip tools write `./main.js`, and a mod is a zip.
+    let out = add_archive(&ctx, &zip_path, None).expect("a '.' component is not a refusal");
+    assert_eq!(out.item().files.len(), 1);
+    assert_eq!(out.item().files[0].path.as_str(), "a/b.txt");
 }
 
 #[test]
@@ -364,7 +368,7 @@ fn test_refusal_dot_ending_component() {
     create_zip(&zip_path, &[("folder./file.txt", b"content")]);
 
     let res = add_archive(&ctx, &zip_path, None);
-    assert!(matches!(res, Err(ContentError::InvalidPath { .. })));
+    assert!(matches!(res, Err(ContentError::UnwritableNames { .. })));
     assert_store_empty(&ctx);
 }
 
@@ -376,7 +380,7 @@ fn test_refusal_space_ending_component() {
     create_zip(&zip_path, &[("folder /file.txt", b"content")]);
 
     let res = add_archive(&ctx, &zip_path, None);
-    assert!(matches!(res, Err(ContentError::InvalidPath { .. })));
+    assert!(matches!(res, Err(ContentError::UnwritableNames { .. })));
     assert_store_empty(&ctx);
 }
 
@@ -388,7 +392,7 @@ fn test_refusal_windows_device_name() {
     create_zip(&zip_path, &[("sub/con.txt", b"content")]);
 
     let res = add_archive(&ctx, &zip_path, None);
-    assert!(matches!(res, Err(ContentError::InvalidPath { .. })));
+    assert!(matches!(res, Err(ContentError::UnwritableNames { .. })));
     assert_store_empty(&ctx);
 }
 
@@ -403,7 +407,7 @@ fn test_refusal_case_collision() {
     );
 
     let res = add_archive(&ctx, &zip_path, None);
-    assert!(matches!(res, Err(ContentError::InvalidPath { .. })));
+    assert!(matches!(res, Err(ContentError::UnwritableNames { .. })));
     assert_store_empty(&ctx);
 }
 
@@ -415,7 +419,7 @@ fn test_refusal_prefix_folder_collision() {
     create_zip(&zip_path, &[("a", b"file a"), ("a/b", b"file a/b")]);
 
     let res = add_archive(&ctx, &zip_path, None);
-    assert!(matches!(res, Err(ContentError::InvalidPath { .. })));
+    assert!(matches!(res, Err(ContentError::UnwritableNames { .. })));
     assert_store_empty(&ctx);
 }
 
@@ -764,7 +768,7 @@ fn test_7z_refusal_device_name_leaves_no_staging() {
     create_7z(&sz_path, &[("COM1", b"device")]);
 
     let res = add_archive(&ctx, &sz_path, None);
-    assert!(matches!(res, Err(ContentError::InvalidPath { .. })));
+    assert!(matches!(res, Err(ContentError::UnwritableNames { .. })));
     assert!(staging_is_empty(&ctx));
 }
 
@@ -777,7 +781,7 @@ fn test_7z_refusal_case_collision_leaves_no_staging() {
     create_7z(&sz_path, &[("File.txt", b"a"), ("file.txt", b"b")]);
 
     let res = add_archive(&ctx, &sz_path, None);
-    assert!(matches!(res, Err(ContentError::InvalidPath { .. })));
+    assert!(matches!(res, Err(ContentError::UnwritableNames { .. })));
     assert!(staging_is_empty(&ctx));
 }
 
@@ -847,6 +851,160 @@ fn test_7z_spoofed_extension_imported_as_7z() {
     let out = add_archive(&ctx, &spoofed_path, Some("Spoofed7z")).unwrap();
     assert_eq!(out.item().files.len(), 1);
     assert_eq!(out.item().files[0].path.as_str(), "legit.txt");
+}
+
+// ---------------------------------------------------------------------------
+// 8b. Names a disk cannot hold: refused, or imported without on request (MASTER_SPEC 32.3)
+// ---------------------------------------------------------------------------
+
+/// A reserved name stops the import by default, and the refusal names every entry that caused it
+/// and why — an import that silently drops files is worse than one that stops.
+#[test]
+fn an_unwritable_name_refuses_by_default_and_names_every_entry() {
+    let (_tmp, ctx) = test_ctx();
+    let work = tempfile::tempdir().unwrap();
+    let zip_path = work.path().join("reserved.zip");
+    create_zip(
+        &zip_path,
+        &[("ok.txt", b"fine"), ("Data/con.txt", b"1"), ("foo.", b"2")],
+    );
+
+    let err = add_archive(&ctx, &zip_path, None).expect_err("a reserved name is refused");
+    let entries = match &err {
+        ContentError::UnwritableNames { entries, .. } => entries.clone(),
+        other => panic!("{other:?}"),
+    };
+    let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(names, ["Data/con.txt", "foo."]);
+    assert!(
+        entries[0].reason.contains("device name"),
+        "{}",
+        entries[0].reason
+    );
+    let message = err.to_string();
+    for entry in &entries {
+        assert!(message.contains(&entry.name), "{message}");
+        assert!(message.contains(&entry.reason), "{message}");
+    }
+    assert_store_empty(&ctx);
+}
+
+/// The person can instead import without them; the files that are usable are stored and the rest
+/// come back in the outcome so the CLI and the desktop can list them.
+#[test]
+fn importing_without_unwritable_names_keeps_the_rest_and_reports_them() {
+    let (_tmp, ctx) = test_ctx();
+    let work = tempfile::tempdir().unwrap();
+    let zip_path = work.path().join("reserved.zip");
+    create_zip(
+        &zip_path,
+        &[("ok.txt", b"fine"), ("Data/con.txt", b"1"), ("foo.", b"2")],
+    );
+
+    let out = add_archive_with_names(&ctx, &zip_path, None, NamePolicy::WithoutThem)
+        .expect("the usable files are imported");
+    let stored: Vec<&str> = out
+        .item()
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    assert_eq!(stored, ["ok.txt"]);
+    let skipped: Vec<&str> = out
+        .skipped()
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(skipped, ["Data/con.txt", "foo."]);
+    assert!(staging_is_empty(&ctx));
+}
+
+/// The same opt-in for a 7z, which is a second decoder with its own listing.
+#[test]
+fn a_7z_with_a_reserved_name_imports_without_it_when_asked() {
+    let (_tmp, ctx) = test_ctx();
+    let work = tempfile::tempdir().unwrap();
+    let sz_path = work.path().join("reserved.7z");
+    create_7z(&sz_path, &[("ok.txt", b"fine"), ("COM1", b"1")]);
+
+    let refused = add_archive(&ctx, &sz_path, None).expect_err("refused by default");
+    assert!(
+        matches!(refused, ContentError::UnwritableNames { .. }),
+        "{refused:?}"
+    );
+
+    let out = add_archive_with_names(&ctx, &sz_path, None, NamePolicy::WithoutThem).unwrap();
+    assert_eq!(out.item().files.len(), 1);
+    assert_eq!(out.item().files[0].path.as_str(), "ok.txt");
+    assert_eq!(out.skipped().len(), 1);
+    assert_eq!(out.skipped()[0].name, "COM1");
+}
+
+/// Two names one case-insensitive disk stores as one are a name it cannot hold: refused by
+/// default, and one of them left out — with its reason — when the person opts in.
+#[test]
+fn a_case_collision_is_left_out_when_the_import_is_opted_in() {
+    let (_tmp, ctx) = test_ctx();
+    let work = tempfile::tempdir().unwrap();
+    let zip_path = work.path().join("collision.zip");
+    create_zip(
+        &zip_path,
+        &[
+            ("ok.txt", b"fine"),
+            ("Data/x.esp", b"1"),
+            ("data/X.ESP", b"2"),
+        ],
+    );
+
+    let refused = add_archive(&ctx, &zip_path, None).expect_err("refused by default");
+    assert!(
+        matches!(refused, ContentError::UnwritableNames { .. }),
+        "{refused:?}"
+    );
+
+    let out = add_archive_with_names(&ctx, &zip_path, None, NamePolicy::WithoutThem).unwrap();
+    assert_eq!(out.item().files.len(), 2);
+    assert_eq!(out.skipped().len(), 1);
+    assert!(
+        out.skipped()[0].reason.to_lowercase().contains("case")
+            || out.skipped()[0].reason.to_lowercase().contains("collides"),
+        "{}",
+        out.skipped()[0].reason
+    );
+}
+
+/// A solid 7z gives its members one compressed block, so a member the reader walks past still has
+/// to be decoded to its end for the next one to start where it should. Two members of the same
+/// length make a mix-up visible as wrong bytes rather than as a wrong size.
+#[test]
+fn a_solid_7z_mod_stores_both_members_with_their_own_bytes() {
+    let (_tmp, ctx) = test_ctx();
+    let work = tempfile::tempdir().unwrap();
+    let sz_path = work.path().join("solid.7z");
+    let members: [(&str, &[u8]); 2] = [("textures/a.bsa", b"AAAA"), ("textures/b.bsa", b"BBBB")];
+    {
+        let mut writer = sevenz_rust2::ArchiveWriter::create(&sz_path).unwrap();
+        let listed: Vec<sevenz_rust2::ArchiveEntry> = members
+            .iter()
+            .map(|(name, _)| sevenz_rust2::ArchiveEntry::new_file(name))
+            .collect();
+        let readers: Vec<sevenz_rust2::SourceReader<std::io::Cursor<&[u8]>>> = members
+            .iter()
+            .map(|(_, bytes)| sevenz_rust2::SourceReader::new(std::io::Cursor::new(*bytes)))
+            .collect();
+        writer.push_archive_entries(listed, readers).unwrap();
+        writer.finish().unwrap();
+    }
+
+    let out = add_archive(&ctx, &sz_path, None).unwrap();
+    assert_eq!(out.item().files.len(), 2);
+    let mut by_path = std::collections::HashMap::new();
+    for file in &out.item().files {
+        let bytes = std::fs::read(ctx.paths.content_object_path(&file.sha256)).unwrap();
+        by_path.insert(file.path.as_str().to_string(), bytes);
+    }
+    assert_eq!(by_path["textures/a.bsa"], b"AAAA");
+    assert_eq!(by_path["textures/b.bsa"], b"BBBB");
 }
 
 // ---------------------------------------------------------------------------

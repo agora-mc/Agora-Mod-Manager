@@ -2041,12 +2041,17 @@ pub fn install(
     let objects_present = outcome.objects_present();
     let item = save_installer_metadata(ctx, outcome.item(), installer.info.as_ref())?;
     let outcome = match outcome {
-        AddOutcome::Added { .. } => AddOutcome::Added { item, objects_new },
+        AddOutcome::Added { .. } => AddOutcome::Added {
+            item,
+            objects_new,
+            skipped: Vec::new(),
+        },
         AddOutcome::Existing { .. } => AddOutcome::Existing {
             item,
             objects_new,
             objects_restored,
             objects_present,
+            skipped: Vec::new(),
         },
     };
     Ok((installer, plan, outcome))

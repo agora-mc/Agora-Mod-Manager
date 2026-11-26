@@ -670,6 +670,7 @@ pub async fn install(
                 ctx,
                 &file_path,
                 Some(&request.item.name),
+                content_store::NamePolicy::Refuse,
                 &damaged,
                 |sha256, _display_path| ContentSource::Catalog {
                     item_id: request.item.id.clone(),
@@ -710,6 +711,7 @@ fn import_and_place(
         ctx,
         file,
         Some(&request.item.name),
+        content_store::NamePolicy::Refuse,
         &HashSet::new(),
         |sha256, _display_path| ContentSource::Catalog {
             item_id: request.item.id.clone(),
@@ -818,6 +820,7 @@ pub fn import_manual_file(
         ctx,
         file,
         Some(&item.name),
+        content_store::NamePolicy::Refuse,
         &HashSet::new(),
         |sha256, _display_path| ContentSource::Catalog {
             item_id: item.id.clone(),

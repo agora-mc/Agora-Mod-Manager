@@ -28,6 +28,7 @@ import {
   pickArchive,
   pickFolder,
   verifyStored,
+  type StoreAdded,
   type VerifyReport,
 } from '@/features/games/content/api';
 import { isGamesError, MINECRAFT_GAME_ID } from '@/features/games/shared/types';
@@ -225,11 +226,34 @@ export function LibraryPage({
     try {
       const path = await pick();
       if (path === null) return;
-      const added = await addToStore(path, null, gameId);
+      let added: StoreAdded;
+      try {
+        added = await addToStore(path, null, gameId);
+      } catch (error) {
+        // An entry whose name a disk cannot hold refuses the whole archive, and the core names
+        // every one. The person can import the rest instead; the files left out are listed after.
+        if (!(isGamesError(error) && error.code === 'UNWRITABLE_NAMES')) throw error;
+        const importAnyway = await confirm({
+          title: `Add this ${what} without the files Windows cannot name?`,
+          body: `${error.message}\n\nEverything else in it will be stored.`,
+          confirmLabel: 'Add without them',
+        });
+        if (!importAnyway) {
+          setActionError(`Nothing was added: ${error.message}`);
+          return;
+        }
+        added = await addToStore(path, null, gameId, true);
+      }
+      const leftOut =
+        added.skipped.length > 0
+          ? ` ${plural(added.skipped.length, 'file')} left out: ${added.skipped
+              .map((entry) => entry.name)
+              .join(', ')}.`
+          : '';
       setNotice(
-        added.status === 'added'
+        (added.status === 'added'
           ? `Added ${added.item.name} (${plural(added.item.fileCount, 'file')}).`
-          : `${added.item.name} was already in your library, so nothing new was stored.`,
+          : `${added.item.name} was already in your library, so nothing new was stored.`) + leftOut,
       );
       setView('game');
       await load();

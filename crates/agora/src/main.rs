@@ -1335,6 +1335,12 @@ enum ContentCmd {
         /// Optional name for the content item.
         #[arg(long)]
         name: Option<String>,
+        /// Import the entries that can be written and list the ones left out, instead of refusing
+        /// the whole archive. An entry whose name a disk cannot hold (a Windows reserved name, a
+        /// trailing dot or space, two names one case-insensitive disk stores as one) stops the
+        /// import by default, and the refusal names every offending entry and why.
+        #[arg(long)]
+        without_unwritable_names: bool,
     },
     /// List all items in the content store.
     List,
@@ -8181,11 +8187,25 @@ async fn run_command(
                 }
             },
             GamesCmd::Content { action } => match action {
-                ContentCmd::Add { path, name } => {
+                ContentCmd::Add {
+                    path,
+                    name,
+                    without_unwritable_names,
+                } => {
+                    let names = if without_unwritable_names {
+                        agora_core::content_store::NamePolicy::WithoutThem
+                    } else {
+                        agora_core::content_store::NamePolicy::Refuse
+                    };
                     let outcome = if path.is_dir() {
                         agora_core::content_store::add_folder(ctx, &path, name.as_deref())
                     } else {
-                        agora_core::content_store::add_archive(ctx, &path, name.as_deref())
+                        agora_core::content_store::add_archive_with_names(
+                            ctx,
+                            &path,
+                            name.as_deref(),
+                            names,
+                        )
                     };
                     match outcome {
                         Ok(outcome) => {
@@ -8207,17 +8227,42 @@ async fn run_command(
                                         outcome.objects_restored()
                                     ),
                                 }
+                                if !outcome.skipped().is_empty() {
+                                    println!("Left out:");
+                                    for entry in outcome.skipped() {
+                                        println!("  {} - {}", entry.name, entry.reason);
+                                    }
+                                }
                             }
                         }
                         Err(e) => {
                             if json {
-                                let out = serde_json::json!({
+                                let mut out = serde_json::json!({
                                     "error": e.to_string(),
                                     "exitCode": 1,
                                 });
+                                // The names, and why, as data too: a front end lists them rather
+                                // than parsing the sentence above.
+                                if let agora_core::content_store::ContentError::UnwritableNames {
+                                    entries,
+                                    ..
+                                } = &e
+                                {
+                                    out["unwritableNames"] = serde_json::json!(entries);
+                                }
                                 eprintln!("{}", serde_json::to_string_pretty(&out)?);
                             } else {
                                 eprintln!("Error: {e}");
+                                if matches!(
+                                    e,
+                                    agora_core::content_store::ContentError::UnwritableNames { .. }
+                                ) {
+                                    eprintln!(
+                                        "Import the rest with --without-unwritable-names, which \
+                                         stores the files that can be written and names the ones it \
+                                         left out."
+                                    );
+                                }
                             }
                             std::process::exit(1);
                         }

@@ -1330,7 +1330,10 @@ fn the_derived_item_reuses_the_objects_records_the_choices_and_replays_to_the_sa
     ];
 
     let (_, plan, outcome) = fomod::install(&fx.ctx, &archive, &choices, None).unwrap();
-    let AddOutcome::Added { item, objects_new } = &outcome else {
+    let AddOutcome::Added {
+        item, objects_new, ..
+    } = &outcome
+    else {
         panic!("expected a new item");
     };
     assert_eq!(*objects_new, 0);

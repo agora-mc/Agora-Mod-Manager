@@ -74,6 +74,17 @@ pub struct StoreAdded {
     pub item: StoreItem,
     pub objects_new: usize,
     pub objects_restored: usize,
+    /// The entries the import left out because a disk cannot hold their names. Empty unless the
+    /// person asked to import without them; the files that were stored are in `item`.
+    pub skipped: Vec<StoreSkippedEntry>,
+}
+
+/// One entry a store import left out, and why, in words that name the problem.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreSkippedEntry {
+    pub name: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -261,6 +272,14 @@ pub fn store_added(outcome: &AddOutcome) -> StoreAdded {
         item: store_item(outcome.item()),
         objects_new,
         objects_restored,
+        skipped: outcome
+            .skipped()
+            .iter()
+            .map(|entry| StoreSkippedEntry {
+                name: entry.name.clone(),
+                reason: entry.reason.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -390,6 +409,17 @@ pub(super) fn content_error(error: ContentError) -> GamesError {
             message, snapshots, ..
         } => GamesError::new("UNREADABLE_SNAPSHOTS", message)
             .with_details(serde_json::json!({ "snapshots": snapshots })),
+        // The one refusal a person can answer: the Library offers to import the files that can be
+        // written, so the names travel as data rather than only inside the sentence.
+        ContentError::UnwritableNames { archive, entries } => {
+            let message = ContentError::UnwritableNames {
+                archive,
+                entries: entries.clone(),
+            }
+            .to_string();
+            GamesError::new("UNWRITABLE_NAMES", message)
+                .with_details(serde_json::json!({ "entries": entries }))
+        }
         other => GamesError::new(CORE_FAILED, other.to_string()),
     }
 }
@@ -484,24 +514,34 @@ pub async fn games_content_list(app: tauri::AppHandle) -> Result<StoreList, Game
 }
 
 /// Add an archive, or a folder, to the content store. A blank `name` keeps the item's own name.
+///
+/// An archive entry whose name a disk cannot hold refuses the import with `UNWRITABLE_NAMES` and
+/// the entries in its details; `without_unwritable_names` is the person's answer to that refusal,
+/// and it stores the files that can be written and reports the rest (MASTER_SPEC §32.3).
 #[tauri::command]
 pub async fn games_content_add(
     app: tauri::AppHandle,
     source_path: String,
     name: Option<String>,
     game_id: Option<String>,
+    without_unwritable_names: Option<bool>,
 ) -> Result<StoreAdded, GamesError> {
     let path = checked_source_path(&source_path)?;
     let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
     let game_id = game_id
         .map(|g| g.trim().to_string())
         .filter(|g| !g.is_empty());
+    let names = if without_unwritable_names.unwrap_or(false) {
+        content_store::NamePolicy::WithoutThem
+    } else {
+        content_store::NamePolicy::Refuse
+    };
     tokio::task::spawn_blocking(move || -> Result<StoreAdded, GamesError> {
         let ctx = crate::core_context(&app)?;
         let outcome = if path.is_dir() {
             content_store::add_folder(&ctx, &path, name.as_deref())
         } else {
-            content_store::add_archive(&ctx, &path, name.as_deref())
+            content_store::add_archive_with_names(&ctx, &path, name.as_deref(), names)
         }
         .map_err(content_error)?;
         // Added from a game's Library: the item belongs to that game unless it already names one.
