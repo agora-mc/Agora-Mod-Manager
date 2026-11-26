@@ -501,6 +501,24 @@ fn collision_key(name: &str) -> String {
     fold_path_case(&full)
 }
 
+/// Whether `path` is **inside** `folder` (strictly, not the same path), component by component
+/// with the platform's case rule.
+///
+/// The question a caller asks about a *name it holds* rather than about two things on disk: is
+/// `state/config/a.toml` inside the declared folder `state/config`? Comparing components one at a
+/// time is what keeps `characters-old` out of `characters`, which a text prefix test would allow.
+pub fn is_inside(path: &Path, folder: &Path) -> bool {
+    let path_parts: Vec<&std::ffi::OsStr> = path.iter().collect();
+    let folder_parts: Vec<&std::ffi::OsStr> = folder.iter().collect();
+    if path_parts.len() <= folder_parts.len() {
+        return false;
+    }
+    folder_parts
+        .iter()
+        .zip(path_parts.iter())
+        .all(|(declared, part)| same_spelling(Path::new(declared), Path::new(part)))
+}
+
 /// What two paths are to each other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathRelation {

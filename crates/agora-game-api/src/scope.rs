@@ -4,7 +4,7 @@
 //! captures and restores exactly what it names. A game that declares nothing gets no automatic
 //! snapshot rather than a guessed one — the caller is told, and the instance is left alone.
 
-use crate::RelPath;
+use crate::{RelPath, StrictRelPath};
 use serde::{Deserialize, Serialize};
 
 /// The folders a snapshot of this game's instance captures, in the package's own words.
@@ -73,6 +73,35 @@ impl SnapshotScope {
                 )));
             }
         }
+        // A nested declaration is allowed only when no declared folder is inside another: two
+        // folders that overlap would capture the same file twice and a restore would own a file two
+        // declarations claim (MASTER_SPEC §32.7). Each list is checked on its own, because the
+        // pre-launch set is expected to repeat folders the tracked set holds.
+        for (list, folders) in [
+            ("tracked", &self.tracked),
+            (
+                "prelaunch",
+                self.prelaunch.as_ref().unwrap_or(&self.tracked),
+            ),
+        ] {
+            let strict: Vec<StrictRelPath> = folders
+                .iter()
+                .filter_map(|folder| folder.check_strict().ok())
+                .collect();
+            if let Err(error) = crate::validate_path_set(&strict) {
+                return Err(SnapshotScopeError(match error {
+                    crate::PathSetError::EmptySet => format!("its {list} list names no folder"),
+                    crate::PathSetError::Collides { path } => format!(
+                        "its {list} list names '{path}' twice, which a case-insensitive disk \
+                         stores as one folder"
+                    ),
+                    crate::PathSetError::FolderIsAFile { prefix, .. } => format!(
+                        "its {list} list names both '{prefix}' and a folder inside it; declare one \
+                         or the other, not both"
+                    ),
+                }));
+            }
+        }
         if self.tracked.is_empty() {
             return Err(SnapshotScopeError(
                 "it names no folder, so a snapshot would capture nothing".into(),
@@ -112,13 +141,21 @@ pub fn validate_declared_folder(folder: &RelPath) -> Result<(), SnapshotScopeErr
             "the instance root is not a folder a snapshot can own".into(),
         ));
     }
-    if path.split('/').any(|part| part.is_empty() || part == ".") {
+    // B1a's strict rule: a '.', '..' or empty component, an absolute path, a drive letter, a
+    // component that ends in a dot or space, a Windows device name, a control character.
+    if let Err(error) = folder.check_strict() {
         return Err(SnapshotScopeError(format!(
-            "'{path}' is not a plain relative folder: it has an empty or '.' part"
+            "'{}' is refused: {}",
+            error.value, error.reason
         )));
     }
-    // B1a: `StrictRelPath` replaces this once it lands, adding the rules `RelPath` leaves to new
-    // writers — a component ending in a dot or space, a Windows reserved name, a control character.
+    // A folder the launcher owns is never a game's state: declaring it would let a snapshot capture
+    // (and a restore replace) the very records that say what the snapshot owns.
+    if let Some(launcher_owned) = path.split('/').find(|part| part.starts_with(".agora")) {
+        return Err(SnapshotScopeError(format!(
+            "'{path}' names '{launcher_owned}', a folder the launcher owns, not state of the game"
+        )));
+    }
     Ok(())
 }
 
@@ -126,12 +163,20 @@ fn parse_folders(list: &str, folders: &[&str]) -> Result<Vec<RelPath>, SnapshotS
     folders
         .iter()
         .map(|folder| {
-            RelPath::new(*folder).map_err(|error| {
+            // The lenient read is what a stored value gets; here the value is about to be used, so it
+            // is held to the strict rule as well (`validate_declared_folder` reports the rest).
+            if folder.trim().is_empty() {
+                return Err(SnapshotScopeError(
+                    "the instance root is not a folder a snapshot can own".into(),
+                ));
+            }
+            let strict = RelPath::strict(*folder).map_err(|error| {
                 SnapshotScopeError(format!(
                     "its {list} list names '{}', which is refused: {}",
                     error.value, error.reason
                 ))
-            })
+            })?;
+            Ok(strict.into_rel_path())
         })
         .collect()
 }
@@ -185,6 +230,30 @@ mod tests {
                 "'{listed}' is not a plain relative folder"
             );
         }
+    }
+
+    /// MASTER_SPEC §32.7: a nested declaration is allowed only when no declared folder is inside
+    /// another, and a folder the launcher owns is never a game's state.
+    #[test]
+    fn overlapping_and_launcher_owned_declarations_are_refused() {
+        let nested = SnapshotScope::declared(&["state", "state/config"], None)
+            .expect_err("a folder and one inside it are refused");
+        assert!(nested.0.contains("inside"), "{nested}");
+
+        let launcher_owned = SnapshotScope::declared(&[".agora_snapshots"], None)
+            .expect_err("the launcher's own state is not a game folder");
+        assert!(
+            launcher_owned.0.contains("launcher owns"),
+            "{launcher_owned}"
+        );
+
+        let buried = SnapshotScope::declared(&["state/.agora_loadouts"], None)
+            .expect_err("a launcher folder at any depth is refused");
+        assert!(buried.0.contains("launcher owns"), "{buried}");
+
+        // Siblings with a shared prefix are two folders, not one inside the other.
+        SnapshotScope::declared(&["state/characters", "state/config"], None)
+            .expect("two sibling folders are a valid declaration");
     }
 
     #[test]

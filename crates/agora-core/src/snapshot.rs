@@ -2542,20 +2542,10 @@ pub(crate) fn scope_covers_root(declared: &[&str], root: &str) -> bool {
             .any(|folder| is_under(Path::new(folder), Path::new(root)))
 }
 
-/// Whether `path` is inside `folder` (strictly, not equal).
+/// Whether `path` is inside `folder` (strictly, not equal): the game contract's comparison, so the
+/// path rules have one home (MASTER_SPEC §32.3).
 fn is_under(path: &Path, folder: &Path) -> bool {
-    let mut path = path.components().peekable();
-    for component in folder.components() {
-        match path.next() {
-            Some(part)
-                if agora_game_api::same_spelling(
-                    Path::new(&part.as_os_str().to_string_lossy().to_string()),
-                    Path::new(&component.as_os_str().to_string_lossy().to_string()),
-                ) => {}
-            _ => return false,
-        }
-    }
-    path.next().is_some()
+    agora_game_api::is_inside(path, folder)
 }
 
 /// Restore the captured files of one root into place, one file at a time.
@@ -2995,9 +2985,20 @@ fn rollback_restore(
             errors.push(format!("cannot put back the backed-up file {relative}"));
             continue;
         };
-        if !backup.exists() {
-            errors.push(format!("rollback backup is missing for {relative}"));
-            continue;
+        // Fail closed: only "the operating system said not found" means the backup is gone. A path
+        // that cannot be examined is reported as its own error, never as missing.
+        match agora_game_api::probe(&backup) {
+            agora_game_api::Probe::Absent => {
+                errors.push(format!("rollback backup is missing for {relative}"));
+                continue;
+            }
+            agora_game_api::Probe::CantTell(error) => {
+                errors.push(format!(
+                    "cannot tell whether the rollback backup of {relative} is there: {error}"
+                ));
+                continue;
+            }
+            agora_game_api::Probe::Present(_) => {}
         }
         if let Some(parent) = live.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
