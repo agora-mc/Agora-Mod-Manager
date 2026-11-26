@@ -54,6 +54,11 @@ struct Seams {
     create_lock_pause: PauseSlot,
     #[cfg(debug_assertions)]
     restore_rename_pause: PauseSlot,
+    /// Between a restore writing the instance manifest and anything looking at it again: the
+    /// moment a crash or a scan used to see the snapshot's base on the disk while the row named
+    /// another.
+    #[cfg(debug_assertions)]
+    restore_manifest_pause: PauseSlot,
     /// Where a plugin install should stop, so a test sees the files and the journal exactly as a
     /// killed process leaves them.
     #[cfg(debug_assertions)]
@@ -487,5 +492,21 @@ impl TestSeams {
     /// Stop the restore here if this context asked it to.
     pub(crate) fn restore_rename_pause_point(&self, instance_id: &str) {
         self.0.restore_rename_pause.wait_if_target(instance_id);
+    }
+
+    /// Test seam: make the next restore of `instance_id` pause once the restored manifest is on
+    /// the disk, until this is called with `None`.
+    pub fn set_restore_pause_after_manifest_for(&self, instance_id: Option<&str>) {
+        self.0.restore_manifest_pause.set(instance_id);
+    }
+
+    /// Whether a paused restore has written its manifest and is waiting.
+    pub fn restore_pause_after_manifest_reached(&self) -> bool {
+        self.0.restore_manifest_pause.reached()
+    }
+
+    /// Stop the restore here if this context asked it to.
+    pub(crate) fn restore_manifest_pause_point(&self, instance_id: &str) {
+        self.0.restore_manifest_pause.wait_if_target(instance_id);
     }
 }

@@ -1588,6 +1588,25 @@ pub fn restore_snapshot_data(
     instance_dir: &Path,
     snapshot_id: &str,
 ) -> Result<Vec<String>, String> {
+    restore_snapshot_data_with(instance_dir, snapshot_id, &|_, _| Ok(None))
+}
+
+/// How a restore writes one file: the snapshot's own bytes, or what the caller says instead.
+///
+/// A restore is the only writer of the live files it replaces, so a caller that must never let a
+/// stale value reach the disk — an instance's pin after a restore, MASTER_SPEC §32.8 — hands in a
+/// function that says what that file holds. Returning `None` writes the snapshot's bytes, and the
+/// bytes handed in are always the verified snapshot bytes, so an override changes what is written
+/// and not what was checked.
+pub type RestoreFileOverride<'a> = dyn Fn(&str, &[u8]) -> Result<Option<Vec<u8>>, String> + 'a;
+
+/// [`restore_snapshot_data`] with one file's contents overridden as it is written, so there is no
+/// moment at which the disk holds the value the caller refuses to keep.
+pub fn restore_snapshot_data_with(
+    instance_dir: &Path,
+    snapshot_id: &str,
+    overridden: &RestoreFileOverride<'_>,
+) -> Result<Vec<String>, String> {
     validate_snapshot_id(snapshot_id)?;
     let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
     // Fail closed (§32.13): only "the operating system said not found" means this is not a data
@@ -1649,6 +1668,10 @@ pub fn restore_snapshot_data(
         // replaced since the capture refuses the write instead of landing outside the instance
         // (MASTER_SPEC §32.3, §32.7).
         let live = live_target(instance_dir, &entry.relative_path)?;
+        let bytes = match overridden(&entry.relative_path, &bytes)? {
+            Some(replaced) => replaced,
+            None => bytes,
+        };
         if let Some(parent) = live.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
