@@ -3,6 +3,7 @@ import {
   confirmCrashFix,
   createSnapshot,
   deleteSnapshot,
+  describeRestoreCoverage,
   disableModForTest,
   exportCrashReport,
   formatError,
@@ -15,6 +16,7 @@ import {
   type DisablePlan,
   type InstalledMod,
   type HealthBlocker,
+  type RestoreOutcome,
 } from '../lib/tauri';
 import {
   analyzeCrashFile,
@@ -38,6 +40,7 @@ import { ModBisectPanel } from './ModBisectPanel';
 import { DependencyPrompt } from './DependencyPrompt';
 import { Button } from '@/components/ui/button';
 import { InstallFlow } from './InstallFlow';
+import { showToast } from './Toast';
 import type { InstallIntent } from '../lib/installFlow';
 import { reinstallIntent, reinstallSourceFor, type ReinstallSource } from '../lib/missingFileReinstall';
 import { tryEarnInteraction } from '../features/interactive/live/interactionAchievements';
@@ -449,15 +452,28 @@ export function CrashInvestigator({
     }
   }, [clearRecoverySnapshotState, instanceId]);
 
+  /**
+   * A restore reports what it covered: a folder the game no longer declares is put back and named
+   * (MASTER_SPEC §32.7), and a partial backup says which folders came back. The Doctor usually
+   * closes the moment the files are back, so the note shows in the dialog and also goes to the
+   * toast, which outlives it. The Recovery tab and the instance editor show the same note inline.
+   */
+  const reportRestoreOutcome = useCallback((outcome: RestoreOutcome) => {
+    const note = describeRestoreCoverage(outcome);
+    if (note === null) return;
+    setNotice(note);
+    showToast(note);
+  }, []);
+
   const restoreInvestigationSnapshot = useCallback(async () => {
     const snapshotId = recoverySnapshotIdRef.current;
     if (!snapshotId) {
       throw new Error('We don’t have a backup to put back — nothing to undo.');
     }
-    await restoreSnapshot(instanceId, snapshotId);
+    reportRestoreOutcome(await restoreSnapshot(instanceId, snapshotId));
     setDisabledByTest([]);
     setPostLaunch(null);
-  }, [instanceId]);
+  }, [instanceId, reportRestoreOutcome]);
 
   const handleClose = useCallback(async () => {
     if (closeInProgressRef.current) return;
