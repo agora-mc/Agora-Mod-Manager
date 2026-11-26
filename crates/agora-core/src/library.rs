@@ -1212,43 +1212,7 @@ fn scan_instances_locked(ctx: &Ctx) -> InstanceScan {
         };
 
         let game_id = manifest.game_data.game.as_str().to_string();
-        let mut item_ids = HashSet::new();
-        for layer in manifest.game_data.layers.iter() {
-            if let LayerSource::Content { content } = &layer.source {
-                item_ids.insert(content.clone());
-            }
-        }
-        let mut hashes = HashSet::new();
-        for installed in manifest
-            .mods
-            .iter()
-            .chain(manifest.resourcepacks.iter())
-            .chain(manifest.shaders.iter())
-            .chain(manifest.datapacks.iter())
-            .chain(manifest.worlds.iter())
-        {
-            if let Some(id) = installed
-                .content_item_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-            {
-                item_ids.insert(id.to_string());
-            }
-            // The store object hash is the file's real identity; `sha256` is the download's.
-            if let Some(hash) = installed
-                .object_sha256
-                .as_deref()
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .or_else(|| {
-                    let hash = installed.sha256.trim();
-                    (!hash.is_empty()).then_some(hash)
-                })
-            {
-                hashes.insert(hash.to_ascii_lowercase());
-            }
-        }
+        let (item_ids, hashes) = instance_references(&manifest);
 
         scan.instances.push(ScannedInstance {
             reference: LibraryInstanceRef {
@@ -1261,6 +1225,54 @@ fn scan_instances_locked(ctx: &Ctx) -> InstanceScan {
         });
     }
     scan
+}
+
+/// The content-store items and object hashes one instance manifest names.
+///
+/// Both the Library's "who uses this item" answer and the object collector read it from here, so the
+/// two can never disagree about what an instance holds: the content layers name items, and every
+/// installed file names the store object its bytes came from (or, failing that, its download hash).
+pub(crate) fn instance_references(
+    manifest: &crate::models::InstanceManifest,
+) -> (HashSet<String>, HashSet<String>) {
+    let mut item_ids = HashSet::new();
+    for layer in manifest.game_data.layers.iter() {
+        if let LayerSource::Content { content } = &layer.source {
+            item_ids.insert(content.clone());
+        }
+    }
+    let mut hashes = HashSet::new();
+    for installed in manifest
+        .mods
+        .iter()
+        .chain(manifest.resourcepacks.iter())
+        .chain(manifest.shaders.iter())
+        .chain(manifest.datapacks.iter())
+        .chain(manifest.worlds.iter())
+    {
+        if let Some(id) = installed
+            .content_item_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            item_ids.insert(id.to_string());
+        }
+        // The store object hash is the file's real identity; `sha256` is the download's.
+        if let Some(hash) = installed
+            .object_sha256
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .or_else(|| {
+                let hash = installed.sha256.trim();
+                (!hash.is_empty()).then_some(hash)
+            })
+        {
+            hashes.insert(hash.to_ascii_lowercase());
+        }
+    }
+    (item_ids, hashes)
 }
 
 /// Every folder under `root`, or every `<folder>/<subdir>` when `subdir` is given. An unreadable

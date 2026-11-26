@@ -480,10 +480,37 @@ pub fn retention_plan_with_sizes(
 /// Lists snapshots, cross-references LKG state, evicts those exceeding the
 /// configured category counts and size cap.
 pub fn run_retention(instance_dir: &Path) -> Result<(), String> {
-    // Retention is automatic housekeeping. Hold the locations lock once for the whole round so an
-    // instance cannot move between live and Recently deleted while we decide what to delete, and
-    // so each delete does not try to take a non-reentrant lock again. A collision that outlasts the
-    // short wait means another operation is in flight: skip this round, delete nothing, keep going.
+    run_retention_with_grace(instance_dir, None)
+}
+
+/// [`run_retention`] with the object collector's grace period chosen: `None` is the hour production
+/// uses, and a test passes zero to see what the round frees.
+pub(crate) fn run_retention_with_grace(
+    instance_dir: &Path,
+    grace: Option<std::time::Duration>,
+) -> Result<(), String> {
+    // Retention is automatic housekeeping. Hold the content-store lock and then the locations lock
+    // once for the whole round, in the collector's order, so an instance cannot move between live
+    // and Recently deleted while we decide what to delete, and so each delete does not try to take
+    // a non-reentrant lock again. A collision that outlasts the short wait means another operation
+    // is in flight: skip this round, delete nothing, keep going.
+    let paths = crate::snapshot::snapshot_store_paths(instance_dir);
+    let manager = crate::lock_manager::LockManager::new(paths.locks_root());
+    let store = match manager.acquire_with_timeout(
+        crate::lock_manager::LockResource::ContentStore,
+        "snapshot-retention",
+        std::time::Duration::from_secs(30),
+        None,
+    ) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!(
+                "skipping snapshot retention for {}: the content store is busy: {error}",
+                instance_dir.display()
+            );
+            return Ok(());
+        }
+    };
     let locations =
         match crate::snapshot::lock_snapshot_locations(instance_dir, "snapshot-retention", true) {
             Ok(guard) => guard,
@@ -562,6 +589,8 @@ pub fn run_retention(instance_dir: &Path) -> Result<(), String> {
             id,
             crate::snapshot::list_snapshot_scan_dir,
             &locations,
+            Some(&store),
+            grace,
         ) {
             errors.push(format!("{id}: {error}"));
         }

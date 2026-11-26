@@ -3,9 +3,11 @@
 //! A mod's files are stored once, by content hash, protected from modification,
 //! and verifiable. Nothing deploys content to a game yet (slice 2).
 
+pub mod collect;
 pub mod convert;
 #[cfg(test)]
 mod import_bench;
+pub mod pending;
 pub mod place;
 pub mod protect;
 mod rar;
@@ -1320,6 +1322,96 @@ fn place_object(
     }
 }
 
+/// Put the bytes of `source` into the one object store, returning the object's SHA-256 and size.
+///
+/// This is how everything that is not a content item's own file enters `content/objects`: the
+/// snapshot walk and a backup import both come through here. It stages the bytes, syncs them, and
+/// commits them with the same [`place_object`] an added item uses, so one rule decides whether an
+/// object already there can be trusted and how a new one is protected.
+pub(crate) fn place_object_from_file(
+    paths: &AppPaths,
+    source: &Path,
+) -> Result<(String, u64), ContentError> {
+    let staging_dir = new_object_staging_dir(paths)?;
+    let mut guard = StagingGuard::new(&staging_dir);
+    let staged_path = staging_dir.join("object");
+    let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
+    let (size, sha256) = copy_and_hash(source, &staged_path, &mut buffer)?;
+    sync_staged_object(&staged_path)?;
+    place_staged(paths, staged_path, size, sha256.clone())?;
+    guard.active = false;
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    Ok((sha256, size))
+}
+
+/// [`place_object_from_file`] for bytes already in memory, such as a captured state file.
+pub(crate) fn place_object_from_bytes(
+    paths: &AppPaths,
+    bytes: &[u8],
+) -> Result<(String, u64), ContentError> {
+    let sha256 = format!("{:x}", Sha256::digest(bytes));
+    let size = bytes.len() as u64;
+    let obj_path = paths.content_object_path(&sha256);
+    if let Some(parent) = obj_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if obj_path.exists() && object_is_trustworthy(&obj_path, size, &sha256)? {
+        if protect::protection(&obj_path)? != Protection::Protected {
+            protect::protect(&obj_path)?;
+        }
+        return Ok((sha256, size));
+    }
+
+    let staging_dir = new_object_staging_dir(paths)?;
+    let mut guard = StagingGuard::new(&staging_dir);
+    let staged_path = staging_dir.join("object");
+    std::fs::write(&staged_path, bytes)?;
+    sync_staged_object(&staged_path)?;
+    place_staged(paths, staged_path, size, sha256.clone())?;
+    guard.active = false;
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    Ok((sha256, size))
+}
+
+/// A fresh folder under the store's staging root for one object on its way in.
+fn new_object_staging_dir(paths: &AppPaths) -> Result<PathBuf, ContentError> {
+    let staging_root = paths.content_staging_dir();
+    std::fs::create_dir_all(&staging_root)?;
+    let unique = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
+    let staging_dir = staging_root.join(unique);
+    std::fs::create_dir_all(&staging_dir)?;
+    Ok(staging_dir)
+}
+
+/// Make staged bytes durable before the rename that gives them their name: a crash between the
+/// write and the rename must not leave an object that reads back as the content it is not.
+///
+/// The handle asks for write access even though nothing more is written: Windows refuses to flush a
+/// handle it opened read-only, so opening the staged file to read would fail the sync itself.
+fn sync_staged_object(path: &Path) -> Result<(), ContentError> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()?;
+    Ok(())
+}
+
+/// Hand one staged file to [`place_object`].
+fn place_staged(
+    paths: &AppPaths,
+    staged_path: PathBuf,
+    size: u64,
+    sha256: String,
+) -> Result<Placed, ContentError> {
+    let entry = StagedEntry {
+        rel_path: validate_entry_path("object")?,
+        staged_path,
+        size,
+        sha256,
+    };
+    place_object(paths, &entry, false)
+}
+
 /// Run `work` for each index in `0..count` on a bounded pool of scoped threads (at most 8, and no
 /// more than the machine's parallelism). Each thread has its own state from `init`. The results
 /// come back in index order. The first error stops the threads from taking new work and is
@@ -1709,37 +1801,7 @@ pub fn store_object_bytes(ctx: &Ctx, bytes: &[u8]) -> Result<String, ContentErro
 
 /// [`store_object_bytes`] for a caller that already holds the content-store lock.
 pub(crate) fn store_object_bytes_locked(ctx: &Ctx, bytes: &[u8]) -> Result<String, ContentError> {
-    let sha256 = format!("{:x}", Sha256::digest(bytes));
-    let size = bytes.len() as u64;
-    let obj_path = ctx.paths.content_object_path(&sha256);
-    if let Some(parent) = obj_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if obj_path.exists() && object_is_trustworthy(&obj_path, size, &sha256)? {
-        if protect::protection(&obj_path)? != Protection::Protected {
-            protect::protect(&obj_path)?;
-        }
-        return Ok(sha256);
-    }
-
-    let staging_root = ctx.paths.content_staging_dir();
-    std::fs::create_dir_all(&staging_root)?;
-    let unique = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
-    let staging_dir = staging_root.join(unique);
-    std::fs::create_dir_all(&staging_dir)?;
-    let mut guard = StagingGuard::new(&staging_dir);
-    let staged_path = staging_dir.join("object");
-    std::fs::write(&staged_path, bytes)?;
-    let entry = StagedEntry {
-        rel_path: validate_entry_path("object")?,
-        staged_path,
-        size,
-        sha256: sha256.clone(),
-    };
-    place_object(&ctx.paths, &entry, false)?;
-    guard.active = false;
-    let _ = std::fs::remove_dir_all(&staging_dir);
-    Ok(sha256)
+    place_object_from_bytes(&ctx.paths, bytes).map(|(sha256, _)| sha256)
 }
 
 /// Read a stored object's bytes, refusing a hash that is not an object name and an object that no
@@ -2411,139 +2473,31 @@ pub fn remove_item_with_options(
         });
     }
     drop(locations);
-    // 1. Read every other manifest, noting whether any is unreadable.
-    let items_dir = ctx.paths.content_items_dir();
-    let mut other_items = Vec::new();
-    let mut an_other_record_is_unreadable = false;
-
-    let item_entries: Vec<_> = match std::fs::read_dir(&items_dir) {
-        Ok(entries) => entries.collect(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => {
-            return Err(ContentError::UnreadableManifest {
-                item_id,
-                manifest: items_dir.display().to_string(),
-                error: error.to_string(),
-            })
-        }
-    };
-    for entry in item_entries {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().map(|e| e == "json").unwrap_or(false) {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                if stem == item_id {
-                    continue;
-                }
-                let parsed = std::fs::read_to_string(&path)
-                    .map_err(|e| e.to_string())
-                    .and_then(|content| {
-                        serde_json::from_str::<ContentItem>(&content).map_err(|e| e.to_string())
-                    });
-                match parsed {
-                    Ok(item) => other_items.push(item),
-                    Err(_) => an_other_record_is_unreadable = true,
-                }
-            }
-        }
-    }
-
-    // 2. Collect every object hash a remaining item records: its files, its saved icon, and a
-    //    hash its source published. The sweep must keep all of them, or removing one item would
-    //    delete another item's icon.
-    let mut remaining_hashes = HashSet::new();
-    for it in &other_items {
-        for f in &it.files {
-            remaining_hashes.insert(f.sha256.clone());
-        }
-        if let Some(icon) = &it.icon_sha256 {
-            remaining_hashes.insert(icon.clone());
-        }
-        for source in &it.sources {
-            match source {
-                ContentSource::Archive { sha256, .. } | ContentSource::Catalog { sha256, .. } => {
-                    remaining_hashes.insert(sha256.clone());
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // 3. Delete target manifest first
+    // 1. Publish the removal: the item's own record goes, so nothing names its objects any more.
     std::fs::remove_file(&target_manifest_path)?;
 
-    // 4. Delete every object that no remaining item references (unprotect, then delete): the
-    //    removed item's own, and any an interrupted add left behind before writing its manifest.
-    //    A failure here only leaves an unreferenced object for the next sweep.
-    let objects_dir = ctx.paths.content_objects_dir();
-    if !an_other_record_is_unreadable {
-        let shards = match std::fs::read_dir(&objects_dir) {
-            Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(error) => Err(error),
-        }
-        .map_err(|error| ContentError::UnreadableManifest {
-            item_id: item_id.clone(),
-            manifest: objects_dir.display().to_string(),
-            error: error.to_string(),
-        })?;
-        let mut to_remove = Vec::new();
-        for shard in shards {
-            let path = shard.path();
-            match std::fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.is_dir() => {}
-                Ok(_) => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    return Err(ContentError::UnreadableManifest {
-                        item_id: item_id.clone(),
-                        manifest: path.display().to_string(),
-                        error: error.to_string(),
-                    })
-                }
-            }
-            let objects =
-                std::fs::read_dir(&path).map_err(|error| ContentError::UnreadableManifest {
-                    item_id: item_id.clone(),
-                    manifest: path.display().to_string(),
-                    error: error.to_string(),
-                })?;
-            for object in objects {
-                let object = object.map_err(|error| ContentError::UnreadableManifest {
-                    item_id: item_id.clone(),
-                    manifest: path.display().to_string(),
-                    error: error.to_string(),
-                })?;
-                to_remove.push(object.path());
-            }
-        }
-        // A whole listing that cannot be read must not turn into "nothing to
-        // keep": collect first, then delete only from a complete picture.
-        for obj_path in to_remove {
-            let name = obj_path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            match std::fs::symlink_metadata(&obj_path) {
-                Ok(metadata) if metadata.is_file() => {}
-                Ok(_) => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    return Err(ContentError::UnreadableManifest {
-                        item_id: item_id.clone(),
-                        manifest: obj_path.display().to_string(),
-                        error: error.to_string(),
-                    })
-                }
-            }
-            if !remaining_hashes.contains(&name) {
-                let _ = protect::unprotect(&obj_path);
-                let _ = std::fs::remove_file(&obj_path);
-            }
-        }
+    // 2. Then let the one collection decide what is unreferenced. It reads every owner record
+    //    fresh — items, instance manifests, snapshot manifests here and in both Recently deleted
+    //    roots, pending records — frees what nothing names in either object store, and refuses to
+    //    free anything at all when a record, a listing or an object's time cannot be read. The
+    //    removal itself has succeeded either way; the report says what was not reclaimed and why.
+    let report = collect::collect_with_ctx(
+        ctx,
+        &collect::CollectRequest {
+            store: collect::LockRequest::Held,
+            locations: collect::LockRequest::Wait,
+            grace: None,
+            ignore_unreadable_snapshots: options.ignore_unreadable_snapshots,
+        },
+    );
+    if report.refused() {
+        eprintln!(
+            "[content] removed {item_id}, but no stored object was reclaimed: {}",
+            report.summary()
+        );
     }
 
-    // 5. Clean up any staging leftovers
+    // 3. Clean up any staging leftovers
     clean_staging_dir(&ctx.paths);
 
     Ok(())

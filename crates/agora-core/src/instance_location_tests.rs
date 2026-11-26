@@ -95,6 +95,15 @@ fn contend(ctx: &Ctx) -> LockGuard {
         .unwrap()
 }
 
+/// Whether some store still holds an object with this name. A capture writes into the one content
+/// store; a store captured before the migration keeps its blobs in `snapshot-objects`.
+fn object_in_any_store(instance_dir: &Path, hash: &str) -> bool {
+    snapshot::snapshot_blob_path(instance_dir, hash).is_file()
+        || snapshot::snapshot_store_paths(instance_dir)
+            .content_object_path(hash)
+            .is_file()
+}
+
 fn snapshot_move_race(restore: bool) {
     let (_dir, ctx) = fixture();
     let a = instance(&ctx, "first", None);
@@ -102,8 +111,7 @@ fn snapshot_move_race(restore: bool) {
     let first = snapshot::create_snapshot(&a, None, &["tracked.txt"]).unwrap();
     snapshot::create_snapshot(&b, None, &["tracked.txt"]).unwrap();
     let hash = format!("{:x}", Sha256::digest(b"shared snapshot bytes"));
-    let blob = snapshot::snapshot_blob_path(&a, &hash);
-    assert!(blob.is_file());
+    assert!(object_in_any_store(&a, &hash));
     let entry = restore.then(|| {
         game_instance::delete(&ctx, "second")
             .unwrap()
@@ -128,11 +136,13 @@ fn snapshot_move_race(restore: bool) {
             entries
         },
         &locations,
+        None,
+        Some(Duration::ZERO),
     )
     .unwrap();
     assert!(fired.load(Ordering::SeqCst), "the scan reached the pause");
     assert!(
-        blob.is_file(),
+        object_in_any_store(&a, &hash),
         "cleanup deleted a blob still needed by the moving instance"
     );
     assert_eq!(
@@ -158,10 +168,12 @@ fn snapshot_delete_refuses_contended_location_lock() {
     let a = instance(&ctx, "first", None);
     let first = snapshot::create_snapshot(&a, None, &["tracked.txt"]).unwrap();
     let hash = format!("{:x}", Sha256::digest(b"shared snapshot bytes"));
-    let blob = snapshot::snapshot_blob_path(&a, &hash);
     let _held = contend(&ctx);
     let delete = snapshot::delete_snapshot(&a, &first.id);
-    assert!(blob.is_file(), "a blocked scan must leave the blob alone");
+    assert!(
+        object_in_any_store(&a, &hash),
+        "a blocked scan must leave the blob alone"
+    );
     assert!(snapshot::list_snapshots(&a)
         .unwrap()
         .iter()
@@ -175,17 +187,19 @@ fn snapshot_prune_refuses_contended_location_lock() {
     let a = instance(&ctx, "first", None);
     let first = snapshot::create_snapshot(&a, None, &["tracked.txt"]).unwrap();
     let hash = format!("{:x}", Sha256::digest(b"shared snapshot bytes"));
-    let blob = snapshot::snapshot_blob_path(&a, &hash);
     // Make the blob an orphan so the independent prune would delete it.
     fs::remove_file(
         a.join(".agora_snapshots")
             .join(format!("{}.json", first.id)),
     )
     .unwrap();
-    assert!(blob.is_file());
+    assert!(object_in_any_store(&a, &hash));
     let _held = contend(&ctx);
     let prune = snapshot::prune_unreferenced_objects(&a);
-    assert!(blob.is_file(), "a blocked prune must leave the blob alone");
+    assert!(
+        object_in_any_store(&a, &hash),
+        "a blocked prune must leave the blob alone"
+    );
     assert!(prune.unwrap_err().contains("instance-locations"));
 }
 

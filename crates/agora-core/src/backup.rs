@@ -710,15 +710,21 @@ pub fn export_snapshot(
         // omitting it.  The zip must be complete or not exist at all.
         if is_modern {
             for entry in &file_index {
-                let blob_path = crate::snapshot::snapshot_blob_path(instance_dir, &entry.sha256);
+                let blob_path = crate::snapshot::snapshot_blob_source(
+                    instance_dir,
+                    &entry.sha256,
+                    entry.size,
+                );
                 // Validate the blob before streaming it into the zip.
-                if !blob_path.is_file() {
-                    return Err(format!(
-                        "snapshot blob is missing for {}: {}",
-                        entry.path,
-                        blob_path.display()
-                    ));
-                }
+                let blob_path = match blob_path {
+                    Some(path) => path,
+                    None => {
+                        return Err(format!(
+                            "snapshot blob is missing for {}: no object store holds it",
+                            entry.path
+                        ))
+                    }
+                };
                 if !crate::snapshot::blob_file_matches(&blob_path, &entry.sha256, entry.size) {
                     return Err(format!(
                         "snapshot blob hash mismatch for {}: object is corrupted or modified",
@@ -1274,8 +1280,9 @@ pub fn import_backup(
             ));
         }
     } else {
-        // Populate the blob store from the staged files.  Each staged file is
-        // hashed (again) and stored under `snapshot-objects/<aa>/<hash>`.
+        // Populate the object store from the staged files.  Each staged file is
+        // hashed (again) and handed to the store's one writer, which stages, syncs and commits it
+        // under the same rules a content item's own files take.
         for entry in &manifest.files {
             let staged_path = staging_dir.join(Path::new(&entry.relative_path));
             // Re-validate the staged file's hash before committing it to the
@@ -1293,51 +1300,13 @@ pub fn import_backup(
                 let _ = fs::remove_dir_all(&staging_dir);
                 return Err(format!("staged hash mismatch for {}", entry.relative_path));
             }
-            let blob_path = crate::snapshot::snapshot_blob_path(instance_dir, &entry.sha256);
-            if let Some(parent) = blob_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| format!("failed to create blob prefix: {error}"))?;
-            }
-            // Deduplicated store: if the blob already exists with the correct
-            // hash, skip the write.  Otherwise atomically commit the bytes.
-            let needs_write = if blob_path.is_file() {
-                !crate::snapshot::blob_file_matches(&blob_path, &entry.sha256, entry.size)
-            } else {
-                true
-            };
-            if needs_write {
-                // Write via a temp file in the object store's parent so the
-                // final rename is atomic and same-volume.
-                let blob_dir = blob_path.parent().unwrap_or(Path::new("."));
-                let temp_blob = blob_dir.join(format!(
-                    ".{}.tmp-{}",
-                    blob_path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("blob"),
-                    uuid::Uuid::new_v4()
-                ));
-                fs::write(&temp_blob, &staged_bytes).map_err(|error| {
-                    format!("failed to write blob for {}: {error}", entry.relative_path)
-                })?;
-                let _ = fs::remove_file(&blob_path);
-                fs::rename(&temp_blob, &blob_path).map_err(|error| {
-                    format!("failed to commit blob for {}: {error}", entry.relative_path)
-                })?;
-                let _ = crate::artifact_receipt::record_verified(
-                    &blob_path,
-                    "sha256",
-                    &entry.sha256,
-                    i64::try_from(entry.size).ok(),
-                );
-            } else {
-                let _ = crate::artifact_receipt::record_verified(
-                    &blob_path,
-                    "sha256",
-                    &entry.sha256,
-                    i64::try_from(entry.size).ok(),
-                );
-            }
+            crate::content_store::place_object_from_bytes(
+                &crate::snapshot::snapshot_store_paths(instance_dir),
+                &staged_bytes,
+            )
+            .map_err(|error| {
+                format!("failed to store blob for {}: {error}", entry.relative_path)
+            })?;
         }
 
         // Write the SnapshotManifest `list_snapshots` and `snapshot_file_index`
@@ -1626,9 +1595,20 @@ pub fn export_game_snapshot(
             if entry.absent {
                 continue;
             }
-            let blob_path = crate::snapshot::snapshot_blob_path(instance_dir, &entry.sha256);
-            if !blob_path.is_file()
-                || !crate::snapshot::blob_file_matches(&blob_path, &entry.sha256, entry.size)
+            let blob_path = match crate::snapshot::snapshot_blob_source(
+                instance_dir,
+                &entry.sha256,
+                entry.size,
+            ) {
+                Some(path) => path,
+                None => {
+                    return Err(format!(
+                        "snapshot blob is missing or corrupted for {}",
+                        entry.relative_path
+                    ))
+                }
+            };
+            if !crate::snapshot::blob_file_matches(&blob_path, &entry.sha256, entry.size)
             {
                 return Err(format!(
                     "snapshot blob is missing or corrupted for {}",
@@ -2421,20 +2401,13 @@ fn import_game_backup(
             {
                 return Err(format!("staged hash mismatch for {}", entry.relative_path));
             }
-            let blob_path = crate::snapshot::snapshot_blob_path(instance_dir, &entry.sha256);
-            if let Some(parent) = blob_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| format!("failed to create blob prefix: {error}"))?;
-            }
-            fs::write(&blob_path, &bytes).map_err(|error| {
-                format!("failed to write blob for {}: {error}", entry.relative_path)
+            crate::content_store::place_object_from_bytes(
+                &crate::snapshot::snapshot_store_paths(instance_dir),
+                &bytes,
+            )
+            .map_err(|error| {
+                format!("failed to store blob for {}: {error}", entry.relative_path)
             })?;
-            let _ = crate::artifact_receipt::record_verified(
-                &blob_path,
-                "sha256",
-                &entry.sha256,
-                i64::try_from(entry.size).ok(),
-            );
         }
 
         if manifest.includes_content_bytes {
@@ -2450,20 +2423,13 @@ fn import_game_backup(
                         "staged content object {hash} does not match its hash"
                     ));
                 }
-                let dest = content_object_path_for(instance_dir, &hash);
-                if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent).map_err(|error| {
-                        format!("failed to create content object prefix: {error}")
-                    })?;
-                }
-                fs::write(&dest, &bytes)
-                    .map_err(|error| format!("failed to write content object {hash}: {error}"))?;
-                let _ = crate::artifact_receipt::record_verified(
-                    &dest,
-                    "sha256",
-                    &hash,
-                    i64::try_from(size).ok(),
-                );
+                crate::content_store::place_object_from_bytes(
+                    &crate::snapshot::snapshot_store_paths(instance_dir),
+                    &bytes,
+                )
+                .map_err(|error| {
+                    format!("failed to store content object {hash}: {error}")
+                })?;
             }
         }
 
