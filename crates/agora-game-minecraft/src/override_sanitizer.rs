@@ -232,51 +232,53 @@ pub fn extract_overrides_with_inputs(
     }
 
     let mut archive = SafeArchive::open(zip_path, ArchiveLimits::PACK).map_err(archive_error)?;
-    let outcome = archive.extract_where(dest_dir, names, &mut |name| {
-        if !policy.admits(name) {
-            return Select::LeaveOut(if is_agora_owned(as_created(name)) {
-                "Agora keeps this file in the instance".to_string()
-            } else {
-                "not a folder a pack's overrides may write".to_string()
-            });
-        }
-        if policy.forbids(name) {
-            return Select::Refuse(format!(
-                "Security Violation: Pack overrides cannot contain executable files or mods. \
-                 Banned file type detected: '{name}'. All mods must be routed through the platform \
-                 manifest."
-            ));
-        }
-        Select::Write
-    });
+    // Staged, never written straight into the instance: a pack that replaces `config/settings.toml`
+    // and then fails on a later entry has replaced nothing (MASTER_SPEC §32.3).
+    let staged = archive
+        .stage(
+            dest_dir,
+            names,
+            &mut |name| {
+                if !policy.admits(name) {
+                    return Select::LeaveOut(if is_agora_owned(as_created(name)) {
+                        "Agora keeps this file in the instance".to_string()
+                    } else {
+                        "not a folder a pack's overrides may write".to_string()
+                    });
+                }
+                if policy.forbids(name) {
+                    return Select::Refuse(format!(
+                    "Security Violation: Pack overrides cannot contain executable files or mods. \
+                     Banned file type detected: '{name}'. All mods must be routed through the \
+                     platform manifest."
+                ));
+                }
+                Select::Write
+            },
+            &|| false,
+        )
+        .map_err(archive_error)?;
 
-    match outcome {
-        Ok(report) => {
-            let mut extracted = report.written;
-            extracted.sort();
-            Ok(ExtractionResult {
-                extracted,
-                skipped: report
-                    .skipped
-                    .iter()
-                    .map(|entry| entry.name.clone())
-                    .collect(),
-                left_out: report
-                    .skipped
-                    .into_iter()
-                    .map(|entry| LeftOutEntry {
-                        path: entry.name,
-                        reason: entry.reason,
-                    })
-                    .collect(),
-                total_bytes_written: report.bytes_written,
+    let report = staged.publish_into(dest_dir).map_err(archive_error)?;
+    let mut extracted = report.written;
+    extracted.sort();
+    Ok(ExtractionResult {
+        extracted,
+        skipped: report
+            .skipped
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect(),
+        left_out: report
+            .skipped
+            .into_iter()
+            .map(|entry| LeftOutEntry {
+                path: entry.name,
+                reason: entry.reason,
             })
-        }
-        Err(error) => {
-            cleanup_partial(dest_dir, archive.written_so_far());
-            Err(archive_error(error))
-        }
-    }
+            .collect(),
+        total_bytes_written: report.bytes_written,
+    })
 }
 
 /// The reader's refusal, as the error codes the CLI and the desktop already report (§32.10).
@@ -306,14 +308,6 @@ fn is_whitelisted(path: &str) -> bool {
 fn has_banned_extension(path: &str) -> bool {
     let lower = as_created(path).to_lowercase();
     BANNED_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
-}
-
-/// Delete partially extracted files on security violation or error.
-fn cleanup_partial(dest_dir: &Path, extracted: &[String]) {
-    for file in extracted {
-        let path = dest_dir.join(file);
-        let _ = std::fs::remove_file(&path);
-    }
 }
 
 #[cfg(test)]
@@ -412,6 +406,66 @@ mod tests {
         assert!(standard.forbids("config/extra.jar"));
         assert!(standard.admits("scripts/recipes.zs"));
         assert!(standard.admits("global_packs/required_data/pack.zip"));
+    }
+
+    #[test]
+    fn a_bad_entry_leaves_an_existing_file_intact() {
+        // A pack replacing `config/settings.toml` and then failing on a later entry may not have
+        // replaced anything: the player's file is the one thing here that cannot be rebuilt.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("pack.zip");
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, bytes) in [
+                ("config/settings.toml", &b"from the pack"[..]),
+                ("config/other.toml", &b"BROKEN-PAYLOAD"[..]),
+            ] {
+                zip.start_file(name, options).unwrap();
+                zip.write_all(bytes).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        // Corrupt the second entry's bytes, so its CRC fails as the extraction reads it.
+        let mut bytes = std::fs::read(&zip_path).unwrap();
+        let at = bytes
+            .windows(b"BROKEN-PAYLOAD".len())
+            .position(|window| window == b"BROKEN-PAYLOAD")
+            .expect("the payload is in the archive");
+        bytes[at] ^= 0xff;
+        std::fs::write(&zip_path, &bytes).unwrap();
+
+        let dest = dir.path().join("instance");
+        std::fs::create_dir_all(dest.join("config")).unwrap();
+        std::fs::write(dest.join("config/settings.toml"), b"mine").unwrap();
+
+        let error = extract_overrides(&zip_path, &dest).unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("crc")
+                || error.to_string().contains("damaged"),
+            "the archive is named as damaged: {error}"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("config/settings.toml")).unwrap(),
+            b"mine",
+            "the player's file is untouched"
+        );
+        assert!(
+            !dest.join("config/other.toml").exists(),
+            "nothing from the failed run is in the destination"
+        );
+        assert_eq!(
+            std::fs::read_dir(dest.join("config")).unwrap().count(),
+            1,
+            "no partial file beside the original"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dest).unwrap().count(),
+            1,
+            "no staging folder left behind"
+        );
     }
 
     fn write_zip_at(path: &Path, entries: &[(&str, &[u8])]) {

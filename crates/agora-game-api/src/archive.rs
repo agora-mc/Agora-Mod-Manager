@@ -1287,6 +1287,39 @@ impl SafeArchive {
         &self.written_so_far
     }
 
+    /// Extract into a folder of its own beside `destination`, and publish it only if every entry was
+    /// written.
+    ///
+    /// This is the shape an extraction into a **live** folder takes: `destination` is an instance's
+    /// `config/`, with the player's own files in it, so a refusal half-way through may not have
+    /// replaced any of them. The reader writes into `.<destination name>.agora-extract-<id>` next to
+    /// it, removes that folder on any error, and hands back a [`StagedExtraction`] whose
+    /// [`StagedExtraction::publish_into`] moves the files into place — the caller publishes, the
+    /// reader never does (MASTER_SPEC §32.3).
+    ///
+    /// A caller whose destination is already a fresh folder of its own (a runtime's staging
+    /// directory, a world's, a plugin package's) needs no staging on top: it calls
+    /// [`SafeArchive::extract_checked`] with that folder.
+    pub fn stage(
+        &mut self,
+        destination: &Path,
+        policy: NamePolicy,
+        select: &mut dyn FnMut(&str) -> Select,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<StagedExtraction, ArchiveError> {
+        let root = fresh_folder_beside(destination).map_err(|error| ArchiveError::Destination {
+            path: destination.display().to_string(),
+            reason: format!("could not make a staging folder: {error}"),
+        })?;
+        match self.extract_checked(&root, policy, select, cancelled) {
+            Ok(report) => Ok(StagedExtraction { root, report }),
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&root);
+                Err(error)
+            }
+        }
+    }
+
     /// The Unix mode an entry recorded, where it recorded one.
     fn entry_mode(&self, name: &str) -> Option<u32> {
         self.entries
@@ -1294,6 +1327,100 @@ impl SafeArchive {
             .find(|entry| entry.name == name)
             .and_then(|entry| entry.unix_mode)
     }
+}
+
+/// An extraction written to a folder of its own, not yet published.
+///
+/// Dropping one removes the folder, so a caller that returns early on a later error leaves nothing
+/// behind. Publishing moves the files into a destination the caller names; the files already there
+/// are replaced one at a time, so a destination is only ever as complete as the extraction was.
+#[derive(Debug)]
+pub struct StagedExtraction {
+    root: PathBuf,
+    report: ExtractReport,
+}
+
+impl StagedExtraction {
+    /// The folder the files are in, for a caller that wants to publish it as a whole.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// What was written, and what was left out.
+    pub fn report(&self) -> &ExtractReport {
+        &self.report
+    }
+
+    /// Move every staged file under `destination`, making only the folders that hold them.
+    ///
+    /// A file in the destination with the same name is replaced; nothing else is touched, so a
+    /// pack's `config/settings.toml` replaces the player's rather than the folder being cleared.
+    pub fn publish_into(mut self, destination: &Path) -> Result<ExtractReport, ArchiveError> {
+        let staged = std::mem::take(&mut self.root);
+        for rel in &self.report.written {
+            let strict =
+                StrictRelPath::new(rel.clone()).map_err(|error| ArchiveError::Destination {
+                    path: destination.display().to_string(),
+                    reason: format!("'{rel}' was written and cannot be placed: {error}"),
+                })?;
+            let target =
+                join_under(destination, &strict).map_err(|error| ArchiveError::Destination {
+                    path: destination.display().to_string(),
+                    reason: error.to_string(),
+                })?;
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| ArchiveError::Write {
+                    path: parent.display().to_string(),
+                    error: error.to_string(),
+                })?;
+            }
+            let from = join_under(&staged, &strict).map_err(|error| ArchiveError::Destination {
+                path: staged.display().to_string(),
+                reason: error.to_string(),
+            })?;
+            std::fs::rename(&from, &target).map_err(|error| ArchiveError::Write {
+                path: target.display().to_string(),
+                error: error.to_string(),
+            })?;
+        }
+        let _ = std::fs::remove_dir_all(&staged);
+        Ok(std::mem::take(&mut self.report))
+    }
+}
+
+impl Drop for StagedExtraction {
+    fn drop(&mut self) {
+        if !self.root.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+}
+
+/// A folder beside `destination` that did not exist, for staging an extraction into.
+///
+/// Beside it, not in the system temporary folder, so publishing is a rename on the same disk and a
+/// half-written file never appears in the destination.
+fn fresh_folder_beside(destination: &Path) -> std::io::Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let name = destination
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "extract".to_string());
+    for _ in 0..64 {
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{name}.agora-extract-{}-{id}", std::process::id()));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no unused staging folder name was available",
+    ))
 }
 
 /// An extraction decided but not yet performed: what would be written, what the caller's own rule
