@@ -202,15 +202,8 @@ pub(crate) fn collect(
     let grace = request.grace.unwrap_or(OBJECT_GRACE);
     let now = SystemTime::now();
     for root in object_roots(paths) {
-        if let Err(error) = read_object_root(
-            &root,
-            &keep,
-            grace,
-            now,
-            &mut candidates,
-            &mut recent,
-            &mut report,
-        ) {
+        if let Err(error) = read_object_root(&root, &keep, grace, now, &mut candidates, &mut recent)
+        {
             report.refusals.push(error);
         }
     }
@@ -582,7 +575,7 @@ impl Owners {
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if !crate::snapshot::is_snapshot_manifest_name(name) {
+            if !crate::snapshot::looks_like_snapshot_manifest(name) {
                 continue;
             }
             let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
@@ -682,7 +675,6 @@ fn read_object_root(
     now: SystemTime,
     candidates: &mut Vec<(String, PathBuf)>,
     recent: &mut Vec<String>,
-    report: &mut CollectReport,
 ) -> Result<(), String> {
     let shards = match std::fs::read_dir(root) {
         Ok(entries) => entries,

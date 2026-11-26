@@ -2499,9 +2499,12 @@ fn read_manifest_file(path: &Path, snapshot_id: &str) -> Result<SnapshotManifest
     Ok(manifest)
 }
 
-/// Whether this file name is a snapshot manifest, as opposed to the helper files that live beside
-/// one (`live-file-index.json`, `mutation-journal.json`) or a verification receipt.
-pub(crate) fn is_snapshot_manifest_name(name: &str) -> bool {
+/// Whether this file name looks like a snapshot manifest, as opposed to the helper files that live
+/// beside one (`live-file-index.json`, `mutation-journal.json`) or a verification receipt.
+///
+/// Not a path validator: it compares whole file names, and the folder they are in is chosen by the
+/// caller.
+pub(crate) fn looks_like_snapshot_manifest(name: &str) -> bool {
     name.ends_with(".json")
         && !name.ends_with(".agora-verified.json")
         && name != "live-file-index.json"

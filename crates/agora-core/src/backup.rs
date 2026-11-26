@@ -1233,6 +1233,28 @@ pub fn import_backup(
         return Err(error);
     }
 
+    // The objects this import is about to reuse or add are registered before the first one lands:
+    // the manifest that names them is published below, after the loop, and a collection running
+    // in between must keep them (MASTER_SPEC §32.8).
+    let imported_hashes: Vec<String> = manifest
+        .files
+        .iter()
+        .filter(|entry| !entry.absent)
+        .map(|entry| entry.sha256.to_ascii_lowercase())
+        .chain(
+            manifest
+                .includes_content_bytes
+                .then(|| content_objects(&manifest.content_items).into_keys())
+                .into_iter()
+                .flatten(),
+        )
+        .collect();
+    let pending = crate::content_store::pending::begin_pending_use(
+        &crate::snapshot::snapshot_store_paths(instance_dir),
+        &imported_hashes,
+        "backup import",
+    )?;
+
     // Phase 3: populate the content-addressed object store from the staged
     // files, then write the SnapshotManifest that makes the imported snapshot
     // appear in `list_snapshots` and participate in retention/GC correctly.
@@ -1311,6 +1333,8 @@ pub fn import_backup(
         let snapshot_manifest_json = build_snapshot_manifest_json(&manifest)?;
         crate::snapshot::atomic_write_pub(&dest_manifest_path, snapshot_manifest_json.as_bytes())?;
     }
+    // The imported snapshot's manifest names every object the import reused or added.
+    pending.published();
 
     // Import stops here, at the snapshot store. It deliberately does not
     // promote anything into the live instance.
@@ -2384,6 +2408,28 @@ fn import_game_backup(
         fs::create_dir_all(crate::snapshot::snapshot_objects_dir(instance_dir))
             .map_err(|error| format!("failed to create snapshot object store: {error}"))?;
 
+        // The objects this import is about to reuse or add are registered before the first one
+        // lands: the manifest that names them is published at the end of this block, and a
+        // collection running in between must keep them (MASTER_SPEC §32.8).
+        let imported_hashes: Vec<String> = manifest
+            .files
+            .iter()
+            .filter(|entry| !entry.absent)
+            .map(|entry| entry.sha256.to_ascii_lowercase())
+            .chain(
+                manifest
+                    .includes_content_bytes
+                    .then(|| content_objects(&manifest.content_items).into_keys())
+                    .into_iter()
+                    .flatten(),
+            )
+            .collect();
+        let pending = crate::content_store::pending::begin_pending_use(
+            &crate::snapshot::snapshot_store_paths(instance_dir),
+            &imported_hashes,
+            "backup import",
+        )?;
+
         for entry in &manifest.files {
             if entry.absent {
                 continue;
@@ -2444,6 +2490,7 @@ fn import_game_backup(
 
         let snapshot_manifest_json = build_snapshot_manifest_json(manifest)?;
         crate::snapshot::atomic_write_pub(&dest_manifest_path, snapshot_manifest_json.as_bytes())?;
+        pending.published();
         Ok(())
     })();
 
@@ -2947,10 +2994,12 @@ mod tests {
         let instance = make_instance(&tmp);
         let snapshot = create_snapshot(&instance, Some("to-corrupt"), TRACKED).unwrap();
 
-        // Corrupt the blob store by deleting a blob.
+        // Fixture: the snapshot's blob is no longer in any store, from whichever one held it.
         let index = crate::snapshot::snapshot_file_index(&instance, &snapshot.id).unwrap();
         let first = &index[0];
-        let blob_path = crate::snapshot::snapshot_blob_path(&instance, &first.sha256);
+        let blob_path = crate::snapshot::snapshot_blob_source(&instance, &first.sha256, first.size)
+            .expect("the capture stored the blob somewhere");
+        crate::content_store::protect::unprotect(&blob_path).unwrap();
         std::fs::remove_file(&blob_path).unwrap();
 
         let export_dir = tmp.path().join("export");

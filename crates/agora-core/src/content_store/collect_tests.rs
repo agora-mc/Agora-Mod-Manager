@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::content_store::collect::{CollectRequest, LockRequest};
 use crate::content_store::{self, pending};
 use crate::ctx::Ctx;
-use crate::process_identity::{Lookup, ProcessCheck, ProcessIdentity, ProcessView};
+use crate::process_identity::{Lookup, ProcessIdentity, ProcessView};
 use crate::snapshot::{self, SnapshotAux};
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -291,7 +291,7 @@ fn a_dead_process_pending_record_is_ignored_and_reported() {
     ctx.test_seams.set_process_view(Some(Arc::new(FixedView {
         answer: Lookup::Absent,
     })));
-    let record = pending_record(&ctx, &[hash.clone()], gone);
+    let record = pending_record(&ctx, std::slice::from_ref(&hash), gone);
 
     content_store::remove_item(&ctx, &item).unwrap();
     assert!(
@@ -324,7 +324,7 @@ fn a_pending_record_that_cannot_be_judged_keeps_its_objects() {
     ctx.test_seams.set_process_view(Some(Arc::new(FixedView {
         answer: Lookup::CantTell("the process table cannot be read".into()),
     })));
-    let record = pending_record(&ctx, &[hash.clone()], live_identity());
+    let record = pending_record(&ctx, std::slice::from_ref(&hash), live_identity());
 
     content_store::remove_item(&ctx, &item).unwrap();
     assert!(

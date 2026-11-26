@@ -67,7 +67,8 @@ pub(crate) struct PendingGuard {
 }
 
 impl PendingGuard {
-    /// The record's path, for a message that has to say what it left behind.
+    /// The record's path. Only a test asks: production drops the record and moves on.
+    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
