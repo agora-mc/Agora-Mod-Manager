@@ -8255,9 +8255,7 @@ async fn run_command(
                                 eprintln!("Error: {e}");
                                 if matches!(
                                     e,
-                                    agora_core::content_store::ContentError::UnwritableNames {
-                                        ..
-                                    }
+                                    agora_core::content_store::ContentError::UnwritableNames { .. }
                                 ) {
                                     eprintln!(
                                         "Import the rest with --without-unwritable-names, which \
