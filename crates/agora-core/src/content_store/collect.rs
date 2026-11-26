@@ -457,27 +457,14 @@ impl Owners {
         // it rolls back or promotes it. A collection running in that window, or one that starts
         // after a crash before the rollback, has to read the manifests that moved there: they name
         // objects the instance will need back, and nothing else names them meanwhile
-        // (MASTER_SPEC §32.8).
-        let mut collect_moved = |path: &Path, report: &mut CollectReport| -> Result<(), String> {
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default();
-            if !(name.starts_with(".agora-quarantine-") || name.starts_with(".agora-import-")) {
+        // (MASTER_SPEC §32.8). `folder_entries` has already refused a link or a folder it cannot
+        // list, so a name that matches is read as an instance tree below.
+        let mut collect_moved = |path: &Path, _report: &mut CollectReport| -> Result<(), String> {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 return Ok(());
-            }
-            match std::fs::symlink_metadata(path) {
-                Ok(metadata) if metadata.is_dir() => instances.push(path.to_path_buf()),
-                Ok(_) => report.refusals.push(format!(
-                    "{} is a link or not a folder, so the instance it holds cannot be judged; \
-                     nothing is deleted",
-                    path.display()
-                )),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => report.refusals.push(format!(
-                    "cannot inspect the moved instance {}: {error}",
-                    path.display()
-                )),
+            };
+            if name.starts_with(".agora-quarantine-") || name.starts_with(".agora-import-") {
+                instances.push(path.to_path_buf());
             }
             Ok(())
         };
