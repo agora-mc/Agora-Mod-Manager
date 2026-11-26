@@ -3161,3 +3161,119 @@ fn a_build_provisions_a_base_a_pin_is_waiting_for() {
     );
     assert!(paths.base_manifest_path(&base_id).is_file());
 }
+
+/// A damaged record names no folder, so its folder may be in any bases root a build registered —
+/// another drive included. Removal said "done" while the folder could still be there; it says which
+/// folders it looked in instead.
+#[test]
+fn removing_a_damaged_record_says_which_roots_it_looked_in() {
+    let tmp = TempDir::new().unwrap();
+    let paths = AppPaths::from_root(tmp.path().join("data"));
+    let base_id = "skyrim-se_steam_2.0.0_nobuild";
+    std::fs::create_dir_all(paths.base_manifests_dir()).unwrap();
+    std::fs::write(paths.base_manifest_path(base_id), "{ not json").unwrap();
+
+    let error = remove_base(&paths, base_id)
+        .expect_err("a removal that cannot find the folder must say so, not report success");
+    let message = format!("{error}");
+    assert!(
+        message.contains(&paths.bases_dir().display().to_string()),
+        "the report names the folder it looked in: {message}"
+    );
+    assert!(
+        !paths.base_manifest_path(base_id).exists(),
+        "the record in the way is gone; what is missing is the folder"
+    );
+}
+
+/// The folder a damaged record cannot name may sit under a registered root on another drive.
+/// Removal removes nothing there (a folder named like the base is not proof it is this base) and
+/// names it, keeping the record so the state stays visible.
+#[test]
+fn removing_a_damaged_record_refuses_a_folder_under_another_root() {
+    let tmp = TempDir::new().unwrap();
+    let paths = AppPaths::from_root(tmp.path().join("data"));
+    let base_id = "skyrim-se_steam_2.0.0_nobuild";
+    std::fs::create_dir_all(paths.base_manifests_dir()).unwrap();
+    std::fs::write(paths.base_manifest_path(base_id), "{ not json").unwrap();
+    let other_root = tmp.path().join("bases_elsewhere");
+    let other_folder = other_root.join(base_id);
+    std::fs::create_dir_all(&other_folder).unwrap();
+    std::fs::write(other_folder.join("SkyrimSE.exe"), b"exe").unwrap();
+    std::fs::write(
+        paths.base_roots_file(),
+        serde_json::to_vec(&vec![other_root.clone()]).unwrap(),
+    )
+    .unwrap();
+
+    let error = remove_base(&paths, base_id)
+        .expect_err("a folder under another root must be reported, not passed over");
+    let message = format!("{error}");
+    assert!(
+        message.contains(&other_folder.display().to_string()),
+        "the report names the folder it found: {message}"
+    );
+    assert!(
+        other_folder.join("SkyrimSE.exe").is_file(),
+        "a damaged record is not proof that folder is this base, so it is not deleted"
+    );
+    assert!(
+        paths.base_manifest_path(base_id).is_file(),
+        "the record is kept while its folder is unresolved"
+    );
+}
+
+/// A stat on the folder that fails for any reason but "not there" is "could not tell", not "gone".
+/// Reading it as gone deleted the record and left the folder: the base vanished from the list while
+/// its files stayed on the disk. The stat is injected because a test cannot make the operating
+/// system refuse a stat on a folder it can see.
+#[test]
+fn a_removal_that_cannot_tell_whether_the_folder_is_there_removes_nothing() {
+    use agora_core::game_base::remove_base_with;
+
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("23"));
+    let outcome = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+    let base_folder = paths.bases_dir().join(&base_id);
+    let manifest_path = paths.base_manifest_path(&base_id);
+    assert!(base_folder.is_dir());
+
+    let removal = remove_base_with(
+        &paths,
+        &base_id,
+        || {},
+        |path: &std::path::Path| {
+            if path.file_name() == Some(std::ffi::OsStr::new(&base_id)) {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "access is denied",
+                ))
+            } else {
+                std::fs::metadata(path)
+            }
+        },
+        |path| std::fs::remove_file(path),
+    );
+    let error = removal.expect_err("a stat that said nothing is not a folder that is gone");
+    let message = format!("{error}");
+    assert!(
+        message.contains(&base_id),
+        "the error names the folder it could not check: {message}"
+    );
+    assert!(base_folder.is_dir(), "the folder is left alone");
+    assert!(
+        manifest_path.is_file(),
+        "the record is kept, so the base stays listed"
+    );
+}

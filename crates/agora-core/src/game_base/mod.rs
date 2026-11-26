@@ -1948,11 +1948,29 @@ pub fn remove_base(paths: &AppPaths, base_id: &str) -> Result<(), BaseError> {
     )
 }
 
-/// Removal with the pinning read's hooks and the record's deletion injected. See
-/// [`instances_pinning_base_with`]. Production calls this through [`remove_base`]; the first
+/// Whether anything is at `path`, as `stat` reports it. Only a clean `NotFound` means nothing is
+/// there; a stat that fails any other way is "could not tell" and an error, because a removal that
+/// reads that as "gone" leaves the folder behind and deletes the record that named it.
+fn path_present_with(
+    stat: &dyn Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+    path: &Path,
+) -> Result<bool, BaseError> {
+    match stat(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(BaseError::Other(format!(
+            "Agora cannot tell whether {} is still there, so nothing was removed: {error}",
+            path.display()
+        ))),
+    }
+}
+
+/// Removal with the pinning read's hooks, every stat it makes and the record's deletion injected.
+/// See [`instances_pinning_base_with`]. Production calls this through [`remove_base`]; the first
 /// closure runs inside the removal's locks, and the last one deletes the record, so a record that
 /// cannot be deleted can be exercised without depending on what the operating system lets a
-/// file's permissions do.
+/// file's permissions do. The stat is injected for the same reason: a stat that fails with
+/// anything but `NotFound` must not be read as "that folder is gone".
 #[doc(hidden)]
 pub fn remove_base_with(
     paths: &AppPaths,
@@ -2014,7 +2032,7 @@ pub fn remove_base_with(
     }
 
     let manifest_path = paths.base_manifest_path(base_id);
-    if !manifest_path.exists() {
+    if !path_present_with(&metadata, &manifest_path)? {
         return Err(BaseError::NotFound(base_id.to_string()));
     }
     // A record that cannot be read at all is an error, not a damaged record: a failed read of a
@@ -2025,8 +2043,19 @@ pub fn remove_base_with(
             // Delete the value that was checked: the folder resolved once, not the spelling the
             // record happened to use.
             let (_folder, resolved) = trusted_base_folder(paths, &manifest, base_id)?;
-            if resolved.exists() {
+            if path_present_with(&metadata, &resolved)? {
                 std::fs::remove_dir_all(&resolved)?;
+                // A folder that outlived its own removal is still there. Deleting the record now
+                // would leave it unbilled and unremovable, so the record stays and the removal
+                // says what is left.
+                if path_present_with(&metadata, &resolved)? {
+                    return Err(BaseError::Other(format!(
+                        "base {base_id}'s folder at {} is still there after it was removed, so its \
+                         record was kept: the base keeps being listed until that folder is deleted \
+                         by hand, or the removal is run again.",
+                        resolved.display()
+                    )));
+                }
             }
             // The folder is gone; a record that stays behind is the base still listed, so the
             // removal did not finish and must not say it did.
@@ -2044,7 +2073,7 @@ pub fn remove_base_with(
         // The record reads but is not a base record, so there is no recorded location to check.
         // Only the folder the id names in the data folder's bases folder is removed, and only if
         // it is a plain folder.
-        Err(_) => remove_damaged_base(paths, base_id, &manifest_path),
+        Err(_) => remove_damaged_base(paths, base_id, &manifest_path, &metadata),
     }
 }
 
@@ -2258,14 +2287,45 @@ pub fn repair_framework(
 
 /// Remove a base whose record cannot be read: the folder the id names in the data folder's bases
 /// folder (if there is one), then the record. A base on another drive keeps its folder under that
-/// drive's `AgoraBases` folder, because a damaged record does not say where that is.
+/// drive's root, because a damaged record does not say where that is.
+///
+/// So the answer is not "removed" unless the folder is known to be gone. A folder with the base's
+/// name under another registered root is named and left alone (a folder's name is not proof that
+/// it is this base), and a folder found nowhere is named as missing from every root that was
+/// looked in, rather than passed off as a removal that finished.
 fn remove_damaged_base(
     paths: &AppPaths,
     base_id: &str,
     manifest_path: &Path,
+    stat: &dyn Fn(&Path) -> std::io::Result<std::fs::Metadata>,
 ) -> Result<(), BaseError> {
+    let roots = known_base_roots(paths)?;
+    let mut elsewhere = Vec::new();
+    for root in roots
+        .iter()
+        .filter(|root| !proven_one_folder(root, &paths.bases_dir()))
+    {
+        let candidate = root.join(base_id);
+        if path_present_with(stat, &candidate)? {
+            elsewhere.push(candidate);
+        }
+    }
+    if !elsewhere.is_empty() {
+        return Err(BaseError::Other(format!(
+            "base {base_id}'s record is damaged, so it cannot say where its folder is. A folder \
+             with that name is under {}, and nothing there was deleted: a damaged record is not \
+             proof that a folder is this base. Check it, and delete it by hand if it is — the \
+             record stays until its folder is resolved.",
+            elsewhere
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
     let folder = paths.bases_dir().join(base_id);
-    match std::fs::symlink_metadata(&folder) {
+    let mut removed_here = false;
+    match stat(&folder) {
         Ok(metadata) => {
             if is_reparse_point_or_symlink(&folder) || !metadata.is_dir() {
                 return Err(BaseError::Other(format!(
@@ -2274,10 +2334,30 @@ fn remove_damaged_base(
                 )));
             }
             std::fs::remove_dir_all(&folder)?;
+            if path_present_with(stat, &folder)? {
+                return Err(BaseError::Other(format!(
+                    "base {base_id}'s folder at {} is still there after it was removed, so its \
+                     record was kept.",
+                    folder.display()
+                )));
+            }
+            removed_here = true;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(BaseError::Io(error)),
     }
     std::fs::remove_file(manifest_path)?;
-    Ok(())
+    if removed_here {
+        return Ok(());
+    }
+    Err(BaseError::Other(format!(
+        "base {base_id}'s record was damaged and has been removed, but no folder for it was found \
+         in {}. A base on another drive keeps its folder under that drive's root; check there \
+         before the space counts as freed.",
+        roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
 }
