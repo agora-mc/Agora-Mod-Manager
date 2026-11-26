@@ -390,7 +390,11 @@ pub(crate) fn write_profile(instance_dir: &Path, profile: &LoadoutProfile) -> Re
     // part (MASTER_SPEC §32.7).
     let game = manifest_game_id(instance_dir)?;
     let json = profile.to_stored(&game)?;
-    fs::write(&profile_path, json).map_err(|e| format!("Cannot write profile: {e}"))
+    // Written atomically, through the same temp-file-then-rename helper the manifests and backups
+    // use: a record cut short by a crash reads as damaged, and the state it held is then only
+    // recoverable from a snapshot. A reader sees the old record or the new one, never a truncation.
+    crate::snapshot::atomic_write_pub(&profile_path, &json)
+        .map_err(|e| format!("Cannot write profile: {e}"))
 }
 
 /// Create a new loadout profile from the current enabled state in the manifest.
