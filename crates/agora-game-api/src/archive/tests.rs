@@ -214,7 +214,8 @@ fn the_presets_carry_the_limits_the_call_sites_used() {
     assert_eq!(ArchiveLimits::GAME_MOD.max_entry_bytes, u64::MAX);
     assert_eq!(ArchiveLimits::GAME_MOD.max_total_bytes, 0, "no total cap");
     assert_eq!(ArchiveLimits::GAME_MOD.max_ratio, 0, "no ratio check");
-    assert!(!ArchiveLimits::GAME_MOD.bounds_the_listing);
+    let bounds_the_listing = ArchiveLimits::GAME_MOD.bounds_the_listing;
+    assert!(!bounds_the_listing, "it reads the entries it is asked for");
 
     assert_eq!(ArchiveLimits::BACKUP.max_entries, 10_000);
     assert_eq!(ArchiveLimits::BACKUP.max_entry_bytes, 1024 * MIB);
@@ -1558,7 +1559,11 @@ fn a_tar_gz_whose_gzip_trailer_is_wrong_is_refused() {
 ///
 /// Each record is `(header name bytes, general-purpose flags, Some((the 0x7075 spelling, the bytes
 /// its own check value covers)))`.
-fn zip_with_unicode_paths(records: &[(&[u8], u16, Option<(&str, &[u8])>)]) -> Vec<u8> {
+/// One record for [`zip_with_unicode_paths`]: its header name bytes, its general-purpose flags, and
+/// the 0x7075 spelling it carries with the bytes that spelling's check value covers.
+type ZipRecord<'a> = (&'a [u8], u16, Option<(&'a str, &'a [u8])>);
+
+fn zip_with_unicode_paths(records: &[ZipRecord<'_>]) -> Vec<u8> {
     fn crc32(bytes: &[u8]) -> u32 {
         let mut crc = flate2::Crc::new();
         crc.update(bytes);
@@ -1773,7 +1778,6 @@ fn stopping_while_an_unwanted_solid_member_is_drained_is_noticed() {
             &mut |_| Select::LeaveOut("not this one".to_string()),
             &cancelled,
         )
-        .err()
-        .expect("the drain noticed the stop");
+        .expect_err("the drain noticed the stop");
     assert!(matches!(error, ArchiveError::Cancelled { .. }), "{error:?}");
 }
