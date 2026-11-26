@@ -1550,12 +1550,29 @@ impl SafeArchive {
         select: &mut dyn FnMut(&str) -> Select,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<StagedExtraction, ArchiveError> {
-        let root = fresh_folder_beside(destination).map_err(|error| ArchiveError::Destination {
+        // The destination is settled first: made if it is missing, its links resolved once, and the
+        // staging folder created beside *that* folder — so publishing is a rename on one disk and a
+        // junctioned instance folder cannot turn the last step into a copy that fails half way.
+        std::fs::create_dir_all(destination).map_err(|error| ArchiveError::Destination {
+            path: destination.display().to_string(),
+            reason: format!("could not be made: {error}"),
+        })?;
+        let resolved = destination
+            .canonicalize()
+            .map_err(|error| ArchiveError::Destination {
+                path: destination.display().to_string(),
+                reason: error.to_string(),
+            })?;
+        let root = fresh_folder_beside(&resolved).map_err(|error| ArchiveError::Destination {
             path: destination.display().to_string(),
             reason: format!("could not make a staging folder: {error}"),
         })?;
         match self.extract_checked(&root, policy, select, cancelled) {
-            Ok(report) => Ok(StagedExtraction { root, report }),
+            Ok(report) => Ok(StagedExtraction {
+                root,
+                destination: resolved,
+                report,
+            }),
             Err(error) => {
                 let _ = std::fs::remove_dir_all(&root);
                 Err(error)
@@ -1571,15 +1588,17 @@ impl SafeArchive {
             .and_then(|entry| entry.unix_mode)
     }
 }
-
 /// An extraction written to a folder of its own, not yet published.
 ///
 /// Dropping one removes the folder, so a caller that returns early on a later error leaves nothing
-/// behind. Publishing moves the files into a destination the caller names; the files already there
-/// are replaced one at a time, so a destination is only ever as complete as the extraction was.
+/// behind. Publishing moves the files into the destination the extraction was staged for, and either
+/// every file arrives or none does (MASTER_SPEC §32.3).
 #[derive(Debug)]
 pub struct StagedExtraction {
     root: PathBuf,
+    /// The destination as it resolves, fixed when the extraction was staged: publishing is a rename
+    /// beside the folder it was staged in, never across a volume.
+    destination: PathBuf,
     report: ExtractReport,
 }
 
@@ -1594,40 +1613,149 @@ impl StagedExtraction {
         &self.report
     }
 
-    /// Move every staged file under `destination`, making only the folders that hold them.
+    /// Move every staged file into the destination, or move nothing at all.
     ///
-    /// A file in the destination with the same name is replaced; nothing else is touched, so a
-    /// pack's `config/settings.toml` replaces the player's rather than the folder being cleared.
-    pub fn publish_into(mut self, destination: &Path) -> Result<ExtractReport, ArchiveError> {
-        let staged = std::mem::take(&mut self.root);
+    /// Three steps, in this order, because a half-published folder is worse than an untouched one:
+    ///
+    /// 1. **Every target is decided before anything moves.** `join_under` answers for each one — a
+    ///    link on the way, or a file where the path needs a folder, ends the publish here, with the
+    ///    path named and the destination untouched.
+    /// 2. **A file that is being replaced is set aside**, into the staging folder's `replaced/`
+    ///    area, before the new one is moved in.
+    /// 3. **Any failure undoes the whole run in reverse**: the new files go back into staging and the
+    ///    originals go back where they were. The staging folder is owned by this value until the very
+    ///    end, so `Drop` removes it however the publish ends.
+    ///
+    /// A crash *during* the publish is a different matter — the process stops between two renames,
+    /// which leaves some files new and some set aside. Putting that right needs a journal, which is
+    /// the staged-apply work (MASTER_SPEC §32.4), not this function.
+    pub fn publish_into(mut self) -> Result<ExtractReport, ArchiveError> {
+        let destination = self.destination.clone();
+        let staging = self.root.clone();
+
+        // 1. Preflight.
+        let mut planned: Vec<(StrictRelPath, PathBuf, PathBuf)> = Vec::new();
         for rel in &self.report.written {
+            let refused = |reason: String| ArchiveError::Destination {
+                path: destination.display().to_string(),
+                reason: format!("'{rel}' cannot be published: {reason}"),
+            };
             let strict =
-                StrictRelPath::new(rel.clone()).map_err(|error| ArchiveError::Destination {
-                    path: destination.display().to_string(),
-                    reason: format!("'{rel}' was written and cannot be placed: {error}"),
-                })?;
+                StrictRelPath::new(rel.clone()).map_err(|error| refused(error.to_string()))?;
             let target =
-                join_under(destination, &strict).map_err(|error| ArchiveError::Destination {
-                    path: destination.display().to_string(),
-                    reason: error.to_string(),
-                })?;
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| ArchiveError::Write {
+                join_under(&destination, &strict).map_err(|error| refused(error.to_string()))?;
+            match std::fs::symlink_metadata(&target) {
+                Ok(metadata) if metadata.is_dir() => {
+                    return Err(refused("a folder is where the file goes".to_string()))
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(refused(error.to_string())),
+            }
+            let replacement =
+                join_under(&staging, &strict).map_err(|error| refused(error.to_string()))?;
+            planned.push((strict, replacement, target));
+        }
+
+        // 2. Move, setting aside what is replaced.
+        let replaced_root = staging.join("replaced");
+        std::fs::create_dir_all(&replaced_root).map_err(|error| ArchiveError::Write {
+            path: replaced_root.display().to_string(),
+            error: error.to_string(),
+        })?;
+        let mut done: Vec<(PathBuf, PathBuf, Option<PathBuf>)> = Vec::new();
+        let mut made_folders: Vec<PathBuf> = Vec::new();
+        for (strict, from, target) in planned {
+            let Some(parent) = target.parent() else {
+                continue;
+            };
+            note_missing_folders(&destination, parent, &mut made_folders);
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                undo_publish(&done, &made_folders);
+                return Err(ArchiveError::Write {
                     path: parent.display().to_string(),
                     error: error.to_string(),
-                })?;
+                });
             }
-            let from = join_under(&staged, &strict).map_err(|error| ArchiveError::Destination {
-                path: staged.display().to_string(),
-                reason: error.to_string(),
-            })?;
-            std::fs::rename(&from, &target).map_err(|error| ArchiveError::Write {
-                path: target.display().to_string(),
-                error: error.to_string(),
-            })?;
+            let aside = if std::fs::symlink_metadata(&target).is_ok() {
+                match join_under(&replaced_root, &strict) {
+                    Ok(where_to) => {
+                        if let Some(parent) = where_to.parent() {
+                            note_missing_folders(&replaced_root, parent, &mut made_folders);
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        match std::fs::rename(&target, &where_to) {
+                            Ok(()) => Some(where_to),
+                            Err(error) => {
+                                undo_publish(&done, &made_folders);
+                                return Err(ArchiveError::Write {
+                                    path: target.display().to_string(),
+                                    error: error.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        undo_publish(&done, &made_folders);
+                        return Err(ArchiveError::Write {
+                            path: target.display().to_string(),
+                            error: error.to_string(),
+                        });
+                    }
+                }
+            } else {
+                None
+            };
+            if let Err(error) = std::fs::rename(&from, &target) {
+                if let Some(aside) = &aside {
+                    let _ = std::fs::rename(aside, &target);
+                }
+                undo_publish(&done, &made_folders);
+                return Err(ArchiveError::Write {
+                    path: target.display().to_string(),
+                    error: error.to_string(),
+                });
+            }
+            done.push((target, from, aside));
         }
-        let _ = std::fs::remove_dir_all(&staged);
+
+        // 3. Committed: the staging folder has done its job and Drop must not look for it again.
+        self.root.clear();
+        let _ = std::fs::remove_dir_all(&staging);
         Ok(std::mem::take(&mut self.report))
+    }
+}
+
+/// Undo a publish that could not finish: the new files go back into staging, in reverse order, and
+/// each original comes back where it was. A folder this run created and left empty goes too.
+fn undo_publish(done: &[(PathBuf, PathBuf, Option<PathBuf>)], made_folders: &[PathBuf]) {
+    for (target, from, aside) in done.iter().rev() {
+        let _ = std::fs::rename(target, from);
+        if let Some(aside) = aside {
+            let _ = std::fs::rename(aside, target);
+        }
+    }
+    for folder in made_folders.iter().rev() {
+        let _ = std::fs::remove_dir(folder);
+    }
+}
+
+/// The folders between `root` and `folder` that do not exist yet, so a publish that fails can take
+/// back the empty ones it created.
+fn note_missing_folders(root: &Path, folder: &Path, made: &mut Vec<PathBuf>) {
+    let mut chain: Vec<&Path> = Vec::new();
+    let mut current = Some(folder);
+    while let Some(path) = current {
+        if path == root {
+            break;
+        }
+        chain.push(path);
+        current = path.parent();
+    }
+    for path in chain.into_iter().rev() {
+        if !path.exists() && !made.iter().any(|known| known == path) {
+            made.push(path.to_path_buf());
+        }
     }
 }
 

@@ -259,7 +259,7 @@ pub fn extract_overrides_with_inputs(
         )
         .map_err(archive_error)?;
 
-    let report = staged.publish_into(dest_dir).map_err(archive_error)?;
+    let report = staged.publish_into().map_err(archive_error)?;
     let mut extracted = report.written;
     extracted.sort();
     Ok(ExtractionResult {

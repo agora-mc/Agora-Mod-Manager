@@ -1296,3 +1296,120 @@ fn a_folder_recorded_twice_is_one_folder() {
         SafeArchive::open_bytes(bytes, ArchiveLimits::PACK).expect("one folder, written twice");
     assert_eq!(archive.file_entries().count(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Staged publishing (MASTER_SPEC §32.3, §32.13)
+// ---------------------------------------------------------------------------
+
+/// The staging folders left beside `folder`, which is where `SafeArchive::stage` puts them.
+fn staging_folders_beside(folder: &Path) -> Vec<String> {
+    std::fs::read_dir(folder)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().to_string())
+                .filter(|name| name.contains(".agora-extract-"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_publish_that_cannot_finish_leaves_the_destination_alone() {
+    // The reviewers' fixture: the pack replaces `config/settings.toml` and then needs
+    // `config/blocked` to be a folder, and it is a regular file. Every target is decided before
+    // anything moves, so the file the player already had is still theirs and nothing half-written is
+    // left behind — not even the staging folder, which is made beside the destination and removed by
+    // `Drop` however the publish ends.
+    let bytes = zip_bytes(&[
+        ("config/settings.toml", b"from the pack"),
+        ("config/blocked/extra.toml", b"extra"),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("instance");
+    std::fs::create_dir_all(dest.join("config")).unwrap();
+    std::fs::write(dest.join("config/settings.toml"), b"the player's own").unwrap();
+    std::fs::write(dest.join("config/blocked"), b"a regular file").unwrap();
+
+    let mut archive = SafeArchive::open_bytes(bytes, ArchiveLimits::PACK).unwrap();
+    let staged = archive
+        .stage(&dest, NamePolicy::Refuse, &mut |_| Select::Write, &|| false)
+        .expect("both entries can be written into a staging folder");
+    let error = staged
+        .publish_into()
+        .expect_err("a file where the pack needs a folder");
+    let text = error.to_string();
+
+    // The damage first: whatever the message says, the player's file is still theirs.
+    assert_eq!(
+        std::fs::read(dest.join("config/settings.toml")).unwrap(),
+        b"the player's own",
+        "the settings file the player had is untouched"
+    );
+    assert!(text.contains("config/blocked"), "{text}");
+    assert_eq!(
+        std::fs::read(dest.join("config/blocked")).unwrap(),
+        b"a regular file"
+    );
+    assert!(!dest.join("config/blocked/extra.toml").exists());
+    let left = staging_folders_beside(dir.path());
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn a_publish_into_a_missing_destination_makes_it() {
+    // An instance that has never written a `config/` folder is the ordinary case for a first import:
+    // the destination is made, the staging folder is made beside it, and the files arrive.
+    let bytes = zip_bytes(&[
+        ("config/settings.toml", b"from the pack"),
+        ("config/deep/note.txt", b"nested"),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("instance");
+    assert!(!dest.exists());
+
+    let mut archive = SafeArchive::open_bytes(bytes, ArchiveLimits::PACK).unwrap();
+    let staged = archive
+        .stage(&dest, NamePolicy::Refuse, &mut |_| Select::Write, &|| false)
+        .unwrap();
+    let report = staged.publish_into().expect("nothing is in the way");
+
+    assert_eq!(report.written.len(), 2, "{:?}", report.written);
+    assert_eq!(
+        std::fs::read(dest.join("config/settings.toml")).unwrap(),
+        b"from the pack"
+    );
+    assert_eq!(
+        std::fs::read(dest.join("config/deep/note.txt")).unwrap(),
+        b"nested"
+    );
+    let left = staging_folders_beside(dir.path());
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn a_folder_where_the_file_goes_is_refused_before_anything_moves() {
+    // A folder — or a file somebody holds open — is a target the publish cannot land on. It is found
+    // in the preflight, so the entry that would have been replaced next to it is still the old one.
+    let bytes = zip_bytes(&[
+        ("config/settings.toml", b"from the pack"),
+        ("config/other.toml", b"from the pack too"),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("instance");
+    std::fs::create_dir_all(dest.join("config/other.toml")).unwrap();
+    std::fs::write(dest.join("config/settings.toml"), b"the player's own").unwrap();
+
+    let mut archive = SafeArchive::open_bytes(bytes, ArchiveLimits::PACK).unwrap();
+    let staged = archive
+        .stage(&dest, NamePolicy::Refuse, &mut |_| Select::Write, &|| false)
+        .unwrap();
+    let error = staged.publish_into().expect_err("a folder is in the way");
+    assert!(error.to_string().contains("config/other.toml"), "{error}");
+    assert_eq!(
+        std::fs::read(dest.join("config/settings.toml")).unwrap(),
+        b"the player's own"
+    );
+    let left = staging_folders_beside(dir.path());
+    assert!(left.is_empty(), "{left:?}");
+}
