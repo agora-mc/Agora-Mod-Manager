@@ -3078,3 +3078,86 @@ fn a_failed_base_record_leaves_no_identity_row() {
         "the identity row was rolled back with the base record"
     );
 }
+
+/// An imported backup names a base that was machine-local where the backup was made, so its pin
+/// can wait for a base this machine has never had. The pinning check before a build exists to stop
+/// a build replacing a folder an instance is using; with no folder there, nothing is replaced and
+/// the build provisions the base the pin is waiting for.
+#[test]
+fn a_build_provisions_a_base_a_pin_is_waiting_for() {
+    use agora_core::ctx::CoreContext;
+    use agora_core::game_instance::GameInstanceManifest;
+    use agora_game_api::BaseReference;
+
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("41"));
+    let RuntimeResolution::Identified { runtime, .. } = &install.runtime else {
+        panic!("the fixture install is identified");
+    };
+    let base_id = make_base_id(runtime);
+    assert!(
+        !paths.bases_dir().join(&base_id).exists(),
+        "the fixture starts without the base"
+    );
+
+    // The instance an import registered: its manifest and row name the base, and the base itself
+    // is not here.
+    let ctx = CoreContext::for_testing(tmp.path().join("data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let manifest = GameInstanceManifest::new(
+        runtime.game.clone(),
+        "imported",
+        "Imported",
+        Some(runtime.clone()),
+        BaseReference::Pinned {
+            id: base_id.clone(),
+            runtime: runtime.clone(),
+            mode: BaseMode::Linked,
+        },
+    );
+    let dir = ctx.paths.instance_dir("imported").unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("instance_manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
+         VALUES ('imported', ?1, 'Imported', datetime('now'), NULL)",
+        [runtime.game.as_str()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO game_instance_bases (instance_id, base_json) VALUES ('imported', ?1)",
+        [serde_json::to_string(&manifest.base).unwrap()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let outcome = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .expect("a base a pin is waiting for is provisioned, not refused");
+    assert!(
+        matches!(outcome, BuildOutcome::Built { .. }),
+        "the build made the base: {outcome:?}"
+    );
+    assert!(
+        paths
+            .bases_dir()
+            .join(&base_id)
+            .join(".agora-base.json")
+            .is_file(),
+        "the base the pin names is there afterwards"
+    );
+    assert!(paths.base_manifest_path(&base_id).is_file());
+}

@@ -706,8 +706,20 @@ pub fn build_base_with_frameworks(
         }
         // A record whose folder is gone is a removal that could not delete the record. It is
         // not a base anything may be pinned to, so the build treats it like a damaged record:
-        // usable only once nothing is pinned to it.
-        BaseRecord::Healthy(_) | BaseRecord::Damaged => {
+        // usable only once nothing is pinned to it — when there is a folder to replace. With no
+        // folder there, the pin is waiting for this base and the build fulfils it.
+        BaseRecord::Healthy(manifest) => {
+            if base_folder_present(&manifest.location) {
+                let pinning = instances_pinning_base(paths, &base_id)?;
+                if !pinning.is_empty() {
+                    return Err(BaseError::Other(format!(
+                        "a damaged base with this id exists ({base_id}) and instance(s) {} are pinned to it, so it was not replaced. Remove those instances first.",
+                        pinning.join(", ")
+                    )));
+                }
+            }
+        }
+        BaseRecord::Damaged => {
             let pinning = instances_pinning_base(paths, &base_id)?;
             if !pinning.is_empty() {
                 return Err(BaseError::Other(format!(
@@ -948,22 +960,31 @@ pub fn build_base_with_frameworks(
     // acquire nothing while holding it. The early check above can be stale by now — an instance
     // may have moved into Recently deleted while the source was hashed. Under both locks the
     // answer cannot change, so a base that is still pinned is kept.
-    let _locations = locks
-        .try_instance_locations("build-base")
-        .map_err(|error| {
+    //
+    // With no folder of this base here, nothing is being replaced: a pin that names it is an
+    // instance *waiting* for the base (an imported backup's pin, or one recorded for a base
+    // somebody deleted), and the build fulfils that pin instead of refusing it. The check exists
+    // to stop a build taking a folder an instance is using, not to stop it making one.
+    let final_base_dir = base_root.join(&base_id);
+    let replacing = base_folder_present(&final_base_dir);
+    let _locations = if replacing {
+        Some(locks.try_instance_locations("build-base").map_err(|error| {
             BaseError::Other(format!(
                 "base {base_id} was kept because instance locations are busy: {error}. Retry once the instance move or scan finishes."
             ))
-        })?;
-    let pinning = instances_pinning_base(paths, &base_id)?;
-    if !pinning.is_empty() {
-        return Err(BaseError::Other(format!(
-            "instance(s) {} still use base {base_id} (including Recently deleted), so it was not replaced. Remove or purge those instances first.",
-            pinning.join(", ")
-        )));
+        })?)
+    } else {
+        None
+    };
+    if replacing {
+        let pinning = instances_pinning_base(paths, &base_id)?;
+        if !pinning.is_empty() {
+            return Err(BaseError::Other(format!(
+                "instance(s) {} still use base {base_id} (including Recently deleted), so it was not replaced. Remove or purge those instances first.",
+                pinning.join(", ")
+            )));
+        }
     }
-
-    let final_base_dir = base_root.join(&base_id);
 
     // The marker travels with the staging folder, so the folder this build puts in place can be
     // told apart from one Agora did not build.
