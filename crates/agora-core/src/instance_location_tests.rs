@@ -1026,3 +1026,65 @@ fn an_unreadable_instance_manifest_refuses_removal() {
     assert!(base_dir.join("game.exe").is_file());
     assert!(ctx.paths.base_manifest_path(base_id).is_file());
 }
+
+/// A game definition the generic instance paths accept, for the tests that need one.
+fn test_game_definition() -> agora_game_api::GameDefinition {
+    serde_json::from_value(serde_json::json!({
+        "id": "test-game",
+        "name": "Test Game",
+        "stores": [],
+        "version_sources": [],
+        "deployment": "virtual_file_system",
+        "content_rules": [],
+        "framework_ids": [],
+        "tool_ids": [],
+        "launch": {
+            "executable": { "root": "runtime", "path": "" },
+            "arguments": [],
+            "environment": {},
+            "working_directory": { "root": "runtime", "path": "" }
+        },
+        "user_files": [],
+        "save_paths": [],
+        "linked_archive_patterns": []
+    }))
+    .expect("a definition the core reads")
+}
+
+/// A clone publishes the base its source is pinned to, so it goes through the same base lock and
+/// record re-read a create and an import use: a base left unusable by a removal is refused rather
+/// than copied into a new instance's row.
+#[test]
+fn a_clone_refuses_a_pin_to_a_base_left_unusable() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    pinned_instance(&ctx, "source", base_id);
+    // The folder is gone and the record is left behind: a removal that could not finish.
+    fs::remove_dir_all(&base_dir).unwrap();
+
+    let cloned = game_instance::clone_instance(
+        &ctx,
+        "source",
+        "Copy",
+        &test_game_definition(),
+        game_instance::CloneOptions::default(),
+    );
+    let error = format!(
+        "{}",
+        cloned.expect_err("a clone must not publish a pin to a base that is not usable")
+    );
+    assert!(
+        error.contains(base_id),
+        "the refusal names the base: {error}"
+    );
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let clones: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM instances WHERE instance_id <> 'source'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(clones, 0, "a refused clone publishes no row");
+}

@@ -307,6 +307,21 @@ pub fn clone_instance(
 
     // The identity row and the base record it is keyed from go together: a clone whose pin
     // was not published would look like an instance nothing pins.
+    //
+    // The pin a clone publishes is the base its source was pinned to, so it takes that base's lock
+    // and reads the record under it before the row goes in, exactly as a create and an import do
+    // (MASTER_SPEC §32.8): a removal that decides between reading the source's manifest and
+    // inserting this row would otherwise leave the clone pinned to a base that is gone.
+    let _base_hold = match &source_manifest.base {
+        agora_game_api::BaseReference::Pinned { id, .. } => {
+            Some(super::hold_base_for_imported_pin(ctx, id, "clone")?)
+        }
+        agora_game_api::BaseReference::Unpinned { .. } => None,
+    };
+    #[cfg(debug_assertions)]
+    if let agora_game_api::BaseReference::Pinned { id, .. } = &source_manifest.base {
+        ctx.test_seams.create_pin_pause_point(id);
+    }
     let inserted = crate::db::in_one_transaction(&conn, |conn| -> Result<(), InstanceError> {
         conn.execute(
             "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
