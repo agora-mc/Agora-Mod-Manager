@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use agora_game_api::StrictRelPath;
+use agora_game_api::{ArchiveLimits, SafeArchive, StrictRelPath};
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -327,21 +327,33 @@ fn run_listing(tar: &Path, archive: &Path) -> Result<Vec<u8>, ContentError> {
     Ok(output.stdout)
 }
 
-/// List a RAR's file entries without extracting anything, through the same `tar -tvf` listing and
-/// rules `stage_rar` uses.
+/// List a RAR's file entries without extracting anything.
+///
+/// The archive is opened by the one reader with the `MOD_ARCHIVE` preset, through the backend above,
+/// so a RAR is listed — and held to the same entry count, sizes and ratio — like any other archive
+/// the content store takes (MASTER_SPEC §32.3). What stays here is the store's own bookkeeping: item
+/// ids, the path set and the free-space question.
 pub(super) fn list_rar_entries(
     archive_path: &Path,
 ) -> Result<Vec<ListedArchiveEntry>, ContentError> {
-    let tar = tar_exe_path()?;
-    let listing = run_listing(&tar, archive_path)?;
-    let entries = parse_tar_listing(&listing)?;
-    if entries.is_empty() {
+    let archive =
+        SafeArchive::open_with_rar(archive_path, ArchiveLimits::MOD_ARCHIVE, rar_reader())
+            .map_err(reader_failure)?;
+    let listed: Vec<ListedEntry> = archive
+        .file_entries()
+        .map(|entry| ListedEntry {
+            kind: ListedKind::File,
+            size: entry.size,
+            name: entry.name.clone(),
+        })
+        .collect();
+    if listed.is_empty() {
         return Err(ContentError::CorruptArchive(
             "Windows' tar found no files in this RAR archive: it is damaged, or not a RAR archive"
                 .to_string(),
         ));
     }
-    let plan = plan_from_listing(entries)?;
+    let plan = plan_from_listing(listed)?;
     Ok(plan
         .files
         .into_iter()
@@ -353,6 +365,17 @@ pub(super) fn list_rar_entries(
             size,
         })
         .collect())
+}
+
+/// The reader's refusal, as the store's own error. The backend speaks tar's words, so a password is
+/// recognised there rather than guessed at here.
+fn reader_failure(error: agora_game_api::ArchiveError) -> ContentError {
+    let text = error.to_string();
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("passphrase") || lower.contains("password") || lower.contains("encrypt") {
+        return ContentError::PasswordProtected;
+    }
+    ContentError::CorruptArchive(text)
 }
 
 /// Total size of the files under `dir`, ignoring anything that cannot be read.
@@ -607,6 +630,74 @@ pub(super) fn stage_rar(
     }
 
     Ok((staged_entries, guard, staging_dir))
+}
+
+// ---------------------------------------------------------------------------
+// The reader's first RAR backend
+// ---------------------------------------------------------------------------
+
+/// Windows' `tar.exe`, behind `agora_game_api::RarReader`.
+///
+/// The one archive reader handles zip, 7z, tar and tar.gz in process and takes a RAR through this
+/// seam, because a RAR decoder in process is a dependency the package allowlist does not hold. The
+/// listing and the bytes come from the same `tar.exe` the importer has always used, so a RAR that
+/// lists here extracts there (MASTER_SPEC §32.3).
+///
+/// Names are handed over exactly as tar prints them: the reader decides what a name may do, and a
+/// backend that pre-filtered would be a second path rule.
+pub struct WindowsTarReader;
+
+impl agora_game_api::RarReader for WindowsTarReader {
+    fn list(&self, archive: &Path) -> Result<Vec<agora_game_api::RarEntry>, String> {
+        let tar = tar_exe_path().map_err(|error| error.to_string())?;
+        let listing = run_listing(&tar, archive).map_err(|error| error.to_string())?;
+        let entries = parse_tar_listing(&listing).map_err(|error| error.to_string())?;
+        if entries.is_empty() {
+            // Since bsdtar 3.8.9 a RAR5 signature followed by garbage lists nothing and exits 0.
+            return Err(
+                "Windows' tar found no files in this RAR archive: it is damaged, or not a RAR \
+                 archive"
+                    .to_string(),
+            );
+        }
+        Ok(entries
+            .into_iter()
+            .map(|entry| agora_game_api::RarEntry {
+                name: entry.name,
+                size: entry.size,
+                is_directory: entry.kind == ListedKind::Dir,
+            })
+            .collect())
+    }
+
+    fn read_entry(
+        &self,
+        archive: &Path,
+        name: &str,
+        out: &mut dyn std::io::Write,
+    ) -> Result<u64, String> {
+        let tar = tar_exe_path().map_err(|error| error.to_string())?;
+        // `--` so that a name starting with a dash is a member, never an option; `-O` writes the
+        // member to stdout, so nothing is created on disk to read one entry.
+        let output = tar_command(&tar)
+            .arg("-xOf")
+            .arg(archive)
+            .arg("--")
+            .arg(name)
+            .output()
+            .map_err(|error| format!("could not run Windows' tar: {error}"))?;
+        if !output.status.success() {
+            return Err(tar_failure(&output.stderr).to_string());
+        }
+        out.write_all(&output.stdout)
+            .map_err(|error| format!("could not write `{name}`: {error}"))?;
+        Ok(output.stdout.len() as u64)
+    }
+}
+
+/// The RAR backend this build has: Windows' `tar.exe`, or one that says why it cannot.
+pub fn rar_reader() -> Box<dyn agora_game_api::RarReader> {
+    Box::new(WindowsTarReader)
 }
 
 // ---------------------------------------------------------------------------
@@ -905,8 +996,28 @@ drwxr-xr-x  0 0      0           0 Mar 31  2023 [ELLE] Bifrost/Main\r\n\
         assert!(err.to_string().contains("Windows' built-in tar"));
     }
 
-    // ---- real archives (run with `cargo test -p agora-core -- --ignored rar`) ----
+    #[cfg(windows)]
+    #[test]
+    fn the_reader_takes_a_rar_through_its_first_backend() {
+        // No RAR the repository may commit exists, so this pins the wiring rather than a listing: the
+        // bytes reach Windows' tar through `SafeArchive::open_with_rar`, and tar's refusal is what
+        // comes back — a seam that was not connected would say it has no backend at all.
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("not-really.rar");
+        std::fs::write(&archive, b"Rar!\x1a\x07\x00and then nothing tar can read").unwrap();
+        let err = list_rar_entries(&archive).expect_err("tar cannot read this");
+        let text = err.to_string();
+        assert!(
+            !text.contains("no RAR reader"),
+            "the backend was asked: {text}"
+        );
+        assert!(
+            text.contains("tar") || text.contains("RAR"),
+            "the refusal is tar's own: {text}"
+        );
+    }
 
+    // ---- real archives (run with `cargo test -p agora-core -- --ignored rar`) ----
     fn vortex_rars() -> Vec<PathBuf> {
         let dir = std::env::var_os("AGORA_TEST_RAR_DIR")
             .map(PathBuf::from)
