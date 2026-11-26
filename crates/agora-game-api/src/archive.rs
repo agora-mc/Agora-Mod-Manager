@@ -21,6 +21,7 @@
 //! RAR is read out of process on Windows, by `tar.exe`. Starting a process is not this contract's
 //! job, so this module declares the [`RarReader`] seam and core supplies an implementation.
 
+use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -510,6 +511,21 @@ impl Source {
 trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
 
+/// What a walk should do after the entry it just handed over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Visit {
+    /// Carry on with the next entry.
+    Next,
+    /// The visitor has what it came for: the rest of the archive is not read.
+    Stop,
+}
+
+/// One entry's bytes, as a function the visitor calls with the writer it wants them in.
+///
+/// A reader from the archive would not do: a RAR comes from a process that writes into a writer, not
+/// from something this side can read, and one shape serves both.
+type EntryBytes<'a> = dyn FnMut(&mut dyn Write) -> Result<u64, ArchiveError> + 'a;
+
 /// One archive, listed and held to its preset, ready to be read or extracted.
 pub struct SafeArchive {
     source: Source,
@@ -520,6 +536,10 @@ pub struct SafeArchive {
     rar: Option<Box<dyn RarReader>>,
     /// The paths the last extraction wrote, kept when it then failed, so a caller can clean up.
     written_so_far: Vec<String>,
+    /// How many times the archive's own bytes have been parsed for its entries: one to list it, one
+    /// per pass since. Only the tests read it, so a caller cannot come to depend on it.
+    #[cfg(test)]
+    parses: usize,
 }
 
 impl SafeArchive {
@@ -614,6 +634,8 @@ impl SafeArchive {
             total_declared: 0,
             rar,
             written_so_far: Vec::new(),
+            #[cfg(test)]
+            parses: 0,
         };
         let entries = archive.list()?;
         archive.entries = entries;
@@ -676,164 +698,265 @@ impl SafeArchive {
     }
 
     /// [`SafeArchive::read`] into a caller's buffer. Returns the bytes read.
+    ///
+    /// The archive is walked in its own order and the walk stops at the entry: one parse, whatever
+    /// the archive's length (MASTER_SPEC §32.3, Rule B).
     pub fn read_into(&mut self, name: &str, out: &mut dyn Write) -> Result<u64, ArchiveError> {
-        let declared = self
-            .entries
-            .iter()
-            .find(|entry| entry.name == name)
-            .map(|entry| entry.size);
-        let Some(declared) = declared else {
+        let path = self.label();
+        let mut written = 0u64;
+        let mut found = false;
+        {
+            let out = &mut *out;
+            self.walk(&|| false, &mut |entry, bytes| {
+                if found || entry.kind != EntryKind::File || entry.name != name {
+                    return Ok(Visit::Next);
+                }
+                written = bytes(out)?;
+                found = true;
+                Ok(Visit::Stop)
+            })?;
+        }
+        if !found {
             return Err(ArchiveError::Corrupt {
-                path: self.label(),
+                path,
                 format: self.format,
                 reason: format!("no entry is named '{name}'"),
             });
-        };
-        self.copy_entry(name, declared, out)
+        }
+        Ok(written)
     }
 
     /// Every file entry's bytes, in archive order, into one buffer each.
+    ///
+    /// One walk of the archive, not one per file: a `tar.gz` is inflated once rather than once per
+    /// entry (MASTER_SPEC §32.3, Rule B).
     pub fn read_all(&mut self) -> Result<Vec<(String, Vec<u8>)>, ArchiveError> {
-        let names: Vec<(String, u64)> = self
-            .file_entries()
-            .map(|entry| (entry.name.clone(), entry.size))
-            .collect();
-        let mut files = Vec::with_capacity(names.len());
-        for (name, declared) in names {
-            let mut bytes = Vec::with_capacity(declared as usize);
-            self.copy_entry(&name, declared, &mut bytes)?;
-            files.push((name, bytes));
-        }
+        let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+        self.walk(&|| false, &mut |entry, bytes| {
+            if entry.kind != EntryKind::File {
+                return Ok(Visit::Next);
+            }
+            let name = entry.name.clone();
+            let mut buffer = Vec::with_capacity(entry.size as usize);
+            bytes(&mut buffer)?;
+            files.push((name, buffer));
+            Ok(Visit::Next)
+        })?;
         Ok(files)
     }
 
-    fn copy_entry(
-        &mut self,
-        name: &str,
-        declared: u64,
-        out: &mut dyn Write,
-    ) -> Result<u64, ArchiveError> {
-        let path = self.label();
-        let context = CopyContext {
-            archive: path,
+    /// The rules one entry's bytes are held to, in the one shape every format reports through.
+    fn context_for<'a>(
+        &self,
+        entry: &ArchiveEntry,
+        cancelled: &'a dyn Fn() -> bool,
+    ) -> CopyContext<'a> {
+        CopyContext {
+            archive: self.label(),
             format: self.format,
             preset: self.limits.preset,
             limit: self.limits.max_entry_bytes,
-            entry: name.to_string(),
-            declared,
+            entry: entry.name.clone(),
+            declared: entry.size,
             exact: self.format != ArchiveFormat::Rar,
-        };
+            cancelled,
+        }
+    }
+
+    /// Walk the archive **once**, in the order it stores its entries, handing each file entry to
+    /// `visit` as a function that copies its bytes wherever the visitor wants them.
+    ///
+    /// One pass is the point (MASTER_SPEC §32.3, Rule B). A `tar.gz` is inflated once for the whole
+    /// archive instead of once per entry, a fifty-thousand-entry zip is parsed once instead of fifty
+    /// thousand times, and a **solid** 7z decodes its members in the order they were packed: its
+    /// members share one compressed block, so an entry the visitor does not want is drained rather
+    /// than stepped over — the library's own words are that "you cannot simply skip the previous
+    /// data and only decompress the data in the back".
+    ///
+    /// `cancelled` is asked before every entry **and** inside every copy, so a person who stops a
+    /// long extraction does not wait for the entry under way to finish.
+    fn walk(
+        &mut self,
+        cancelled: &dyn Fn() -> bool,
+        visit: &mut dyn FnMut(&ArchiveEntry, &mut EntryBytes<'_>) -> Result<Visit, ArchiveError>,
+    ) -> Result<(), ArchiveError> {
+        #[cfg(test)]
+        {
+            self.parses += 1;
+        }
+        let path = self.label();
+        let entries = self.entries.clone();
         match self.format {
             ArchiveFormat::Zip => {
-                let index = self
-                    .entries
-                    .iter()
-                    .position(|entry| entry.name == name)
-                    .ok_or_else(|| ArchiveError::Corrupt {
-                        path: self.label(),
-                        format: ArchiveFormat::Zip,
-                        reason: format!("no entry is named '{name}'"),
-                    })?;
                 let mut source = self.open_reader()?;
                 let mut zip = zip::ZipArchive::new(source.as_mut()).map_err(|error| {
                     ArchiveError::Corrupt {
-                        path: context.archive.clone(),
+                        path: path.clone(),
                         format: ArchiveFormat::Zip,
                         reason: format!("{error}"),
                     }
                 })?;
-                let mut entry = zip.by_index(index).map_err(|error| ArchiveError::Corrupt {
-                    path: context.archive.clone(),
-                    format: ArchiveFormat::Zip,
+                for (index, entry) in entries.iter().enumerate() {
+                    if entry.kind != EntryKind::File {
+                        continue;
+                    }
+                    if cancelled() {
+                        return Err(ArchiveError::Cancelled { path });
+                    }
+                    let mut file = zip.by_index(index).map_err(|error| ArchiveError::Corrupt {
+                        path: path.clone(),
+                        format: ArchiveFormat::Zip,
+                        reason: format!("entry '{index}': {error}"),
+                    })?;
+                    let context = self.context_for(entry, cancelled);
+                    let mut copy = |out: &mut dyn Write| copy_bounded(&mut file, out, &context);
+                    if visit(entry, &mut copy)? == Visit::Stop {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            }
+            ArchiveFormat::Tar | ArchiveFormat::TarGz => {
+                let source = self.open_reader()?;
+                let reader: Box<dyn Read> = if self.format == ArchiveFormat::Tar {
+                    source
+                } else {
+                    Box::new(flate2::read::GzDecoder::new(source))
+                };
+                let mut archive = tar::Archive::new(reader);
+                let listed = archive.entries().map_err(|error| ArchiveError::Corrupt {
+                    path: path.clone(),
+                    format: self.format,
                     reason: format!("{error}"),
                 })?;
-                copy_bounded(&mut entry, out, &context)
+                for entry in listed {
+                    let mut entry = entry.map_err(|error| ArchiveError::Corrupt {
+                        path: path.clone(),
+                        format: self.format,
+                        reason: format!("{error}"),
+                    })?;
+                    let name = entry_name_of(&entry, self.format, &path)?;
+                    // The listing was taken from these same bytes, so an entry it did not show
+                    // means the two disagree: refuse rather than read a name nothing checked.
+                    let Some(known) = entries.iter().find(|known| known.name == name) else {
+                        return Err(ArchiveError::Corrupt {
+                            path: path.clone(),
+                            format: self.format,
+                            reason: format!("an entry named '{name}' was not in the listing"),
+                        });
+                    };
+                    if known.kind != EntryKind::File {
+                        continue;
+                    }
+                    if cancelled() {
+                        return Err(ArchiveError::Cancelled { path: path.clone() });
+                    }
+                    let context = self.context_for(known, cancelled);
+                    let mut copy = |out: &mut dyn Write| copy_bounded(&mut entry, out, &context);
+                    if visit(known, &mut copy)? == Visit::Stop {
+                        return Ok(());
+                    }
+                }
+                Ok(())
             }
-            ArchiveFormat::Tar => {
-                let source = self.open_reader()?;
-                copy_from_tar(source, name, out, &context)
+            ArchiveFormat::SevenZ => {
+                let mut source = self.open_reader()?;
+                let mut reader =
+                    sevenz_rust2::ArchiveReader::new(&mut source, sevenz_rust2::Password::empty())
+                        .map_err(|error| sevenz_error(&path, error))?;
+                let mut failure: Option<ArchiveError> = None;
+                let result = reader.for_each_entries(|entry, entry_reader| {
+                    let Some(known) = entries.iter().find(|known| known.name == entry.name) else {
+                        failure = Some(ArchiveError::Corrupt {
+                            path: path.clone(),
+                            format: ArchiveFormat::SevenZ,
+                            reason: format!(
+                                "an entry named '{}' was not in the listing",
+                                entry.name
+                            ),
+                        });
+                        return Err(sevenz_rust2::Error::Other("stopped".into()));
+                    };
+                    if known.kind != EntryKind::File {
+                        return Ok(true);
+                    }
+                    if cancelled() {
+                        failure = Some(ArchiveError::Cancelled { path: path.clone() });
+                        return Err(sevenz_rust2::Error::Other("stopped".into()));
+                    }
+                    let context = self.context_for(known, cancelled);
+                    let mut copy =
+                        |out: &mut dyn Write| copy_bounded(&mut *entry_reader, out, &context);
+                    let next = match visit(known, &mut copy) {
+                        Ok(next) => next,
+                        Err(error) => {
+                            failure = Some(error);
+                            return Err(sevenz_rust2::Error::Other("stopped".into()));
+                        }
+                    };
+                    if next == Visit::Stop {
+                        return Ok(false);
+                    }
+                    // Members of one block share the decoder: this one's bytes are read to the end
+                    // whether or not they were wanted, or the next member decodes from a position
+                    // that is not its own.
+                    if let Err(error) = std::io::copy(&mut *entry_reader, &mut std::io::sink()) {
+                        failure = Some(ArchiveError::Corrupt {
+                            path: path.clone(),
+                            format: ArchiveFormat::SevenZ,
+                            reason: format!("entry '{}': {error}", entry.name),
+                        });
+                        return Err(sevenz_rust2::Error::Other("stopped".into()));
+                    }
+                    Ok(true)
+                });
+                if let Some(error) = failure {
+                    return Err(error);
+                }
+                result.map_err(|error| sevenz_error(&path, error))
             }
-            ArchiveFormat::TarGz => {
-                let source = self.open_reader()?;
-                let decoder = flate2::read::GzDecoder::new(source);
-                copy_from_tar(Box::new(decoder) as Box<dyn Read>, name, out, &context)
-            }
-            ArchiveFormat::SevenZ => self.copy_from_sevenz(name, out, &context, declared),
             ArchiveFormat::Rar => {
                 let Some(rar) = self.rar.as_deref() else {
-                    return Err(ArchiveError::NoRarReader {
-                        path: context.archive.clone(),
-                    });
+                    return Err(ArchiveError::NoRarReader { path });
                 };
                 let Source::Path(archive) = &self.source else {
-                    return Err(ArchiveError::NoRarReader { path: self.label() });
+                    return Err(ArchiveError::NoRarReader { path });
                 };
-                let mut sink = Sink::new(out, &context);
-                let written = rar.read_entry(archive, name, &mut sink).map_err(|reason| {
-                    ArchiveError::Rar {
-                        path: context.archive.clone(),
-                        reason,
+                let archive = archive.clone();
+                for entry in &entries {
+                    if entry.kind != EntryKind::File {
+                        continue;
                     }
-                })?;
-                sink.finish()?;
-                Ok(written)
-            }
-        }
-    }
-
-    fn copy_from_sevenz(
-        &mut self,
-        name: &str,
-        out: &mut dyn Write,
-        context: &CopyContext,
-        declared: u64,
-    ) -> Result<u64, ArchiveError> {
-        let mut source = self.open_reader()?;
-        let mut reader =
-            sevenz_rust2::ArchiveReader::new(&mut source, sevenz_rust2::Password::empty())
-                .map_err(|error| sevenz_error(&context.archive, error))?;
-        let mut failure: Option<ArchiveError> = None;
-        let mut written = 0u64;
-        let wanted = name.to_string();
-        let result = reader.for_each_entries(|entry, entry_reader| {
-            if entry.name != wanted || entry.is_directory || entry.is_anti_item {
-                return Ok(true);
-            }
-            let local = CopyContext {
-                declared,
-                ..context.clone()
-            };
-            match copy_bounded(entry_reader, out, &local) {
-                Ok(bytes) => {
-                    written = bytes;
-                    Ok(false)
+                    if cancelled() {
+                        return Err(ArchiveError::Cancelled { path: path.clone() });
+                    }
+                    let context = self.context_for(entry, cancelled);
+                    let mut copy = |out: &mut dyn Write| {
+                        let mut sink = Sink::new(out, &context);
+                        let written =
+                            rar.read_entry(&archive, &entry.name, &mut sink)
+                                .map_err(|reason| ArchiveError::Rar {
+                                    path: path.clone(),
+                                    reason,
+                                })?;
+                        sink.finish()?;
+                        Ok(written)
+                    };
+                    if visit(entry, &mut copy)? == Visit::Stop {
+                        return Ok(());
+                    }
                 }
-                Err(error) => {
-                    failure = Some(error);
-                    Err(sevenz_rust2::Error::Other("stopped".into()))
-                }
+                Ok(())
             }
-        });
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        match result {
-            Ok(()) => {
-                if written == 0 && declared > 0 {
-                    return Err(ArchiveError::Corrupt {
-                        path: context.archive.clone(),
-                        format: ArchiveFormat::SevenZ,
-                        reason: format!("entry '{name}' could not be read"),
-                    });
-                }
-                Ok(written)
-            }
-            Err(error) => Err(sevenz_error(&context.archive, error)),
         }
     }
 
     /// List the archive's entries, holding every one of them to the preset.
     fn list(&mut self) -> Result<Vec<ArchiveEntry>, ArchiveError> {
+        #[cfg(test)]
+        {
+            self.parses += 1;
+        }
         let entries = match self.format {
             ArchiveFormat::Zip => self.list_zip()?,
             ArchiveFormat::SevenZ => self.list_sevenz()?,
@@ -1227,55 +1350,102 @@ impl SafeArchive {
 
         let mut report = ExtractReport::default();
         let mut remaining_total = self.limits.max_total_bytes;
-        for (strict, name, declared) in plan {
-            if cancelled() {
-                return Err(ArchiveError::Cancelled { path: path.clone() });
-            }
-            let target = join_under(dest, &strict).map_err(|error| match error {
-                PathError::UnsafePath { reason, .. } => ArchiveError::UnsafeNames {
-                    path: path.clone(),
-                    entries: vec![SkippedEntry {
-                        name: name.clone(),
-                        reason,
-                    }],
-                },
-                other => ArchiveError::Destination {
-                    path: dest.display().to_string(),
-                    reason: other.to_string(),
-                },
-            })?;
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| ArchiveError::Write {
-                    path: parent.display().to_string(),
+        let preset_total = self.limits.max_total_bytes;
+        let preset = self.limits.preset;
+        let format = self.format;
+        let limit = self.limits.max_entry_bytes;
+        let exact = self.format != ArchiveFormat::Rar;
+        // The plan is in the archive's own order, so one walk of the archive meets every entry it
+        // names exactly once. This table is how the walk finds its plan without searching it per
+        // entry, and `delivered` is what makes an entry the archive never handed over a refusal
+        // rather than a file that quietly is not there.
+        let by_name: HashMap<&str, usize> = plan
+            .iter()
+            .enumerate()
+            .map(|(index, (_, name, _))| (name.as_str(), index))
+            .collect();
+        let modes: Vec<Option<u32>> = plan
+            .iter()
+            .map(|(_, name, _)| self.entry_mode(name))
+            .collect();
+        let mut delivered = vec![false; plan.len()];
+        let mut written_now: Vec<String> = Vec::new();
+
+        let outcome = {
+            let plan = &plan;
+            let mut write_entry = |entry: &ArchiveEntry,
+                                   bytes: &mut EntryBytes<'_>|
+             -> Result<Visit, ArchiveError> {
+                let Some(&index) = by_name.get(entry.name.as_str()) else {
+                    return Ok(Visit::Next);
+                };
+                if delivered[index] {
+                    return Ok(Visit::Next);
+                }
+                let (strict, name, declared) = &plan[index];
+                let target = join_under(dest, strict).map_err(|error| match error {
+                    PathError::UnsafePath { reason, .. } => ArchiveError::UnsafeNames {
+                        path: path.clone(),
+                        entries: vec![SkippedEntry {
+                            name: name.clone(),
+                            reason,
+                        }],
+                    },
+                    other => ArchiveError::Destination {
+                        path: dest.display().to_string(),
+                        reason: other.to_string(),
+                    },
+                })?;
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| ArchiveError::Write {
+                        path: parent.display().to_string(),
+                        error: error.to_string(),
+                    })?;
+                }
+                let file = std::fs::File::create(&target).map_err(|error| ArchiveError::Write {
+                    path: target.display().to_string(),
                     error: error.to_string(),
                 })?;
-            }
-            let file = std::fs::File::create(&target).map_err(|error| ArchiveError::Write {
-                path: target.display().to_string(),
-                error: error.to_string(),
-            })?;
-            let mut out = CountingFile {
-                file,
-                written: 0,
-                remaining_total,
-                context: CopyContext {
-                    archive: path.clone(),
-                    format: self.format,
-                    preset: self.limits.preset,
-                    limit: self.limits.max_entry_bytes,
-                    entry: name.clone(),
-                    declared,
-                    exact: self.format != ArchiveFormat::Rar,
-                },
-                preset_total: self.limits.max_total_bytes,
-                preset: self.limits.preset,
+                let mut out = CountingFile {
+                    file,
+                    written: 0,
+                    remaining_total,
+                    context: CopyContext {
+                        archive: path.clone(),
+                        format,
+                        preset,
+                        limit,
+                        entry: name.clone(),
+                        declared: *declared,
+                        exact,
+                        cancelled,
+                    },
+                    preset_total,
+                    preset,
+                };
+                let bytes_written = bytes(&mut out)?;
+                remaining_total = remaining_total.saturating_sub(bytes_written);
+                delivered[index] = true;
+                keep_executable_bit(&target, modes[index]);
+                written_now.push(strict.as_str().to_string());
+                report.written.push(strict.as_str().to_string());
+                report.bytes_written += bytes_written;
+                Ok(Visit::Next)
             };
-            let written = self.copy_entry(&name, declared, &mut out)?;
-            remaining_total = remaining_total.saturating_sub(written);
-            keep_executable_bit(&target, self.entry_mode(&name));
-            self.written_so_far.push(strict.as_str().to_string());
-            report.written.push(strict.as_str().to_string());
-            report.bytes_written += written;
+            self.walk(cancelled, &mut write_entry)
+        };
+        self.written_so_far = std::mem::take(&mut written_now);
+        outcome?;
+
+        if let Some(index) = delivered.iter().position(|done| !done) {
+            return Err(ArchiveError::Corrupt {
+                path,
+                format: self.format,
+                reason: format!(
+                    "the listing showed '{}' and the archive did not deliver it",
+                    plan[index].1
+                ),
+            });
         }
         report.skipped = skipped;
         Ok(report)
@@ -1285,6 +1455,12 @@ impl SafeArchive {
     /// leave nothing behind after a refusal deletes these.
     pub fn written_so_far(&self) -> &[String] {
         &self.written_so_far
+    }
+
+    /// How many times the archive's bytes have been parsed for its entries (a test's view, §32.3).
+    #[cfg(test)]
+    pub(crate) fn parses(&self) -> usize {
+        self.parses
     }
 
     /// Extract into a folder of its own beside `destination`, and publish it only if every entry was
@@ -1436,8 +1612,8 @@ struct PlannedExtraction {
 /// Where one entry's bytes are going, and what they are allowed to be. One shape for every format,
 /// so the "declared size lied" and "passed the preset" messages read the same whichever decoder
 /// delivered the bytes.
-#[derive(Debug, Clone)]
-struct CopyContext {
+#[derive(Clone)]
+struct CopyContext<'a> {
     archive: String,
     format: ArchiveFormat,
     preset: &'static str,
@@ -1447,6 +1623,9 @@ struct CopyContext {
     /// Whether the declared size is the archive's own binary header, which the bytes must match. A
     /// RAR listing is a text report from a process, so its numbers bound the read rather than pin it.
     exact: bool,
+    /// Asked between buffers as well as between entries: a single entry can be gigabytes long, and a
+    /// person who asked to stop should not wait for it to finish.
+    cancelled: &'a dyn Fn() -> bool,
 }
 
 /// Keep the one permission bit a downloaded archive is allowed to set.
@@ -1549,14 +1728,22 @@ fn read_up_to<R: Read>(
 
 /// Copy one entry's bytes into `out`, refusing the moment they disagree with its own declaration: a
 /// header that lies about its size is caught at the first byte it did not declare.
+///
+/// The caller's "stop" is asked between buffers here too, so a person stopping a download-sized
+/// entry is answered within a buffer rather than when the entry ends.
 fn copy_bounded(
     reader: &mut dyn Read,
     out: &mut dyn Write,
-    context: &CopyContext,
+    context: &CopyContext<'_>,
 ) -> Result<u64, ArchiveError> {
     let mut buffer = vec![0u8; 64 * 1024];
     let mut written = 0u64;
     loop {
+        if (context.cancelled)() {
+            return Err(ArchiveError::Cancelled {
+                path: context.archive.clone(),
+            });
+        }
         let read = match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => n,
@@ -1657,37 +1844,6 @@ fn list_tar(
         });
     }
     Ok(entries)
-}
-
-fn copy_from_tar(
-    reader: Box<dyn Read>,
-    name: &str,
-    out: &mut dyn Write,
-    context: &CopyContext,
-) -> Result<u64, ArchiveError> {
-    let mut archive = tar::Archive::new(reader);
-    let entries = archive.entries().map_err(|error| ArchiveError::Corrupt {
-        path: context.archive.clone(),
-        format: context.format,
-        reason: format!("{error}"),
-    })?;
-    for entry in entries {
-        let mut entry = entry.map_err(|error| ArchiveError::Corrupt {
-            path: context.archive.clone(),
-            format: context.format,
-            reason: format!("{error}"),
-        })?;
-        let entry_name = entry_name_of(&entry, context.format, &context.archive)?;
-        if entry_name != name {
-            continue;
-        }
-        return copy_bounded(&mut entry, out, context);
-    }
-    Err(ArchiveError::Corrupt {
-        path: context.archive.clone(),
-        format: context.format,
-        reason: format!("no entry is named '{name}'"),
-    })
 }
 
 /// The entry names a zip declares more than once, and nothing else.
@@ -1830,12 +1986,12 @@ fn sevenz_error(path: &str, error: sevenz_rust2::Error) -> ArchiveError {
 /// A writer that holds a `RarReader`'s output to the same declaration every other format is held to.
 struct Sink<'a> {
     out: &'a mut dyn Write,
-    context: &'a CopyContext,
+    context: &'a CopyContext<'a>,
     written: u64,
 }
 
 impl<'a> Sink<'a> {
-    fn new(out: &'a mut dyn Write, context: &'a CopyContext) -> Self {
+    fn new(out: &'a mut dyn Write, context: &'a CopyContext<'a>) -> Self {
         Self {
             out,
             context,
@@ -1881,7 +2037,7 @@ struct CountingFile<'a> {
     file: std::fs::File,
     written: u64,
     remaining_total: u64,
-    context: CopyContext,
+    context: CopyContext<'a>,
     preset_total: u64,
     preset: &'a str,
 }

@@ -5618,6 +5618,18 @@ three path comparators.
     skipped with a recorded reason and the outer metadata still comes back.
   - **Every entry is copied to the end of its stream**, so a `Stored` entry that declares more bytes
     than it holds meets the decoder's CRC check instead of a trusting count.
+  - **An extraction never writes into a live folder.** A destination that already holds the player's
+    files (an instance's `config/`, a pack's overrides) is written into a folder the reader makes
+    beside it, and the caller publishes that folder only after the whole extraction succeeded; on
+    any failure it is removed and the destination is untouched. A destination the caller made for
+    the job (a runtime's, a world's, a plugin package's) needs no staging on top.
+  - **One pass, in archive order.** Extraction and multi-entry reads walk the archive once: one
+    `ZipArchive`, one tar or tar.gz stream, the 7z decoder's sequential callback. A fresh parse per
+    file made a fifty-thousand-entry world quadratic, and a tar.gz's prefix was inflated once per
+    entry. A solid 7z's members share one compressed block, so an entry nobody wants is still
+    drained to its end — stepped over, the member after it decodes from a position that is not its
+    own. Cancellation is asked before every entry and between buffers, so stopping a gigabyte entry
+    is answered inside it rather than when it ends.
   - Presets today: pack, mod archive, backup, plugin package, jar metadata, runtime, and
     `WORLD_ARCHIVE` (200 000 entries, 16 GiB, no tighter per-entry limit) for a world a player
     exported or downloaded.

@@ -113,6 +113,28 @@ fn tar_gz_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
+/// A **solid** 7z: every entry shares one compressed block, which is the shape a reader that walks
+/// past the entries in front of the one it wants without draining them decodes wrongly. The library
+/// says as much itself: "when decoding a solid archive, the data to be decompressed depends on the
+/// data in front of it, you cannot simply skip the previous data and only decompress the data in the
+/// back".
+fn solid_sevenz_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("solid.7z");
+    let mut writer = sevenz_rust2::ArchiveWriter::create(&path).unwrap();
+    let listed: Vec<sevenz_rust2::ArchiveEntry> = entries
+        .iter()
+        .map(|(name, _)| sevenz_rust2::ArchiveEntry::new_file(name))
+        .collect();
+    let readers: Vec<sevenz_rust2::SourceReader<std::io::Cursor<&[u8]>>> = entries
+        .iter()
+        .map(|(_, bytes)| sevenz_rust2::SourceReader::new(std::io::Cursor::new(*bytes)))
+        .collect();
+    writer.push_archive_entries(listed, readers).unwrap();
+    writer.finish().unwrap();
+    std::fs::read(&path).unwrap()
+}
+
 fn sevenz_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fixture.7z");
@@ -699,6 +721,25 @@ fn a_sevenz_is_listed_read_and_extracted() {
 }
 
 #[test]
+fn a_solid_sevenz_gives_every_member_its_own_bytes() {
+    // Two members of one block, of the same length so a mix-up cannot show up as a length: the
+    // second member's bytes are only right if the first member's were decoded on the way past.
+    let entries: [(&str, &[u8]); 2] = [("a.txt", b"AAAA"), ("b.txt", b"BBBB")];
+    let mut archive = SafeArchive::open_bytes(solid_sevenz_bytes(&entries), ArchiveLimits::PACK)
+        .expect("a solid 7z lists like any other");
+    assert_eq!(archive.read("a.txt").unwrap(), b"AAAA");
+    assert_eq!(archive.read("b.txt").unwrap(), b"BBBB");
+
+    let (dir, dest) = extract_dir();
+    let mut archive =
+        SafeArchive::open_bytes(solid_sevenz_bytes(&entries), ArchiveLimits::PACK).unwrap();
+    archive.extract(&dest, NamePolicy::Refuse).unwrap();
+    assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"AAAA");
+    assert_eq!(std::fs::read(dest.join("b.txt")).unwrap(), b"BBBB");
+    drop(dir);
+}
+
+#[test]
 fn a_plain_tar_is_listed_by_its_magic_not_its_extension() {
     let bytes = tar_bytes(&[("a.txt", b"hello")]);
     let archive = SafeArchive::open_bytes(bytes, ArchiveLimits::PACK).unwrap();
@@ -967,7 +1008,10 @@ fn a_cancelled_extraction_stops_between_entries() {
     let error = archive
         .extract_checked(&dest, NamePolicy::Refuse, &mut |_| Select::Write, &|| {
             asked.set(asked.get() + 1);
-            asked.get() > 2
+            // Asked once before each entry and twice inside each copy — a three-byte entry is one
+            // read of its bytes and one of the end — so the seventh ask is the start of the third
+            // entry, and the answer arrives after two complete files and no partial third.
+            asked.get() > 6
         })
         .unwrap_err();
     assert!(matches!(error, ArchiveError::Cancelled { .. }), "{error:?}");
@@ -976,6 +1020,49 @@ fn a_cancelled_extraction_stops_between_entries() {
         2,
         "the two entries before the stop are written and reported, so the caller can throw its \
          staging directory away"
+    );
+    drop(dir);
+}
+
+#[test]
+fn a_cancelled_extraction_stops_inside_one_large_entry() {
+    // One 4 MiB entry is sixty-four buffers long, so asking between entries is not enough: the
+    // answer only arrives once the whole entry has been written.
+    let (dir, dest) = extract_dir();
+    let big = vec![7u8; 4 * 1024 * 1024];
+    let mut archive =
+        SafeArchive::open_bytes(tar_bytes(&[("big.bin", &big)]), ArchiveLimits::PACK).unwrap();
+    let asked = std::cell::Cell::new(0u32);
+    let error = archive
+        .extract_checked(&dest, NamePolicy::Refuse, &mut |_| Select::Write, &|| {
+            asked.set(asked.get() + 1);
+            asked.get() > 2
+        })
+        .unwrap_err();
+    assert!(matches!(error, ArchiveError::Cancelled { .. }), "{error:?}");
+    let written = std::fs::metadata(dest.join("big.bin")).unwrap().len();
+    assert!(
+        written < big.len() as u64,
+        "the copy stopped partway through, at {written} bytes"
+    );
+    drop(dir);
+}
+
+#[test]
+fn an_extraction_reads_the_archive_once() {
+    // A world of 50 000 entries took a fresh parse of the whole archive per file. The count here is
+    // the archive's own parses, not the clock: opening lists once, and the extraction is one more.
+    let names: Vec<String> = (0..200).map(|index| format!("data/{index}.txt")).collect();
+    let empty: &[u8] = b"x";
+    let entries: Vec<(&str, &[u8])> = names.iter().map(|name| (name.as_str(), empty)).collect();
+    let mut archive = SafeArchive::open_bytes(zip_bytes(&entries), ArchiveLimits::PACK).unwrap();
+    let (dir, dest) = extract_dir();
+    let report = archive.extract(&dest, NamePolicy::Refuse).unwrap();
+    assert_eq!(report.written.len(), 200);
+    assert_eq!(
+        archive.parses(),
+        2,
+        "one parse to list, one to extract the 200 entries"
     );
     drop(dir);
 }
