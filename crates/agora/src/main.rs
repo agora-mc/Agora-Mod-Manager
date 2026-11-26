@@ -7620,7 +7620,9 @@ async fn run_command(
                                 row.kind.clone(),
                                 row.reason.clone(),
                                 format_size(row.size),
-                                if row.already_in_library {
+                                if row.kind == "refused" {
+                                    "refused".to_string()
+                                } else if row.already_in_library {
                                     "already in your library".to_string()
                                 } else {
                                     "would be offered".to_string()

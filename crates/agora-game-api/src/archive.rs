@@ -12,8 +12,8 @@
 //!   fine; only [`SafeArchive::extract`] applies the strict rule, because only then does a name
 //!   become a file on a disk.
 //! * **Limits are named presets.** A caller picks the job (`PACK`, `BACKUP`, `PLUGIN_PACKAGE`,
-//!   `JAR_METADATA`, `RUNTIME`, `MOD_ARCHIVE`) instead of inventing numbers, so two call sites that
-//!   do the same job cannot drift apart.
+//!   `JAR_METADATA`, `RUNTIME`, `GAME_MOD`, `TECHNIC_PACK`) instead of inventing numbers, so two
+//!   call sites that do the same job cannot drift apart.
 //! * **Fail closed.** A corrupt, truncated, password-protected or unreadable archive is an error
 //!   with the reason. An entry whose declared size lies is refused at the byte where the lie shows.
 //!   There is no "empty archive" answer to a question that could not be answered.
@@ -39,7 +39,8 @@ use crate::path::{join_under, validate_path_set, PathError, PathSetError, RelPat
 /// | preset | entries | per entry | total | ratio |
 /// |---|---|---|---|---|
 /// | `PACK` | 5 000 (`MAX_MRPACK_OVERRIDE_FILES`, `MAX_TECHNIC_ZIP_FILES`) | 500 MiB (`MAX_MRPACK_FILE_BYTES`) | 2 GiB (`MAX_MRPACK_OVERRIDE_BYTES`) | 200 (new) |
-/// | `MOD_ARCHIVE` | 5 000 (technic zip) | 500 MiB (`MAX_TECHNIC_ENTRY_BYTES`) | 2 GiB (`MAX_TECHNIC_ZIP_BYTES`) | 200 (new) |
+/// | `TECHNIC_PACK` | 5 000 (`MAX_TECHNIC_ZIP_FILES`) | 500 MiB (`MAX_TECHNIC_ENTRY_BYTES`) | 2 GiB (`MAX_TECHNIC_ZIP_BYTES`) | 200 (new) |
+/// | `GAME_MOD` | none | none | none | none (as today) |
 /// | `BACKUP` | 10 000 (`MAX_BACKUP_ENTRIES`) | 1 GiB (`MAX_BACKUP_SINGLE_FILE_SIZE`) | 64 GiB (`MAX_BACKUP_TOTAL_SIZE`) | none (Agora wrote it) |
 /// | `PLUGIN_PACKAGE` | 2 000 (`install::MAX_ENTRIES`) | 16 MiB (`MAX_ENTRY_BYTES`) | 64 MiB (`MAX_TOTAL_BYTES`) | 200 (`MAX_EXPANSION_RATIO`) |
 /// | `JAR_METADATA` | not bounded (none today) | 32 MiB (`jar_metadata::MAX_ENTRY_BYTES`), on each read | not bounded | none |
@@ -99,15 +100,35 @@ impl ArchiveLimits {
         counts_folders: true,
     };
 
-    /// A mod archive added to the content store, or a technic-style zip.
-    pub const MOD_ARCHIVE: Self = Self {
-        preset: "mod archive",
+    /// A technic-style modpack zip. Its numbers are `import.rs`'s own (`MAX_TECHNIC_*`); it is the
+    /// preset for that one job, not for every mod archive a player has.
+    pub const TECHNIC_PACK: Self = Self {
+        preset: "technic pack",
         max_entries: 5_000,
         max_entry_bytes: 500 * MIB,
         max_total_bytes: 2 * GIB,
         max_ratio: 200,
         bounds_the_listing: true,
         counts_folders: true,
+    };
+
+    /// A mod archive added to the content store: a zip, 7z or rar the player picked from a curated
+    /// source.
+    ///
+    /// Carried over exactly from `content_store`, which held neither a per-entry nor a total size
+    /// cap and no entry cap for these, and meant it: a Skyrim texture or BSA/BA2 mod is routinely
+    /// past the 500 MiB per entry and 2 GiB total a Technic pack is held to, and a store that
+    /// refuses the mod the player downloaded is a store that does not work. What the store did
+    /// check — each entry's path, a zip symlink, case-insensitive collisions — is checked by the
+    /// reader's own rules, unchanged.
+    pub const GAME_MOD: Self = Self {
+        preset: "game mod",
+        max_entries: 0,
+        max_entry_bytes: u64::MAX,
+        max_total_bytes: 0,
+        max_ratio: 0,
+        bounds_the_listing: false,
+        counts_folders: false,
     };
 
     /// An instance backup or a snapshot: written by Agora, so its sizes are its own claim. The

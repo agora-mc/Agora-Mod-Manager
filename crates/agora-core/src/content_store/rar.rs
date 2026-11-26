@@ -329,16 +329,17 @@ fn run_listing(tar: &Path, archive: &Path) -> Result<Vec<u8>, ContentError> {
 
 /// List a RAR's file entries without extracting anything.
 ///
-/// The archive is opened by the one reader with the `MOD_ARCHIVE` preset, through the backend above,
-/// so a RAR is listed — and held to the same entry count, sizes and ratio — like any other archive
-/// the content store takes (MASTER_SPEC §32.3). What stays here is the store's own bookkeeping: item
-/// ids, the path set and the free-space question.
+/// The archive is opened by the one reader with the `GAME_MOD` preset, through the backend above, so
+/// a RAR is listed — and held to the same name, duplicate and path rules — like the zip and 7z mods
+/// beside it (MASTER_SPEC §32.3). The preset carries the numbers the store enforced before this
+/// reader existed, which were none for sizes: a Skyrim texture or BSA mod is past the limits a
+/// Technic pack is held to. What stays here is the store's own bookkeeping: item ids, the path set
+/// and the free-space question.
 pub(super) fn list_rar_entries(
     archive_path: &Path,
 ) -> Result<Vec<ListedArchiveEntry>, ContentError> {
-    let archive =
-        SafeArchive::open_with_rar(archive_path, ArchiveLimits::MOD_ARCHIVE, rar_reader())
-            .map_err(reader_failure)?;
+    let archive = SafeArchive::open_with_rar(archive_path, ArchiveLimits::GAME_MOD, rar_reader())
+        .map_err(reader_failure)?;
     let listed: Vec<ListedEntry> = archive
         .file_entries()
         .map(|entry| ListedEntry {

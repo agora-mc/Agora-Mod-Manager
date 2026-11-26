@@ -203,9 +203,18 @@ fn the_presets_carry_the_limits_the_call_sites_used() {
     assert_eq!(ArchiveLimits::PACK.max_total_bytes, 2 * 1024 * MIB);
     assert_eq!(ArchiveLimits::PACK.max_ratio, 200);
 
-    assert_eq!(ArchiveLimits::MOD_ARCHIVE.max_entries, 5_000);
-    assert_eq!(ArchiveLimits::MOD_ARCHIVE.max_entry_bytes, 500 * MIB);
-    assert_eq!(ArchiveLimits::MOD_ARCHIVE.max_total_bytes, 2 * 1024 * MIB);
+    assert_eq!(ArchiveLimits::TECHNIC_PACK.max_entries, 5_000);
+    assert_eq!(ArchiveLimits::TECHNIC_PACK.max_entry_bytes, 500 * MIB);
+    assert_eq!(ArchiveLimits::TECHNIC_PACK.max_total_bytes, 2 * 1024 * MIB);
+
+    // A content-store mod: the numbers `content_store` enforced before this reader existed, which
+    // were none. A Skyrim texture or BSA mod is past Technic's numbers, and refusing it would
+    // refuse the mod the player downloaded.
+    assert_eq!(ArchiveLimits::GAME_MOD.max_entries, 0, "no entry cap");
+    assert_eq!(ArchiveLimits::GAME_MOD.max_entry_bytes, u64::MAX);
+    assert_eq!(ArchiveLimits::GAME_MOD.max_total_bytes, 0, "no total cap");
+    assert_eq!(ArchiveLimits::GAME_MOD.max_ratio, 0, "no ratio check");
+    assert!(!ArchiveLimits::GAME_MOD.bounds_the_listing);
 
     assert_eq!(ArchiveLimits::BACKUP.max_entries, 10_000);
     assert_eq!(ArchiveLimits::BACKUP.max_entry_bytes, 1024 * MIB);
@@ -249,20 +258,22 @@ fn the_presets_carry_the_limits_the_call_sites_used() {
 
     let listing_checks: Vec<bool> = [
         ArchiveLimits::PACK,
-        ArchiveLimits::MOD_ARCHIVE,
+        ArchiveLimits::TECHNIC_PACK,
         ArchiveLimits::BACKUP,
         ArchiveLimits::PLUGIN_PACKAGE,
         ArchiveLimits::RUNTIME,
         ArchiveLimits::WORLD_ARCHIVE,
         ArchiveLimits::JAR_METADATA,
+        ArchiveLimits::GAME_MOD,
     ]
     .into_iter()
     .map(|limits| limits.bounds_the_listing)
     .collect();
     assert_eq!(
         listing_checks,
-        vec![true, true, true, true, true, true, false],
-        "only the metadata reader bounds the entries it reads instead of the listing"
+        vec![true, true, true, true, true, true, false, false],
+        "the two jobs that read what they need (a jar's metadata, a store's mod) do not bound the \
+         listing"
     );
 }
 
@@ -719,7 +730,7 @@ fn a_sevenz_is_listed_read_and_extracted() {
         ("mods/info.json", b"{\"id\":\"x\"}"),
         ("mods/a.class", b"code"),
     ]);
-    let mut archive = SafeArchive::open_bytes(bytes, ArchiveLimits::MOD_ARCHIVE).unwrap();
+    let mut archive = SafeArchive::open_bytes(bytes, ArchiveLimits::TECHNIC_PACK).unwrap();
     assert_eq!(archive.format(), ArchiveFormat::SevenZ);
     assert_eq!(archive.file_entries().count(), 2);
     assert_eq!(archive.read("mods/info.json").unwrap(), b"{\"id\":\"x\"}");
@@ -833,7 +844,7 @@ fn rar_magic_bytes() -> Vec<u8> {
 
 #[test]
 fn a_rar_archive_without_a_reader_is_refused() {
-    let error = SafeArchive::open_bytes(rar_magic_bytes(), ArchiveLimits::MOD_ARCHIVE)
+    let error = SafeArchive::open_bytes(rar_magic_bytes(), ArchiveLimits::TECHNIC_PACK)
         .err()
         .expect("no reader was given");
     assert!(
@@ -873,7 +884,7 @@ fn a_rar_archive_reads_through_the_seam() {
     let path = dir.path().join("mod.rar");
     std::fs::write(&path, rar_magic_bytes()).unwrap();
     let mut archive =
-        SafeArchive::open_with_rar(&path, ArchiveLimits::MOD_ARCHIVE, Box::new(FakeRar)).unwrap();
+        SafeArchive::open_with_rar(&path, ArchiveLimits::TECHNIC_PACK, Box::new(FakeRar)).unwrap();
     assert_eq!(archive.format(), ArchiveFormat::Rar);
     assert_eq!(archive.file_entries().count(), 2);
     assert_eq!(archive.read("mods/a.esp").unwrap(), b"data");
@@ -883,7 +894,7 @@ fn a_rar_archive_reads_through_the_seam() {
     // RAR's `textures/aux.dds` is refused by default like an entry of any other format.
     let out = dir.path().join("out");
     let mut archive =
-        SafeArchive::open_with_rar(&path, ArchiveLimits::MOD_ARCHIVE, Box::new(FakeRar)).unwrap();
+        SafeArchive::open_with_rar(&path, ArchiveLimits::TECHNIC_PACK, Box::new(FakeRar)).unwrap();
     let error = archive.extract(&out, NamePolicy::Refuse).unwrap_err();
     assert!(
         matches!(error, ArchiveError::UnsafeNames { .. }),
@@ -914,7 +925,7 @@ fn a_rar_reader_that_cannot_list_is_fail_closed() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("broken.rar");
     std::fs::write(&path, rar_magic_bytes()).unwrap();
-    let error = SafeArchive::open_with_rar(&path, ArchiveLimits::MOD_ARCHIVE, Box::new(Failing))
+    let error = SafeArchive::open_with_rar(&path, ArchiveLimits::TECHNIC_PACK, Box::new(Failing))
         .err()
         .expect("a reader that cannot list is an error, never an empty archive");
     match error {
