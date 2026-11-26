@@ -168,15 +168,30 @@ describe('removeBase', () => {
   });
 
   it('accepts a removed base', async () => {
-    invokeMock.mockResolvedValueOnce({ baseId: base.baseId, status: 'removed' });
-    await expect(removeBase(base.baseId)).resolves.toEqual({ baseId: base.baseId, status: 'removed' });
+    invokeMock.mockResolvedValueOnce({ baseId: base.baseId, status: 'removed', warnings: [] });
+    await expect(removeBase(base.baseId)).resolves.toEqual({
+      baseId: base.baseId,
+      status: 'removed',
+      warnings: [],
+    });
     expect(invokeMock).toHaveBeenCalledWith('games_base_remove', { baseId: base.baseId });
+  });
+
+  it('carries what the removal could not check', async () => {
+    const warning = "base x's record was damaged and has been removed, but no folder for it was found in D:/a";
+    invokeMock.mockResolvedValueOnce({ baseId: base.baseId, status: 'removed', warnings: [warning] });
+    await expect(removeBase(base.baseId)).resolves.toEqual({
+      baseId: base.baseId,
+      status: 'removed',
+      warnings: [warning],
+    });
   });
 
   it.each([
     ['null (an unmocked command answers this)', null],
-    ['a reply that does not say removed', { baseId: base.baseId, status: 'ok' }],
+    ['a reply that does not say removed', { baseId: base.baseId, status: 'ok', warnings: [] }],
     ['an empty object', {}],
+    ['a reply without its warnings', { baseId: base.baseId, status: 'removed' }],
   ])('rejects %s instead of reading it as removed', async (_label, reply) => {
     invokeMock.mockResolvedValueOnce(reply);
     await expect(removeBase(base.baseId)).rejects.toThrow('games_base_remove did not return the documented shape.');

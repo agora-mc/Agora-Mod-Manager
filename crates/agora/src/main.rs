@@ -7942,15 +7942,22 @@ async fn run_command(
                 }
                 BaseCmd::Remove { base_id } => {
                     match agora_core::game_base::remove_base(&ctx.paths, &base_id) {
-                        Ok(()) => {
+                        Ok(removal) => {
                             if json {
                                 let out = serde_json::json!({
                                     "status": "removed",
                                     "base_id": base_id,
+                                    "warnings": removal.warnings,
                                 });
                                 println!("{}", serde_json::to_string_pretty(&out)?);
                             } else {
                                 println!("Base '{base_id}' removed.");
+                                // What the removal could not check. The base is gone from the list
+                                // either way; a damaged record names no folder, so the folder may
+                                // be on a drive Agora has no root for.
+                                for warning in &removal.warnings {
+                                    eprintln!("Warning: {warning}");
+                                }
                             }
                         }
                         Err(agora_core::game_base::BaseError::InUse { instances }) => {

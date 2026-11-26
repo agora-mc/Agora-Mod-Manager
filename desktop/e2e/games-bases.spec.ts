@@ -201,7 +201,7 @@ test('a base that needs attention names the damaged files', async ({ page }) => 
 test('removing an unused base asks first, then removes it and says so', async ({ page }) => {
   await boot(page, {
     games_base_list: { bases: [spareBase], damaged: [] },
-    games_base_remove: { baseId: spareBase.baseId, status: 'removed' },
+    games_base_remove: { baseId: spareBase.baseId, status: 'removed', warnings: [] },
   });
   await openBases(page);
 
@@ -321,7 +321,7 @@ test('a backend error shows its own message', async ({ page }) => {
 test('a damaged base record is listed with its file and reason, offers no checks, and its removal asks first', async ({ page }) => {
   await boot(page, {
     games_base_list: { bases: [], damaged: [damagedRecord] },
-    games_base_remove: { baseId: damagedRecord.baseId, status: 'removed' },
+    games_base_remove: { baseId: damagedRecord.baseId, status: 'removed', warnings: [] },
   });
   await openBases(page);
 
@@ -341,6 +341,23 @@ test('a damaged base record is listed with its file and reason, offers no checks
   await expect(dialog).toContainText('Its record file is deleted');
   await dialog.getByRole('button', { name: 'Remove base' }).click();
   await expect(page.getByRole('status').filter({ hasText: 'Removed the damaged base record.' })).toBeVisible();
+});
+
+test('a removal that could not find the folder says where it looked, and still removed the base', async ({ page }) => {
+  const warning =
+    "base x's record was damaged and has been removed, but no folder for it was found in D:/agora/bases";
+  await boot(page, {
+    games_base_list: { bases: [], damaged: [damagedRecord] },
+    games_base_remove: { baseId: damagedRecord.baseId, status: 'removed', warnings: [warning] },
+  });
+  await openBases(page);
+
+  const card = page.getByTestId('damaged-base-card');
+  await card.getByRole('button', { name: 'Remove base' }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Remove base' }).click();
+  const status = page.getByRole('status').filter({ hasText: 'Removed the damaged base record.' });
+  await expect(status).toBeVisible();
+  await expect(status).toContainText(warning);
 });
 
 test('a damaged base record in use cannot be removed, and names the instances that use it', async ({ page }) => {

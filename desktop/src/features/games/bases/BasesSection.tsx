@@ -69,8 +69,9 @@ export function BasesSection({ gameId, gameName, frame }: BasesSectionProps) {
     });
     if (!ok) return;
     try {
-      await removeBase(baseId);
-      setNotice(done);
+      const reply = await removeBase(baseId);
+      // A warning is about what the removal could not check, not a failure: say both.
+      setNotice([done, ...reply.warnings].join(' '));
       refresh();
     } catch (error: unknown) {
       // The backend names the instances that still use the base; show its message as it is.

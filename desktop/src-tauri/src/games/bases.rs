@@ -483,6 +483,9 @@ fn file_problem(problem: BaseProblem) -> BaseFileProblem {
 pub struct RemoveReply {
     pub base_id: String,
     pub status: String,
+    /// What the removal could not check: a damaged record names no folder, so its folder may be on
+    /// a drive Agora has no root for. The base is gone from the list either way.
+    pub warnings: Vec<String>,
 }
 
 /// Delete a base no instance uses. Core refuses while any instance is pinned to it and names
@@ -495,10 +498,11 @@ pub async fn games_base_remove(
 ) -> Result<RemoveReply, GamesError> {
     tokio::task::spawn_blocking(move || -> Result<RemoveReply, GamesError> {
         let ctx = crate::core_context(&app)?;
-        game_base::remove_base(&ctx.paths, &base_id).map_err(base_error)?;
+        let removal = game_base::remove_base(&ctx.paths, &base_id).map_err(base_error)?;
         Ok(RemoveReply {
             base_id,
             status: "removed".to_string(),
+            warnings: removal.warnings,
         })
     })
     .await

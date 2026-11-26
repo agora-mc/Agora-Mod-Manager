@@ -111,6 +111,11 @@ export interface FrameworkRepairReply {
 export interface RemoveReply {
   baseId: string;
   status: 'removed';
+  /**
+   * What the removal could not check. A damaged record names no folder, so its folder may be on a
+   * drive Agora has no root for: the base leaves the list and these say where it looked.
+   */
+  warnings: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +203,8 @@ function isVerifyReply(value: unknown): value is VerifyReply {
 }
 
 function isRemoveReply(value: unknown): value is RemoveReply {
-  return isObj(value) && isStr(value.baseId) && value.status === 'removed';
+  return isObj(value) && isStr(value.baseId) && value.status === 'removed'
+    && Array.isArray(value.warnings) && value.warnings.every(isStr);
 }
 
 function isFrameworkRepairReply(value: unknown): value is FrameworkRepairReply {

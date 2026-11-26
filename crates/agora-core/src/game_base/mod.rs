@@ -2036,7 +2036,19 @@ fn damaged_record_listed_as(paths: &AppPaths, base_id: &str) -> Result<Option<Pa
     Ok(None)
 }
 
-pub fn remove_base(paths: &AppPaths, base_id: &str) -> Result<(), BaseError> {
+/// What a base removal did.
+///
+/// A damaged record names no folder, so its folder may be on a drive Agora has no root for. The
+/// record is still removed — it is what the person asked to delete — and the removal says which
+/// roots it searched so nobody counts the space as freed on a folder it never found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BaseRemoval {
+    /// What the person has to know. The base is gone from the list either way; these say what
+    /// could not be checked.
+    pub warnings: Vec<String>,
+}
+
+pub fn remove_base(paths: &AppPaths, base_id: &str) -> Result<BaseRemoval, BaseError> {
     remove_base_with(
         paths,
         base_id,
@@ -2076,7 +2088,7 @@ pub fn remove_base_with(
     between_reads: impl Fn(),
     metadata: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
     remove_record: impl Fn(&Path) -> std::io::Result<()>,
-) -> Result<(), BaseError> {
+) -> Result<BaseRemoval, BaseError> {
     let locks = crate::lock_manager::LockManager::new(paths.locks_root());
     // A plain id can also be named by a build or a framework repair, so take its lock first. A
     // damaged record is listed under a file name that need not be a valid lock component; it only
@@ -2122,7 +2134,7 @@ pub fn remove_base_with(
             )));
         }
         std::fs::remove_file(&record)?;
-        return Ok(());
+        return Ok(BaseRemoval::default());
     }
     let pinning = instances_pinning_base_with(paths, base_id, &metadata, &between_reads)?;
     if !pinning.is_empty() {
@@ -2166,7 +2178,7 @@ pub fn remove_base_with(
                     manifest_path.display()
                 )));
             }
-            Ok(())
+            Ok(BaseRemoval::default())
         }
         // The record reads but is not a base record, so there is no recorded location to check.
         // Only the folder the id names in the data folder's bases folder is removed, and only if
@@ -2396,7 +2408,7 @@ fn remove_damaged_base(
     base_id: &str,
     manifest_path: &Path,
     stat: &dyn Fn(&Path) -> std::io::Result<std::fs::Metadata>,
-) -> Result<(), BaseError> {
+) -> Result<BaseRemoval, BaseError> {
     let roots = known_base_roots(paths)?;
     let mut elsewhere = Vec::new();
     for root in roots
@@ -2446,16 +2458,21 @@ fn remove_damaged_base(
     }
     std::fs::remove_file(manifest_path)?;
     if removed_here {
-        return Ok(());
+        return Ok(BaseRemoval::default());
     }
-    Err(BaseError::Other(format!(
-        "base {base_id}'s record was damaged and has been removed, but no folder for it was found \
-         in {}. A base on another drive keeps its folder under that drive's root; check there \
-         before the space counts as freed.",
-        roots
-            .iter()
-            .map(|root| root.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    )))
+    // The record is gone, which is what the person asked to have removed; the folder it named was
+    // never found. The base leaves the list, and the warning says where Agora looked, so nobody
+    // counts the space as freed for a folder on a drive it has no root for.
+    Ok(BaseRemoval {
+        warnings: vec![format!(
+            "base {base_id}'s record was damaged and has been removed, but no folder for it was \
+             found in {}. A base on another drive keeps its folder under that drive's own bases \
+             folder; check there before the space counts as freed.",
+            roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )],
+    })
 }

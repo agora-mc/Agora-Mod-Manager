@@ -3163,8 +3163,8 @@ fn a_build_provisions_a_base_a_pin_is_waiting_for() {
 }
 
 /// A damaged record names no folder, so its folder may be in any bases root a build registered —
-/// another drive included. Removal said "done" while the folder could still be there; it says which
-/// folders it looked in instead.
+/// another drive included. The record goes, which is what was asked; the removal then says which
+/// folders it looked in, so nobody counts the space as freed for a folder it never found.
 #[test]
 fn removing_a_damaged_record_says_which_roots_it_looked_in() {
     let tmp = TempDir::new().unwrap();
@@ -3173,12 +3173,13 @@ fn removing_a_damaged_record_says_which_roots_it_looked_in() {
     std::fs::create_dir_all(paths.base_manifests_dir()).unwrap();
     std::fs::write(paths.base_manifest_path(base_id), "{ not json").unwrap();
 
-    let error = remove_base(&paths, base_id)
-        .expect_err("a removal that cannot find the folder must say so, not report success");
-    let message = format!("{error}");
+    let removal = remove_base(&paths, base_id)
+        .expect("the record is removed; what is missing is the folder, and that is a warning");
+    assert_eq!(removal.warnings.len(), 1, "{removal:?}");
+    let warning = &removal.warnings[0];
     assert!(
-        message.contains(&paths.bases_dir().display().to_string()),
-        "the report names the folder it looked in: {message}"
+        warning.contains(&paths.bases_dir().display().to_string()),
+        "the warning names the folder it looked in: {warning}"
     );
     assert!(
         !paths.base_manifest_path(base_id).exists(),
