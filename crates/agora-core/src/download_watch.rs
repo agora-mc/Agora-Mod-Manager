@@ -51,6 +51,12 @@ pub enum DownloadsError {
     NotFound(String),
     #[error("the download '{0}' has changed since Agora saw it; scan again")]
     Changed(String),
+    /// An archive of a format Agora reads that the reader *refused*: a name that leaves the
+    /// archive, two entries with one name, a password, a damaged archive. Not the same thing as a
+    /// file that is not an archive at all (that is ignored quietly), and never dropped silently: it
+    /// carries the reader's reason, and the scan records it as a notice of its own.
+    #[error("'{path}' was refused: {reason}")]
+    Refused { path: String, reason: String },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -268,29 +274,52 @@ impl WatchState {
             if ignored.contains(&sha256) {
                 continue;
             }
-            let Some(classified) = classify_path(ctx, &path)? else {
-                continue;
-            };
-
             let nexus_mod_id = nexus_mod_id(&entry.name);
-            let notice = StoredDownload {
-                path: entry.path,
-                file_name: entry.name,
-                size: marker.0,
-                sha256,
-                game_id: classified.game_id,
-                kind: classified.kind,
-                reason: classified.reason,
-                nexus_mod_id,
-                catalog_item_id: classified
-                    .catalog_item
-                    .as_ref()
-                    .map(|item| item.item_id.clone()),
-                catalog_item_name: classified
-                    .catalog_item
-                    .as_ref()
-                    .map(|item| item.item_name.clone()),
-                found_at_unix_ms: content_store::now_unix_ms(),
+            let refused;
+            let notice = match classify_path(ctx, &path) {
+                Ok(Some(classified)) => {
+                    refused = false;
+                    StoredDownload {
+                        path: entry.path,
+                        file_name: entry.name,
+                        size: marker.0,
+                        sha256,
+                        game_id: classified.game_id,
+                        kind: classified.kind,
+                        reason: classified.reason,
+                        nexus_mod_id,
+                        catalog_item_id: classified
+                            .catalog_item
+                            .as_ref()
+                            .map(|item| item.item_id.clone()),
+                        catalog_item_name: classified
+                            .catalog_item
+                            .as_ref()
+                            .map(|item| item.item_name.clone()),
+                        found_at_unix_ms: content_store::now_unix_ms(),
+                    }
+                }
+                Ok(None) => continue,
+                // An archive this reader refused is not a failure of the poll, and not something to
+                // drop either: it is kept with the reader's reason so the player can see why Agora
+                // will not use it. No game was identified, so the row names none.
+                Err(DownloadsError::Refused { reason, .. }) => {
+                    refused = true;
+                    StoredDownload {
+                        path: entry.path,
+                        file_name: entry.name,
+                        size: marker.0,
+                        sha256,
+                        game_id: String::new(),
+                        kind: "refused".into(),
+                        reason,
+                        nexus_mod_id,
+                        catalog_item_id: None,
+                        catalog_item_name: None,
+                        found_at_unix_ms: content_store::now_unix_ms(),
+                    }
+                }
+                Err(error) => return Err(error),
             };
             // One file has one notice: replace any older row for the same path (including
             // duplicates left by a previous version).
@@ -298,7 +327,13 @@ impl WatchState {
             notices.retain(|stored| stored.path != notice.path);
             notices_changed |= notices.len() != before;
             notices.push(notice.clone());
-            added.push(notice);
+            // A refusal is not a new mod: it is stored and listed, but it is not counted as one
+            // waiting in the Library, and the batch toast is about those.
+            if !refused {
+                added.push(notice);
+            } else {
+                notices_changed = true;
+            }
         }
 
         if !added.is_empty() || notices_changed {
@@ -309,16 +344,26 @@ impl WatchState {
 }
 
 /// Classify one file by its contents against the games the player has enabled. Anything that is
-/// not a readable archive, or matches no enabled game, is `None` and is ignored quietly.
+/// not an archive Agora can read, or matches no enabled game, is `None` and is ignored quietly.
+///
+/// A file that *is* an archive of a format Agora reads and that the reader refuses is
+/// [`DownloadsError::Refused`], with the reader's reason: silently dropping it would tell the player
+/// nothing about a download Agora could not use.
 pub fn classify_path(ctx: &Ctx, path: &Path) -> Result<Option<ClassifiedDownload>, DownloadsError> {
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
         return Ok(None);
     };
     let entries = match content_store::list_archive_entries(path) {
         Ok(entries) => entries,
-        // A file we cannot read as an archive is not content; it is never reported as an error or
-        // offered. A genuine I/O failure on the folder is reported by `read_folder`.
-        Err(_) => return Ok(None),
+        // Not an archive of a format Agora reads: not content, and never reported. A genuine I/O
+        // failure on the folder is reported by `read_folder`.
+        Err(ContentError::UnsupportedArchiveFormat) => return Ok(None),
+        Err(error) => {
+            return Err(DownloadsError::Refused {
+                path: path.display().to_string(),
+                reason: error.to_string(),
+            })
+        }
     };
     let enabled: HashSet<String> = game_support::list(ctx)
         .map_err(LauncherError::from)?
@@ -635,8 +680,28 @@ pub fn scan_folder_now(ctx: &Ctx, folder: &Path) -> Result<Vec<ScannedDownload>,
         if ignored.contains(&sha256) {
             continue;
         }
-        let Some(classified) = classify_path(ctx, &path)? else {
-            continue;
+        let classified = match classify_path(ctx, &path) {
+            Ok(Some(classified)) => classified,
+            Ok(None) => continue,
+            // The reader refused this archive: it is a row of its own, saying so, rather than a file
+            // the scan pretends it never saw.
+            Err(DownloadsError::Refused { reason, .. }) => {
+                rows.push(ScannedDownload {
+                    path: entry.path,
+                    file_name: entry.name.clone(),
+                    size: entry.marker.map(|marker| marker.0).unwrap_or_default(),
+                    sha256,
+                    game_id: String::new(),
+                    kind: "refused".into(),
+                    reason,
+                    nexus_mod_id: nexus_mod_id(&entry.name),
+                    catalog_item_id: None,
+                    catalog_item_name: None,
+                    already_in_library: false,
+                });
+                continue;
+            }
+            Err(error) => return Err(error),
         };
         let already_in_library = content_store::contains_hash(ctx, &sha256)?;
         rows.push(ScannedDownload {

@@ -3241,26 +3241,31 @@ fn extract_natives_atomically(
         for archive_spec in archives {
             let archive_path = &archive_spec.path;
             let rules = archive_spec.rules.as_ref();
+            // Two records under one name is the reader's refusal to make: `zip::ZipArchive` keeps
+            // only the last of them, so a listing cannot show the collision (MASTER_SPEC §32.3).
+            let duplicated =
+                agora_game_api::duplicate_zip_entry_names(archive_path).map_err(|error| {
+                    LauncherError::Generic {
+                        code: "ERR_NATIVE_ARCHIVE".into(),
+                        message: error.to_string(),
+                    }
+                })?;
+            if !duplicated.is_empty() {
+                return Err(LauncherError::Generic {
+                    code: "ERR_NATIVE_DUPLICATE_PATH".into(),
+                    message: format!(
+                        "Native archive {} holds more than one entry named {}.",
+                        archive_path.display(),
+                        duplicated.join(", ")
+                    ),
+                });
+            }
             let file = std::fs::File::open(archive_path).map_err(native_io_error)?;
             let mut archive =
                 zip::ZipArchive::new(file).map_err(|error| LauncherError::Generic {
                     code: "ERR_NATIVE_ARCHIVE".into(),
                     message: format!("Invalid native archive {}: {error}", archive_path.display()),
                 })?;
-            let central_records = std::fs::File::open(archive_path)
-                .and_then(|file| {
-                    central_directory_record_count(file, archive.central_directory_start())
-                })
-                .map_err(native_io_error)?;
-            if central_records != archive.len() {
-                return Err(LauncherError::Generic {
-                    code: "ERR_NATIVE_DUPLICATE_PATH".into(),
-                    message: format!(
-                        "Native archive {} contains duplicate entry names.",
-                        archive_path.display()
-                    ),
-                });
-            }
             total_entries = total_entries.saturating_add(archive.len());
             if total_entries > MAX_ENTRIES {
                 return Err(LauncherError::ZipBomb);
@@ -3710,33 +3715,6 @@ pub(crate) fn safe_relative_path(raw: &str) -> LauncherResult<PathBuf> {
         return Err(LauncherError::OverrideSecurityViolation);
     }
     Ok(path)
-}
-
-/// Count the raw records in a ZIP central directory.
-///
-/// `zip::ZipArchive` keeps only the last of several entries that share a name,
-/// so `len()` alone cannot reveal duplicates; comparing it with this count can.
-fn central_directory_record_count(file: std::fs::File, start: u64) -> std::io::Result<usize> {
-    use std::io::{Read, Seek, SeekFrom};
-    const SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
-    let mut reader = std::io::BufReader::new(file);
-    reader.seek(SeekFrom::Start(start))?;
-    let mut header = [0u8; 46];
-    let mut count = 0usize;
-    loop {
-        match reader.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(error) => return Err(error),
-        }
-        if header[..4] != SIGNATURE {
-            break;
-        }
-        let field = |at: usize| i64::from(u16::from_le_bytes([header[at], header[at + 1]]));
-        reader.seek_relative(field(28) + field(30) + field(32))?;
-        count += 1;
-    }
-    Ok(count)
 }
 
 fn native_io_error(error: std::io::Error) -> LauncherError {

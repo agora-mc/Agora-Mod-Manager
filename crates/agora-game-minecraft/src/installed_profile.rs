@@ -19,6 +19,7 @@
 use crate::launch::{merge_forge_version, parse_maven_descriptor, VersionInfo};
 use agora_core::download::{sha1_hex, sha256_hex, stable_version_json};
 use agora_core::network;
+use agora_game_api::{ArchiveLimits, SafeArchive};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -973,29 +974,39 @@ pub fn installer_side_artifacts_from_jar(
 }
 
 fn install_profile_from_jar(jar: &[u8]) -> Result<serde_json::Value, ProfileIssue> {
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(jar)).map_err(|error| {
-        ProfileIssue::corrupt(None, format!("Installer is not a readable JAR: {error}"))
-    })?;
-    let mut entry = archive.by_name("install_profile.json").map_err(|error| {
-        ProfileIssue::corrupt(
-            None,
-            format!("Installer has no install_profile.json: {error}"),
-        )
-    })?;
+    let mut archive =
+        SafeArchive::open_bytes(jar.to_vec(), ArchiveLimits::JAR_METADATA).map_err(|error| {
+            ProfileIssue::corrupt(None, format!("Installer is not a readable JAR: {error}"))
+        })?;
     const MAX_INSTALL_PROFILE_SIZE: u64 = 4 * 1024 * 1024;
-    if entry.size() > MAX_INSTALL_PROFILE_SIZE {
+    // The size the archive declares, before the bytes are read: a lying header is caught again by
+    // the reader, which counts what actually arrives (MASTER_SPEC §32.13).
+    let declared = archive
+        .entries()
+        .iter()
+        .find(|entry| entry.name == "install_profile.json")
+        .map(|entry| entry.size)
+        .ok_or_else(|| {
+            ProfileIssue::corrupt(None, "Installer has no install_profile.json".to_string())
+        })?;
+    if declared > MAX_INSTALL_PROFILE_SIZE {
+        return Err(ProfileIssue::corrupt(
+            None,
+            format!("Installer's install_profile.json is too large: {declared} bytes"),
+        ));
+    }
+    let bytes = archive.read("install_profile.json").map_err(|error| {
+        ProfileIssue::corrupt(None, format!("Cannot read install_profile.json: {error}"))
+    })?;
+    if bytes.len() as u64 > MAX_INSTALL_PROFILE_SIZE {
         return Err(ProfileIssue::corrupt(
             None,
             format!(
                 "Installer's install_profile.json is too large: {} bytes",
-                entry.size()
+                bytes.len()
             ),
         ));
     }
-    let mut bytes = Vec::with_capacity(entry.size() as usize);
-    entry.read_to_end(&mut bytes).map_err(|error| {
-        ProfileIssue::corrupt(None, format!("Cannot read install_profile.json: {error}"))
-    })?;
     serde_json::from_slice(&bytes).map_err(|error| {
         ProfileIssue::corrupt(
             None,

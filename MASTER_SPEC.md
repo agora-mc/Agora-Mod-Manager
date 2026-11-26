@@ -5591,6 +5591,72 @@ three path comparators.
   so it carries Windows-only tests). Limits on entry count, total and per-entry size and compression
   ratio, in named presets (pack, backup, plugin package, jar metadata, runtime, mod archive), today's
   values carried over and listed.
+  - It lives in `agora-game-api::archive`, because core and the game packages both read archives and
+    neither may own the other (§26.12); `agora-game-api` may therefore depend on the four decoders
+    (`zip`, `sevenz-rust2`, `tar`, `flate2`) on the same terms as `regex` for the crash contract:
+    plain libraries, no runtime, already in the workspace.
+  - RAR has no usable in-process decoder, and starting a process is not this contract's job, so the
+    reader declares a `RarReader` seam that core fills in with Windows' own `tar.exe`. A RAR archive
+    read without one is an error, never an empty listing.
+  - An entry name is not a file name until something writes it. Extraction goes through `join_under`
+    and `validate_path_set`. A name that escapes the root (`..`, absolute, a drive letter) is always
+    refused; a name a disk cannot hold (a Windows reserved name, a trailing dot or space, `:`, an
+    illegal character, two names a case-insensitive disk stores as one) is refused by default with
+    every offending entry named, and a caller may instead extract without them, in which case they
+    come back in the result so the CLI and the desktop can list them. User-facing imports wire that
+    opt-in (`agora pack extract-overrides --without-unwritable-names`); internal extractions never
+    skip silently. A caller's own rule is asked about **the path the file would have**, not the raw
+    entry name (`./config/x` and `config\x` are `config/x`), and a name a disk cannot hold is
+    answered by this rule before any caller rule is asked, so `config/run.bat.` is reported as a name
+    Windows would rewrite rather than as a file type a pack banned.
+  - Its guard counts direct archive opens per file, in `scripts/archive_budget.json`, and the count
+    only goes down.
+  - **Two entries with one name are refused**, naming them: `zip::ZipArchive` keeps only the last of
+    several same-named records, so a listing cannot show the collision, and whichever entry lost
+    would have been written over without a word. A tar, a 7z and a RAR list every record, so the
+    listing check covers them; a folder recorded twice is one folder and is left alone.
+  - **A preset can bound the entries a job reads instead of the listing** (`per_entry_at_listing`).
+    A job that reads every entry refuses an oversized one at listing; `JAR_METADATA` does not, so a
+    mod jar's 40 MiB texture is no reason to lose the mod's id, while a nested jar over the cap is
+    skipped with a recorded reason and the outer metadata still comes back.
+  - **Every entry is copied to the end of its stream**, so a `Stored` entry that declares more bytes
+    than it holds meets the decoder's CRC check instead of a trusting count.
+  - **A limit never loosens on the way here.** The entry count includes the folders an archive
+    records wherever the call site counted `ZipArchive::len()` (runtime, plugin package, world, pack,
+    mod archive), and files only where it counted a manifest's file list (backup). A format with no
+    compressed size per entry — a 7z, a solid one especially — is held to the ratio the whole archive
+    claims against the bytes it is; a zip keeps its tighter per-entry check. A `tar.gz` is refused
+    while the stream is read, not after it has been inflated: the header that declares more than the
+    preset allows is the refusal, and the decompression stops there.
+  - **An extraction never writes into a live folder.** A destination that already holds the player's
+    files (an instance's `config/`, a pack's overrides) is written into a folder the reader makes
+    beside it, and the caller publishes that folder only after the whole extraction succeeded; on
+    any failure it is removed and the destination is untouched. A destination the caller made for
+    the job (a runtime's, a world's, a plugin package's) needs no staging on top.
+  - **One pass, in archive order.** Extraction and multi-entry reads walk the archive once: one
+    `ZipArchive`, one tar or tar.gz stream, the 7z decoder's sequential callback. A fresh parse per
+    file made a fifty-thousand-entry world quadratic, and a tar.gz's prefix was inflated once per
+    entry. A solid 7z's members share one compressed block, so an entry nobody wants is still
+    drained to its end — stepped over, the member after it decodes from a position that is not its
+    own. Cancellation is asked before every entry and between buffers, so stopping a gigabyte entry
+    is answered inside it rather than when it ends.
+  - Presets today: pack, mod archive, backup, plugin package, jar metadata, runtime, and
+    `WORLD_ARCHIVE` (200 000 entries, 16 GiB, no tighter per-entry limit) for a world a player
+    exported or downloaded.
+- **Where the remaining opens go:** `content_store` (staging, item ids, `rename` into place) is B3;
+  `import.rs` and `pack_update.rs` follow the import protocol (C2); `backup.rs` and `snapshot.rs` sit
+  inside restore protocols and move with them (C2). `launch_planner`'s native extraction keeps its
+  own admission rules but asks the reader whether two entries share a name.
+- **RAR's first backend is `content_store/rar.rs`** (Windows' `tar.exe`), so the reader's RAR seam is
+  filled rather than declared. **It never names a member to `tar.exe`**: bsdtar reads the arguments
+  after `--` as patterns, so `-xOf archive -- "[ab].txt"` prints `a.txt`'s and `b.txt`'s bytes and a
+  member called `[ELLE] x.txt` matches nothing. The backend lists (the limits are checked on the
+  listing), extracts the whole archive once into a folder of its own, checks the extracted tree
+  against the listing — files, sizes, no link or reparse point — and serves reads from that copy,
+  with the reader's classification, duplicate and name rules unchanged and the real size on disk
+  re-checked. No member data goes through a pipe. A RAR the repository may commit does not exist
+  yet, so the tests read an archive `tar.exe` reads the same way (a zip) and the real-RAR ones stay
+  `#[ignore]`d because they read a user's Vortex folder.
 - **Guard:** private path validators, direct archive opens outside the reader, and path comparisons
   outside the comparison module (in recovery, trust and staging code) are counted.
 

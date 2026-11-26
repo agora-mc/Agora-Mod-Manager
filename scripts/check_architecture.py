@@ -499,7 +499,25 @@ def resolved_dependency(name: str, specification, workspace: dict) -> tuple[str,
 def check_game_api_dependencies() -> None:
     # serde_json and regex are for the crash contract: a pack is hand-written JSON, and its linter
     # compiles rule regexes (MASTER_SPEC §30.11). Both are plain libraries, not a runtime.
-    allowed = {"serde", "serde_json", "semver", "thiserror", "regex"}
+    #
+    # zip, sevenz-rust2, tar and flate2 are the one archive reader (§32.3). They are decoders, not a
+    # runtime: no process, no network, no operating-system store, and the workspace already carried
+    # all four for core and the Minecraft package. RAR has no such library, so the reader declares a
+    # seam and core fills it in out of process.
+    allowed = {
+        "serde",
+        "serde_json",
+        "semver",
+        "thiserror",
+        "regex",
+        "zip",
+        "sevenz-rust2",
+        "tar",
+        "flate2",
+        # Test-only, and the repository's own rule for a temporary directory (a path unique per
+        # process). It builds into no code that ships.
+        "tempfile",
+    }
     if not GAME_API_CARGO.exists():
         err("agora-game-api Cargo.toml missing")
         return
@@ -516,9 +534,15 @@ def check_game_api_dependencies() -> None:
         if package not in allowed or "path" in details or "git" in details:
             forbidden.append(alias)
     if forbidden:
-        err(f"agora-game-api dependencies must be serde, serde_json, semver, thiserror or regex only: {sorted(forbidden)}")
+        err(
+            "agora-game-api dependencies must be serde, serde_json, semver, thiserror, regex or "
+            f"the archive decoders (zip, sevenz-rust2, tar, flate2) only: {sorted(forbidden)}"
+        )
     else:
-        print("OK: agora-game-api depends only on serde, serde_json, semver, thiserror and regex")
+        print(
+            "OK: agora-game-api depends only on serde, serde_json, semver, thiserror, regex and "
+            "the archive decoders"
+        )
 
 
 def is_game_package(name: str, path: str = "") -> bool:
@@ -1446,6 +1470,163 @@ def check_path_rules() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 17. Direct archive opens: one reader, counted, and the count may only go down
+# ---------------------------------------------------------------------------
+# MASTER_SPEC §32.3. About 37 production call sites opened zip archives themselves, each with its
+# own idea of which entry names were acceptable and how large an archive may be; `tar.gz` runtimes
+# had their own `tar` code; and RAR went through `tar.exe` through a third path. The one reader is
+# `agora-game-api::SafeArchive`; this counts what still opens an archive directly, per file, so the
+# number can only fall.
+#
+# An *open* is a decoder constructed, or a process spawned that lists or extracts an archive: the
+# zip crate's reader, `sevenz_rust2`'s archive and reader, the `tar` crate's archive, a gzip decoder
+# wrapped around one, and a `tar.exe`/`unrar` command. Writing an archive is not counted: only reads
+# are this slice's job, and the writers are a different one.
+#
+# Two files are the reader itself and are not counted: the contract's `archive.rs`, and core's
+# out-of-process RAR backend, which is the `RarReader` implementation the seam exists for. Test
+# items are blanked before counting, on the same rules as §15 and §16.
+ARCHIVE_BUDGET = REPO_ROOT / "scripts" / "archive_budget.json"
+ARCHIVE_OWNER_MODULES = (
+    "crates/agora-game-api/src/archive.rs",
+    "crates/agora-core/src/content_store/rar.rs",
+)
+ARCHIVE_OPEN_ROOTS = (
+    CORE_SRC,
+    REPO_ROOT / "crates" / "agora-game-minecraft" / "src",
+    REPO_ROOT / "crates" / "agora-game-creation" / "src",
+    REPO_ROOT / "crates" / "agora-plugin-host" / "src",
+    CLI_SRC,
+    DESKTOP_SRC,
+)
+# Each pattern is one direct open, however it is spelled. `ZipArchive::new` covers `zip::ZipArchive`
+# and the imported `ZipArchive`; `ZipWriter` is a write and is deliberately absent.
+ARCHIVE_OPEN_PATTERNS = (
+    re.compile(r"ZipArchive\s*::\s*new\s*\("),
+    re.compile(r"sevenz_rust2\s*::\s*Archive\s*::\s*read\s*\("),
+    re.compile(r"sevenz_rust2\s*::\s*ArchiveReader\s*::\s*new\s*\("),
+    re.compile(r"tar\s*::\s*Archive\s*::\s*new\s*\("),
+    re.compile(r"flate2\s*::\s*read\s*::\s*GzDecoder\s*::\s*new\s*\("),
+    # A process that lists or extracts an archive.
+    re.compile(r"Command\s*::\s*new\s*\(\s*[^)]*(?:tar|unrar|7z)"),
+)
+
+
+def archive_opens_in(path: Path) -> int:
+    """How many times one Rust file opens an archive directly."""
+    cleaned = blank_test_items(blank_rust_noise(path.read_text(encoding="utf-8", errors="replace")))
+    return sum(len(pattern.findall(cleaned)) for pattern in ARCHIVE_OPEN_PATTERNS)
+
+
+def check_one_archive_reader() -> None:
+    try:
+        budget_document = json.loads(ARCHIVE_BUDGET.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        err(f"{ARCHIVE_BUDGET.name} is missing: the archive-open budget is checked in")
+        return
+    except (OSError, ValueError) as exc:
+        err(f"Cannot read {ARCHIVE_BUDGET.name}: {exc}")
+        return
+    allowed_counts = budget_document.get("opens", {})
+    if not isinstance(allowed_counts, dict):
+        err(f"{ARCHIVE_BUDGET.name}: 'opens' must be an object of file to count")
+        return
+
+    found = {}
+    for root in ARCHIVE_OPEN_ROOTS:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*.rs")):
+            if is_test_only_module_file(path):
+                continue
+            relative = path.relative_to(REPO_ROOT).as_posix()
+            if relative in ARCHIVE_OWNER_MODULES:
+                continue
+            count = archive_opens_in(path)
+            if count:
+                found[relative] = count
+
+    problems = []
+    for name in sorted(set(found) - set(allowed_counts)):
+        problems.append(
+            f"  {name}: {found[name]} direct archive open(s) not in the budget; use "
+            f"agora_game_api::SafeArchive, or add its count to {ARCHIVE_BUDGET.name}"
+        )
+    for name in sorted(set(allowed_counts) - set(found)):
+        problems.append(f"  {name}: budgeted but no direct archive open found; remove its entry")
+
+    committed = committed_archive_budget()
+    if committed is None:
+        print(
+            "note: no committed archive budget to compare against (no git, no parent commit, or "
+            "the file is new at the branch point); the only-goes-down rule is unchecked this run",
+            file=sys.stderr,
+        )
+    elif budget_document.get("rule") != committed.get("rule"):
+        print(
+            f"note: the counting rule changed ({committed.get('rule')} -> "
+            f"{budget_document.get('rule')}), so the numbers are re-taken; the only-goes-down rule "
+            "starts from this commit",
+            file=sys.stderr,
+        )
+    else:
+        was = committed.get("opens", {})
+        for name in sorted(set(found) | set(was)):
+            raised = found.get(name, 0) > was.get(name, 0)
+            if raised:
+                problems.append(
+                    f"  {name}: direct archive opens raised from {was.get(name, 0)} to "
+                    f"{found.get(name, 0)}; this budget only shrinks"
+                )
+
+    for name in sorted(set(found) & set(allowed_counts)):
+        allowed = allowed_counts[name]
+        if not isinstance(allowed, int):
+            problems.append(f"  {name}: budget must be a whole number, not {allowed!r}")
+        elif found[name] > allowed:
+            problems.append(
+                f"  {name}: {found[name]} direct archive opens, budget {allowed}; this budget only "
+                "shrinks. Move the open onto agora_game_api::SafeArchive"
+            )
+        elif found[name] < allowed:
+            problems.append(
+                f"  {name}: {found[name]} direct archive opens, below the budget of {allowed}; "
+                f"lower it to {found[name]} in {ARCHIVE_BUDGET.name}"
+            )
+
+    if problems:
+        err("One archive reader (MASTER_SPEC §32.3)")
+        for problem in problems:
+            print(problem, file=sys.stderr)
+    else:
+        total = sum(found.values())
+        print(f"OK: {total} direct archive opens left outside SafeArchive, within budget")
+
+
+def committed_archive_budget() -> dict[str, Any] | None:
+    """The archive budget as the branch point has it, or `None` when there is no git to ask."""
+    reference = budget_baseline_ref()
+    if reference is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "show", f"{reference}:{ARCHIVE_BUDGET.relative_to(REPO_ROOT).as_posix()}"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> int:
@@ -1511,6 +1692,10 @@ def main() -> int:
 
     print("--- 16. Path rules and path comparison ---")
     check_path_rules()
+    print()
+
+    print("--- 17. One archive reader ---")
+    check_one_archive_reader()
     print()
 
     if EXIT_CODE == 0:

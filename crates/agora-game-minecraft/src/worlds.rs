@@ -13,6 +13,9 @@ use agora_core as core_api;
 use agora_core::ctx::Ctx;
 use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::instance_runtime::InstanceGuard;
+use agora_game_api::{
+    classify_entry_name, ArchiveError, ArchiveLimits, EntryName, NamePolicy, SafeArchive, Select,
+};
 use base64::Engine;
 use core_api::app_paths::is_safe_file_name;
 use fastnbt::Value;
@@ -23,9 +26,6 @@ use std::path::{Path, PathBuf};
 
 /// Icons larger than this are not inlined; the game writes 64×64 PNGs.
 const MAX_ICON_BYTES: u64 = 256 * 1024;
-/// Limits for importing a world archive.
-const MAX_IMPORT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-const MAX_IMPORT_ENTRIES: usize = 200_000;
 
 /// One world as the Worlds page shows it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -342,14 +342,9 @@ impl WorldService {
         let saves = dir.join("saves");
         std::fs::create_dir_all(&saves)
             .map_err(|e| io_error("ERR_WORLD_IMPORT", "Could not create saves/", e))?;
-        let file = std::fs::File::open(archive)
-            .map_err(|e| io_error("ERR_WORLD_IMPORT", "Could not open the archive", e))?;
-        let mut zip = zip::ZipArchive::new(file)
-            .map_err(|e| io_error("ERR_WORLD_IMPORT", "Not a readable zip archive", e))?;
-        if zip.len() > MAX_IMPORT_ENTRIES {
-            return Err(error("ERR_WORLD_IMPORT", "The archive has too many files."));
-        }
-        let prefix = world_prefix(&mut zip)?;
+        let mut source = SafeArchive::open(archive, ArchiveLimits::WORLD_ARCHIVE)
+            .map_err(|e| archive_error("Could not read the archive", e))?;
+        let prefix = world_prefix(&source)?;
         let suggested = prefix
             .trim_end_matches('/')
             .rsplit('/')
@@ -367,11 +362,16 @@ impl WorldService {
         let folder = free_folder_name(&saves, &suggested);
         let staging = saves.join(format!(".{folder}.agora-import"));
         let _ = std::fs::remove_dir_all(&staging);
-        let result = extract_world(&mut zip, &prefix, &staging).and_then(|()| {
-            std::fs::rename(&staging, saves.join(&folder))
+        let world_root = if prefix.is_empty() {
+            staging.clone()
+        } else {
+            staging.join(prefix.trim_end_matches('/'))
+        };
+        let result = extract_world(&mut source, &prefix, &staging).and_then(|()| {
+            std::fs::rename(&world_root, saves.join(&folder))
                 .map_err(|e| io_error("ERR_WORLD_IMPORT", "Could not finish the import", e))
         });
-        if result.is_err() {
+        if result.is_err() || world_root != staging {
             let _ = std::fs::remove_dir_all(&staging);
         }
         result.map(|()| folder)
@@ -845,22 +845,25 @@ fn write_world_zip(world: &Path, folder: &str, destination: &Path) -> LauncherRe
 
 /// The folder inside the archive that holds `level.dat`: the shallowest one,
 /// as `""` for the root or `"name/"`.
-fn world_prefix(zip: &mut zip::ZipArchive<std::fs::File>) -> LauncherResult<String> {
+fn world_prefix(archive: &SafeArchive) -> LauncherResult<String> {
     let mut best: Option<String> = None;
-    for index in 0..zip.len() {
-        let entry = zip
-            .by_index_raw(index)
-            .map_err(|e| io_error("ERR_WORLD_IMPORT", "Could not read the archive", e))?;
-        let Some(path) = entry.enclosed_name() else {
+    for entry in archive.file_entries() {
+        // The name read the way the extraction reads it: `./MyWorld/level.dat` is
+        // `MyWorld/level.dat`, and the selection below is made against that classified path, so a
+        // folder found under one spelling and selected under another would take none of the world.
+        let EntryName::Writable(rel) = classify_entry_name(&entry.name) else {
             continue;
         };
-        if path.file_name().and_then(|n| n.to_str()) != Some("level.dat") {
+        let path = rel.as_str();
+        // The file has to *be* `level.dat`: `backup-level.dat` ends with it and is not a world, so
+        // a level file an archive keeps as a copy cannot pick the folder.
+        let (parent, file) = match path.rsplit_once('/') {
+            Some((parent, file)) => (parent, file),
+            None => ("", path),
+        };
+        if file != "level.dat" {
             continue;
         }
-        let parent = path
-            .parent()
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_default();
         let prefix = if parent.is_empty() {
             String::new()
         } else {
@@ -881,54 +884,31 @@ fn world_prefix(zip: &mut zip::ZipArchive<std::fs::File>) -> LauncherResult<Stri
     })
 }
 
-fn extract_world(
-    zip: &mut zip::ZipArchive<std::fs::File>,
-    prefix: &str,
-    target: &Path,
-) -> LauncherResult<()> {
-    std::fs::create_dir_all(target)
-        .map_err(|e| io_error("ERR_WORLD_IMPORT", "Could not create the world folder", e))?;
-    let mut written = 0u64;
-    for index in 0..zip.len() {
-        let mut entry = zip
-            .by_index(index)
-            .map_err(|e| io_error("ERR_WORLD_IMPORT", "Could not read the archive", e))?;
-        // `enclosed_name` rejects absolute paths and `..`, so nothing can
-        // land outside the world folder.
-        let Some(path) = entry.enclosed_name() else {
-            continue;
-        };
-        let path = path.to_string_lossy().replace('\\', "/");
-        let Some(relative) = path.strip_prefix(prefix) else {
-            continue;
-        };
-        if relative.is_empty() || entry.is_symlink() {
-            continue;
-        }
-        let destination = target.join(relative);
-        if entry.is_dir() {
-            std::fs::create_dir_all(&destination)
-                .map_err(|e| io_error("ERR_WORLD_IMPORT", "Could not create a folder", e))?;
-            continue;
-        }
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| io_error("ERR_WORLD_IMPORT", "Could not create a folder", e))?;
-        }
-        let mut out = std::fs::File::create(&destination)
-            .map_err(|e| io_error("ERR_WORLD_IMPORT", "Could not write a world file", e))?;
-        let remaining = MAX_IMPORT_BYTES.saturating_sub(written);
-        let copied = std::io::copy(&mut (&mut entry).take(remaining + 1), &mut out)
-            .map_err(|e| io_error("ERR_WORLD_IMPORT", "Could not write a world file", e))?;
-        written += copied;
-        if written > MAX_IMPORT_BYTES {
-            return Err(error(
-                "ERR_WORLD_IMPORT",
-                "The world in that archive is too large.",
-            ));
-        }
-    }
-    Ok(())
+/// Unpack the world under `prefix` into `target`, and nothing else.
+///
+/// The archive's names are the reader's to check: an entry that escapes the
+/// folder, carries a link or names something no disk can hold refuses the whole
+/// import with the entry named, rather than writing part of a world.
+fn extract_world(archive: &mut SafeArchive, prefix: &str, target: &Path) -> LauncherResult<()> {
+    let wanted = prefix.to_string();
+    archive
+        .extract_where(target, NamePolicy::Refuse, &mut |name| {
+            let path = name.replace('\\', "/");
+            if path.starts_with(&wanted) && path != wanted {
+                Select::Write
+            } else {
+                // A README beside the world folder, or a second world in the same
+                // archive: left out, and reported as left out.
+                Select::LeaveOut("it is not part of this world".to_string())
+            }
+        })
+        .map(|_| ())
+        .map_err(|e| archive_error("Could not import the world", e))
+}
+
+/// A refusal from the one archive reader, as the code the Worlds page already reports.
+fn archive_error(context: &str, refusal: ArchiveError) -> LauncherError {
+    error("ERR_WORLD_IMPORT", format!("{context}: {refusal}"))
 }
 
 #[cfg(test)]
@@ -1054,6 +1034,83 @@ mod tests {
         let saves = root.path().join("instances/inst/saves");
         assert!(saves.join(&folder).join("level.dat").is_file());
         assert!(saves.join(&folder).join("region/r.0.0.mca").is_file());
+    }
+
+    #[test]
+    fn import_refuses_an_archive_that_climbs_out_of_the_world_folder() {
+        // The reader's rule, not the importer's: an entry that leaves the folder refuses the whole
+        // import with the entry named, where the old loop skipped it silently and imported the rest.
+        let (root, service) = fixture();
+        let archive = root.path().join("evil.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("MyWorld/level.dat", options).unwrap();
+        zip.write_all(&level_dat("Evil", 1, 0)).unwrap();
+        zip.start_file("../escape.txt", options).unwrap();
+        zip.write_all(b"x").unwrap();
+        zip.finish().unwrap();
+
+        let err = service.import("inst", &archive).unwrap_err();
+        assert!(err.to_string().contains("escape.txt"), "{err}");
+        let saves = root.path().join("instances/inst/saves");
+        assert!(
+            !saves.join("escape.txt").exists(),
+            "nothing may be written outside the world folder"
+        );
+        assert_eq!(
+            std::fs::read_dir(&saves).unwrap().count(),
+            2,
+            "the two fixture worlds, and no staging folder left behind"
+        );
+    }
+
+    #[test]
+    fn a_level_file_kept_as_a_copy_does_not_pick_the_folder() {
+        // `backup-level.dat` at the archive's root ends with `level.dat`, and "shallowest wins"
+        // then picked the root: the import took the copy and none of the world.
+        let (root, service) = fixture();
+        let archive = root.path().join("copies.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("backup-level.dat", options).unwrap();
+        zip.write_all(&level_dat("Old", 1, 0)).unwrap();
+        zip.start_file("MyWorld/level.dat", options).unwrap();
+        zip.write_all(&level_dat("Real", 1, 0)).unwrap();
+        zip.start_file("MyWorld/region/r.0.0.mca", options).unwrap();
+        zip.write_all(b"region").unwrap();
+        zip.finish().unwrap();
+
+        let folder = service.import("inst", &archive).unwrap();
+        let saves = root.path().join("instances/inst/saves");
+        assert!(
+            saves.join(&folder).join("region/r.0.0.mca").is_file(),
+            "the world's own folder, not the root the copy sits in"
+        );
+        assert!(!saves.join(&folder).join("backup-level.dat").exists());
+    }
+
+    #[test]
+    fn a_world_written_with_a_leading_dot_slash_imports() {
+        // `./MyWorld/level.dat` names the same folder as `MyWorld/level.dat`: some archivers write the
+        // dot. Discovery and selection have to read that name the same way, or the folder is found
+        // and none of the world's files are taken.
+        let (root, service) = fixture();
+        let archive = root.path().join("dotted.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("./MyWorld/level.dat", options).unwrap();
+        zip.write_all(&level_dat("Dotted", 1, 0)).unwrap();
+        zip.start_file("./MyWorld/region/r.0.0.mca", options)
+            .unwrap();
+        zip.write_all(b"region").unwrap();
+        zip.finish().unwrap();
+
+        let folder = service.import("inst", &archive).unwrap();
+        let saves = root.path().join("instances/inst/saves");
+        assert!(
+            saves.join(&folder).join("region/r.0.0.mca").is_file(),
+            "the world's own folder, dot and all"
+        );
     }
 
     #[test]

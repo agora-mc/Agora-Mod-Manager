@@ -47,6 +47,7 @@ use super::service::{Consent, PluginService, UpdateOutcome};
 use super::store::{self, OfficialProvenance};
 use super::{install, InstallPreview};
 use crate::error::{LauncherError, LauncherResult};
+use agora_game_api::{ArchiveLimits, NamePolicy, SafeArchive};
 use agora_plugin_api::manifest::PluginId;
 use rusqlite::Connection;
 use semver::{Version, VersionReq};
@@ -546,42 +547,21 @@ fn finish_digest(mut entries: Vec<DigestEntry>) -> String {
 /// installer compares to the signed entry before unpacking. Unpacking writes
 /// the files and the folders above them, and nothing else, so the two agree.
 pub fn zip_tree_digest(bytes: &[u8]) -> LauncherResult<String> {
-    use std::io::Read;
-    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| {
-        refused(
-            "ERR_PLUGIN_PACKAGE_INVALID",
-            format!("not a readable plugin package: {e}"),
-        )
-    })?;
-    if zip.len() > install::MAX_ENTRIES {
-        return Err(refused(
-            "ERR_PLUGIN_PACKAGE_INVALID",
-            "the package holds too many files",
-        ));
-    }
+    let mut archive = SafeArchive::open_bytes(bytes.to_vec(), ArchiveLimits::PLUGIN_PACKAGE)
+        .map_err(|error| refused("ERR_PLUGIN_PACKAGE_INVALID", error.to_string()))?;
+    // The same naming decision the install makes, so a package the digest covers is a package the
+    // installer will accept (MASTER_SPEC §32.3).
+    archive
+        .left_out_names(NamePolicy::Refuse)
+        .map_err(|error| refused("ERR_PLUGIN_PACKAGE_INVALID", error.to_string()))?;
+
+    let names: Vec<String> = archive
+        .file_entries()
+        .map(|entry| entry.name.clone())
+        .collect();
     let mut files: BTreeMap<String, String> = BTreeMap::new();
     let mut folders: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut total = 0u64;
-    for index in 0..zip.len() {
-        let mut entry = zip.by_index(index).map_err(|e| {
-            refused(
-                "ERR_PLUGIN_PACKAGE_INVALID",
-                format!("unreadable entry in the package: {e}"),
-            )
-        })?;
-        let name = entry
-            .name()
-            .map_err(|e| {
-                refused(
-                    "ERR_PLUGIN_PACKAGE_INVALID",
-                    format!("unreadable entry in the package: {e}"),
-                )
-            })?
-            .into_owned();
-        if entry.is_dir() {
-            continue;
-        }
-        install::validate_entry_path(&name)?;
+    for name in names {
         let parts: Vec<&str> = name
             .split(['/', '\\'])
             .filter(|part| !part.is_empty() && *part != ".")
@@ -595,29 +575,14 @@ pub fn zip_tree_digest(bytes: &[u8]) -> LauncherResult<String> {
         for depth in 1..=ancestors.len() {
             folders.insert(parts[..depth].join("/"));
         }
+        let content = archive.read(&name).map_err(|error| {
+            refused(
+                "ERR_PLUGIN_PACKAGE_INVALID",
+                format!("could not read `{name}`: {error}"),
+            )
+        })?;
         let mut hasher = Sha256::new();
-        let mut buffer = [0u8; 64 * 1024];
-        let mut read_here = 0u64;
-        loop {
-            let n = entry.read(&mut buffer).map_err(|e| {
-                refused(
-                    "ERR_PLUGIN_PACKAGE_INVALID",
-                    format!("could not read `{name}`: {e}"),
-                )
-            })?;
-            if n == 0 {
-                break;
-            }
-            read_here += n as u64;
-            total += n as u64;
-            if read_here > install::MAX_ENTRY_BYTES || total > install::MAX_TOTAL_BYTES {
-                return Err(refused(
-                    "ERR_PLUGIN_PACKAGE_INVALID",
-                    "the package expands past its size limit",
-                ));
-            }
-            hasher.update(&buffer[..n]);
-        }
+        hasher.update(&content);
         // A later entry with the same path replaces an earlier one, as unpacking does.
         files.insert(parts.join("/"), hex::encode(hasher.finalize()));
     }

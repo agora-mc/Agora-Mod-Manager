@@ -185,11 +185,16 @@ dependencies = [
 name = "agora-game-api"
 version = "0.9.5"
 dependencies = [
+ "flate2",
  "regex",
  "semver",
  "serde",
  "serde_json",
+ "sevenz-rust2",
+ "tar",
+ "tempfile",
  "thiserror 1.0.69",
+ "zip",
 ]
 
 [[package]]

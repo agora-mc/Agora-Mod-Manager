@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use agora_game_api::StrictRelPath;
+use agora_game_api::{ArchiveLimits, SafeArchive, StrictRelPath};
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -327,21 +327,34 @@ fn run_listing(tar: &Path, archive: &Path) -> Result<Vec<u8>, ContentError> {
     Ok(output.stdout)
 }
 
-/// List a RAR's file entries without extracting anything, through the same `tar -tvf` listing and
-/// rules `stage_rar` uses.
+/// List a RAR's file entries without extracting anything.
+///
+/// The archive is opened by the one reader with the `GAME_MOD` preset, through the backend above, so
+/// a RAR is listed — and held to the same name, duplicate and path rules — like the zip and 7z mods
+/// beside it (MASTER_SPEC §32.3). The preset carries the numbers the store enforced before this
+/// reader existed, which were none for sizes: a Skyrim texture or BSA mod is past the limits a
+/// Technic pack is held to. What stays here is the store's own bookkeeping: item ids, the path set
+/// and the free-space question.
 pub(super) fn list_rar_entries(
     archive_path: &Path,
 ) -> Result<Vec<ListedArchiveEntry>, ContentError> {
-    let tar = tar_exe_path()?;
-    let listing = run_listing(&tar, archive_path)?;
-    let entries = parse_tar_listing(&listing)?;
-    if entries.is_empty() {
+    let archive = SafeArchive::open_with_rar(archive_path, ArchiveLimits::GAME_MOD, rar_reader())
+        .map_err(reader_failure)?;
+    let listed: Vec<ListedEntry> = archive
+        .file_entries()
+        .map(|entry| ListedEntry {
+            kind: ListedKind::File,
+            size: entry.size,
+            name: entry.name.clone(),
+        })
+        .collect();
+    if listed.is_empty() {
         return Err(ContentError::CorruptArchive(
             "Windows' tar found no files in this RAR archive: it is damaged, or not a RAR archive"
                 .to_string(),
         ));
     }
-    let plan = plan_from_listing(entries)?;
+    let plan = plan_from_listing(listed)?;
     Ok(plan
         .files
         .into_iter()
@@ -353,6 +366,17 @@ pub(super) fn list_rar_entries(
             size,
         })
         .collect())
+}
+
+/// The reader's refusal, as the store's own error. The backend speaks tar's words, so a password is
+/// recognised there rather than guessed at here.
+fn reader_failure(error: agora_game_api::ArchiveError) -> ContentError {
+    let text = error.to_string();
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("passphrase") || lower.contains("password") || lower.contains("encrypt") {
+        return ContentError::PasswordProtected;
+    }
+    ContentError::CorruptArchive(text)
 }
 
 /// Total size of the files under `dir`, ignoring anything that cannot be read.
@@ -607,6 +631,242 @@ pub(super) fn stage_rar(
     }
 
     Ok((staged_entries, guard, staging_dir))
+}
+
+// ---------------------------------------------------------------------------
+// The reader's first RAR backend
+// ---------------------------------------------------------------------------
+
+/// Windows' `tar.exe`, behind `agora_game_api::RarReader`.
+///
+/// The one archive reader handles zip, 7z, tar and tar.gz in process and takes a RAR through this
+/// seam, because a RAR decoder in process is a dependency the package allowlist does not hold. The
+/// listing and the bytes come from the same `tar.exe` the importer has always used, so a RAR that
+/// lists here extracts there (MASTER_SPEC §32.3).
+///
+/// **A member is never named to `tar.exe`.** bsdtar reads the arguments after `--` as *patterns*:
+/// `tar -xOf archive -- "[ab].txt"` prints the bytes of `a.txt` and `b.txt`, and a member called
+/// `[ELLE] x.txt` matches nothing at all. So the archive is listed, the listing is held to every path
+/// rule, the whole archive is extracted **once** into a folder of this backend's own, and every read
+/// is served from the files verified there — by name, from a folder that holds nothing else, with no
+/// member data buffered through a pipe.
+///
+/// Names are handed over exactly as tar prints them: the reader decides what a name may do, and a
+/// backend that pre-filtered would be a second path rule.
+#[derive(Default)]
+pub struct WindowsTarReader {
+    /// The private copy of the archive, made the first time an entry is read and dropped with the
+    /// reader. One backend serves one archive; the reader makes a fresh one for each it opens.
+    staged: std::sync::Mutex<Option<std::sync::Arc<StagedRar>>>,
+}
+
+/// A whole archive extracted into a folder of its own, with the listing it was checked against.
+struct StagedRar {
+    root: PathBuf,
+    files: HashMap<String, PathBuf>,
+}
+
+impl Drop for StagedRar {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+impl WindowsTarReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The archive extracted into a private folder, extracted once however many entries are read.
+    fn staged(
+        &self,
+        archive: &Path,
+        admitted: Option<&[agora_game_api::RarEntry]>,
+    ) -> Result<std::sync::Arc<StagedRar>, String> {
+        let mut slot = self
+            .staged
+            .lock()
+            .map_err(|_| "the RAR staging folder was left locked".to_string())?;
+        if let Some(staged) = slot.as_ref() {
+            return Ok(std::sync::Arc::clone(staged));
+        }
+        let staged =
+            std::sync::Arc::new(stage_whole_archive(archive, admitted).map_err(|e| e.to_string())?);
+        *slot = Some(std::sync::Arc::clone(&staged));
+        Ok(staged)
+    }
+}
+
+/// Refuse a listing that is not the listing the limits were applied to.
+///
+/// Staging runs `tar` a second time, so between the reader's listing and the copy there is a moment
+/// in which the file can be replaced. The limits, the duplicate check and the name rules were all
+/// judged on the first listing; serving the second one's bytes would apply them to a listing that is
+/// gone. Names, sizes and count have to agree, or the archive is refused.
+fn check_unchanged(
+    listed: &[ListedEntry],
+    admitted: &[agora_game_api::RarEntry],
+) -> Result<(), ContentError> {
+    let changed = |detail: String| {
+        Err(ContentError::CorruptArchive(format!(
+            "the archive changed since it was opened: {detail}"
+        )))
+    };
+    if listed.len() != admitted.len() {
+        return changed(format!(
+            "it listed {} entries then and {} now",
+            admitted.len(),
+            listed.len()
+        ));
+    }
+    for (now, then) in listed.iter().zip(admitted) {
+        let is_directory = now.kind == ListedKind::Dir;
+        if now.name != then.name {
+            return changed(format!("'{}' was listed as '{}'", then.name, now.name));
+        }
+        if is_directory != then.is_directory {
+            return changed(format!(
+                "'{}' was {} then and is {} now",
+                now.name,
+                if then.is_directory {
+                    "a folder"
+                } else {
+                    "a file"
+                },
+                if is_directory { "a folder" } else { "a file" }
+            ));
+        }
+        if now.size != then.size {
+            return changed(format!(
+                "'{}' was {} bytes then and is {} now",
+                now.name, then.size, now.size
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// List a whole archive, hold it to the rules, extract it once into a folder of its own and check
+/// what tar wrote against the listing.
+///
+/// The listing comes first and is the only thing the checks see, exactly as for the importer: a line
+/// that cannot be read refuses the archive, a name that escapes or collides refuses it, and the sizes
+/// the extraction is held to are the listing's own. What is extracted is then checked file by file —
+/// sizes, folders, no link or reparse point — so a member is served from a file whose size is what the
+/// listing said, not from a size tar claimed on stdout.
+fn stage_whole_archive(
+    archive: &Path,
+    admitted: Option<&[agora_game_api::RarEntry]>,
+) -> Result<StagedRar, ContentError> {
+    let tar = tar_exe_path()?;
+    let listing = run_listing(&tar, archive)?;
+    let entries = parse_tar_listing(&listing)?;
+    if entries.is_empty() {
+        return Err(ContentError::CorruptArchive(
+            "Windows' tar found no files in this RAR archive: it is damaged, or not a RAR archive"
+                .to_string(),
+        ));
+    }
+    // The listing the limits were applied to, before it is thrown away: a RAR that changed between
+    // the two listings would otherwise be served from bytes nothing measured.
+    if let Some(admitted) = admitted {
+        check_unchanged(&entries, admitted)?;
+    }
+    let plan = plan_from_listing(entries)?;
+    let root = private_staging_folder()?;
+    let extracted = run_extraction(&tar, archive, &root, plan.declared_total)
+        .and_then(|()| check_extracted_tree(&root, &plan));
+    if let Err(error) = extracted {
+        let _ = std::fs::remove_dir_all(&root);
+        return Err(error);
+    }
+    let files = plan
+        .files
+        .iter()
+        .map(|(rel, _)| (rel.as_str().to_string(), root.join(rel.as_str())))
+        .collect();
+    Ok(StagedRar { root, files })
+}
+
+/// A folder of this process's own under the system temporary directory, for one archive's copy.
+///
+/// It is not the content store's staging area: this backend is created by the reader without a `Ctx`,
+/// and the copy is the size of the archive's contents, so it must never land inside an instance or a
+/// game folder.
+fn private_staging_folder() -> Result<PathBuf, ContentError> {
+    let unique = format!(
+        "agora-rar-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let path = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+impl agora_game_api::RarReader for WindowsTarReader {
+    fn list(&self, archive: &Path) -> Result<Vec<agora_game_api::RarEntry>, String> {
+        let tar = tar_exe_path().map_err(|error| error.to_string())?;
+        let listing = run_listing(&tar, archive).map_err(|error| error.to_string())?;
+        let entries = parse_tar_listing(&listing).map_err(|error| error.to_string())?;
+        if entries.is_empty() {
+            // Since bsdtar 3.8.9 a RAR5 signature followed by garbage lists nothing and exits 0.
+            return Err(
+                "Windows' tar found no files in this RAR archive: it is damaged, or not a RAR \
+                 archive"
+                    .to_string(),
+            );
+        }
+        Ok(entries
+            .into_iter()
+            .map(|entry| agora_game_api::RarEntry {
+                name: entry.name,
+                size: entry.size,
+                is_directory: entry.kind == ListedKind::Dir,
+            })
+            .collect())
+    }
+
+    /// Stage the archive against the listing the reader's limits were applied to. This is the call
+    /// that turns "the file I listed" into "the file I serve": a relisting that disagrees with it
+    /// refuses the archive instead of serving bytes nothing measured.
+    fn stage(&self, archive: &Path, admitted: &[agora_game_api::RarEntry]) -> Result<(), String> {
+        self.staged(archive, Some(admitted)).map(|_| ())
+    }
+
+    fn read_entry(
+        &self,
+        archive: &Path,
+        name: &str,
+        out: &mut dyn std::io::Write,
+    ) -> Result<u64, String> {
+        // Staged by `stage` before the first read; a backend used on its own still stages here,
+        // with nothing to compare its listing to.
+        let staged = self.staged(archive, None)?;
+        let Some(path) = staged.files.get(name) else {
+            return Err(format!("no entry is named '{name}' in this archive"));
+        };
+        let mut file = std::fs::File::open(path)
+            .map_err(|error| format!("could not read '{name}': {error}"))?;
+        let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
+        let mut written = 0u64;
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|error| format!("could not read '{name}': {error}"))?;
+            if read == 0 {
+                return Ok(written);
+            }
+            out.write_all(&buffer[..read])
+                .map_err(|error| format!("could not write '{name}': {error}"))?;
+            written += read as u64;
+        }
+    }
+}
+
+/// The RAR backend this build has: Windows' `tar.exe`, or one that says why it cannot.
+pub fn rar_reader() -> Box<dyn agora_game_api::RarReader> {
+    Box::new(WindowsTarReader::new())
 }
 
 // ---------------------------------------------------------------------------
@@ -905,8 +1165,172 @@ drwxr-xr-x  0 0      0           0 Mar 31  2023 [ELLE] Bifrost/Main\r\n\
         assert!(err.to_string().contains("Windows' built-in tar"));
     }
 
-    // ---- real archives (run with `cargo test -p agora-core -- --ignored rar`) ----
+    #[cfg(windows)]
+    #[test]
+    fn the_reader_takes_a_rar_through_its_first_backend() {
+        // No RAR the repository may commit exists, so this pins the wiring rather than a listing: the
+        // bytes reach Windows' tar through `SafeArchive::open_with_rar`, and tar's refusal is what
+        // comes back — a seam that was not connected would say it has no backend at all.
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("not-really.rar");
+        std::fs::write(&archive, b"Rar!\x1a\x07\x00and then nothing tar can read").unwrap();
+        let err = list_rar_entries(&archive).expect_err("tar cannot read this");
+        let text = err.to_string();
+        assert!(
+            !text.contains("no RAR reader"),
+            "the backend was asked: {text}"
+        );
+        assert!(
+            text.contains("tar") || text.contains("RAR"),
+            "the refusal is tar's own: {text}"
+        );
+    }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_member_whose_name_looks_like_a_glob_is_read_by_its_own_bytes() {
+        // `tar -xOf <archive> -- <name>` reads the name as a *pattern*, not a name: `[ab].txt`
+        // printed the bytes of `a.txt` and `b.txt`, and a member called `[ELLE] x.txt` matched
+        // nothing at all. The backend extracts the archive once into a folder of its own and serves
+        // reads from the files it verified there, so a name is a file name (MASTER_SPEC §32.3).
+        if tar_exe_path().is_err() {
+            println!("skipped: no Windows tar.exe on this machine, so there is no RAR reader");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // A zip is an archive `tar.exe` reads exactly as it reads a RAR: the same listing, the same
+        // extraction. No RAR the repository may commit exists, and this is the same code path.
+        let archive = dir.path().join("members.zip");
+        {
+            use std::io::Write;
+            let file = std::fs::File::create(&archive).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            for (name, bytes) in [
+                ("[ab].txt", b"A-one".as_slice()),
+                ("a.txt", b"just-a".as_slice()),
+                ("b.txt", b"just-b".as_slice()),
+                ("[ELLE] x.txt", b"elle".as_slice()),
+            ] {
+                zip.start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(bytes).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+
+        let reader = WindowsTarReader::new();
+        let mut bytes = Vec::new();
+        use agora_game_api::RarReader as _;
+        let written = reader.read_entry(&archive, "[ab].txt", &mut bytes).unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(
+            bytes, b"A-one",
+            "the member's own bytes, not a.txt's and b.txt's"
+        );
+        bytes.clear();
+        reader
+            .read_entry(&archive, "[ELLE] x.txt", &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"elle");
+        bytes.clear();
+        reader.read_entry(&archive, "a.txt", &mut bytes).unwrap();
+        assert_eq!(bytes, b"just-a");
+    }
+
+    fn admitted(listed: &[ListedEntry]) -> Vec<agora_game_api::RarEntry> {
+        listed
+            .iter()
+            .map(|entry| agora_game_api::RarEntry {
+                name: entry.name.clone(),
+                size: entry.size,
+                is_directory: entry.kind == ListedKind::Dir,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_listing_that_changed_since_it_was_opened_is_refused() {
+        // Staging runs tar a second time. The limits, the duplicate check and the name rules were
+        // all judged on the first listing, so a relisting that disagrees with it means the bytes are
+        // not the bytes that were measured.
+        let listed = entries(CAPTURED);
+        let then = admitted(&listed);
+        check_unchanged(&listed, &then).expect("the listing it was given");
+
+        let mut bigger = then.clone();
+        bigger[0].size += 1;
+        let error = check_unchanged(&listed, &bigger).expect_err("a size that changed");
+        assert!(
+            error.to_string().contains("changed since it was opened"),
+            "{error}"
+        );
+
+        let mut renamed = then.clone();
+        renamed[1].name = "other.esp".into();
+        assert!(check_unchanged(&listed, &renamed).is_err());
+
+        let mut fewer = then.clone();
+        fewer.pop();
+        let error = check_unchanged(&listed, &fewer).expect_err("an entry that went missing");
+        assert!(
+            error.to_string().contains("changed since it was opened"),
+            "{error}"
+        );
+
+        let mut folder_became_file = then.clone();
+        folder_became_file[2].is_directory = false;
+        assert!(check_unchanged(&listed, &folder_became_file).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staging_refuses_an_archive_that_is_not_the_listing_it_was_given() {
+        if tar_exe_path().is_err() {
+            println!("skipped: no Windows tar.exe on this machine, so there is no RAR reader");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // A zip is an archive `tar.exe` lists and extracts exactly as it does a RAR: the same code
+        // path, and no RAR the repository may commit exists.
+        let archive = dir.path().join("members.zip");
+        {
+            use std::io::Write;
+            let file = std::fs::File::create(&archive).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            for (name, bytes) in [
+                ("a.txt", b"just-a".as_slice()),
+                ("b.txt", b"just-b".as_slice()),
+            ] {
+                zip.start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(bytes).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+
+        use agora_game_api::RarReader as _;
+        let reader = WindowsTarReader::new();
+        let listed = reader.list(&archive).unwrap();
+        assert_eq!(listed.len(), 2);
+
+        let mut wrong = listed.clone();
+        wrong[0].size += 1;
+        let error = reader
+            .stage(&archive, &wrong)
+            .expect_err("a listing that is not this archive's");
+        assert!(
+            error.contains("changed since it was opened"),
+            "the refusal names what changed: {error}"
+        );
+
+        // The listing it was measured on stages, and the members read from the copy it made.
+        reader.stage(&archive, &listed).expect("its own listing");
+        let mut bytes = Vec::new();
+        reader.read_entry(&archive, "a.txt", &mut bytes).unwrap();
+        assert_eq!(bytes, b"just-a");
+    }
+
+    // ---- real archives (run with `cargo test -p agora-core -- --ignored rar`) ----
     fn vortex_rars() -> Vec<PathBuf> {
         let dir = std::env::var_os("AGORA_TEST_RAR_DIR")
             .map(PathBuf::from)

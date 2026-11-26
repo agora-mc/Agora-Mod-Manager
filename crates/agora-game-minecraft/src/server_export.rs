@@ -18,6 +18,7 @@
 use crate::gc::{generate_args_for_java, GcProfile};
 use crate::loader_manifests::{self, LoaderEntry};
 use agora_core as core_api;
+use agora_game_api::{ArchiveLimits, SafeArchive};
 use core_api::app_paths::is_safe_file_name;
 use core_api::artifact_hash::verify_download;
 use core_api::ctx::Ctx;
@@ -26,7 +27,6 @@ use core_api::helpers::read_manifest;
 use core_api::http_client::{self, ClientCategory, HttpClients};
 use core_api::network::{NetworkCategory, NetworkPolicy};
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// What an export produced, for the CLI's `--json` and the desktop dialog.
@@ -450,13 +450,10 @@ impl ModSide {
 }
 
 fn read_mod_side(jar_path: &Path, loader: &str) -> ModSide {
-    let file = match std::fs::File::open(jar_path) {
-        Ok(file) => file,
-        Err(error) => return ModSide::Unknown(error.to_string()),
-    };
-    let mut archive = match zip::ZipArchive::new(file) {
+    // Reading a jar's metadata, so the names stay the archive's own keys (MASTER_SPEC §32.3).
+    let mut archive = match SafeArchive::open(jar_path, ArchiveLimits::JAR_METADATA) {
         Ok(archive) => archive,
-        Err(_) => return ModSide::Unknown("not a readable jar".into()),
+        Err(error) => return ModSide::Unknown(error.to_string()),
     };
 
     for name in metadata_candidates(loader) {
@@ -566,11 +563,9 @@ fn side_from_toml(content: &str) -> ModSide {
     ModSide::Unknown("the mod declares conflicting sides".into())
 }
 
-fn read_entry_utf8(archive: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Option<String> {
-    let mut file = archive.by_name(name).ok()?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
-    Some(String::from_utf8_lossy(&buf).into_owned())
+fn read_entry_utf8(archive: &mut SafeArchive, name: &str) -> Option<String> {
+    let bytes = archive.read(name).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 // ---------------------------------------------------------------------------

@@ -513,3 +513,53 @@ fn a_download_matching_a_manual_link_asset_names_its_catalog_entry() {
     assert_eq!(added[0].catalog_item_name.as_deref(), Some("SKSE64"));
     assert!(added[0].reason.contains("SKSE64"), "{}", added[0].reason);
 }
+
+#[test]
+fn a_zip_the_reader_refuses_is_recorded_rather_than_dropped() {
+    // `../escape.txt` is a name that leaves the archive: the store refuses the whole archive, and
+    // that refusal used to be swallowed like a file that is not an archive at all. It is a notice of
+    // its own now, carrying the reader's reason, and it is not counted as a mod waiting to be added.
+    let (_tmp, ctx) = test_ctx();
+    let downloads = tempfile::tempdir().unwrap();
+    watch_folder(&ctx, downloads.path());
+    turn_on(&ctx);
+    let mut state = WatchState::start(&ctx).unwrap();
+
+    create_zip(
+        &downloads.path().join("Climbing Mod.zip"),
+        &[("Cool.esp", b"esp"), ("../escape.txt", b"out")],
+    );
+
+    assert!(
+        scan_until_stable(&mut state, &ctx).is_empty(),
+        "a refused archive is not a mod waiting in the library"
+    );
+    let rows = download_watch::list(&ctx).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].kind, "refused");
+    assert!(rows[0].reason.contains("escape.txt"), "{}", rows[0].reason);
+
+    let scanned = download_watch::scan_folder_now(&ctx, downloads.path()).unwrap();
+    assert_eq!(scanned.len(), 1, "{scanned:?}");
+    assert_eq!(scanned[0].kind, "refused");
+    assert!(scanned[0].reason.contains("escape.txt"));
+}
+
+#[test]
+fn a_file_that_is_not_an_archive_stays_quiet() {
+    // The other half of the rule: a `.zip` whose bytes are not a zip is not content, and is never
+    // reported as a refusal.
+    let (_tmp, ctx) = test_ctx();
+    let downloads = tempfile::tempdir().unwrap();
+    watch_folder(&ctx, downloads.path());
+    turn_on(&ctx);
+    let mut state = WatchState::start(&ctx).unwrap();
+
+    std::fs::write(downloads.path().join("broken.zip"), b"not a zip at all").unwrap();
+
+    assert!(scan_until_stable(&mut state, &ctx).is_empty());
+    assert!(download_watch::list(&ctx).unwrap().is_empty());
+    assert!(download_watch::scan_folder_now(&ctx, downloads.path())
+        .unwrap()
+        .is_empty());
+}

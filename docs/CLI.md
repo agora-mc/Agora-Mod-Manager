@@ -412,8 +412,8 @@ in the desktop app's Library. Nothing is imported, and no file is moved, changed
 
 | Command | Purpose |
 | --- | --- |
-| `agora downloads scan [--folder <path>] [--json]` | Classify the common mod archives (`.zip`, `.7z`, `.rar`, `.jar`, `.mrpack`) in a folder and print each one's game, kind and the reason it was recognised. Browser partials are skipped, and an unrelated archive is left out. Anything already in the content store is marked `already in your library`. The default folder is the one Agora watches, else your Downloads folder |
-| `agora downloads list [--json]` | List the new downloads Agora noticed while download watching was on in the app, as the Library shows them. Files that no longer exist are dropped |
+| `agora downloads scan [--folder <path>] [--json]` | Classify the common mod archives (`.zip`, `.7z`, `.rar`, `.jar`, `.mrpack`) in a folder and print each one's game, kind and the reason it was recognised. Browser partials are skipped, and an unrelated archive is left out. An archive Agora reads and **refuses** — a name that leaves it, two entries with one name, a password, a damaged archive — is listed with kind `refused` and the reader's reason; a file that is not an archive at all is left out. Anything already in the content store is marked `already in your library`. The default folder is the one Agora watches, else your Downloads folder |
+| `agora downloads list [--json]` | List the new downloads Agora noticed while download watching was on in the app, as the Library shows them. Files that no longer exist are dropped. A download the archive reader refused is listed with kind `refused` and the reader's reason |
 | `agora downloads add <ID \| FILE_NAME> [--json]` | Add a noticed download to your library through its game's own flow. `ID` is the start of its SHA-256 as `downloads list` prints it. The file is checked against the hash Agora saw and is only read, never moved or changed. An archive with an installer is stored and named, ready for `games content fomod` |
 | `agora downloads ignore <ID \| FILE_NAME>` | Stop offering a download. It is remembered by its contents, so downloading it again does not bring it back |
 
@@ -656,7 +656,7 @@ Minecraft only loads data packs from inside a world, so Agora copies enabled dat
 | `agora pack discard <REVIEW_ID>` | Throw away the copy `pack review` staged, when you decide not to import it |
 | `agora pack retry <INSTANCE> <PACK_FILE> [--entry <FILENAME>]... [--allow-modrinth-once] [--install-anyway]` | Try an Agora pack's mods again on the instance its import made (after turning Modrinth on, say); mods already installed are skipped |
 | `agora pack mods <PACK>` | List the mods in a catalog pack |
-| `agora pack extract-overrides <INSTANCE> <ZIP>` | Extract a pack's overrides zip into an instance with the import's safety checks |
+| `agora pack extract-overrides <INSTANCE> <ZIP> [--without-unwritable-names]` | Extract a pack's overrides zip into an instance with the import's safety checks. An entry whose name a disk cannot hold stops the extraction and the refusal names each one and why: a Windows reserved name (`config/aux.dds`), a trailing dot or space, a `:`, or two entries a case-insensitive disk stores as one file. `--without-unwritable-names` is the explicit answer to that refusal: the entries that can be written are, and the output lists every entry that was not, with the reason. Nothing is ever dropped without its name and reason |
 | `agora pack install-catalog <ITEM> [--name <NAME>] [--accept-changed] [--allow-unverified]` | Install a catalog entry that pins a provider's modpack, as a new instance |
 | `agora import launchers [--root <DIR>]` | List Prism, CurseForge and Modrinth instances that can be imported |
 | `agora import plan <KEY>... [--root <DIR>] [--name <NAME>] [--no-settings]` | Show what importing launcher instances would copy; prints a plan fingerprint |

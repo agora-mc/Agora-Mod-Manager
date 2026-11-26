@@ -1,12 +1,19 @@
 use agora_core::error::{LauncherError, LauncherResult};
+use agora_game_api::{ArchiveError, ArchiveLimits, NamePolicy, SafeArchive, Select};
 use serde::Serialize;
-use std::io::Read;
 use std::path::Path;
 
-/// Hard limits for zip extraction (§7.2.1).
+/// Hard limits for zip extraction (§7.2.1). The sizes an *archive may hold* are the reader's, in
+/// [`ArchiveLimits::PACK`]; this is the one a caller can see before anything is opened: the file
+/// itself.
 pub const MAX_ZIP_SIZE: u64 = 500 * 1024 * 1024; // 500MB compressed
-const MAX_EXTRACTED_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2GB total extracted
-const MAX_FILE_COUNT: usize = 5000; // 5000 files max
+
+/// What to do about an entry whose name a disk cannot hold.
+///
+/// `Refuse` is the default and the safe answer: the person who asked for the import is shown every
+/// offending name and why. `WithoutThem` is their explicit answer, and the entries they gave up come
+/// back in [`ExtractionResult::left_out`] so the caller can list them.
+pub type NamesPolicy = NamePolicy;
 
 /// Directory whitelist (§7.2.2). Only files under these prefixes are extracted.
 ///
@@ -145,23 +152,43 @@ fn is_agora_owned(path: &str) -> bool {
 /// Result of an override extraction.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExtractionResult {
+    /// The paths written, relative to the instance.
     pub extracted: Vec<String>,
+    /// The paths not written, by name: outside the policy's folders, or a name a disk cannot hold.
     pub skipped: Vec<String>,
+    /// The same entries as `skipped`, each with the reason it was left out. This is what a caller
+    /// shows a person who asked for the import, so nothing is dropped without saying why.
+    pub left_out: Vec<LeftOutEntry>,
     pub total_bytes_written: u64,
+}
+
+/// One entry a pack import did not write, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LeftOutEntry {
+    pub path: String,
+    pub reason: String,
 }
 
 /// Extract a zip file into an instance directory with full sanitization.
 ///
-/// This is the main entry point for §7.2. It:
+/// This is the main entry point for §7.2. The archive is read through
+/// [`SafeArchive`](../agora_game_api/archive/struct.SafeArchive.html), which owns the limits
+/// (the `PACK` preset), the path rules and the write, so this function owns only what is specific to
+/// a pack's overrides:
 /// 1. Checks compressed size against MAX_ZIP_SIZE.
-/// 2. Pre-scans all entries for total uncompressed size and file count.
-/// 3. Validates each entry path against the directory whitelist.
-/// 4. Rejects banned extensions even within whitelisted directories.
-/// 5. Prevents Zip Slip (path traversal) by rejecting `..` and absolute paths.
-/// 6. Tracks actual bytes written and aborts mid-stream if limits are exceeded.
-/// 7. On any security violation, deletes partially extracted files.
+/// 2. Leaves out entries outside the whitelist (or the whole archive, under `Permissive`).
+/// 3. Refuses banned extensions even within whitelisted directories.
+/// 4. Refuses zip slip, links and a damaged archive, through the reader.
+/// 5. Refuses by default an entry whose name a disk cannot hold, and names each one; the caller may
+///    ask for the rest instead, and gets the list of what was left out.
+/// 6. On any refusal, deletes the files it had already written.
 pub fn extract_overrides(zip_path: &Path, dest_dir: &Path) -> LauncherResult<ExtractionResult> {
-    extract_overrides_with(zip_path, dest_dir, OverridePolicy::Standard)
+    extract_overrides_with_inputs(
+        zip_path,
+        dest_dir,
+        OverridePolicy::Standard,
+        NamesPolicy::Refuse,
+    )
 }
 
 /// [`extract_overrides`] under an explicit [`OverridePolicy`].
@@ -169,6 +196,20 @@ pub fn extract_overrides_with(
     zip_path: &Path,
     dest_dir: &Path,
     policy: OverridePolicy,
+) -> LauncherResult<ExtractionResult> {
+    extract_overrides_with_inputs(zip_path, dest_dir, policy, NamesPolicy::Refuse)
+}
+
+/// [`extract_overrides_with`], and what to do about an entry whose name a disk cannot hold.
+///
+/// `NamesPolicy::WithoutThem` is the caller's explicit answer to a refusal it was shown: the usable
+/// entries are written and the rest come back in [`ExtractionResult::left_out`]. Nothing is ever
+/// dropped without a name and a reason.
+pub fn extract_overrides_with_inputs(
+    zip_path: &Path,
+    dest_dir: &Path,
+    policy: OverridePolicy,
+    names: NamesPolicy,
 ) -> LauncherResult<ExtractionResult> {
     // Pre-check: compressed file size.
     let zip_size = zip_path
@@ -190,205 +231,70 @@ pub fn extract_overrides_with(
         });
     }
 
-    let file = std::fs::File::open(zip_path).map_err(|_| LauncherError::Generic {
-        code: "ERR_OVERRIDE_FAILED".to_string(),
-        message: "Could not open zip file.".to_string(),
-    })?;
-
-    let mut archive = zip::ZipArchive::new(file).map_err(|_| LauncherError::Generic {
-        code: "ERR_OVERRIDE_FAILED".to_string(),
-        message: "Invalid or corrupt zip file.".to_string(),
-    })?;
-
-    // Phase 1: Pre-scan all entries for size and count limits.
-    let mut total_uncompressed: u64 = 0;
-    let mut entry_count: usize = 0;
-
-    for i in 0..archive.len() {
-        let entry = archive.by_index(i).map_err(|_| LauncherError::Generic {
-            code: "ERR_OVERRIDE_FAILED".to_string(),
-            message: "Could not read zip entry.".to_string(),
-        })?;
-
-        total_uncompressed = total_uncompressed.saturating_add(entry.size());
-        entry_count += 1;
-
-        if total_uncompressed > MAX_EXTRACTED_SIZE {
-            return Err(LauncherError::Generic {
-                code: "ERR_ZIP_BOMB".to_string(),
-                message: format!(
-                    "Total uncompressed size exceeds the {}GB limit. Possible zip bomb.",
-                    MAX_EXTRACTED_SIZE / (1024 * 1024 * 1024)
-                ),
-            });
-        }
-
-        if entry_count > MAX_FILE_COUNT {
-            return Err(LauncherError::Generic {
-                code: "ERR_TOO_MANY_FILES".to_string(),
-                message: format!(
-                    "Zip contains more than {} files. Limit exceeded.",
-                    MAX_FILE_COUNT
-                ),
-            });
-        }
-    }
-
-    // Phase 2: Extract with path validation.
-    let mut extracted: Vec<String> = Vec::new();
-    let mut skipped: Vec<String> = Vec::new();
-    let mut bytes_written: u64 = 0;
-
-    for i in 0..archive.len() {
-        let entry = archive.by_index(i).map_err(|_| LauncherError::Generic {
-            code: "ERR_OVERRIDE_FAILED".to_string(),
-            message: "Could not read zip entry during extraction.".to_string(),
-        })?;
-
-        let raw_name = entry
-            .name()
-            .map_err(|_| LauncherError::Generic {
-                code: "ERR_OVERRIDE_FAILED".to_string(),
-                message: "Could not read zip entry during extraction.".to_string(),
-            })?
-            .into_owned();
-
-        // Sanitize the path: reject absolute paths and parent traversal.
-        let safe_name = match sanitize_path(&raw_name) {
-            Some(name) => name,
-            None => {
-                // Path traversal attempt — abort entire extraction.
-                cleanup_partial(dest_dir, &extracted);
-                return Err(LauncherError::Generic {
-                    code: "ERR_ZIP_SLIP".to_string(),
-                    message: format!(
-                        "Path traversal detected in zip entry: '{}'. Extraction aborted.",
-                        raw_name
-                    ),
-                });
-            }
-        };
-
-        // Skip directories (they'll be created by their files).
-        if entry.is_dir() {
-            continue;
-        }
-
-        // Check directory whitelist.
-        if !policy.admits(&safe_name) {
-            skipped.push(safe_name.clone());
-            continue;
-        }
-
-        // Check banned extensions.
-        if policy.forbids(&safe_name) {
-            cleanup_partial(dest_dir, &extracted);
-            return Err(LauncherError::Generic {
-                code: "ERR_SECURITY_VIOLATION".to_string(),
-                message: format!(
+    let mut archive = SafeArchive::open(zip_path, ArchiveLimits::PACK).map_err(archive_error)?;
+    // Staged, never written straight into the instance: a pack that replaces `config/settings.toml`
+    // and then fails on a later entry has replaced nothing (MASTER_SPEC §32.3).
+    let staged = archive
+        .stage(
+            dest_dir,
+            names,
+            &mut |name| {
+                if !policy.admits(name) {
+                    return Select::LeaveOut(if is_agora_owned(as_created(name)) {
+                        "Agora keeps this file in the instance".to_string()
+                    } else {
+                        "not a folder a pack's overrides may write".to_string()
+                    });
+                }
+                if policy.forbids(name) {
+                    return Select::Refuse(format!(
                     "Security Violation: Pack overrides cannot contain executable files or mods. \
-                     Banned file type detected: '{}'. \
-                     All mods must be routed through the platform manifest.",
-                    safe_name
-                ),
-            });
-        }
+                     Banned file type detected: '{name}'. All mods must be routed through the \
+                     platform manifest."
+                ));
+                }
+                Select::Write
+            },
+            &|| false,
+        )
+        .map_err(archive_error)?;
 
-        // Build the destination path and verify it's inside the sandbox.
-        let dest_path = dest_dir.join(&safe_name);
-        if !dest_path.starts_with(dest_dir) {
-            cleanup_partial(dest_dir, &extracted);
-            return Err(LauncherError::Generic {
-                code: "ERR_ZIP_SLIP".to_string(),
-                message: format!(
-                    "Resolved path escapes the instance directory: '{}'. Extraction aborted.",
-                    raw_name
-                ),
-            });
-        }
-
-        // Create parent directories.
-        if let Some(parent) = dest_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|_| LauncherError::Generic {
-                code: "ERR_OVERRIDE_FAILED".to_string(),
-                message: "Could not create directory for extracted file.".to_string(),
-            })?;
-        }
-
-        // Write the file, tracking actual bytes.
-        //
-        // The Phase 1 prescan sums `entry.size()`, which is the *declared*
-        // uncompressed size from the central directory — attacker-controlled
-        // metadata. A single entry can declare a few KB and inflate to
-        // gigabytes, so an unbounded `read_to_end` here would exhaust memory
-        // before the running-total check below ever runs. Cap the read at the
-        // remaining budget (plus one byte, so an over-long stream is detected
-        // rather than silently truncated).
-        let remaining_budget = MAX_EXTRACTED_SIZE.saturating_sub(bytes_written);
-        let mut file_data = Vec::new();
-        entry
-            .take(remaining_budget.saturating_add(1))
-            .read_to_end(&mut file_data)
-            .map_err(|_| LauncherError::Generic {
-                code: "ERR_OVERRIDE_FAILED".to_string(),
-                message: "Could not read file data from zip.".to_string(),
-            })?;
-
-        let file_len = file_data.len() as u64;
-
-        // Mid-stream check: abort if actual bytes exceed limit.
-        if file_len > remaining_budget {
-            cleanup_partial(dest_dir, &extracted);
-            return Err(LauncherError::Generic {
-                code: "ERR_ZIP_BOMB".to_string(),
-                message: "Actual extracted size exceeds the 2GB limit. Aborting.".to_string(),
-            });
-        }
-        bytes_written = bytes_written.saturating_add(file_len);
-
-        std::fs::write(&dest_path, &file_data).map_err(|_| LauncherError::Generic {
-            code: "ERR_OVERRIDE_FAILED".to_string(),
-            message: format!("Could not write extracted file: '{}'.", safe_name),
-        })?;
-
-        extracted.push(safe_name);
-    }
-
+    let report = staged.publish_into().map_err(archive_error)?;
+    let mut extracted = report.written;
+    extracted.sort();
     Ok(ExtractionResult {
         extracted,
-        skipped,
-        total_bytes_written: bytes_written,
+        skipped: report
+            .skipped
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect(),
+        left_out: report
+            .skipped
+            .into_iter()
+            .map(|entry| LeftOutEntry {
+                path: entry.name,
+                reason: entry.reason,
+            })
+            .collect(),
+        total_bytes_written: report.bytes_written,
     })
 }
 
-/// Strip absolute paths and `../` sequences. Returns None if the path is
-/// purely traversal (no valid path remains).
-fn sanitize_path(raw: &str) -> Option<String> {
-    // Replace backslashes with forward slashes for Windows compatibility.
-    let normalized = raw.replace('\\', "/");
-
-    // Reject absolute paths (Unix and Windows drive letters).
-    if normalized.starts_with('/') || normalized.matches(':').count() > 0 {
-        return None;
+/// The reader's refusal, as the error codes the CLI and the desktop already report (§32.10).
+fn archive_error(error: ArchiveError) -> LauncherError {
+    let code = match &error {
+        ArchiveError::TooManyEntries { .. } => "ERR_TOO_MANY_FILES",
+        ArchiveError::TooLarge { .. } | ArchiveError::RatioExceeded { .. } => "ERR_ZIP_BOMB",
+        ArchiveError::Escapes { .. } | ArchiveError::LinkEntry { .. } => "ERR_ZIP_SLIP",
+        ArchiveError::UnsafeNames { .. } => "ERR_ZIP_UNSAFE_NAMES",
+        ArchiveError::Refused { .. } => "ERR_SECURITY_VIOLATION",
+        _ => "ERR_OVERRIDE_FAILED",
+    };
+    LauncherError::Generic {
+        code: code.to_string(),
+        message: error.to_string(),
     }
-
-    // Split on '/' and rebuild, rejecting any '..' component.
-    let mut parts: Vec<&str> = Vec::new();
-    for part in normalized.split('/') {
-        if part == ".." {
-            return None; // Zip Slip attempt
-        }
-        if part == "." || part.is_empty() {
-            continue;
-        }
-        parts.push(part);
-    }
-
-    if parts.is_empty() {
-        return None;
-    }
-
-    Some(parts.join("/"))
 }
 
 /// Check if a path starts with one of the whitelisted directory prefixes.
@@ -404,40 +310,48 @@ fn has_banned_extension(path: &str) -> bool {
     BANNED_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
 }
 
-/// Delete partially extracted files on security violation or error.
-fn cleanup_partial(dest_dir: &Path, extracted: &[String]) {
-    for file in extracted {
-        let path = dest_dir.join(file);
-        let _ = std::fs::remove_file(&path);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_sanitize_path_rejects_traversal() {
-        assert!(sanitize_path("../../evil.exe").is_none());
-        assert!(sanitize_path("config/../../evil.exe").is_none());
-        assert!(sanitize_path("/etc/passwd").is_none());
-        assert!(sanitize_path("C:/windows/system32/evil.dll").is_none());
-    }
-
-    #[test]
-    fn test_sanitize_path_normalizes_backslashes() {
-        assert_eq!(
-            sanitize_path("config\\mod\\settings.toml").unwrap(),
-            "config/mod/settings.toml"
-        );
-    }
-
-    #[test]
-    fn test_sanitize_path_strips_dot_segments() {
-        assert_eq!(
-            sanitize_path("./config/./mod.toml").unwrap(),
-            "config/mod.toml"
-        );
+    fn the_name_rules_are_the_game_contracts() {
+        use agora_game_api::{classify_entry_name, EntryName};
+        // A pack's entry names are held to the one rule, so this file has no copy of it: what it
+        // used to strip silently is now a refusal that names the entry, or a name a disk cannot
+        // hold that the caller is told about.
+        assert!(matches!(
+            classify_entry_name("../../evil.exe"),
+            EntryName::Escapes { .. }
+        ));
+        assert!(matches!(
+            classify_entry_name("config/../../evil.exe"),
+            EntryName::Escapes { .. }
+        ));
+        assert!(matches!(
+            classify_entry_name("/etc/passwd"),
+            EntryName::Escapes { .. }
+        ));
+        assert!(matches!(
+            classify_entry_name("C:/windows/system32/evil.dll"),
+            EntryName::Escapes { .. }
+        ));
+        // Backslashes read as `/`.
+        match classify_entry_name("config\\mod\\settings.toml") {
+            EntryName::Writable(path) => assert_eq!(path.as_str(), "config/mod/settings.toml"),
+            other => panic!("unexpected {other:?}"),
+        }
+        // A `.` component names the folder it is in, so `./config/./mod.toml` is `config/mod.toml`
+        // and not a different file. A trailing dot *is* a name a disk cannot hold, so it is reported
+        // rather than quietly rewritten.
+        match classify_entry_name("./config/./mod.toml") {
+            EntryName::Writable(path) => assert_eq!(path.as_str(), "config/mod.toml"),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            classify_entry_name("config/mod.toml."),
+            EntryName::Unwritable { .. }
+        ));
     }
 
     #[test]
@@ -495,6 +409,198 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_entry_leaves_an_existing_file_intact() {
+        // A pack replacing `config/settings.toml` and then failing on a later entry may not have
+        // replaced anything: the player's file is the one thing here that cannot be rebuilt.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("pack.zip");
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, bytes) in [
+                ("config/settings.toml", &b"from the pack"[..]),
+                ("config/other.toml", &b"BROKEN-PAYLOAD"[..]),
+            ] {
+                zip.start_file(name, options).unwrap();
+                zip.write_all(bytes).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        // Corrupt the second entry's bytes, so its CRC fails as the extraction reads it.
+        let mut bytes = std::fs::read(&zip_path).unwrap();
+        let at = bytes
+            .windows(b"BROKEN-PAYLOAD".len())
+            .position(|window| window == b"BROKEN-PAYLOAD")
+            .expect("the payload is in the archive");
+        bytes[at] ^= 0xff;
+        std::fs::write(&zip_path, &bytes).unwrap();
+
+        let dest = dir.path().join("instance");
+        std::fs::create_dir_all(dest.join("config")).unwrap();
+        std::fs::write(dest.join("config/settings.toml"), b"mine").unwrap();
+
+        let error = extract_overrides(&zip_path, &dest).unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("crc")
+                || error.to_string().contains("damaged"),
+            "the archive is named as damaged: {error}"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("config/settings.toml")).unwrap(),
+            b"mine",
+            "the player's file is untouched"
+        );
+        assert!(
+            !dest.join("config/other.toml").exists(),
+            "nothing from the failed run is in the destination"
+        );
+        assert_eq!(
+            std::fs::read_dir(dest.join("config")).unwrap().count(),
+            1,
+            "no partial file beside the original"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dest).unwrap().count(),
+            1,
+            "no staging folder left behind"
+        );
+    }
+
+    fn write_zip_at(path: &Path, entries: &[(&str, &[u8])]) {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for (name, bytes) in entries {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn a_pack_entry_named_after_a_windows_device_is_refused_and_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("pack.zip");
+        write_zip_at(
+            &zip_path,
+            &[("config/settings.toml", b"a"), ("config/aux.dds", b"b")],
+        );
+        let dest = dir.path().join("instance");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let error = extract_overrides(&zip_path, &dest).unwrap_err();
+        assert!(
+            error.to_string().contains("config/aux.dds"),
+            "the refusal names the entry: {error}"
+        );
+        assert!(
+            error.to_string().contains("device name"),
+            "the refusal says why: {error}"
+        );
+        assert!(
+            !dest.join("config/settings.toml").exists(),
+            "a refusal writes nothing at all"
+        );
+
+        // The caller's explicit answer: write what can be written, and say what was left out.
+        let result = extract_overrides_with_inputs(
+            &zip_path,
+            &dest,
+            OverridePolicy::Standard,
+            NamesPolicy::WithoutThem,
+        )
+        .unwrap();
+        assert_eq!(result.extracted, vec!["config/settings.toml"]);
+        assert_eq!(result.skipped, vec!["config/aux.dds"]);
+        assert_eq!(result.left_out.len(), 1);
+        assert_eq!(result.left_out[0].path, "config/aux.dds");
+        assert!(result.left_out[0].reason.contains("device name"));
+    }
+
+    #[test]
+    fn a_case_collision_in_a_pack_is_refused_and_then_left_out_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("pack.zip");
+        write_zip_at(
+            &zip_path,
+            &[
+                ("config/Mod.toml", b"one"),
+                ("config/mod.toml", b"two"),
+                ("config/other.toml", b"three"),
+            ],
+        );
+        let dest = dir.path().join("instance");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let error = extract_overrides(&zip_path, &dest).unwrap_err();
+        assert!(error.to_string().contains("mod.toml"), "{error}");
+
+        let result = extract_overrides_with_inputs(
+            &zip_path,
+            &dest,
+            OverridePolicy::Standard,
+            NamesPolicy::WithoutThem,
+        )
+        .unwrap();
+        assert_eq!(result.extracted.len(), 2);
+        assert_eq!(result.left_out.len(), 1);
+        assert_eq!(result.left_out[0].path, "config/mod.toml");
+        assert!(result.left_out[0].reason.contains("case-insensitively"));
+        assert_eq!(
+            std::fs::read(dest.join("config/Mod.toml")).unwrap(),
+            b"one",
+            "the first spelling is the one kept"
+        );
+    }
+
+    #[test]
+    fn a_traversal_entry_still_refuses_the_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("pack.zip");
+        {
+            use std::io::Write;
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+            zip.start_file("../evil.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"x").unwrap();
+            zip.finish().unwrap();
+        }
+        let dest = dir.path().join("instance");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        // An escape is never skippable, even for a caller that would leave entries out.
+        let error = extract_overrides_with_inputs(
+            &zip_path,
+            &dest,
+            OverridePolicy::Standard,
+            NamesPolicy::WithoutThem,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, LauncherError::Generic { code, .. } if code == "ERR_ZIP_SLIP"),
+            "{error:?}"
+        );
+        assert!(!dir.path().join("evil.txt").exists());
+    }
+
+    #[test]
+    fn a_damaged_zip_is_an_error_and_not_an_empty_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("pack.zip");
+        std::fs::write(&zip_path, b"PK\x03\x04 certainly not a whole zip").unwrap();
+        let dest = dir.path().join("instance");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let error = extract_overrides(&zip_path, &dest).unwrap_err();
+        assert!(
+            matches!(&error, LauncherError::Generic { code, .. } if code == "ERR_OVERRIDE_FAILED"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
     fn permissive_extraction_writes_mods_and_still_refuses_executables() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
@@ -533,5 +639,122 @@ mod tests {
         assert!(!has_banned_extension(
             "shaderpacks/ComplementaryShaders.zip"
         ));
+    }
+
+    /// A pack whose entry names are the ones the policy used to judge raw: the same file spelled
+    /// with a `.` component or with backslashes, the files Agora owns spelled that way, and a name
+    /// Windows would create without its trailing dot.
+    fn policy_fixture_zip(dir: &Path) -> std::path::PathBuf {
+        use std::io::Write;
+        let zip_path = dir.join("pack.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, bytes) in [
+            ("./config/dotted.toml", &b"a"[..]),
+            ("config\\backslashed.toml", &b"b"[..]),
+            ("./instance_manifest.json", &b"c"[..]),
+            ("sub\\.agora\\state.json", &b"d"[..]),
+            ("config/run.bat.", &b"e"[..]),
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+        zip_path
+    }
+
+    #[test]
+    fn a_dotted_or_backslashed_config_name_is_the_config_file_it_names() {
+        // `./config/x` and `config\x` name the same file as `config/x`, so the folder rule has to
+        // admit them: judged on the raw entry name they were dropped as "not a folder a pack's
+        // overrides may write", which silently lost a pack's real config files.
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = policy_fixture_zip(dir.path());
+        let dest = dir.path().join("instance");
+        std::fs::create_dir_all(&dest).unwrap();
+        let result = extract_overrides_with_inputs(
+            &zip_path,
+            &dest,
+            OverridePolicy::Standard,
+            NamesPolicy::WithoutThem,
+        )
+        .expect("what can be written is written");
+        assert!(
+            dest.join("config/dotted.toml").exists(),
+            "`./config/x` is `config/x`: {result:?}"
+        );
+        assert!(
+            dest.join("config/backslashed.toml").exists(),
+            "a backslash is a separator: {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_agora_owns_is_protected_however_its_name_is_spelled() {
+        // Reduced security mode admits every folder, so the protected-file rule is the only thing
+        // between a pack and `instance_manifest.json`. Judged on the raw entry name, `./` in front
+        // of it was enough to have it written over.
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = policy_fixture_zip(dir.path());
+        let dest = dir.path().join("instance");
+        std::fs::create_dir_all(&dest).unwrap();
+        extract_overrides_with_inputs(
+            &zip_path,
+            &dest,
+            OverridePolicy::Permissive,
+            NamesPolicy::WithoutThem,
+        )
+        .expect("what can be written is written");
+        assert!(
+            !dest.join("instance_manifest.json").exists(),
+            "`./instance_manifest.json` is the manifest Agora owns"
+        );
+        assert!(
+            !dest.join("sub").exists(),
+            r"`sub\.agora\x` is inside Agora's own folder"
+        );
+    }
+
+    #[test]
+    fn a_name_a_disk_cannot_hold_is_reported_as_a_name_not_as_a_banned_type() {
+        // `config/run.bat.` is written by Windows as `config/run.bat`, so it is a name a disk
+        // cannot hold. Asked about the raw name, the pack's banned-extension rule refused the whole
+        // archive as a security violation, which is not what the archive is.
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = policy_fixture_zip(dir.path());
+        let dest = dir.path().join("instance");
+        std::fs::create_dir_all(&dest).unwrap();
+        let result = extract_overrides_with_inputs(
+            &zip_path,
+            &dest,
+            OverridePolicy::Standard,
+            NamesPolicy::WithoutThem,
+        )
+        .expect("what can be written is written");
+        let left_out = result
+            .left_out
+            .iter()
+            .find(|entry| entry.path == "config/run.bat.")
+            .unwrap_or_else(|| panic!("the entry is named: {result:?}"));
+        assert!(
+            left_out.reason.contains("dot"),
+            "the reason is about the name: {left_out:?}"
+        );
+
+        // And when the caller did not opt out, that same name is what refuses the extraction.
+        let refused = dir.path().join("refused");
+        std::fs::create_dir_all(&refused).unwrap();
+        let error = extract_overrides_with_inputs(
+            &zip_path,
+            &refused,
+            OverridePolicy::Standard,
+            NamesPolicy::Refuse,
+        )
+        .expect_err("a name Windows cannot hold is refused by default");
+        assert_eq!(
+            error.code(),
+            "ERR_ZIP_UNSAFE_NAMES",
+            "not a security violation: {error}"
+        );
     }
 }

@@ -28,6 +28,7 @@ use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::lock_manager::{LockManager, LockResource};
 use agora_core::network::{NetworkCategory, NetworkPolicy};
 use agora_core::operation_manager::OpHandle;
+use agora_game_api::{ArchiveError, ArchiveLimits, NamePolicy, SafeArchive, Select};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -74,16 +75,8 @@ impl Drop for StagingCleanup {
 /// Archive cache directory (relative to runtimes_root).
 const ARCHIVE_CACHE_DIR: &str = ".archives";
 
-// --- Extraction caps ---
-
-/// Maximum files per archive (generous for JRE archives).
-const MAX_ENTRIES: usize = 10_000;
-
-/// Per-entry uncompressed size cap (500 MB).
-const PER_ENTRY_LIMIT: u64 = 500 * 1024 * 1024;
-
-/// Aggregate uncompressed size cap (2 GB).
-const AGGREGATE_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
+// The sizes an archive may hold are `agora_game_api::ArchiveLimits::RUNTIME`'s, not this file's:
+// one place for every archive's limits (MASTER_SPEC §32.3).
 
 // --- Download timeouts ---
 
@@ -1026,8 +1019,15 @@ fn sha256_hex_file(path: &Path) -> std::io::Result<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Safe extraction — ZIP
+// Safe extraction — the one archive reader
 // ---------------------------------------------------------------------------
+//
+// A runtime is a JRE zip or a JRE tar.gz, and both go through
+// `agora_game_api::SafeArchive` with the `RUNTIME` preset: the entry count, the per-entry and total
+// sizes, a link entry, a name that escapes the staging directory and an entry that lies about its
+// size are the reader's rules now (MASTER_SPEC §32.3). What stays here is what belongs to a
+// *runtime*: the cancellation a download screen offers, the codes the desktop and the CLI report,
+// and the executable bit a Unix `bin/java` needs.
 
 fn extract_zip(
     archive_path: &Path,
@@ -1036,131 +1036,8 @@ fn extract_zip(
     progress: &dyn RuntimeProgress,
     component: &str,
 ) -> LauncherResult<()> {
-    let file = std::fs::File::open(archive_path).map_err(|e| LauncherError::Generic {
-        code: "ERR_ARCHIVE_OPEN".into(),
-        message: format!("Failed to open {}: {e}", archive_path.display()),
-    })?;
-
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| LauncherError::Generic {
-        code: "ERR_ARCHIVE_PARSE".into(),
-        message: format!("Failed to parse ZIP {}: {e}", archive_path.display()),
-    })?;
-
-    if archive.len() > MAX_ENTRIES {
-        return Err(LauncherError::ZipBomb);
-    }
-
-    let mut seen_paths: Vec<PathBuf> = Vec::new();
-    let mut aggregate_size: u64 = 0;
-
-    for i in 0..archive.len() {
-        // Check cancellation at every entry.
-        check_cancelled(progress, entry.major, component)?;
-
-        let mut entry_zip = archive.by_index(i).map_err(|e| LauncherError::Generic {
-            code: "ERR_ARCHIVE_ENTRY".into(),
-            message: format!("Failed to read entry {i}: {e}"),
-        })?;
-
-        let raw_name = entry_zip
-            .name()
-            .map_err(|e| LauncherError::Generic {
-                code: "ERR_ARCHIVE_ENTRY".into(),
-                message: format!("Failed to read entry {i}: {e}"),
-            })?
-            .into_owned();
-
-        // Check for NUL bytes.
-        if raw_name.contains('\0') {
-            return Err(LauncherError::Generic {
-                code: "ERR_ARCHIVE_INVALID_NAME".into(),
-                message: "Archive entry name contains NUL byte.".into(),
-            });
-        }
-
-        // Normalize separators.
-        let normalized = raw_name.replace('\\', "/");
-
-        // Validate entry name (no absolute/traversal/UNC/colon).
-        let relative = validate_entry_name(&normalized)?;
-
-        // Check unix_mode: only regular files and directories.
-        if let Some(mode) = entry_zip.unix_mode() {
-            if !is_allowed_mode(mode) {
-                return Err(LauncherError::Generic {
-                    code: "ERR_ARCHIVE_FORBIDDEN_ENTRY".into(),
-                    message: format!("Forbidden entry type in '{}' (mode 0{mode:o})", raw_name),
-                });
-            }
-        }
-
-        if entry_zip.is_dir() {
-            let target = staging.join(&relative);
-            // Directory entries are structural and may legitimately be
-            // ancestors of later file entries. Only files are tracked for
-            // duplicate and file-vs-directory collision checks.
-            std::fs::create_dir_all(&target).map_err(|e| LauncherError::Generic {
-                code: "ERR_ARCHIVE_EXTRACT".into(),
-                message: format!("Failed to create directory {}: {e}", target.display()),
-            })?;
-            continue;
-        }
-
-        // Regular file.
-        let declared_size = entry_zip.size();
-        if declared_size > PER_ENTRY_LIMIT {
-            return Err(LauncherError::ZipBomb);
-        }
-        aggregate_size = aggregate_size.saturating_add(declared_size);
-        if aggregate_size > AGGREGATE_LIMIT {
-            return Err(LauncherError::ZipBomb);
-        }
-
-        let target = staging.join(&relative);
-        check_path_collision(&seen_paths, &normalized, &relative)?;
-        seen_paths.push(relative);
-
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| LauncherError::Generic {
-                code: "ERR_ARCHIVE_EXTRACT".into(),
-                message: format!("Failed to create parent {}: {e}", parent.display()),
-            })?;
-        }
-
-        let mut output = std::fs::File::create(&target).map_err(|e| LauncherError::Generic {
-            code: "ERR_ARCHIVE_EXTRACT".into(),
-            message: format!("Failed to create {}: {e}", target.display()),
-        })?;
-
-        let bytes_written =
-            std::io::copy(&mut entry_zip, &mut output).map_err(|e| LauncherError::Generic {
-                code: "ERR_ARCHIVE_EXTRACT".into(),
-                message: format!("Failed to extract {}: {e}", target.display()),
-            })?;
-
-        if bytes_written != declared_size {
-            return Err(LauncherError::Generic {
-                code: "ERR_ARCHIVE_SIZE_MISMATCH".into(),
-                message: format!(
-                    "Entry '{}' declared {declared_size} bytes but {bytes_written} extracted",
-                    raw_name
-                ),
-            });
-        }
-
-        // Preserve executable bit on Unix.
-        #[cfg(unix)]
-        if let Some(mode) = entry_zip.unix_mode() {
-            set_unix_permissions(&target, mode);
-        }
-    }
-
-    Ok(())
+    extract_runtime_archive(archive_path, staging, entry, progress, component)
 }
-
-// ---------------------------------------------------------------------------
-// Safe extraction — tar.gz
-// ---------------------------------------------------------------------------
 
 fn extract_tar_gz(
     archive_path: &Path,
@@ -1169,263 +1046,73 @@ fn extract_tar_gz(
     progress: &dyn RuntimeProgress,
     component: &str,
 ) -> LauncherResult<()> {
-    let file = std::fs::File::open(archive_path).map_err(|e| LauncherError::Generic {
-        code: "ERR_ARCHIVE_OPEN".into(),
-        message: format!("Failed to open {}: {e}", archive_path.display()),
-    })?;
-
-    let decoder = flate2::read::GzDecoder::new(file);
-    let mut archive = tar::Archive::new(decoder);
-
-    let mut seen_paths: Vec<PathBuf> = Vec::new();
-    let mut aggregate_size: u64 = 0;
-    let mut entry_count: usize = 0;
-
-    // We must process entries manually because tar::Archive doesn't expose
-    // entry count before iteration. We'll cap as we go.
-    let result: LauncherResult<()> = (|| {
-        let entries = archive.entries().map_err(|e| LauncherError::Generic {
-            code: "ERR_TAR_ENTRIES".into(),
-            message: format!("Failed to read tar entries: {e}"),
-        })?;
-
-        for entry_result in entries {
-            entry_count += 1;
-
-            // Check cancellation at every entry.
-            check_cancelled(progress, entry.major, component)?;
-            if entry_count > MAX_ENTRIES {
-                return Err(LauncherError::ZipBomb);
-            }
-
-            let mut entry = entry_result.map_err(|e| LauncherError::Generic {
-                code: "ERR_TAR_ENTRY".into(),
-                message: format!("Failed to read tar entry: {e}"),
-            })?;
-
-            // Reject symlinks, hardlinks, devices, FIFOs.
-            let entry_type;
-            #[cfg(unix)]
-            let mode;
-            {
-                let header = entry.header();
-                entry_type = header.entry_type();
-                if !matches!(
-                    entry_type,
-                    tar::EntryType::Regular
-                        | tar::EntryType::Directory
-                        | tar::EntryType::Continuous
-                ) {
-                    return Err(LauncherError::Generic {
-                        code: "ERR_ARCHIVE_FORBIDDEN_ENTRY".into(),
-                        message: format!("Forbidden entry type {:?} in tar archive", entry_type),
-                    });
-                }
-
-                // Reject links.
-                let has_link = header
-                    .link_name()
-                    .map_err(|e| LauncherError::Generic {
-                        code: "ERR_TAR_HEADER".into(),
-                        message: format!("Failed to read tar link name: {e}"),
-                    })?
-                    .is_some();
-                if has_link {
-                    return Err(LauncherError::Generic {
-                        code: "ERR_ARCHIVE_FORBIDDEN_ENTRY".into(),
-                        message: "Hardlinks are not permitted.".into(),
-                    });
-                }
-
-                // Extract mode for Unix permissions before header goes out of scope.
-                #[cfg(unix)]
-                {
-                    mode = header.mode().unwrap_or(0o644);
-                }
-            } // header dropped here, releasing the immutable borrow on entry
-
-            let raw_name = match entry.path() {
-                Ok(p) => p.to_string_lossy().into_owned(),
-                Err(_) => continue,
-            };
-
-            if raw_name.contains('\0') {
-                return Err(LauncherError::Generic {
-                    code: "ERR_ARCHIVE_INVALID_NAME".into(),
-                    message: "Archive entry name contains NUL byte.".into(),
-                });
-            }
-
-            let normalized = raw_name.replace('\\', "/");
-            let relative = validate_entry_name(&normalized)?;
-
-            if entry_type.is_dir() {
-                let target = staging.join(&relative);
-                // Real Temurin tarballs contain explicit parent directory
-                // entries before their files. Do not classify those expected
-                // ancestor relationships as path collisions.
-                std::fs::create_dir_all(&target).map_err(|e| LauncherError::Generic {
-                    code: "ERR_ARCHIVE_EXTRACT".into(),
-                    message: format!("Failed to create directory {}: {e}", target.display()),
-                })?;
-                continue;
-            }
-
-            // Regular file.
-            let declared_size = entry.size();
-            if declared_size > PER_ENTRY_LIMIT {
-                return Err(LauncherError::ZipBomb);
-            }
-            aggregate_size = aggregate_size.saturating_add(declared_size);
-            if aggregate_size > AGGREGATE_LIMIT {
-                return Err(LauncherError::ZipBomb);
-            }
-
-            let target = staging.join(&relative);
-            check_path_collision(&seen_paths, &normalized, &relative)?;
-            seen_paths.push(relative);
-
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| LauncherError::Generic {
-                    code: "ERR_ARCHIVE_EXTRACT".into(),
-                    message: format!("Failed to create parent {}: {e}", parent.display()),
-                })?;
-            }
-
-            let mut output =
-                std::fs::File::create(&target).map_err(|e| LauncherError::Generic {
-                    code: "ERR_ARCHIVE_EXTRACT".into(),
-                    message: format!("Failed to create {}: {e}", target.display()),
-                })?;
-
-            let bytes_written =
-                std::io::copy(&mut entry, &mut output).map_err(|e| LauncherError::Generic {
-                    code: "ERR_ARCHIVE_EXTRACT".into(),
-                    message: format!("Failed to extract {}: {e}", target.display()),
-                })?;
-
-            if bytes_written != declared_size {
-                return Err(LauncherError::Generic {
-                    code: "ERR_ARCHIVE_SIZE_MISMATCH".into(),
-                    message: format!(
-                        "Entry '{raw_name}' declared {declared_size} bytes but {bytes_written} extracted"
-                    ),
-                });
-            }
-
-            // Preserve executable bit on Unix.
-            #[cfg(unix)]
-            {
-                set_unix_permissions(&target, mode);
-            }
-        }
-        Ok(())
-    })();
-
-    result
+    extract_runtime_archive(archive_path, staging, entry, progress, component)
 }
 
-// ---------------------------------------------------------------------------
-// Entry name validation
-// ---------------------------------------------------------------------------
-
-fn validate_entry_name(normalized: &str) -> LauncherResult<PathBuf> {
-    // Reject absolute Unix paths.
-    if normalized.starts_with('/') {
-        return Err(LauncherError::OverrideSecurityViolation);
-    }
-    // Reject UNC paths.
-    if normalized.starts_with("//") {
-        return Err(LauncherError::OverrideSecurityViolation);
-    }
-    // Reject Windows drive letters.
-    if normalized.contains(':') {
-        return Err(LauncherError::OverrideSecurityViolation);
-    }
-
-    let mut path = PathBuf::new();
-    for component in normalized.split('/') {
-        if component.is_empty() || component == "." {
-            continue;
-        }
-        if component == ".." {
-            return Err(LauncherError::OverrideSecurityViolation);
-        }
-        path.push(component);
-    }
-    if path.as_os_str().is_empty() {
-        return Err(LauncherError::OverrideSecurityViolation);
-    }
-    Ok(path)
-}
-
-// ---------------------------------------------------------------------------
-// Path collision detection
-// ---------------------------------------------------------------------------
-
-fn check_path_collision(
-    seen: &[PathBuf],
-    _normalized_name: &str,
-    relative: &Path,
+/// Extract a runtime archive into `staging`, whatever format it is: the reader decides by content.
+///
+/// The catalog says which format to expect, and a download is checked against its published hash
+/// before it arrives, so a mismatch here is a broken download rather than a surprise. Nothing is
+/// skipped: a name a disk cannot hold stops the extraction and the message names it, because a
+/// runtime missing a file would fail at a launch instead, far from the cause.
+fn extract_runtime_archive(
+    archive_path: &Path,
+    staging: &Path,
+    entry: &RuntimeCatalogEntry,
+    progress: &dyn RuntimeProgress,
+    component: &str,
 ) -> LauncherResult<()> {
-    let rel_str = relative.to_string_lossy();
+    let mut archive = SafeArchive::open(archive_path, ArchiveLimits::RUNTIME)
+        .map_err(|error| archive_error(error, archive_path))?;
 
-    // 1. Exact duplicate.
-    if seen.iter().any(|p| p.as_os_str() == relative.as_os_str()) {
-        return Err(LauncherError::OverrideSecurityViolation);
-    }
-
-    // 2. Case-insensitive collision.
-    let rel_lower = rel_str.to_ascii_lowercase();
-    for prev in seen {
-        if prev.to_string_lossy().to_ascii_lowercase() == rel_lower {
-            return Err(LauncherError::OverrideSecurityViolation);
-        }
-    }
-
-    // 3. File-directory conflict (ancestor check).
-    for prev in seen {
-        let prev_str = prev.to_string_lossy();
-        if prev_str.len() > rel_str.len()
-            && prev_str.starts_with(rel_str.as_ref())
-            && prev_str.as_ref()[rel_str.len()..].starts_with('/')
-        {
-            return Err(LauncherError::OverrideSecurityViolation);
-        }
-        if rel_str.len() > prev_str.len()
-            && rel_str.starts_with(prev_str.as_ref())
-            && rel_str.as_ref()[prev_str.len()..].starts_with('/')
-        {
-            return Err(LauncherError::OverrideSecurityViolation);
-        }
-    }
-
-    Ok(())
+    let cancelled = || check_cancelled(progress, entry.major, component).is_err();
+    archive
+        .extract_checked(
+            staging,
+            NamePolicy::Refuse,
+            &mut |_| Select::Write,
+            &cancelled,
+        )
+        .map(|_| ())
+        .map_err(|error| match error {
+            ArchiveError::Cancelled { .. } => LauncherError::JavaRuntimeCancelled {
+                major: entry.major,
+                component: component.to_string(),
+            },
+            other => archive_error(other, archive_path),
+        })
 }
 
-// ---------------------------------------------------------------------------
-// Unix permission helpers
-// ---------------------------------------------------------------------------
-
-#[cfg(unix)]
-fn set_unix_permissions(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    // Preserve executable bit, strip setuid/setgid/sticky.
-    let conservative = mode & 0o755;
-    if let Err(_e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(conservative)) {
-        // Best-effort.
+/// The reader's refusal, as the codes a runtime install already reports.
+fn archive_error(error: ArchiveError, archive_path: &Path) -> LauncherError {
+    match &error {
+        // The preset's limits are what a zip bomb trips.
+        ArchiveError::TooManyEntries { .. }
+        | ArchiveError::TooLarge { .. }
+        | ArchiveError::RatioExceeded { .. }
+        | ArchiveError::EntrySizeLies { .. } => LauncherError::ZipBomb,
+        ArchiveError::Unreadable { error: reason, .. } if reason.contains("missing") => {
+            LauncherError::Generic {
+                code: "ERR_ARCHIVE_OPEN".into(),
+                message: format!("Failed to open {}: {reason}", archive_path.display()),
+            }
+        }
+        ArchiveError::Escapes { .. }
+        | ArchiveError::LinkEntry { .. }
+        | ArchiveError::UnsafeNames { .. }
+        | ArchiveError::Refused { .. } => LauncherError::Generic {
+            code: "ERR_ARCHIVE_FORBIDDEN_ENTRY".into(),
+            message: error.to_string(),
+        },
+        ArchiveError::Write { .. } | ArchiveError::Destination { .. } => LauncherError::Generic {
+            code: "ERR_ARCHIVE_EXTRACT".into(),
+            message: error.to_string(),
+        },
+        _ => LauncherError::Generic {
+            code: "ERR_ARCHIVE_PARSE".into(),
+            message: format!("Failed to parse {}: {error}", archive_path.display()),
+        },
     }
-}
-
-// ---------------------------------------------------------------------------
-// Mode validation
-// ---------------------------------------------------------------------------
-
-fn is_allowed_mode(mode: u32) -> bool {
-    const S_IFMT: u32 = 0o170000;
-    const S_IFREG: u32 = 0o100000;
-    const S_IFDIR: u32 = 0o040000;
-    matches!(mode & S_IFMT, S_IFREG | S_IFDIR)
 }
 
 // ---------------------------------------------------------------------------
@@ -1967,55 +1654,6 @@ mod tests {
         std::fs::write(&path, bad).unwrap();
 
         assert!(RuntimeReceipt::read_from(&path).is_err());
-    }
-
-    #[test]
-    fn test_validate_entry_name_rejects_absolute() {
-        assert!(validate_entry_name("/etc/passwd").is_err());
-    }
-
-    #[test]
-    fn test_validate_entry_name_rejects_traversal() {
-        assert!(validate_entry_name("../../evil").is_err());
-    }
-
-    #[test]
-    fn test_validate_entry_name_rejects_unc() {
-        assert!(validate_entry_name("//server/share/evil").is_err());
-    }
-
-    #[test]
-    fn test_validate_entry_name_rejects_colon() {
-        assert!(validate_entry_name("C:/Windows/evil.dll").is_err());
-    }
-
-    #[test]
-    fn test_validate_entry_name_accepts_normal() {
-        let p = validate_entry_name("jdk-21/jre/bin/java").unwrap();
-        assert_eq!(p, PathBuf::from("jdk-21/jre/bin/java"));
-    }
-
-    #[test]
-    fn test_check_path_collision_exact_duplicate() {
-        let seen = vec![PathBuf::from("a/b")];
-        assert!(check_path_collision(&seen, "a/b", Path::new("a/b")).is_err());
-    }
-
-    #[test]
-    fn test_check_path_collision_case_collision() {
-        let seen = vec![PathBuf::from("A/B")];
-        assert!(check_path_collision(&seen, "a/b", Path::new("a/b")).is_err());
-    }
-
-    #[test]
-    fn test_is_allowed_mode_accepts_files_and_dirs() {
-        assert!(is_allowed_mode(0o100644)); // regular file
-        assert!(is_allowed_mode(0o040755)); // directory
-    }
-
-    #[test]
-    fn test_is_allowed_mode_rejects_symlinks() {
-        assert!(!is_allowed_mode(0o120777)); // symlink
     }
 
     #[test]

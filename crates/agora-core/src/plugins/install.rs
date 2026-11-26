@@ -16,26 +16,28 @@
 use super::store;
 use super::store::PluginSource;
 use crate::error::{LauncherError, LauncherResult};
+use agora_game_api::{ArchiveLimits, NamePolicy, SafeArchive};
 use agora_plugin_api::capability::{CapabilityRequest, CapabilitySet};
 use agora_plugin_api::distribution::{PublicKey, UpdateSource, UPDATE_SOURCE_FILENAME};
 use agora_plugin_api::manifest::{PluginId, PluginManifest, MANIFEST_FILENAME};
-use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
+// A package's limits are a preset of the one archive reader (MASTER_SPEC §32.3). These names stay
+// because the download cap and the catalog code ask them, and they must not drift from the preset.
 /// How many files one plugin package may contain.
-pub const MAX_ENTRIES: usize = 2_000;
+pub const MAX_ENTRIES: usize = ArchiveLimits::PLUGIN_PACKAGE.max_entries;
 
 /// How large one file inside a package may be once expanded.
-pub const MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_ENTRY_BYTES: u64 = ArchiveLimits::PLUGIN_PACKAGE.max_entry_bytes;
 
 /// How large a whole package may be once expanded.
-pub const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_TOTAL_BYTES: u64 = ArchiveLimits::PLUGIN_PACKAGE.max_total_bytes;
 
 /// Largest expansion ratio a package may have before it is treated as hostile.
 ///
 /// A legitimately compressible plugin (JSON, JavaScript) reaches perhaps 20:1.
 /// Past 200:1 the archive is not a plugin, it is a decompression bomb.
-pub const MAX_EXPANSION_RATIO: u64 = 200;
+pub const MAX_EXPANSION_RATIO: u64 = ArchiveLimits::PLUGIN_PACKAGE.max_ratio;
 
 fn invalid_package(message: impl Into<String>) -> LauncherError {
     LauncherError::Generic {
@@ -387,66 +389,32 @@ pub fn read_package_manifest(archive: &Path) -> LauncherResult<PackageContents> 
 
 /// [`read_package_manifest`] over bytes already in memory.
 pub fn read_package_manifest_bytes(bytes: &[u8]) -> LauncherResult<PackageContents> {
-    let compressed = (bytes.len() as u64).max(1);
-    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
-        .map_err(|e| invalid_package(format!("not a readable plugin package: {e}")))?;
+    let mut archive = SafeArchive::open_bytes(bytes.to_vec(), ArchiveLimits::PLUGIN_PACKAGE)
+        .map_err(|error| invalid_package(error.to_string()))?;
 
-    if zip.len() > MAX_ENTRIES {
-        return Err(invalid_package(format!(
-            "the package contains {} files; the limit is {MAX_ENTRIES}",
-            zip.len()
-        )));
-    }
+    // A preview must not pass a package the install would then refuse, so the names are decided
+    // here by the same rule the extraction uses, and nothing is written either way.
+    archive
+        .left_out_names(NamePolicy::Refuse)
+        .map_err(|error| invalid_package(error.to_string()))?;
 
-    let mut total = 0u64;
+    let package_files: Vec<(String, u64)> = archive
+        .file_entries()
+        .map(|entry| (entry.name.clone(), entry.size))
+        .collect();
+    let file_count = package_files.len();
+    let total: u64 = package_files.iter().map(|(_, size)| *size).sum();
+
     let mut manifest_text: Option<String> = None;
     let mut source_text: Option<String> = None;
-    for index in 0..zip.len() {
-        let mut entry = zip
-            .by_index(index)
-            .map_err(|e| invalid_package(format!("unreadable entry in the package: {e}")))?;
-        let name = entry
-            .name()
-            .map_err(|e| invalid_package(format!("unreadable entry in the package: {e}")))?
-            .into_owned();
-        if entry.is_dir() {
-            continue;
-        }
-        validate_entry_path(&name)?;
-        let size = entry.size();
-        if size > MAX_ENTRY_BYTES {
-            return Err(invalid_package(format!(
-                "`{name}` expands to {size} bytes; the per-file limit is {MAX_ENTRY_BYTES}"
-            )));
-        }
-        total = total.saturating_add(size);
-        if total > MAX_TOTAL_BYTES {
-            return Err(invalid_package(format!(
-                "the package expands past {MAX_TOTAL_BYTES} bytes"
-            )));
-        }
+    for (name, _) in &package_files {
         if name == MANIFEST_FILENAME {
-            let mut text = String::new();
-            entry
-                .read_to_string(&mut text)
-                .map_err(|e| invalid_package(format!("could not read {MANIFEST_FILENAME}: {e}")))?;
+            let text = read_package_text(&mut archive, name)?;
             manifest_text = Some(text);
         } else if name == UPDATE_SOURCE_FILENAME {
-            let mut text = String::new();
-            entry.read_to_string(&mut text).map_err(|e| {
-                invalid_package(format!("could not read {UPDATE_SOURCE_FILENAME}: {e}"))
-            })?;
+            let text = read_package_text(&mut archive, name)?;
             source_text = Some(text);
         }
-    }
-
-    // Checked after the walk so the ratio is against the real expanded size,
-    // not the declared one for a single entry.
-    if total / compressed > MAX_EXPANSION_RATIO {
-        return Err(invalid_package(format!(
-            "the package expands {}x, past the {MAX_EXPANSION_RATIO}x limit",
-            total / compressed
-        )));
     }
 
     let Some(text) = manifest_text else {
@@ -464,23 +432,16 @@ pub fn read_package_manifest_bytes(bytes: &[u8]) -> LauncherResult<PackageConten
     let code_digest = if let Some(entrypoint) = &manifest.entrypoint {
         use sha2::{Digest, Sha256};
         let mut files = std::collections::BTreeMap::new();
-        for index in 0..zip.len() {
-            let mut entry = zip
-                .by_index(index)
-                .map_err(|e| invalid_package(format!("unreadable entry in the package: {e}")))?;
-            if entry.is_dir() {
-                continue;
-            }
-            let name =
-                normalize_relative(&entry.name().map_err(|e| {
-                    invalid_package(format!("unreadable entry in the package: {e}"))
-                })?);
+        for (entry_name, _) in &package_files {
+            let name = normalize_relative(entry_name);
             if name == MANIFEST_FILENAME || name == UPDATE_SOURCE_FILENAME {
                 continue;
             }
-            let mut hasher = Sha256::new();
-            std::io::copy(&mut entry, &mut hasher)
+            let bytes = archive
+                .read(entry_name)
                 .map_err(|e| invalid_package(format!("could not read `{name}`: {e}")))?;
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
             files.insert(name, hex::encode(hasher.finalize()));
         }
         let entrypoint = normalize_relative(entrypoint);
@@ -506,9 +467,17 @@ pub fn read_package_manifest_bytes(bytes: &[u8]) -> LauncherResult<PackageConten
         manifest,
         update_source,
         code_digest,
-        file_count: zip.len(),
+        file_count,
         uncompressed_bytes: total,
     })
+}
+
+/// One text file out of a package, refused if it is not UTF-8.
+fn read_package_text(archive: &mut SafeArchive, name: &str) -> LauncherResult<String> {
+    let bytes = archive
+        .read(name)
+        .map_err(|error| invalid_package(error.to_string()))?;
+    String::from_utf8(bytes).map_err(|_| invalid_package(format!("`{name}` is not UTF-8 text")))
 }
 
 /// Describe what installing a package would do.
@@ -657,82 +626,14 @@ pub fn extract_package(bytes: &[u8], destination: &Path) -> LauncherResult<()> {
 }
 
 fn extract_into(bytes: &[u8], staging: &Path) -> LauncherResult<()> {
-    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
-        .map_err(|e| invalid_package(format!("not a readable plugin package: {e}")))?;
-
-    let mut written = 0u64;
-    for index in 0..zip.len() {
-        let mut entry = zip
-            .by_index(index)
-            .map_err(|e| invalid_package(format!("unreadable entry in the package: {e}")))?;
-        let name = entry
-            .name()
-            .map_err(|e| invalid_package(format!("unreadable entry in the package: {e}")))?
-            .into_owned();
-        if entry.is_dir() {
-            continue;
-        }
-        // Re-validated here: this is the pass that actually creates files.
-        validate_entry_path(&name)?;
-        let target = staging.join(name.replace('\\', "/"));
-        if !target.starts_with(staging) {
-            return Err(invalid_package(format!("`{name}` escapes the package")));
-        }
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| io_error(format!("could not create {}: {e}", parent.display())))?;
-        }
-        written = written.saturating_add(entry.size());
-        if written > MAX_TOTAL_BYTES {
-            return Err(invalid_package("the package expands past its size limit"));
-        }
-        let mut out = std::fs::File::create(&target)
-            .map_err(|e| io_error(format!("could not write {}: {e}", target.display())))?;
-        std::io::copy(&mut entry, &mut out)
-            .map_err(|e| io_error(format!("could not write {}: {e}", target.display())))?;
-    }
-    Ok(())
-}
-
-/// Reject any archive entry that is not a plain relative path.
-///
-/// Separate from the manifest's own path check because this runs over every
-/// file in the archive, including ones the manifest never mentions.
-pub fn validate_entry_path(name: &str) -> LauncherResult<()> {
-    if name.is_empty() {
-        return Err(invalid_package("the package contains an unnamed entry"));
-    }
-    if name.contains('\0') {
-        return Err(invalid_package("a package entry name contains a NUL byte"));
-    }
-    let normalized = name.replace('\\', "/");
-    if normalized.starts_with('/') {
-        return Err(invalid_package(format!("`{name}` is an absolute path")));
-    }
-    if normalized.len() >= 2 && normalized.as_bytes()[1] == b':' {
-        return Err(invalid_package(format!("`{name}` is an absolute path")));
-    }
-    for component in Path::new(&normalized).components() {
-        match component {
-            Component::ParentDir => {
-                return Err(invalid_package(format!(
-                    "`{name}` climbs out of the package"
-                )))
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(invalid_package(format!("`{name}` is an absolute path")))
-            }
-            Component::Normal(part) => {
-                if part.to_string_lossy().contains(':') {
-                    return Err(invalid_package(format!(
-                        "`{name}` contains a `:` in a path segment"
-                    )));
-                }
-            }
-            Component::CurDir => {}
-        }
-    }
-    Ok(())
+    let mut archive = SafeArchive::open_bytes(bytes.to_vec(), ArchiveLimits::PLUGIN_PACKAGE)
+        .map_err(|error| invalid_package(error.to_string()))?;
+    // A plugin package is Agora's own install, not a user's import: there is no "extract without
+    // the awkward names" here, so a name a disk cannot hold refuses the package (MASTER_SPEC §32.3).
+    archive
+        .extract(staging, NamePolicy::Refuse)
+        .map(|_| ())
+        .map_err(|error| invalid_package(error.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,33 +976,54 @@ mod tests {
             ("../escape.js", b"x"),
         ]);
         let err = read_package_manifest(&path).unwrap_err();
-        assert!(err.to_string().contains("climbs out"), "{err}");
+        assert!(
+            err.to_string().contains("leaves the extraction root"),
+            "{err}"
+        );
     }
 
     #[test]
-    fn absolute_and_traversing_entry_paths_are_all_refused() {
-        for bad in [
-            "/etc/passwd",
-            "C:/windows/system32/evil.dll",
-            "..",
-            "a/../../b.js",
-            "a/b:stream.js",
+    fn absolute_and_drive_letter_entries_are_refused() {
+        for (name, expected) in [
+            ("/etc/passwd", "it is absolute"),
+            ("C:/windows/system32/evil.dll", "drive letter"),
+            ("a/../../b.js", "'..' component"),
         ] {
+            let (_dir, path) = write_package(&[
+                (MANIFEST_FILENAME, manifest_json("acme.one").as_bytes()),
+                (name, b"x"),
+            ]);
+            let err = read_package_manifest(&path).unwrap_err();
             assert!(
-                validate_entry_path(bad).is_err(),
-                "`{bad}` should have been rejected"
+                err.to_string().contains(expected),
+                "`{name}` should have been refused with `{expected}`: {err}"
             );
         }
     }
 
     #[test]
-    fn ordinary_relative_entry_paths_are_accepted() {
-        for good in ["main.js", "dist/main.js", "assets/icon.png", "./main.js"] {
-            assert!(
-                validate_entry_path(good).is_ok(),
-                "`{good}` should have been accepted"
-            );
-        }
+    fn a_package_naming_a_file_windows_reserves_is_refused_with_the_name() {
+        // An internal install never skips quietly: the whole package is refused, and the message
+        // names the entry and the rule (MASTER_SPEC §32.3).
+        let (_dir, path) = write_package(&[
+            (MANIFEST_FILENAME, manifest_json("acme.one").as_bytes()),
+            ("main.js", b"x"),
+            ("textures/aux.dds", b"x"),
+        ]);
+        let err = read_package_manifest(&path).unwrap_err();
+        assert!(err.to_string().contains("textures/aux.dds"), "{err}");
+        assert!(err.to_string().contains("device name"), "{err}");
+    }
+
+    #[test]
+    fn ordinary_relative_entry_names_are_accepted() {
+        let (_dir, path) = write_package(&[
+            (MANIFEST_FILENAME, manifest_json("acme.one").as_bytes()),
+            ("./main.js", b"x"),
+            ("dist/util.js", b"x"),
+            ("assets/icon.png", b"x"),
+        ]);
+        assert!(read_package_manifest(&path).is_ok());
     }
 
     #[test]

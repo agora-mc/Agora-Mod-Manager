@@ -2077,22 +2077,40 @@ pub async fn get_connectivity_status(
 ///
 /// Implements Â§7.2: directory whitelist, zip-bomb limits, banned extensions,
 /// and Zip Slip protection.
+///
+/// `without_unwritable_names` is the caller's explicit answer to a refusal it was shown: an entry
+/// whose name a disk cannot hold (a Windows reserved name, a trailing dot or space, a case
+/// collision) stops the extraction by default, and the refusal names each one. With this set, the
+/// usable entries are written and the rest come back in `left_out`, so the screen can list them.
 #[tauri::command]
 pub async fn extract_overrides(
     app: tauri::AppHandle,
     _state: tauri::State<'_, LauncherState>,
     zip_path: String,
     instance_id: String,
+    without_unwritable_names: Option<bool>,
 ) -> LauncherResult<crate::override_sanitizer::ExtractionResult> {
     let zip = std::path::PathBuf::from(zip_path);
     let dest = crate::paths::instance_dir(&app, &instance_id)
         .map_err(|_| LauncherError::InstanceCreateFailed)?;
-    tokio::task::spawn_blocking(move || crate::override_sanitizer::extract_overrides(&zip, &dest))
-        .await
-        .map_err(|_| LauncherError::Generic {
-            code: "ERR_OVERRIDE_FAILED".to_string(),
-            message: "Extraction task failed.".to_string(),
-        })?
+    let names = if without_unwritable_names.unwrap_or(false) {
+        agora_game_api::NamePolicy::WithoutThem
+    } else {
+        agora_game_api::NamePolicy::Refuse
+    };
+    tokio::task::spawn_blocking(move || {
+        crate::override_sanitizer::extract_overrides_with_inputs(
+            &zip,
+            &dest,
+            crate::override_sanitizer::OverridePolicy::Standard,
+            names,
+        )
+    })
+    .await
+    .map_err(|_| LauncherError::Generic {
+        code: "ERR_OVERRIDE_FAILED".to_string(),
+        message: "Extraction task failed.".to_string(),
+    })?
 }
 
 /// Bring the launcher window back to the foreground.

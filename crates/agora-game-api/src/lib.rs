@@ -6,6 +6,7 @@
 //! Layer descriptions express ownership, not a choice of VFS implementation;
 //! write isolation and tracer packages must validate this API before it is fixed.
 
+pub mod archive;
 pub mod condition;
 pub mod crash;
 pub mod game;
@@ -16,6 +17,7 @@ pub mod package;
 pub mod path;
 pub mod probe;
 
+pub use archive::*;
 pub use condition::*;
 pub use game::*;
 pub use host::*;

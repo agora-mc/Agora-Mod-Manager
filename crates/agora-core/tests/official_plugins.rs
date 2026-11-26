@@ -3902,9 +3902,10 @@ async fn an_official_update_that_adds_a_script_asks_again_with_no_new_capability
 }
 
 #[test]
-fn a_package_with_duplicate_entries_hashes_what_it_extracts() {
-    // The `zip` writer refuses duplicate names, so build the bytes directly.
-    // A malicious package is not constrained by a writer.
+fn a_package_that_names_one_entry_twice_is_refused() {
+    // The `zip` writer refuses duplicate names, so build the bytes directly. A malicious package is
+    // not constrained by a writer, and the reader refuses it: the last entry would otherwise be what
+    // is installed while the digest covers both (MASTER_SPEC §32.3).
     fn duplicate_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         fn crc(data: &[u8]) -> u32 {
             let mut crc = flate2::Crc::new();
@@ -3966,19 +3967,17 @@ fn a_package_with_duplicate_entries_hashes_what_it_extracts() {
     let first = b"export function noop() { return 1; }\n";
     let last = b"export function noop() { return 2; }\n";
     let bytes = duplicate_zip(&[("main.js", first), ("main.js", last)]);
-    let pinned = zip_tree_digest(&bytes).expect("the pinned hash reads both entries");
+    let pinned = zip_tree_digest(&bytes).expect_err("two entries named main.js");
+    assert!(pinned.to_string().contains("main.js"), "{pinned}");
 
     let tmp = tempfile::tempdir().unwrap();
     let destination = tmp.path().join("unpacked");
-    agora_core::plugins::install::extract_package(&bytes, &destination).unwrap();
-    assert_eq!(
-        tree_digest(&destination).unwrap(),
-        pinned,
-        "the pinned hash describes exactly what unpacking wrote"
-    );
-    assert_eq!(
-        std::fs::read_to_string(destination.join("main.js")).unwrap(),
-        String::from_utf8_lossy(last)
+    let refused = agora_core::plugins::install::extract_package(&bytes, &destination)
+        .expect_err("the install refuses the archive the digest refused");
+    assert!(refused.to_string().contains("main.js"), "{refused}");
+    assert!(
+        !destination.exists(),
+        "nothing is left where the plugin would have gone"
     );
 }
 
