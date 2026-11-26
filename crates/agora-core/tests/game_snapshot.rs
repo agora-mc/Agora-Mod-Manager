@@ -1597,14 +1597,8 @@ fn the_undo_of_a_restore_leaves_a_file_beside_a_mapped_one_alone() {
     // The game writes to a file the snapshot never recorded, after the restore took its undo point.
     std::fs::write(h.dir().join("user/notes.txt"), b"edited after the restore").unwrap();
 
-    game_snapshot::restore(
-        &h.ctx,
-        &h.id,
-        &h.def,
-        &outcome.undo_snapshot_id,
-        false,
-    )
-    .expect("the undo point reads back");
+    game_snapshot::restore(&h.ctx, &h.id, &h.def, &outcome.undo_snapshot_id, false)
+        .expect("the undo point reads back");
 
     assert_eq!(
         std::fs::read(h.dir().join("user/notes.txt")).unwrap(),

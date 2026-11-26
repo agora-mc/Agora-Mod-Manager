@@ -2025,11 +2025,7 @@ fn restore_snapshot_impl(
     // A manifest that records a file by path is a data snapshot (generic games). It is restored
     // file by file, on purpose: restoring it as whole folders would replace folders it does not
     // own. Refuse here rather than move a folder the snapshot never covered.
-    if let Some(entry) = coverage
-        .roots()
-        .iter()
-        .find(|root| root.name.contains('/'))
-    {
+    if let Some(entry) = coverage.roots().iter().find(|root| root.name.contains('/')) {
         let _ = fs::remove_dir_all(&extract_dir);
         return Err(format!(
             "snapshot {snapshot_id} records the file '{}', so it is restored file by file, not as \
