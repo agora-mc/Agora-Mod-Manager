@@ -2043,7 +2043,7 @@ fn restore_snapshot_impl(
                 let rollback =
                     rollback_restore(instance_dir, &pre_dir, &[], &moved_current, &restore_id);
                 let _ = fs::remove_dir_all(&extract_dir);
-                let _ = fs::remove_file(restore_journal_path(instance_dir));
+                clear_journal_unless_failed(instance_dir, &rollback);
                 return Err(combine_restore_error(
                     format!(
                         "cannot tell whether {entry_name} is there, so it was not replaced: {error}"
@@ -2061,7 +2061,7 @@ fn restore_snapshot_impl(
                 let rollback =
                     rollback_restore(instance_dir, &pre_dir, &[], &moved_current, &restore_id);
                 let _ = fs::remove_dir_all(&extract_dir);
-                let _ = fs::remove_file(restore_journal_path(instance_dir));
+                clear_journal_unless_failed(instance_dir, &rollback);
                 return Err(combine_restore_error(
                     format!("failed to move current {entry_name} into backup: {error}"),
                     rollback,
@@ -2095,7 +2095,7 @@ fn restore_snapshot_impl(
                 &restore_id,
             );
             let _ = fs::remove_dir_all(&extract_dir);
-            let _ = fs::remove_file(restore_journal_path(instance_dir));
+            clear_journal_unless_failed(instance_dir, &rollback);
             return Err(combine_restore_error(
                 format!("failed to promote restored {entry_name}: {error}"),
                 rollback,
@@ -2860,36 +2860,66 @@ fn rollback_restore(
     let mut errors = Vec::new();
     for entry_name in promoted.iter().rev() {
         let live = instance_dir.join(entry_name);
-        if live.exists() {
-            let displaced = failed_dir.join(entry_name);
-            if let Some(parent) = displaced.parent() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    errors.push(format!(
-                        "could not prepare displacement for {entry_name}: {e}"
-                    ));
-                    continue;
-                }
-            }
-            if let Err(e) = fs::rename(&live, &displaced) {
+        // Fail closed: only "not found" means there is nothing to displace (§32.13).
+        match agora_game_api::probe(&live) {
+            agora_game_api::Probe::Absent => continue,
+            agora_game_api::Probe::CantTell(error) => {
                 errors.push(format!(
-                    "could not displace partial restore {entry_name}: {e}"
+                    "cannot tell whether the partial restore of {entry_name} is there: {error}"
                 ));
+                continue;
             }
+            agora_game_api::Probe::Present(_) => {}
+        }
+        let displaced = failed_dir.join(entry_name);
+        if let Some(parent) = displaced.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                errors.push(format!(
+                    "could not prepare displacement for {entry_name}: {e}"
+                ));
+                continue;
+            }
+        }
+        if let Err(e) = fs::rename(&live, &displaced) {
+            errors.push(format!(
+                "could not displace partial restore {entry_name}: {e}"
+            ));
         }
     }
 
     for entry_name in moved_current.iter().rev() {
         let backup = pre_dir.join(entry_name);
         let live = instance_dir.join(entry_name);
-        if !backup.exists() {
-            errors.push(format!("rollback backup is missing for {entry_name}"));
-            continue;
+        // A backup that is a link is present as a link: `exists()` follows it, and a folder the
+        // person replaced with a link to a path that no longer exists would read as missing — the
+        // rollback would report failure and leave the link in the backup folder (§32.13).
+        match agora_game_api::probe(&backup) {
+            agora_game_api::Probe::Present(_) => {}
+            agora_game_api::Probe::Absent => {
+                errors.push(format!("rollback backup is missing for {entry_name}"));
+                continue;
+            }
+            agora_game_api::Probe::CantTell(error) => {
+                errors.push(format!(
+                    "cannot tell whether the rollback backup of {entry_name} is there: {error}"
+                ));
+                continue;
+            }
         }
-        if live.exists() {
-            errors.push(format!(
-                "rollback destination still exists for {entry_name}"
-            ));
-            continue;
+        match agora_game_api::probe(&live) {
+            agora_game_api::Probe::Absent => {}
+            agora_game_api::Probe::Present(_) => {
+                errors.push(format!(
+                    "rollback destination still exists for {entry_name}"
+                ));
+                continue;
+            }
+            agora_game_api::Probe::CantTell(error) => {
+                errors.push(format!(
+                    "cannot tell whether {entry_name} is still there to be replaced back: {error}"
+                ));
+                continue;
+            }
         }
         if let Err(e) = fs::rename(&backup, &live) {
             errors.push(format!("could not restore original {entry_name}: {e}"));
@@ -2915,6 +2945,17 @@ fn combine_restore_error(primary: String, rollback: Result<(), String>) -> Strin
     match rollback {
         Ok(()) => format!("{primary}; original instance state was restored"),
         Err(rollback_error) => format!("{primary}; {rollback_error}"),
+    }
+}
+
+/// Clear the restore journal once the transaction is over without leaving work behind.
+///
+/// A rollback that could not finish keeps it: the journal names the pre-restore state, so recovery
+/// — or the person, with the paths the error printed — can still act on what is left (MASTER_SPEC
+/// §32.11). Removing it would make the failed transaction look like one that never started.
+fn clear_journal_unless_failed(instance_dir: &Path, rollback: &Result<(), String>) {
+    if rollback.is_ok() {
+        let _ = fs::remove_file(restore_journal_path(instance_dir));
     }
 }
 
@@ -4170,6 +4211,119 @@ mod tests {
             b"new options state"
         );
         assert!(!inst.join(RESTORE_MARKER).exists());
+    }
+
+    /// A rollback that could not finish leaves the journal in place.
+    ///
+    /// Recovery is the only thing that knows what the instance looked like before the interrupted
+    /// restore; removing its record when the rollback fails would leave a mixed instance with
+    /// nothing naming the state it should go back to (MASTER_SPEC §32.11).
+    #[test]
+    fn a_failed_rollback_keeps_the_journal() {
+        let tmp = TempDir::new().unwrap();
+        let inst = make_instance(&tmp);
+        let pre = pre_restore_dir(&inst);
+        fs::create_dir_all(pre.join("characters")).unwrap();
+        fs::write(pre.join("characters").join("hero.sav"), b"level 1").unwrap();
+        fs::create_dir_all(inst.join("characters")).unwrap();
+        fs::write(inst.join("characters").join("hero.sav"), b"partial").unwrap();
+        fs::write(inst.join(RESTORE_MARKER), b"interrupted").unwrap();
+        // A leftover file where the rollback needs its displacement folder, so the rollback cannot
+        // even start: the recovery has to report that and leave its record alone.
+        fs::write(
+            inst.join(".agora_failed_restore_interrupted-interrupted"),
+            b"in the way",
+        )
+        .unwrap();
+        RestoreJournal {
+            schema_version: RESTORE_JOURNAL_SCHEMA_VERSION,
+            restore_id: "interrupted".into(),
+            snapshot_id: "whatever".into(),
+            original: vec![SnapshotRoot {
+                name: "characters".into(),
+                state: RootState::Directory,
+            }],
+            target: vec![SnapshotRoot {
+                name: "characters".into(),
+                state: RootState::Directory,
+            }],
+            committed: false,
+        }
+        .write(&inst)
+        .unwrap();
+
+        let error = restore_snapshot(&inst, "missing-snapshot").unwrap_err();
+
+        assert!(
+            error.contains("rollback"),
+            "the recovery says what it could not do: {error}"
+        );
+        assert!(
+            restore_journal_path(&inst).exists(),
+            "the journal is still there to recover from"
+        );
+    }
+
+    /// A backup that is a link is seen as a link.
+    ///
+    /// A folder replaced by a link to a path that no longer exists is still a folder standing in the
+    /// instance, and it is what a rollback has to put back. `exists()` follows the link, answers
+    /// "no such thing", and leaves the link in the backup folder behind a failed rollback
+    /// (MASTER_SPEC §32.13).
+    #[cfg(windows)]
+    #[test]
+    fn a_rollback_puts_back_a_dangling_link_as_a_link() {
+        use std::process::Command;
+
+        let tmp = TempDir::new().unwrap();
+        let inst = make_instance(&tmp);
+        fs::create_dir_all(inst.join("characters")).unwrap();
+        fs::write(inst.join("characters").join("hero.sav"), b"level 1").unwrap();
+        let snapshot = create_snapshot_scoped(
+            &inst,
+            Some("captured characters"),
+            &["characters", "mods", "config"],
+        )
+        .unwrap();
+
+        // The folder is now a junction to a place that does not exist.
+        fs::remove_dir_all(inst.join("characters")).unwrap();
+        let gone = tmp.path().join("gone");
+        let link = inst.join("characters");
+        let status = Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&link)
+            .arg(&gone)
+            .status()
+            .unwrap();
+        assert!(status.success(), "the junction was not created");
+        assert!(
+            matches!(
+                agora_game_api::probe(&link),
+                agora_game_api::Probe::Present(agora_game_api::PresentKind::Symlink)
+            ),
+            "the fixture is a link that is there"
+        );
+
+        let error = restore_snapshot_impl(&inst, &snapshot.id, Some(0)).unwrap_err();
+
+        assert!(
+            error.contains("original instance state was restored"),
+            "the rollback put the folder back: {error}"
+        );
+        assert!(
+            matches!(
+                agora_game_api::probe(&link),
+                agora_game_api::Probe::Present(agora_game_api::PresentKind::Symlink)
+            ),
+            "the link is back where it was"
+        );
+        assert!(
+            !restore_journal_path(&inst).exists(),
+            "and the journal is only kept when a rollback could not finish"
+        );
     }
 
     /// A folder the game no longer declares is restored by the same wholesale mechanism as any
