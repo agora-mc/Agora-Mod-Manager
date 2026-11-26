@@ -3232,9 +3232,25 @@ pub(super) fn delete_snapshot_with(
     instance_dir: &Path,
     snapshot_id: &str,
     _list_dir: impl Fn(&Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>>,
-    _locations: &LockGuard,
+    locations: &LockGuard,
     store: &LockGuard,
     grace: Option<std::time::Duration>,
+) -> Result<(), String> {
+    delete_snapshot_records(instance_dir, snapshot_id)?;
+    finish_snapshot_delete(instance_dir, snapshot_id, locations, store, grace, None)?;
+    Ok(())
+}
+
+/// Remove one snapshot's own records — its manifest or zip, the receipt beside it and its
+/// fingerprint — and judge no object.
+///
+/// Separated from the collection so a batch (retention's whole plan) removes everything it is going
+/// to remove first, then runs **one** collection over the result: per-snapshot collections made a
+/// round of retention free objects a later eviction still named inside the same round
+/// (MASTER_SPEC §32.8).
+pub(super) fn delete_snapshot_records(
+    instance_dir: &Path,
+    snapshot_id: &str,
 ) -> Result<(), String> {
     validate_snapshot_id(snapshot_id)?;
     let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
@@ -3254,27 +3270,38 @@ pub(super) fn delete_snapshot_with(
         fs::remove_file(&zip_path).map_err(|e| format!("failed to delete snapshot zip: {e}"))?;
     }
     let _ = fs::remove_file(snapshot_fingerprint_path(instance_dir, snapshot_id));
+    Ok(())
+}
 
+/// Collect after a snapshot (or a whole batch of them) has been removed, and tidy an empty
+/// snapshots folder.
+fn finish_snapshot_delete(
+    instance_dir: &Path,
+    snapshot_id: &str,
+    _locations: &LockGuard,
+    store: &LockGuard,
+    grace: Option<std::time::Duration>,
+    request: Option<&crate::content_store::collect::CollectRequest>,
+) -> Result<crate::content_store::collect::CollectReport, String> {
     // Nothing names this snapshot's objects now: the one collection decides whether any record
     // still does, and says why it kept them if it cannot tell.
-    let report = crate::content_store::collect::collect_at_instance(
-        instance_dir,
-        &crate::content_store::collect::CollectRequest {
-            store: crate::content_store::collect::LockRequest::Held,
-            locations: crate::content_store::collect::LockRequest::Held,
-            grace,
-            ignore_unreadable_snapshots: false,
-            pause: None,
-        },
-    )
-    .map_err(|error| format!("snapshot {snapshot_id} was deleted, but {error}"))?;
+    let owned;
+    let request = match request {
+        Some(request) => request,
+        None => {
+            owned = crate::content_store::collect::CollectRequest {
+                store: crate::content_store::collect::LockRequest::Held,
+                locations: crate::content_store::collect::LockRequest::Held,
+                grace,
+                ignore_unreadable_snapshots: false,
+                pause: None,
+            };
+            &owned
+        }
+    };
+    let report = crate::content_store::collect::collect_at_instance(instance_dir, request)
+        .map_err(|error| format!("snapshot {snapshot_id} was deleted, but {error}"))?;
     let _ = store;
-    if report.refused() {
-        eprintln!(
-            "snapshot {snapshot_id} was deleted; stored objects kept: {}",
-            report.summary()
-        );
-    }
 
     let dir = snapshots_dir(instance_dir);
     if dir.exists()
@@ -3285,8 +3312,7 @@ pub(super) fn delete_snapshot_with(
     {
         let _ = fs::remove_dir(&dir);
     }
-
-    Ok(())
+    Ok(report)
 }
 
 /// Take instance locations for snapshot cleanup. `wait` uses the short bounded wait for operations
