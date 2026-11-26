@@ -200,7 +200,12 @@ impl SnapshotService {
 
         // Validate the target before capturing anything: an invalid request
         // should not cost the user a snapshot.
-        let scope = snapshot::restore_scope(&instance_dir, snapshot_id).map_err(snapshot_error)?;
+        let scope_entries =
+            snapshot::restore_scope_entries(&instance_dir, snapshot_id).map_err(snapshot_error)?;
+        let scope: Vec<String> = scope_entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
 
         // The undo snapshot covers exactly what the restore will replace.
         // Matching the scope means undoing a configuration-only restore does
@@ -221,14 +226,11 @@ impl SnapshotService {
         // anyway, and the result says which, so the person restoring is not left guessing about
         // state that came back from outside the current scope (MASTER_SPEC §32.7). The question is
         // asked of the scope the snapshot recorded, compared by path components with the platform's
-        // case rule at any depth: dropping `state/characters` while `state/config` stays is reported.
+        // case rule, like with like: a folder the game dropped and a file it dropped are told apart.
         let game = self.instance_game(instance_id)?;
-        for folder in &scope {
-            if !snapshot::scope_covers_root(&entries, folder) {
-                outcome.notices.push(format!(
-                    "folder '{folder}' is no longer tracked by {}; restored from the snapshot anyway",
-                    game.as_str()
-                ));
+        for entry in &scope_entries {
+            if let Some(notice) = snapshot::untracked_notice(&entries, entry, game.as_str()) {
+                outcome.notices.push(notice);
             }
         }
         self.restore_manifest_identity(instance_id, identity.as_ref())?;

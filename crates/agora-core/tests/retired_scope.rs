@@ -182,6 +182,7 @@ fn a_data_snapshot_of_a_folder_the_game_stopped_declaring_keeps_new_files() {
         ],
         SnapshotOrigin::Automatic,
         &SnapshotAux::default(),
+        &["characters", "config"],
     )
     .unwrap();
     write(dir.path(), "characters/new.sav", b"created since");
@@ -219,6 +220,7 @@ fn a_data_restore_refuses_to_write_through_a_folder_a_link_replaced() {
         ],
         SnapshotOrigin::Automatic,
         &SnapshotAux::default(),
+        &["characters", "config"],
     )
     .unwrap();
 

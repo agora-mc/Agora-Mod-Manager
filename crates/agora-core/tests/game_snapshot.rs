@@ -1551,14 +1551,13 @@ fn the_undo_of_a_restore_removes_a_file_the_restore_created() {
     );
 }
 
-/// A folder is retired even when a path inside it is mapped separately.
+/// A mapped file is not a dropped folder.
 ///
-/// A snapshot records the root it captured (`user`), while the game declares a file inside that
-/// root (`user/Plugins.txt`). The folder as a whole is not the game's, so a restore replaces
-/// everything in it — the notice has to say so rather than counting the mapped child as coverage
-/// (MASTER_SPEC §32.7).
+/// The snapshot records what it captured: the file `user/Plugins.txt`, because that is what the
+/// game declares there, not the folder `user` that happens to hold it. So a restore of it says
+/// nothing about `user` — the false notice a root-shaped scope produced (MASTER_SPEC §32.7).
 #[test]
-fn a_folder_is_reported_retired_even_when_a_child_path_is_still_mapped() {
+fn a_mapped_file_is_not_reported_as_a_folder_the_game_dropped() {
     let h = Harness::new();
     // `h.def` declares the load order file `user/Plugins.txt` and no folder holding it.
     std::fs::create_dir_all(h.dir().join("user")).unwrap();
@@ -1569,19 +1568,52 @@ fn a_folder_is_reported_retired_even_when_a_child_path_is_still_mapped() {
     let outcome =
         game_snapshot::restore(&h.ctx, &h.id, &h.def, &taken.id, false).expect("restored");
 
-    let noticed = outcome
-        .outcome
-        .notices
-        .iter()
-        .find(|notice| notice.contains("'user'"))
-        .unwrap_or_else(|| {
-            panic!(
-                "the restore reports the folder it no longer declares: {:?}",
-                outcome.outcome.notices
-            )
-        });
     assert!(
-        noticed.contains("no longer tracked") && noticed.contains("skyrim-se"),
-        "{noticed}"
+        !outcome
+            .outcome
+            .notices
+            .iter()
+            .any(|notice| notice.contains("'user'")),
+        "the file's folder is not reported as dropped: {:?}",
+        outcome.outcome.notices
+    );
+}
+
+/// The undo point covers the recorded scope, not the folder a mapped file lives in.
+///
+/// The reviewers' reproduction: map only `user/Plugins.txt`, keep `user/notes.txt` beside it,
+/// snapshot, restore, edit `notes.txt`, undo — the edit has to survive, because the restore never
+/// touched `notes.txt` (MASTER_SPEC §32.7).
+#[test]
+fn the_undo_of_a_restore_leaves_a_file_beside_a_mapped_one_alone() {
+    let h = Harness::new();
+    std::fs::create_dir_all(h.dir().join("user")).unwrap();
+    std::fs::write(h.dir().join("user/Plugins.txt"), b"*A.esm").unwrap();
+    std::fs::write(h.dir().join("user/notes.txt"), b"the user's notes").unwrap();
+    let taken = game_snapshot::create(&h.ctx, &h.id, &h.def, None, SnapshotOrigin::User).unwrap();
+
+    let outcome =
+        game_snapshot::restore(&h.ctx, &h.id, &h.def, &taken.id, false).expect("restored");
+    // The game writes to a file the snapshot never recorded, after the restore took its undo point.
+    std::fs::write(h.dir().join("user/notes.txt"), b"edited after the restore").unwrap();
+
+    game_snapshot::restore(
+        &h.ctx,
+        &h.id,
+        &h.def,
+        &outcome.undo_snapshot_id,
+        false,
+    )
+    .expect("the undo point reads back");
+
+    assert_eq!(
+        std::fs::read(h.dir().join("user/notes.txt")).unwrap(),
+        b"edited after the restore",
+        "the undo covers the recorded scope, so a file it never captured is left as it is"
+    );
+    assert_eq!(
+        std::fs::read(h.dir().join("user/Plugins.txt")).unwrap(),
+        b"*A.esm",
+        "and the file the snapshot did record comes back"
     );
 }

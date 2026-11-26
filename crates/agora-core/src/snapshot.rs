@@ -1485,12 +1485,18 @@ fn store_snapshot_object_bytes(instance_dir: &Path, bytes: &[u8]) -> Result<(Str
 /// (Cyberpunk's `mods/modlist.txt`), so capturing its folder would also copy
 /// mod bytes. The contents land in the same object store and manifest a walked
 /// snapshot uses.
+///
+/// `folders` names the scope entries that are folders (the folders the game's package declares,
+/// plus the shared loadout store). Every other captured path is recorded as the file it is, so a
+/// snapshot of `user/Plugins.txt` records that file and not the folder `user` around it: a restore
+/// of a folder owns everything in it, including files the game never declared (MASTER_SPEC §32.7).
 pub fn create_snapshot_from_data(
     instance_dir: &Path,
     label: Option<&str>,
     files: &[SnapshotInputFile],
     origin: SnapshotOrigin,
     aux: &SnapshotAux,
+    folders: &[&str],
 ) -> Result<Snapshot, String> {
     let id = uuid::Uuid::new_v4().to_string();
     fs::create_dir_all(snapshots_dir(instance_dir))
@@ -1504,25 +1510,23 @@ pub fn create_snapshot_from_data(
         std::collections::BTreeMap::new();
     for file in files {
         validate_relative_path(&file.relative_path)?;
-        let root = file
+        let first = file
             .relative_path
             .split('/')
             .next()
             .unwrap_or_default()
             .to_string();
-        let has_child = file.relative_path.contains('/');
-        roots
-            .entry(root)
-            .and_modify(|state| {
-                if has_child {
-                    *state = RootState::Directory;
-                }
-            })
-            .or_insert(if has_child {
-                RootState::Directory
-            } else {
-                RootState::File
-            });
+        // What the snapshot recorded is what it captured: a declared folder as that folder, and a
+        // mapped file as the file itself. Recording `user` for a captured `user/Plugins.txt` would
+        // claim a folder the game never declared, and everything else in it becomes something the
+        // restore — and its undo — own. `folders` are the declarations, so a plain comparison of
+        // the first component is exact enough: the same definition supplies both strings.
+        let (name, state) = if folders.iter().any(|folder| *folder == first) {
+            (first, RootState::Directory)
+        } else {
+            (file.relative_path.clone(), RootState::File)
+        };
+        roots.entry(name).or_insert(state);
         match &file.contents {
             Some(bytes) => {
                 let (hash, size) = store_snapshot_object_bytes(instance_dir, bytes)?;
@@ -1575,6 +1579,11 @@ pub fn create_snapshot_from_data(
 /// Restore a snapshot created by [`create_snapshot_from_data`]: verify every
 /// blob first, then write each declared file atomically. A file the snapshot
 /// recorded as absent is removed.
+///
+/// This is the data-snapshot mechanism and it stays file-level on purpose: a generic game's state
+/// files live beside content, so the files of a declared folder are restored one by one and a file
+/// created since the capture is left alone. Whole-root snapshots go through
+/// [`restore_snapshot`], which replaces whole folders (MASTER_SPEC §32.7).
 pub fn restore_snapshot_data(
     instance_dir: &Path,
     snapshot_id: &str,
@@ -1902,6 +1911,20 @@ pub fn restore_snapshot(
 /// will replace — copying worlds to undo a configuration-only restore is pure
 /// cost — and to tell the user what the restore can and cannot promise.
 pub fn restore_scope(instance_dir: &Path, snapshot_id: &str) -> Result<Vec<String>, String> {
+    Ok(restore_scope_entries(instance_dir, snapshot_id)?
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect())
+}
+
+/// [`restore_scope`] with what each entry is: a folder the game declares, or a file it maps.
+///
+/// The difference is what the notice needs — a recorded folder the game dropped and a recorded
+/// file it dropped are told apart, and named as what they are (MASTER_SPEC §32.7).
+pub fn restore_scope_entries(
+    instance_dir: &Path,
+    snapshot_id: &str,
+) -> Result<Vec<SnapshotRoot>, String> {
     validate_snapshot_id(snapshot_id)?;
     let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
     // Fail closed (§32.13): only "the operating system said not found" means this snapshot predates
@@ -1922,11 +1945,30 @@ pub fn restore_scope(instance_dir: &Path, snapshot_id: &str) -> Result<Vec<Strin
             ))
         }
     };
-    Ok(resolve_restore_coverage(&manifest)?
-        .roots()
-        .iter()
-        .map(|root| root.name.clone())
-        .collect())
+    Ok(resolve_restore_coverage(&manifest)?.roots().to_vec())
+}
+
+/// The sentence that tells the user a restore put back state the game no longer declares.
+///
+/// The comparison is the scope question, so a recorded folder is owned by a declaration that is it
+/// or holds it, and a recorded file by a declaration that names it or names the folder it lives in.
+/// `None` means the declaration in force still owns it, or holds something inside it.
+pub(crate) fn untracked_notice(
+    declared: &[&str],
+    entry: &SnapshotRoot,
+    game: &str,
+) -> Option<String> {
+    if scope_contains(declared, &entry.name) {
+        return None;
+    }
+    let what = match entry.state {
+        RootState::Directory => "folder",
+        RootState::File | RootState::Absent => "file",
+    };
+    Some(format!(
+        "{what} '{}' is no longer tracked by {game}; restored from the snapshot anyway",
+        entry.name
+    ))
 }
 
 fn restore_snapshot_impl(
@@ -1979,6 +2021,22 @@ fn restore_snapshot_impl(
             return Err(error);
         }
     };
+
+    // A manifest that records a file by path is a data snapshot (generic games). It is restored
+    // file by file, on purpose: restoring it as whole folders would replace folders it does not
+    // own. Refuse here rather than move a folder the snapshot never covered.
+    if let Some(entry) = coverage
+        .roots()
+        .iter()
+        .find(|root| root.name.contains('/'))
+    {
+        let _ = fs::remove_dir_all(&extract_dir);
+        return Err(format!(
+            "snapshot {snapshot_id} records the file '{}', so it is restored file by file, not as \
+             whole folders",
+            entry.name
+        ));
+    }
 
     let covered: Vec<String> = coverage
         .roots()
@@ -2545,28 +2603,18 @@ pub(crate) fn validate_snapshot_id(snapshot_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether a declared folder is `path` or holds it, comparing component by component with the
-/// platform's case rule (MASTER_SPEC §32.3).
+/// Whether a declared folder (or mapped file) is `path` or holds it, comparing component by
+/// component with the platform's case rule (MASTER_SPEC §32.3).
 ///
-/// This is the question a restore asks about a captured file and about a snapshot root: a
-/// declaration of `state/config` covers `state/config/a.toml` and the root `state/config`, and a
-/// declaration of `characters` covers the root `characters` and every file under it.
+/// This is the question a restore asks about a recorded scope entry: a declaration of `state/config`
+/// covers `state/config/a.toml` and the entry `state/config`, a declaration of `characters` covers
+/// the entry `characters` and every file under it — and a declaration of `user/Plugins.txt` covers
+/// that file, never the folder `user` around it (MASTER_SPEC §32.7).
 pub(crate) fn scope_contains(declared: &[&str], path: &str) -> bool {
     declared.iter().any(|folder| {
         agora_game_api::same_spelling(Path::new(folder), Path::new(path))
             || is_under(Path::new(path), Path::new(folder))
     })
-}
-
-/// Whether a snapshot root is owned by the declaration in force.
-///
-/// A declared folder covers a root it holds (`state/config` covers the root `state/config`) and the
-/// root it lives in (`user` covers a declaration of `user`), and nothing else. A declaration of a
-/// path *inside* the root does not cover it: the folder as a whole is not the game's, so a restore
-/// replaces everything the folder holds, including whatever else the person put there. That is the
-/// case worth reporting — `user` dropped from the declaration while `user/Plugins.txt` stays mapped.
-pub(crate) fn scope_covers_root(declared: &[&str], root: &str) -> bool {
-    scope_contains(declared, root)
 }
 
 /// Whether `path` is inside `folder` (strictly, not equal): the game contract's comparison, so the
@@ -2701,7 +2749,19 @@ fn capture_root_states(instance_dir: &Path, entries: &[&str]) -> Result<Vec<Snap
 fn resolve_restore_coverage(manifest: &SnapshotManifest) -> Result<RestoreCoverage, String> {
     if let Some(scope) = &manifest.scope {
         for root in scope {
-            validate_scope_root(&root.name)?;
+            // A scope entry is a folder the game declares or a file its definition maps, and a
+            // nested entry is always the file (MASTER_SPEC §32.7).
+            if root.name.contains('/') {
+                validate_relative_path(&root.name)?;
+                if root.state != RootState::File {
+                    return Err(format!(
+                        "snapshot scope records '{}' as a folder, but a nested entry is a file",
+                        root.name
+                    ));
+                }
+            } else {
+                validate_scope_root(&root.name)?;
+            }
         }
         let mut seen = HashSet::new();
         for root in scope {
@@ -2709,11 +2769,13 @@ fn resolve_restore_coverage(manifest: &SnapshotManifest) -> Result<RestoreCovera
                 return Err(format!("snapshot scope lists {} twice", root.name));
             }
         }
-        // Every recorded file must live inside a covered root, or the manifest
-        // is internally inconsistent and must not be applied.
+        // Every recorded file must be inside a covered entry — a folder that holds it, or the file
+        // itself — or the manifest is internally inconsistent and must not be applied.
         for entry in &manifest.files {
-            let root = entry.relative_path.split('/').next().unwrap_or_default();
-            if !seen.contains(root) {
+            let covered = scope
+                .iter()
+                .any(|root| scope_contains(&[root.name.as_str()], &entry.relative_path));
+            if !covered {
                 return Err(format!(
                     "snapshot contains {} which is outside its recorded scope",
                     entry.relative_path
@@ -4654,15 +4716,9 @@ mod tests {
         assert!(scope_contains(&declared, "CHARACTERS/hero.sav"));
         assert!(scope_contains(&declared, "State/Config/a.toml"));
 
-        // A root is owned by the declaration when the declaration covers it or holds it. A path
-        // mapped inside the root does not own it: `user` is not tracked just because
-        // `user/Plugins.txt` is (MASTER_SPEC §32.7).
-        assert!(scope_covers_root(&declared, "characters"));
-        assert!(scope_covers_root(&declared, "state/config"));
-        assert!(!scope_covers_root(&declared, "state"));
-        assert!(!scope_covers_root(&["user/Plugins.txt"], "user"));
-        assert!(!scope_covers_root(&declared, "mods"));
-        assert!(!scope_covers_root(&declared, "characters-old"));
+        // A path mapped inside a folder does not own that folder: `user` is not tracked just
+        // because `user/Plugins.txt` is (MASTER_SPEC §32.7).
+        assert!(!scope_contains(&["user/Plugins.txt"], "user"));
     }
 
     fn write_test_archive(path: &Path, entries: &[(&str, &[u8])]) {

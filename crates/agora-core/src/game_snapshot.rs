@@ -261,6 +261,20 @@ enum DeclaredFolders {
     Prelaunch,
 }
 
+/// The scope entries a generic snapshot may record as folders: the folders the game's package
+/// declares, and the shared loadout store. Everything else a snapshot captures is a file its
+/// definition maps, and is recorded as that file (MASTER_SPEC §32.7).
+fn declared_scope_folders(definition: &GameDefinition) -> Vec<String> {
+    let mut folders: Vec<String> = definition
+        .snapshot
+        .iter()
+        .flat_map(|scope| scope.tracked_entries())
+        .map(|folder| (*folder).to_string())
+        .collect();
+    folders.push(LOADOUTS_SCOPE_ROOT.to_string());
+    folders
+}
+
 /// The state files, as data. A missing declared file is recorded as absent.
 fn capture_files(
     ctx: &Ctx,
@@ -437,7 +451,9 @@ pub fn create_locked(
     let files = capture_files(ctx, instance_id, definition, DeclaredFolders::All)?;
     let data = capture_data(ctx, instance_id, definition)?;
     let aux = aux_for(&data)?;
-    snapshot::create_snapshot_from_data(&dir, label, &files, origin, &aux)
+    let folders = declared_scope_folders(definition);
+    let folder_refs: Vec<&str> = folders.iter().map(String::as_str).collect();
+    snapshot::create_snapshot_from_data(&dir, label, &files, origin, &aux, &folder_refs)
 }
 
 /// Take an automatic recovery point before a change, for a caller that already
@@ -670,12 +686,15 @@ pub fn prepare_launch(
     }
 
     let aux = aux_for(&current_data)?;
+    let folders = declared_scope_folders(definition);
+    let folder_refs: Vec<&str> = folders.iter().map(String::as_str).collect();
     let snapshot = snapshot::create_snapshot_from_data(
         &dir,
         Some("pre-launch"),
         &current_files,
         SnapshotOrigin::Automatic,
         &aux,
+        &folder_refs,
     )?;
     if let Err(error) = lkg::run_retention(&dir) {
         eprintln!("[snapshot] retention after pre-launch capture failed: {error}");
@@ -1090,12 +1109,16 @@ pub fn restore_locked(
     }
 
     // What the snapshot recorded as its scope, and what this game tracks today. Read before
-    // anything moves: retention after the restore may prune the snapshot being restored. A folder
-    // the snapshot captured but the game no longer declares is restored anyway, and named in the
-    // result (MASTER_SPEC §32.7). Compared by path components with the platform's case rule at any
-    // depth, against the folders the game lists in full, so dropping `state/characters` while
-    // `state/config` stays is reported.
-    let recorded = snapshot::restore_scope(&dir, snapshot_id)?;
+    // anything moves: retention after the restore may prune the snapshot being restored. A scope
+    // entry the snapshot captured but the game no longer declares is restored anyway, and named in
+    // the result (MASTER_SPEC §32.7). The snapshot recorded a folder as a folder and a mapped file
+    // as that file, so the comparison is like with like, by path components with the platform's
+    // case rule.
+    let recorded_entries = snapshot::restore_scope_entries(&dir, snapshot_id)?;
+    let recorded: Vec<String> = recorded_entries
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
     let tracked = tracked_paths(definition);
     let tracked_refs: Vec<&str> = tracked.iter().map(String::as_str).collect();
 
@@ -1125,12 +1148,15 @@ pub fn restore_locked(
             contents: None,
         });
     }
+    let folders = declared_scope_folders(definition);
+    let folder_refs: Vec<&str> = folders.iter().map(String::as_str).collect();
     let undo = snapshot::create_snapshot_from_data(
         &dir,
         Some(&pre_restore_label(chrono::Utc::now())),
         &current_files,
         SnapshotOrigin::Automatic,
         &undo_aux,
+        &folder_refs,
     )?;
 
     // Durable before the first write: an interruption names the snapshot that
@@ -1213,14 +1239,10 @@ pub fn restore_locked(
         cleanup_warning: None,
         preserved_recovery_dir: None,
         undo_snapshot_id: Some(undo.id.clone()),
-        notices: recorded
+        notices: recorded_entries
             .iter()
-            .filter(|folder| !snapshot::scope_covers_root(&tracked_refs, folder))
-            .map(|folder| {
-                format!(
-                    "folder '{folder}' is no longer tracked by {}; restored from the snapshot anyway",
-                    definition.id.as_str()
-                )
+            .filter_map(|entry| {
+                snapshot::untracked_notice(&tracked_refs, entry, definition.id.as_str())
             })
             .collect(),
     };
