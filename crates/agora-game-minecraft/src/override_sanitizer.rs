@@ -640,4 +640,121 @@ mod tests {
             "shaderpacks/ComplementaryShaders.zip"
         ));
     }
+
+    /// A pack whose entry names are the ones the policy used to judge raw: the same file spelled
+    /// with a `.` component or with backslashes, the files Agora owns spelled that way, and a name
+    /// Windows would create without its trailing dot.
+    fn policy_fixture_zip(dir: &Path) -> std::path::PathBuf {
+        use std::io::Write;
+        let zip_path = dir.join("pack.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, bytes) in [
+            ("./config/dotted.toml", &b"a"[..]),
+            ("config\\backslashed.toml", &b"b"[..]),
+            ("./instance_manifest.json", &b"c"[..]),
+            ("sub\\.agora\\state.json", &b"d"[..]),
+            ("config/run.bat.", &b"e"[..]),
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+        zip_path
+    }
+
+    #[test]
+    fn a_dotted_or_backslashed_config_name_is_the_config_file_it_names() {
+        // `./config/x` and `config\x` name the same file as `config/x`, so the folder rule has to
+        // admit them: judged on the raw entry name they were dropped as "not a folder a pack's
+        // overrides may write", which silently lost a pack's real config files.
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = policy_fixture_zip(dir.path());
+        let dest = dir.path().join("instance");
+        std::fs::create_dir_all(&dest).unwrap();
+        let result = extract_overrides_with_inputs(
+            &zip_path,
+            &dest,
+            OverridePolicy::Standard,
+            NamesPolicy::WithoutThem,
+        )
+        .expect("what can be written is written");
+        assert!(
+            dest.join("config/dotted.toml").exists(),
+            "`./config/x` is `config/x`: {result:?}"
+        );
+        assert!(
+            dest.join("config/backslashed.toml").exists(),
+            "a backslash is a separator: {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_agora_owns_is_protected_however_its_name_is_spelled() {
+        // Reduced security mode admits every folder, so the protected-file rule is the only thing
+        // between a pack and `instance_manifest.json`. Judged on the raw entry name, `./` in front
+        // of it was enough to have it written over.
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = policy_fixture_zip(dir.path());
+        let dest = dir.path().join("instance");
+        std::fs::create_dir_all(&dest).unwrap();
+        extract_overrides_with_inputs(
+            &zip_path,
+            &dest,
+            OverridePolicy::Permissive,
+            NamesPolicy::WithoutThem,
+        )
+        .expect("what can be written is written");
+        assert!(
+            !dest.join("instance_manifest.json").exists(),
+            "`./instance_manifest.json` is the manifest Agora owns"
+        );
+        assert!(
+            !dest.join("sub").exists(),
+            r"`sub\.agora\x` is inside Agora's own folder"
+        );
+    }
+
+    #[test]
+    fn a_name_a_disk_cannot_hold_is_reported_as_a_name_not_as_a_banned_type() {
+        // `config/run.bat.` is written by Windows as `config/run.bat`, so it is a name a disk
+        // cannot hold. Asked about the raw name, the pack's banned-extension rule refused the whole
+        // archive as a security violation, which is not what the archive is.
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = policy_fixture_zip(dir.path());
+        let dest = dir.path().join("instance");
+        std::fs::create_dir_all(&dest).unwrap();
+        let result = extract_overrides_with_inputs(
+            &zip_path,
+            &dest,
+            OverridePolicy::Standard,
+            NamesPolicy::WithoutThem,
+        )
+        .expect("what can be written is written");
+        let left_out = result
+            .left_out
+            .iter()
+            .find(|entry| entry.path == "config/run.bat.")
+            .unwrap_or_else(|| panic!("the entry is named: {result:?}"));
+        assert!(
+            left_out.reason.contains("dot"),
+            "the reason is about the name: {left_out:?}"
+        );
+
+        // And when the caller did not opt out, that same name is what refuses the extraction.
+        let refused = dir.path().join("refused");
+        std::fs::create_dir_all(&refused).unwrap();
+        let error = extract_overrides_with_inputs(
+            &zip_path,
+            &refused,
+            OverridePolicy::Standard,
+            NamesPolicy::Refuse,
+        )
+        .expect_err("a name Windows cannot hold is refused by default");
+        assert_eq!(
+            error.code(),
+            "ERR_ZIP_UNSAFE_NAMES",
+            "not a security violation: {error}"
+        );
+    }
 }

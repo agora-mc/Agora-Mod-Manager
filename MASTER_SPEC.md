@@ -5605,7 +5605,10 @@ three path comparators.
     every offending entry named, and a caller may instead extract without them, in which case they
     come back in the result so the CLI and the desktop can list them. User-facing imports wire that
     opt-in (`agora pack extract-overrides --without-unwritable-names`); internal extractions never
-    skip silently.
+    skip silently. A caller's own rule is asked about **the path the file would have**, not the raw
+    entry name (`./config/x` and `config\x` are `config/x`), and a name a disk cannot hold is
+    answered by this rule before any caller rule is asked, so `config/run.bat.` is reported as a name
+    Windows would rewrite rather than as a file type a pack banned.
   - Its guard counts direct archive opens per file, in `scripts/archive_budget.json`, and the count
     only goes down.
   - **Two entries with one name are refused**, naming them: `zip::ZipArchive` keeps only the last of

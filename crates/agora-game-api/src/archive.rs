@@ -230,6 +230,10 @@ pub struct ExtractReport {
 /// A caller's rules — a pack's whitelist of folders, a rule that only the top-level file is taken —
 /// are not the reader's business, but they must not become a second place where paths are decided.
 /// So the caller answers with one of these, and the reader keeps doing the writing.
+///
+/// The rule is asked about **the path the file would have**, already classified (`config/x` for an
+/// entry named `./config/x` or `config\x`), never the raw entry name. An entry whose name a disk
+/// cannot hold is not put to the rule at all: [`NamePolicy`] answers that one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Select {
     /// Write it, under the reader's own name rules.
@@ -1222,23 +1226,13 @@ impl SafeArchive {
                 }
                 EntryKind::File => {}
             }
-            let wanted = select(&entry.name);
-            if let Select::Refuse(reason) = wanted {
-                return Err(ArchiveError::Refused {
-                    path: path.clone(),
-                    entry: entry.name.clone(),
-                    reason,
-                });
-            }
-            match classify_entry_name(&entry.name) {
-                EntryName::Writable(strict) => match wanted {
-                    Select::Write => plan.push((strict, entry.name.clone(), entry.size)),
-                    Select::LeaveOut(reason) => skipped.push(SkippedEntry {
-                        name: entry.name.clone(),
-                        reason,
-                    }),
-                    Select::Refuse(_) => unreachable!("answered above"),
-                },
+            // The name is classified **before** the caller's rule is asked (§32.3). Two reasons: the
+            // rule is about the file the entry would become, so it is handed that path and not the
+            // raw entry name — `./config/x` and `config\x` name `config/x`; and a name a disk cannot
+            // hold is answered by the naming rule, not by the caller's rule, so `config/run.bat.` is
+            // reported as a name Windows would rewrite rather than as a file the caller banned.
+            let strict = match classify_entry_name(&entry.name) {
+                EntryName::Writable(strict) => strict,
                 EntryName::Escapes { reason } => {
                     return Err(ArchiveError::Escapes {
                         path: path.clone(),
@@ -1253,6 +1247,21 @@ impl SafeArchive {
                     };
                     unwritable.push(left_out.clone());
                     skipped.push(left_out);
+                    continue;
+                }
+            };
+            match select(strict.as_str()) {
+                Select::Write => plan.push((strict, entry.name.clone(), entry.size)),
+                Select::LeaveOut(reason) => skipped.push(SkippedEntry {
+                    name: entry.name.clone(),
+                    reason,
+                }),
+                Select::Refuse(reason) => {
+                    return Err(ArchiveError::Refused {
+                        path: path.clone(),
+                        entry: entry.name.clone(),
+                        reason,
+                    })
                 }
             }
         }
