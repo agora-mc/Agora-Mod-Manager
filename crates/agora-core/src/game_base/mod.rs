@@ -1701,7 +1701,119 @@ fn instances_pinning_base_with(
             instances.push(instance_id);
         }
     }
+    // A manifest is an owner record even when no row agrees with it: a create or an import writes
+    // its manifest before its row, so a crash in between leaves a pin nothing else records.
+    for instance_id in instance_manifests_pinning_base(paths, base_id)? {
+        if !instances.contains(&instance_id) {
+            instances.push(instance_id);
+        }
+    }
     instances.sort();
+    Ok(instances)
+}
+
+/// Every instance manifest, in the live instances folder and in both Recently deleted areas, whose
+/// `base` is pinned to `base_id` (MASTER_SPEC §32.8).
+///
+/// The scan is deliberately wider than the database: a create or a general registration writes the
+/// instance's manifest first and its row afterwards, so a crash in between — or a row the schema
+/// refuses, as it does for a base on a Minecraft instance — leaves a manifest that pins a base and
+/// no row that does. A folder that is a link is not followed, an entry that cannot be listed is
+/// not skipped, and a manifest that cannot be read is not passed over: the caller is about to
+/// delete a base, so "I could not tell" is never "nothing pins it". An entry with no manifest pins
+/// nothing (a Minecraft instance keeps none), which is the one absence this reads as absence.
+fn instance_manifests_pinning_base(
+    paths: &AppPaths,
+    base_id: &str,
+) -> Result<Vec<String>, BaseError> {
+    let unreadable = |path: &Path, error: &dyn std::fmt::Display| {
+        BaseError::Other(format!(
+            "cannot read {} while checking which instances use base {base_id}, so the base is \
+             kept: {error}",
+            path.display()
+        ))
+    };
+    let mut instances = Vec::new();
+    for (root, in_trash) in [
+        (paths.instances_root(), false),
+        (paths.recently_deleted_games_root(), true),
+        (paths.recently_deleted_root(), true),
+    ] {
+        let read = match std::fs::read_dir(&root) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(BaseError::Other(format!(
+                "cannot read {}, so Agora cannot tell which instances use base {base_id}: {error}",
+                root.display()
+            )))
+            }
+        };
+        for entry in read {
+            let entry = entry.map_err(|error| {
+                BaseError::Other(format!(
+                    "cannot read {}, so Agora cannot tell which instances use base {base_id}: {error}",
+                    root.display()
+                ))
+            })?;
+            let entry_path = entry.path();
+            match std::fs::symlink_metadata(&entry_path) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) if is_reparse_point_or_symlink(&entry_path) => {
+                    return Err(BaseError::Other(format!(
+                        "{} is a link, so Agora cannot tell whether the instance in it uses base {base_id}; the base is kept",
+                        entry_path.display()
+                    )))
+                }
+                // A file beside the instance folders holds no instance.
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(unreadable(&entry_path, &error)),
+            }
+            let folder = if in_trash {
+                entry_path.join("instance")
+            } else {
+                entry_path.clone()
+            };
+            if in_trash {
+                match std::fs::symlink_metadata(&folder) {
+                    Ok(metadata) if metadata.is_dir() => {}
+                    Ok(_) => {
+                        return Err(BaseError::Other(format!(
+                            "{} is a link, so Agora cannot tell whether the instance in it uses base {base_id}; the base is kept",
+                            folder.display()
+                        )))
+                    }
+                    // A purged entry has no folder, and an entry of another shape pins nothing.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(unreadable(&folder, &error)),
+                }
+            }
+            let manifest_path = folder.join("instance_manifest.json");
+            let bytes = match std::fs::read(&manifest_path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(unreadable(&manifest_path, &error)),
+            };
+            let stored: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|error| unreadable(&manifest_path, &error))?;
+            let Some(base) = stored.get("base") else {
+                continue;
+            };
+            let base_ref: agora_game_api::BaseReference = serde_json::from_value(base.clone())
+                .map_err(|error| unreadable(&manifest_path, &error))?;
+            if !matches!(&base_ref, agora_game_api::BaseReference::Pinned { id, .. } if id == base_id)
+            {
+                continue;
+            }
+            let instance_id = stored
+                .get("instance_id")
+                .and_then(|id| id.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| entry.file_name().to_string_lossy().into_owned());
+            instances.push(instance_id);
+        }
+    }
     Ok(instances)
 }
 
@@ -1720,7 +1832,6 @@ fn trash_instances_pinning_base(paths: &AppPaths, base_id: &str) -> Result<Vec<S
             )))
         }
     };
-    let now = chrono::Utc::now();
     let mut instances = Vec::new();
     for entry in read {
         let entry = entry.map_err(|error| {
@@ -1777,15 +1888,9 @@ fn trash_instances_pinning_base(paths: &AppPaths, base_id: &str) -> Result<Vec<S
         if !matches!(&base_ref, agora_game_api::BaseReference::Pinned { id, .. } if id == base_id) {
             continue;
         }
-        // An entry whose expiry cannot be read is counted, so a damaged entry keeps the base.
-        let expired = stored
-            .get("expires_at")
-            .and_then(|value| value.as_str())
-            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-            .is_some_and(|at| at <= now);
-        if !expired {
-            instances.push(instance_id.to_string());
-        }
+        // Every entry counts, expired or not: an entry can be restored until it is purged, and
+        // recovery can publish its row at any time, so its base has to stay until it is gone.
+        instances.push(instance_id.to_string());
     }
     Ok(instances)
 }

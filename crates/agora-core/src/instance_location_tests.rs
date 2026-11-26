@@ -896,3 +896,133 @@ fn a_backup_import_cannot_publish_a_pin_to_a_base_being_removed() {
         imported.base
     );
 }
+
+/// An entry past its expiry is still restorable until it is purged, and recovery can publish its
+/// row at any time. Skipping it in the pinning scan let a base be removed while the instance it
+/// belongs to could still come back.
+#[test]
+fn an_expired_entry_still_keeps_its_base() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    pinned_instance(&ctx, "pinned", base_id);
+    let entry = game_instance::delete(&ctx, "pinned")
+        .unwrap()
+        .trash_entry_id
+        .unwrap();
+    let record = ctx
+        .paths
+        .recently_deleted_games_root()
+        .join(&entry)
+        .join("entry.json");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    stored["expires_at"] = serde_json::Value::String("2001-01-01T00:00:00Z".into());
+    fs::write(&record, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+    let removal = game_base::remove_base(&ctx.paths, base_id);
+    assert!(
+        matches!(&removal, Err(BaseError::InUse { instances }) if instances == &vec!["pinned".to_string()]),
+        "an expired but restorable entry stopped protecting its base: {removal:?}"
+    );
+    assert!(base_dir.join("game.exe").is_file());
+    assert!(ctx.paths.base_manifest_path(base_id).is_file());
+}
+
+/// A create writes the instance's manifest, then its row. A crash between the two leaves a
+/// manifest that pins the base and no row, and nothing else on disk says the instance is there.
+#[test]
+fn an_orphan_pinned_manifest_keeps_its_base() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    let folder = ctx.paths.instance_dir("orphan").unwrap();
+    fs::create_dir_all(&folder).unwrap();
+    let manifest = GameInstanceManifest::new(
+        GameId::new("test-game").unwrap(),
+        "orphan",
+        "Orphan",
+        None,
+        BaseReference::Pinned {
+            id: base_id.into(),
+            runtime: RuntimeIdentity::minecraft("1.0"),
+            mode: BaseMode::Linked,
+        },
+    );
+    fs::write(
+        folder.join("instance_manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let removal = game_base::remove_base(&ctx.paths, base_id);
+    assert!(
+        matches!(&removal, Err(BaseError::InUse { instances }) if instances == &vec!["orphan".to_string()]),
+        "a manifest with no row stopped protecting its base: {removal:?}"
+    );
+    assert!(base_dir.join("game.exe").is_file());
+    assert!(ctx.paths.base_manifest_path(base_id).is_file());
+}
+
+/// A generic registration writes the manifest before the row, and a Minecraft-game instance cannot
+/// have a base row at all, so its manifest can name a base that no row ever did. Minecraft's delete
+/// then moves that folder into its own Recently deleted area, where it is restorable.
+#[test]
+fn a_pinned_manifest_in_the_other_recently_deleted_root_keeps_its_base() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    let folder = ctx
+        .paths
+        .recently_deleted_root()
+        .join("entry-1")
+        .join("instance");
+    fs::create_dir_all(&folder).unwrap();
+    let manifest = GameInstanceManifest::new(
+        GameId::new("minecraft").unwrap(),
+        "imported",
+        "Imported",
+        None,
+        BaseReference::Pinned {
+            id: base_id.into(),
+            runtime: RuntimeIdentity::minecraft("1.0"),
+            mode: BaseMode::Linked,
+        },
+    );
+    fs::write(
+        folder.join("instance_manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let removal = game_base::remove_base(&ctx.paths, base_id);
+    assert!(
+        matches!(&removal, Err(BaseError::InUse { instances }) if instances == &vec!["imported".to_string()]),
+        "a restorable entry in Minecraft's area stopped protecting its base: {removal:?}"
+    );
+    assert!(base_dir.join("game.exe").is_file());
+    assert!(ctx.paths.base_manifest_path(base_id).is_file());
+}
+
+/// A manifest that cannot be read might pin this base, so the base is kept and the file named.
+#[test]
+fn an_unreadable_instance_manifest_refuses_removal() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    let folder = ctx.paths.instance_dir("damaged").unwrap();
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("instance_manifest.json"), b"{ not json").unwrap();
+
+    let removal = game_base::remove_base(&ctx.paths, base_id);
+    let error = format!(
+        "{}",
+        removal.expect_err("an unreadable manifest must keep the base")
+    );
+    assert!(
+        error.contains("instance_manifest.json"),
+        "the refusal names the manifest it could not read: {error}"
+    );
+    assert!(base_dir.join("game.exe").is_file());
+    assert!(ctx.paths.base_manifest_path(base_id).is_file());
+}
