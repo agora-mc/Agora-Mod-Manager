@@ -587,6 +587,14 @@ fn base_folder_is_intact(manifest: &BaseManifest) -> bool {
     base_folder_present(folder) && base_marker_matches(folder, &manifest.base_id)
 }
 
+/// Whether `folder` is a plain directory: something is there, the stat did not fail, it is not a
+/// link, and it is a folder. A pin names a folder an instance runs from, so a plain file at the
+/// recorded path — or a stat that could not tell — is not that folder.
+fn folder_is_plain_directory(folder: &Path) -> bool {
+    !is_reparse_point_or_symlink(folder)
+        && matches!(std::fs::symlink_metadata(folder), Ok(metadata) if metadata.is_dir())
+}
+
 /// What the record of a base says about whether a pin may name it, read under the base's own lock
 /// (MASTER_SPEC §32.8).
 #[derive(Debug)]
@@ -618,10 +626,7 @@ pub(crate) fn pinnable_base(paths: &AppPaths, base_id: &str) -> Result<PinnableB
         BaseRecord::Damaged => Ok(PinnableBase::Unusable),
         BaseRecord::Healthy(manifest) => {
             let folder = &manifest.location;
-            if manifest.base_id == base_id
-                && base_folder_present(folder)
-                && !is_reparse_point_or_symlink(folder)
-            {
+            if manifest.base_id == base_id && folder_is_plain_directory(folder) {
                 Ok(PinnableBase::Ready(manifest))
             } else {
                 Ok(PinnableBase::Unusable)

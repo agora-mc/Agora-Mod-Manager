@@ -1088,3 +1088,61 @@ fn a_clone_refuses_a_pin_to_a_base_left_unusable() {
         .unwrap();
     assert_eq!(clones, 0, "a refused clone publishes no row");
 }
+
+/// A base's recorded folder that is a plain file holds no files an instance could run from, but
+/// the record is healthy and something is at the path, so both old questions ("is the record
+/// readable", "is something there") answered yes. Only "is it a folder?" catches it, and a pin to
+/// it names a base nobody can open.
+#[test]
+fn a_clone_refuses_a_pin_to_a_base_folder_that_is_a_file() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let folder = ctx.paths.bases_dir().join(base_id);
+    fs::create_dir_all(ctx.paths.bases_dir()).unwrap();
+    fs::write(&folder, b"a file where the base folder should be").unwrap();
+    let manifest = serde_json::json!({
+        "manifest_version": 1u32,
+        "base_id": base_id,
+        "runtime": RuntimeIdentity::minecraft("1.0"),
+        "mode": BaseMode::Linked,
+        "source_install": "steam:1",
+        "source_product": "Test Game",
+        "source_location": dir.path().join("source"),
+        "location": folder,
+        "created_unix_ms": 0i64,
+        "files": [],
+        "skipped": [],
+    });
+    fs::create_dir_all(ctx.paths.base_manifests_dir()).unwrap();
+    fs::write(
+        ctx.paths.base_manifest_path(base_id),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    pinned_instance(&ctx, "source", base_id);
+
+    let cloned = game_instance::clone_instance(
+        &ctx,
+        "source",
+        "Copy",
+        &test_game_definition(),
+        game_instance::CloneOptions::default(),
+    );
+    let error = format!(
+        "{}",
+        cloned.expect_err("a pin must not name a base whose folder is a file")
+    );
+    assert!(
+        error.contains(base_id),
+        "the refusal names the base: {error}"
+    );
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let clones: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM instances WHERE instance_id <> 'source'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(clones, 0, "a refused clone publishes no row");
+}
