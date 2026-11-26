@@ -15,7 +15,7 @@ use agora_core::models::InstanceManifest;
 use agora_core::network::NetworkPolicy;
 use agora_core::process_identity::{self, ProcessIdentity};
 use agora_core::process_session_manager::ProcessSession;
-use agora_core::snapshot::{create_snapshot_scoped, snapshot_file_entries};
+use agora_core::snapshot::create_snapshot_scoped;
 use agora_core::task_scheduler::BlockingPriority;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -110,10 +110,10 @@ pub trait LaunchProgress: Send + Sync {
 /// async task and the launch progress is only borrowed, so its reports travel
 /// over a channel and are delivered here while the provisioning future runs.
 async fn provision_java_reporting(
-    ctx: &agora_core::ctx::Ctx,
+    ctx: &Ctx,
     runtimes_root: std::path::PathBuf,
     major: u32,
-    policy: agora_core::network::NetworkPolicy,
+    policy: NetworkPolicy,
     progress: &dyn LaunchProgress,
 ) -> LauncherResult<crate::java::JavaInstallation> {
     struct ChannelProgress(tokio::sync::mpsc::UnboundedSender<(String, Option<f64>)>);
@@ -2097,7 +2097,7 @@ mod tests {
         std::fs::write(inst.join("undeclared").join("keep.txt"), b"not ours").unwrap();
 
         let id = create_or_reuse_snapshot(&inst).expect("a launch takes its pre-launch point");
-        let mut captured: Vec<String> = snapshot_file_entries(&inst, &id)
+        let mut captured: Vec<String> = agora_core::snapshot::snapshot_file_entries(&inst, &id)
             .unwrap()
             .into_iter()
             .map(|entry| entry.relative_path)
