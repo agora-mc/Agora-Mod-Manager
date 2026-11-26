@@ -2544,7 +2544,9 @@ pub(crate) fn snapshot_manifest_references(
         .iter()
         .filter_map(|file| file.blob_sha256.as_deref().or(file.sha256.as_deref()))
         .filter(|hash| validate_blob_hash(hash).is_ok())
-        .map(str::to_string)
+        // Object names are lowercase hex, and a manifest may carry either case: a collection that
+        // compared them as written would free an object a snapshot still names (MASTER_SPEC §32.8).
+        .map(str::to_ascii_lowercase)
         .collect();
     Ok((hashes, manifest.content_refs.clone()))
 }

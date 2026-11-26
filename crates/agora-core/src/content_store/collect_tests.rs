@@ -622,3 +622,122 @@ fn removing_an_item_frees_only_what_nothing_else_names() {
     );
     assert!(ctx.paths.content_item_path(&theirs_id).is_file());
 }
+
+// ---------------------------------------------------------------------------
+// 9. Digests are compared in one case: object names are lowercase hex
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_item_record_written_in_upper_case_still_names_its_object() {
+    let (_dir, ctx) = fixture();
+    let work = tempfile::tempdir().unwrap();
+    let file = work.path().join("mod.jar");
+    fs::write(&file, b"mod bytes").unwrap();
+    let item = content_store::add_file(&ctx, &file, Some("mod"), None)
+        .unwrap()
+        .item()
+        .item_id
+        .clone();
+    let hash = sha256_hex(b"mod bytes");
+
+    // A record that wrote its digest in upper case names the same object: object names are
+    // lowercase hex, and a collection comparing them as written would free what it still uses.
+    let record = ctx.paths.content_item_path(&item);
+    let mut json: serde_json::Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    for field in ["files", "sources"] {
+        if let Some(entries) = json.get_mut(field).and_then(|value| value.as_array_mut()) {
+            for entry in entries {
+                if let Some(sha) = entry.get_mut("sha256").and_then(|value| value.as_str()) {
+                    let upper = sha.to_ascii_uppercase();
+                    entry["sha256"] = serde_json::Value::String(upper);
+                }
+            }
+        }
+    }
+    fs::write(&record, serde_json::to_vec(&json).unwrap()).unwrap();
+
+    let report = crate::content_store::collect::collect_with_ctx(
+        &ctx,
+        &CollectRequest {
+            store: LockRequest::Wait,
+            locations: LockRequest::Wait,
+            grace: None,
+            ignore_unreadable_snapshots: false,
+            pause: None,
+        },
+    );
+    assert!(
+        !report.refused(),
+        "the collection ran: {:?}",
+        report.refusals
+    );
+    assert!(
+        object_exists(&ctx, &hash),
+        "a digest written in upper case names the object it always named"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. A deleted instance that is a link: nothing is deleted, and the path is named
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_trashed_instance_that_is_a_link_is_named_and_nothing_is_deleted() {
+    let (_dir, ctx) = fixture();
+    let live = instance_with_file(&ctx, "live", b"live bytes");
+    let snap = snapshot::create_snapshot(&live, None, &["mods"]).unwrap();
+    let blob = sha256_hex(b"live bytes");
+
+    // The snapshot moves to the Recently deleted root, and the instance folder inside it is a
+    // link: which objects the deleted instance's snapshot names cannot be judged without
+    // following a tree this collection was not asked about.
+    let trash_entry = ctx.paths.recently_deleted_root().join("trashed");
+    fs::create_dir_all(&trash_entry).unwrap();
+    let moved_snapshots = trash_entry.join("snapshots");
+    fs::create_dir_all(&moved_snapshots).unwrap();
+    fs::rename(
+        live.join(".agora_snapshots"),
+        moved_snapshots.join(".agora_snapshots"),
+    )
+    .unwrap();
+    let elsewhere = ctx.paths.instances_root().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::write(elsewhere.join("keep.jar"), b"live bytes").unwrap();
+    let link = trash_entry.join("instance");
+    if !make_folder_link(&elsewhere, &link) {
+        panic!(
+            "this process cannot create a folder link, so the check must not be skipped silently"
+        );
+    }
+    // Nothing on disk names the blob now except what is behind the link.
+    fs::remove_dir_all(&live).unwrap();
+    assert!(object_exists(&ctx, &blob));
+
+    let report = crate::content_store::collect::collect_with_ctx(
+        &ctx,
+        &CollectRequest {
+            store: LockRequest::Wait,
+            locations: LockRequest::Wait,
+            grace: None,
+            ignore_unreadable_snapshots: false,
+            pause: None,
+        },
+    );
+    assert!(
+        report.refused(),
+        "a deleted instance that is a link stops the collection"
+    );
+    assert!(
+        report
+            .refusals
+            .iter()
+            .any(|why| why.contains(&link.display().to_string())),
+        "the refusal names the link: {:?}",
+        report.refusals
+    );
+    assert!(
+        object_exists(&ctx, &blob),
+        "nothing may be deleted while an owner location cannot be read"
+    );
+    assert!(snap.id.len() > 10);
+}

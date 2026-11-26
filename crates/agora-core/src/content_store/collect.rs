@@ -363,17 +363,19 @@ impl Owners {
                 }
             };
             let mut hashes = HashSet::new();
+            // Object names are lowercase hex: a record that wrote a digest in upper case still
+            // names the same object, and comparing it as written would free it.
             for file in &item.files {
-                hashes.insert(file.sha256.clone());
+                hashes.insert(file.sha256.to_ascii_lowercase());
             }
             if let Some(icon) = &item.icon_sha256 {
-                hashes.insert(icon.clone());
+                hashes.insert(icon.to_ascii_lowercase());
             }
             for source in &item.sources {
                 match source {
                     crate::content_store::ContentSource::Archive { sha256, .. }
                     | crate::content_store::ContentSource::Catalog { sha256, .. } => {
-                        hashes.insert(sha256.clone());
+                        hashes.insert(sha256.to_ascii_lowercase());
                     }
                     _ => {}
                 }
@@ -398,7 +400,14 @@ impl Owners {
         let mut collect_folder = |path: &Path, report: &mut CollectReport| -> Result<(), String> {
             match std::fs::symlink_metadata(path) {
                 Ok(metadata) if metadata.is_dir() => instances.push(path.to_path_buf()),
-                Ok(_) => {}
+                // A link where an instance folder should be is named, not followed: the manifests
+                // behind it belong to a tree this collection was not asked about, so judging
+                // objects by it would be a guess about what is in use.
+                Ok(_) => report.refusals.push(format!(
+                    "the instance folder {} is a link or not a folder, so what it names cannot be \
+                     read; nothing is deleted",
+                    path.display()
+                )),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => report.refusals.push(format!(
                     "cannot inspect the instance folder {}: {error}",
@@ -418,7 +427,13 @@ impl Owners {
                     let moved = path.join("instance");
                     match std::fs::symlink_metadata(&moved) {
                         Ok(metadata) if metadata.is_dir() => instances.push(moved),
-                        Ok(_) => {}
+                        // The same rule for a deleted instance: a link names a tree this
+                        // collection cannot read, so it refuses and keeps every object.
+                        Ok(_) => report.refusals.push(format!(
+                            "the deleted instance {} is a link or not a folder, so what it names \
+                             cannot be read; nothing is deleted",
+                            moved.display()
+                        )),
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) => report.refusals.push(format!(
                             "cannot inspect the deleted instance {}: {error}",
@@ -494,7 +509,9 @@ impl Owners {
         report: &mut CollectReport,
     ) {
         let path = instance_dir.join("instance_manifest.json");
-        match std::fs::metadata(&path) {
+        // Asked without following a link: a dangling link reads as "no manifest" through
+        // `metadata`, which would let a collection judge an instance by nothing at all.
+        match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_file() => {}
             Ok(_) => {
                 report.refusals.push(format!(
@@ -548,7 +565,15 @@ impl Owners {
                 return;
             }
             Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => return,
+            // A file where the snapshots folder should be is not "no snapshots": what the
+            // instance holds cannot be told.
+            Ok(_) => {
+                report.refusals.push(format!(
+                    "{} is not a folder, so the snapshots it holds cannot be judged",
+                    dir.display()
+                ));
+                return;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
             Err(error) => {
                 report
@@ -658,14 +683,18 @@ fn read_pending(
                 ));
                 stale.push(path);
             }
-            ProcessCheck::Alive => keep.extend(record.hashes),
+            // The hashes a record names are object names, which are lowercase hex: a record that
+            // wrote one in upper case still holds that object.
+            ProcessCheck::Alive => {
+                keep.extend(record.hashes.iter().map(|hash| hash.to_ascii_lowercase()))
+            }
             ProcessCheck::CantTell(reason) => {
                 report.failures.push(format!(
                     "cannot tell whether '{}' (process {}) is still running ({reason}), so the \
                      objects it holds are kept",
                     record.operation, record.process.pid
                 ));
-                keep.extend(record.hashes);
+                keep.extend(record.hashes.iter().map(|hash| hash.to_ascii_lowercase()));
             }
         }
     }
@@ -692,7 +721,15 @@ fn read_object_root(
             .path();
         match std::fs::symlink_metadata(&shard) {
             Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => continue,
+            // A link where a shard of the store should be names objects this collection cannot
+            // see: listing it would judge an incomplete set, so nothing is deleted.
+            Ok(_) => {
+                return Err(format!(
+                    "{} is a link or not a folder, so the objects in it cannot be listed; nothing \
+                     is deleted",
+                    shard.display()
+                ))
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(format!("cannot inspect {}: {error}", shard.display()));
@@ -713,7 +750,15 @@ fn read_object_root(
             }
             let metadata = match std::fs::symlink_metadata(&path) {
                 Ok(metadata) if metadata.is_file() => metadata,
-                Ok(_) => continue,
+                // Anything else under an object name — a link included — is something this
+                // collection cannot judge, so it stops rather than reads past it.
+                Ok(_) => {
+                    return Err(format!(
+                        "{} is a link or not a file, so what it holds cannot be told; nothing is \
+                         deleted",
+                        path.display()
+                    ))
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
                     return Err(format!("cannot inspect {}: {error}", path.display()));

@@ -920,10 +920,41 @@ fn read_and_validate_manifest<R: Read + std::io::Seek>(
     }
     drop(manifest_entry);
 
-    let manifest: BackupManifest = serde_json::from_slice(&manifest_bytes)
+    let mut manifest: BackupManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| format!("failed to parse backup manifest: {error}"))?;
     validate_backup_manifest(&manifest)?;
+    normalize_backup_hashes(&mut manifest);
     Ok(manifest)
+}
+
+/// One case for every digest a backup carries.
+///
+/// Object names are lowercase hex. A backup that wrote them in upper case still ships the same
+/// objects, and an import that recorded the digest as it was written would name an object the
+/// store does not hold under that spelling — and a collection comparing names as written would
+/// free an object the record still names (MASTER_SPEC §32.8). Normalising here, once, means every
+/// reader downstream sees one case.
+fn normalize_backup_hashes(manifest: &mut BackupManifest) {
+    for entry in &mut manifest.files {
+        entry.sha256 = entry.sha256.to_ascii_lowercase();
+    }
+    for item in &mut manifest.content_items {
+        for file in &mut item.files {
+            file.sha256 = file.sha256.to_ascii_lowercase();
+        }
+        if let Some(icon) = item.icon_sha256.as_mut() {
+            *icon = icon.to_ascii_lowercase();
+        }
+        for source in &mut item.sources {
+            match source {
+                crate::content_store::ContentSource::Archive { sha256, .. }
+                | crate::content_store::ContentSource::Catalog { sha256, .. } => {
+                    *sha256 = sha256.to_ascii_lowercase();
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Verify that a zip's file set is exactly `{manifest.json} ∪ files` with no
