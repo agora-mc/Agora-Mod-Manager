@@ -1042,6 +1042,22 @@ fn parse_from_archive(
             break;
         }
 
+        // A nested jar bigger than a metadata read may use is skipped with the reason, and the
+        // outer jar's own metadata still comes back (MASTER_SPEC §32.3): the cap is about what is
+        // read, so it may never fail the jar it is read out of.
+        if declared_entry_size(archive, entry_name).is_some_and(|size| size > MAX_ENTRY_BYTES) {
+            status.record_partial();
+            diagnostics.push(ParseDiagnostic {
+                kind: ParseDiagnosticKind::NestedLimitExceeded,
+                entry_path: Some(normalized.clone()),
+                message: format!(
+                    "A declared nested JAR is larger than the {MAX_ENTRY_BYTES} bytes a metadata \
+                     read may use."
+                ),
+            });
+            continue;
+        }
+
         let bytes = read_entry_bytes_bounded(archive, entry_name, MAX_ENTRY_BYTES);
         let bytes = match bytes {
             Some(b) if !b.is_empty() => b,
@@ -1240,6 +1256,15 @@ fn read_entry_utf8_bounded(
     String::from_utf8(bytes).ok()
 }
 
+/// The size an entry declares, as the archive lists it, or `None` when no entry has that name.
+fn declared_entry_size(archive: &SafeArchive, name: &str) -> Option<u64> {
+    archive
+        .entries()
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.size)
+}
+
 /// Read a binary entry, named as the archive names it, with a byte-size bound.
 /// Returns `None` if the entry exceeds `max_bytes`.
 fn read_entry_bytes_bounded(
@@ -1249,11 +1274,7 @@ fn read_entry_bytes_bounded(
 ) -> Option<Vec<u8>> {
     // The declared size first, so an entry that claims more than a metadata file may hold is never
     // read; then the bytes actually returned, because a declared size can lie (MASTER_SPEC §32.13).
-    let declared = archive
-        .entries()
-        .iter()
-        .find(|entry| entry.name == name)?
-        .size;
+    let declared = declared_entry_size(archive, name)?;
     if declared > max_bytes {
         return None;
     }
@@ -3272,9 +3293,13 @@ Embedded-Dependencies-Mod: a.jar
         assert_eq!(parsed.status, ParseStatus::Partial);
         assert!(parsed.metadata.provided_mods.is_empty());
         assert_eq!(parsed.metadata.mod_jar_id.as_deref(), Some("outer"));
-        assert!(parsed.diagnostics.iter().any(|diagnostic| diagnostic.kind
-            == ParseDiagnosticKind::IoFailure
-            && diagnostic.entry_path.as_deref() == Some("big.jar")));
+        assert!(
+            parsed.diagnostics.iter().any(|diagnostic| diagnostic.kind
+                == ParseDiagnosticKind::NestedLimitExceeded
+                && diagnostic.entry_path.as_deref() == Some("big.jar")),
+            "the skip says it was the per-read cap: {:?}",
+            parsed.diagnostics
+        );
     }
 
     #[test]
@@ -3929,5 +3954,30 @@ Embedded-Dependencies-Mod: a.jar
         assert!(!is_platform_dependency("some-mod", "fabric", "0.20.1"));
         assert!(!is_platform_dependency("fabric-api", "fabric", "0.20.1"));
         assert!(!is_platform_dependency("", "fabric", "0.20.1"));
+    }
+
+    #[test]
+    fn a_jar_whose_assets_together_exceed_the_nested_byte_budget_still_parses() {
+        // 128 MiB was the budget for the bytes a metadata read may use, and it was applied to the
+        // whole listing: a jar of textures that no metadata reader ever opens was refused before a
+        // single entry was read, so the mod's id and version were lost with it.
+        let big = vec![0u8; 130 * 1024 * 1024];
+        let jar = build_test_jar_binary(&[
+            (
+                "fabric.mod.json",
+                br#"{"id":"outer","version":"1.0.0","depends":{"minecraft":"1.20.1"}}"# as &[u8],
+            ),
+            ("assets/outer/big.png", &big),
+        ]);
+        let parsed = parse_jar_metadata_for_loader_with_status(&jar, "fabric");
+        let _ = std::fs::remove_file(&jar);
+        assert_eq!(
+            parsed.status,
+            ParseStatus::Complete,
+            "{:?}",
+            parsed.diagnostics
+        );
+        assert_eq!(parsed.metadata.mod_jar_id.as_deref(), Some("outer"));
+        assert_eq!(parsed.metadata.mod_version.as_deref(), Some("1.0.0"));
     }
 }

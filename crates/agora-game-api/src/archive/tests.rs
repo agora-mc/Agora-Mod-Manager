@@ -181,7 +181,7 @@ fn small_limits() -> ArchiveLimits {
         max_entry_bytes: 32,
         max_total_bytes: 48,
         max_ratio: 0,
-        per_entry_at_listing: true,
+        bounds_the_listing: true,
     }
 }
 
@@ -221,7 +221,11 @@ fn the_presets_carry_the_limits_the_call_sites_used() {
     assert_eq!(ArchiveLimits::PLUGIN_PACKAGE.max_ratio, 200);
 
     assert_eq!(ArchiveLimits::JAR_METADATA.max_entry_bytes, 32 * MIB);
-    assert_eq!(ArchiveLimits::JAR_METADATA.max_total_bytes, 128 * MIB);
+    assert_eq!(
+        ArchiveLimits::JAR_METADATA.max_total_bytes,
+        0,
+        "the 128 MiB was a budget for the nested bytes a read may use, never a cap on the jar"
+    );
 
     assert_eq!(ArchiveLimits::RUNTIME.max_entries, 10_000);
     assert_eq!(ArchiveLimits::RUNTIME.max_entry_bytes, 500 * MIB);
@@ -248,7 +252,7 @@ fn the_presets_carry_the_limits_the_call_sites_used() {
         ArchiveLimits::JAR_METADATA,
     ]
     .into_iter()
-    .map(|limits| limits.per_entry_at_listing)
+    .map(|limits| limits.bounds_the_listing)
     .collect();
     assert_eq!(
         listing_checks,

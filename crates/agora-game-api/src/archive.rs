@@ -42,12 +42,17 @@ use crate::path::{join_under, validate_path_set, PathError, PathSetError, RelPat
 /// | `MOD_ARCHIVE` | 5 000 (technic zip) | 500 MiB (`MAX_TECHNIC_ENTRY_BYTES`) | 2 GiB (`MAX_TECHNIC_ZIP_BYTES`) | 200 (new) |
 /// | `BACKUP` | 10 000 (`MAX_BACKUP_ENTRIES`) | 1 GiB (`MAX_BACKUP_SINGLE_FILE_SIZE`) | 64 GiB (`MAX_BACKUP_TOTAL_SIZE`) | none (Agora wrote it) |
 /// | `PLUGIN_PACKAGE` | 2 000 (`install::MAX_ENTRIES`) | 16 MiB (`MAX_ENTRY_BYTES`) | 64 MiB (`MAX_TOTAL_BYTES`) | 200 (`MAX_EXPANSION_RATIO`) |
-/// | `JAR_METADATA` | 10 000 (none today) | 32 MiB (`jar_metadata::MAX_ENTRY_BYTES`) | 128 MiB (`MAX_TOTAL_NESTED_BYTES`) | none |
+/// | `JAR_METADATA` | not bounded (none today) | 32 MiB (`jar_metadata::MAX_ENTRY_BYTES`), on each read | not bounded | none |
 /// | `RUNTIME` | 10 000 (`runtime_manager::MAX_ENTRIES`) | 500 MiB (`PER_ENTRY_LIMIT`) | 2 GiB (`AGGREGATE_LIMIT`) | none today |
 ///
 /// The ratio rules marked *new* close a hole: neither call site had one, and a compression ratio is
 /// the check that catches a bomb while its declared sizes still look reasonable. 200 is the value
 /// the plugin package already used.
+///
+/// `JAR_METADATA` reads a manifest and the nested jars it names and nothing else, so its numbers are
+/// the ones a *read* is held to. What the listing is held to is [`ArchiveLimits::bounds_the_listing`]:
+/// a jar of 130 MiB of textures is bigger than the nested-byte budget that call site had, and the
+/// budget was never about the jar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArchiveLimits {
     /// The job this preset is for, as it appears in a refusal.
@@ -60,13 +65,16 @@ pub struct ArchiveLimits {
     pub max_total_bytes: u64,
     /// Most uncompressed bytes one compressed byte may become. `0` does not check.
     pub max_ratio: u64,
-    /// Whether [`Self::max_entry_bytes`] also refuses the whole archive at listing time.
+    /// Whether the listing itself is held to [`Self::max_entries`], [`Self::max_entry_bytes`] and
+    /// [`Self::max_total_bytes`].
     ///
-    /// It is `true` for a job that reads or writes every entry, where one oversized entry is a
-    /// refusal whatever happens next. A job that reads only some entries (a jar's metadata) says
-    /// `false`: a 40 MiB texture no metadata reader ever asks for is no reason to lose the mod's id,
-    /// and the limit still applies to each entry as it is read.
-    pub per_entry_at_listing: bool,
+    /// It is `true` for a job that reads or writes every entry, where one oversized entry — or a
+    /// listing that adds up to more than the job may write — is a refusal whatever happens next. A
+    /// job that reads only a handful of entries says `false`: a jar's metadata opens its manifest and
+    /// its nested jars and nothing else, so a 130 MiB of textures no reader ever asks for is no
+    /// reason to lose the mod's id. The per-entry limit still applies to each entry as it is read,
+    /// which is where such a job's real bound lives.
+    pub bounds_the_listing: bool,
 }
 
 const MIB: u64 = 1024 * 1024;
@@ -80,7 +88,7 @@ impl ArchiveLimits {
         max_entry_bytes: 500 * MIB,
         max_total_bytes: 2 * GIB,
         max_ratio: 200,
-        per_entry_at_listing: true,
+        bounds_the_listing: true,
     };
 
     /// A mod archive added to the content store, or a technic-style zip.
@@ -90,7 +98,7 @@ impl ArchiveLimits {
         max_entry_bytes: 500 * MIB,
         max_total_bytes: 2 * GIB,
         max_ratio: 200,
-        per_entry_at_listing: true,
+        bounds_the_listing: true,
     };
 
     /// An instance backup or a snapshot: written by Agora, so its sizes are its own claim. The
@@ -101,7 +109,7 @@ impl ArchiveLimits {
         max_entry_bytes: GIB,
         max_total_bytes: 64 * GIB,
         max_ratio: 0,
-        per_entry_at_listing: true,
+        bounds_the_listing: true,
     };
 
     /// A downloaded plugin package: small, and code, so the tightest preset.
@@ -111,21 +119,23 @@ impl ArchiveLimits {
         max_entry_bytes: 16 * MIB,
         max_total_bytes: 64 * MIB,
         max_ratio: 200,
-        per_entry_at_listing: true,
+        bounds_the_listing: true,
     };
 
     /// Reading metadata out of a jar, nested jars included. The nesting depth and the number of
-    /// nested jars are the caller's business; this bounds one archive's entries and bytes.
+    /// nested jars are the caller's business; this bounds one entry as it is read, and nothing else.
     ///
-    /// The per-entry limit applies to each entry the reader asks for, not to the listing: a mod jar's
-    /// big texture is never read, so it cannot fail the jar's metadata.
+    /// The listing is not held to anything: the job reads a manifest and the nested jars the manifest
+    /// names, and a jar of textures it never opens is not a bigger risk for being big. The counts and
+    /// totals below are `0` because the call sites this replaced had none — a jar with a hundred
+    /// thousand entries was read before, and refusing it now would refuse jars that used to parse.
     pub const JAR_METADATA: Self = Self {
         preset: "jar metadata",
-        max_entries: 10_000,
+        max_entries: 0,
         max_entry_bytes: 32 * MIB,
-        max_total_bytes: 128 * MIB,
+        max_total_bytes: 0,
         max_ratio: 0,
-        per_entry_at_listing: false,
+        bounds_the_listing: false,
     };
 
     /// A downloaded game runtime: a JRE zip or tar.gz. Large files, few entries, and Agora checks
@@ -136,7 +146,7 @@ impl ArchiveLimits {
         max_entry_bytes: 500 * MIB,
         max_total_bytes: 2 * GIB,
         max_ratio: 0,
-        per_entry_at_listing: true,
+        bounds_the_listing: true,
     };
 
     /// A world a player exported, or one they downloaded: a folder of region files, one of which
@@ -149,7 +159,7 @@ impl ArchiveLimits {
         max_entry_bytes: 16 * GIB,
         max_total_bytes: 16 * GIB,
         max_ratio: 0,
-        per_entry_at_listing: true,
+        bounds_the_listing: true,
     };
 }
 
@@ -1115,12 +1125,19 @@ impl SafeArchive {
                 names: duplicated,
             });
         }
+        // The whole listing is still totalled, because the tar.gz ratio and `total_declared_bytes`
+        // are about the archive and not about the job; only the *refusals* follow the preset.
+        let held_to_the_listing = self.limits.bounds_the_listing;
         for entry in entries {
             if entry.kind != EntryKind::File {
                 continue;
             }
             files += 1;
-            if self.limits.per_entry_at_listing && entry.size > self.limits.max_entry_bytes {
+            total = total.saturating_add(entry.size);
+            if !held_to_the_listing {
+                continue;
+            }
+            if entry.size > self.limits.max_entry_bytes {
                 return Err(ArchiveError::TooLarge {
                     path,
                     format: self.format,
@@ -1130,7 +1147,6 @@ impl SafeArchive {
                     limit: self.limits.max_entry_bytes,
                 });
             }
-            total = total.saturating_add(entry.size);
             if total > self.limits.max_total_bytes {
                 return Err(ArchiveError::TooLarge {
                     path,
@@ -1157,7 +1173,7 @@ impl SafeArchive {
                 }
             }
         }
-        if files > self.limits.max_entries {
+        if held_to_the_listing && files > self.limits.max_entries {
             return Err(ArchiveError::TooManyEntries {
                 path,
                 format: self.format,
