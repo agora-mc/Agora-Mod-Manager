@@ -678,7 +678,11 @@ impl WindowsTarReader {
     }
 
     /// The archive extracted into a private folder, extracted once however many entries are read.
-    fn staged(&self, archive: &Path) -> Result<std::sync::Arc<StagedRar>, String> {
+    fn staged(
+        &self,
+        archive: &Path,
+        admitted: Option<&[agora_game_api::RarEntry]>,
+    ) -> Result<std::sync::Arc<StagedRar>, String> {
         let mut slot = self
             .staged
             .lock()
@@ -686,10 +690,60 @@ impl WindowsTarReader {
         if let Some(staged) = slot.as_ref() {
             return Ok(std::sync::Arc::clone(staged));
         }
-        let staged = std::sync::Arc::new(stage_whole_archive(archive).map_err(|e| e.to_string())?);
+        let staged =
+            std::sync::Arc::new(stage_whole_archive(archive, admitted).map_err(|e| e.to_string())?);
         *slot = Some(std::sync::Arc::clone(&staged));
         Ok(staged)
     }
+}
+
+/// Refuse a listing that is not the listing the limits were applied to.
+///
+/// Staging runs `tar` a second time, so between the reader's listing and the copy there is a moment
+/// in which the file can be replaced. The limits, the duplicate check and the name rules were all
+/// judged on the first listing; serving the second one's bytes would apply them to a listing that is
+/// gone. Names, sizes and count have to agree, or the archive is refused.
+fn check_unchanged(
+    listed: &[ListedEntry],
+    admitted: &[agora_game_api::RarEntry],
+) -> Result<(), ContentError> {
+    let changed = |detail: String| {
+        Err(ContentError::CorruptArchive(format!(
+            "the archive changed since it was opened: {detail}"
+        )))
+    };
+    if listed.len() != admitted.len() {
+        return changed(format!(
+            "it listed {} entries then and {} now",
+            admitted.len(),
+            listed.len()
+        ));
+    }
+    for (now, then) in listed.iter().zip(admitted) {
+        let is_directory = now.kind == ListedKind::Dir;
+        if now.name != then.name {
+            return changed(format!("'{}' was listed as '{}'", then.name, now.name));
+        }
+        if is_directory != then.is_directory {
+            return changed(format!(
+                "'{}' was {} then and is {} now",
+                now.name,
+                if then.is_directory {
+                    "a folder"
+                } else {
+                    "a file"
+                },
+                if is_directory { "a folder" } else { "a file" }
+            ));
+        }
+        if now.size != then.size {
+            return changed(format!(
+                "'{}' was {} bytes then and is {} now",
+                now.name, then.size, now.size
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// List a whole archive, hold it to the rules, extract it once into a folder of its own and check
@@ -700,7 +754,10 @@ impl WindowsTarReader {
 /// the extraction is held to are the listing's own. What is extracted is then checked file by file —
 /// sizes, folders, no link or reparse point — so a member is served from a file whose size is what the
 /// listing said, not from a size tar claimed on stdout.
-fn stage_whole_archive(archive: &Path) -> Result<StagedRar, ContentError> {
+fn stage_whole_archive(
+    archive: &Path,
+    admitted: Option<&[agora_game_api::RarEntry]>,
+) -> Result<StagedRar, ContentError> {
     let tar = tar_exe_path()?;
     let listing = run_listing(&tar, archive)?;
     let entries = parse_tar_listing(&listing)?;
@@ -709,6 +766,11 @@ fn stage_whole_archive(archive: &Path) -> Result<StagedRar, ContentError> {
             "Windows' tar found no files in this RAR archive: it is damaged, or not a RAR archive"
                 .to_string(),
         ));
+    }
+    // The listing the limits were applied to, before it is thrown away: a RAR that changed between
+    // the two listings would otherwise be served from bytes nothing measured.
+    if let Some(admitted) = admitted {
+        check_unchanged(&entries, admitted)?;
     }
     let plan = plan_from_listing(entries)?;
     let root = private_staging_folder()?;
@@ -765,13 +827,22 @@ impl agora_game_api::RarReader for WindowsTarReader {
             .collect())
     }
 
+    /// Stage the archive against the listing the reader's limits were applied to. This is the call
+    /// that turns "the file I listed" into "the file I serve": a relisting that disagrees with it
+    /// refuses the archive instead of serving bytes nothing measured.
+    fn stage(&self, archive: &Path, admitted: &[agora_game_api::RarEntry]) -> Result<(), String> {
+        self.staged(archive, Some(admitted)).map(|_| ())
+    }
+
     fn read_entry(
         &self,
         archive: &Path,
         name: &str,
         out: &mut dyn std::io::Write,
     ) -> Result<u64, String> {
-        let staged = self.staged(archive)?;
+        // Staged by `stage` before the first read; a backend used on its own still stages here,
+        // with nothing to compare its listing to.
+        let staged = self.staged(archive, None)?;
         let Some(path) = staged.files.get(name) else {
             return Err(format!("no entry is named '{name}' in this archive"));
         };
@@ -1162,6 +1233,99 @@ drwxr-xr-x  0 0      0           0 Mar 31  2023 [ELLE] Bifrost/Main\r\n\
             .unwrap();
         assert_eq!(bytes, b"elle");
         bytes.clear();
+        reader.read_entry(&archive, "a.txt", &mut bytes).unwrap();
+        assert_eq!(bytes, b"just-a");
+    }
+
+    fn admitted(listed: &[ListedEntry]) -> Vec<agora_game_api::RarEntry> {
+        listed
+            .iter()
+            .map(|entry| agora_game_api::RarEntry {
+                name: entry.name.clone(),
+                size: entry.size,
+                is_directory: entry.kind == ListedKind::Dir,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_listing_that_changed_since_it_was_opened_is_refused() {
+        // Staging runs tar a second time. The limits, the duplicate check and the name rules were
+        // all judged on the first listing, so a relisting that disagrees with it means the bytes are
+        // not the bytes that were measured.
+        let listed = entries(CAPTURED);
+        let then = admitted(&listed);
+        check_unchanged(&listed, &then).expect("the listing it was given");
+
+        let mut bigger = then.clone();
+        bigger[0].size += 1;
+        let error = check_unchanged(&listed, &bigger).expect_err("a size that changed");
+        assert!(
+            error.to_string().contains("changed since it was opened"),
+            "{error}"
+        );
+
+        let mut renamed = then.clone();
+        renamed[1].name = "other.esp".into();
+        assert!(check_unchanged(&listed, &renamed).is_err());
+
+        let mut fewer = then.clone();
+        fewer.pop();
+        let error = check_unchanged(&listed, &fewer).expect_err("an entry that went missing");
+        assert!(
+            error.to_string().contains("changed since it was opened"),
+            "{error}"
+        );
+
+        let mut folder_became_file = then.clone();
+        folder_became_file[2].is_directory = false;
+        assert!(check_unchanged(&listed, &folder_became_file).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staging_refuses_an_archive_that_is_not_the_listing_it_was_given() {
+        if tar_exe_path().is_err() {
+            println!("skipped: no Windows tar.exe on this machine, so there is no RAR reader");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // A zip is an archive `tar.exe` lists and extracts exactly as it does a RAR: the same code
+        // path, and no RAR the repository may commit exists.
+        let archive = dir.path().join("members.zip");
+        {
+            use std::io::Write;
+            let file = std::fs::File::create(&archive).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            for (name, bytes) in [
+                ("a.txt", b"just-a".as_slice()),
+                ("b.txt", b"just-b".as_slice()),
+            ] {
+                zip.start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(bytes).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+
+        use agora_game_api::RarReader as _;
+        let reader = WindowsTarReader::new();
+        let listed = reader.list(&archive).unwrap();
+        assert_eq!(listed.len(), 2);
+
+        let mut wrong = listed.clone();
+        wrong[0].size += 1;
+        let error = reader
+            .stage(&archive, &wrong)
+            .expect_err("a listing that is not this archive's");
+        assert!(
+            error.contains("changed since it was opened"),
+            "the refusal names what changed: {error}"
+        );
+
+        // The listing it was measured on stages, and the members read from the copy it made.
+        reader.stage(&archive, &listed).expect("its own listing");
+        let mut bytes = Vec::new();
         reader.read_entry(&archive, "a.txt", &mut bytes).unwrap();
         assert_eq!(bytes, b"just-a");
     }

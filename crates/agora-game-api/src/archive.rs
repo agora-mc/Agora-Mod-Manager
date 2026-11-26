@@ -521,8 +521,30 @@ pub struct RarEntry {
 pub trait RarReader: Send + Sync {
     /// The archive's entries, in the order the reader reports them.
     fn list(&self, archive: &Path) -> Result<Vec<RarEntry>, String>;
+    /// Prepare the archive for reading, given the listing the reader's limits were applied to.
+    ///
+    /// A backend that can only serve a member by unpacking the whole archive unpacks it here, once,
+    /// and checks what it found against `admitted` — the same names, sizes and count — because the
+    /// limits and the name rules were applied to *that* listing: bytes from a file that changed
+    /// since it was listed are bytes nothing checked. A backend that reads a member directly does
+    /// nothing.
+    fn stage(&self, _archive: &Path, _admitted: &[RarEntry]) -> Result<(), String> {
+        Ok(())
+    }
     /// One entry's bytes, written to `out`. Returns how many bytes it wrote.
     fn read_entry(&self, archive: &Path, name: &str, out: &mut dyn Write) -> Result<u64, String>;
+}
+
+/// The listing the limits were applied to, in the shape a RAR backend stages against.
+fn rar_admitted(entries: &[ArchiveEntry]) -> Vec<RarEntry> {
+    entries
+        .iter()
+        .map(|entry| RarEntry {
+            name: entry.name.clone(),
+            size: entry.size,
+            is_directory: entry.kind == EntryKind::Directory,
+        })
+        .collect()
 }
 
 /// Where an archive comes from: a file, or bytes already in hand.
@@ -979,6 +1001,13 @@ impl SafeArchive {
                     return Err(ArchiveError::NoRarReader { path });
                 };
                 let archive = archive.clone();
+                // The backend stages the archive against the listing the limits were applied to, so
+                // a member served here is a member that was checked (MASTER_SPEC §32.3).
+                rar.stage(&archive, &rar_admitted(&entries))
+                    .map_err(|reason| ArchiveError::Rar {
+                        path: path.clone(),
+                        reason,
+                    })?;
                 for entry in &entries {
                     if entry.kind != EntryKind::File {
                         continue;

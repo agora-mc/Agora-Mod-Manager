@@ -1424,3 +1424,109 @@ fn a_folder_where_the_file_goes_is_refused_before_anything_moves() {
     let left = staging_folders_beside(dir.path());
     assert!(left.is_empty(), "{left:?}");
 }
+
+/// A backend that records the listing it was staged with, and can refuse staging.
+struct StagingRar {
+    admitted: std::sync::Arc<std::sync::Mutex<Vec<RarEntry>>>,
+    refuse: bool,
+}
+
+impl RarReader for StagingRar {
+    fn list(&self, _archive: &Path) -> Result<Vec<RarEntry>, String> {
+        Ok(vec![
+            RarEntry {
+                name: "mods/a.esp".to_string(),
+                size: 4,
+                is_directory: false,
+            },
+            RarEntry {
+                name: "textures/".to_string(),
+                size: 0,
+                is_directory: true,
+            },
+        ])
+    }
+
+    fn stage(&self, _archive: &Path, admitted: &[RarEntry]) -> Result<(), String> {
+        *self.admitted.lock().unwrap() = admitted.to_vec();
+        if self.refuse {
+            return Err("the archive changed since it was opened".to_string());
+        }
+        Ok(())
+    }
+
+    fn read_entry(&self, _archive: &Path, name: &str, out: &mut dyn Write) -> Result<u64, String> {
+        if name != "mods/a.esp" {
+            return Err(format!("no entry is named '{name}'"));
+        }
+        out.write_all(b"data").map_err(|error| error.to_string())?;
+        Ok(4)
+    }
+}
+
+fn staging_rar(refuse: bool) -> (StagingRar, std::sync::Arc<std::sync::Mutex<Vec<RarEntry>>>) {
+    let admitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let backend = StagingRar {
+        admitted: std::sync::Arc::clone(&admitted),
+        refuse,
+    };
+    (backend, admitted)
+}
+
+#[test]
+fn a_rar_backend_is_staged_against_the_listing_the_limits_used() {
+    // Listing is a second read of the file for a RAR, so the reader says which listing it measured
+    // before anything is served: names, sizes and count, as they were when the limits were applied.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mod.rar");
+    std::fs::write(&path, rar_magic_bytes()).unwrap();
+    let (backend, admitted) = staging_rar(false);
+    let mut archive =
+        SafeArchive::open_with_rar(&path, ArchiveLimits::GAME_MOD, Box::new(backend)).unwrap();
+    assert_eq!(archive.read("mods/a.esp").unwrap(), b"data");
+    assert_eq!(
+        *admitted.lock().unwrap(),
+        vec![
+            RarEntry {
+                name: "mods/a.esp".to_string(),
+                size: 4,
+                is_directory: false
+            },
+            RarEntry {
+                name: "textures/".to_string(),
+                size: 0,
+                is_directory: true
+            },
+        ],
+        "the whole listing, folders included, with the sizes it was held to"
+    );
+}
+
+#[test]
+fn a_rar_that_changed_since_it_was_opened_is_refused() {
+    // A RAR really can be replaced between the listing and the copy. The backend's relisting then
+    // disagrees with the listing the limits were applied to, and nothing is served from it.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mod.rar");
+    std::fs::write(&path, rar_magic_bytes()).unwrap();
+    let (backend, _admitted) = staging_rar(true);
+    let mut archive =
+        SafeArchive::open_with_rar(&path, ArchiveLimits::GAME_MOD, Box::new(backend)).unwrap();
+    let error = archive
+        .read("mods/a.esp")
+        .expect_err("the archive changed under the reader");
+    assert!(matches!(error, ArchiveError::Rar { .. }), "{error:?}");
+    assert!(
+        error.to_string().contains("changed since it was opened"),
+        "{error}"
+    );
+
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    assert!(archive.extract(&out, NamePolicy::Refuse).is_err());
+    assert_eq!(
+        std::fs::read_dir(&out).unwrap().count(),
+        0,
+        "no part of an archive nothing measured reaches a folder"
+    );
+}
