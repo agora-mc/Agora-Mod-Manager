@@ -760,6 +760,58 @@ fn a_solid_sevenz_gives_every_member_its_own_bytes() {
     drop(dir);
 }
 
+/// A preset that names no total limit holds an extraction to no total.
+///
+/// `GAME_MOD` and `JAR_METADATA` are `0` for the count, the total and the ratio, which reads as
+/// "none", exactly as it does in the preset table. Read as a cap of zero bytes, the first byte of
+/// the first entry is a refusal — and the content store, whose mods are `GAME_MOD`, could not
+/// extract a single file.
+#[test]
+fn a_preset_with_no_total_cap_extracts_the_archive() {
+    let (dir, dest) = extract_dir();
+    let bytes = zip_bytes(&[("a.txt", b"hello"), ("b/c.txt", b"world")]);
+    let mut archive = SafeArchive::open_bytes(bytes, ArchiveLimits::GAME_MOD).unwrap();
+    let report = archive.extract(&dest, NamePolicy::Refuse).unwrap();
+    assert_eq!(report.written, ["a.txt", "b/c.txt"]);
+    assert_eq!(report.bytes_written, 10);
+    assert_eq!(std::fs::read(dest.join("b/c.txt")).unwrap(), b"world");
+    drop(dir);
+}
+
+/// An encrypted 7z lists its entries — names and sizes sit in a header that is not encrypted — so a
+/// reader that only fails when a member is read has already told the caller what an archive it
+/// cannot read holds, and a caller that checks free space first has already worked on it. A
+/// password is refused at the listing, where nothing has been written (§32.13).
+#[test]
+fn a_password_protected_sevenz_is_refused_at_the_listing() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("plain");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("secret.txt"), b"top secret").unwrap();
+    let path = dir.path().join("encrypted.7z");
+    sevenz_rust2::compress_to_path_encrypted(
+        &source,
+        &path,
+        sevenz_rust2::Password::from("password123"),
+    )
+    .unwrap();
+
+    let error = match SafeArchive::open(&path, ArchiveLimits::GAME_MOD) {
+        Ok(readable) => panic!(
+            "a password-protected archive is never listed as a readable one: {:?}",
+            readable
+                .file_entries()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>()
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, ArchiveError::PasswordProtected { .. }),
+        "{error:?}"
+    );
+}
+
 #[test]
 fn a_plain_tar_is_listed_by_its_magic_not_its_extension() {
     let bytes = tar_bytes(&[("a.txt", b"hello")]);
