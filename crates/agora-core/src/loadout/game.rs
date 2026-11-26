@@ -61,9 +61,13 @@ pub struct GameLoadoutRules {
 }
 
 /// The part of a game instance's setup a loadout records.
+///
+/// Every field except `layer_order` and `save_folder` is required. They were all written by the
+/// first version of this record, so a section without one is a record that lost its state, not one
+/// that records nothing: applying an empty loadout would turn every managed layer off, clear the
+/// lists and switch the instance to the shared saves (MASTER_SPEC §26.10, §32.7).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameLoadout {
-    #[serde(default)]
     pub content: Vec<GameLoadoutContent>,
     /// Content layer order (layer ids, lowest priority first, matching `LayerStack`).
     /// Empty (including loadouts saved before this field existed) leaves the instance's
@@ -71,13 +75,9 @@ pub struct GameLoadout {
     /// place at the end.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub layer_order: Vec<String>,
-    #[serde(default)]
     pub plugin_lists: Vec<GameLoadoutPluginList>,
-    #[serde(default)]
     pub inis: Vec<GameLoadoutIni>,
-    #[serde(default)]
     pub rules: Vec<GameLoadoutRules>,
-    #[serde(default)]
     pub saves: SavesChoice,
     /// The own save folder this loadout uses. `Some(scope)` names a folder under the instance;
     /// `None` with `saves = Own` means the instance's single own folder, adopted from before
@@ -214,6 +214,7 @@ pub fn create_game_profile(
         let dir = instance_dir(ctx, instance_id)?;
         let single_claimed = loadout::list_profiles(&dir)
             .map_err(|e| e.to_string())?
+            .profiles
             .iter()
             .any(|profile| {
                 profile.name != name
@@ -693,6 +694,7 @@ mod tests {
 
     fn definition() -> GameDefinition {
         GameDefinition {
+            snapshot: None,
             mo2_game_name: None,
             import_ids: Default::default(),
             session: Default::default(),
@@ -947,7 +949,7 @@ mod tests {
 
         let done = update_game_profile(&s.ctx, "test-instance", &s.def, "base").unwrap();
         assert_eq!(done.name, "base");
-        let profiles = loadout::list_profiles(&s.dir).unwrap();
+        let profiles = loadout::list_profiles(&s.dir).unwrap().profiles;
         let game = profiles[0].game.as_ref().unwrap();
         assert!(
             !game
@@ -1073,5 +1075,45 @@ mod tests {
         );
         assert!(!after.layers.layers()[0].enabled, "content:b turned off");
         assert!(after.layers.layers()[1].enabled, "content:a kept on");
+    }
+
+    #[test]
+    fn a_profile_written_before_schema_32_applies_the_same() {
+        let s = setup();
+        create_game_profile(&s.ctx, "test-instance", &s.def, "base").unwrap();
+        // Rewrite the record in the shape code before schema 32 wrote: one game's state, flat,
+        // with no `sections` map. This is data from before the slice, read by the code after it.
+        let saved = loadout::read_profile(&s.dir, "base").unwrap();
+        let legacy = serde_json::json!({
+            "name": saved.name,
+            "enabled_mods": saved.enabled_mods,
+            "created_at": saved.created_at,
+            "covers": saved.covers,
+            "items": saved.items,
+            "game": saved.game,
+        });
+        let profiles_dir = loadout::loadouts_dir(&s.dir);
+        fs::create_dir_all(&profiles_dir).unwrap();
+        fs::write(profiles_dir.join("base.json"), legacy.to_string()).unwrap();
+
+        // Change everything the profile covers, then apply the old record.
+        let mut manifest = game_instance::get_manifest(&s.ctx, "test-instance").unwrap();
+        let mut layers = manifest.layers.layers().to_vec();
+        layers[0].enabled = false;
+        manifest.layers = agora_game_api::LayerStack::new(layers).unwrap();
+        manifest.saves = SavesChoice::Own;
+        crate::game_deploy::write_instance_manifest_atomic(&s.ctx, "test-instance", &manifest)
+            .unwrap();
+        fs::write(s.dir.join("user/Plugins.txt"), b"*C.esp\n").unwrap();
+
+        apply_game_profile_with_undo(&s.ctx, "test-instance", &s.def, "base", false).unwrap();
+
+        let restored = game_instance::get_manifest(&s.ctx, "test-instance").unwrap();
+        assert!(restored.layers.layers()[0].enabled);
+        assert_eq!(restored.saves, SavesChoice::Shared);
+        assert_eq!(
+            fs::read(s.dir.join("user/Plugins.txt")).unwrap(),
+            b"*A.esp\n*B.esp\n"
+        );
     }
 }

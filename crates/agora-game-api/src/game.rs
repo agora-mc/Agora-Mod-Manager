@@ -2,6 +2,7 @@ use crate::condition::{Condition, ConditionFacts, Truth};
 use crate::id::{FrameworkId, GameId, InstallId, LayerId, StoreId, ToolId};
 use crate::package::GameContext;
 use crate::path::RelPath;
+use crate::scope::SnapshotScope;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -693,6 +694,13 @@ pub struct GameDefinition {
     /// recipe's executable is the game and only exit code 0 is a normal quit.
     #[serde(default, skip_serializing_if = "SessionRules::is_default")]
     pub session: SessionRules,
+    /// The folders a snapshot of this game's instance covers (MASTER_SPEC §32.7). Absent keeps the
+    /// behaviour a game had before the field existed: a generic game's snapshot is the state files
+    /// its definition declares, and a game with nothing declared and no state files has no scope.
+    /// A declaration naming the instance root, `..`, an absolute path or a malformed folder is
+    /// refused when the package loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SnapshotScope>,
 }
 
 /// What Agora watches in a session, and which exit codes mean "the game was closed normally".
@@ -3227,6 +3235,7 @@ mod tests {
     #[test]
     fn linked_archive_matching_is_case_insensitive() {
         let def = GameDefinition {
+            snapshot: None,
             mo2_game_name: None,
             import_ids: Default::default(),
             session: Default::default(),
@@ -3278,6 +3287,7 @@ mod tests {
     #[test]
     fn declared_write_matching_is_case_insensitive() {
         let def = GameDefinition {
+            snapshot: None,
             mo2_game_name: None,
             import_ids: Default::default(),
             session: Default::default(),
@@ -3319,6 +3329,7 @@ mod tests {
     #[test]
     fn excluded_paths_matching_is_case_insensitive() {
         let def = GameDefinition {
+            snapshot: None,
             mo2_game_name: None,
             import_ids: Default::default(),
             session: Default::default(),
@@ -3356,6 +3367,7 @@ mod tests {
     #[test]
     fn copy_patterns_match_defaults_and_custom_case_insensitively() {
         let def = GameDefinition {
+            snapshot: None,
             mo2_game_name: None,
             import_ids: Default::default(),
             session: Default::default(),

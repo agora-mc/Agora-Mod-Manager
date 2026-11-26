@@ -1550,7 +1550,7 @@ fn two_profiles_import_merged_with_a_loadout_for_each() {
         );
     }
     let dir = f.ctx.paths.instance_dir(instance).unwrap();
-    let loadouts = agora_core::loadout::list_profiles(&dir).unwrap();
+    let loadouts = agora_core::loadout::list_profiles(&dir).unwrap().profiles;
     let enabled = |profile_name: &str| -> std::collections::BTreeMap<String, bool> {
         let profile = loadouts
             .iter()
@@ -1639,7 +1639,7 @@ fn f1h_merged_profiles_preserve_opposite_mod_priorities() {
         "Test Profile puts Alpha above Gamma"
     );
 
-    agora_core::game_loadout::apply_game_profile_with_undo(
+    agora_core::loadout::game::apply_game_profile_with_undo(
         &f.ctx, instance, &f.def, "Reverse", false,
     )
     .expect("switching to Reverse succeeds");
@@ -1649,7 +1649,7 @@ fn f1h_merged_profiles_preserve_opposite_mod_priorities() {
         "Reverse puts Gamma above Alpha"
     );
 
-    agora_core::game_loadout::apply_game_profile_with_undo(
+    agora_core::loadout::game::apply_game_profile_with_undo(
         &f.ctx,
         instance,
         &f.def,
@@ -1717,7 +1717,7 @@ fn f1a_merged_profile_without_own_settings_uses_shared_not_profile_1() {
     let instance = &report.instances[0];
     let dir = f.ctx.paths.instance_dir(instance).unwrap();
 
-    let loadouts = agora_core::loadout::list_profiles(&dir).unwrap();
+    let loadouts = agora_core::loadout::list_profiles(&dir).unwrap().profiles;
     let get_loadout = |name: &str| {
         loadouts
             .iter()
@@ -1746,7 +1746,7 @@ fn f1a_merged_profile_without_own_settings_uses_shared_not_profile_1() {
     );
 
     // Switching to Shared removes Profile 1's private INI copies and plugin list.
-    agora_core::game_loadout::apply_game_profile_with_undo(
+    agora_core::loadout::game::apply_game_profile_with_undo(
         &f.ctx, instance, &f.def, "Shared", false,
     )
     .expect("apply Shared");
@@ -1764,7 +1764,7 @@ fn f1a_merged_profile_without_own_settings_uses_shared_not_profile_1() {
     );
 
     // Switching to OwnPlugins keeps INIs shared, while writing OwnPlugins' own Plugins.txt.
-    agora_core::game_loadout::apply_game_profile_with_undo(
+    agora_core::loadout::game::apply_game_profile_with_undo(
         &f.ctx,
         instance,
         &f.def,
@@ -1840,7 +1840,7 @@ fn f1b_merged_local_saves_get_distinct_scoped_folders_and_copy_each_profiles_sav
     );
 
     // Switching to Alt points at Alt's scoped folder.
-    agora_core::game_loadout::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "Alt", false)
+    agora_core::loadout::game::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "Alt", false)
         .expect("apply Alt");
     assert_eq!(
         game_saves::in_use_folder(&f.ctx, instance, &f.def).unwrap(),
@@ -1895,7 +1895,7 @@ fn f1c_overwrite_layer_stays_enabled_and_wins_in_every_merged_loadout() {
     );
 
     // Switching to Profile 2: overwrite still stays enabled and still wins conflicts.
-    agora_core::game_loadout::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "Alt", false)
+    agora_core::loadout::game::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "Alt", false)
         .expect("apply Alt");
     assert_eq!(
         planned_file_bytes(&f, instance, "Data/meshes/armor/helm.nif"),
@@ -1959,7 +1959,7 @@ fn f1d_byte_identical_alias_folders_stay_enabled_in_each_profiles_loadout() {
     );
 
     // Under Alt (EchoAlias enabled): AliasShared.esp must STILL be deployed.
-    agora_core::game_loadout::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "Alt", false)
+    agora_core::loadout::game::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "Alt", false)
         .expect("apply Alt");
     assert_eq!(
         planned_file_bytes(&f, instance, "Data/AliasShared.esp"),
@@ -2520,14 +2520,16 @@ fn acceptance_merged_mo2_profiles_reproduce_winners_saves_and_effective_inis() {
     check_mage();
 
     // Switch to Warrior.
-    agora_core::game_loadout::apply_game_profile_with_undo(
+    agora_core::loadout::game::apply_game_profile_with_undo(
         &f.ctx, instance, &f.def, "Warrior", false,
     )
     .expect("switch to Warrior");
     check_warrior();
 
     // Switch back to Mage.
-    agora_core::game_loadout::apply_game_profile_with_undo(&f.ctx, instance, &f.def, "Mage", false)
-        .expect("switch back to Mage");
+    agora_core::loadout::game::apply_game_profile_with_undo(
+        &f.ctx, instance, &f.def, "Mage", false,
+    )
+    .expect("switch back to Mage");
     check_mage();
 }

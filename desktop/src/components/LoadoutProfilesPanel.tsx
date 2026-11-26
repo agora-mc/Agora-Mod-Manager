@@ -109,7 +109,11 @@ export function LoadoutProfilesPanel({
 
   const reloadProfiles = async () => {
     try {
-      setProfiles(await listLoadoutProfiles(instanceId));
+      const listing = await listLoadoutProfiles(instanceId);
+      setProfiles(listing.profiles);
+      // A record that cannot be read is named, never dropped from the list in silence: an empty
+      // one would read as "turn everything off" if it were applied.
+      if (listing.damaged.length > 0) reportError(listing.damaged.join(' '));
     } catch (e) {
       reportError(e);
     }

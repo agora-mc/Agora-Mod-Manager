@@ -19,41 +19,65 @@ use crate::snapshot::{self, RestoreOutcome, Snapshot};
 
 pub struct SnapshotService {
     ctx: Ctx,
-    /// The tracked roots a Minecraft instance's snapshot covers. Core no longer
-    /// knows them; the Minecraft package declares them and the adapter passes
-    /// them here. A generic game instance ignores this and declares its own.
-    minecraft_entries: Vec<String>,
 }
 
 impl SnapshotService {
     pub fn new(ctx: Ctx) -> Self {
-        Self {
-            ctx,
-            minecraft_entries: Vec::new(),
-        }
+        Self { ctx }
     }
 
-    /// Supply the Minecraft tracked-entry set (declared by the Minecraft
-    /// package) for this service. Without it, a Minecraft snapshot is refused
-    /// rather than taken against an empty scope.
-    pub fn with_minecraft_entries(mut self, entries: &[&str]) -> Self {
-        self.minecraft_entries = entries.iter().map(|entry| (*entry).to_string()).collect();
-        self
+    /// The game `instance_id` belongs to, from the identity table every instance has a row in
+    /// (MASTER_SPEC §32.7). An instance with no row is a Minecraft one, the same rule the rest of
+    /// this service uses; a database that cannot be read is cannot-tell, never a guess.
+    fn instance_game(&self, instance_id: &str) -> LauncherResult<agora_game_api::GameId> {
+        crate::game_instance::game_of(&self.ctx, instance_id)
+            .map(|game| game.unwrap_or_else(agora_game_api::GameId::minecraft))
+            .map_err(|error| LauncherError::Generic {
+                code: "ERR_LOCAL_STATE_FAILED".into(),
+                message: format!("cannot tell which game '{instance_id}' belongs to: {error}"),
+            })
     }
 
-    fn require_minecraft_entries(&self) -> LauncherResult<Vec<&str>> {
-        let entries = if self.minecraft_entries.is_empty() {
-            &self.ctx.minecraft_snapshot_entries
-        } else {
-            &self.minecraft_entries
+    /// The folders the package of `instance_id`'s game declared (MASTER_SPEC §32.7).
+    ///
+    /// Core holds no game's folder list: the instance's own game decides, so a generic game that
+    /// declares folders is captured and restored by the same rule as Minecraft. An instance with no
+    /// row in the identity table is a Minecraft one, the same rule the rest of this service uses. A
+    /// game that declares nothing, or is not installed, is refused with `ERR_SNAPSHOT_SCOPE` rather
+    /// than captured against an empty scope.
+    fn declared_scope(&self, instance_id: &str) -> LauncherResult<Vec<String>> {
+        let game = self.instance_game(instance_id)?;
+        let declared = self
+            .ctx
+            .games
+            .game(&game)
+            .and_then(|definition| definition.snapshot.as_ref());
+        let Some(scope) = declared else {
+            return Err(LauncherError::Generic {
+                code: "ERR_SNAPSHOT_SCOPE".into(),
+                message: format!(
+                    "no package declares the folders a snapshot of a '{}' instance covers, so \
+                     nothing was captured or restored",
+                    game.as_str()
+                ),
+            });
         };
+        let entries: Vec<String> = scope
+            .tracked_entries()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         if entries.is_empty() {
             return Err(LauncherError::Generic {
                 code: "ERR_SNAPSHOT_SCOPE".into(),
-                message: "the Minecraft snapshot scope was not supplied by this front end".into(),
+                message: format!(
+                    "the snapshot scope declared for '{}' is empty, so nothing was captured or \
+                     restored",
+                    game.as_str()
+                ),
             });
         }
-        Ok(entries.iter().map(String::as_str).collect())
+        Ok(entries)
     }
 
     /// Whether `instance_id` is a generic game instance rather than a
@@ -96,7 +120,8 @@ impl SnapshotService {
             return Ok(snapshot);
         }
 
-        let entries = self.require_minecraft_entries()?;
+        let declared = self.declared_scope(instance_id)?;
+        let entries: Vec<&str> = declared.iter().map(String::as_str).collect();
 
         let snapshot = snapshot::create_snapshot_with_origin(
             &instance_dir,
@@ -164,7 +189,8 @@ impl SnapshotService {
             return Ok(outcome.outcome);
         }
 
-        let entries = self.require_minecraft_entries()?;
+        let declared = self.declared_scope(instance_id)?;
+        let entries: Vec<&str> = declared.iter().map(String::as_str).collect();
         // A snapshot can carry another instance's manifest (an imported backup,
         // a clone's source). The restore replaces state, never identity.
         let identity =
@@ -174,7 +200,12 @@ impl SnapshotService {
 
         // Validate the target before capturing anything: an invalid request
         // should not cost the user a snapshot.
-        let scope = snapshot::restore_scope(&instance_dir, snapshot_id).map_err(snapshot_error)?;
+        let scope_entries =
+            snapshot::restore_scope_entries(&instance_dir, snapshot_id).map_err(snapshot_error)?;
+        let scope: Vec<String> = scope_entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
 
         // The undo snapshot covers exactly what the restore will replace.
         // Matching the scope means undoing a configuration-only restore does
@@ -190,6 +221,18 @@ impl SnapshotService {
 
         let outcome = snapshot::restore_snapshot(&instance_dir, snapshot_id, &entries)
             .map_err(snapshot_error)?;
+        let mut outcome = outcome;
+        // A snapshot owns what it captured. A folder this game no longer declares is restored
+        // anyway, and the result says which, so the person restoring is not left guessing about
+        // state that came back from outside the current scope (MASTER_SPEC §32.7). The question is
+        // asked of the scope the snapshot recorded, compared by path components with the platform's
+        // case rule, like with like: a folder the game dropped and a file it dropped are told apart.
+        let game = self.instance_game(instance_id)?;
+        for entry in &scope_entries {
+            if let Some(notice) = snapshot::untracked_notice(&entries, entry, game.as_str()) {
+                outcome.notices.push(notice);
+            }
+        }
         self.restore_manifest_identity(instance_id, identity.as_ref())?;
         self.sync_row_from_restored_manifest(instance_id)?;
 
@@ -369,6 +412,68 @@ mod tests {
         );
     }
 
+    /// A registry whose Minecraft package declares the scope these fixtures model, so the service
+    /// reads the declaration the way a real package supplies it.
+    fn registry() -> std::sync::Arc<crate::game_registry::GameRegistry> {
+        use crate::game_registry::{DeclarativePackage, GameRegistry, PackageSource};
+        use agora_game_api::{
+            DeploymentStrategy, GameDefinition, GameId, PackageDefinition, SnapshotScope,
+        };
+
+        let game = GameDefinition {
+            snapshot: Some(
+                SnapshotScope::declared(TRACKED, Some(PRELAUNCH))
+                    .expect("the fixture's Minecraft scope is usable"),
+            ),
+            id: GameId::minecraft(),
+            name: "Minecraft: Java Edition".into(),
+            extends: None,
+            stores: Vec::new(),
+            version_sources: Vec::new(),
+            deployment: DeploymentStrategy::Redirect,
+            content_rules: Vec::new(),
+            content_layout: None,
+            framework_ids: Vec::new(),
+            tool_ids: Vec::new(),
+            launch: None,
+            user_files: Vec::new(),
+            save_paths: Vec::new(),
+            linked_archive_patterns: Vec::new(),
+            declared_writes: Vec::new(),
+            copy_patterns: Vec::new(),
+            excluded_paths: Vec::new(),
+            load_orders: Vec::new(),
+            launch_alternatives: Vec::new(),
+            runtime_files: Vec::new(),
+            save_location: Vec::new(),
+            ini_checks: Vec::new(),
+            mo2_game_name: None,
+            import_ids: Default::default(),
+            session: Default::default(),
+        };
+        let package = PackageDefinition {
+            id: "test.minecraft".into(),
+            version: semver::Version::new(0, 1, 0),
+            api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
+            parents: Vec::new(),
+            games: vec![game],
+            frameworks: Vec::new(),
+            tools: Vec::new(),
+            game_templates: Default::default(),
+            behaviours: None,
+        };
+        let mut builder = GameRegistry::builder();
+        builder
+            .add(
+                PackageSource::Compiled {
+                    crate_name: "test".into(),
+                },
+                std::sync::Arc::new(DeclarativePackage(package)),
+            )
+            .unwrap();
+        std::sync::Arc::new(builder.build())
+    }
+
     /// The guard that removes the data root, then the service, its context and the instance id. The
     /// guard comes first so that it drops last, after the database handles the others hold.
     fn service() -> (RemoveOnDrop, SnapshotService, Ctx, String) {
@@ -378,7 +483,7 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let guard = RemoveOnDrop::new(root.clone());
-        let ctx = Ctx::for_testing(root);
+        let ctx = Ctx::for_testing(root).with_games(registry());
         crate::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
         let instance_id = "demo".to_string();
         let dir = ctx.paths.instance_dir(&instance_id).unwrap();
@@ -386,12 +491,113 @@ mod tests {
         fs::write(dir.join("mods").join("a.jar"), b"original").unwrap();
         fs::create_dir_all(dir.join("saves").join("world")).unwrap();
         fs::write(dir.join("saves").join("world").join("level.dat"), b"world").unwrap();
-        (
-            guard,
-            SnapshotService::new(ctx.clone()).with_minecraft_entries(TRACKED),
-            ctx,
-            instance_id,
+        (guard, SnapshotService::new(ctx.clone()), ctx, instance_id)
+    }
+
+    /// The instance's own game decides the scope (MASTER_SPEC §32.7): a Minecraft instance and an
+    /// instance of a game whose package declares nothing are not treated the same, and the refusal
+    /// names the game it could not read a declaration from.
+    #[test]
+    fn a_game_that_declares_no_snapshot_folder_is_refused_by_its_own_name() {
+        let (_root, service, ctx, id) = service();
+        let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        conn.execute(
+            "INSERT INTO instances (instance_id, game, name) VALUES (?1, 'scope-game', 'demo')",
+            [&id],
         )
+        .unwrap();
+
+        let refused = service
+            .create(&id, None)
+            .expect_err("no declaration, no snapshot");
+        assert!(refused.to_string().contains("scope-game"), "{refused}");
+    }
+
+    /// A snapshot owns what it captured, so a folder the game no longer declares is still
+    /// restored — and the result says so, naming the folder and the game, instead of doing it
+    /// quietly (MASTER_SPEC §32.7).
+    #[test]
+    fn a_restore_reports_a_folder_the_game_no_longer_tracks() {
+        let (_root, service, ctx, id) = service();
+        let dir = ctx.paths.instance_dir(&id).unwrap();
+        fs::create_dir_all(dir.join("characters")).unwrap();
+        fs::write(dir.join("characters").join("hero.sav"), b"level 1").unwrap();
+        // Captured while the folder was part of the scope; the package no longer declares it.
+        let taken =
+            snapshot::create_snapshot_scoped(&dir, Some("older scope"), &["mods", "characters"])
+                .unwrap();
+        fs::write(dir.join("characters").join("hero.sav"), b"level 9").unwrap();
+
+        let outcome = service.restore(&id, &taken.id).unwrap();
+
+        assert_eq!(
+            fs::read(dir.join("characters").join("hero.sav")).unwrap(),
+            b"level 1",
+            "the snapshot owns what it captured"
+        );
+        let noticed = outcome
+            .notices
+            .iter()
+            .find(|notice| notice.contains("characters"))
+            .expect("the restore reports the folder it no longer tracks");
+        assert!(
+            noticed.contains("no longer tracked") && noticed.contains("minecraft"),
+            "{noticed}"
+        );
+        assert!(
+            noticed.contains("restored from the snapshot anyway"),
+            "{noticed}"
+        );
+    }
+
+    /// A retired folder is restored by the same wholesale mechanism as a tracked one, so a file
+    /// created since the capture goes with the folder it sits in — and the undo point, sized to the
+    /// recorded scope, puts it back (MASTER_SPEC §32.7).
+    #[test]
+    fn the_undo_of_a_restore_that_replaced_a_retired_folder_brings_back_its_new_files() {
+        let (_root, service, ctx, id) = service();
+        let dir = ctx.paths.instance_dir(&id).unwrap();
+        fs::create_dir_all(dir.join("characters")).unwrap();
+        fs::write(dir.join("characters").join("hero.sav"), b"level 1").unwrap();
+        // Captured while the folder was part of the scope; the package no longer declares it.
+        let taken =
+            snapshot::create_snapshot_scoped(&dir, Some("older scope"), &["mods", "characters"])
+                .unwrap();
+        fs::write(dir.join("characters").join("hero.sav"), b"level 9").unwrap();
+        fs::write(dir.join("characters").join("new.sav"), b"created since").unwrap();
+
+        service.restore(&id, &taken.id).unwrap();
+
+        assert_eq!(
+            fs::read(dir.join("characters").join("hero.sav")).unwrap(),
+            b"level 1"
+        );
+        assert!(
+            !dir.join("characters").join("new.sav").exists(),
+            "the folder comes back the way the snapshot captured it"
+        );
+
+        let undo = snapshot::list_snapshots(&dir)
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| {
+                snapshot
+                    .label
+                    .as_deref()
+                    .is_some_and(|label| label.starts_with("pre-restore-"))
+            })
+            .expect("undo snapshot was not created");
+        service.restore(&id, &undo.id).unwrap();
+
+        assert_eq!(
+            fs::read(dir.join("characters").join("new.sav")).unwrap(),
+            b"created since",
+            "the undo covers the recorded scope, so the file the restore replaced is back"
+        );
+        assert_eq!(
+            fs::read(dir.join("characters").join("hero.sav")).unwrap(),
+            b"level 9"
+        );
     }
 
     #[test]

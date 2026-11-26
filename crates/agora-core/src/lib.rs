@@ -48,7 +48,6 @@ pub mod game_ini;
 pub mod game_instance;
 pub mod game_launch;
 pub mod game_load_order;
-pub mod game_loadout;
 pub mod game_mod_ini;
 pub mod game_plugins;
 pub mod game_registry;

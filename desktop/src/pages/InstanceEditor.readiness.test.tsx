@@ -56,8 +56,9 @@ beforeEach(() => {
       case 'list_instance_templates':
       case 'list_snapshots':
       case 'list_capturable_template_files':
-      case 'list_loadout_profiles':
         return [];
+      case 'list_loadout_profiles':
+        return { profiles: [], damaged: [] };
       case 'get_mod_groups': return {};
       default: return null;
     }

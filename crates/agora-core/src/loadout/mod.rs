@@ -1,3 +1,16 @@
+//! The one loadout service (MASTER_SPEC §32.7).
+//!
+//! A loadout profile records what an instance's setup was and puts that setup back. The record,
+//! its storage (`.agora_loadouts`), listing, apply/switch and the rules every game shares — the
+//! undo point taken before anything changes, and the all-or-nothing renames — live here.
+//!
+//! What a profile captures for a particular game is a section, not a second service. [`game`]
+//! holds the section a generic game contributes from its definition (content layers, plugin lists,
+//! INI copies, load-after rules, the save choice). The content section in this module is the set of
+//! enabled items a Minecraft instance records in its manifest.
+
+pub mod game;
+
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -29,7 +42,15 @@ pub struct LoadoutItem {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The version of the stored loadout record (MASTER_SPEC §32.7).
+///
+/// Before it, a record held one game's state in flat fields (`enabled_mods`, `covers`, `items`,
+/// `game`). From it, a record holds a `sections` map keyed by game id, so each game contributes its
+/// own section to the one record and no game's shape has to know another's. Records written before
+/// it are migrated when they are read; a record that cannot be is reported, never dropped.
+pub const LOADOUT_SCHEMA_VERSION: u32 = 32;
+
+#[derive(Debug, Clone)]
 pub struct LoadoutProfile {
     pub name: String,
     /// Names of the enabled items, across every kind. Kept so older readers
@@ -38,18 +59,226 @@ pub struct LoadoutProfile {
     pub created_at: String,
     /// Recorded at save time. Profiles saved before this field existed have
     /// none, so their per-kind counts are unknown.
-    #[serde(default)]
     pub covers: Option<LoadoutCoverage>,
     /// Every item the profile records, on and off, with its kind. Apply only
     /// changes items listed here (plus mods, see `apply_profile_items`).
     /// Absent on profiles saved before this existed.
-    #[serde(default)]
     pub items: Option<Vec<LoadoutItem>>,
     /// A game instance's state: its content layers, plugin lists, INI copies,
     /// load-after rules and save choice (MASTER_SPEC §26.10). `None` on a
     /// Minecraft profile, which keeps the fields above instead.
+    pub game: Option<crate::loadout::game::GameLoadout>,
+}
+
+/// One game's contribution to a stored loadout record, as it appears under `sections`.
+///
+/// `enabled_mods` is required: every writer of this version fills it in, so a section without it is
+/// a record that lost its state. Reading that as an empty list would apply as "turn everything
+/// off", which is the one thing a damaged record must never do.
+#[derive(Serialize, Deserialize)]
+struct StoredSection {
+    enabled_mods: Vec<String>,
+    #[serde(default)]
+    covers: Option<LoadoutCoverage>,
+    #[serde(default)]
+    items: Option<Vec<LoadoutItem>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub game: Option<crate::game_loadout::GameLoadout>,
+    game: Option<crate::loadout::game::GameLoadout>,
+}
+
+/// The stored record from schema 32 on: one section per game, keyed by that game's id.
+#[derive(Serialize, Deserialize)]
+struct StoredProfile {
+    schema_version: u32,
+    name: String,
+    created_at: String,
+    sections: std::collections::BTreeMap<String, StoredSection>,
+}
+
+/// The record a version before schema 32 wrote: one game's state in flat fields.
+///
+/// `enabled_mods` is required here for the same reason it is required in a section: it is the one
+/// field every writer of the flat format wrote, so a flat-shaped record without it is damaged rather
+/// than empty. (`covers`, `items` and `game` were added later, so they stay optional.)
+#[derive(Serialize, Deserialize)]
+struct LegacyProfile {
+    name: String,
+    enabled_mods: Vec<String>,
+    created_at: String,
+    #[serde(default)]
+    covers: Option<LoadoutCoverage>,
+    #[serde(default)]
+    items: Option<Vec<LoadoutItem>>,
+    #[serde(default)]
+    game: Option<crate::loadout::game::GameLoadout>,
+}
+
+impl StoredSection {
+    fn of(profile: &LoadoutProfile) -> Self {
+        Self {
+            enabled_mods: profile.enabled_mods.clone(),
+            covers: profile.covers.clone(),
+            items: profile.items.clone(),
+            game: profile.game.clone(),
+        }
+    }
+
+    fn into_profile(self, name: String, created_at: String) -> LoadoutProfile {
+        LoadoutProfile {
+            name,
+            created_at,
+            enabled_mods: self.enabled_mods,
+            covers: self.covers,
+            items: self.items,
+            game: self.game,
+        }
+    }
+}
+
+impl LoadoutProfile {
+    /// Read a stored record, from any version this code has written.
+    ///
+    /// A record from before schema 32 is migrated on the way in; the section it held keeps whatever
+    /// the game that wrote it recorded. A record that cannot be read is an error naming the file,
+    /// never a profile with nothing in it, because that would apply as "turn everything off".
+    ///
+    /// The version is read strictly: `schema_version` is honoured only when it is exactly the
+    /// integer [`LOADOUT_SCHEMA_VERSION`], because that is the only value this code writes. A
+    /// version that is a string, a float, a negative number, or a number this build does not write
+    /// is a damaged record - it is reported, never read as an older format and never read as
+    /// nothing. A record with no `schema_version` at all is the flat format written before it
+    /// existed, and still reads leniently. `expected_game`, when the instance's game can be told,
+    /// must be the section the record holds: a loadout filed under another game cannot be applied.
+    fn from_stored(
+        bytes: &[u8],
+        describe: &str,
+        expected_game: Option<&str>,
+    ) -> Result<Self, String> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|e| format!("{describe} is not a loadout record: {e}"))?;
+        let version = match value.get("schema_version") {
+            None => None,
+            Some(declared) => match declared.as_u64() {
+                Some(declared) if declared == u64::from(LOADOUT_SCHEMA_VERSION) => Some(declared),
+                _ => {
+                    return Err(format!(
+                        "{describe} records schema_version {declared}, and this build writes only \
+                         {LOADOUT_SCHEMA_VERSION}; it is not read"
+                    ))
+                }
+            },
+        };
+        if version.is_some() {
+            let stored: StoredProfile = serde_json::from_value(value)
+                .map_err(|e| format!("{describe} is not a loadout record: {e}"))?;
+            let section = match stored.sections.len() {
+                1 => stored.sections.into_iter().next(),
+                // A loadout belongs to one instance, so it holds one game's section. More than one
+                // is a record this code did not write; ignoring the rest would apply half of it.
+                0 => {
+                    return Err(format!(
+                        "{describe} records no section, so there is nothing to apply"
+                    ))
+                }
+                count => {
+                    return Err(format!(
+                        "{describe} records {count} game sections; a loadout belongs to one game, \
+                         so it cannot be applied"
+                    ))
+                }
+            };
+            let (game, section) = section.expect("one section");
+            if let Some(expected) = expected_game {
+                if game != expected {
+                    return Err(format!(
+                        "{describe} records a '{game}' section, but this instance is a \
+                         '{expected}' instance, so it cannot be applied"
+                    ));
+                }
+            }
+            return Ok(section.into_profile(stored.name, stored.created_at));
+        }
+        // Before schema 32: one game's state, flat.
+        let legacy: LegacyProfile = serde_json::from_value(value)
+            .map_err(|e| format!("{describe} is a loadout record this code cannot read: {e}"))?;
+        Ok(LoadoutProfile {
+            name: legacy.name,
+            created_at: legacy.created_at,
+            enabled_mods: legacy.enabled_mods,
+            covers: legacy.covers,
+            items: legacy.items,
+            game: legacy.game,
+        })
+    }
+
+    /// The record to write: this profile's state as the section of `game` (MASTER_SPEC §32.7).
+    fn to_stored(&self, game: &str) -> Result<Vec<u8>, String> {
+        let stored = StoredProfile {
+            schema_version: LOADOUT_SCHEMA_VERSION,
+            name: self.name.clone(),
+            created_at: self.created_at.clone(),
+            sections: [(game.to_string(), StoredSection::of(self))]
+                .into_iter()
+                .collect(),
+        };
+        serde_json::to_vec_pretty(&stored).map_err(|e| format!("Cannot serialize profile: {e}"))
+    }
+}
+
+/// A profile as the CLI and the desktop show it: the state it records, flat.
+///
+/// This is the shape front ends have always printed, so their output does not change with the
+/// stored format. Writing goes through [`LoadoutProfile::to_stored`], which files the same state
+/// under the instance's game.
+impl Serialize for LoadoutProfile {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        LegacyProfile {
+            name: self.name.clone(),
+            enabled_mods: self.enabled_mods.clone(),
+            created_at: self.created_at.clone(),
+            covers: self.covers.clone(),
+            items: self.items.clone(),
+            game: self.game.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+/// The game an instance belongs to, read from its manifest so a loadout written before records
+/// named their game is filed under the right section.
+///
+/// The manifest is the only place that knows before the database is open: a game instance's
+/// manifest names its `game`, and a Minecraft instance's carries `minecraft_version`. This reads
+/// those two markers and nothing else — it is not a load of the manifest, so it neither heals nor
+/// rewrites one. A manifest that is neither is cannot-tell, and the loadout is reported rather than
+/// guessed at.
+fn manifest_game_id(instance_dir: &Path) -> Result<String, String> {
+    let path = instance_dir.join("instance_manifest.json");
+    let bytes = fs::read(&path).map_err(|e| {
+        format!(
+            "cannot read {} to tell which game this loadout belongs to: {e}",
+            path.display()
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        format!(
+            "{} is not a manifest this code can read ({e}), so the loadouts filed under it cannot \
+             be migrated to schema {}",
+            path.display(),
+            LOADOUT_SCHEMA_VERSION
+        )
+    })?;
+    if let Some(game) = value.get("game").and_then(serde_json::Value::as_str) {
+        return Ok(game.to_string());
+    }
+    if value.get("minecraft_version").is_some() {
+        return Ok(agora_game_api::GameId::MINECRAFT.to_string());
+    }
+    Err(format!(
+        "{} names no game, so the loadouts filed under it cannot be migrated to schema {}",
+        path.display(),
+        LOADOUT_SCHEMA_VERSION
+    ))
 }
 
 /// Mods are every kind that is not a pack or a world, matching `content_subdir`.
@@ -163,9 +392,15 @@ pub(crate) fn write_profile(instance_dir: &Path, profile: &LoadoutProfile) -> Re
 
     let safe_name = sanitize_profile_name(&profile.name);
     let profile_path = profiles_dir.join(format!("{safe_name}.json"));
-    let json = serde_json::to_string_pretty(profile)
-        .map_err(|e| format!("Cannot serialize profile: {e}"))?;
-    fs::write(&profile_path, json).map_err(|e| format!("Cannot write profile: {e}"))
+    // The section is filed under the instance's game: one record, each game contributing its own
+    // part (MASTER_SPEC §32.7).
+    let game = manifest_game_id(instance_dir)?;
+    let json = profile.to_stored(&game)?;
+    // Written atomically, through the same temp-file-then-rename helper the manifests and backups
+    // use: a record cut short by a crash reads as damaged, and the state it held is then only
+    // recoverable from a snapshot. A reader sees the old record or the new one, never a truncation.
+    crate::snapshot::atomic_write_pub(&profile_path, &json)
+        .map_err(|e| format!("Cannot write profile: {e}"))
 }
 
 /// Create a new loadout profile from the current enabled state in the manifest.
@@ -292,14 +527,42 @@ pub fn update_profile(instance_dir: &Path, profile_name: &str) -> Result<Loadout
     })
 }
 
+/// The loadouts an instance has, and the records that could not be read.
+///
+/// A damaged record is never dropped and never read as an empty profile: it stays where it is and
+/// is named here, so one unreadable file does not hide every good loadout (or, worse, apply as
+/// "turn everything off").
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadoutListing {
+    pub profiles: Vec<LoadoutProfile>,
+    /// One line per record that could not be read, naming the file and what is wrong with it.
+    pub damaged: Vec<String>,
+}
+
+/// Whether something is at `path`, failing closed: a path that cannot be examined is an error, never
+/// "nothing there" (MASTER_SPEC §32.13).
+fn is_present(path: &Path) -> Result<bool, String> {
+    match agora_game_api::probe(path) {
+        agora_game_api::Probe::Present(_) => Ok(true),
+        agora_game_api::Probe::Absent => Ok(false),
+        agora_game_api::Probe::CantTell(error) => Err(format!(
+            "cannot tell what is at {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 /// List all loadout profiles for an instance.
-pub fn list_profiles(instance_dir: &Path) -> Result<Vec<LoadoutProfile>, String> {
+pub fn list_profiles(instance_dir: &Path) -> Result<LoadoutListing, String> {
     let profiles_dir = loadouts_dir(instance_dir);
-    if !profiles_dir.is_dir() {
-        return Ok(Vec::new());
+    if !is_present(&profiles_dir)? {
+        return Ok(LoadoutListing::default());
     }
 
-    let mut profiles = Vec::new();
+    // The instance's game, when the manifest says: a section filed under another game is damaged.
+    let expected_game = manifest_game_id(instance_dir).ok();
+    let mut listing = LoadoutListing::default();
     let entries =
         fs::read_dir(&profiles_dir).map_err(|e| format!("Cannot read loadouts dir: {e}"))?;
 
@@ -309,15 +572,24 @@ pub fn list_profiles(instance_dir: &Path) -> Result<Vec<LoadoutProfile>, String>
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let content =
-            fs::read_to_string(&path).map_err(|e| format!("Cannot read {:?}: {e}", path))?;
-        let profile: LoadoutProfile =
-            serde_json::from_str(&content).map_err(|e| format!("Invalid profile JSON: {e}"))?;
-        profiles.push(profile);
+        let describe = format!("the loadout at {}", path.display());
+        let content = match fs::read(&path) {
+            Ok(content) => content,
+            Err(error) => {
+                listing
+                    .damaged
+                    .push(format!("{describe} cannot be read: {error}"));
+                continue;
+            }
+        };
+        match LoadoutProfile::from_stored(&content, &describe, expected_game.as_deref()) {
+            Ok(profile) => listing.profiles.push(profile),
+            Err(error) => listing.damaged.push(error),
+        }
     }
 
-    profiles.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(profiles)
+    listing.profiles.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(listing)
 }
 
 pub(crate) fn read_profile(
@@ -326,9 +598,15 @@ pub(crate) fn read_profile(
 ) -> Result<LoadoutProfile, String> {
     let safe_name = sanitize_profile_name(profile_name);
     let profile_path = loadouts_dir(instance_dir).join(format!("{safe_name}.json"));
-    let content =
-        fs::read_to_string(&profile_path).map_err(|e| format!("Cannot read profile: {e}"))?;
-    serde_json::from_str(&content).map_err(|e| format!("Invalid profile JSON: {e}"))
+    let content = fs::read(&profile_path).map_err(|e| format!("Cannot read profile: {e}"))?;
+    // Applying or updating one record: the instance's game has to match, or the loadout would be
+    // half-applied. A manifest that says nothing about the game is reported, not guessed.
+    let expected_game = manifest_game_id(instance_dir)?;
+    LoadoutProfile::from_stored(
+        &content,
+        &format!("the loadout at {}", profile_path.display()),
+        Some(&expected_game),
+    )
 }
 
 /// What applying a profile does with an enabled mod the profile does not list
@@ -502,7 +780,7 @@ fn set_entry_enabled(
 
     if should_enable {
         // Currently disabled → enable
-        if disabled.exists() {
+        if is_present(&disabled)? {
             fs::rename(&disabled, &original)
                 .map_err(|e| format!("Cannot enable {}: {e}", entry.filename))?;
             journal.push((disabled, original));
@@ -510,7 +788,7 @@ fn set_entry_enabled(
         entry.enabled = true;
     } else {
         // Currently enabled → disable
-        if original.exists() {
+        if is_present(&original)? {
             fs::rename(&original, &disabled)
                 .map_err(|e| format!("Cannot disable {}: {e}", entry.filename))?;
             journal.push((original, disabled));
@@ -628,18 +906,23 @@ pub fn delete_profile(instance_dir: &Path, profile_name: &str) -> Result<(), Str
     let safe_name = sanitize_profile_name(profile_name);
     let profile_path = profiles_dir.join(format!("{safe_name}.json"));
 
-    if !profile_path.exists() {
+    if !is_present(&profile_path)? {
         return Err(format!("Profile '{profile_name}' not found"));
     }
 
     fs::remove_file(&profile_path).map_err(|e| format!("Cannot delete profile: {e}"))?;
 
-    if profiles_dir.exists() {
-        let remaining: Vec<_> = fs::read_dir(&profiles_dir)
-            .map_err(|e| format!("Cannot read loadouts dir: {e}"))?
-            .filter_map(|e| e.ok())
-            .collect();
-        if remaining.is_empty() {
+    if is_present(&profiles_dir)? {
+        // Every entry is read: a directory whose entries cannot be listed says nothing about whether
+        // it is empty, and removing the folder would take the remaining records with it.
+        let mut remaining = 0usize;
+        for entry in
+            fs::read_dir(&profiles_dir).map_err(|e| format!("Cannot read loadouts dir: {e}"))?
+        {
+            entry.map_err(|e| format!("Cannot read loadouts dir: {e}"))?;
+            remaining += 1;
+        }
+        if remaining == 0 {
             let _ = fs::remove_dir(&profiles_dir);
         }
     }
@@ -778,7 +1061,15 @@ mod tests {
         fs::create_dir_all(&profiles_dir).unwrap();
         fs::write(
             profiles_dir.join("minimal.json"),
-            serde_json::to_string_pretty(&minimal).unwrap(),
+            serde_json::to_string_pretty(&LegacyProfile {
+                name: minimal.name.clone(),
+                enabled_mods: minimal.enabled_mods.clone(),
+                created_at: minimal.created_at.clone(),
+                covers: minimal.covers.clone(),
+                items: minimal.items.clone(),
+                game: minimal.game.clone(),
+            })
+            .unwrap(),
         )
         .unwrap();
 
@@ -846,7 +1137,15 @@ mod tests {
         fs::create_dir_all(&profiles_dir).unwrap();
         fs::write(
             profiles_dir.join("all-on.json"),
-            serde_json::to_string_pretty(&profile).unwrap(),
+            serde_json::to_string_pretty(&LegacyProfile {
+                name: profile.name.clone(),
+                enabled_mods: profile.enabled_mods.clone(),
+                created_at: profile.created_at.clone(),
+                covers: profile.covers.clone(),
+                items: profile.items.clone(),
+                game: profile.game.clone(),
+            })
+            .unwrap(),
         )
         .unwrap();
 
@@ -965,7 +1264,15 @@ mod tests {
         fs::create_dir_all(&profiles_dir).unwrap();
         fs::write(
             profiles_dir.join("no-shaders.json"),
-            serde_json::to_string_pretty(&profile).unwrap(),
+            serde_json::to_string_pretty(&LegacyProfile {
+                name: profile.name.clone(),
+                enabled_mods: profile.enabled_mods.clone(),
+                created_at: profile.created_at.clone(),
+                covers: profile.covers.clone(),
+                items: profile.items.clone(),
+                game: profile.game.clone(),
+            })
+            .unwrap(),
         )
         .unwrap();
 
@@ -1158,7 +1465,7 @@ mod tests {
     fn test_list_profiles_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("empty");
-        let profiles = list_profiles(&dir).unwrap();
+        let profiles = list_profiles(&dir).unwrap().profiles;
         assert!(profiles.is_empty());
     }
 
@@ -1170,16 +1477,16 @@ mod tests {
         create_profile(&dir, "alpha").unwrap();
         create_profile(&dir, "beta").unwrap();
 
-        let profiles = list_profiles(&dir).unwrap();
+        let profiles = list_profiles(&dir).unwrap().profiles;
         assert_eq!(profiles.len(), 2);
 
         delete_profile(&dir, "alpha").unwrap();
-        let profiles = list_profiles(&dir).unwrap();
+        let profiles = list_profiles(&dir).unwrap().profiles;
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].name, "beta");
 
         delete_profile(&dir, "beta").unwrap();
-        let profiles = list_profiles(&dir).unwrap();
+        let profiles = list_profiles(&dir).unwrap().profiles;
         assert!(profiles.is_empty());
     }
 
@@ -1242,7 +1549,7 @@ mod tests {
         )
         .unwrap();
 
-        let profiles = list_profiles(&dir).unwrap();
+        let profiles = list_profiles(&dir).unwrap().profiles;
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].enabled_mods, vec!["a.jar".to_string()]);
         assert!(profiles[0].covers.is_none(), "unknown counts stay unknown");
@@ -1257,7 +1564,7 @@ mod tests {
             let err = create_profile(&dir, blank).expect_err("blank name must be refused");
             assert!(err.contains("needs a name"), "unexpected error: {err}");
         }
-        assert!(list_profiles(&dir).unwrap().is_empty());
+        assert!(list_profiles(&dir).unwrap().profiles.is_empty());
         assert!(
             !loadouts_dir(&dir).exists(),
             "a refused profile must not leave a loadouts folder behind"
@@ -1289,6 +1596,26 @@ mod tests {
         fs::write(dir.join("mods").join(on_disk), filename).unwrap();
     }
 
+    /// Write a profile in the shape code before schema 32 wrote it: one game's state, flat. The
+    /// migration tests use this so they exercise data written by the code this replaced.
+    fn write_legacy_profile(dir: &Path, profile: &LoadoutProfile) {
+        let legacy = LegacyProfile {
+            name: profile.name.clone(),
+            enabled_mods: profile.enabled_mods.clone(),
+            created_at: profile.created_at.clone(),
+            covers: profile.covers.clone(),
+            items: profile.items.clone(),
+            game: profile.game.clone(),
+        };
+        let profiles_dir = loadouts_dir(dir);
+        fs::create_dir_all(&profiles_dir).unwrap();
+        fs::write(
+            profiles_dir.join(format!("{}.json", sanitize_profile_name(&profile.name))),
+            serde_json::to_string_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn save_legacy_profile(dir: &Path, name: &str, enabled_mods: &[&str]) {
         let profile = LoadoutProfile {
             name: name.to_string(),
@@ -1298,13 +1625,7 @@ mod tests {
             items: None,
             game: None,
         };
-        let profiles_dir = loadouts_dir(dir);
-        fs::create_dir_all(&profiles_dir).unwrap();
-        fs::write(
-            profiles_dir.join(format!("{name}.json")),
-            serde_json::to_string_pretty(&profile).unwrap(),
-        )
-        .unwrap();
+        write_legacy_profile(dir, &profile);
     }
 
     fn is_on(dir: &Path, filename: &str) -> bool {
@@ -1434,13 +1755,13 @@ mod tests {
         assert_eq!(planned.name, "both");
 
         // Planning writes nothing.
-        let still = list_profiles(&dir).unwrap();
+        let still = list_profiles(&dir).unwrap().profiles;
         assert_eq!(still[0].enabled_mods, saved.enabled_mods);
 
         let done = update_profile(&dir, "both").unwrap();
         assert_eq!(done.changes, expected);
 
-        let after = list_profiles(&dir).unwrap();
+        let after = list_profiles(&dir).unwrap().profiles;
         assert_eq!(
             after.len(),
             1,
@@ -1508,7 +1829,7 @@ mod tests {
                 },
             ]
         );
-        let upgraded = &list_profiles(&dir).unwrap()[0];
+        let upgraded = &list_profiles(&dir).unwrap().profiles[0];
         assert!(upgraded.items.is_some(), "the profile now records items");
         assert!(upgraded.covers.is_some());
     }
@@ -1542,7 +1863,7 @@ mod tests {
         let done = update_profile(&dir, "Pvp: fast").unwrap();
         assert_eq!(done.name, "Pvp: fast");
         assert_eq!(done.changes.len(), 1);
-        let profiles = list_profiles(&dir).unwrap();
+        let profiles = list_profiles(&dir).unwrap().profiles;
         assert_eq!(profiles.len(), 1, "same file, not a second profile");
         assert_eq!(profiles[0].name, "Pvp: fast");
     }
@@ -1629,5 +1950,273 @@ mod tests {
             manifest_before,
             "the manifest still records b and d as off"
         );
+    }
+
+    #[test]
+    fn a_written_record_files_its_state_under_the_instances_game() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = setup_instance(&tmp, &["sodium.jar"]);
+        let saved = create_profile(&dir, "shape").unwrap();
+
+        let stored: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(loadouts_dir(&dir).join("shape.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored["schema_version"], LOADOUT_SCHEMA_VERSION);
+        let sections = stored["sections"].as_object().expect("one section map");
+        assert_eq!(
+            sections.keys().collect::<Vec<_>>(),
+            vec![&agora_game_api::GameId::MINECRAFT.to_string()],
+            "the section is filed under the instance's game"
+        );
+        assert_eq!(sections["minecraft"]["enabled_mods"][0], "sodium.jar");
+
+        // What was written reads back as what was saved.
+        let read = read_profile(&dir, "shape").unwrap();
+        assert_eq!(read.name, saved.name);
+        assert_eq!(read.enabled_mods, saved.enabled_mods);
+        assert_eq!(read.covers, saved.covers);
+        assert!(read.game.is_none());
+    }
+
+    /// The damaged-record corpus: a truncated record, a version this build does not write, and a
+    /// section filed under another game are each reported and refused, never read as an empty
+    /// profile (which would apply as "turn everything off") and never dropped.
+    #[test]
+    fn a_record_that_cannot_be_read_is_named_while_the_good_one_is_listed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = setup_instance(&tmp, &["sodium.jar"]);
+        create_profile(&dir, "good").unwrap();
+        let profiles_dir = loadouts_dir(&dir);
+        let truncated = profiles_dir.join("cut.json");
+        fs::write(&truncated, br#"{"name":"cut","enabled_mods":["sod"#).unwrap();
+
+        let listing = list_profiles(&dir).unwrap();
+
+        assert_eq!(listing.profiles.len(), 1, "the good record is still listed");
+        assert_eq!(listing.profiles[0].name, "good");
+        assert!(
+            listing.damaged.iter().any(|line| line.contains("cut.json")),
+            "the damaged record is named: {:?}",
+            listing.damaged
+        );
+        assert!(truncated.is_file(), "the damaged record is not deleted");
+        assert!(
+            read_profile(&dir, "cut").is_err(),
+            "and it is refused for apply"
+        );
+    }
+
+    #[test]
+    fn a_record_whose_version_is_not_the_one_this_build_writes_is_damaged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = setup_instance(&tmp, &["sodium.jar"]);
+        let profiles_dir = loadouts_dir(&dir);
+        fs::create_dir_all(&profiles_dir).unwrap();
+
+        let mut record = serde_json::json!({
+            "schema_version": LOADOUT_SCHEMA_VERSION,
+            "name": "versioned",
+            "created_at": "2026-01-01T00:00:00Z",
+            "sections": {"minecraft": {"enabled_mods": ["sodium.jar"]}},
+        });
+        // The version as a string: the same number, the wrong type.
+        record["schema_version"] = serde_json::json!(LOADOUT_SCHEMA_VERSION.to_string());
+        let path = profiles_dir.join("versioned.json");
+        fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let listing = list_profiles(&dir).unwrap();
+        assert!(listing.profiles.is_empty(), "nothing is read from it");
+        assert!(
+            listing
+                .damaged
+                .iter()
+                .any(|line| line.contains("schema_version")),
+            "{:?}",
+            listing.damaged
+        );
+
+        // A version this build does not write, with a shape it also did not write.
+        record["schema_version"] = serde_json::json!(LOADOUT_SCHEMA_VERSION + 1);
+        fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let listing = list_profiles(&dir).unwrap();
+        assert!(listing.profiles.is_empty());
+        assert!(
+            listing
+                .damaged
+                .iter()
+                .any(|line| line.contains(&(LOADOUT_SCHEMA_VERSION + 1).to_string())),
+            "{:?}",
+            listing.damaged
+        );
+
+        // The record this build writes reads, so the refusals above are about the version.
+        create_profile(&dir, "versioned").unwrap();
+        let listing = list_profiles(&dir).unwrap();
+        assert_eq!(listing.profiles.len(), 1, "{:?}", listing.damaged);
+    }
+
+    /// A record whose `schema_version` was lost is not read as the flat format: the flat format's
+    /// required field is not where a versioned record keeps its state, so reading it as one would
+    /// produce an empty profile, which applies as "turn everything off".
+    #[test]
+    fn a_record_whose_version_was_stripped_is_damaged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = setup_instance(&tmp, &["sodium.jar"]);
+        create_profile(&dir, "stripped").unwrap();
+        let path = loadouts_dir(&dir).join("stripped.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record
+            .as_object_mut()
+            .expect("an object")
+            .remove("schema_version");
+        fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let listing = list_profiles(&dir).unwrap();
+
+        assert!(listing.profiles.is_empty(), "nothing is read from it");
+        assert!(
+            listing
+                .damaged
+                .iter()
+                .any(|line| line.contains("stripped.json")),
+            "the damaged record is named: {:?}",
+            listing.damaged
+        );
+        assert!(
+            read_profile(&dir, "stripped").is_err(),
+            "and it is refused for apply"
+        );
+    }
+
+    /// A section with no state in it is damaged too: a version this code writes always fills the
+    /// section in, so an empty one is a record that lost its state, not one that records nothing.
+    #[test]
+    fn a_section_without_its_required_fields_is_damaged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = setup_instance(&tmp, &["sodium.jar"]);
+        let profiles_dir = loadouts_dir(&dir);
+        fs::create_dir_all(&profiles_dir).unwrap();
+        let record = serde_json::json!({
+            "schema_version": LOADOUT_SCHEMA_VERSION,
+            "name": "empty",
+            "created_at": "2026-01-01T00:00:00Z",
+            "sections": {"minecraft": {}},
+        });
+        fs::write(
+            profiles_dir.join("empty.json"),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+
+        let listing = list_profiles(&dir).unwrap();
+
+        assert!(listing.profiles.is_empty(), "nothing is read from it");
+        assert!(
+            listing
+                .damaged
+                .iter()
+                .any(|line| line.contains("empty.json")),
+            "the damaged record is named: {:?}",
+            listing.damaged
+        );
+        assert!(read_profile(&dir, "empty").is_err());
+    }
+
+    /// A game section whose state is missing is damaged, not an empty loadout.
+    ///
+    /// A game's section records its content layers, its lists and its save choice. An empty one
+    /// applies as "turn every managed layer off, clear the lists, and use the shared saves" — the
+    /// one thing a damaged record must never do (MASTER_SPEC §26.10, §32.7).
+    #[test]
+    fn a_game_section_without_its_state_is_damaged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("game-instance");
+        fs::create_dir_all(&dir).unwrap();
+        // A game instance's manifest names its game; the section has to match it to be applied.
+        fs::write(
+            dir.join("instance_manifest.json"),
+            serde_json::json!({"instance_id": "game-instance", "name": "G", "game": "skyrim-se"})
+                .to_string(),
+        )
+        .unwrap();
+        let profiles_dir = loadouts_dir(&dir);
+        fs::create_dir_all(&profiles_dir).unwrap();
+
+        for (name, game) in [
+            ("empty-game", serde_json::json!({})),
+            (
+                "contentless",
+                serde_json::json!({"plugin_lists": [], "inis": [], "rules": [], "saves": "shared"}),
+            ),
+        ] {
+            let record = serde_json::json!({
+                "schema_version": LOADOUT_SCHEMA_VERSION,
+                "name": name,
+                "created_at": "2026-01-01T00:00:00Z",
+                "sections": {"skyrim-se": {
+                    "enabled_mods": [], "covers": null, "items": null, "game": game,
+                }},
+            });
+            fs::write(
+                profiles_dir.join(format!("{name}.json")),
+                serde_json::to_vec_pretty(&record).unwrap(),
+            )
+            .unwrap();
+
+            let listing = list_profiles(&dir).unwrap();
+
+            assert!(
+                !listing.profiles.iter().any(|profile| profile.name == name),
+                "{name} is not read as a loadout: {:?}",
+                listing.profiles
+            );
+            assert!(
+                listing
+                    .damaged
+                    .iter()
+                    .any(|line| line.contains(&format!("{name}.json"))),
+                "the damaged record is named: {:?}",
+                listing.damaged
+            );
+            assert!(
+                read_profile(&dir, name).is_err(),
+                "{name} is refused for apply"
+            );
+            fs::remove_file(profiles_dir.join(format!("{name}.json"))).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_section_filed_under_another_game_is_damaged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = setup_instance(&tmp, &["sodium.jar"]);
+        let profiles_dir = loadouts_dir(&dir);
+        fs::create_dir_all(&profiles_dir).unwrap();
+        let record = serde_json::json!({
+            "schema_version": LOADOUT_SCHEMA_VERSION,
+            "name": "elsewhere",
+            "created_at": "2026-01-01T00:00:00Z",
+            "sections": {"skyrim-se": {"enabled_mods": ["sodium.jar"]}},
+        });
+        fs::write(
+            profiles_dir.join("elsewhere.json"),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+
+        let listing = list_profiles(&dir).unwrap();
+
+        assert!(listing.profiles.is_empty(), "it cannot be applied here");
+        let named = listing
+            .damaged
+            .iter()
+            .find(|line| line.contains("elsewhere.json"))
+            .expect("the record is named");
+        assert!(
+            named.contains("skyrim-se") && named.contains("minecraft"),
+            "{named}"
+        );
+        assert!(read_profile(&dir, "elsewhere").is_err());
     }
 }

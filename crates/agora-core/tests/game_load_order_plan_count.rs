@@ -41,6 +41,7 @@ impl GamePackage for Package {
 fn definition() -> GameDefinition {
     let plugin_list = 2u8;
     let mut def = GameDefinition {
+        snapshot: None,
         mo2_game_name: None,
         import_ids: Default::default(),
         session: Default::default(),

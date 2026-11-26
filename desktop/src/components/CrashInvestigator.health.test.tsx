@@ -165,13 +165,17 @@ function detail(overrides: { answer?: CrashAnswer; status?: string; reason?: str
   };
 }
 
-function renderDoctor(overrides: { manualLogText?: string; onOpenContent?: () => void } = {}) {
+function renderDoctor(overrides: {
+  manualLogText?: string;
+  onOpenContent?: () => void;
+  onLaunch?: () => Promise<'failed' | 'started'>;
+} = {}) {
   return render(
     <CrashInvestigator
       instanceId="inst-1"
       manualLogText={overrides.manualLogText}
       onClose={() => undefined}
-      onLaunch={async () => 'started' as never}
+      onLaunch={(overrides.onLaunch ?? (async () => 'started')) as never}
       processState={{ status: 'idle' } as never}
       onOpenContent={overrides.onOpenContent}
     />,
@@ -191,7 +195,13 @@ beforeEach(() => {
   tauriMocks.getDisablePlan.mockResolvedValue({ dependents: [] });
   tauriMocks.createSnapshot.mockResolvedValue({ id: 'snap-1' });
   tauriMocks.disableModForTest.mockResolvedValue(undefined);
-  tauriMocks.restoreSnapshot.mockResolvedValue(undefined);
+  // A restore answers with what it covered; the Doctor reads it, so the default is a real answer.
+  tauriMocks.restoreSnapshot.mockResolvedValue({
+    snapshotId: 'snap-1',
+    coverage: 'complete',
+    restoredRoots: ['mods'],
+    preservedRoots: [],
+  });
   tauriMocks.deleteSnapshot.mockResolvedValue(undefined);
   crashMocks.listCrashAnswers.mockResolvedValue({
     answers: [{
@@ -315,5 +325,26 @@ describe('Crash Doctor: the engine answer', () => {
     await waitFor(() => expect(tauriMocks.disableModForTest).toHaveBeenCalledWith('inst-1', 'example.jar'));
     expect(tauriMocks.resolveCrashSuspectFile).toHaveBeenCalledWith('inst-1', 'item:mods/example.jar:abc');
 
+  });
+});
+
+describe('Crash Doctor: putting the files back', () => {
+  it('says what the restore covered, including a folder the game no longer tracks', async () => {
+    tauriMocks.checkInstanceHealth.mockResolvedValue(report({ score: 'green' }));
+    tauriMocks.restoreSnapshot.mockResolvedValue({
+      snapshotId: 'snap-1',
+      coverage: 'complete',
+      restoredRoots: ['mods'],
+      preservedRoots: [],
+      notices: ['The folder "characters" is no longer tracked by this game; restored from the snapshot anyway.'],
+    });
+    renderDoctor({ onLaunch: async () => 'failed' });
+
+    fireEvent.click(await screen.findByRole('button', { name: /Test without Example Mod/ }));
+
+    expect(
+      await screen.findByText(/The folder "characters" is no longer tracked by this game/, {}, { timeout: 3000 }),
+    ).toBeInTheDocument();
+    expect(tauriMocks.restoreSnapshot).toHaveBeenCalledWith('inst-1', 'snap-1');
   });
 });

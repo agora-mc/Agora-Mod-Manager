@@ -156,6 +156,7 @@ pub fn game_package() -> Arc<dyn GamePackage> {
                     mo2_game_name: None,
                     import_ids: Default::default(),
                     session: Default::default(),
+                    snapshot: Some(crate::snapshot_scope::declaration()),
                     id: GameId::minecraft(),
                     extends: None,
                     name: "Minecraft: Java Edition".to_string(),

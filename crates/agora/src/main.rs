@@ -2718,13 +2718,7 @@ async fn async_main() {
             agora_core::plugins::official::RegistryTrust::production(),
             &local_state_options,
         ) {
-            Ok((ctx, warnings, report)) => (
-                ctx.with_minecraft_snapshot_entries(
-                    agora_game_minecraft::snapshot_scope::tracked_entries(),
-                ),
-                warnings,
-                report,
-            ),
+            Ok((ctx, warnings, report)) => (ctx, warnings, report),
             Err(error) => {
                 progress.log("error", &format!("Core initialization failed: {error}"));
                 eprintln!("Error initializing Agora core: {error}");
@@ -5550,6 +5544,9 @@ async fn run_snapshots_command(
                 if let Some(warning) = &outcome.cleanup_warning {
                     println!("  Note: {warning}");
                 }
+                for notice in &outcome.notices {
+                    println!("  Note: {notice}");
+                }
                 if let Some(preserved) = &outcome.preserved_recovery_dir {
                     println!("  Recovery material from an earlier interrupted restore was kept at {preserved}");
                 }
@@ -5694,6 +5691,9 @@ async fn run_snapshots_command(
                         "Restored '{}' to its last-known-good setup (undo snapshot {}).",
                         instance, outcome.undo_snapshot_id
                     );
+                    for notice in &outcome.outcome.notices {
+                        println!("  Note: {notice}");
+                    }
                 }
             } else {
                 let state = agora_core::lkg::read_lkg_state(&instance_dir)
@@ -5712,6 +5712,9 @@ async fn run_snapshots_command(
                         "Restored '{}' to its last-known-good snapshot {}.",
                         instance, snapshot_id
                     );
+                    for notice in &outcome.notices {
+                        println!("  Note: {notice}");
+                    }
                 }
             }
         }
@@ -6578,7 +6581,7 @@ async fn run_loadout_command(
                 let definition = ctx.games.game(&record.game).ok_or_else(|| {
                     anyhow::anyhow!("The definition for game '{}' is missing", record.game)
                 })?;
-                agora_core::game_loadout::create_game_profile(ctx, &instance, definition, &name)
+                agora_core::loadout::game::create_game_profile(ctx, &instance, definition, &name)
                     .map_err(|e| anyhow::anyhow!("Failed to create loadout: {e}"))?
             } else {
                 agora_core::loadout::create_profile(&instance_dir, &name)
@@ -6598,10 +6601,16 @@ async fn run_loadout_command(
             if !instance_dir.exists() {
                 anyhow::bail!("Instance '{}' not found", instance);
             }
-            let profiles = agora_core::loadout::list_profiles(&instance_dir)
+            let listing = agora_core::loadout::list_profiles(&instance_dir)
                 .map_err(|e| anyhow::anyhow!("Failed to list loadouts: {e}"))?;
+            let profiles = &listing.profiles;
             if json {
                 println!("{}", serde_json::to_string_pretty(&profiles)?);
+                // Machine output stays an array of profiles; the records that could not be read go
+                // to stderr so a script's stdout stays parseable and a person still sees them.
+                for damaged in &listing.damaged {
+                    eprintln!("Unreadable loadout record: {damaged}");
+                }
             } else {
                 let manifest = agora_core::game_instance::get_manifest(ctx, &instance).ok();
                 let definition = manifest
@@ -6653,6 +6662,10 @@ async fn run_loadout_command(
                     })
                     .collect();
                 print_table(&["Name", "Created", "Entries", "Saves"], &rows);
+                // A record that cannot be read is named, never silently left out of the list.
+                for damaged in &listing.damaged {
+                    println!("  Unreadable: {damaged}");
+                }
             }
         }
         LoadoutCmd::Apply {
@@ -6672,7 +6685,7 @@ async fn run_loadout_command(
                 let definition = ctx.games.game(&record.game).ok_or_else(|| {
                     anyhow::anyhow!("The definition for game '{}' is missing", record.game)
                 })?;
-                agora_core::game_loadout::apply_game_profile_with_undo(
+                agora_core::loadout::game::apply_game_profile_with_undo(
                     ctx,
                     &instance,
                     definition,
@@ -6741,7 +6754,7 @@ async fn run_loadout_command(
             };
             let service = agora_game_minecraft::loadout_service::LoadoutService::new(ctx.clone());
             let preview = match game_definition {
-                Some(definition) => agora_core::game_loadout::plan_game_profile_update(
+                Some(definition) => agora_core::loadout::game::plan_game_profile_update(
                     ctx, &instance, definition, &name,
                 )
                 .map_err(|e| anyhow::anyhow!("Failed to read the loadout: {e}"))?,
@@ -6770,7 +6783,7 @@ async fn run_loadout_command(
                 }
             } else {
                 let done = match game_definition {
-                    Some(definition) => agora_core::game_loadout::update_game_profile(
+                    Some(definition) => agora_core::loadout::game::update_game_profile(
                         ctx, &instance, definition, &name,
                     )
                     .map_err(|e| anyhow::anyhow!("Failed to update the loadout: {e}"))?,
@@ -18671,9 +18684,6 @@ mod tests {
         let mut games = agora_core::game_registry::GameRegistry::builder();
         agora_game_minecraft::register_into(&mut games).unwrap();
         let (ctx, _) = agora_core::ctx::CoreContext::initialize(paths.clone(), games).unwrap();
-        let ctx = ctx.with_minecraft_snapshot_entries(
-            agora_game_minecraft::snapshot_scope::tracked_entries(),
-        );
         let progress = super::CliProgressSink::new(&root.join("cli.log"), false).unwrap();
 
         let entry_id = "20200101T000000Z-test";

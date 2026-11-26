@@ -787,7 +787,9 @@ export interface RecentlyDeletedEntry {
   expires_at: string;
   size_bytes: number;
 }
-export interface RestoreOutcome {
+/** What restoring an instance from Recently deleted did: its row, and whether the name had to
+ *  change to avoid colliding with a live instance. */
+export interface RestoreDeletedInstanceOutcome {
   instance_id: string;
   original_instance_id: string;
   renamed: boolean;
@@ -795,7 +797,7 @@ export interface RestoreOutcome {
 export const listRecentlyDeleted = () =>
   invoke<RecentlyDeletedEntry[]>('list_recently_deleted');
 export const restoreDeletedInstance = (entryId: string) =>
-  invoke<RestoreOutcome>('restore_deleted_instance', { entryId });
+  invoke<RestoreDeletedInstanceOutcome>('restore_deleted_instance', { entryId });
 export const purgeDeletedInstance = (entryId: string) =>
   invoke<void>('purge_deleted_instance', { entryId });
 export const unlockInstance = (instanceId: string) =>
@@ -2668,6 +2670,12 @@ export interface RestoreOutcome {
   cleanupWarning?: string;
   preservedRecoveryDir?: string;
   undoSnapshotId?: string;
+  /**
+   * What the person restoring should know about what it did, in words they can read. A folder the
+   * snapshot captured but the game no longer declares is restored anyway and named here, so it is
+   * never restored quietly.
+   */
+  notices?: string[];
 }
 
 export const restoreSnapshot = (
@@ -2693,6 +2701,9 @@ export const describeRestoreCoverage = (outcome: RestoreOutcome): string | null 
   }
   if (outcome.cleanupWarning) {
     notes.push(outcome.cleanupWarning);
+  }
+  for (const notice of outcome.notices ?? []) {
+    notes.push(notice);
   }
   return notes.length > 0 ? notes.join(' ') : null;
 };
@@ -3214,8 +3225,15 @@ export interface TemplateApplyOutcome {
 export const applyInstanceTemplate = (instanceId: string, templateId: string) =>
   invoke<TemplateApplyOutcome>('apply_instance_template', { instanceId, templateId });
 
+/** The loadouts an instance has, and the records that could not be read. */
+export interface LoadoutListing {
+  profiles: LoadoutProfile[];
+  /** One line per record that could not be read, naming the file and what is wrong with it. */
+  damaged: string[];
+}
+
 export const listLoadoutProfiles = (instanceId: string) =>
-  invoke<LoadoutProfile[]>('list_loadout_profiles', { instanceId });
+  invoke<LoadoutListing>('list_loadout_profiles', { instanceId });
 
 export const createLoadoutProfile = (instanceId: string, name: string) =>
   invoke<LoadoutProfile>('create_loadout_profile', { instanceId, name });

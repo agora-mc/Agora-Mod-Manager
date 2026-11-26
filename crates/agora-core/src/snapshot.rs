@@ -452,6 +452,11 @@ pub struct RestoreOutcome {
     /// takes one), so the restore itself can be undone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undo_snapshot_id: Option<String>,
+    /// Things the person restoring should know about what the restore did, in words they can read.
+    /// A folder the snapshot covers but the game no longer declares is restored anyway and named
+    /// here (MASTER_SPEC §32.7), never restored quietly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1401,7 +1406,7 @@ pub fn create_snapshot_full(
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         snapshot: snapshot.clone(),
         files,
-        scope: Some(capture_root_states(instance_dir, entries)),
+        scope: Some(capture_root_states(instance_dir, entries)?),
         content_refs: aux.content_refs.clone(),
         state: aux.state.clone(),
     };
@@ -1480,12 +1485,18 @@ fn store_snapshot_object_bytes(instance_dir: &Path, bytes: &[u8]) -> Result<(Str
 /// (Cyberpunk's `mods/modlist.txt`), so capturing its folder would also copy
 /// mod bytes. The contents land in the same object store and manifest a walked
 /// snapshot uses.
+///
+/// `folders` names the scope entries that are folders (the folders the game's package declares,
+/// plus the shared loadout store). Every other captured path is recorded as the file it is, so a
+/// snapshot of `user/Plugins.txt` records that file and not the folder `user` around it: a restore
+/// of a folder owns everything in it, including files the game never declared (MASTER_SPEC §32.7).
 pub fn create_snapshot_from_data(
     instance_dir: &Path,
     label: Option<&str>,
     files: &[SnapshotInputFile],
     origin: SnapshotOrigin,
     aux: &SnapshotAux,
+    folders: &[&str],
 ) -> Result<Snapshot, String> {
     let id = uuid::Uuid::new_v4().to_string();
     fs::create_dir_all(snapshots_dir(instance_dir))
@@ -1499,25 +1510,23 @@ pub fn create_snapshot_from_data(
         std::collections::BTreeMap::new();
     for file in files {
         validate_relative_path(&file.relative_path)?;
-        let root = file
+        let first = file
             .relative_path
             .split('/')
             .next()
             .unwrap_or_default()
             .to_string();
-        let has_child = file.relative_path.contains('/');
-        roots
-            .entry(root)
-            .and_modify(|state| {
-                if has_child {
-                    *state = RootState::Directory;
-                }
-            })
-            .or_insert(if has_child {
-                RootState::Directory
-            } else {
-                RootState::File
-            });
+        // What the snapshot recorded is what it captured: a declared folder as that folder, and a
+        // mapped file as the file itself. Recording `user` for a captured `user/Plugins.txt` would
+        // claim a folder the game never declared, and everything else in it becomes something the
+        // restore — and its undo — own. `folders` are the declarations, so a plain comparison of
+        // the first component is exact enough: the same definition supplies both strings.
+        let (name, state) = if folders.iter().any(|folder| *folder == first) {
+            (first, RootState::Directory)
+        } else {
+            (file.relative_path.clone(), RootState::File)
+        };
+        roots.entry(name).or_insert(state);
         match &file.contents {
             Some(bytes) => {
                 let (hash, size) = store_snapshot_object_bytes(instance_dir, bytes)?;
@@ -1570,14 +1579,30 @@ pub fn create_snapshot_from_data(
 /// Restore a snapshot created by [`create_snapshot_from_data`]: verify every
 /// blob first, then write each declared file atomically. A file the snapshot
 /// recorded as absent is removed.
+///
+/// This is the data-snapshot mechanism and it stays file-level on purpose: a generic game's state
+/// files live beside content, so the files of a declared folder are restored one by one and a file
+/// created since the capture is left alone. Whole-root snapshots go through
+/// [`restore_snapshot`], which replaces whole folders (MASTER_SPEC §32.7).
 pub fn restore_snapshot_data(
     instance_dir: &Path,
     snapshot_id: &str,
 ) -> Result<Vec<String>, String> {
     validate_snapshot_id(snapshot_id)?;
     let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
-    if !manifest_path.is_file() {
-        return Err(format!("snapshot {snapshot_id} is not a data snapshot"));
+    // Fail closed (§32.13): only "the operating system said not found" means this is not a data
+    // snapshot. A path that cannot be examined is its own error.
+    match agora_game_api::probe(&manifest_path) {
+        agora_game_api::Probe::Present(_) => {}
+        agora_game_api::Probe::Absent => {
+            return Err(format!("snapshot {snapshot_id} is not a data snapshot"))
+        }
+        agora_game_api::Probe::CantTell(error) => {
+            return Err(format!(
+                "cannot tell what is at {}, so this snapshot cannot be restored: {error}",
+                manifest_path.display()
+            ))
+        }
     }
     let manifest = read_manifest_file(&manifest_path, snapshot_id)?;
     let mut staged: Vec<(&SnapshotFileEntry, Vec<u8>)> = Vec::new();
@@ -1620,7 +1645,10 @@ pub fn restore_snapshot_data(
 
     let mut restored = Vec::with_capacity(manifest.files.len());
     for (entry, bytes) in staged {
-        let live = instance_dir.join(Path::new(&entry.relative_path));
+        // The write goes through the strict path rules: a folder on the way that a link has
+        // replaced since the capture refuses the write instead of landing outside the instance
+        // (MASTER_SPEC §32.3, §32.7).
+        let live = live_target(instance_dir, &entry.relative_path)?;
         if let Some(parent) = live.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
@@ -1632,20 +1660,22 @@ pub fn restore_snapshot_data(
         if !entry.absent {
             continue;
         }
-        let live = instance_dir.join(Path::new(&entry.relative_path));
-        match fs::symlink_metadata(&live) {
-            Ok(metadata) if metadata.is_dir() => {
+        let live = live_target(instance_dir, &entry.relative_path)?;
+        // Fail closed (§32.13): only "the operating system said not found" means there is nothing
+        // to remove. A path that cannot be examined is its own error.
+        match agora_game_api::probe(&live) {
+            agora_game_api::Probe::Present(agora_game_api::PresentKind::Directory) => {
                 return Err(format!(
                     "snapshot says {} was absent, but a folder is there",
                     entry.relative_path
                 ))
             }
-            Ok(_) => {
+            agora_game_api::Probe::Present(_) => {
                 fs::remove_file(&live)
                     .map_err(|e| format!("failed to remove {}: {e}", entry.relative_path))?;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
+            agora_game_api::Probe::Absent => {}
+            agora_game_api::Probe::CantTell(error) => {
                 return Err(format!(
                     "failed to inspect {} while restoring: {error}",
                     entry.relative_path
@@ -1655,6 +1685,20 @@ pub fn restore_snapshot_data(
         restored.push(entry.relative_path.clone());
     }
     Ok(restored)
+}
+
+/// Where a snapshot path belongs in the instance, checked against the strict path rules so a link
+/// standing in for a folder on the way cannot take the write outside.
+fn live_target(instance_dir: &Path, relative_path: &str) -> Result<PathBuf, String> {
+    let strict =
+        agora_game_api::StrictRelPath::new(relative_path.to_string()).map_err(|error| {
+            format!(
+                "the snapshot records '{relative_path}', which cannot be written: {}",
+                error.reason
+            )
+        })?;
+    agora_game_api::join_under(instance_dir, &strict)
+        .map_err(|error| format!("refusing to restore '{relative_path}': {error}"))
 }
 
 fn store_snapshot_object(instance_dir: &Path, source: &Path) -> Result<(String, u64), String> {
@@ -1867,22 +1911,64 @@ pub fn restore_snapshot(
 /// will replace — copying worlds to undo a configuration-only restore is pure
 /// cost — and to tell the user what the restore can and cannot promise.
 pub fn restore_scope(instance_dir: &Path, snapshot_id: &str) -> Result<Vec<String>, String> {
+    Ok(restore_scope_entries(instance_dir, snapshot_id)?
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect())
+}
+
+/// [`restore_scope`] with what each entry is: a folder the game declares, or a file it maps.
+///
+/// The difference is what the notice needs — a recorded folder the game dropped and a recorded
+/// file it dropped are told apart, and named as what they are (MASTER_SPEC §32.7).
+pub fn restore_scope_entries(
+    instance_dir: &Path,
+    snapshot_id: &str,
+) -> Result<Vec<SnapshotRoot>, String> {
     validate_snapshot_id(snapshot_id)?;
     let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
-    let manifest = if manifest_path.is_file() {
-        read_manifest_file(&manifest_path, snapshot_id)?
-    } else {
-        let file = fs::File::open(snapshot_zip_path(instance_dir, snapshot_id))
-            .map_err(|e| format!("failed to open snapshot zip: {e}"))?;
-        let mut archive =
-            zip::ZipArchive::new(file).map_err(|e| format!("failed to read snapshot zip: {e}"))?;
-        read_manifest(&mut archive, snapshot_id)?
+    // Fail closed (§32.13): only "the operating system said not found" means this snapshot predates
+    // manifests. A path that cannot be examined is its own error, not a fall back to the archive.
+    let manifest = match agora_game_api::probe(&manifest_path) {
+        agora_game_api::Probe::Present(_) => read_manifest_file(&manifest_path, snapshot_id)?,
+        agora_game_api::Probe::Absent => {
+            let file = fs::File::open(snapshot_zip_path(instance_dir, snapshot_id))
+                .map_err(|e| format!("failed to open snapshot zip: {e}"))?;
+            let mut archive = zip::ZipArchive::new(file)
+                .map_err(|e| format!("failed to read snapshot zip: {e}"))?;
+            read_manifest(&mut archive, snapshot_id)?
+        }
+        agora_game_api::Probe::CantTell(error) => {
+            return Err(format!(
+                "cannot tell what is at {}, so this snapshot's scope cannot be read: {error}",
+                manifest_path.display()
+            ))
+        }
     };
-    Ok(resolve_restore_coverage(&manifest)?
-        .roots()
-        .iter()
-        .map(|root| root.name.clone())
-        .collect())
+    Ok(resolve_restore_coverage(&manifest)?.roots().to_vec())
+}
+
+/// The sentence that tells the user a restore put back state the game no longer declares.
+///
+/// The comparison is the scope question, so a recorded folder is owned by a declaration that is it
+/// or holds it, and a recorded file by a declaration that names it or names the folder it lives in.
+/// `None` means the declaration in force still owns it, or holds something inside it.
+pub(crate) fn untracked_notice(
+    declared: &[&str],
+    entry: &SnapshotRoot,
+    game: &str,
+) -> Option<String> {
+    if scope_contains(declared, &entry.name) {
+        return None;
+    }
+    let what = match entry.state {
+        RootState::Directory => "folder",
+        RootState::File | RootState::Absent => "file",
+    };
+    Some(format!(
+        "{what} '{}' is no longer tracked by {game}; restored from the snapshot anyway",
+        entry.name
+    ))
 }
 
 fn restore_snapshot_impl(
@@ -1895,7 +1981,22 @@ fn restore_snapshot_impl(
     let preserved_recovery_dir = recover_interrupted_restore(instance_dir)?;
     let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
     let zip_path = snapshot_zip_path(instance_dir, snapshot_id);
-    if !manifest_path.exists() && !zip_path.exists() {
+    // Fail closed (§32.13): only "the operating system said not found" means this snapshot is not
+    // there. An unreadable location is its own answer, never "nothing found".
+    let mut found = false;
+    for path in [&manifest_path, &zip_path] {
+        match agora_game_api::probe(path) {
+            agora_game_api::Probe::Present(_) => found = true,
+            agora_game_api::Probe::Absent => {}
+            agora_game_api::Probe::CantTell(error) => {
+                return Err(format!(
+                "cannot tell what is at {}, so snapshot {snapshot_id} cannot be checked: {error}",
+                path.display()
+            ))
+            }
+        }
+    }
+    if !found {
         return Err(format!("snapshot {snapshot_id} not found"));
     }
 
@@ -1921,6 +2022,18 @@ fn restore_snapshot_impl(
         }
     };
 
+    // A manifest that records a file by path is a data snapshot (generic games). It is restored
+    // file by file, on purpose: restoring it as whole folders would replace folders it does not
+    // own. Refuse here rather than move a folder the snapshot never covered.
+    if let Some(entry) = coverage.roots().iter().find(|root| root.name.contains('/')) {
+        let _ = fs::remove_dir_all(&extract_dir);
+        return Err(format!(
+            "snapshot {snapshot_id} records the file '{}', so it is restored file by file, not as \
+             whole folders",
+            entry.name
+        ));
+    }
+
     let covered: Vec<String> = coverage
         .roots()
         .iter()
@@ -1929,13 +2042,24 @@ fn restore_snapshot_impl(
     let original = capture_root_states(
         instance_dir,
         &covered.iter().map(String::as_str).collect::<Vec<_>>(),
-    );
+    )?;
 
     let pre_dir = pre_restore_dir(instance_dir);
-    if pre_dir.exists() {
+    // Fail closed (§32.13): a backup folder that cannot be examined is reported, not treated as
+    // absent — the material in it may be the only copy of what a previous restore moved aside.
+    match agora_game_api::probe(&pre_dir) {
         // recover_interrupted_restore has already dealt with any recognised
         // recovery material, so anything still here is unaccounted for.
-        preserve_orphaned_recovery_dir(instance_dir, &pre_dir)?;
+        agora_game_api::Probe::Present(_) => {
+            preserve_orphaned_recovery_dir(instance_dir, &pre_dir)?;
+        }
+        agora_game_api::Probe::Absent => {}
+        agora_game_api::Probe::CantTell(error) => {
+            return Err(format!(
+                "cannot tell what is at {}, so this restore will not start over it: {error}",
+                pre_dir.display()
+            ))
+        }
     }
     fs::create_dir_all(&pre_dir).map_err(|e| format!("failed to create pre-restore dir: {e}"))?;
 
@@ -1954,11 +2078,35 @@ fn restore_snapshot_impl(
     fs::write(&marker_path, restore_id.as_bytes())
         .map_err(|e| format!("failed to write restore marker: {e}"))?;
 
+    // Every root the snapshot covers is replaced the same way — moved aside, then the captured
+    // root promoted in its place — whatever the game declares today. A folder the game no longer
+    // tracks belongs to the snapshot that captured it (MASTER_SPEC §32.7); giving it a second,
+    // file-by-file restore is what left it half restored after an interruption, and what left a
+    // failed pack update's files behind. What a restore may touch is the snapshot's recorded scope,
+    // not the declaration in force, which only governs future captures.
     let staged_roots = snapshot_roots(&manifest);
     let mut moved_current = Vec::new();
     for entry_name in &covered {
         let src = instance_dir.join(entry_name);
-        if fs::symlink_metadata(&src).is_ok() {
+        // Whether the root is there decides whether it is moved aside; "I could not look" is not
+        // "it is not there" (§32.13), so an unreadable one stops the restore before anything moves.
+        let present = match agora_game_api::probe(&src) {
+            agora_game_api::Probe::Present(_) => true,
+            agora_game_api::Probe::Absent => false,
+            agora_game_api::Probe::CantTell(error) => {
+                let rollback =
+                    rollback_restore(instance_dir, &pre_dir, &[], &moved_current, &restore_id);
+                let _ = fs::remove_dir_all(&extract_dir);
+                clear_journal_unless_failed(instance_dir, &rollback);
+                return Err(combine_restore_error(
+                    format!(
+                        "cannot tell whether {entry_name} is there, so it was not replaced: {error}"
+                    ),
+                    rollback,
+                ));
+            }
+        };
+        if present {
             let dst = pre_dir.join(entry_name);
             if let Some(parent) = dst.parent() {
                 fs::create_dir_all(parent).map_err(|e| format!("failed to create parent: {e}"))?;
@@ -1967,7 +2115,7 @@ fn restore_snapshot_impl(
                 let rollback =
                     rollback_restore(instance_dir, &pre_dir, &[], &moved_current, &restore_id);
                 let _ = fs::remove_dir_all(&extract_dir);
-                let _ = fs::remove_file(restore_journal_path(instance_dir));
+                clear_journal_unless_failed(instance_dir, &rollback);
                 return Err(combine_restore_error(
                     format!("failed to move current {entry_name} into backup: {error}"),
                     rollback,
@@ -2001,7 +2149,7 @@ fn restore_snapshot_impl(
                 &restore_id,
             );
             let _ = fs::remove_dir_all(&extract_dir);
-            let _ = fs::remove_file(restore_journal_path(instance_dir));
+            clear_journal_unless_failed(instance_dir, &rollback);
             return Err(combine_restore_error(
                 format!("failed to promote restored {entry_name}: {error}"),
                 rollback,
@@ -2048,6 +2196,7 @@ fn restore_snapshot_impl(
         cleanup_warning,
         preserved_recovery_dir: preserved_recovery_dir.map(|path| path.display().to_string()),
         undo_snapshot_id: None,
+        notices: Vec::new(),
     })
 }
 
@@ -2135,17 +2284,32 @@ fn recover_interrupted_restore(instance_dir: &Path) -> Result<Option<PathBuf>, S
         .iter()
         .filter(|root| {
             root.state == RootState::Absent
-                && fs::symlink_metadata(instance_dir.join(&root.name)).is_ok()
+                // "Not found" is the only answer that means the root is not there to undo. An
+                // unreadable one is treated as present, so rollback reports it rather than
+                // silently leaving a promoted root in place (§32.13).
+                && !agora_game_api::probe(instance_dir.join(&root.name)).is_absent()
         })
         .map(|root| root.name.clone())
         .collect();
-    let backed_up: Vec<String> = journal
+    let mut backed_up: Vec<String> = Vec::new();
+    for root in journal
         .original
         .iter()
         .filter(|root| root.state != RootState::Absent)
-        .map(|root| root.name.clone())
-        .filter(|name| pre_dir.join(name).exists())
-        .collect();
+    {
+        match agora_game_api::probe(pre_dir.join(&root.name)) {
+            agora_game_api::Probe::Present(_) => backed_up.push(root.name.clone()),
+            // A root with no backup had not moved when the process stopped; nothing to put back.
+            agora_game_api::Probe::Absent => {}
+            agora_game_api::Probe::CantTell(error) => {
+                return Err(format!(
+                    "cannot tell whether the backup of '{}' is there, so the interrupted restore \
+                     is not undone automatically: {error}",
+                    root.name
+                ))
+            }
+        }
+    }
     let mut displace = promoted;
     displace.extend(backed_up.iter().cloned());
 
@@ -2435,6 +2599,26 @@ pub(crate) fn validate_snapshot_id(snapshot_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether a declared folder (or mapped file) is `path` or holds it, comparing component by
+/// component with the platform's case rule (MASTER_SPEC §32.3).
+///
+/// This is the question a restore asks about a recorded scope entry: a declaration of `state/config`
+/// covers `state/config/a.toml` and the entry `state/config`, a declaration of `characters` covers
+/// the entry `characters` and every file under it — and a declaration of `user/Plugins.txt` covers
+/// that file, never the folder `user` around it (MASTER_SPEC §32.7).
+pub(crate) fn scope_contains(declared: &[&str], path: &str) -> bool {
+    declared.iter().any(|folder| {
+        agora_game_api::same_spelling(Path::new(folder), Path::new(path))
+            || is_under(Path::new(path), Path::new(folder))
+    })
+}
+
+/// Whether `path` is inside `folder` (strictly, not equal): the game contract's comparison, so the
+/// path rules have one home (MASTER_SPEC §32.3).
+fn is_under(path: &Path, folder: &Path) -> bool {
+    agora_game_api::is_inside(path, folder)
+}
+
 fn snapshot_roots(manifest: &SnapshotManifest) -> HashSet<&str> {
     manifest
         .files
@@ -2510,22 +2694,45 @@ fn write_root(relative: &str) -> Result<String, String> {
 /// Record the live state of each scope root at capture time.
 ///
 /// Uses `symlink_metadata` so a link is classified as what it is rather than
-/// as whatever it points at.
-fn capture_root_states(instance_dir: &Path, entries: &[&str]) -> Vec<SnapshotRoot> {
-    entries
-        .iter()
-        .map(|name| {
-            let state = match fs::symlink_metadata(instance_dir.join(name)) {
-                Ok(metadata) if metadata.is_dir() => RootState::Directory,
-                Ok(_) => RootState::File,
-                Err(_) => RootState::Absent,
-            };
-            SnapshotRoot {
-                name: (*name).to_string(),
-                state,
+/// as whatever it points at. The lookup is injected so a failing one can be exercised (see
+/// [`capture_root_states`]).
+///
+/// A root that cannot be examined is cannot-tell, not absent (§32.13). What this records decides
+/// whether a restore moves the root aside and whether an interruption removes it, so "I could not
+/// look" must never become "it is not there".
+fn capture_root_states_with(
+    instance_dir: &Path,
+    entries: &[&str],
+    metadata: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<Vec<SnapshotRoot>, String> {
+    let mut states = Vec::with_capacity(entries.len());
+    for name in entries {
+        let root = instance_dir.join(name);
+        // The injected lookup answers "is it there, and what is it"; a result that says "there is
+        // something but I will not describe it" is the only case left over, and it is cannot-tell.
+        let state = match metadata(&root) {
+            Ok(metadata) if metadata.is_dir() => RootState::Directory,
+            Ok(_) => RootState::File,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => RootState::Absent,
+            Err(error) => {
+                return Err(format!(
+                    "cannot tell whether '{}' is there, so this snapshot cannot record what it \
+                     owns: {error}",
+                    root.display()
+                ))
             }
-        })
-        .collect()
+        };
+        states.push(SnapshotRoot {
+            name: (*name).to_string(),
+            state,
+        });
+    }
+    Ok(states)
+}
+
+/// [`capture_root_states_with`] against the live filesystem.
+fn capture_root_states(instance_dir: &Path, entries: &[&str]) -> Result<Vec<SnapshotRoot>, String> {
+    capture_root_states_with(instance_dir, entries, |path| fs::symlink_metadata(path))
 }
 
 /// Decide which roots this snapshot may replace.
@@ -2538,7 +2745,19 @@ fn capture_root_states(instance_dir: &Path, entries: &[&str]) -> Vec<SnapshotRoo
 fn resolve_restore_coverage(manifest: &SnapshotManifest) -> Result<RestoreCoverage, String> {
     if let Some(scope) = &manifest.scope {
         for root in scope {
-            validate_scope_root(&root.name)?;
+            // A scope entry is a folder the game declares or a file its definition maps, and a
+            // nested entry is always the file (MASTER_SPEC §32.7).
+            if root.name.contains('/') {
+                validate_relative_path(&root.name)?;
+                if root.state != RootState::File {
+                    return Err(format!(
+                        "snapshot scope records '{}' as a folder, but a nested entry is a file",
+                        root.name
+                    ));
+                }
+            } else {
+                validate_scope_root(&root.name)?;
+            }
         }
         let mut seen = HashSet::new();
         for root in scope {
@@ -2546,11 +2765,13 @@ fn resolve_restore_coverage(manifest: &SnapshotManifest) -> Result<RestoreCovera
                 return Err(format!("snapshot scope lists {} twice", root.name));
             }
         }
-        // Every recorded file must live inside a covered root, or the manifest
-        // is internally inconsistent and must not be applied.
+        // Every recorded file must be inside a covered entry — a folder that holds it, or the file
+        // itself — or the manifest is internally inconsistent and must not be applied.
         for entry in &manifest.files {
-            let root = entry.relative_path.split('/').next().unwrap_or_default();
-            if !seen.contains(root) {
+            let covered = scope
+                .iter()
+                .any(|root| scope_contains(&[root.name.as_str()], &entry.relative_path));
+            if !covered {
                 return Err(format!(
                     "snapshot contains {} which is outside its recorded scope",
                     entry.relative_path
@@ -2591,7 +2812,11 @@ fn resolve_restore_coverage(manifest: &SnapshotManifest) -> Result<RestoreCovera
     Ok(RestoreCoverage::LegacyPartial(roots))
 }
 
-const RESTORE_JOURNAL_SCHEMA_VERSION: u32 = 1;
+/// Version 2 dropped the file-by-file retired-root fields: a journal from version 1 named roots
+/// whose rollback is now a root rename, so its `original`/`target` no longer describe what recovery
+/// would do. A version 1 journal is therefore not interpreted at all — it is refused and preserved
+/// like a pre-journal marker, instead of being replayed under rules it was not written for.
+const RESTORE_JOURNAL_SCHEMA_VERSION: u32 = 2;
 
 fn restore_journal_path(instance_dir: &Path) -> PathBuf {
     instance_dir.join(".agora_restore_journal.json")
@@ -2693,36 +2918,66 @@ fn rollback_restore(
     let mut errors = Vec::new();
     for entry_name in promoted.iter().rev() {
         let live = instance_dir.join(entry_name);
-        if live.exists() {
-            let displaced = failed_dir.join(entry_name);
-            if let Some(parent) = displaced.parent() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    errors.push(format!(
-                        "could not prepare displacement for {entry_name}: {e}"
-                    ));
-                    continue;
-                }
-            }
-            if let Err(e) = fs::rename(&live, &displaced) {
+        // Fail closed: only "not found" means there is nothing to displace (§32.13).
+        match agora_game_api::probe(&live) {
+            agora_game_api::Probe::Absent => continue,
+            agora_game_api::Probe::CantTell(error) => {
                 errors.push(format!(
-                    "could not displace partial restore {entry_name}: {e}"
+                    "cannot tell whether the partial restore of {entry_name} is there: {error}"
                 ));
+                continue;
             }
+            agora_game_api::Probe::Present(_) => {}
+        }
+        let displaced = failed_dir.join(entry_name);
+        if let Some(parent) = displaced.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                errors.push(format!(
+                    "could not prepare displacement for {entry_name}: {e}"
+                ));
+                continue;
+            }
+        }
+        if let Err(e) = fs::rename(&live, &displaced) {
+            errors.push(format!(
+                "could not displace partial restore {entry_name}: {e}"
+            ));
         }
     }
 
     for entry_name in moved_current.iter().rev() {
         let backup = pre_dir.join(entry_name);
         let live = instance_dir.join(entry_name);
-        if !backup.exists() {
-            errors.push(format!("rollback backup is missing for {entry_name}"));
-            continue;
+        // A backup that is a link is present as a link: `exists()` follows it, and a folder the
+        // person replaced with a link to a path that no longer exists would read as missing — the
+        // rollback would report failure and leave the link in the backup folder (§32.13).
+        match agora_game_api::probe(&backup) {
+            agora_game_api::Probe::Present(_) => {}
+            agora_game_api::Probe::Absent => {
+                errors.push(format!("rollback backup is missing for {entry_name}"));
+                continue;
+            }
+            agora_game_api::Probe::CantTell(error) => {
+                errors.push(format!(
+                    "cannot tell whether the rollback backup of {entry_name} is there: {error}"
+                ));
+                continue;
+            }
         }
-        if live.exists() {
-            errors.push(format!(
-                "rollback destination still exists for {entry_name}"
-            ));
-            continue;
+        match agora_game_api::probe(&live) {
+            agora_game_api::Probe::Absent => {}
+            agora_game_api::Probe::Present(_) => {
+                errors.push(format!(
+                    "rollback destination still exists for {entry_name}"
+                ));
+                continue;
+            }
+            agora_game_api::Probe::CantTell(error) => {
+                errors.push(format!(
+                    "cannot tell whether {entry_name} is still there to be replaced back: {error}"
+                ));
+                continue;
+            }
         }
         if let Err(e) = fs::rename(&backup, &live) {
             errors.push(format!("could not restore original {entry_name}: {e}"));
@@ -2748,6 +3003,17 @@ fn combine_restore_error(primary: String, rollback: Result<(), String>) -> Strin
     match rollback {
         Ok(()) => format!("{primary}; original instance state was restored"),
         Err(rollback_error) => format!("{primary}; {rollback_error}"),
+    }
+}
+
+/// Clear the restore journal once the transaction is over without leaving work behind.
+///
+/// A rollback that could not finish keeps it: the journal names the pre-restore state, so recovery
+/// — or the person, with the paths the error printed — can still act on what is left (MASTER_SPEC
+/// §32.11). Removing it would make the failed transaction look like one that never started.
+fn clear_journal_unless_failed(instance_dir: &Path, rollback: &Result<(), String>) {
+    if rollback.is_ok() {
+        let _ = fs::remove_file(restore_journal_path(instance_dir));
     }
 }
 
@@ -4005,8 +4271,208 @@ mod tests {
         assert!(!inst.join(RESTORE_MARKER).exists());
     }
 
+    /// A rollback that could not finish leaves the journal in place.
+    ///
+    /// Recovery is the only thing that knows what the instance looked like before the interrupted
+    /// restore; removing its record when the rollback fails would leave a mixed instance with
+    /// nothing naming the state it should go back to (MASTER_SPEC §32.11).
     #[test]
-    fn interrupted_restore_is_recovered_before_a_new_attempt() {
+    fn a_failed_rollback_keeps_the_journal() {
+        let tmp = TempDir::new().unwrap();
+        let inst = make_instance(&tmp);
+        let pre = pre_restore_dir(&inst);
+        fs::create_dir_all(pre.join("characters")).unwrap();
+        fs::write(pre.join("characters").join("hero.sav"), b"level 1").unwrap();
+        fs::create_dir_all(inst.join("characters")).unwrap();
+        fs::write(inst.join("characters").join("hero.sav"), b"partial").unwrap();
+        fs::write(inst.join(RESTORE_MARKER), b"interrupted").unwrap();
+        // A leftover file where the rollback needs its displacement folder, so the rollback cannot
+        // even start: the recovery has to report that and leave its record alone.
+        fs::write(
+            inst.join(".agora_failed_restore_interrupted-interrupted"),
+            b"in the way",
+        )
+        .unwrap();
+        RestoreJournal {
+            schema_version: RESTORE_JOURNAL_SCHEMA_VERSION,
+            restore_id: "interrupted".into(),
+            snapshot_id: "whatever".into(),
+            original: vec![SnapshotRoot {
+                name: "characters".into(),
+                state: RootState::Directory,
+            }],
+            target: vec![SnapshotRoot {
+                name: "characters".into(),
+                state: RootState::Directory,
+            }],
+            committed: false,
+        }
+        .write(&inst)
+        .unwrap();
+
+        let error = restore_snapshot(&inst, "missing-snapshot").unwrap_err();
+
+        assert!(
+            error.contains("rollback"),
+            "the recovery says what it could not do: {error}"
+        );
+        assert!(
+            restore_journal_path(&inst).exists(),
+            "the journal is still there to recover from"
+        );
+    }
+
+    /// A backup that is a link is seen as a link.
+    ///
+    /// A folder replaced by a link to a path that no longer exists is still a folder standing in the
+    /// instance, and it is what a rollback has to put back. `exists()` follows the link, answers
+    /// "no such thing", and leaves the link in the backup folder behind a failed rollback
+    /// (MASTER_SPEC §32.13).
+    #[cfg(windows)]
+    #[test]
+    fn a_rollback_puts_back_a_dangling_link_as_a_link() {
+        use std::process::Command;
+
+        let tmp = TempDir::new().unwrap();
+        let inst = make_instance(&tmp);
+        fs::create_dir_all(inst.join("characters")).unwrap();
+        fs::write(inst.join("characters").join("hero.sav"), b"level 1").unwrap();
+        let snapshot = create_snapshot_scoped(
+            &inst,
+            Some("captured characters"),
+            &["characters", "mods", "config"],
+        )
+        .unwrap();
+
+        // The folder is now a junction to a place that does not exist.
+        fs::remove_dir_all(inst.join("characters")).unwrap();
+        let gone = tmp.path().join("gone");
+        let link = inst.join("characters");
+        let status = Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&link)
+            .arg(&gone)
+            .status()
+            .unwrap();
+        assert!(status.success(), "the junction was not created");
+        assert!(
+            matches!(
+                agora_game_api::probe(&link),
+                agora_game_api::Probe::Present(agora_game_api::PresentKind::Symlink)
+            ),
+            "the fixture is a link that is there"
+        );
+
+        let error = restore_snapshot_impl(&inst, &snapshot.id, Some(0)).unwrap_err();
+
+        assert!(
+            error.contains("original instance state was restored"),
+            "the rollback put the folder back: {error}"
+        );
+        assert!(
+            matches!(
+                agora_game_api::probe(&link),
+                agora_game_api::Probe::Present(agora_game_api::PresentKind::Symlink)
+            ),
+            "the link is back where it was"
+        );
+        assert!(
+            !restore_journal_path(&inst).exists(),
+            "and the journal is only kept when a rollback could not finish"
+        );
+    }
+
+    /// A folder the game no longer declares is restored by the same wholesale mechanism as any
+    /// tracked one, so a failure at any promotion step is rolled back through the journal instead
+    /// of leaving the folder half restored (MASTER_SPEC §32.7).
+    #[test]
+    fn an_interrupted_restore_of_a_retired_folder_rolls_back_at_every_step() {
+        // `characters` is first so the injected failure reaches it before any tracked root: the
+        // retired root's restore has no step of its own to interrupt. Every entry holds a file, so
+        // each one is a promotion step that can be made to fail.
+        const CAPTURED: &[&str] = &["characters", "mods", "config", "options.txt"];
+        for step in 0..CAPTURED.len() {
+            let tmp = TempDir::new().unwrap();
+            let inst = make_instance(&tmp);
+            fs::create_dir_all(inst.join("characters")).unwrap();
+            fs::write(inst.join("characters").join("hero.sav"), b"level 1").unwrap();
+            // Captured while `characters` was part of the scope; `TRACKED` no longer names it.
+            let snapshot =
+                create_snapshot_scoped(&inst, Some("captured characters"), CAPTURED).unwrap();
+
+            fs::write(inst.join("characters").join("hero.sav"), b"level 9").unwrap();
+            fs::write(inst.join("characters").join("new.sav"), b"created since").unwrap();
+            fs::write(inst.join("config").join("settings.toml"), b"key=changed").unwrap();
+
+            let error = restore_snapshot_impl(&inst, &snapshot.id, Some(step)).unwrap_err();
+            assert!(
+                error.contains("original instance state was restored"),
+                "step {step}: {error}"
+            );
+            assert_eq!(
+                fs::read(inst.join("characters").join("hero.sav")).unwrap(),
+                b"level 9",
+                "step {step}: the file the restore replaced is back"
+            );
+            assert_eq!(
+                fs::read(inst.join("characters").join("new.sav")).unwrap(),
+                b"created since",
+                "step {step}: the file created since the capture is back"
+            );
+            assert_eq!(
+                fs::read(inst.join("config").join("settings.toml")).unwrap(),
+                b"key=changed",
+                "step {step}"
+            );
+            assert!(
+                !inst.join(RESTORE_MARKER).exists(),
+                "step {step}: the marker is cleared"
+            );
+            assert!(
+                !restore_journal_path(&inst).exists(),
+                "step {step}: no journal is left to recover"
+            );
+        }
+    }
+
+    /// A root whose metadata cannot be read is cannot-tell, not absent.
+    ///
+    /// What a restore records about a root decides whether it is moved aside and whether an
+    /// interruption removes it, so "I could not look" must never become "it is not there". The
+    /// metadata lookup is injected so the failure can be exercised without the OS failing on cue.
+    #[test]
+    fn a_root_that_cannot_be_examined_is_cannot_tell_not_absent() {
+        let tmp = TempDir::new().unwrap();
+        let inst = make_instance(&tmp);
+        let refused = capture_root_states_with(&inst, &["mods"], |path| {
+            if path.ends_with("mods") {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))
+            } else {
+                fs::symlink_metadata(path)
+            }
+        })
+        .expect_err("a root that cannot be examined is cannot-tell");
+        assert!(
+            refused.contains("mods") && refused.contains("cannot tell"),
+            "{refused}"
+        );
+
+        // The control: what is there and what is not are still told apart.
+        let states = capture_root_states_with(&inst, &["mods", "datapacks"], |path| {
+            fs::symlink_metadata(path)
+        })
+        .unwrap();
+        assert_eq!(states[0].state, RootState::Directory);
+        assert_eq!(states[1].state, RootState::Absent);
+    }
+
+    #[test]
+    fn an_interrupted_restore_is_recovered_before_a_new_attempt() {
         let tmp = TempDir::new().unwrap();
         let inst = make_instance(&tmp);
         fs::write(
@@ -4226,6 +4692,29 @@ mod tests {
             fs::read(inst.join("saves").join("world1").join("level.dat")).unwrap(),
             b"w"
         );
+    }
+
+    /// The scope comparison a restore and the "no longer tracked" notice both ask: a declared
+    /// folder covers itself and everything under it, compared component by component.
+    #[test]
+    fn scope_comparison_follows_path_components() {
+        let declared = ["state/config", "characters"];
+        assert!(scope_contains(&declared, "characters"));
+        assert!(scope_contains(&declared, "characters/hero.sav"));
+        assert!(scope_contains(&declared, "characters/nested/deep.sav"));
+        assert!(scope_contains(&declared, "state/config/a.toml"));
+        // A sibling that shares a prefix with a declared folder is a different folder.
+        assert!(!scope_contains(&declared, "characters-old/hero.sav"));
+        assert!(!scope_contains(&declared, "state"));
+        assert!(!scope_contains(&declared, "state/configs/a.toml"));
+
+        // The case rule is the platform's, not this machine's assumption.
+        assert!(scope_contains(&declared, "CHARACTERS/hero.sav"));
+        assert!(scope_contains(&declared, "State/Config/a.toml"));
+
+        // A path mapped inside a folder does not own that folder: `user` is not tracked just
+        // because `user/Plugins.txt` is (MASTER_SPEC §32.7).
+        assert!(!scope_contains(&["user/Plugins.txt"], "user"));
     }
 
     fn write_test_archive(path: &Path, entries: &[(&str, &[u8])]) {

@@ -73,6 +73,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 
 fn bench_definition() -> GameDefinition {
     GameDefinition {
+        snapshot: None,
         mo2_game_name: None,
         import_ids: Default::default(),
         session: Default::default(),

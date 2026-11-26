@@ -2152,7 +2152,7 @@ fn mo2_state_for_merge(
     plan: &Mo2Plan,
     profile_dir: &Path,
     merged: &MergedLayers,
-) -> Result<crate::game_loadout::GameLoadout, ImportError> {
+) -> Result<crate::loadout::game::GameLoadout, ImportError> {
     let manifest = game_instance::get_manifest(ctx, instance_id)?;
     let store = game_ini::store_of(ctx, instance_id)?;
     let overwrite_layer_id = merged.overwrite_layer_id.as_deref();
@@ -2177,7 +2177,7 @@ fn mo2_state_for_merge(
                     .layer_mods
                     .get(id.as_str())
                     .is_some_and(|folders| folders.iter().any(|folder| enabled.contains(folder)));
-            content.push(crate::game_loadout::GameLoadoutContent {
+            content.push(crate::loadout::game::GameLoadoutContent {
                 item: id,
                 enabled: is_enabled,
             });
@@ -2245,10 +2245,10 @@ fn mo2_state_for_merge(
     } else {
         None
     };
-    let mut plugin_lists: Vec<crate::game_loadout::GameLoadoutPluginList> = definition
+    let mut plugin_lists: Vec<crate::loadout::game::GameLoadoutPluginList> = definition
         .load_orders
         .iter()
-        .map(|rule| crate::game_loadout::GameLoadoutPluginList {
+        .map(|rule| crate::loadout::game::GameLoadoutPluginList {
             list: rule.id.clone(),
             contents: None,
         })
@@ -2259,11 +2259,11 @@ fn mo2_state_for_merge(
         }
     }
 
-    let mut inis: Vec<crate::game_loadout::GameLoadoutIni> = definition
+    let mut inis: Vec<crate::loadout::game::GameLoadoutIni> = definition
         .user_files
         .iter()
         .filter(|m| m.applies_to_store(&store))
-        .map(|mapping| crate::game_loadout::GameLoadoutIni {
+        .map(|mapping| crate::loadout::game::GameLoadoutIni {
             file: mapping.instance_path.as_str().to_string(),
             contents: None,
         })
@@ -2281,7 +2281,7 @@ fn mo2_state_for_merge(
         if let Some(existing) = inis.iter_mut().find(|i| i.file == ini.instance_path) {
             existing.contents = contents;
         } else {
-            inis.push(crate::game_loadout::GameLoadoutIni {
+            inis.push(crate::loadout::game::GameLoadoutIni {
                 file: ini.instance_path.clone(),
                 contents,
             });
@@ -2298,13 +2298,13 @@ fn mo2_state_for_merge(
     let rules = definition
         .load_orders
         .iter()
-        .map(|rule| crate::game_loadout::GameLoadoutRules {
+        .map(|rule| crate::loadout::game::GameLoadoutRules {
             list: rule.id.clone(),
             rules: Vec::new(),
         })
         .collect();
 
-    Ok(crate::game_loadout::GameLoadout {
+    Ok(crate::loadout::game::GameLoadout {
         content,
         layer_order,
         plugin_lists,
@@ -2482,11 +2482,11 @@ pub fn mo2_run_profiles(
                         &profile_dir,
                         &merged_layers,
                     )?;
-                    crate::game_loadout::save_game_profile(ctx, &instance_id, profile, state)
+                    crate::loadout::game::save_game_profile(ctx, &instance_id, profile, state)
                         .map_err(ImportError::Other)?;
                     loadouts.push(profile.clone());
                 }
-                crate::game_loadout::apply_game_profile_with_undo(
+                crate::loadout::game::apply_game_profile_with_undo(
                     ctx,
                     &instance_id,
                     &definition,

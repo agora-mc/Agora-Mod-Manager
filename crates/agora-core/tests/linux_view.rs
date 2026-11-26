@@ -144,6 +144,7 @@ fn test_definition() -> GameDefinition {
         launch_alternatives: Vec::new(),
         content_layout: None,
         copy_patterns: Vec::new(),
+        snapshot: None,
     }
 }
 

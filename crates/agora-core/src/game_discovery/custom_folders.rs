@@ -485,6 +485,7 @@ mod tests {
 
     fn game(id: &str, name: &str, executable: &str) -> GameDefinition {
         GameDefinition {
+            snapshot: None,
             mo2_game_name: None,
             import_ids: Default::default(),
             session: Default::default(),

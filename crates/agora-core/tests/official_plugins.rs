@@ -58,6 +58,7 @@ fn game_package(plugin_game: &str) -> PackageDefinition {
         game_templates: std::collections::BTreeMap::new(),
         behaviours: None,
         games: vec![GameDefinition {
+            snapshot: None,
             mo2_game_name: None,
             import_ids: Default::default(),
             session: Default::default(),

@@ -46,27 +46,49 @@ impl GamePackage for TestPackage {
     }
 }
 
+/// A Minecraft game, registered so a Minecraft snapshot has the declaration core now reads.
+fn minecraft_definition() -> GameDefinition {
+    let mut def = skyrim_definition();
+    def.id = GameId::minecraft();
+    def.name = "Minecraft: Java Edition".into();
+    def.stores = Vec::new();
+    def.content_rules = Vec::new();
+    def.load_orders = Vec::new();
+    def.user_files = Vec::new();
+    def.save_paths = Vec::new();
+    def.save_location = Vec::new();
+    def.ini_checks = Vec::new();
+    def.declared_writes = Vec::new();
+    def.snapshot = Some(
+        agora_game_api::SnapshotScope::declared(MINECRAFT, None)
+            .expect("the fixture's Minecraft scope is usable"),
+    );
+    def
+}
+
 fn registry(def: &GameDefinition) -> Arc<GameRegistry> {
     let mut builder = GameRegistry::builder();
-    let package = PackageDefinition {
-        id: format!("test.{}", def.id),
-        version: semver::Version::new(0, 1, 0),
-        api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
-        parents: vec![],
-        game_templates: Default::default(),
-        behaviours: None,
-        games: vec![def.clone()],
-        frameworks: vec![],
-        tools: vec![],
-    };
-    builder
-        .add(
-            PackageSource::Compiled {
-                crate_name: "test".into(),
-            },
-            Arc::new(TestPackage(package)),
-        )
-        .unwrap();
+    for def in [def.clone(), minecraft_definition()] {
+        let package = PackageDefinition {
+            id: format!("test.{}", def.id),
+            version: semver::Version::new(0, 1, 0),
+            api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
+            parents: vec![],
+            game_templates: Default::default(),
+            behaviours: None,
+            games: vec![def.clone()],
+            frameworks: vec![],
+            tools: vec![],
+        };
+        builder
+            .add(
+                PackageSource::Compiled {
+                    crate_name: "test".into(),
+                },
+                Arc::new(TestPackage(package)),
+            )
+            .unwrap();
+    }
     Arc::new(builder.build())
 }
 
@@ -119,9 +141,7 @@ impl Harness {
         let lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let data = TempDir::new().unwrap();
         let def = definition();
-        let ctx = CoreContext::for_testing(data.path().join("app_data"))
-            .with_games(registry(&def))
-            .with_minecraft_snapshot_entries(MINECRAFT);
+        let ctx = CoreContext::for_testing(data.path().join("app_data")).with_games(registry(&def));
         agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
         let id = "skyrim-test".to_string();
         let harness = Self {
@@ -658,9 +678,7 @@ fn restore_to_lkg_round_trips_files_and_rules() {
 // -- backups ------------------------------------------------------------------------------------
 
 fn fresh_context(def: &GameDefinition, root: &std::path::Path) -> CoreContext {
-    let ctx = CoreContext::for_testing(root.join("app_data"))
-        .with_games(registry(def))
-        .with_minecraft_snapshot_entries(MINECRAFT);
+    let ctx = CoreContext::for_testing(root.join("app_data")).with_games(registry(def));
     agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
     ctx
 }
@@ -1294,4 +1312,302 @@ async fn a_partial_fetch_leaves_nothing_applied_and_keeps_fetched_objects() {
         .unwrap()
         .join(".agora_snapshots")
         .exists());
+}
+
+// -- declared snapshot folders (MASTER_SPEC §32.7) -----------------------------------------------
+
+/// A definition that declares folders of its own, beside the per-file state it names.
+fn definition_declaring(folders: &[&str]) -> GameDefinition {
+    let mut def = definition();
+    def.snapshot = Some(
+        agora_game_api::SnapshotScope::declared(folders, None).expect("the folders are usable"),
+    );
+    def
+}
+
+/// A definition that declares which of its folders the mandatory pre-launch snapshot captures.
+fn definition_declaring_prelaunch(tracked: &[&str], prelaunch: &[&str]) -> GameDefinition {
+    let mut def = definition();
+    def.snapshot = Some(
+        agora_game_api::SnapshotScope::declared(tracked, Some(prelaunch))
+            .expect("the folders are usable"),
+    );
+    def
+}
+
+/// The documented example: `tracked: [characters, config]`, `prelaunch: [config]`.
+fn prelaunch_entries(dir: &std::path::Path, snapshot_id: &str) -> Vec<String> {
+    snapshot::snapshot_file_entries(dir, snapshot_id)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.relative_path)
+        .collect()
+}
+
+#[test]
+fn launch_captures_only_the_declared_prelaunch_folders() {
+    let h = Harness::new();
+    let def = definition_declaring_prelaunch(&["characters", "config"], &["config"]);
+    std::fs::create_dir_all(h.dir().join("characters")).unwrap();
+    std::fs::write(h.dir().join("characters/hero.sav"), b"level 1").unwrap();
+    std::fs::create_dir_all(h.dir().join("config")).unwrap();
+    std::fs::write(h.dir().join("config/a.toml"), b"config v1").unwrap();
+
+    let point = game_snapshot::prepare_launch(&h.ctx, &h.id, &def).expect("the launch point");
+    let captured = prelaunch_entries(&h.dir(), &point.snapshot_id);
+
+    assert!(
+        captured.iter().any(|path| path == "config/a.toml"),
+        "a pre-launch folder is captured: {captured:?}"
+    );
+    assert!(
+        !captured.iter().any(|path| path.starts_with("characters")),
+        "a folder the package did not list for pre-launch is not captured: {captured:?}"
+    );
+    // The state a launch point exists for is still captured.
+    assert!(
+        captured.iter().any(|path| path == "user/Plugins.txt"),
+        "the declared state files are still captured: {captured:?}"
+    );
+}
+
+#[test]
+fn a_tracked_folder_that_cannot_be_read_does_not_block_launch() {
+    let h = Harness::new();
+    let def = definition_declaring_prelaunch(&["characters", "config"], &["config"]);
+    // A file where the package declares a folder: capturing that folder refuses.
+    std::fs::write(h.dir().join("characters"), b"not a folder").unwrap();
+
+    let point = game_snapshot::prepare_launch(&h.ctx, &h.id, &def)
+        .expect("a folder this launch does not capture cannot block it");
+    let captured = prelaunch_entries(&h.dir(), &point.snapshot_id);
+    assert!(
+        !captured.iter().any(|path| path.starts_with("characters")),
+        "{captured:?}"
+    );
+}
+
+#[test]
+fn a_declared_snapshot_folder_is_captured_and_restored() {
+    let h = Harness::new();
+    let def = definition_declaring(&["characters"]);
+    let extras = h.dir().join("characters");
+    std::fs::create_dir_all(&extras).unwrap();
+    std::fs::write(extras.join("hero.sav"), b"level 1").unwrap();
+
+    let taken = game_snapshot::create(
+        &h.ctx,
+        &h.id,
+        &def,
+        Some("with characters"),
+        SnapshotOrigin::User,
+    )
+    .unwrap();
+    let captured: Vec<String> = snapshot::snapshot_file_entries(&h.dir(), &taken.id)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.relative_path)
+        .collect();
+    assert!(
+        captured.iter().any(|path| path == "characters/hero.sav"),
+        "the declared folder's file is in the snapshot: {captured:?}"
+    );
+
+    std::fs::write(extras.join("hero.sav"), b"level 9").unwrap();
+    game_snapshot::restore(&h.ctx, &h.id, &def, &taken.id, false).unwrap();
+    assert_eq!(
+        std::fs::read(extras.join("hero.sav")).unwrap(),
+        b"level 1",
+        "the declared folder is state a restore puts back"
+    );
+}
+
+#[test]
+fn a_declared_folder_that_is_missing_captures_nothing_rather_than_failing() {
+    let h = Harness::new();
+    let def = definition_declaring(&["not-written-yet"]);
+    let taken = game_snapshot::create(&h.ctx, &h.id, &def, None, SnapshotOrigin::User)
+        .expect("a folder the game has not written is nothing to capture");
+    let captured: Vec<String> = snapshot::snapshot_file_entries(&h.dir(), &taken.id)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.relative_path)
+        .collect();
+    assert!(
+        !captured
+            .iter()
+            .any(|path| path.starts_with("not-written-yet")),
+        "{captured:?}"
+    );
+}
+
+#[test]
+fn a_declared_folder_that_is_a_file_refuses_the_capture() {
+    let h = Harness::new();
+    let def = definition_declaring(&["characters"]);
+    // The instance has a file where the package declares a folder.
+    std::fs::write(h.dir().join("characters"), b"not a folder").unwrap();
+
+    let refused = game_snapshot::create(&h.ctx, &h.id, &def, None, SnapshotOrigin::User)
+        .expect_err("a file standing in for a declared folder is cannot-tell");
+    assert!(
+        refused.to_string().contains("is a file, not a folder"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn a_restore_reports_a_folder_the_game_no_longer_declares() {
+    let h = Harness::new();
+    let declaring = definition_declaring(&["characters"]);
+    let extras = h.dir().join("characters");
+    std::fs::create_dir_all(&extras).unwrap();
+    std::fs::write(extras.join("hero.sav"), b"level 1").unwrap();
+    let taken =
+        game_snapshot::create(&h.ctx, &h.id, &declaring, None, SnapshotOrigin::User).unwrap();
+    std::fs::write(extras.join("hero.sav"), b"level 9").unwrap();
+
+    // The package changed and no longer declares the folder; the snapshot still owns it.
+    let outcome =
+        game_snapshot::restore(&h.ctx, &h.id, &h.def, &taken.id, false).expect("restored anyway");
+    assert_eq!(std::fs::read(extras.join("hero.sav")).unwrap(), b"level 1");
+    let noticed = outcome
+        .outcome
+        .notices
+        .iter()
+        .find(|notice| notice.contains("characters"))
+        .expect("the restore reports the folder it no longer tracks");
+    assert!(
+        noticed.contains("no longer tracked") && noticed.contains("skyrim-se"),
+        "{noticed}"
+    );
+}
+
+#[test]
+fn the_undo_of_a_restore_that_wrote_a_retired_folder_puts_it_back() {
+    let h = Harness::new();
+    let declaring = definition_declaring(&["characters"]);
+    let extras = h.dir().join("characters");
+    std::fs::create_dir_all(&extras).unwrap();
+    std::fs::write(extras.join("hero.sav"), b"level 1").unwrap();
+    let taken =
+        game_snapshot::create(&h.ctx, &h.id, &declaring, None, SnapshotOrigin::User).unwrap();
+
+    // The game writes, and the package stops declaring the folder.
+    std::fs::write(extras.join("hero.sav"), b"level 9").unwrap();
+    std::fs::write(extras.join("new.sav"), b"created since").unwrap();
+
+    let outcome =
+        game_snapshot::restore(&h.ctx, &h.id, &h.def, &taken.id, false).expect("restored anyway");
+    assert_eq!(std::fs::read(extras.join("hero.sav")).unwrap(), b"level 1");
+    assert_eq!(
+        std::fs::read(extras.join("new.sav")).unwrap(),
+        b"created since",
+        "a file created since the snapshot stays"
+    );
+
+    // Undoing the restore puts back what the restore replaced, in the folder the game dropped.
+    game_snapshot::restore(&h.ctx, &h.id, &h.def, &outcome.undo_snapshot_id, false)
+        .expect("the undo point holds the retired folder too");
+    assert_eq!(
+        std::fs::read(extras.join("hero.sav")).unwrap(),
+        b"level 9",
+        "the undo snapshot covers everything the restore touched"
+    );
+    assert_eq!(
+        std::fs::read(extras.join("new.sav")).unwrap(),
+        b"created since"
+    );
+}
+
+/// Undo removes a file the restore created.
+///
+/// A data restore writes the files its manifest lists, so undoing it has to record the ones that
+/// were not there: a file the restore created, left behind by the undo, is state the user cannot
+/// get rid of (MASTER_SPEC §32.7).
+#[test]
+fn the_undo_of_a_restore_removes_a_file_the_restore_created() {
+    let h = Harness::new();
+    let def = definition_declaring(&["characters"]);
+    let extras = h.dir().join("characters");
+    std::fs::create_dir_all(&extras).unwrap();
+    std::fs::write(extras.join("hero.sav"), b"level 1").unwrap();
+    let taken = game_snapshot::create(&h.ctx, &h.id, &def, None, SnapshotOrigin::User).unwrap();
+
+    std::fs::remove_file(extras.join("hero.sav")).unwrap();
+    let outcome = game_snapshot::restore(&h.ctx, &h.id, &def, &taken.id, false)
+        .expect("the snapshot owns a folder it declared");
+    assert_eq!(
+        std::fs::read(extras.join("hero.sav")).unwrap(),
+        b"level 1",
+        "the restore puts the captured file back"
+    );
+
+    game_snapshot::restore(&h.ctx, &h.id, &def, &outcome.undo_snapshot_id, false)
+        .expect("the undo point reads back");
+    assert!(
+        !extras.join("hero.sav").exists(),
+        "the undo removes the file the restore created"
+    );
+}
+
+/// A mapped file is not a dropped folder.
+///
+/// The snapshot records what it captured: the file `user/Plugins.txt`, because that is what the
+/// game declares there, not the folder `user` that happens to hold it. So a restore of it says
+/// nothing about `user` — the false notice a root-shaped scope produced (MASTER_SPEC §32.7).
+#[test]
+fn a_mapped_file_is_not_reported_as_a_folder_the_game_dropped() {
+    let h = Harness::new();
+    // `h.def` declares the load order file `user/Plugins.txt` and no folder holding it.
+    std::fs::create_dir_all(h.dir().join("user")).unwrap();
+    std::fs::write(h.dir().join("user/Plugins.txt"), b"*A.esm").unwrap();
+    let taken = game_snapshot::create(&h.ctx, &h.id, &h.def, None, SnapshotOrigin::User)
+        .expect("the declared state files are captured");
+
+    let outcome =
+        game_snapshot::restore(&h.ctx, &h.id, &h.def, &taken.id, false).expect("restored");
+
+    assert!(
+        !outcome
+            .outcome
+            .notices
+            .iter()
+            .any(|notice| notice.contains("'user'")),
+        "the file's folder is not reported as dropped: {:?}",
+        outcome.outcome.notices
+    );
+}
+
+/// The undo point covers the recorded scope, not the folder a mapped file lives in.
+///
+/// The reviewers' reproduction: map only `user/Plugins.txt`, keep `user/notes.txt` beside it,
+/// snapshot, restore, edit `notes.txt`, undo — the edit has to survive, because the restore never
+/// touched `notes.txt` (MASTER_SPEC §32.7).
+#[test]
+fn the_undo_of_a_restore_leaves_a_file_beside_a_mapped_one_alone() {
+    let h = Harness::new();
+    std::fs::create_dir_all(h.dir().join("user")).unwrap();
+    std::fs::write(h.dir().join("user/Plugins.txt"), b"*A.esm").unwrap();
+    std::fs::write(h.dir().join("user/notes.txt"), b"the user's notes").unwrap();
+    let taken = game_snapshot::create(&h.ctx, &h.id, &h.def, None, SnapshotOrigin::User).unwrap();
+
+    let outcome =
+        game_snapshot::restore(&h.ctx, &h.id, &h.def, &taken.id, false).expect("restored");
+    // The game writes to a file the snapshot never recorded, after the restore took its undo point.
+    std::fs::write(h.dir().join("user/notes.txt"), b"edited after the restore").unwrap();
+
+    game_snapshot::restore(&h.ctx, &h.id, &h.def, &outcome.undo_snapshot_id, false)
+        .expect("the undo point reads back");
+
+    assert_eq!(
+        std::fs::read(h.dir().join("user/notes.txt")).unwrap(),
+        b"edited after the restore",
+        "the undo covers the recorded scope, so a file it never captured is left as it is"
+    );
+    assert_eq!(
+        std::fs::read(h.dir().join("user/Plugins.txt")).unwrap(),
+        b"*A.esm",
+        "and the file the snapshot did record comes back"
+    );
 }

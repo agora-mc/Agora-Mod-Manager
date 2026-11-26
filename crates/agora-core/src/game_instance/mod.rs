@@ -682,6 +682,33 @@ pub fn adopt_imported_snapshot(
 }
 
 /// Retrieve a generic instance record by ID.
+/// The game an instance belongs to, from the identity table every instance has a row in
+/// (MASTER_SPEC §32.7).
+///
+/// `Ok(None)` means there is no row, which is an instance created before the identity table or by
+/// a caller that has not registered one; a database that cannot be read is an error, never a guess.
+pub fn game_of(ctx: &Ctx, id: &str) -> Result<Option<GameId>, String> {
+    let db_path = ctx.paths.local_state_db();
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = crate::db::local_state_connection(&db_path).map_err(|e| e.to_string())?;
+    let game: Option<String> = conn
+        .query_row(
+            "SELECT game FROM instances WHERE instance_id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("cannot read the game of instance '{id}': {e}"))?;
+    match game {
+        None => Ok(None),
+        Some(game) => GameId::new(&game)
+            .map(Some)
+            .map_err(|e| format!("instance '{id}' records a game id that cannot be used: {e}")),
+    }
+}
+
 pub fn get(ctx: &Ctx, id: &str) -> Result<Option<GameInstanceRecord>, InstanceError> {
     let db_path = ctx.paths.local_state_db();
     if !db_path.exists() {

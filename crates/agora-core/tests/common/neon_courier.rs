@@ -50,6 +50,7 @@ fn rule(marker: &str, mount: &str) -> ContentRule {
 /// layout names only one, which is what the importers read.
 pub fn definition() -> GameDefinition {
     GameDefinition {
+        snapshot: None,
         mo2_game_name: Some(MO2_NAME.into()),
         import_ids: [("vortex".to_string(), VORTEX_ID.to_string())]
             .into_iter()

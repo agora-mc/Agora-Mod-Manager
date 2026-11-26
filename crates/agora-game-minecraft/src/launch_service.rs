@@ -9,12 +9,13 @@ use agora_core::app_paths::AppPaths;
 use agora_core::ctx::Ctx;
 use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::instance_runtime;
-use agora_core::lkg::LaunchOutcome;
+use agora_core::lkg::{classify_launch, LaunchEvents, LaunchOutcome};
 use agora_core::lock_manager::{LockGuard, LockResource};
 use agora_core::models::InstanceManifest;
 use agora_core::network::NetworkPolicy;
 use agora_core::process_identity::{self, ProcessIdentity};
 use agora_core::process_session_manager::ProcessSession;
+use agora_core::snapshot::create_snapshot_scoped;
 use agora_core::task_scheduler::BlockingPriority;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -109,10 +110,10 @@ pub trait LaunchProgress: Send + Sync {
 /// async task and the launch progress is only borrowed, so its reports travel
 /// over a channel and are delivered here while the provisioning future runs.
 async fn provision_java_reporting(
-    ctx: &agora_core::ctx::Ctx,
+    ctx: &Ctx,
     runtimes_root: std::path::PathBuf,
     major: u32,
-    policy: agora_core::network::NetworkPolicy,
+    policy: NetworkPolicy,
     progress: &dyn LaunchProgress,
 ) -> LauncherResult<crate::java::JavaInstallation> {
     struct ChannelProgress(tokio::sync::mpsc::UnboundedSender<(String, Option<f64>)>);
@@ -1196,7 +1197,7 @@ impl LaunchService {
                 // The delegated launcher does not expose the game PID or exit code.
                 // A clean-shutdown log marker is the only safe success signal.
                 if log.lines().any(|line| line.contains("Stopping!")) {
-                    break agora_core::lkg::classify_launch(&agora_core::lkg::LaunchEvents {
+                    break classify_launch(&LaunchEvents {
                         exit_code: Some(0),
                         runtime_ms: started.elapsed().as_millis() as u64,
                         was_user_cancelled: false,
@@ -1430,11 +1431,12 @@ fn create_or_reuse_snapshot(instance_dir: &Path) -> LauncherResult<String> {
 
 fn create_fresh_prelaunch_snapshot(instance_dir: &Path, scope: &[&str]) -> LauncherResult<String> {
     let snapshot =
-        agora_core::snapshot::create_snapshot_scoped(instance_dir, Some("pre-launch"), scope)
-            .map_err(|error| LauncherError::Generic {
+        create_snapshot_scoped(instance_dir, Some("pre-launch"), scope).map_err(|error| {
+            LauncherError::Generic {
                 code: "ERR_SNAPSHOT_CREATE".into(),
                 message: error.to_string(),
-            })?;
+            }
+        })?;
     // create_snapshot_scoped writes the scoped reuse receipt from the same
     // metadata traversal that created the snapshot.
     Ok(snapshot.id)
@@ -2049,6 +2051,59 @@ mod tests {
             }
             _ => panic!("expected SwitchLoader"),
         }
+    }
+
+    /// The launch path's pre-launch snapshot, pinned to an exact file set.
+    ///
+    /// The package's list is checked on its own elsewhere; this is the path a launch actually takes
+    /// (`create_or_reuse_snapshot`), so a change to what a launch captures shows up here as a
+    /// different list rather than as a surprise after a crash.
+    #[test]
+    fn a_launch_point_captures_exactly_the_prelaunch_golden_file_set() {
+        const PRELAUNCH_GOLDEN: &[&str] = &[
+            "config/a.toml",
+            "datapacks/pack.zip",
+            "defaultconfigs/b.toml",
+            "instance_manifest.json",
+            "kubejs/server.js",
+            "mods/a.jar",
+            "mods/b.jar.disabled",
+            "options.txt",
+            "resourcepacks/pack.zip",
+            "shaderpacks/shader.zip",
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let inst = tmp.path().join("instance");
+        for (relative, bytes) in [
+            ("mods/a.jar", "mod a"),
+            ("mods/b.jar.disabled", "mod b"),
+            ("config/a.toml", "config"),
+            ("defaultconfigs/b.toml", "config"),
+            ("kubejs/server.js", "script"),
+            ("resourcepacks/pack.zip", "pack"),
+            ("shaderpacks/shader.zip", "shader"),
+            ("datapacks/pack.zip", "data"),
+            ("saves/world/level.dat", "world"),
+            ("options.txt", "options"),
+        ] {
+            let path = inst.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        std::fs::write(inst.join("instance_manifest.json"), b"{}").unwrap();
+        // Neither of these is snapshot state, and a launch must not capture them.
+        std::fs::write(inst.join("notes.txt"), b"the user's own file").unwrap();
+        std::fs::create_dir_all(inst.join("undeclared")).unwrap();
+        std::fs::write(inst.join("undeclared").join("keep.txt"), b"not ours").unwrap();
+
+        let id = create_or_reuse_snapshot(&inst).expect("a launch takes its pre-launch point");
+        let mut captured: Vec<String> = agora_core::snapshot::snapshot_file_entries(&inst, &id)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.relative_path)
+            .collect();
+        captured.sort();
+        assert_eq!(captured, PRELAUNCH_GOLDEN);
     }
 
     #[test]

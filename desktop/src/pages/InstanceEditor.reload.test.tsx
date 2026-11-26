@@ -91,7 +91,10 @@ beforeEach(() => {
       case 'get_dependency_graph':
       case 'list_loadout_profiles':
         return command === 'list_loadout_profiles'
-          ? [{ name: 'Fast', enabled_mods: [], created_at: '2026-01-01T00:00:00Z' }]
+          ? {
+              profiles: [{ name: 'Fast', enabled_mods: [], created_at: '2026-01-01T00:00:00Z' }],
+              damaged: [],
+            }
           : [];
       case 'list_instance_templates': return [template];
       case 'list_snapshots':
@@ -104,7 +107,10 @@ beforeEach(() => {
         return { jvm_applied: true, files_applied: 0, files_missing: 0, undo_snapshot_id: null };
       case 'restore_snapshot':
         current = detail({ minecraft_version: '26.1.2' });
-        return undefined;
+        // The command answers with what the restore did, which the editor shows.
+        return {
+          snapshotId: 'snap-1', coverage: 'exact', restoredRoots: [], preservedRoots: [],
+        };
       case 'apply_loadout_profile':
         return undefined;
       case 'list_loadout_unlisted_mods':

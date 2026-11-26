@@ -71,6 +71,7 @@ impl Drop for TestHarness {
 
 fn test_skyrim_definition() -> GameDefinition {
     GameDefinition {
+        snapshot: None,
         mo2_game_name: None,
         import_ids: Default::default(),
         session: Default::default(),

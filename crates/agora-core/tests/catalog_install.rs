@@ -237,6 +237,7 @@ impl GamePackage for TestPackage {
 
 fn test_definition() -> GameDefinition {
     GameDefinition {
+        snapshot: None,
         id: GameId::new("test-game").unwrap(),
         extends: None,
         name: "Test Game".into(),

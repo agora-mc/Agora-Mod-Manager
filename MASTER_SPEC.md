@@ -5738,6 +5738,18 @@ modules, duplicated triggers.
 - **Core's instance type** carries the identity; Minecraft's detail type lives in its package.
   **Loadouts:** one service in core, each game contributing its sections. **Snapshots:** Minecraft
   declares its tracked folders instead of `TRACKED_ENTRIES`.
+- **A snapshot owns what it captured, and the manifest says what that is.** A game's definition
+  declares the snapshot scope (a tracked set and a narrower pre-launch set); a capture records the
+  entries it took, each as a folder or as a mapped file, and restore, the undo snapshot taken before
+  a restore and the "the package no longer declares this" notice all read that record. The current
+  declaration only decides future captures, so a folder a package drops is still restored, reported
+  and undoable. A recorded folder is restored wholesale like any tracked one; a generic game's
+  mapped file (`user/Plugins.txt`) is recorded and compared as a file, never as the folder around
+  it, so files beside a mapped one are not swept into the undo. Manifests written before the record
+  existed take the declaration in force today as their scope. A declared folder is validated where
+  the package loads: an absolute path, `..`, `""`, `.`, a path inside the launcher's own `.agora*`
+  names and a nested folder (`state/config`) are refused, the last one until nested snapshot folders
+  are supported at all.
 - **Tests:** open an old database with both kinds, both trash formats, pre-registration import jobs and
   global plugin storage; delete one instance
   and see every dependent row go; restore a recently-deleted one.

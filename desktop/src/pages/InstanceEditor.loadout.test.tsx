@@ -66,7 +66,7 @@ beforeEach(() => {
       case 'list_snapshots':
       case 'list_capturable_template_files':
         return [];
-      case 'list_loadout_profiles': return profiles;
+      case 'list_loadout_profiles': return { profiles, damaged: [] };
       case 'create_loadout_profile': return undefined;
       case 'apply_loadout_profile': return undefined;
       case 'list_loadout_unlisted_mods':

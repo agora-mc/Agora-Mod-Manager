@@ -26,8 +26,8 @@ use agora_core::game_import::{self, Mo2Request, RunOptions};
 use agora_core::game_instance::{
     self, create, get_manifest, CloneOptions, GameInstanceRecord, SavesChoice,
 };
-use agora_core::game_loadout;
 use agora_core::game_registry::{GameInventory, IdentifiedInstall, RuntimeResolution};
+use agora_core::loadout::game as game_loadout;
 use agora_core::snapshot_service::SnapshotService;
 use agora_core::{game_ini, game_saves, instance_runtime, save_backup};
 use agora_game_api::{

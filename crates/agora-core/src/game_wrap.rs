@@ -1302,6 +1302,7 @@ mod tests {
 
     fn loader_definition() -> GameDefinition {
         GameDefinition {
+            snapshot: None,
             mo2_game_name: None,
             session: Default::default(),
             id: GameId::new("loader-test-game").unwrap(),

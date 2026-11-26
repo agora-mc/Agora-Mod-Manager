@@ -16,6 +16,7 @@ pub mod layer;
 pub mod package;
 pub mod path;
 pub mod probe;
+pub mod scope;
 
 pub use archive::*;
 pub use condition::*;
@@ -26,5 +27,6 @@ pub use layer::*;
 pub use package::*;
 pub use path::*;
 pub use probe::*;
+pub use scope::*;
 
 pub const GAME_API_VERSION: semver::Version = semver::Version::new(0, 1, 0);
