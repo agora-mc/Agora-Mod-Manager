@@ -5608,6 +5608,27 @@ three path comparators.
     skip silently.
   - Its guard counts direct archive opens per file, in `scripts/archive_budget.json`, and the count
     only goes down.
+  - **Two entries with one name are refused**, naming them: `zip::ZipArchive` keeps only the last of
+    several same-named records, so a listing cannot show the collision, and whichever entry lost
+    would have been written over without a word. A tar, a 7z and a RAR list every record, so the
+    listing check covers them; a folder recorded twice is one folder and is left alone.
+  - **A preset can bound the entries a job reads instead of the listing** (`per_entry_at_listing`).
+    A job that reads every entry refuses an oversized one at listing; `JAR_METADATA` does not, so a
+    mod jar's 40 MiB texture is no reason to lose the mod's id, while a nested jar over the cap is
+    skipped with a recorded reason and the outer metadata still comes back.
+  - **Every entry is copied to the end of its stream**, so a `Stored` entry that declares more bytes
+    than it holds meets the decoder's CRC check instead of a trusting count.
+  - Presets today: pack, mod archive, backup, plugin package, jar metadata, runtime, and
+    `WORLD_ARCHIVE` (200 000 entries, 16 GiB, no tighter per-entry limit) for a world a player
+    exported or downloaded.
+- **Where the remaining opens go:** `content_store` (staging, item ids, `rename` into place) is B3;
+  `import.rs` and `pack_update.rs` follow the import protocol (C2); `backup.rs` and `snapshot.rs` sit
+  inside restore protocols and move with them (C2). `launch_planner`'s native extraction keeps its
+  own admission rules but asks the reader whether two entries share a name.
+- **RAR's first backend is `content_store/rar.rs`** (Windows' `tar.exe`, listing and `-xOf` per
+  entry), so the reader's RAR seam is filled rather than declared. A RAR the repository may commit
+  does not exist yet, so the happy path is unproven; the real-RAR tests stay `#[ignore]`d because
+  they read a user's Vortex folder.
 - **Guard:** private path validators, direct archive opens outside the reader, and path comparisons
   outside the comparison module (in recovery, trust and staging code) are counted.
 
