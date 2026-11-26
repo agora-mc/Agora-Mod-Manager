@@ -1197,6 +1197,7 @@ impl SafeArchive {
             .map(|entry| DeclaredName {
                 name: entry.name.trim_end_matches('/').to_string(),
                 is_directory: entry.kind == EntryKind::Directory,
+                alias: None,
             })
             .collect();
         let duplicated = names_declared_more_than_once(&declared);
@@ -2243,6 +2244,10 @@ pub fn duplicate_zip_entry_names(path: &Path) -> Result<Vec<String>, ArchiveErro
 struct DeclaredName {
     name: String,
     is_directory: bool,
+    /// The Info-ZIP Unicode Path (0x7075) spelling of the same record, when it carries one whose
+    /// check value matches. A second spelling of one name, not a second path: nothing is ever
+    /// written under it, and it is only here so that two records that claim one path are refused.
+    alias: Option<String>,
 }
 
 fn zip_declared_entry_names(
@@ -2265,7 +2270,6 @@ fn zip_declared_entry_names(
         }
         let field = |at: usize| usize::from(u16::from_le_bytes([header[at], header[at + 1]]));
         let (name_length, extra_length, comment_length) = (field(28), field(30), field(32));
-        let general_purpose = u16::from_le_bytes([header[8], header[9]]);
         let mut raw_name = vec![0u8; name_length];
         reader.read_exact(&mut raw_name)?;
         let mut extra = vec![0u8; extra_length];
@@ -2273,35 +2277,34 @@ fn zip_declared_entry_names(
         reader.seek_relative(comment_length as i64)?;
         // Decoded the way the zip crate decodes it, so two records it reads as one name are seen
         // as one name here too, and two it reads as different names are not collapsed into one by a
-        // lossy conversion (MASTER_SPEC §32.3).
-        let name = decode_zip_name(&raw_name, general_purpose, &extra).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "an entry's name cannot be decoded, so it cannot be checked",
-            )
-        })?;
+        // lossy conversion (MASTER_SPEC §32.3). The Info-ZIP Unicode Path field is a *second*
+        // spelling of the same record, and it counts whatever the general-purpose flag says.
+        let name = decode_zip_name(&raw_name);
         let is_directory = name.ends_with('/');
         let name = name.trim_end_matches('/').to_string();
-        names.push(DeclaredName { name, is_directory });
+        let alias = unicode_path_name(&raw_name, &extra)
+            .map(|unicode| unicode.trim_end_matches('/').to_string())
+            .filter(|unicode| *unicode != name);
+        names.push(DeclaredName {
+            name,
+            is_directory,
+            alias,
+        });
     }
     Ok(names)
 }
 
 /// The name a zip record declares, decoded the way the zip crate decodes it.
 ///
-/// UTF-8 when the record's general-purpose flag says so; otherwise CP437, which is what a zip
-/// written before UTF-8 was allowed means by those bytes; and the Info-ZIP Unicode Path extra field
-/// when it is there and its own check value matches the raw name. A byte sequence that is neither
-/// (`None`) is a name nothing can compare, so the caller refuses rather than guesses.
-fn decode_zip_name(raw: &[u8], general_purpose: u16, extra: &[u8]) -> Option<String> {
-    const UTF8_FLAG: u16 = 0x0800;
-    if general_purpose & UTF8_FLAG != 0 {
-        return String::from_utf8(raw.to_vec()).ok();
+/// `zip` 9.0.5 decides by the bytes themselves, not by the general-purpose flag: `[0xC3,0xA9]` is
+/// `é` in UTF-8 and a UTF-8 flag would be redundant, while `[0x82]` is `é` in CP437 and cannot be
+/// UTF-8 at all (`ZipFileData::name`). Decoding by the flag instead would name an entry something
+/// the extractor never writes, and would miss two records the crate reads as one name.
+fn decode_zip_name(raw: &[u8]) -> String {
+    match std::str::from_utf8(raw) {
+        Ok(text) => text.to_string(),
+        Err(_) => cp437(raw),
     }
-    if let Some(unicode) = unicode_path_name(raw, extra) {
-        return Some(unicode);
-    }
-    Some(cp437(raw))
 }
 
 /// The 0x7075 field: a UTF-8 spelling of the name, valid only when its CRC is the raw name's.
@@ -2363,24 +2366,32 @@ fn cp437(raw: &[u8]) -> String {
 ///
 /// A folder recorded twice is one folder and is left alone. A name that is a file once and a folder
 /// once is not: no disk holds both, and whichever the reader picked would be the other one silently
-/// lost.
+/// lost. A record's Unicode Path spelling counts as a spelling of *that* record, so two records that
+/// claim one path are refused whichever spelling each of them was written with.
 fn names_declared_more_than_once(names: &[DeclaredName]) -> Vec<String> {
     let mut files: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut folders: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut duplicated: Vec<String> = Vec::new();
     for declared in names {
-        let name = declared.name.as_str();
-        let seen_twice = if declared.is_directory {
-            // A folder recorded twice is one folder: archive tools write the parent before every
-            // child, and refusing that would refuse ordinary archives.
-            folders.insert(name);
-            false
-        } else {
-            !files.insert(name)
-        };
-        let clash = files.contains(name) && folders.contains(name);
-        if (seen_twice || clash) && !duplicated.iter().any(|known| known == name) {
-            duplicated.push(declared.name.clone());
+        let mut spellings: Vec<&str> = vec![declared.name.as_str()];
+        if let Some(alias) = declared.alias.as_deref() {
+            if alias != declared.name {
+                spellings.push(alias);
+            }
+        }
+        for spelling in spellings {
+            let seen_twice = if declared.is_directory {
+                // A folder recorded twice is one folder: archive tools write the parent before every
+                // child, and refusing that would refuse ordinary archives.
+                folders.insert(spelling);
+                false
+            } else {
+                !files.insert(spelling)
+            };
+            let clash = files.contains(spelling) && folders.contains(spelling);
+            if (seen_twice || clash) && !duplicated.iter().any(|known| known == spelling) {
+                duplicated.push(spelling.to_string());
+            }
         }
     }
     duplicated

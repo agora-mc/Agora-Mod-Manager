@@ -1551,3 +1551,150 @@ fn a_tar_gz_whose_gzip_trailer_is_wrong_is_refused() {
         "a trailer that is not all there is the same kind of lie"
     );
 }
+
+/// A hand-built zip whose records carry the names, general-purpose flags and Info-ZIP Unicode Path
+/// (0x7075) fields a test names, because neither the writer nor the reader's helpers can produce that
+/// combination.
+///
+/// Each record is `(header name bytes, general-purpose flags, Some((the 0x7075 spelling, the bytes
+/// its own check value covers)))`.
+fn zip_with_unicode_paths(records: &[(&[u8], u16, Option<(&str, &[u8])>)]) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = flate2::Crc::new();
+        crc.update(bytes);
+        crc.sum()
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut central: Vec<u8> = Vec::new();
+    for (header, flags, unicode) in records {
+        let data = b"x";
+        let crc = crc32(data);
+        let mut extra = Vec::new();
+        if let Some((unicode_name, crc_over)) = unicode {
+            let mut body = vec![1u8];
+            body.extend_from_slice(&crc32(crc_over).to_le_bytes());
+            body.extend_from_slice(unicode_name.as_bytes());
+            extra.extend_from_slice(&0x7075u16.to_le_bytes());
+            extra.extend_from_slice(&(body.len() as u16).to_le_bytes());
+            extra.extend_from_slice(&body);
+        }
+        let offset = out.len() as u32;
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&flags.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(header.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+        out.extend_from_slice(header);
+        out.extend_from_slice(&extra);
+        out.extend_from_slice(data);
+
+        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&flags.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(header.len() as u16).to_le_bytes());
+        central.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(header);
+        central.extend_from_slice(&extra);
+    }
+    let central_offset = out.len() as u32;
+    let central_len = central.len() as u32;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&(records.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(records.len() as u16).to_le_bytes());
+    out.extend_from_slice(&central_len.to_le_bytes());
+    out.extend_from_slice(&central_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+#[test]
+fn two_records_whose_unicode_path_names_agree_are_one_name() {
+    // `a.txt` and `b.txt` each carry an Info-ZIP Unicode Path field naming `shared.txt`. Whichever
+    // spelling a reader trusts, the archive holds one path twice, so it is refused rather than
+    // leaving one of them silently unreachable.
+    let bytes = zip_with_unicode_paths(&[
+        (b"a.txt", 0, Some(("shared.txt", b"a.txt"))),
+        (b"b.txt", 0, Some(("shared.txt", b"b.txt"))),
+    ]);
+    let error = SafeArchive::open_bytes(bytes, ArchiveLimits::PACK)
+        .err()
+        .expect("one path declared twice");
+    match error {
+        ArchiveError::DuplicateNames { names, .. } => {
+            assert_eq!(names, vec!["shared.txt".to_string()]);
+        }
+        other => panic!("unexpected error {other:?}"),
+    }
+}
+
+#[test]
+fn a_unicode_path_on_a_utf8_flagged_record_still_counts() {
+    // The UTF-8 flag says how to read the header name; it says nothing about the extra field, which
+    // is Info-ZIP's own spelling of the same path. Both records' fields name `shared.txt`, and the
+    // check value matches each header name, so both spellings are the archive's claim.
+    let bytes = zip_with_unicode_paths(&[
+        (b"a.txt", 0x0800, Some(("shared.txt", b"a.txt"))),
+        (b"b.txt", 0x0800, Some(("shared.txt", b"b.txt"))),
+    ]);
+    let error = SafeArchive::open_bytes(bytes, ArchiveLimits::PACK)
+        .err()
+        .expect("one path declared twice, whatever the flag says");
+    match error {
+        ArchiveError::DuplicateNames { names, .. } => {
+            assert_eq!(names, vec!["shared.txt".to_string()]);
+        }
+        other => panic!("unexpected error {other:?}"),
+    }
+}
+
+#[test]
+fn a_unicode_path_whose_check_value_is_wrong_names_nothing() {
+    // The field's own CRC-32 does not match the header name it sits beside, so — APPNOTE 4.6.9.4 —
+    // it says nothing about this record, and two distinct entries stay distinct.
+    let bytes = zip_with_unicode_paths(&[
+        (b"a.txt", 0, Some(("shared.txt", b"not-this-name"))),
+        (b"b.txt", 0, Some(("shared.txt", b"nor-this-one"))),
+    ]);
+    let archive =
+        SafeArchive::open_bytes(bytes, ArchiveLimits::PACK).expect("two distinct names, two files");
+    assert_eq!(archive.file_entries().count(), 2);
+}
+
+#[test]
+fn names_the_zip_crate_reads_as_one_are_caught_even_when_the_bytes_differ() {
+    // `[0xC3,0xA9]` is the UTF-8 spelling of `é` and `[0x82]` is the CP437 one. `zip` 9.0.5's own
+    // rule (`ZipFileData::name`) is "the bytes as UTF-8 when they are valid UTF-8, CP437 otherwise",
+    // so it reads both records as `é`: the archive holds one name twice. A scanner that decoded by
+    // the general-purpose flag instead would call them `├⌐` and `é`, and miss it.
+    let bytes = zip_with_unicode_paths(&[(&[0xC3u8, 0xA9u8], 0, None), (&[0x82u8], 0, None)]);
+    let error = SafeArchive::open_bytes(bytes, ArchiveLimits::PACK)
+        .err()
+        .expect("one name, two spellings of it");
+    match error {
+        ArchiveError::DuplicateNames { names, .. } => {
+            assert_eq!(names, vec!["\u{00E9}".to_string()]);
+        }
+        other => panic!("unexpected error {other:?}"),
+    }
+}
