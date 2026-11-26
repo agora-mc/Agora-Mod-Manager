@@ -41,6 +41,25 @@ fn fixture() -> (tempfile::TempDir, Ctx) {
     (dir, ctx)
 }
 
+/// A context whose registry defines `test-game`, so a path that checks the game definition (an
+/// imported instance's registration does) runs instead of stopping at "that game is not
+/// installed".
+fn ctx_with_test_game() -> (tempfile::TempDir, Ctx) {
+    struct NoServices;
+    impl crate::game_hooks::CompiledServices for NoServices {}
+
+    let (dir, ctx) = fixture();
+    let mut games = crate::game_registry::GameRegistry::builder();
+    games
+        .add_compiled(
+            "test",
+            crate::game_registry::test_support::package("test-game"),
+            Arc::new(NoServices),
+        )
+        .unwrap();
+    (dir, ctx.with_games(Arc::new(games.build())))
+}
+
 fn instance(ctx: &Ctx, id: &str, item: Option<&str>) -> PathBuf {
     let mut manifest = GameInstanceManifest::new(
         GameId::new("test-game").unwrap(),
@@ -340,6 +359,13 @@ fn base_fixture(ctx: &Ctx, tmp: &Path, base_id: &str) -> PathBuf {
     let folder = ctx.paths.bases_dir().join(base_id);
     fs::create_dir_all(&folder).unwrap();
     fs::write(folder.join("game.exe"), b"base bytes").unwrap();
+    // The marker a build writes into its own folder, so the base is one a pin may name and a
+    // rebuild may replace.
+    fs::write(
+        folder.join(".agora-base.json"),
+        serde_json::json!({ "base_id": base_id }).to_string(),
+    )
+    .unwrap();
     let manifest = serde_json::json!({
         "manifest_version": 1u32,
         "base_id": base_id,
@@ -782,4 +808,91 @@ fn a_restore_recovery_cannot_publish_a_pin_while_a_base_removal_decides() {
         "the base pinned by the restorable instance was removed"
     );
     assert!(ctx.paths.base_manifest_path(base_id).is_file());
+}
+
+/// A backup import registers an instance whose manifest names a base: the same pin a create
+/// publishes, through the same core path. It published that pin with no lock at all, so a removal
+/// that got to decide in between saw an unused base, deleted it, and reported success, leaving a
+/// live instance pinned to a folder that is gone.
+#[cfg(debug_assertions)]
+#[test]
+fn a_backup_import_cannot_publish_a_pin_to_a_base_being_removed() {
+    let (dir, ctx) = ctx_with_test_game();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    // Nothing pins the base yet, so a removal that decides now would delete it.
+    let manifest = GameInstanceManifest::new(
+        GameId::new("test-game").unwrap(),
+        "imported",
+        "Imported",
+        None,
+        BaseReference::Pinned {
+            id: base_id.into(),
+            runtime: RuntimeIdentity::minecraft("1.0"),
+            mode: BaseMode::Linked,
+        },
+    );
+
+    ctx.test_seams
+        .set_create_pause_before_publishing_pin(Some(base_id));
+    let import_ctx = ctx.clone();
+    let import_manifest = manifest.clone();
+    let import =
+        std::thread::spawn(move || game_instance::register_manifest(&import_ctx, &import_manifest));
+    let mut reached = false;
+    for _ in 0..600 {
+        if ctx.test_seams.create_pause_before_publishing_pin_reached() {
+            reached = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        reached,
+        "the import never held the base's lock before publishing its pin"
+    );
+
+    // A removal decides now: it must park on the base's lock, held until the pin is published.
+    let removal_paths = ctx.paths.clone();
+    let removal_base = base_id.to_string();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let removal = std::thread::spawn(move || {
+        let result = game_base::remove_base(&removal_paths, &removal_base);
+        let _ = done_tx.send(());
+        result
+    });
+    // If nothing keeps the base, the removal finishes on its own inside this window (the bug):
+    // it decides while the pin is still unpublished, deletes the base and reports success. Under
+    // the fix it parks on the base's lock, which the import holds until its row is inserted.
+    let mut decided_without_the_pin = false;
+    for _ in 0..300 {
+        if done_rx.try_recv().is_ok() {
+            decided_without_the_pin = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    ctx.test_seams.set_create_pause_before_publishing_pin(None);
+    let imported = import.join().unwrap().expect("the import completes");
+    let removal_outcome = removal.join().unwrap();
+
+    assert!(
+        !decided_without_the_pin,
+        "the removal decided while the pin was unpublished, instead of waiting for it"
+    );
+    assert!(
+        matches!(&removal_outcome, Err(BaseError::InUse { instances }) if instances == &vec!["imported".to_string()]),
+        "the removal must answer to the pin the import published: {removal_outcome:?}"
+    );
+    assert!(
+        base_dir.join("game.exe").is_file(),
+        "a base the imported instance pins was removed from under it"
+    );
+    assert!(ctx.paths.base_manifest_path(base_id).is_file());
+    assert!(
+        matches!(&imported.base, BaseReference::Pinned { id, .. } if id == base_id),
+        "the imported instance pins the base it names: {:?}",
+        imported.base
+    );
 }

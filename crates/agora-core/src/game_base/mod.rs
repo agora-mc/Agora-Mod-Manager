@@ -587,6 +587,49 @@ fn base_folder_is_intact(manifest: &BaseManifest) -> bool {
     base_folder_present(folder) && base_marker_matches(folder, &manifest.base_id)
 }
 
+/// What the record of a base says about whether a pin may name it, read under the base's own lock
+/// (MASTER_SPEC §32.8).
+#[derive(Debug)]
+pub(crate) enum PinnableBase {
+    /// A healthy record whose folder is really there: a pin may name it.
+    Ready(BaseManifest),
+    /// Nothing is at the record's own path, so this machine has never had that base.
+    Absent,
+    /// A record is there and is not one a pin may name: it is damaged, it names another base, the
+    /// folder it names is gone, or that folder is a link somewhere else.
+    Unusable,
+}
+
+/// The record of `base_id` as a pin publisher may use it, read under the base's own lock.
+///
+/// A removal deletes a base's folder and then its record, so a record left behind is the remains
+/// of a removal that could not finish, and a record whose folder is gone names no files. A pin to
+/// either would leave a live instance pointing at a base that is not there. The folder is judged
+/// without the build marker: a pin is only about whether the files are there, and whether a build
+/// may *replace* a folder is the marker's own question.
+///
+/// A record that cannot be read at all is an error rather than `Absent` or `Unusable`: "could not
+/// tell" is not "gone", and a caller about to pin must not be told the base is absent when the
+/// disk refused to answer.
+pub(crate) fn pinnable_base(paths: &AppPaths, base_id: &str) -> Result<PinnableBase, BaseError> {
+    let manifest_path = paths.base_manifest_path(base_id);
+    match read_base_record(base_id, &manifest_path)? {
+        BaseRecord::Missing => Ok(PinnableBase::Absent),
+        BaseRecord::Damaged => Ok(PinnableBase::Unusable),
+        BaseRecord::Healthy(manifest) => {
+            let folder = &manifest.location;
+            if manifest.base_id == base_id
+                && base_folder_present(folder)
+                && !is_reparse_point_or_symlink(folder)
+            {
+                Ok(PinnableBase::Ready(*manifest))
+            } else {
+                Ok(PinnableBase::Unusable)
+            }
+        }
+    }
+}
+
 /// Build a base for `install`: the folder every instance of it shares.
 #[allow(clippy::too_many_arguments)]
 pub fn build_base(

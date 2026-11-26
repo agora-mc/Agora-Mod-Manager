@@ -49,6 +49,9 @@ struct Seams {
     base_build_pauses: Mutex<Vec<Arc<BaseBuildPause>>>,
     #[cfg(debug_assertions)]
     create_pin_pause: PauseSlot,
+    /// Between a create's build and the base lock it holds to publish its pin: the window where a
+    /// removal can finish in between, leaving a record with no folder behind.
+    create_lock_pause: PauseSlot,
     #[cfg(debug_assertions)]
     restore_rename_pause: PauseSlot,
     /// Where a plugin install should stop, so a test sees the files and the journal exactly as a
@@ -436,20 +439,38 @@ impl TestSeams {
         }
     }
 
-    /// Test seam: make the next create that pins `base_id` stop after choosing it, until this is
-    /// called with `None`.
+    /// Test seam: make the next instance whose pin names `base_id` stop after taking the base's
+    /// lock and before publishing that pin, until this is called with `None`. A create and an
+    /// imported instance's registration both publish a pin this way.
     pub fn set_create_pause_before_publishing_pin(&self, base_id: Option<&str>) {
         self.0.create_pin_pause.set(base_id);
     }
 
-    /// Whether a paused create has reached the window and is waiting.
+    /// Whether a paused pin publisher has reached the window and is waiting.
     pub fn create_pause_before_publishing_pin_reached(&self) -> bool {
         self.0.create_pin_pause.reached()
     }
 
-    /// Stop the create here if this context asked it to.
+    /// Stop the pin publisher here if this context asked it to.
     pub(crate) fn create_pin_pause_point(&self, base_id: &str) {
         self.0.create_pin_pause.wait_if_target(base_id);
+    }
+
+    /// Test seam: make the next create that pins `base_id` stop between building the base and
+    /// taking the base's lock for its pin, until this is called with `None`. That is the window a
+    /// removal can finish in and leave a record with no folder behind.
+    pub fn set_create_pause_before_locking_base(&self, base_id: Option<&str>) {
+        self.0.create_lock_pause.set(base_id);
+    }
+
+    /// Whether a paused create has reached the window and is waiting.
+    pub fn create_pause_before_locking_base_reached(&self) -> bool {
+        self.0.create_lock_pause.reached()
+    }
+
+    /// Stop the create here if this context asked it to.
+    pub(crate) fn create_lock_pause_point(&self, base_id: &str) {
+        self.0.create_lock_pause.wait_if_target(base_id);
     }
 
     /// Test seam: make the next restore of `instance_id` pause right after its rename, until this

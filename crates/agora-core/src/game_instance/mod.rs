@@ -310,6 +310,97 @@ fn check_id_exists(
     Ok(dir.exists())
 }
 
+/// Take `base_id`'s lock for a pin this operation is about to publish, and say what the base's own
+/// record reads under it (MASTER_SPEC §32.8).
+///
+/// A base is built, or an imported instance's manifest read, some time before its pin exists in
+/// the database. In between the base looks unpinned, so a removal could finish and leave a live
+/// instance pointing at a folder that is no longer there. The lock is first in the documented
+/// order and nothing else is acquired while it is held; the read under it catches a removal that
+/// decided first, and one that starts after must wait and answer to the pin.
+///
+/// A base that is there but unusable (a damaged record, another base's record, a record whose
+/// folder is gone, or a folder that is a link) is always an error: publishing a pin to it would
+/// name a base nobody can read. A record that is simply not there is left to the caller, because
+/// a base made a moment ago and one from another machine's backup look the same on disk.
+fn lock_base_for_pin(
+    ctx: &Ctx,
+    base_id: &str,
+    operation: &str,
+) -> Result<
+    (
+        crate::lock_manager::LockGuard,
+        crate::game_base::PinnableBase,
+    ),
+    InstanceError,
+> {
+    let hold = ctx
+        .lock_manager
+        .acquire(
+            crate::lock_manager::LockResource::Base(base_id.to_string()),
+            operation,
+        )
+        .map_err(|error| {
+            InstanceError::Other(format!(
+                "could not lock base {base_id} to publish this instance's pin: {error}"
+            ))
+        })?;
+    let found = crate::game_base::pinnable_base(&ctx.paths, base_id).map_err(|error| {
+        InstanceError::Other(format!(
+            "the base {base_id} this instance would pin cannot be read ({error}), so Agora \
+             cannot tell whether its removal finished while the instance was being made. \
+             Try again."
+        ))
+    })?;
+    if matches!(found, crate::game_base::PinnableBase::Unusable) {
+        return Err(InstanceError::Other(format!(
+            "the base {base_id} this instance would pin is not usable: its record is damaged or \
+             names another base, the folder it names is gone, or the folder is a link somewhere \
+             else. Its removal may have finished while the instance was being made. Try again."
+        )));
+    }
+    Ok((hold, found))
+}
+
+/// Hold the base this operation just built until its pin is published, and answer the record the
+/// pin names. A base built a moment ago and not there now means a removal finished in the gap, so
+/// the pin is refused rather than published to a folder that is gone.
+fn hold_base_for_new_pin(
+    ctx: &Ctx,
+    base_id: &str,
+    operation: &str,
+) -> Result<
+    (
+        crate::lock_manager::LockGuard,
+        crate::game_base::BaseManifest,
+    ),
+    InstanceError,
+> {
+    let (hold, found) = lock_base_for_pin(ctx, base_id, operation)?;
+    match found {
+        crate::game_base::PinnableBase::Ready(record) => Ok((hold, record)),
+        _ => Err(InstanceError::Other(format!(
+            "the base {base_id} this instance would pin is gone: its record is not there any \
+             more, so a removal finished while the instance was being made. Try again."
+        ))),
+    }
+}
+
+/// Hold the base an imported manifest names until its pin is published.
+///
+/// A backup from another machine names a base that was machine-local there, so a base with no
+/// record here is not a removal: the pin is published as the backup recorded it, and opening the
+/// instance reports a base Agora cannot find (rather than the import failing and the person left
+/// with no instance at all). A base that *is* here but unusable still refuses.
+fn hold_base_for_imported_pin(
+    ctx: &Ctx,
+    base_id: &str,
+    operation: &str,
+) -> Result<crate::lock_manager::LockGuard, InstanceError> {
+    let (hold, _found) = lock_base_for_pin(ctx, base_id, operation)?;
+    Ok(hold)
+}
+
 /// Create a generic game instance from an identified install.
 pub fn create(
     ctx: &Ctx,
@@ -404,47 +495,14 @@ pub fn create_with_options(
         let base_id = manifest.base_id.clone();
         // The build released its lock on the base, and the pin this instance will publish does
         // not exist yet, so a removal could sweep the base out from between those two moments.
-        // Take the base's lock (first in the documented order; no other lock is acquired while
-        // it is held) from choosing the base until the pin's row is inserted below: a removal
-        // either decided before this (detected by re-reading the record) or sees the pin after.
-        let hold = ctx
-            .lock_manager
-            .acquire(
-                crate::lock_manager::LockResource::Base(base_id.clone()),
-                "create-instance",
-            )
-            .map_err(|error| {
-                InstanceError::Other(format!(
-                    "could not lock base {base_id} to publish this instance's pin: {error}"
-                ))
-            })?;
-        let manifest_path = ctx.paths.base_manifest_path(&base_id);
-        let text = std::fs::read_to_string(&manifest_path).map_err(|error| {
-            InstanceError::Other(format!(
-                "the base {base_id} this instance would pin was kept (its record at \
-                 {} cannot be read: {error}); its removal may have finished while the \
-                 instance was being created. Try again.",
-                manifest_path.display()
-            ))
-        })?;
-        let record: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
-            InstanceError::Other(format!(
-                "the base {base_id} this instance would pin was kept (its record at \
-                 {} cannot be read: {error}); its removal may have finished while the \
-                 instance was being created. Try again.",
-                manifest_path.display()
-            ))
-        })?;
-        if record.get("base_id").and_then(|id| id.as_str()) != Some(base_id.as_str()) {
-            return Err(InstanceError::Other(format!(
-                "the base {base_id} this instance would pin no longer exists as itself; \
-                 its removal may have finished while the instance was being created. Try again."
-            )));
-        }
+        // A test can park the create in that gap to race a removal against it.
+        #[cfg(debug_assertions)]
+        ctx.test_seams.create_lock_pause_point(&base_id);
+        let (hold, record) = hold_base_for_new_pin(ctx, &base_id, "create-instance")?;
         let b_ref = BaseReference::Pinned {
-            id: manifest.base_id.clone(),
-            runtime: manifest.runtime.clone(),
-            mode: manifest.mode,
+            id: record.base_id.clone(),
+            runtime: record.runtime.clone(),
+            mode: record.mode,
         };
         base_lock = Some(hold);
         (b_ref, Some(outcome))
@@ -573,6 +631,21 @@ pub fn register_manifest(
             "the definition for game '{}' is not installed, so an instance of it cannot be registered",
             manifest.game.as_str()
         )));
+    }
+
+    // An imported instance that names a base publishes the same pin a create does, so it holds
+    // the base from here until its row is inserted, under the record re-read: a removal that
+    // started first has to answer to the pin, and a local base left unusable by one fails the
+    // registration instead of leaving the instance pinned to it (the backup stays restorable).
+    let _base_hold = match &manifest.base {
+        BaseReference::Pinned { id, .. } => {
+            Some(hold_base_for_imported_pin(ctx, id, "register-manifest")?)
+        }
+        BaseReference::Unpinned { .. } => None,
+    };
+    #[cfg(debug_assertions)]
+    if let BaseReference::Pinned { id, .. } = &manifest.base {
+        ctx.test_seams.create_pin_pause_point(id);
     }
 
     let manifest_path = instance_dir.join("instance_manifest.json");

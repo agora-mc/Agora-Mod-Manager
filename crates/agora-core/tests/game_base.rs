@@ -1447,6 +1447,111 @@ fn base_removal_cannot_remove_a_base_an_instance_create_is_choosing() {
     assert_eq!(present, Some(1), "the created instance's row is published");
 }
 
+/// A create builds its base and publishes its pin later. A removal that runs in that gap, deletes
+/// the folder and cannot delete the record leaves a record naming no files. The create holds the
+/// base's lock while it re-reads that record, so it is the read that has to refuse: a pin must
+/// name a base that is really there, record and folder alike.
+#[cfg(debug_assertions)]
+#[test]
+fn a_create_cannot_pin_a_base_whose_removal_deleted_its_folder() {
+    use agora_core::ctx::CoreContext;
+    use agora_core::game_base::remove_base_with;
+    use agora_core::game_instance;
+
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("31"));
+    let outcome = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+    let base_folder = paths.bases_dir().join(&base_id);
+    assert!(base_folder.join(".agora-base.json").is_file());
+
+    let ctx = CoreContext::for_testing(tmp.path().join("data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+
+    // Park the create between building the base and taking the base's lock for its pin.
+    ctx.test_seams
+        .set_create_pause_before_locking_base(Some(&base_id));
+    let create_ctx = ctx.clone();
+    let create_install = install.clone();
+    let create_definition = test_definition();
+    let create = std::thread::spawn(move || {
+        game_instance::create(
+            &create_ctx,
+            &create_install,
+            &create_definition,
+            "Pinned late",
+            Some("pinned-late".into()),
+            BaseMode::Linked,
+            &|_| {},
+        )
+    });
+    let mut reached = false;
+    for _ in 0..600 {
+        if ctx.test_seams.create_pause_before_locking_base_reached() {
+            reached = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        reached,
+        "the create never got between its build and its base's lock"
+    );
+
+    // The removal deletes the folder and cannot delete the record, so it reports that it did not
+    // finish and the record stays, naming a folder that is gone.
+    let removal = remove_base_with(
+        &paths,
+        &base_id,
+        || {},
+        |path| std::fs::metadata(path),
+        |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the record is in use by another program",
+            ))
+        },
+    );
+    assert!(
+        removal.is_err(),
+        "the injected refusal must leave the record behind"
+    );
+    assert!(!base_folder.exists(), "the removal deleted the folder");
+
+    ctx.test_seams.set_create_pause_before_locking_base(None);
+    let created = create.join().unwrap();
+
+    let error = created.expect_err("a create pinned a base whose folder is gone");
+    let message = format!("{error}");
+    assert!(
+        message.contains(&base_id),
+        "the refusal names the base: {message}"
+    );
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM instances WHERE instance_id = 'pinned-late'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0, "a refused create publishes no row");
+    assert!(
+        !ctx.paths.instance_dir("pinned-late").unwrap().exists(),
+        "a refused create leaves no instance folder"
+    );
+}
+
 #[test]
 fn base_id_parts_never_start_or_end_with_a_dot() {
     for odd in ["1.", ".1", ".", "..", "...", "a..b."] {
