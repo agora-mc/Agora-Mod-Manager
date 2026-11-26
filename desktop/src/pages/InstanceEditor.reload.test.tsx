@@ -91,7 +91,10 @@ beforeEach(() => {
       case 'get_dependency_graph':
       case 'list_loadout_profiles':
         return command === 'list_loadout_profiles'
-          ? [{ name: 'Fast', enabled_mods: [], created_at: '2026-01-01T00:00:00Z' }]
+          ? {
+              profiles: [{ name: 'Fast', enabled_mods: [], created_at: '2026-01-01T00:00:00Z' }],
+              damaged: [],
+            }
           : [];
       case 'list_instance_templates': return [template];
       case 'list_snapshots':

@@ -67,7 +67,10 @@ beforeEach(() => {
         if (edgesGate) await edgesGate;
         return edges;
       case 'list_loadout_profiles':
-        return [{ name: 'Fast', enabled_mods: [], created_at: '2026-01-01T00:00:00Z' }];
+        return {
+          profiles: [{ name: 'Fast', enabled_mods: [], created_at: '2026-01-01T00:00:00Z' }],
+          damaged: [],
+        };
       case 'list_loadout_unlisted_mods':
         return [];
       case 'list_instance_templates':
