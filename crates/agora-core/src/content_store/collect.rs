@@ -445,6 +445,36 @@ impl Owners {
             self.folder_entries(&root, report, &mut collect_trashed)?;
         }
 
+        // A launcher import moves an instance tree — snapshots included — under `staging/` before
+        // it rolls back or promotes it. A collection running in that window, or one that starts
+        // after a crash before the rollback, has to read the manifests that moved there: they name
+        // objects the instance will need back, and nothing else names them meanwhile
+        // (MASTER_SPEC §32.8).
+        let mut collect_moved = |path: &Path, report: &mut CollectReport| -> Result<(), String> {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if !(name.starts_with(".agora-quarantine-") || name.starts_with(".agora-import-")) {
+                return Ok(());
+            }
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_dir() => instances.push(path.to_path_buf()),
+                Ok(_) => report.refusals.push(format!(
+                    "{} is a link or not a folder, so the instance it holds cannot be judged; \
+                     nothing is deleted",
+                    path.display()
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => report.refusals.push(format!(
+                    "cannot inspect the moved instance {}: {error}",
+                    path.display()
+                )),
+            }
+            Ok(())
+        };
+        self.folder_entries(&paths.staging_root(), report, &mut collect_moved)?;
+
         for instance in &instances {
             self.read_instance_manifest(instance, keep, report);
             self.read_snapshot_folder(instance, request, keep, report);

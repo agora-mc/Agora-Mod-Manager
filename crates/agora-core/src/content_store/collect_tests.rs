@@ -741,3 +741,47 @@ fn a_trashed_instance_that_is_a_link_is_named_and_nothing_is_deleted() {
     );
     assert!(snap.id.len() > 10);
 }
+
+// ---------------------------------------------------------------------------
+// 11. An instance a launcher import moved under staging keeps what it names
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_snapshot_in_import_quarantine_keeps_its_blobs() {
+    let (_dir, ctx) = fixture();
+    let live = instance_with_file(&ctx, "imported", b"quarantined bytes");
+    let snap = snapshot::create_snapshot(&live, None, &["mods"]).unwrap();
+    let blob = sha256_hex(b"quarantined bytes");
+
+    // What a launcher-import update does before it promotes the new tree or rolls the old one
+    // back: the instance folder itself, snapshots and all, is renamed to
+    // `staging/.agora-quarantine-*`. Only the manifests in there name the blob now.
+    let quarantine = ctx
+        .paths
+        .staging_root()
+        .join(".agora-quarantine-imported-crashed");
+    fs::create_dir_all(ctx.paths.staging_root()).unwrap();
+    fs::rename(&live, &quarantine).unwrap();
+    assert!(object_exists(&ctx, &blob));
+
+    let report = crate::content_store::collect::collect_with_ctx(
+        &ctx,
+        &CollectRequest {
+            store: LockRequest::Wait,
+            locations: LockRequest::Wait,
+            grace: None,
+            ignore_unreadable_snapshots: false,
+            pause: None,
+        },
+    );
+    assert!(
+        !report.refused(),
+        "the collection ran: {:?}",
+        report.refusals
+    );
+    assert!(
+        object_exists(&ctx, &blob),
+        "a snapshot a launcher import moved under staging still names its blobs"
+    );
+    assert!(snap.id.len() > 10);
+}
