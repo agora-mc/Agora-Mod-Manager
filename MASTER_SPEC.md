@@ -5757,14 +5757,26 @@ modules, duplicated triggers.
 ### 32.8 One content store (before release)
 Mod files live in `content/objects` with its own sweep, and snapshots keep a second store,
 `snapshot-objects`, that re-reads every manifest to decide what to delete.
-- **One object store** (`content/objects`) with a reference index (`content_refs`: object, owner kind,
-  owner id, path). Placing, snapshotting and restoring add or remove references.
-- **Deletion needs proof of reachability,** not just a readable index: an index can read fine and
-  still be incomplete. Before the first collection, and whenever the index's generation is older than
-  the last migration or recovery, a full reconcile scans every owner (live instances, snapshots,
-  trash, in-flight operations, library items, icons) and rebuilds the references. An interrupted
-  reference publication marks the index stale, so collection cannot resume until a reconcile. Collection then deletes only objects with
-  no reference, under the store lock, after a grace period, and deletes nothing if any read fails.
+- **One object store** (`content/objects`). Snapshots write their blobs there with the store's one
+  writer (temp file, `sync_all`, rename, verified receipt); reads fall back to the old
+  `snapshot-objects` only until the migration below has run.
+- **No reference index (owner, 2026-11-25).** What is in use is worked out fresh from the owners'
+  own records at every collection: content item records (files, icons, sources), live instance
+  manifests, snapshot manifests (in live instances and in both Recently deleted roots), and
+  in-flight operations. An index would be a second answer kept beside the files, updated by every
+  writer without a transaction spanning both, which is the shape of the base-pinning bugs (32.11).
+  A scan of hundreds of records takes well under a second; an index can come back later as a cache
+  checked against a scan, never as the authority.
+- **In-flight operations register what they are about to use** before they reuse or add an object
+  (a pending record under `content/pending/`, written under the store lock with the process's
+  identity), and remove it after their owner record is published. A pending record of a process
+  the one liveness check (32.13) proves dead is ignored and reported; "cannot tell" keeps it.
+- **One collector** behind every entry point (removing a content item, deleting a snapshot,
+  automatic retention, `agora content gc`). It holds the store lock and then the
+  instance-locations lock from its first listing through its last delete, never deletes an object
+  newer than a grace period, and deletes nothing if any owner record, listing or pending record
+  cannot be read, or if an owner location is a link it cannot follow safely (named in the refusal).
+  `--ignore-unreadable-snapshots` stays as the person's explicit override, with the risk named.
 - Until the stores are unified, the snapshot and content-store scans hold a single
   cross-process instance-locations lock from the first listing through the last manifest read.
   Moves between live and Recently deleted and purges take the same lock. Base removal, and a build
@@ -5781,10 +5793,12 @@ Mod files live in `content/objects` with its own sweep, and snapshots keep a sec
   base until its pin's row is published, and re-reads the record under it, so a removal cannot
   finish between those two moments undetected.
 - **Migration:** snapshot objects are moved in and re-hashed; mismatches are kept and reported;
-  resumable.
+  resumable (a journal on the 32.11 envelope). The old `snapshot-objects` reads and sweep are removed
+  once it has run.
 - `plugins/blobs` stays separate (a per-plugin key-value store, not content-addressed).
 - **Tests:** removing a mod a snapshot holds keeps the object; deleting the last snapshot frees it;
-  an unreadable or incomplete index deletes nothing; a crash halfway through the migration resumes.
+  an unreadable owner record or pending record deletes nothing; a capture that reuses a blob while a
+  collection runs keeps it; a crash halfway through the migration resumes.
 
 ### 32.9 `Ctx`, process state, database access and the settings cache
 - **Statics:** configuration moves into `Ctx` (`ctx.net`, program name); process-wide resource guards
