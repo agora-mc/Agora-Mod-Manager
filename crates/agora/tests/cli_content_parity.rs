@@ -91,6 +91,74 @@ fn crash_report_for_an_instance_with_no_evidence_says_so_in_json() {
 }
 
 #[test]
+fn content_add_refuses_unwritable_names_and_imports_without_them_on_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let archive = work.path().join("mod.zip");
+    {
+        use std::io::Write;
+        let file = std::fs::File::create(&archive).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in [("ok.txt", b"fine" as &[u8]), ("Data/con.txt", b"1")] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    let archive_arg = archive.to_string_lossy().to_string();
+
+    // Refused by default, with the entry and why on the command line.
+    let refused = agora(tmp.path(), &["games", "content", "add", &archive_arg]);
+    assert_eq!(refused.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("Data/con.txt"), "{stderr}");
+    assert!(stderr.contains("device name"), "{stderr}");
+    assert!(stderr.contains("--without-unwritable-names"), "{stderr}");
+
+    // The same refusal as data, so a front end lists the names instead of parsing them.
+    let refused_json = agora(
+        tmp.path(),
+        &["--json", "games", "content", "add", &archive_arg],
+    );
+    assert_eq!(refused_json.status.code(), Some(1));
+    let envelope: serde_json::Value = serde_json::from_str(
+        String::from_utf8_lossy(&refused_json.stderr)
+            .lines()
+            .skip_while(|line| !line.starts_with('{'))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .as_str(),
+    )
+    .expect("a JSON error envelope");
+    assert_eq!(envelope["unwritableNames"][0]["name"], "Data/con.txt");
+
+    // Opted in: the files that can be written are stored, and the rest are listed in the result.
+    let imported = agora(
+        tmp.path(),
+        &[
+            "--json",
+            "games",
+            "content",
+            "add",
+            &archive_arg,
+            "--without-unwritable-names",
+        ],
+    );
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let outcome: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&imported.stdout).as_ref())
+            .expect("the added item as JSON");
+    assert_eq!(outcome["item"]["files"].as_array().unwrap().len(), 1);
+    assert_eq!(outcome["skipped"][0]["name"], "Data/con.txt");
+}
+
+#[test]
 fn reading_a_missing_instance_or_item_fails_with_exit_1() {
     let tmp = tempfile::tempdir().unwrap();
     for args in [
