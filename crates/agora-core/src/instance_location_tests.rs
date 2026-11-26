@@ -105,7 +105,7 @@ fn object_in_any_store(instance_dir: &Path, hash: &str) -> bool {
 }
 
 fn snapshot_move_race(restore: bool) {
-    let (_dir, ctx) = fixture();
+    let (dir, ctx) = fixture();
     let a = instance(&ctx, "first", None);
     let b = instance(&ctx, "second", None);
     let first = snapshot::create_snapshot(&a, None, &["tracked.txt"]).unwrap();
@@ -118,29 +118,27 @@ fn snapshot_move_race(restore: bool) {
             .trash_entry_id
             .unwrap()
     });
-    let pause_root = if restore {
-        ctx.paths.instances_root()
-    } else {
-        ctx.paths.recently_deleted_games_root()
-    };
-    let fired = AtomicBool::new(false);
-    let locations = contend(&ctx);
-    snapshot::delete_snapshot_with(
-        &a,
-        &first.id,
-        |dir| {
-            let entries = snapshot::list_snapshot_scan_dir(dir);
-            if dir == pause_root && !fired.swap(true, Ordering::SeqCst) {
-                attempt_move(&ctx, entry.as_deref());
-            }
-            entries
-        },
-        &locations,
-        None,
-        Some(Duration::ZERO),
+    // Only the other instance's snapshot still names the blob, so the sweep would free it unless
+    // moving that instance into or out of Recently deleted waits for the collection.
+    fs::remove_file(
+        a.join(".agora_snapshots")
+            .join(format!("{}.json", first.id)),
     )
     .unwrap();
-    assert!(fired.load(Ordering::SeqCst), "the scan reached the pause");
+
+    let fired = Arc::new(AtomicBool::new(false));
+    let fired_in_hook = Arc::clone(&fired);
+    let move_ctx = Ctx::for_testing(dir.path().to_path_buf());
+    let pause = Arc::new(move || {
+        if !fired_in_hook.swap(true, Ordering::SeqCst) {
+            attempt_move(&move_ctx, entry.as_deref());
+        }
+    });
+    snapshot::prune_unreferenced_objects_with_pause(&a, Some(Duration::ZERO), Some(pause)).unwrap();
+    assert!(
+        fired.load(Ordering::SeqCst),
+        "the collection reached the pause"
+    );
     assert!(
         object_in_any_store(&a, &hash),
         "cleanup deleted a blob still needed by the moving instance"

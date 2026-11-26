@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime};
 use crate::app_paths::AppPaths;
 use crate::content_store::pending::PendingRecord;
 use crate::content_store::ContentItem;
-use crate::lock_manager::{LockManager, LockGuard, LockResource};
+use crate::lock_manager::{LockGuard, LockManager, LockResource};
 use crate::process_identity::{ProcessCheck, ProcessIdentity};
 
 /// How long a newly written object is left alone whatever the records say.
@@ -43,7 +43,7 @@ pub(crate) enum LockRequest {
 }
 
 /// What one collection is asked to do.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct CollectRequest {
     pub store: LockRequest,
     pub locations: LockRequest,
@@ -54,6 +54,25 @@ pub(crate) struct CollectRequest {
     /// instead of stopping the collection. It is the same choice `--ignore-unreadable-snapshots`
     /// makes when an item is removed.
     pub ignore_unreadable_snapshots: bool,
+    /// A test seam: called once the owner records have been listed and before the first delete, so
+    /// a test can try to move an instance in the window the collection's locks must hold shut.
+    /// Production never installs one.
+    pub pause: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for CollectRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CollectRequest")
+            .field("store", &self.store)
+            .field("locations", &self.locations)
+            .field("grace", &self.grace)
+            .field(
+                "ignore_unreadable_snapshots",
+                &self.ignore_unreadable_snapshots,
+            )
+            .field("pause", &self.pause.as_ref().map(|_| "<hook>"))
+            .finish()
+    }
 }
 
 impl Default for CollectRequest {
@@ -63,6 +82,7 @@ impl Default for CollectRequest {
             locations: LockRequest::Wait,
             grace: None,
             ignore_unreadable_snapshots: false,
+            pause: None,
         }
     }
 }
@@ -91,10 +111,7 @@ impl CollectReport {
     /// One line for a person: what was reclaimed, or what was not and why.
     pub(crate) fn summary(&self) -> String {
         if self.refused() {
-            return format!(
-                "kept every stored object: {}",
-                self.refusals.join("; ")
-            );
+            return format!("kept every stored object: {}", self.refusals.join("; "));
         }
         let mut parts = Vec::new();
         if !self.deleted.is_empty() {
@@ -134,7 +151,12 @@ pub(crate) fn collect(
     let manager = LockManager::new(paths.locks_root());
     // Store lock first, then instance locations: the order every caller uses, so two collectors
     // and an instance move cannot deadlock.
-    let _store = acquire(&manager, LockResource::ContentStore, request.store, STORE_WAIT)?;
+    let _store = acquire(
+        &manager,
+        LockResource::ContentStore,
+        request.store,
+        STORE_WAIT,
+    )?;
     let _locations = match request.locations {
         LockRequest::Held => None,
         LockRequest::Try => Some(
@@ -180,9 +202,15 @@ pub(crate) fn collect(
     let grace = request.grace.unwrap_or(OBJECT_GRACE);
     let now = SystemTime::now();
     for root in object_roots(paths) {
-        if let Err(error) =
-            read_object_root(&root, &keep, grace, now, &mut candidates, &mut recent, &mut report)
-        {
+        if let Err(error) = read_object_root(
+            &root,
+            &keep,
+            grace,
+            now,
+            &mut candidates,
+            &mut recent,
+            &mut report,
+        ) {
             report.refusals.push(error);
         }
     }
@@ -191,6 +219,9 @@ pub(crate) fn collect(
         return Ok(report);
     }
     report.kept_recent = recent;
+    if let Some(pause) = &request.pause {
+        pause();
+    }
 
     for (hash, path) in candidates {
         match remove_object(&path) {
@@ -223,7 +254,11 @@ pub(crate) fn collect_with_ctx(ctx: &crate::ctx::Ctx, request: &CollectRequest) 
     if request.grace.is_none() {
         request.grace = ctx.test_seams.object_grace();
     }
-    match collect(&ctx.paths, &|identity| ctx.process_check(identity), &request) {
+    match collect(
+        &ctx.paths,
+        &|identity| ctx.process_check(identity),
+        &request,
+    ) {
         Ok(report) => report,
         Err(error) => CollectReport {
             refusals: vec![error],
@@ -239,7 +274,11 @@ pub(crate) fn collect_at_instance(
     request: &CollectRequest,
 ) -> Result<CollectReport, String> {
     let paths = crate::snapshot::snapshot_store_paths(instance_dir);
-    collect(&paths, &|identity| crate::process_identity::check(identity), request)
+    collect(
+        &paths,
+        &|identity| crate::process_identity::check(identity),
+        request,
+    )
 }
 
 /// Take one lock for a collection.
@@ -251,9 +290,12 @@ fn acquire(
 ) -> Result<Option<LockGuard>, String> {
     let guard = match request {
         LockRequest::Held => return Ok(None),
-        LockRequest::Try => manager
-            .acquire_with_timeout(resource.clone(), "content-collect", Duration::ZERO, None),
-        LockRequest::Wait => manager.acquire_with_timeout(resource.clone(), "content-collect", wait, None),
+        LockRequest::Try => {
+            manager.acquire_with_timeout(resource.clone(), "content-collect", Duration::ZERO, None)
+        }
+        LockRequest::Wait => {
+            manager.acquire_with_timeout(resource.clone(), "content-collect", wait, None)
+        }
     };
     match guard {
         Ok(guard) => Ok(Some(guard)),
@@ -299,11 +341,14 @@ impl Owners {
             }
         };
         for entry in entries {
-            let entry = entry.map_err(|error| {
-                format!("cannot read an entry in {}: {error}", dir.display())
-            })?;
+            let entry = entry
+                .map_err(|error| format!("cannot read an entry in {}: {error}", dir.display()))?;
             let path = entry.path();
-            if path.extension().map(|extension| extension != "json").unwrap_or(true) {
+            if path
+                .extension()
+                .map(|extension| extension != "json")
+                .unwrap_or(true)
+            {
                 continue;
             }
             let item: ContentItem = match std::fs::read_to_string(&path)
@@ -352,19 +397,18 @@ impl Owners {
         report: &mut CollectReport,
     ) -> Result<(), String> {
         let mut instances: Vec<PathBuf> = Vec::new();
-        let mut collect_folder =
-            |path: &Path, report: &mut CollectReport| -> Result<(), String> {
-                match std::fs::symlink_metadata(path) {
-                    Ok(metadata) if metadata.is_dir() => instances.push(path.to_path_buf()),
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => report.refusals.push(format!(
-                        "cannot inspect the instance folder {}: {error}",
-                        path.display()
-                    )),
-                }
-                Ok(())
-            };
+        let mut collect_folder = |path: &Path, report: &mut CollectReport| -> Result<(), String> {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_dir() => instances.push(path.to_path_buf()),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => report.refusals.push(format!(
+                    "cannot inspect the instance folder {}: {error}",
+                    path.display()
+                )),
+            }
+            Ok(())
+        };
         self.folder_entries(&paths.instances_root(), report, &mut collect_folder)?;
 
         for root in [
@@ -463,10 +507,9 @@ impl Owners {
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
             Err(error) => {
-                report.refusals.push(format!(
-                    "cannot inspect {}: {error}",
-                    path.display()
-                ));
+                report
+                    .refusals
+                    .push(format!("cannot inspect {}: {error}", path.display()));
                 return;
             }
         }
@@ -510,7 +553,9 @@ impl Owners {
             Ok(_) => return,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
             Err(error) => {
-                report.refusals.push(format!("cannot inspect {}: {error}", dir.display()));
+                report
+                    .refusals
+                    .push(format!("cannot inspect {}: {error}", dir.display()));
                 return;
             }
         }
@@ -527,9 +572,10 @@ impl Owners {
             let path = match entry {
                 Ok(entry) => entry.path(),
                 Err(error) => {
-                    report
-                        .refusals
-                        .push(format!("cannot read an entry in {}: {error}", dir.display()));
+                    report.refusals.push(format!(
+                        "cannot read an entry in {}: {error}",
+                        dir.display()
+                    ));
                     continue;
                 }
             };
@@ -554,7 +600,8 @@ impl Owners {
                 Err(error) if request.ignore_unreadable_snapshots => {
                     report.failures.push(format!(
                         "kept the objects of a snapshot that cannot be read ({}) because \
-                         --ignore-unreadable-snapshots was given: {error}",
+                         --ignore-unreadable-snapshots was given, and a snapshot that cannot be \
+                         read may lose files it needs to restore: {error}",
                         path.display()
                     ));
                 }
@@ -588,7 +635,11 @@ fn read_pending(
         let path = entry
             .map_err(|error| format!("cannot read an entry in {}: {error}", dir.display()))?
             .path();
-        if path.extension().map(|extension| extension != "json").unwrap_or(true) {
+        if path
+            .extension()
+            .map(|extension| extension != "json")
+            .unwrap_or(true)
+        {
             continue;
         }
         let record = match PendingRecord::read(&path) {
@@ -653,9 +704,9 @@ fn read_object_root(
         let objects = std::fs::read_dir(&shard)
             .map_err(|error| format!("cannot list {}: {error}", shard.display()))?;
         for object in objects {
-            let path = object.map(|entry| entry.path()).map_err(|error| {
-                format!("cannot read an entry in {}: {error}", shard.display())
-            })?;
+            let path = object
+                .map(|entry| entry.path())
+                .map_err(|error| format!("cannot read an entry in {}: {error}", shard.display()))?;
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };

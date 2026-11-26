@@ -8,7 +8,12 @@ use agora_core::content_store as cs;
 use agora_core::ctx::CoreContext;
 
 fn ctx(tmp: &Path) -> CoreContext {
-    CoreContext::for_testing(tmp.join("data"))
+    let ctx = CoreContext::for_testing(tmp.join("data"));
+    // These tests are about what a sweep frees; their fixtures write objects a moment before the
+    // sweep runs, so the production hour of grace would keep every one of them.
+    ctx.test_seams
+        .set_object_grace(Some(std::time::Duration::ZERO));
+    ctx
 }
 
 fn zip_with(path: &Path, entries: &[(&str, &[u8])]) -> PathBuf {

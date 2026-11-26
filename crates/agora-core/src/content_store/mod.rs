@@ -4,6 +4,8 @@
 //! and verifiable. Nothing deploys content to a game yet (slice 2).
 
 pub mod collect;
+#[cfg(test)]
+mod collect_tests;
 pub mod convert;
 #[cfg(test)]
 mod import_bench;
@@ -2487,6 +2489,7 @@ pub fn remove_item_with_options(
             store: collect::LockRequest::Held,
             locations: collect::LockRequest::Wait,
             grace: None,
+            pause: None,
             ignore_unreadable_snapshots: options.ignore_unreadable_snapshots,
         },
     );

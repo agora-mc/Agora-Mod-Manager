@@ -574,12 +574,8 @@ pub(crate) fn snapshot_blob_source(instance_dir: &Path, hash: &str, size: u64) -
         return Some(content);
     }
     let legacy = snapshot_blob_path(instance_dir, hash);
-    let receipt = crate::artifact_receipt::is_verified(
-        &legacy,
-        "sha256",
-        hash,
-        i64::try_from(size).ok(),
-    );
+    let receipt =
+        crate::artifact_receipt::is_verified(&legacy, "sha256", hash, i64::try_from(size).ok());
     if legacy.is_file() && (receipt || blob_file_matches(&legacy, hash, size)) {
         return Some(legacy);
     }
@@ -1592,12 +1588,11 @@ pub fn create_snapshot_from_data(
         roots.entry(name).or_insert(state);
         match &file.contents {
             Some(bytes) => {
-                let (hash, size) =
-                    crate::content_store::place_object_from_bytes(
-                        &snapshot_store_paths(instance_dir),
-                        bytes,
-                    )
-                    .map_err(|e| e.to_string())?;
+                let (hash, size) = crate::content_store::place_object_from_bytes(
+                    &snapshot_store_paths(instance_dir),
+                    bytes,
+                )
+                .map_err(|e| e.to_string())?;
                 total_size += size;
                 entries.push(SnapshotFileEntry {
                     relative_path: file.relative_path.clone(),
@@ -3234,6 +3229,7 @@ pub(super) fn delete_snapshot_with(
             locations: crate::content_store::collect::LockRequest::Held,
             grace,
             ignore_unreadable_snapshots: false,
+            pause: None,
         },
     )
     .map_err(|error| format!("snapshot {snapshot_id} was deleted, but {error}"))?;
@@ -3301,7 +3297,11 @@ pub fn snapshot_storage_size(instance_dir: &Path, snapshot_id: &str) -> u64 {
                     // damaged blob still counts its size against the cap.
                     let path = snapshot_blob_path(instance_dir, hash);
                     fs::metadata(&path)
-                        .or_else(|_| fs::metadata(snapshot_store_paths(instance_dir).content_object_path(hash)))
+                        .or_else(|_| {
+                            fs::metadata(
+                                snapshot_store_paths(instance_dir).content_object_path(hash),
+                            )
+                        })
                         .map(|m| m.len())
                         .unwrap_or(0)
                 })
@@ -3329,6 +3329,16 @@ pub(crate) fn prune_unreferenced_objects_with_grace(
     instance_dir: &Path,
     grace: Option<std::time::Duration>,
 ) -> Result<(), String> {
+    prune_unreferenced_objects_with_pause(instance_dir, grace, None)
+}
+
+/// [`prune_unreferenced_objects_with_grace`] with the collector's pause installed: the test hook
+/// fires once every owner record has been listed and before the first delete.
+pub(crate) fn prune_unreferenced_objects_with_pause(
+    instance_dir: &Path,
+    grace: Option<std::time::Duration>,
+    pause: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+) -> Result<(), String> {
     let report = crate::content_store::collect::collect_at_instance(
         instance_dir,
         &crate::content_store::collect::CollectRequest {
@@ -3336,6 +3346,7 @@ pub(crate) fn prune_unreferenced_objects_with_grace(
             locations: crate::content_store::collect::LockRequest::Try,
             grace,
             ignore_unreadable_snapshots: false,
+            pause,
         },
     )?;
     if report.refused() {
@@ -3536,12 +3547,15 @@ mod tests {
         let manifest_path = snapshot_manifest_path(&a, &snap.id);
         let mut manifest: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
-        manifest["files"].as_array_mut().unwrap().push(serde_json::json!({
-            "relative_path": "mods/other.jar",
-            "size": 3,
-            "sha256": "not-a-sha256",
-            "blob_sha256": "not-a-sha256",
-        }));
+        manifest["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "relative_path": "mods/other.jar",
+                "size": 3,
+                "sha256": "not-a-sha256",
+                "blob_sha256": "not-a-sha256",
+            }));
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 
         super::prune_unreferenced_objects_with_grace(&a, Some(std::time::Duration::ZERO)).unwrap();
@@ -3579,16 +3593,16 @@ mod tests {
         // without following a tree this collection was not asked about, so nothing is deleted.
         let link = tmp.path().join("instances").join("linked");
         if !make_folder_link(&b, &link) {
-            eprintln!("skipped: this process cannot create a folder link, so the check does not run");
+            eprintln!(
+                "skipped: this process cannot create a folder link, so the check does not run"
+            );
             return;
         }
         fs::remove_file(snapshot_manifest_path(&a, &snap_a.id)).unwrap();
 
-        let error = super::prune_unreferenced_objects_with_grace(
-            &a,
-            Some(std::time::Duration::ZERO),
-        )
-        .expect_err("a linked instance must stop the collection");
+        let error =
+            super::prune_unreferenced_objects_with_grace(&a, Some(std::time::Duration::ZERO))
+                .expect_err("a linked instance must stop the collection");
         assert!(
             error.contains("is a link") && error.contains(&link.display().to_string()),
             "the refusal names the link: {error}"
@@ -3721,7 +3735,7 @@ mod tests {
         fs::write(snapshots_dir(&a).join("live-file-index.json"), b"garbage").unwrap();
         fs::write(snapshots_dir(&a).join("mutation-journal.json"), b"garbage").unwrap();
         assert!(count_snapshot_objects(&a) > 0);
-        delete_snapshot(&a, &snap.id).unwrap();
+        delete_snapshot_collecting(&a, &snap.id, Some(std::time::Duration::ZERO)).unwrap();
         assert!(!snapshot_objects_dir(&a).exists() || count_snapshot_objects(&a) == 0);
     }
 
@@ -4134,7 +4148,9 @@ mod tests {
         let manifest_path = snapshot_manifest_path(&inst, &snap.id);
         assert!(manifest_path.exists());
 
-        delete_snapshot(&inst, &snap.id).unwrap();
+        // Grace zero: this test is about what deleting the last snapshot frees, and the fixture
+        // wrote its objects a moment ago.
+        delete_snapshot_collecting(&inst, &snap.id, Some(std::time::Duration::ZERO)).unwrap();
         assert!(!manifest_path.exists());
         assert_eq!(count_snapshot_objects(&inst), 0);
     }

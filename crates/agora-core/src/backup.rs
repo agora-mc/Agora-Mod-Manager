@@ -710,11 +710,8 @@ pub fn export_snapshot(
         // omitting it.  The zip must be complete or not exist at all.
         if is_modern {
             for entry in &file_index {
-                let blob_path = crate::snapshot::snapshot_blob_source(
-                    instance_dir,
-                    &entry.sha256,
-                    entry.size,
-                );
+                let blob_path =
+                    crate::snapshot::snapshot_blob_source(instance_dir, &entry.sha256, entry.size);
                 // Validate the blob before streaming it into the zip.
                 let blob_path = match blob_path {
                     Some(path) => path,
@@ -1608,8 +1605,7 @@ pub fn export_game_snapshot(
                     ))
                 }
             };
-            if !crate::snapshot::blob_file_matches(&blob_path, &entry.sha256, entry.size)
-            {
+            if !crate::snapshot::blob_file_matches(&blob_path, &entry.sha256, entry.size) {
                 return Err(format!(
                     "snapshot blob is missing or corrupted for {}",
                     entry.relative_path
@@ -2427,9 +2423,7 @@ fn import_game_backup(
                     &crate::snapshot::snapshot_store_paths(instance_dir),
                     &bytes,
                 )
-                .map_err(|error| {
-                    format!("failed to store content object {hash}: {error}")
-                })?;
+                .map_err(|error| format!("failed to store content object {hash}: {error}"))?;
             }
         }
 

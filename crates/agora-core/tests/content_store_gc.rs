@@ -19,6 +19,10 @@ use data_root::DataRoot;
 fn test_ctx() -> (DataRoot, Ctx) {
     let tmp = DataRoot::new();
     let ctx = Ctx::for_testing(tmp.path().to_path_buf());
+    // These tests are about what a sweep frees; their fixtures write objects a moment before the
+    // sweep runs, so the production hour of grace would keep every one of them.
+    ctx.test_seams
+        .set_object_grace(Some(std::time::Duration::ZERO));
     (tmp, ctx)
 }
 

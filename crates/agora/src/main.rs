@@ -1366,7 +1366,8 @@ enum ContentCmd {
         /// Item ID or unique prefix to remove.
         item: String,
         /// Remove it even when a snapshot manifest cannot be read. The ignored
-        /// snapshots are named on stderr and can no longer restore the item.
+        /// snapshots are named on stderr and can no longer restore the item; a
+        /// snapshot that cannot be read may lose files it needs to restore.
         #[arg(long)]
         ignore_unreadable_snapshots: bool,
     },

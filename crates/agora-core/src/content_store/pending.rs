@@ -103,7 +103,9 @@ pub(crate) fn begin_pending_use(
     let manager = LockManager::new(paths.locks_root());
     let _lock = manager
         .acquire(LockResource::ContentStore, operation)
-        .map_err(|error| format!("cannot register the objects {operation} is about to use: {error}"))?;
+        .map_err(|error| {
+            format!("cannot register the objects {operation} is about to use: {error}")
+        })?;
     write_pending_record(paths, hashes, operation)
 }
 
