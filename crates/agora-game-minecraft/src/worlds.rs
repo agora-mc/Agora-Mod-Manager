@@ -13,7 +13,9 @@ use agora_core as core_api;
 use agora_core::ctx::Ctx;
 use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::instance_runtime::InstanceGuard;
-use agora_game_api::{ArchiveError, ArchiveLimits, NamePolicy, SafeArchive, Select};
+use agora_game_api::{
+    classify_entry_name, ArchiveError, ArchiveLimits, EntryName, NamePolicy, SafeArchive, Select,
+};
 use base64::Engine;
 use core_api::app_paths::is_safe_file_name;
 use fastnbt::Value;
@@ -846,12 +848,18 @@ fn write_world_zip(world: &Path, folder: &str, destination: &Path) -> LauncherRe
 fn world_prefix(archive: &SafeArchive) -> LauncherResult<String> {
     let mut best: Option<String> = None;
     for entry in archive.file_entries() {
-        let path = entry.name.replace('\\', "/");
+        // The name read the way the extraction reads it: `./MyWorld/level.dat` is
+        // `MyWorld/level.dat`, and the selection below is made against that classified path, so a
+        // folder found under one spelling and selected under another would take none of the world.
+        let EntryName::Writable(rel) = classify_entry_name(&entry.name) else {
+            continue;
+        };
+        let path = rel.as_str();
         // The file has to *be* `level.dat`: `backup-level.dat` ends with it and is not a world, so
         // a level file an archive keeps as a copy cannot pick the folder.
         let (parent, file) = match path.rsplit_once('/') {
             Some((parent, file)) => (parent, file),
-            None => ("", path.as_str()),
+            None => ("", path),
         };
         if file != "level.dat" {
             continue;
@@ -1079,6 +1087,30 @@ mod tests {
             "the world's own folder, not the root the copy sits in"
         );
         assert!(!saves.join(&folder).join("backup-level.dat").exists());
+    }
+
+    #[test]
+    fn a_world_written_with_a_leading_dot_slash_imports() {
+        // `./MyWorld/level.dat` names the same folder as `MyWorld/level.dat`: some archivers write the
+        // dot. Discovery and selection have to read that name the same way, or the folder is found
+        // and none of the world's files are taken.
+        let (root, service) = fixture();
+        let archive = root.path().join("dotted.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("./MyWorld/level.dat", options).unwrap();
+        zip.write_all(&level_dat("Dotted", 1, 0)).unwrap();
+        zip.start_file("./MyWorld/region/r.0.0.mca", options)
+            .unwrap();
+        zip.write_all(b"region").unwrap();
+        zip.finish().unwrap();
+
+        let folder = service.import("inst", &archive).unwrap();
+        let saves = root.path().join("instances/inst/saves");
+        assert!(
+            saves.join(&folder).join("region/r.0.0.mca").is_file(),
+            "the world's own folder, dot and all"
+        );
     }
 
     #[test]
