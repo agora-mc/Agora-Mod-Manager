@@ -526,7 +526,8 @@ pub fn update_profile(instance_dir: &Path, profile_name: &str) -> Result<Loadout
 /// A damaged record is never dropped and never read as an empty profile: it stays where it is and
 /// is named here, so one unreadable file does not hide every good loadout (or, worse, apply as
 /// "turn everything off").
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LoadoutListing {
     pub profiles: Vec<LoadoutProfile>,
     /// One line per record that could not be read, naming the file and what is wrong with it.

@@ -5447,7 +5447,7 @@ pub async fn list_loadout_profiles(
     app: tauri::AppHandle,
     _state: tauri::State<'_, LauncherState>,
     instance_id: String,
-) -> LauncherResult<Vec<agora_core::loadout::LoadoutProfile>> {
+) -> LauncherResult<agora_core::loadout::LoadoutListing> {
     let sanitized = paths::sanitize_id(&instance_id);
     let instance_dir =
         paths::instance_dir(&app, &sanitized).map_err(|e| LauncherError::Generic {

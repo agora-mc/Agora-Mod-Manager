@@ -3199,8 +3199,15 @@ export interface TemplateApplyOutcome {
 export const applyInstanceTemplate = (instanceId: string, templateId: string) =>
   invoke<TemplateApplyOutcome>('apply_instance_template', { instanceId, templateId });
 
+/** The loadouts an instance has, and the records that could not be read. */
+export interface LoadoutListing {
+  profiles: LoadoutProfile[];
+  /** One line per record that could not be read, naming the file and what is wrong with it. */
+  damaged: string[];
+}
+
 export const listLoadoutProfiles = (instanceId: string) =>
-  invoke<LoadoutProfile[]>('list_loadout_profiles', { instanceId });
+  invoke<LoadoutListing>('list_loadout_profiles', { instanceId });
 
 export const createLoadoutProfile = (instanceId: string, name: string) =>
   invoke<LoadoutProfile>('create_loadout_profile', { instanceId, name });
