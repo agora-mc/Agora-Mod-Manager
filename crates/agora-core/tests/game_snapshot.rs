@@ -1550,3 +1550,38 @@ fn the_undo_of_a_restore_removes_a_file_the_restore_created() {
         "the undo removes the file the restore created"
     );
 }
+
+/// A folder is retired even when a path inside it is mapped separately.
+///
+/// A snapshot records the root it captured (`user`), while the game declares a file inside that
+/// root (`user/Plugins.txt`). The folder as a whole is not the game's, so a restore replaces
+/// everything in it — the notice has to say so rather than counting the mapped child as coverage
+/// (MASTER_SPEC §32.7).
+#[test]
+fn a_folder_is_reported_retired_even_when_a_child_path_is_still_mapped() {
+    let h = Harness::new();
+    // `h.def` declares the load order file `user/Plugins.txt` and no folder holding it.
+    std::fs::create_dir_all(h.dir().join("user")).unwrap();
+    std::fs::write(h.dir().join("user/Plugins.txt"), b"*A.esm").unwrap();
+    let taken = game_snapshot::create(&h.ctx, &h.id, &h.def, None, SnapshotOrigin::User)
+        .expect("the declared state files are captured");
+
+    let outcome =
+        game_snapshot::restore(&h.ctx, &h.id, &h.def, &taken.id, false).expect("restored");
+
+    let noticed = outcome
+        .outcome
+        .notices
+        .iter()
+        .find(|notice| notice.contains("'user'"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the restore reports the folder it no longer declares: {:?}",
+                outcome.outcome.notices
+            )
+        });
+    assert!(
+        noticed.contains("no longer tracked") && noticed.contains("skyrim-se"),
+        "{noticed}"
+    );
+}

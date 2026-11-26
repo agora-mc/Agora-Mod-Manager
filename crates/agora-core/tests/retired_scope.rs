@@ -201,3 +201,51 @@ fn a_data_snapshot_of_a_folder_the_game_stopped_declaring_keeps_new_files() {
     );
     assert_eq!(read(dir.path(), "config/a.toml"), b"config v1");
 }
+
+/// A data restore writes through the strict path rules: a folder on the way that a link replaced
+/// since the capture refuses the write instead of landing outside the instance.
+#[cfg(windows)]
+#[test]
+fn a_data_restore_refuses_to_write_through_a_folder_a_link_replaced() {
+    use std::process::Command;
+
+    let dir = instance();
+    let taken = snapshot::create_snapshot_from_data(
+        dir.path(),
+        Some("captured both"),
+        &[
+            file("characters/hero.sav", b"level 1"),
+            file("config/a.toml", b"config v1"),
+        ],
+        SnapshotOrigin::Automatic,
+        &SnapshotAux::default(),
+    )
+    .unwrap();
+
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("hero.sav"), b"outside").unwrap();
+    fs::remove_dir_all(dir.path().join("characters")).unwrap();
+    let link = dir.path().join("characters");
+    let status = Command::new("cmd")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(&link)
+        .arg(outside.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "the junction was not created");
+
+    let error = snapshot::restore_snapshot_data(dir.path(), &taken.id).unwrap_err();
+
+    assert!(
+        error.contains("goes through the link") || error.contains("refus"),
+        "the restore says why it was refused: {error}"
+    );
+    assert_eq!(
+        read(outside.path(), "hero.sav"),
+        b"outside",
+        "nothing was written outside the instance"
+    );
+    let _ = fs::remove_dir(&link);
+}

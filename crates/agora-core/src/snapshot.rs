@@ -1581,8 +1581,19 @@ pub fn restore_snapshot_data(
 ) -> Result<Vec<String>, String> {
     validate_snapshot_id(snapshot_id)?;
     let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
-    if !manifest_path.is_file() {
-        return Err(format!("snapshot {snapshot_id} is not a data snapshot"));
+    // Fail closed (§32.13): only "the operating system said not found" means this is not a data
+    // snapshot. A path that cannot be examined is its own error.
+    match agora_game_api::probe(&manifest_path) {
+        agora_game_api::Probe::Present(_) => {}
+        agora_game_api::Probe::Absent => {
+            return Err(format!("snapshot {snapshot_id} is not a data snapshot"))
+        }
+        agora_game_api::Probe::CantTell(error) => {
+            return Err(format!(
+                "cannot tell what is at {}, so this snapshot cannot be restored: {error}",
+                manifest_path.display()
+            ))
+        }
     }
     let manifest = read_manifest_file(&manifest_path, snapshot_id)?;
     let mut staged: Vec<(&SnapshotFileEntry, Vec<u8>)> = Vec::new();
@@ -1625,7 +1636,10 @@ pub fn restore_snapshot_data(
 
     let mut restored = Vec::with_capacity(manifest.files.len());
     for (entry, bytes) in staged {
-        let live = instance_dir.join(Path::new(&entry.relative_path));
+        // The write goes through the strict path rules: a folder on the way that a link has
+        // replaced since the capture refuses the write instead of landing outside the instance
+        // (MASTER_SPEC §32.3, §32.7).
+        let live = live_target(instance_dir, &entry.relative_path)?;
         if let Some(parent) = live.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
@@ -1637,20 +1651,22 @@ pub fn restore_snapshot_data(
         if !entry.absent {
             continue;
         }
-        let live = instance_dir.join(Path::new(&entry.relative_path));
-        match fs::symlink_metadata(&live) {
-            Ok(metadata) if metadata.is_dir() => {
+        let live = live_target(instance_dir, &entry.relative_path)?;
+        // Fail closed (§32.13): only "the operating system said not found" means there is nothing
+        // to remove. A path that cannot be examined is its own error.
+        match agora_game_api::probe(&live) {
+            agora_game_api::Probe::Present(agora_game_api::PresentKind::Directory) => {
                 return Err(format!(
                     "snapshot says {} was absent, but a folder is there",
                     entry.relative_path
                 ))
             }
-            Ok(_) => {
+            agora_game_api::Probe::Present(_) => {
                 fs::remove_file(&live)
                     .map_err(|e| format!("failed to remove {}: {e}", entry.relative_path))?;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
+            agora_game_api::Probe::Absent => {}
+            agora_game_api::Probe::CantTell(error) => {
                 return Err(format!(
                     "failed to inspect {} while restoring: {error}",
                     entry.relative_path
@@ -1660,6 +1676,20 @@ pub fn restore_snapshot_data(
         restored.push(entry.relative_path.clone());
     }
     Ok(restored)
+}
+
+/// Where a snapshot path belongs in the instance, checked against the strict path rules so a link
+/// standing in for a folder on the way cannot take the write outside.
+fn live_target(instance_dir: &Path, relative_path: &str) -> Result<PathBuf, String> {
+    let strict =
+        agora_game_api::StrictRelPath::new(relative_path.to_string()).map_err(|error| {
+            format!(
+                "the snapshot records '{relative_path}', which cannot be written: {}",
+                error.reason
+            )
+        })?;
+    agora_game_api::join_under(instance_dir, &strict)
+        .map_err(|error| format!("refusing to restore '{relative_path}': {error}"))
 }
 
 fn store_snapshot_object(instance_dir: &Path, source: &Path) -> Result<(String, u64), String> {
@@ -2469,16 +2499,15 @@ pub(crate) fn scope_contains(declared: &[&str], path: &str) -> bool {
     })
 }
 
-/// Whether a snapshot root is owned by the declaration in force, at that root or at any depth.
+/// Whether a snapshot root is owned by the declaration in force.
 ///
-/// A declared folder covers a root it holds (`state/config` covers the root `state/config`), and a
-/// root covers a declared folder it holds (`state` covers a declaration of `state/config`), because
-/// the root is the unit a manifest records.
+/// A declared folder covers a root it holds (`state/config` covers the root `state/config`) and the
+/// root it lives in (`user` covers a declaration of `user`), and nothing else. A declaration of a
+/// path *inside* the root does not cover it: the folder as a whole is not the game's, so a restore
+/// replaces everything the folder holds, including whatever else the person put there. That is the
+/// case worth reporting — `user` dropped from the declaration while `user/Plugins.txt` stays mapped.
 pub(crate) fn scope_covers_root(declared: &[&str], root: &str) -> bool {
     scope_contains(declared, root)
-        || declared
-            .iter()
-            .any(|folder| is_under(Path::new(folder), Path::new(root)))
 }
 
 /// Whether `path` is inside `folder` (strictly, not equal): the game contract's comparison, so the
@@ -4355,10 +4384,13 @@ mod tests {
         assert!(scope_contains(&declared, "CHARACTERS/hero.sav"));
         assert!(scope_contains(&declared, "State/Config/a.toml"));
 
-        // A root is owned by the declaration when the declaration covers it or holds it.
+        // A root is owned by the declaration when the declaration covers it or holds it. A path
+        // mapped inside the root does not own it: `user` is not tracked just because
+        // `user/Plugins.txt` is (MASTER_SPEC §32.7).
         assert!(scope_covers_root(&declared, "characters"));
-        assert!(scope_covers_root(&declared, "state"));
         assert!(scope_covers_root(&declared, "state/config"));
+        assert!(!scope_covers_root(&declared, "state"));
+        assert!(!scope_covers_root(&["user/Plugins.txt"], "user"));
         assert!(!scope_covers_root(&declared, "mods"));
         assert!(!scope_covers_root(&declared, "characters-old"));
     }
