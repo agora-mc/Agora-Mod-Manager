@@ -107,7 +107,10 @@ beforeEach(() => {
         return { jvm_applied: true, files_applied: 0, files_missing: 0, undo_snapshot_id: null };
       case 'restore_snapshot':
         current = detail({ minecraft_version: '26.1.2' });
-        return undefined;
+        // The command answers with what the restore did, which the editor shows.
+        return {
+          snapshotId: 'snap-1', coverage: 'exact', restoredRoots: [], preservedRoots: [],
+        };
       case 'apply_loadout_profile':
         return undefined;
       case 'list_loadout_unlisted_mods':
