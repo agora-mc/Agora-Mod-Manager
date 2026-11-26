@@ -4704,6 +4704,69 @@ fn games_base_cli_list_verify_remove() {
 }
 
 #[test]
+fn games_base_cli_removing_a_damaged_record_succeeds_and_warns_where_it_looked() {
+    // A damaged record names no folder, so its folder may be on a drive Agora has no root for. The
+    // record goes and the command succeeds; a warning names every root it searched, so nobody
+    // counts the space as freed for a folder it never found.
+    let (_tmp, data_dir) = temp_data_dir();
+    let manifests = data_dir.join("bases").join("manifests");
+    std::fs::create_dir_all(&manifests).unwrap();
+    let base_id = "skyrim-se_steam_2.0.0_nobuild";
+    std::fs::write(manifests.join(format!("{base_id}.json")), "{ not json").unwrap();
+
+    let output = run_agora(&data_dir, &["games", "base", "remove", base_id]);
+    assert!(
+        output.status.success(),
+        "the record is removed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("Base '{base_id}' removed.")),
+        "{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Warning:") && stderr.contains("no folder for it was found in"),
+        "the warning says the removal could not find the folder: {stderr}"
+    );
+    assert!(
+        stderr.contains(&data_dir.join("bases").display().to_string()),
+        "and names the root it searched: {stderr}"
+    );
+    assert!(!manifests.join(format!("{base_id}.json")).exists());
+}
+
+#[test]
+fn games_base_cli_removing_a_damaged_record_carries_the_warning_in_json() {
+    let (_tmp, data_dir) = temp_data_dir();
+    let manifests = data_dir.join("bases").join("manifests");
+    std::fs::create_dir_all(&manifests).unwrap();
+    let base_id = "skyrim-se_steam_2.0.0_nobuild";
+    std::fs::write(manifests.join(format!("{base_id}.json")), "{ not json").unwrap();
+
+    let output = run_agora_json(&data_dir, &["games", "base", "remove", base_id]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("one json object on stdout");
+    assert_eq!(value["status"], "removed");
+    assert_eq!(value["base_id"], base_id);
+    let warnings = value["warnings"].as_array().expect("warnings");
+    assert_eq!(warnings.len(), 1, "{value}");
+    assert!(
+        warnings[0]
+            .as_str()
+            .unwrap()
+            .contains("no folder for it was found in"),
+        "{value}"
+    );
+}
+
+#[test]
 fn games_base_cli_lists_damaged_records_with_their_reason() {
     let (_tmp, data_dir) = temp_data_dir();
     let manifests = data_dir.join("bases").join("manifests");

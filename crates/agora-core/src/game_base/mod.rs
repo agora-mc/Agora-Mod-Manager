@@ -587,6 +587,54 @@ fn base_folder_is_intact(manifest: &BaseManifest) -> bool {
     base_folder_present(folder) && base_marker_matches(folder, &manifest.base_id)
 }
 
+/// Whether `folder` is a plain directory: something is there, the stat did not fail, it is not a
+/// link, and it is a folder. A pin names a folder an instance runs from, so a plain file at the
+/// recorded path — or a stat that could not tell — is not that folder.
+fn folder_is_plain_directory(folder: &Path) -> bool {
+    !is_reparse_point_or_symlink(folder)
+        && matches!(std::fs::symlink_metadata(folder), Ok(metadata) if metadata.is_dir())
+}
+
+/// What the record of a base says about whether a pin may name it, read under the base's own lock
+/// (MASTER_SPEC §32.8).
+#[derive(Debug)]
+pub(crate) enum PinnableBase {
+    /// A healthy record whose folder is really there: a pin may name it.
+    Ready(Box<BaseManifest>),
+    /// Nothing is at the record's own path, so this machine has never had that base.
+    Absent,
+    /// A record is there and is not one a pin may name: it is damaged, it names another base, the
+    /// folder it names is gone, or that folder is a link somewhere else.
+    Unusable,
+}
+
+/// The record of `base_id` as a pin publisher may use it, read under the base's own lock.
+///
+/// A removal deletes a base's folder and then its record, so a record left behind is the remains
+/// of a removal that could not finish, and a record whose folder is gone names no files. A pin to
+/// either would leave a live instance pointing at a base that is not there. The folder is judged
+/// without the build marker: a pin is only about whether the files are there, and whether a build
+/// may *replace* a folder is the marker's own question.
+///
+/// A record that cannot be read at all is an error rather than `Absent` or `Unusable`: "could not
+/// tell" is not "gone", and a caller about to pin must not be told the base is absent when the
+/// disk refused to answer.
+pub(crate) fn pinnable_base(paths: &AppPaths, base_id: &str) -> Result<PinnableBase, BaseError> {
+    let manifest_path = paths.base_manifest_path(base_id);
+    match read_base_record(base_id, &manifest_path)? {
+        BaseRecord::Missing => Ok(PinnableBase::Absent),
+        BaseRecord::Damaged => Ok(PinnableBase::Unusable),
+        BaseRecord::Healthy(manifest) => {
+            let folder = &manifest.location;
+            if manifest.base_id == base_id && folder_is_plain_directory(folder) {
+                Ok(PinnableBase::Ready(manifest))
+            } else {
+                Ok(PinnableBase::Unusable)
+            }
+        }
+    }
+}
+
 /// Build a base for `install`: the folder every instance of it shares.
 #[allow(clippy::too_many_arguments)]
 pub fn build_base(
@@ -663,8 +711,20 @@ pub fn build_base_with_frameworks(
         }
         // A record whose folder is gone is a removal that could not delete the record. It is
         // not a base anything may be pinned to, so the build treats it like a damaged record:
-        // usable only once nothing is pinned to it.
-        BaseRecord::Healthy(_) | BaseRecord::Damaged => {
+        // usable only once nothing is pinned to it — when there is a folder to replace. With no
+        // folder there, the pin is waiting for this base and the build fulfils it.
+        BaseRecord::Healthy(manifest) => {
+            if base_folder_present(&manifest.location) {
+                let pinning = instances_pinning_base(paths, &base_id)?;
+                if !pinning.is_empty() {
+                    return Err(BaseError::Other(format!(
+                        "a damaged base with this id exists ({base_id}) and instance(s) {} are pinned to it, so it was not replaced. Remove those instances first.",
+                        pinning.join(", ")
+                    )));
+                }
+            }
+        }
+        BaseRecord::Damaged => {
             let pinning = instances_pinning_base(paths, &base_id)?;
             if !pinning.is_empty() {
                 return Err(BaseError::Other(format!(
@@ -905,22 +965,85 @@ pub fn build_base_with_frameworks(
     // acquire nothing while holding it. The early check above can be stale by now — an instance
     // may have moved into Recently deleted while the source was hashed. Under both locks the
     // answer cannot change, so a base that is still pinned is kept.
-    let _locations = locks
-        .try_instance_locations("build-base")
-        .map_err(|error| {
+    //
+    // With no folder of this base here, nothing is being replaced: a pin that names it is an
+    // instance *waiting* for the base (an imported backup's pin, or one recorded for a base
+    // somebody deleted), and the build fulfils that pin instead of refusing it. The check exists
+    // to stop a build taking a folder an instance is using, not to stop it making one.
+    let final_base_dir = base_root.join(&base_id);
+    let replacing = base_folder_present(&final_base_dir);
+    // A folder whose own marker says this build made it, with no record beside it, is a build cut
+    // short between placing the folder and publishing the record (MASTER_SPEC §32.8). Its pin is
+    // waiting for it, so the pinning check below would leave the base unbuildable and unremovable
+    // at once. The folder is this build's own output for this source, so the retry finishes the
+    // build: it verifies the folder the way a launch verifies a base, and publishes the record for
+    // it. A folder without the marker, or one holding files this source did not give, is somebody
+    // else's and is refused rather than adopted; a record that is there and damaged is its own
+    // case, and is still judged by the pinning check below.
+    let interrupted =
+        if replacing && record_missing && base_marker_matches(&final_base_dir, &base_id) {
+            let candidate = BaseManifest {
+                manifest_version: 1,
+                base_id: base_id.clone(),
+                runtime: runtime.clone(),
+                mode,
+                source_install: install.install_id.clone(),
+                source_product: Some(install.discovered.product.clone()),
+                source_location: source_dir.clone(),
+                location: final_base_dir.clone(),
+                created_unix_ms: now_unix_ms(),
+                files: base_files.clone(),
+                skipped: skipped.clone(),
+                incomplete_frameworks: incomplete_frameworks.clone(),
+            };
+            let verification = verify_base(
+                &candidate,
+                VerifyDepth::Full,
+                &|path| definition.is_declared_write(path),
+                &|path| definition.is_excluded(path),
+            );
+            verification.problems.is_empty().then_some(candidate)
+        } else {
+            None
+        };
+    let _locations = if replacing {
+        Some(locks.try_instance_locations("build-base").map_err(|error| {
             BaseError::Other(format!(
                 "base {base_id} was kept because instance locations are busy: {error}. Retry once the instance move or scan finishes."
             ))
-        })?;
-    let pinning = instances_pinning_base(paths, &base_id)?;
-    if !pinning.is_empty() {
-        return Err(BaseError::Other(format!(
-            "instance(s) {} still use base {base_id} (including Recently deleted), so it was not replaced. Remove or purge those instances first.",
-            pinning.join(", ")
-        )));
+        })?)
+    } else {
+        None
+    };
+    if replacing && interrupted.is_none() {
+        let pinning = instances_pinning_base(paths, &base_id)?;
+        if !pinning.is_empty() {
+            return Err(BaseError::Other(format!(
+                "instance(s) {} still use base {base_id} (including Recently deleted), so it was not replaced. Remove or purge those instances first.",
+                pinning.join(", ")
+            )));
+        }
     }
-
-    let final_base_dir = base_root.join(&base_id);
+    if let Some(manifest) = interrupted {
+        // The folder is already what this build would have placed; the staging copy of the same
+        // files goes with the guard. The record is what was missing.
+        write_base_record(paths, &base_id, &unique, &manifest)?;
+        return Ok(BuildOutcome::Built {
+            linked_bytes: manifest
+                .files
+                .iter()
+                .filter(|file| file.linked)
+                .map(|file| file.size)
+                .sum(),
+            copied_bytes: manifest
+                .files
+                .iter()
+                .filter(|file| !file.linked)
+                .map(|file| file.size)
+                .sum(),
+            manifest,
+        });
+    }
 
     // The marker travels with the staging folder, so the folder this build puts in place can be
     // told apart from one Agora did not build.
@@ -972,10 +1095,7 @@ pub fn build_base_with_frameworks(
         &base_root,
     );
 
-    let created_unix_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => d.as_millis() as i64,
-        Err(e) => -(e.duration().as_millis() as i64),
-    };
+    let created_unix_ms = now_unix_ms();
 
     let manifest = BaseManifest {
         manifest_version: 1,
@@ -993,18 +1113,37 @@ pub fn build_base_with_frameworks(
     };
 
     // Write manifest (temp file + rename)
-    let manifests_dir = paths.base_manifests_dir();
-    std::fs::create_dir_all(&manifests_dir)?;
-    let tmp_manifest = manifests_dir.join(format!("{base_id}.json.tmp-{unique}"));
-    let manifest_bytes = serde_json::to_string_pretty(&manifest)?;
-    std::fs::write(&tmp_manifest, manifest_bytes)?;
-    std::fs::rename(&tmp_manifest, &manifest_path)?;
+    write_base_record(paths, &base_id, &unique, &manifest)?;
 
     Ok(BuildOutcome::Built {
         manifest,
         linked_bytes,
         copied_bytes,
     })
+}
+
+/// This moment, as the millisecond stamp a base record carries.
+fn now_unix_ms() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as i64,
+        Err(e) => -(e.duration().as_millis() as i64),
+    }
+}
+
+/// Publish a base's record: written beside it and renamed into place, so a reader sees either the
+/// previous record or this one and never half of either.
+fn write_base_record(
+    paths: &AppPaths,
+    base_id: &str,
+    unique: &str,
+    manifest: &BaseManifest,
+) -> Result<(), BaseError> {
+    let manifests_dir = paths.base_manifests_dir();
+    std::fs::create_dir_all(&manifests_dir)?;
+    let tmp_manifest = manifests_dir.join(format!("{base_id}.json.tmp-{unique}"));
+    std::fs::write(&tmp_manifest, serde_json::to_string_pretty(manifest)?)?;
+    std::fs::rename(&tmp_manifest, paths.base_manifest_path(base_id))?;
+    Ok(())
 }
 
 struct HashProgressContext<'a> {
@@ -1658,7 +1797,149 @@ fn instances_pinning_base_with(
             instances.push(instance_id);
         }
     }
+    // A manifest is an owner record even when no row agrees with it: a create or an import writes
+    // its manifest before its row, so a crash in between leaves a pin nothing else records.
+    for instance_id in instance_manifests_pinning_base(paths, base_id)? {
+        if !instances.contains(&instance_id) {
+            instances.push(instance_id);
+        }
+    }
     instances.sort();
+    Ok(instances)
+}
+
+/// Every instance manifest, in the live instances folder and in both Recently deleted areas, whose
+/// `base` is pinned to `base_id` (MASTER_SPEC §32.8).
+///
+/// The scan is deliberately wider than the database: a create or a general registration writes the
+/// instance's manifest first and its row afterwards, so a crash in between — or a row the schema
+/// refuses, as it does for a base on a Minecraft instance — leaves a manifest that pins a base and
+/// no row that does. A folder that is a link is not followed, an entry that cannot be listed is
+/// not skipped, and a manifest that cannot be read is not passed over: the caller is about to
+/// delete a base, so "I could not tell" is never "nothing pins it". An entry with no manifest pins
+/// nothing (a Minecraft instance keeps none), which is the one absence this reads as absence.
+/// Read a record the pin scan needs: an instance manifest, or a Recently deleted entry record.
+///
+/// A record that is a link is refused by name. A link whose target is offline or on a drive that is
+/// not mounted reads as "not found", and reading it that way would pass over the one record that
+/// says an instance pins the base — and then the removal deletes the base (MASTER_SPEC §32.8).
+/// Only a clean `NotFound` on a path that is not a link means there is no record here.
+fn read_pin_record(path: &Path, base_id: &str) -> Result<Option<Vec<u8>>, BaseError> {
+    let cannot_tell = |why: &dyn std::fmt::Display| {
+        BaseError::Other(format!(
+            "cannot read {}{why}, so Agora cannot tell whether the record there uses base {base_id}; \
+             the base is kept",
+            path.display()
+        ))
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(_) if is_reparse_point_or_symlink(path) => Err(BaseError::Other(format!(
+            "{} is a link, so Agora cannot tell whether the record there uses base {base_id}; the \
+             base is kept",
+            path.display()
+        ))),
+        // Something that is not a file (a folder on the name) is not a record either, and what it
+        // holds cannot be read as one.
+        Ok(metadata) if !metadata.is_file() => Err(cannot_tell(&" is not a file")),
+        Ok(_) => match std::fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) => Err(cannot_tell(&format!(" ({error})"))),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(cannot_tell(&format!(" ({error})"))),
+    }
+}
+
+fn instance_manifests_pinning_base(
+    paths: &AppPaths,
+    base_id: &str,
+) -> Result<Vec<String>, BaseError> {
+    let unreadable = |path: &Path, error: &dyn std::fmt::Display| {
+        BaseError::Other(format!(
+            "cannot read {} while checking which instances use base {base_id}, so the base is \
+             kept: {error}",
+            path.display()
+        ))
+    };
+    let mut instances = Vec::new();
+    for (root, in_trash) in [
+        (paths.instances_root(), false),
+        (paths.recently_deleted_games_root(), true),
+        (paths.recently_deleted_root(), true),
+    ] {
+        let read = match std::fs::read_dir(&root) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(BaseError::Other(format!(
+                "cannot read {}, so Agora cannot tell which instances use base {base_id}: {error}",
+                root.display()
+            )))
+            }
+        };
+        for entry in read {
+            let entry = entry.map_err(|error| {
+                BaseError::Other(format!(
+                    "cannot read {}, so Agora cannot tell which instances use base {base_id}: {error}",
+                    root.display()
+                ))
+            })?;
+            let entry_path = entry.path();
+            match std::fs::symlink_metadata(&entry_path) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) if is_reparse_point_or_symlink(&entry_path) => {
+                    return Err(BaseError::Other(format!(
+                        "{} is a link, so Agora cannot tell whether the instance in it uses base {base_id}; the base is kept",
+                        entry_path.display()
+                    )))
+                }
+                // A file beside the instance folders holds no instance.
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(unreadable(&entry_path, &error)),
+            }
+            let folder = if in_trash {
+                entry_path.join("instance")
+            } else {
+                entry_path.clone()
+            };
+            if in_trash {
+                match std::fs::symlink_metadata(&folder) {
+                    Ok(metadata) if metadata.is_dir() => {}
+                    Ok(_) => {
+                        return Err(BaseError::Other(format!(
+                            "{} is a link, so Agora cannot tell whether the instance in it uses base {base_id}; the base is kept",
+                            folder.display()
+                        )))
+                    }
+                    // A purged entry has no folder, and an entry of another shape pins nothing.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(unreadable(&folder, &error)),
+                }
+            }
+            let manifest_path = folder.join("instance_manifest.json");
+            let Some(bytes) = read_pin_record(&manifest_path, base_id)? else {
+                continue;
+            };
+            let stored: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|error| unreadable(&manifest_path, &error))?;
+            let Some(base) = stored.get("base") else {
+                continue;
+            };
+            let base_ref: agora_game_api::BaseReference = serde_json::from_value(base.clone())
+                .map_err(|error| unreadable(&manifest_path, &error))?;
+            if !matches!(&base_ref, agora_game_api::BaseReference::Pinned { id, .. } if id == base_id)
+            {
+                continue;
+            }
+            let instance_id = stored
+                .get("instance_id")
+                .and_then(|id| id.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| entry.file_name().to_string_lossy().into_owned());
+            instances.push(instance_id);
+        }
+    }
     Ok(instances)
 }
 
@@ -1677,7 +1958,6 @@ fn trash_instances_pinning_base(paths: &AppPaths, base_id: &str) -> Result<Vec<S
             )))
         }
     };
-    let now = chrono::Utc::now();
     let mut instances = Vec::new();
     for entry in read {
         let entry = entry.map_err(|error| {
@@ -1688,17 +1968,10 @@ fn trash_instances_pinning_base(paths: &AppPaths, base_id: &str) -> Result<Vec<S
         })?;
         let entry_path = entry.path();
         let record = entry_path.join("entry.json");
-        let text = match std::fs::read_to_string(&record) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(BaseError::Other(format!(
-                    "cannot read the deleted entry {}, so Agora cannot tell whether base {base_id} is in use: {error}",
-                    record.display()
-                )))
-            }
+        let Some(text) = read_pin_record(&record, base_id)? else {
+            continue;
         };
-        let stored: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+        let stored: serde_json::Value = serde_json::from_slice(&text).map_err(|error| {
             BaseError::Other(format!(
                 "cannot read the deleted entry {}, so Agora cannot tell whether base {base_id} is in use: {error}",
                 record.display()
@@ -1734,15 +2007,9 @@ fn trash_instances_pinning_base(paths: &AppPaths, base_id: &str) -> Result<Vec<S
         if !matches!(&base_ref, agora_game_api::BaseReference::Pinned { id, .. } if id == base_id) {
             continue;
         }
-        // An entry whose expiry cannot be read is counted, so a damaged entry keeps the base.
-        let expired = stored
-            .get("expires_at")
-            .and_then(|value| value.as_str())
-            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-            .is_some_and(|at| at <= now);
-        if !expired {
-            instances.push(instance_id.to_string());
-        }
+        // Every entry counts, expired or not: an entry can be restored until it is purged, and
+        // recovery can publish its row at any time, so its base has to stay until it is gone.
+        instances.push(instance_id.to_string());
     }
     Ok(instances)
 }
@@ -1769,7 +2036,19 @@ fn damaged_record_listed_as(paths: &AppPaths, base_id: &str) -> Result<Option<Pa
     Ok(None)
 }
 
-pub fn remove_base(paths: &AppPaths, base_id: &str) -> Result<(), BaseError> {
+/// What a base removal did.
+///
+/// A damaged record names no folder, so its folder may be on a drive Agora has no root for. The
+/// record is still removed — it is what the person asked to delete — and the removal says which
+/// roots it searched so nobody counts the space as freed on a folder it never found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BaseRemoval {
+    /// What the person has to know. The base is gone from the list either way; these say what
+    /// could not be checked.
+    pub warnings: Vec<String>,
+}
+
+pub fn remove_base(paths: &AppPaths, base_id: &str) -> Result<BaseRemoval, BaseError> {
     remove_base_with(
         paths,
         base_id,
@@ -1779,11 +2058,29 @@ pub fn remove_base(paths: &AppPaths, base_id: &str) -> Result<(), BaseError> {
     )
 }
 
-/// Removal with the pinning read's hooks and the record's deletion injected. See
-/// [`instances_pinning_base_with`]. Production calls this through [`remove_base`]; the first
+/// Whether anything is at `path`, as `stat` reports it. Only a clean `NotFound` means nothing is
+/// there; a stat that fails any other way is "could not tell" and an error, because a removal that
+/// reads that as "gone" leaves the folder behind and deletes the record that named it.
+fn path_present_with(
+    stat: &dyn Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+    path: &Path,
+) -> Result<bool, BaseError> {
+    match stat(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(BaseError::Other(format!(
+            "Agora cannot tell whether {} is still there, so nothing was removed: {error}",
+            path.display()
+        ))),
+    }
+}
+
+/// Removal with the pinning read's hooks, every stat it makes and the record's deletion injected.
+/// See [`instances_pinning_base_with`]. Production calls this through [`remove_base`]; the first
 /// closure runs inside the removal's locks, and the last one deletes the record, so a record that
 /// cannot be deleted can be exercised without depending on what the operating system lets a
-/// file's permissions do.
+/// file's permissions do. The stat is injected for the same reason: a stat that fails with
+/// anything but `NotFound` must not be read as "that folder is gone".
 #[doc(hidden)]
 pub fn remove_base_with(
     paths: &AppPaths,
@@ -1791,7 +2088,7 @@ pub fn remove_base_with(
     between_reads: impl Fn(),
     metadata: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
     remove_record: impl Fn(&Path) -> std::io::Result<()>,
-) -> Result<(), BaseError> {
+) -> Result<BaseRemoval, BaseError> {
     let locks = crate::lock_manager::LockManager::new(paths.locks_root());
     // A plain id can also be named by a build or a framework repair, so take its lock first. A
     // damaged record is listed under a file name that need not be a valid lock component; it only
@@ -1837,7 +2134,7 @@ pub fn remove_base_with(
             )));
         }
         std::fs::remove_file(&record)?;
-        return Ok(());
+        return Ok(BaseRemoval::default());
     }
     let pinning = instances_pinning_base_with(paths, base_id, &metadata, &between_reads)?;
     if !pinning.is_empty() {
@@ -1845,7 +2142,7 @@ pub fn remove_base_with(
     }
 
     let manifest_path = paths.base_manifest_path(base_id);
-    if !manifest_path.exists() {
+    if !path_present_with(&metadata, &manifest_path)? {
         return Err(BaseError::NotFound(base_id.to_string()));
     }
     // A record that cannot be read at all is an error, not a damaged record: a failed read of a
@@ -1856,8 +2153,19 @@ pub fn remove_base_with(
             // Delete the value that was checked: the folder resolved once, not the spelling the
             // record happened to use.
             let (_folder, resolved) = trusted_base_folder(paths, &manifest, base_id)?;
-            if resolved.exists() {
+            if path_present_with(&metadata, &resolved)? {
                 std::fs::remove_dir_all(&resolved)?;
+                // A folder that outlived its own removal is still there. Deleting the record now
+                // would leave it unbilled and unremovable, so the record stays and the removal
+                // says what is left.
+                if path_present_with(&metadata, &resolved)? {
+                    return Err(BaseError::Other(format!(
+                        "base {base_id}'s folder at {} is still there after it was removed, so its \
+                         record was kept: the base keeps being listed until that folder is deleted \
+                         by hand, or the removal is run again.",
+                        resolved.display()
+                    )));
+                }
             }
             // The folder is gone; a record that stays behind is the base still listed, so the
             // removal did not finish and must not say it did.
@@ -1870,12 +2178,12 @@ pub fn remove_base_with(
                     manifest_path.display()
                 )));
             }
-            Ok(())
+            Ok(BaseRemoval::default())
         }
         // The record reads but is not a base record, so there is no recorded location to check.
         // Only the folder the id names in the data folder's bases folder is removed, and only if
         // it is a plain folder.
-        Err(_) => remove_damaged_base(paths, base_id, &manifest_path),
+        Err(_) => remove_damaged_base(paths, base_id, &manifest_path, &metadata),
     }
 }
 
@@ -2089,14 +2397,45 @@ pub fn repair_framework(
 
 /// Remove a base whose record cannot be read: the folder the id names in the data folder's bases
 /// folder (if there is one), then the record. A base on another drive keeps its folder under that
-/// drive's `AgoraBases` folder, because a damaged record does not say where that is.
+/// drive's root, because a damaged record does not say where that is.
+///
+/// So the answer is not "removed" unless the folder is known to be gone. A folder with the base's
+/// name under another registered root is named and left alone (a folder's name is not proof that
+/// it is this base), and a folder found nowhere is named as missing from every root that was
+/// looked in, rather than passed off as a removal that finished.
 fn remove_damaged_base(
     paths: &AppPaths,
     base_id: &str,
     manifest_path: &Path,
-) -> Result<(), BaseError> {
+    stat: &dyn Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<BaseRemoval, BaseError> {
+    let roots = known_base_roots(paths)?;
+    let mut elsewhere = Vec::new();
+    for root in roots
+        .iter()
+        .filter(|root| !proven_one_folder(root, &paths.bases_dir()))
+    {
+        let candidate = root.join(base_id);
+        if path_present_with(stat, &candidate)? {
+            elsewhere.push(candidate);
+        }
+    }
+    if !elsewhere.is_empty() {
+        return Err(BaseError::Other(format!(
+            "base {base_id}'s record is damaged, so it cannot say where its folder is. A folder \
+             with that name is under {}, and nothing there was deleted: a damaged record is not \
+             proof that a folder is this base. Check it, and delete it by hand if it is — the \
+             record stays until its folder is resolved.",
+            elsewhere
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
     let folder = paths.bases_dir().join(base_id);
-    match std::fs::symlink_metadata(&folder) {
+    let mut removed_here = false;
+    match stat(&folder) {
         Ok(metadata) => {
             if is_reparse_point_or_symlink(&folder) || !metadata.is_dir() {
                 return Err(BaseError::Other(format!(
@@ -2105,10 +2444,35 @@ fn remove_damaged_base(
                 )));
             }
             std::fs::remove_dir_all(&folder)?;
+            if path_present_with(stat, &folder)? {
+                return Err(BaseError::Other(format!(
+                    "base {base_id}'s folder at {} is still there after it was removed, so its \
+                     record was kept.",
+                    folder.display()
+                )));
+            }
+            removed_here = true;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(BaseError::Io(error)),
     }
     std::fs::remove_file(manifest_path)?;
-    Ok(())
+    if removed_here {
+        return Ok(BaseRemoval::default());
+    }
+    // The record is gone, which is what the person asked to have removed; the folder it named was
+    // never found. The base leaves the list, and the warning says where Agora looked, so nobody
+    // counts the space as freed for a folder on a drive it has no root for.
+    Ok(BaseRemoval {
+        warnings: vec![format!(
+            "base {base_id}'s record was damaged and has been removed, but no folder for it was \
+             found in {}. A base on another drive keeps its folder under that drive's own bases \
+             folder; check there before the space counts as freed.",
+            roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )],
+    })
 }

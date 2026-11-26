@@ -941,15 +941,24 @@ pub fn missing_content(ctx: &Ctx, refs: &[String]) -> Vec<String> {
     missing
 }
 
-/// Keep the live instance's id and name after a snapshot wrote its manifest.
-/// A snapshot captured from another instance (an imported backup, a clone's
-/// source) may carry a different identity; restoring its state must not rename
-/// the instance or change its id.
+/// Keep the live instance's id, name and base after a snapshot wrote its manifest.
+///
+/// A snapshot captured from another instance (an imported backup, a clone's source) may carry a
+/// different identity; restoring its state must not rename the instance or change its id. Nor may
+/// it move the instance onto another base: a snapshot records the mod setup, while which game files
+/// the instance plays on is the live row's business, and a manifest that named the snapshot's base
+/// would disagree with the row about what the instance is pinned to (MASTER_SPEC §32.8). The row is
+/// the authority; an instance with no row keeps what its own live manifest said.
+///
+/// The manifest is normally written with this identity by the restore itself
+/// ([`snapshot::restore_snapshot_data_with`]), so this finds nothing to change. It stays for the
+/// manifest a snapshot did not record: an older snapshot that captured no live manifest leaves the
+/// one on the disk untouched, and that one still has to agree with the row.
 fn restore_manifest_identity(
     ctx: &Ctx,
     instance_id: &str,
     instance_dir: &Path,
-    identity: Option<&(String, String)>,
+    identity: Option<&(String, Option<String>, agora_game_api::BaseReference)>,
 ) -> Result<(), String> {
     let manifest_path = instance_dir.join(INSTANCE_MANIFEST_ROOT);
     if !manifest_path.is_file() {
@@ -959,26 +968,46 @@ fn restore_manifest_identity(
         .map_err(|error| format!("cannot read the restored manifest: {error}"))?;
     let mut manifest: GameInstanceManifest = serde_json::from_str(&text)
         .map_err(|error| format!("the restored manifest cannot be read: {error}"))?;
-    let (wanted_id, wanted_name) = match identity {
-        Some((id, name)) => (id.as_str(), Some(name.as_str())),
-        None => (instance_id, None),
-    };
-    let mut changed = false;
-    if manifest.instance_id != wanted_id {
-        manifest.instance_id = wanted_id.to_string();
-        changed = true;
-    }
-    if let Some(name) = wanted_name {
-        if manifest.name != name {
-            manifest.name = name.to_string();
-            changed = true;
+    let Some(identity) = identity else {
+        let wanted_id = instance_id;
+        if manifest.instance_id == wanted_id {
+            return Ok(());
         }
-    }
-    if !changed {
+        manifest.instance_id = wanted_id.to_string();
+        return crate::game_deploy::write_instance_manifest_atomic(ctx, instance_id, &manifest)
+            .map_err(|error| {
+                format!("the restored manifest could not keep its identity: {error}")
+            });
+    };
+    if !apply_identity(&mut manifest, identity) {
         return Ok(());
     }
     crate::game_deploy::write_instance_manifest_atomic(ctx, instance_id, &manifest)
         .map_err(|error| format!("the restored manifest could not keep its identity: {error}"))
+}
+
+/// Make `manifest` say the live instance's id, name and base. Returns whether anything changed.
+fn apply_identity(
+    manifest: &mut GameInstanceManifest,
+    identity: &(String, Option<String>, agora_game_api::BaseReference),
+) -> bool {
+    let (id, name, base) = identity;
+    let mut changed = false;
+    if manifest.instance_id != *id {
+        manifest.instance_id = id.clone();
+        changed = true;
+    }
+    if let Some(name) = name {
+        if manifest.name != *name {
+            manifest.name = name.clone();
+            changed = true;
+        }
+    }
+    if manifest.base != *base {
+        manifest.base = base.clone();
+        changed = true;
+    }
+    changed
 }
 
 fn pre_restore_label(at: chrono::DateTime<chrono::Utc>) -> String {
@@ -1058,17 +1087,17 @@ pub fn restore_locked(
         .paths
         .instance_dir(instance_id)
         .map_err(|e| e.to_string())?;
-    // A restore replaces the manifest, but never the instance's identity. The
-    // row is the authority; fall back to the live manifest for an instance that
-    // has not been registered yet.
+    // A restore replaces the manifest, but never the instance's identity or the base it plays on.
+    // The row is the authority; fall back to the live manifest for an instance that has not been
+    // registered yet.
     let identity = game_instance::get(ctx, instance_id)
         .ok()
         .flatten()
-        .map(|record| (record.instance_id, record.name))
+        .map(|record| (record.instance_id, Some(record.name), record.base))
         .or_else(|| {
             game_instance::get_manifest(ctx, instance_id)
                 .ok()
-                .map(|manifest| (manifest.instance_id, manifest.name))
+                .map(|manifest| (manifest.instance_id, None, manifest.base))
         });
 
     let forced_while_not_idle = match activity_is_running(ctx, instance_id) {
@@ -1163,7 +1192,29 @@ pub fn restore_locked(
     // puts the instance back.
     snapshot::atomic_write_pub(&pending_path(&dir), undo.id.as_bytes())?;
 
-    let restored = match snapshot::restore_snapshot_data(&dir, snapshot_id) {
+    // The manifest is written with the row's identity, not corrected after it lands: between a
+    // write and a correction the disk names the snapshot's base while the row names the live one,
+    // and a deployment or a base-removal scan reading then acts on the wrong base (MASTER_SPEC
+    // §32.8). A snapshot records the mod setup; which game files an instance plays on is the row's
+    // business.
+    let keep_identity = |relative: &str, bytes: &[u8]| -> Result<Option<Vec<u8>>, String> {
+        if relative != INSTANCE_MANIFEST_ROOT {
+            return Ok(None);
+        }
+        let Some(identity) = identity.as_ref() else {
+            return Ok(None);
+        };
+        let mut manifest: GameInstanceManifest = serde_json::from_slice(bytes)
+            .map_err(|error| format!("the snapshot's instance manifest cannot be read: {error}"))?;
+        if !apply_identity(&mut manifest, identity) {
+            return Ok(None);
+        }
+        let rewritten = serde_json::to_vec_pretty(&manifest)
+            .map_err(|error| format!("the restored manifest cannot be written: {error}"))?;
+        Ok(Some(rewritten))
+    };
+
+    let restored = match snapshot::restore_snapshot_data_with(&dir, snapshot_id, &keep_identity) {
         Ok(restored) => restored,
         Err(error) => {
             let rollback = snapshot::restore_snapshot_data(&dir, &undo.id);
@@ -1178,6 +1229,12 @@ pub fn restore_locked(
             }));
         }
     };
+
+    // Test seam: the restored manifest is on the disk and nothing has looked at it again. A test
+    // reads the file here, which is the moment a crash between a write and a correction used to
+    // leave the snapshot's base behind.
+    #[cfg(debug_assertions)]
+    ctx.test_seams.restore_manifest_pause_point(instance_id);
 
     if let Err(error) = restore_manifest_identity(ctx, instance_id, &dir, identity.as_ref()) {
         let rollback = snapshot::restore_snapshot_data(&dir, &undo.id);

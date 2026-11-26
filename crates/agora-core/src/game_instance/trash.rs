@@ -725,6 +725,13 @@ fn recover_entry(
             )));
         } else if is_plain_dir(&instances_root.join(&restoring.new_id)) {
             let dest = instances_root.join(&restoring.new_id);
+            // Finishing the restore publishes the pin (the live row) and clears the entry that
+            // held it, and a pinning scan reads the live rows and Recently deleted apart while it
+            // holds instance-locations. This runs under the entry's instance lock, so the
+            // locations lock comes next in the documented order; holding it across the insert and
+            // the tidy is what stops a base removal reading the rows before the insert and the
+            // trash after the cleanup and finding the pin in neither.
+            let _locations = try_lock_locations(ctx, "recover-restore")?;
             // The destination might have been reused since the crash. Only finish a restore when
             // the folder still carries the marker the delete wrote for this very entry.
             verify_restore_marker(&dest, entry_id)?;

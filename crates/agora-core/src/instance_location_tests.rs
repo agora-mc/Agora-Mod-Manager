@@ -14,7 +14,7 @@ use crate::content_store::{self, ContentError};
 use crate::ctx::Ctx;
 use crate::game_base::{self, BaseError};
 use crate::game_instance::{self, trash, GameInstanceManifest};
-use crate::lock_manager::{LockGuard, LockManager, LockResource};
+use crate::lock_manager::{LockGuard, LockManager, LockRefusal, LockResource};
 use crate::snapshot::{self, SnapshotAux, SnapshotOrigin};
 use rusqlite::OptionalExtension;
 
@@ -39,6 +39,25 @@ fn fixture() -> (tempfile::TempDir, Ctx) {
     let ctx = Ctx::for_testing(dir.path().to_path_buf());
     crate::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
     (dir, ctx)
+}
+
+/// A context whose registry defines `test-game`, so a path that checks the game definition (an
+/// imported instance's registration does) runs instead of stopping at "that game is not
+/// installed".
+fn ctx_with_test_game() -> (tempfile::TempDir, Ctx) {
+    struct NoServices;
+    impl crate::game_hooks::CompiledServices for NoServices {}
+
+    let (dir, ctx) = fixture();
+    let mut games = crate::game_registry::GameRegistry::builder();
+    games
+        .add_compiled(
+            "test",
+            crate::game_registry::test_support::package("test-game"),
+            Arc::new(NoServices),
+        )
+        .unwrap();
+    (dir, ctx.with_games(Arc::new(games.build())))
 }
 
 fn instance(ctx: &Ctx, id: &str, item: Option<&str>) -> PathBuf {
@@ -89,10 +108,23 @@ fn instance(ctx: &Ctx, id: &str, item: Option<&str>) -> PathBuf {
     dir
 }
 
+/// Another operation's hold on instance-locations. It is taken on a thread of its own, because the
+/// order rule is per thread (MASTER_SPEC §32.8): a hold recorded against this thread would refuse
+/// this thread's own locks for the *order* instead of reporting the lock as busy, and the case
+/// under test is a lock somebody else holds. The guard comes back so a test can drop it when it
+/// wants the lock released.
 fn contend(ctx: &Ctx) -> LockGuard {
-    LockManager::new(ctx.paths.locks_root())
-        .acquire(LockResource::InstanceLocations, "test contender")
-        .unwrap()
+    let manager = LockManager::new(ctx.paths.locks_root());
+    let (ready, acquired) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let guard = manager
+            .acquire(LockResource::InstanceLocations, "test contender")
+            .unwrap();
+        ready.send(guard).unwrap();
+    });
+    acquired
+        .recv()
+        .expect("the contender thread holds the locations lock")
 }
 
 fn snapshot_move_race(restore: bool) {
@@ -340,6 +372,13 @@ fn base_fixture(ctx: &Ctx, tmp: &Path, base_id: &str) -> PathBuf {
     let folder = ctx.paths.bases_dir().join(base_id);
     fs::create_dir_all(&folder).unwrap();
     fs::write(folder.join("game.exe"), b"base bytes").unwrap();
+    // The marker a build writes into its own folder, so the base is one a pin may name and a
+    // rebuild may replace.
+    fs::write(
+        folder.join(".agora-base.json"),
+        serde_json::json!({ "base_id": base_id }).to_string(),
+    )
+    .unwrap();
     let manifest = serde_json::json!({
         "manifest_version": 1u32,
         "base_id": base_id,
@@ -691,4 +730,517 @@ fn user_snapshot_delete_waits_for_a_lock_released_within_the_wait() {
         .expect("a user delete waits briefly instead of failing on a passing collision");
     releaser.join().unwrap();
     assert!(snapshot::list_snapshots(&instance_dir).unwrap().is_empty());
+}
+
+/// MASTER_SPEC §32.8: instance-locations is the last lock taken, and nothing is taken while it is
+/// held. A thread that holds it and asks for another lock is refused with an error naming both
+/// locks — in every build, because the operation it would otherwise wait for is the one waiting
+/// for it, which is a deadlock and not a slow start.
+#[test]
+fn taking_a_lock_while_holding_instance_locations_is_refused() {
+    let (_dir, ctx) = fixture();
+    let manager = LockManager::new(ctx.paths.locks_root());
+    let _held = manager.try_instance_locations("test holder").unwrap();
+    let refusal = manager
+        .acquire_typed(LockResource::Base("a-base".into()), "test waiter")
+        .expect_err("a lock taken while instance-locations is held is the wrong order");
+    assert!(
+        matches!(refusal, LockRefusal::Unavailable(_)),
+        "the wrong order is not somebody holding the lock: {refusal:?}"
+    );
+    let error = refusal.into_launcher_error();
+    assert_eq!(error.code(), "ERR_LOCK_ORDER");
+    let message = error.to_string();
+    assert!(
+        message.contains("instance-locations") && message.contains("base-a-base"),
+        "the refusal names both locks: {message}"
+    );
+    // The order refusal took nothing: the locations lock is still the only one held, and it is
+    // still this thread's.
+    assert!(manager
+        .current_operation(&LockResource::Base("a-base".into()))
+        .is_none());
+}
+
+/// The hold is the *thread's*, not the process's: another operation holding instance-locations on
+/// a thread of its own is that operation's business. A library scan on a shared thread does not
+/// make an unrelated import on this one fail, and this thread still sees the locations lock as
+/// busy rather than as a wrong order.
+#[test]
+fn a_location_hold_on_another_thread_does_not_refuse_this_threads_locks() {
+    let (_dir, ctx) = fixture();
+    let held = contend(&ctx);
+    let manager = LockManager::new(ctx.paths.locks_root());
+    let base = manager
+        .acquire(
+            LockResource::Base("a-base".into()),
+            "an unrelated operation",
+        )
+        .expect("a hold on another thread is not this thread's hold");
+    drop(base);
+    let busy = manager
+        .try_instance_locations("a second scan")
+        .expect_err("the locations lock really is held, by the other thread");
+    assert_eq!(busy.code(), "ERR_LOCK_TIMEOUT", "{busy}");
+    drop(held);
+}
+
+/// A restore cut off just after its rename: the files are back under `instances/` with the
+/// marker the delete wrote, the trash entry is still there, and no row was published. Finishing
+/// it publishes the pin (the row) and clears the entry, and a pinning scan reads the live rows
+/// and Recently deleted apart: unless recovery holds instance-locations across both, a base
+/// removal can read the rows before the insert and the trash after the tidy and delete a base
+/// the instance still needs.
+#[test]
+fn a_restore_recovery_cannot_publish_a_pin_while_a_base_removal_decides() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    pinned_instance(&ctx, "pinned", base_id);
+    let entry = game_instance::delete(&ctx, "pinned")
+        .unwrap()
+        .trash_entry_id
+        .unwrap();
+    // The state a crash leaves: the entry marked, the folder moved, no row yet.
+    let entry_dir = ctx.paths.recently_deleted_games_root().join(&entry);
+    fs::write(
+        entry_dir.join("restoring.json"),
+        br#"{"new_id":"pinned","new_name":"pinned"}"#,
+    )
+    .unwrap();
+    fs::write(
+        entry_dir
+            .join("instance")
+            .join(".agora-restore-marker.json"),
+        serde_json::json!({ "entry_id": entry }).to_string(),
+    )
+    .unwrap();
+    fs::rename(
+        entry_dir.join("instance"),
+        ctx.paths.instance_dir("pinned").unwrap(),
+    )
+    .unwrap();
+
+    // The removal's pause between its two pinning reads runs the recovery, exactly where a
+    // startup pass of another Agora program would land.
+    let recovery_ctx = ctx.clone();
+    let fired = AtomicBool::new(false);
+    let warnings: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let removal = game_base::remove_base_with(
+        &ctx.paths,
+        base_id,
+        || {
+            if fired.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let (actions, said) = trash::recover_interrupted_reporting(&recovery_ctx);
+            assert!(
+                actions.is_empty(),
+                "recovery published a pin while a base removal held instance-locations: {actions:?}"
+            );
+            *warnings.lock().unwrap() = said;
+        },
+        |path| std::fs::metadata(path),
+        |path| std::fs::remove_file(path),
+    );
+    assert!(fired.load(Ordering::SeqCst), "the pause was reached");
+    let said = warnings.lock().unwrap().clone();
+    assert!(
+        said.iter()
+            .any(|warning| warning.contains("instance-locations")),
+        "recovery must hold instance-locations, and say which lock kept it back: {said:?}"
+    );
+    assert!(
+        matches!(&removal, Err(BaseError::InUse { instances }) if instances == &vec!["pinned".to_string()]),
+        "a base the restorable instance still pins was removed: {removal:?}"
+    );
+    assert!(
+        base_dir.join("game.exe").is_file(),
+        "the base pinned by the restorable instance was removed"
+    );
+    assert!(ctx.paths.base_manifest_path(base_id).is_file());
+}
+
+/// A backup import registers an instance whose manifest names a base: the same pin a create
+/// publishes, through the same core path. It published that pin with no lock at all, so a removal
+/// that got to decide in between saw an unused base, deleted it, and reported success, leaving a
+/// live instance pinned to a folder that is gone.
+#[cfg(debug_assertions)]
+#[test]
+fn a_backup_import_cannot_publish_a_pin_to_a_base_being_removed() {
+    let (dir, ctx) = ctx_with_test_game();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    // Nothing pins the base yet, so a removal that decides now would delete it.
+    let manifest = GameInstanceManifest::new(
+        GameId::new("test-game").unwrap(),
+        "imported",
+        "Imported",
+        None,
+        BaseReference::Pinned {
+            id: base_id.into(),
+            runtime: RuntimeIdentity::minecraft("1.0"),
+            mode: BaseMode::Linked,
+        },
+    );
+
+    ctx.test_seams
+        .set_create_pause_before_publishing_pin(Some(base_id));
+    let import_ctx = ctx.clone();
+    let import_manifest = manifest.clone();
+    let import =
+        std::thread::spawn(move || game_instance::register_manifest(&import_ctx, &import_manifest));
+    let mut reached = false;
+    for _ in 0..600 {
+        if ctx.test_seams.create_pause_before_publishing_pin_reached() {
+            reached = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        reached,
+        "the import never held the base's lock before publishing its pin"
+    );
+
+    // A removal decides now: it must park on the base's lock, held until the pin is published.
+    let removal_paths = ctx.paths.clone();
+    let removal_base = base_id.to_string();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let removal = std::thread::spawn(move || {
+        let result = game_base::remove_base(&removal_paths, &removal_base);
+        let _ = done_tx.send(());
+        result
+    });
+    // If nothing keeps the base, the removal finishes on its own inside this window (the bug):
+    // it decides while the pin is still unpublished, deletes the base and reports success. Under
+    // the fix it parks on the base's lock, which the import holds until its row is inserted.
+    let mut decided_without_the_pin = false;
+    for _ in 0..300 {
+        if done_rx.try_recv().is_ok() {
+            decided_without_the_pin = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    ctx.test_seams.set_create_pause_before_publishing_pin(None);
+    let imported = import.join().unwrap().expect("the import completes");
+    let removal_outcome = removal.join().unwrap();
+
+    assert!(
+        !decided_without_the_pin,
+        "the removal decided while the pin was unpublished, instead of waiting for it"
+    );
+    assert!(
+        matches!(&removal_outcome, Err(BaseError::InUse { instances }) if instances == &vec!["imported".to_string()]),
+        "the removal must answer to the pin the import published: {removal_outcome:?}"
+    );
+    assert!(
+        base_dir.join("game.exe").is_file(),
+        "a base the imported instance pins was removed from under it"
+    );
+    assert!(ctx.paths.base_manifest_path(base_id).is_file());
+    assert!(
+        matches!(&imported.base, BaseReference::Pinned { id, .. } if id == base_id),
+        "the imported instance pins the base it names: {:?}",
+        imported.base
+    );
+}
+
+/// An entry past its expiry is still restorable until it is purged, and recovery can publish its
+/// row at any time. Skipping it in the pinning scan let a base be removed while the instance it
+/// belongs to could still come back.
+#[test]
+fn an_expired_entry_still_keeps_its_base() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    pinned_instance(&ctx, "pinned", base_id);
+    let entry = game_instance::delete(&ctx, "pinned")
+        .unwrap()
+        .trash_entry_id
+        .unwrap();
+    let record = ctx
+        .paths
+        .recently_deleted_games_root()
+        .join(&entry)
+        .join("entry.json");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    stored["expires_at"] = serde_json::Value::String("2001-01-01T00:00:00Z".into());
+    fs::write(&record, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+    let removal = game_base::remove_base(&ctx.paths, base_id);
+    assert!(
+        matches!(&removal, Err(BaseError::InUse { instances }) if instances == &vec!["pinned".to_string()]),
+        "an expired but restorable entry stopped protecting its base: {removal:?}"
+    );
+    assert!(base_dir.join("game.exe").is_file());
+    assert!(ctx.paths.base_manifest_path(base_id).is_file());
+}
+
+/// A create writes the instance's manifest, then its row. A crash between the two leaves a
+/// manifest that pins the base and no row, and nothing else on disk says the instance is there.
+#[test]
+fn an_orphan_pinned_manifest_keeps_its_base() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    let folder = ctx.paths.instance_dir("orphan").unwrap();
+    fs::create_dir_all(&folder).unwrap();
+    let manifest = GameInstanceManifest::new(
+        GameId::new("test-game").unwrap(),
+        "orphan",
+        "Orphan",
+        None,
+        BaseReference::Pinned {
+            id: base_id.into(),
+            runtime: RuntimeIdentity::minecraft("1.0"),
+            mode: BaseMode::Linked,
+        },
+    );
+    fs::write(
+        folder.join("instance_manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let removal = game_base::remove_base(&ctx.paths, base_id);
+    assert!(
+        matches!(&removal, Err(BaseError::InUse { instances }) if instances == &vec!["orphan".to_string()]),
+        "a manifest with no row stopped protecting its base: {removal:?}"
+    );
+    assert!(base_dir.join("game.exe").is_file());
+    assert!(ctx.paths.base_manifest_path(base_id).is_file());
+}
+
+/// A generic registration writes the manifest before the row, and a Minecraft-game instance cannot
+/// have a base row at all, so its manifest can name a base that no row ever did. Minecraft's delete
+/// then moves that folder into its own Recently deleted area, where it is restorable.
+#[test]
+fn a_pinned_manifest_in_the_other_recently_deleted_root_keeps_its_base() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    let folder = ctx
+        .paths
+        .recently_deleted_root()
+        .join("entry-1")
+        .join("instance");
+    fs::create_dir_all(&folder).unwrap();
+    let manifest = GameInstanceManifest::new(
+        GameId::new("minecraft").unwrap(),
+        "imported",
+        "Imported",
+        None,
+        BaseReference::Pinned {
+            id: base_id.into(),
+            runtime: RuntimeIdentity::minecraft("1.0"),
+            mode: BaseMode::Linked,
+        },
+    );
+    fs::write(
+        folder.join("instance_manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let removal = game_base::remove_base(&ctx.paths, base_id);
+    assert!(
+        matches!(&removal, Err(BaseError::InUse { instances }) if instances == &vec!["imported".to_string()]),
+        "a restorable entry in Minecraft's area stopped protecting its base: {removal:?}"
+    );
+    assert!(base_dir.join("game.exe").is_file());
+    assert!(ctx.paths.base_manifest_path(base_id).is_file());
+}
+
+/// A manifest that cannot be read might pin this base, so the base is kept and the file named.
+#[test]
+fn an_unreadable_instance_manifest_refuses_removal() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    let folder = ctx.paths.instance_dir("damaged").unwrap();
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("instance_manifest.json"), b"{ not json").unwrap();
+
+    let removal = game_base::remove_base(&ctx.paths, base_id);
+    let error = format!(
+        "{}",
+        removal.expect_err("an unreadable manifest must keep the base")
+    );
+    assert!(
+        error.contains("instance_manifest.json"),
+        "the refusal names the manifest it could not read: {error}"
+    );
+    assert!(base_dir.join("game.exe").is_file());
+    assert!(ctx.paths.base_manifest_path(base_id).is_file());
+}
+
+/// A game definition the generic instance paths accept, for the tests that need one.
+fn test_game_definition() -> agora_game_api::GameDefinition {
+    serde_json::from_value(serde_json::json!({
+        "id": "test-game",
+        "name": "Test Game",
+        "stores": [],
+        "version_sources": [],
+        "deployment": "virtual_file_system",
+        "content_rules": [],
+        "framework_ids": [],
+        "tool_ids": [],
+        "launch": {
+            "executable": { "root": "runtime", "path": "" },
+            "arguments": [],
+            "environment": {},
+            "working_directory": { "root": "runtime", "path": "" }
+        },
+        "user_files": [],
+        "save_paths": [],
+        "linked_archive_patterns": []
+    }))
+    .expect("a definition the core reads")
+}
+
+/// A clone publishes the base its source is pinned to, so it goes through the same base lock and
+/// record re-read a create and an import use: a base left unusable by a removal is refused rather
+/// than copied into a new instance's row.
+#[test]
+fn a_clone_refuses_a_pin_to_a_base_left_unusable() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    pinned_instance(&ctx, "source", base_id);
+    // The folder is gone and the record is left behind: a removal that could not finish.
+    fs::remove_dir_all(&base_dir).unwrap();
+
+    let cloned = game_instance::clone_instance(
+        &ctx,
+        "source",
+        "Copy",
+        &test_game_definition(),
+        game_instance::CloneOptions::default(),
+    );
+    let error = format!(
+        "{}",
+        cloned.expect_err("a clone must not publish a pin to a base that is not usable")
+    );
+    assert!(
+        error.contains(base_id),
+        "the refusal names the base: {error}"
+    );
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let clones: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM instances WHERE instance_id <> 'source'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(clones, 0, "a refused clone publishes no row");
+}
+
+/// A clone's base is judged before its folder is promoted, so a refusal leaves nothing behind. A
+/// folder whose manifest pins a base, with no row and no clone reported, is an instance nothing
+/// lists and nothing removes — and it names a base a removal has already taken away
+/// (MASTER_SPEC §32.8).
+#[test]
+fn a_clone_refused_its_base_leaves_no_folder_and_no_pin() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    pinned_instance(&ctx, "source", base_id);
+    // The folder is gone and the record is left behind: a removal that could not finish, which
+    // makes the base unusable for a pin.
+    fs::remove_dir_all(&base_dir).unwrap();
+
+    let cloned = game_instance::clone_instance(
+        &ctx,
+        "source",
+        "Copy",
+        &test_game_definition(),
+        game_instance::CloneOptions::default(),
+    );
+    assert!(
+        cloned.is_err(),
+        "a clone must not publish a pin to a base that is not usable"
+    );
+
+    let mut folders: Vec<String> = fs::read_dir(ctx.paths.instances_root())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    folders.sort();
+    assert_eq!(
+        folders,
+        vec!["source".to_string()],
+        "the refused clone left a folder behind: {folders:?}"
+    );
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM instances WHERE instance_id <> 'source'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0, "a refused clone publishes no row");
+}
+
+/// A base's recorded folder that is a plain file holds no files an instance could run from, but
+/// the record is healthy and something is at the path, so both old questions ("is the record
+/// readable", "is something there") answered yes. Only "is it a folder?" catches it, and a pin to
+/// it names a base nobody can open.
+#[test]
+fn a_clone_refuses_a_pin_to_a_base_folder_that_is_a_file() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let folder = ctx.paths.bases_dir().join(base_id);
+    fs::create_dir_all(ctx.paths.bases_dir()).unwrap();
+    fs::write(&folder, b"a file where the base folder should be").unwrap();
+    let manifest = serde_json::json!({
+        "manifest_version": 1u32,
+        "base_id": base_id,
+        "runtime": RuntimeIdentity::minecraft("1.0"),
+        "mode": BaseMode::Linked,
+        "source_install": "steam:1",
+        "source_product": "Test Game",
+        "source_location": dir.path().join("source"),
+        "location": folder,
+        "created_unix_ms": 0i64,
+        "files": [],
+        "skipped": [],
+    });
+    fs::create_dir_all(ctx.paths.base_manifests_dir()).unwrap();
+    fs::write(
+        ctx.paths.base_manifest_path(base_id),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    pinned_instance(&ctx, "source", base_id);
+
+    let cloned = game_instance::clone_instance(
+        &ctx,
+        "source",
+        "Copy",
+        &test_game_definition(),
+        game_instance::CloneOptions::default(),
+    );
+    let error = format!(
+        "{}",
+        cloned.expect_err("a pin must not name a base whose folder is a file")
+    );
+    assert!(
+        error.contains(base_id),
+        "the refusal names the base: {error}"
+    );
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let clones: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM instances WHERE instance_id <> 'source'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(clones, 0, "a refused clone publishes no row");
 }

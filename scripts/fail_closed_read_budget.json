@@ -3,7 +3,7 @@
     "crates/agora-core/src/artifact_hash.rs": 0,
     "crates/agora-core/src/backup.rs": 24,
     "crates/agora-core/src/db.rs": 14,
-    "crates/agora-core/src/game_base/mod.rs": 17,
+    "crates/agora-core/src/game_base/mod.rs": 14,
     "crates/agora-core/src/game_instance/trash.rs": 9,
     "crates/agora-core/src/game_tool_swap.rs": 14,
     "crates/agora-core/src/game_user_files.rs": 20,

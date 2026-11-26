@@ -1611,3 +1611,132 @@ fn the_undo_of_a_restore_leaves_a_file_beside_a_mapped_one_alone() {
         "and the file the snapshot did record comes back"
     );
 }
+
+/// A snapshot records the mod setup, not which game files the instance plays on: that is the live
+/// row's business. A snapshot taken while the instance was pinned to one base must not move a
+/// restored instance onto it, or the manifest and the row would disagree about the base an
+/// instance is pinned to.
+#[test]
+fn a_restore_keeps_the_live_rows_base_in_the_manifest() {
+    let h = Harness::new();
+    let runtime = h.manifest().runtime_identity.unwrap();
+    let pinned = |id: &str| BaseReference::Pinned {
+        id: id.into(),
+        runtime: runtime.clone(),
+        mode: agora_game_api::BaseMode::Linked,
+    };
+
+    // The snapshot is taken while the instance is pinned to the old base.
+    let mut manifest = h.manifest();
+    manifest.base = pinned("base-old");
+    h.write_manifest(&manifest);
+    let snap =
+        game_snapshot::create(&h.ctx, &h.id, &h.def, Some("base"), SnapshotOrigin::User).unwrap();
+
+    // The row and the live manifest now name the base it was rebuilt onto.
+    let mut manifest = h.manifest();
+    manifest.base = pinned("base-new");
+    h.write_manifest(&manifest);
+    let conn = agora_core::db::local_state_connection(&h.ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "UPDATE game_instance_bases SET base_json = ?1 WHERE instance_id = ?2",
+        rusqlite::params![serde_json::to_string(&pinned("base-new")).unwrap(), h.id],
+    )
+    .unwrap();
+    drop(conn);
+
+    game_snapshot::restore(&h.ctx, &h.id, &h.def, &snap.id, false).unwrap();
+
+    let base = h.manifest().base;
+    assert!(
+        matches!(&base, BaseReference::Pinned { id, .. } if id == "base-new"),
+        "the restore put the snapshot's base back into the manifest, against the row: {base:?}"
+    );
+    let row = agora_core::game_instance::get(&h.ctx, &h.id)
+        .unwrap()
+        .expect("the row")
+        .base;
+    assert!(
+        matches!(&row, BaseReference::Pinned { id, .. } if id == "base-new"),
+        "the row still names the base it was pinned to: {row:?}"
+    );
+}
+
+/// The manifest a restore writes must name the row's base from the moment it lands. A write
+/// followed by a correction leaves the snapshot's base on the disk in between, and a deployment or
+/// a base-removal scan that reads then acts on a base the instance is not pinned to
+/// (MASTER_SPEC §32.8). The seam holds the restore at exactly that moment, before anything looks at
+/// the manifest again.
+#[test]
+fn a_restore_never_puts_the_snapshots_base_on_the_disk() {
+    let h = Harness::new();
+    let runtime = h.manifest().runtime_identity.unwrap();
+    let pinned = |id: &str| BaseReference::Pinned {
+        id: id.into(),
+        runtime: runtime.clone(),
+        mode: agora_game_api::BaseMode::Linked,
+    };
+
+    // The snapshot is taken while the instance is pinned to the old base.
+    let mut manifest = h.manifest();
+    manifest.base = pinned("base-old");
+    h.write_manifest(&manifest);
+    let snap =
+        game_snapshot::create(&h.ctx, &h.id, &h.def, Some("base"), SnapshotOrigin::User).unwrap();
+
+    // The row and the live manifest now name the base it was rebuilt onto.
+    let mut manifest = h.manifest();
+    manifest.base = pinned("base-new");
+    h.write_manifest(&manifest);
+    let conn = agora_core::db::local_state_connection(&h.ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "UPDATE game_instance_bases SET base_json = ?1 WHERE instance_id = ?2",
+        rusqlite::params![serde_json::to_string(&pinned("base-new")).unwrap(), h.id],
+    )
+    .unwrap();
+    drop(conn);
+
+    h.ctx
+        .test_seams
+        .set_restore_pause_after_manifest_for(Some(&h.id));
+    let restore_ctx = h.ctx.clone();
+    let restore_id = h.id.clone();
+    let restore_def = h.def.clone();
+    let restore_snapshot = snap.id.clone();
+    let restore = std::thread::spawn(move || {
+        game_snapshot::restore(
+            &restore_ctx,
+            &restore_id,
+            &restore_def,
+            &restore_snapshot,
+            false,
+        )
+    });
+    let mut reached = false;
+    for _ in 0..600 {
+        if h.ctx.test_seams.restore_pause_after_manifest_reached() {
+            reached = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(reached, "the restore never wrote its manifest");
+
+    // The moment the manifest is on the disk, before anything corrects it.
+    let on_disk = h.manifest().base;
+    h.ctx.test_seams.set_restore_pause_after_manifest_for(None);
+    restore
+        .join()
+        .unwrap()
+        .expect("the restore finishes once the seam is released");
+
+    assert!(
+        matches!(&on_disk, BaseReference::Pinned { id, .. } if id == "base-new"),
+        "the restored manifest named the snapshot's base while the row named the live one: {on_disk:?}"
+    );
+    let after = h.manifest().base;
+    assert!(
+        matches!(&after, BaseReference::Pinned { id, .. } if id == "base-new"),
+        "and it still names it afterwards: {after:?}"
+    );
+}

@@ -1447,6 +1447,111 @@ fn base_removal_cannot_remove_a_base_an_instance_create_is_choosing() {
     assert_eq!(present, Some(1), "the created instance's row is published");
 }
 
+/// A create builds its base and publishes its pin later. A removal that runs in that gap, deletes
+/// the folder and cannot delete the record leaves a record naming no files. The create holds the
+/// base's lock while it re-reads that record, so it is the read that has to refuse: a pin must
+/// name a base that is really there, record and folder alike.
+#[cfg(debug_assertions)]
+#[test]
+fn a_create_cannot_pin_a_base_whose_removal_deleted_its_folder() {
+    use agora_core::ctx::CoreContext;
+    use agora_core::game_base::remove_base_with;
+    use agora_core::game_instance;
+
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("31"));
+    let outcome = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+    let base_folder = paths.bases_dir().join(&base_id);
+    assert!(base_folder.join(".agora-base.json").is_file());
+
+    let ctx = CoreContext::for_testing(tmp.path().join("data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+
+    // Park the create between building the base and taking the base's lock for its pin.
+    ctx.test_seams
+        .set_create_pause_before_locking_base(Some(&base_id));
+    let create_ctx = ctx.clone();
+    let create_install = install.clone();
+    let create_definition = test_definition();
+    let create = std::thread::spawn(move || {
+        game_instance::create(
+            &create_ctx,
+            &create_install,
+            &create_definition,
+            "Pinned late",
+            Some("pinned-late".into()),
+            BaseMode::Linked,
+            &|_| {},
+        )
+    });
+    let mut reached = false;
+    for _ in 0..600 {
+        if ctx.test_seams.create_pause_before_locking_base_reached() {
+            reached = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        reached,
+        "the create never got between its build and its base's lock"
+    );
+
+    // The removal deletes the folder and cannot delete the record, so it reports that it did not
+    // finish and the record stays, naming a folder that is gone.
+    let removal = remove_base_with(
+        &paths,
+        &base_id,
+        || {},
+        |path| std::fs::metadata(path),
+        |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the record is in use by another program",
+            ))
+        },
+    );
+    assert!(
+        removal.is_err(),
+        "the injected refusal must leave the record behind"
+    );
+    assert!(!base_folder.exists(), "the removal deleted the folder");
+
+    ctx.test_seams.set_create_pause_before_locking_base(None);
+    let created = create.join().unwrap();
+
+    let error = created.expect_err("a create pinned a base whose folder is gone");
+    let message = format!("{error}");
+    assert!(
+        message.contains(&base_id),
+        "the refusal names the base: {message}"
+    );
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM instances WHERE instance_id = 'pinned-late'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0, "a refused create publishes no row");
+    assert!(
+        !ctx.paths.instance_dir("pinned-late").unwrap().exists(),
+        "a refused create leaves no instance folder"
+    );
+}
+
 #[test]
 fn base_id_parts_never_start_or_end_with_a_dot() {
     for odd in ["1.", ".1", ".", "..", "...", "a..b."] {
@@ -2971,5 +3076,507 @@ fn a_failed_base_record_leaves_no_identity_row() {
     assert_eq!(
         identities, 0,
         "the identity row was rolled back with the base record"
+    );
+}
+
+/// An imported backup names a base that was machine-local where the backup was made, so its pin
+/// can wait for a base this machine has never had. The pinning check before a build exists to stop
+/// a build replacing a folder an instance is using; with no folder there, nothing is replaced and
+/// the build provisions the base the pin is waiting for.
+#[test]
+fn a_build_provisions_a_base_a_pin_is_waiting_for() {
+    use agora_core::ctx::CoreContext;
+    use agora_core::game_instance::GameInstanceManifest;
+    use agora_game_api::BaseReference;
+
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("41"));
+    let RuntimeResolution::Identified { runtime, .. } = &install.runtime else {
+        panic!("the fixture install is identified");
+    };
+    let base_id = make_base_id(runtime);
+    assert!(
+        !paths.bases_dir().join(&base_id).exists(),
+        "the fixture starts without the base"
+    );
+
+    // The instance an import registered: its manifest and row name the base, and the base itself
+    // is not here.
+    let ctx = CoreContext::for_testing(tmp.path().join("data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let manifest = GameInstanceManifest::new(
+        runtime.game.clone(),
+        "imported",
+        "Imported",
+        Some(runtime.clone()),
+        BaseReference::Pinned {
+            id: base_id.clone(),
+            runtime: runtime.clone(),
+            mode: BaseMode::Linked,
+        },
+    );
+    let dir = ctx.paths.instance_dir("imported").unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("instance_manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
+         VALUES ('imported', ?1, 'Imported', datetime('now'), NULL)",
+        [runtime.game.as_str()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO game_instance_bases (instance_id, base_json) VALUES ('imported', ?1)",
+        [serde_json::to_string(&manifest.base).unwrap()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let outcome = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .expect("a base a pin is waiting for is provisioned, not refused");
+    assert!(
+        matches!(outcome, BuildOutcome::Built { .. }),
+        "the build made the base: {outcome:?}"
+    );
+    assert!(
+        paths
+            .bases_dir()
+            .join(&base_id)
+            .join(".agora-base.json")
+            .is_file(),
+        "the base the pin names is there afterwards"
+    );
+    assert!(paths.base_manifest_path(&base_id).is_file());
+}
+
+/// A damaged record names no folder, so its folder may be in any bases root a build registered —
+/// another drive included. The record goes, which is what was asked; the removal then says which
+/// folders it looked in, so nobody counts the space as freed for a folder it never found.
+#[test]
+fn removing_a_damaged_record_says_which_roots_it_looked_in() {
+    let tmp = TempDir::new().unwrap();
+    let paths = AppPaths::from_root(tmp.path().join("data"));
+    let base_id = "skyrim-se_steam_2.0.0_nobuild";
+    std::fs::create_dir_all(paths.base_manifests_dir()).unwrap();
+    std::fs::write(paths.base_manifest_path(base_id), "{ not json").unwrap();
+
+    let removal = remove_base(&paths, base_id)
+        .expect("the record is removed; what is missing is the folder, and that is a warning");
+    assert_eq!(removal.warnings.len(), 1, "{removal:?}");
+    let warning = &removal.warnings[0];
+    assert!(
+        warning.contains(&paths.bases_dir().display().to_string()),
+        "the warning names the folder it looked in: {warning}"
+    );
+    assert!(
+        !paths.base_manifest_path(base_id).exists(),
+        "the record in the way is gone; what is missing is the folder"
+    );
+}
+
+/// The folder a damaged record cannot name may sit under a registered root on another drive.
+/// Removal removes nothing there (a folder named like the base is not proof it is this base) and
+/// names it, keeping the record so the state stays visible.
+#[test]
+fn removing_a_damaged_record_refuses_a_folder_under_another_root() {
+    let tmp = TempDir::new().unwrap();
+    let paths = AppPaths::from_root(tmp.path().join("data"));
+    let base_id = "skyrim-se_steam_2.0.0_nobuild";
+    std::fs::create_dir_all(paths.base_manifests_dir()).unwrap();
+    std::fs::write(paths.base_manifest_path(base_id), "{ not json").unwrap();
+    let other_root = tmp.path().join("bases_elsewhere");
+    let other_folder = other_root.join(base_id);
+    std::fs::create_dir_all(&other_folder).unwrap();
+    std::fs::write(other_folder.join("SkyrimSE.exe"), b"exe").unwrap();
+    std::fs::write(
+        paths.base_roots_file(),
+        serde_json::to_vec(&vec![other_root.clone()]).unwrap(),
+    )
+    .unwrap();
+
+    let error = remove_base(&paths, base_id)
+        .expect_err("a folder under another root must be reported, not passed over");
+    let message = format!("{error}");
+    assert!(
+        message.contains(&other_folder.display().to_string()),
+        "the report names the folder it found: {message}"
+    );
+    assert!(
+        other_folder.join("SkyrimSE.exe").is_file(),
+        "a damaged record is not proof that folder is this base, so it is not deleted"
+    );
+    assert!(
+        paths.base_manifest_path(base_id).is_file(),
+        "the record is kept while its folder is unresolved"
+    );
+}
+
+/// A stat on the folder that fails for any reason but "not there" is "could not tell", not "gone".
+/// Reading it as gone deleted the record and left the folder: the base vanished from the list while
+/// its files stayed on the disk. The stat is injected because a test cannot make the operating
+/// system refuse a stat on a folder it can see.
+#[test]
+fn a_removal_that_cannot_tell_whether_the_folder_is_there_removes_nothing() {
+    use agora_core::game_base::remove_base_with;
+
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("23"));
+    let outcome = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+    let base_folder = paths.bases_dir().join(&base_id);
+    let manifest_path = paths.base_manifest_path(&base_id);
+    assert!(base_folder.is_dir());
+
+    let removal = remove_base_with(
+        &paths,
+        &base_id,
+        || {},
+        |path: &std::path::Path| {
+            if path.file_name() == Some(std::ffi::OsStr::new(&base_id)) {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "access is denied",
+                ))
+            } else {
+                std::fs::metadata(path)
+            }
+        },
+        |path| std::fs::remove_file(path),
+    );
+    let error = removal.expect_err("a stat that said nothing is not a folder that is gone");
+    let message = format!("{error}");
+    assert!(
+        message.contains(&base_id),
+        "the error names the folder it could not check: {message}"
+    );
+    assert!(base_folder.is_dir(), "the folder is left alone");
+    assert!(
+        manifest_path.is_file(),
+        "the record is kept, so the base stays listed"
+    );
+}
+
+/// A link at `link` whose target is gone: a manifest or entry record that is a link, pointing at a
+/// drive or a folder that is not there any more. A file symlink is the shape a drive that went away
+/// leaves, so it is tried first; an account without the symlink privilege (no Developer Mode) gets
+/// a dangling directory junction instead, which needs none and makes the same point.
+fn dangling_link(target: &Path, link: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        if std::os::windows::fs::symlink_file(target, link).is_ok() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(target)?;
+        junction::create(target, link)?;
+        std::fs::remove_dir_all(target)
+    }
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+}
+
+/// A manifest that is a link is not a manifest that is absent. A link whose target is offline reads
+/// as "not found", and reading it that way let a base removal pass over the one record that said an
+/// instance pins the base — and then delete it. A link is named as a link and the base kept.
+#[test]
+fn a_manifest_that_is_a_link_keeps_its_base() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("51"));
+    let outcome = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+    let base_folder = paths.bases_dir().join(&base_id);
+    assert!(base_folder.is_dir());
+
+    // An instance folder with no row: its manifest, a link to somewhere that is gone, is the only
+    // record that it pins the base.
+    let orphan = paths.instances_root().join("orphan-instance");
+    std::fs::create_dir_all(&orphan).unwrap();
+    dangling_link(
+        &tmp.path().join("manifest-target"),
+        &orphan.join("instance_manifest.json"),
+    )
+    .unwrap();
+
+    let error = remove_base(&paths, &base_id)
+        .expect_err("a manifest Agora cannot read through a link must keep the base");
+    let message = format!("{error}");
+    assert!(
+        message.contains("instance_manifest.json"),
+        "the refusal names the manifest that is a link: {message}"
+    );
+    assert!(
+        message.contains("is a link"),
+        "the refusal says the record is a link, not that it failed to read: {message}"
+    );
+    assert!(base_folder.join(".agora-base.json").is_file());
+    assert!(paths.base_manifest_path(&base_id).is_file());
+}
+
+/// The same for a Recently deleted entry record: an `entry.json` that is a link to a place that is
+/// gone is not an entry that pins nothing. It is named, and the base is kept.
+#[test]
+fn an_entry_record_that_is_a_link_keeps_its_base() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("52"));
+    let outcome = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+    let base_folder = paths.bases_dir().join(&base_id);
+    assert!(base_folder.is_dir());
+
+    let entry = paths
+        .recently_deleted_games_root()
+        .join("20240101-000000_taken");
+    std::fs::create_dir_all(entry.join("instance")).unwrap();
+    dangling_link(&tmp.path().join("entry-target"), &entry.join("entry.json")).unwrap();
+
+    let error = remove_base(&paths, &base_id)
+        .expect_err("an entry record Agora cannot read through a link must keep the base");
+    let message = format!("{error}");
+    assert!(
+        message.contains("entry.json"),
+        "the refusal names the entry record that is a link: {message}"
+    );
+    assert!(
+        message.contains("is a link"),
+        "the refusal says the record is a link, not that it failed to read: {message}"
+    );
+    assert!(base_folder.join(".agora-base.json").is_file());
+    assert!(paths.base_manifest_path(&base_id).is_file());
+}
+
+/// The state a build leaves when it is cut short between renaming its marked folder into place and
+/// publishing the record: a folder, no record, and — for a base an import is waiting for — a pin.
+/// Neither a build nor a removal could finish it: the retry saw a folder to replace and a pin on
+/// it, and refused. The folder carries this build's marker, so it is this build's own output: the
+/// retry verifies it and publishes the record.
+#[test]
+fn a_build_interrupted_after_placing_its_folder_finishes_on_retry() {
+    use agora_core::ctx::CoreContext;
+    use agora_core::game_instance::GameInstanceManifest;
+    use agora_game_api::BaseReference;
+
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("43"));
+    let RuntimeResolution::Identified { runtime, .. } = &install.runtime else {
+        panic!("the fixture install is identified");
+    };
+    let base_id = make_base_id(runtime);
+
+    let first = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .unwrap();
+    assert!(matches!(first, BuildOutcome::Built { .. }), "{first:?}");
+    // The crash: the folder is in place with its marker, the record never was written.
+    std::fs::remove_file(paths.base_manifest_path(&base_id)).unwrap();
+    assert!(paths
+        .bases_dir()
+        .join(&base_id)
+        .join(".agora-base.json")
+        .is_file());
+    assert!(!paths.base_manifest_path(&base_id).exists());
+
+    // The pin that has been waiting for this base all along.
+    let ctx = CoreContext::for_testing(tmp.path().join("data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let manifest = GameInstanceManifest::new(
+        runtime.game.clone(),
+        "imported",
+        "Imported",
+        Some(runtime.clone()),
+        BaseReference::Pinned {
+            id: base_id.clone(),
+            runtime: runtime.clone(),
+            mode: BaseMode::Linked,
+        },
+    );
+    let dir = ctx.paths.instance_dir("imported").unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("instance_manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
+         VALUES ('imported', ?1, 'Imported', datetime('now'), NULL)",
+        [runtime.game.as_str()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO game_instance_bases (instance_id, base_json) VALUES ('imported', ?1)",
+        [serde_json::to_string(&manifest.base).unwrap()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let retried = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .expect("a build interrupted after placing its folder finishes on retry");
+    assert!(
+        matches!(retried, BuildOutcome::Built { .. }),
+        "the retry published the record: {retried:?}"
+    );
+    assert!(
+        paths.base_manifest_path(&base_id).is_file(),
+        "the record is published for the folder that was there"
+    );
+    let listed = list_bases(&paths).unwrap();
+    assert!(
+        listed.iter().any(|entry| matches!(
+            entry,
+            BaseEntry::Readable(manifest) if manifest.manifest.base_id == base_id
+        )),
+        "the base is listed as readable, not damaged: {listed:?}"
+    );
+}
+
+/// The same folder without the build's marker is not this build's output: it is somebody else's
+/// folder under the base's name, and a pin waiting for the base still means it must not be
+/// replaced.
+#[test]
+fn a_build_does_not_adopt_an_unmarked_folder_for_a_waiting_pin() {
+    use agora_core::ctx::CoreContext;
+    use agora_core::game_instance::GameInstanceManifest;
+    use agora_game_api::BaseReference;
+
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("44"));
+    let RuntimeResolution::Identified { runtime, .. } = &install.runtime else {
+        panic!("the fixture install is identified");
+    };
+    let base_id = make_base_id(runtime);
+
+    let first = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .unwrap();
+    assert!(matches!(first, BuildOutcome::Built { .. }), "{first:?}");
+    std::fs::remove_file(paths.base_manifest_path(&base_id)).unwrap();
+    // No marker: not a folder this build can prove it made.
+    std::fs::remove_file(paths.bases_dir().join(&base_id).join(".agora-base.json")).unwrap();
+
+    let ctx = CoreContext::for_testing(tmp.path().join("data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let manifest = GameInstanceManifest::new(
+        runtime.game.clone(),
+        "imported",
+        "Imported",
+        Some(runtime.clone()),
+        BaseReference::Pinned {
+            id: base_id.clone(),
+            runtime: runtime.clone(),
+            mode: BaseMode::Linked,
+        },
+    );
+    let dir = ctx.paths.instance_dir("imported").unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("instance_manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
+         VALUES ('imported', ?1, 'Imported', datetime('now'), NULL)",
+        [runtime.game.as_str()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO game_instance_bases (instance_id, base_json) VALUES ('imported', ?1)",
+        [serde_json::to_string(&manifest.base).unwrap()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let refused = build_base(
+        &paths,
+        &install,
+        &test_definition(),
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    );
+    let error = format!(
+        "{}",
+        refused.expect_err("a folder this build cannot prove it made is not replaced")
+    );
+    assert!(
+        error.contains("imported"),
+        "the refusal names the instance the folder is kept for: {error}"
+    );
+    assert!(
+        paths.bases_dir().join(&base_id).is_dir(),
+        "the folder that may be somebody else's is left alone"
     );
 }

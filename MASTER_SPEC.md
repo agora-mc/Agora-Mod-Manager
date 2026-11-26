@@ -5785,7 +5785,11 @@ Mod files live in `content/objects` with its own sweep, and snapshots keep a sec
   Automatic snapshot retention holds it for a whole round and, if it is still busy after a short
   wait, skips that round without deleting anything and without failing. A user-requested delete
   waits briefly before refusing. Acquire this lock after any instance, base or content-store locks,
-  and acquire nothing while holding it.
+  and acquire nothing while holding it. A take that breaks that order is refused with
+  `ERR_LOCK_ORDER` naming both locks, in release as in test builds: the take is the one lock the
+  deadlock waits for. The hold is the thread's — a lock held on another thread is that
+  operation's, and a guard dropped on a thread other than the one that took it ends the hold that
+  thread recorded.
 - A restore holds the instance-locations lock across its whole move: the rename, the live row's
   insert and the trash record's removal are one critical section, so a pinning scan cannot read
   the database before the insert and the trash after the cleanup and see the pin in neither. An

@@ -40,6 +40,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 /// OS advisory locking on an open handle.
@@ -227,6 +228,50 @@ fn lock_table(held: &HeldLocks) -> std::sync::MutexGuard<'_, HashMap<PathBuf, He
 }
 
 // ---------------------------------------------------------------------------
+// Instance-locations holds, per thread (MASTER_SPEC §32.8)
+// ---------------------------------------------------------------------------
+
+/// The threads that hold instance-locations in this process right now, and how many holds each
+/// has.
+///
+/// The lock order is a rule about one operation's locks, and an operation's locks belong to the
+/// thread running it, so the record is per thread — but it cannot be a thread-local or a
+/// `LockManager`'s own table. A guard can be dropped on a thread other than the one that took it
+/// (a task that migrates, a guard handed on), which would leave a thread-local set forever; and a
+/// second `LockManager` in the same thread would not see the first one's hold. One table for the
+/// process answers for both, keyed by the thread that recorded the hold, which is the thread that
+/// is told about it.
+static LOCATION_HOLDERS: OnceLock<Mutex<HashMap<ThreadId, usize>>> = OnceLock::new();
+
+fn location_holders() -> std::sync::MutexGuard<'static, HashMap<ThreadId, usize>> {
+    LOCATION_HOLDERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record that `thread` took instance-locations.
+fn record_location_hold(thread: ThreadId) {
+    *location_holders().entry(thread).or_insert(0) += 1;
+}
+
+/// Forget one of `thread`'s holds, and the thread with its last one.
+fn forget_location_hold(thread: ThreadId) {
+    let mut holders = location_holders();
+    if let Some(count) = holders.get_mut(&thread) {
+        *count -= 1;
+        if *count == 0 {
+            holders.remove(&thread);
+        }
+    }
+}
+
+/// Whether the calling thread holds instance-locations right now.
+fn thread_holds_locations() -> bool {
+    location_holders().contains_key(&std::thread::current().id())
+}
+
+// ---------------------------------------------------------------------------
 // LockError (structured, public)
 // ---------------------------------------------------------------------------
 
@@ -335,6 +380,9 @@ pub struct LockGuard {
     /// For an instance lock: the change to record on release, so another
     /// program showing this instance knows to reload it.
     change: Option<PendingChange>,
+    /// For the instance-locations lock: the thread whose hold this guard is, so the hold ends
+    /// when the guard does, whichever thread drops it.
+    location_holder: Option<ThreadId>,
 }
 
 #[derive(Debug)]
@@ -361,6 +409,11 @@ impl Drop for LockGuard {
                 &change.instance_id,
                 &change.operation,
             );
+        }
+        // The order rule's hold ends with the guard, wherever the guard is dropped: the thread it
+        // is recorded against may be this one and may not.
+        if let Some(thread) = self.location_holder.take() {
+            forget_location_hold(thread);
         }
         // Removing the entry drops the handle, which releases the OS lock.
         lock_table(&self.held).remove(&self.key);
@@ -482,6 +535,45 @@ impl LockManager {
         lock_table(&self.held)
             .get(key)
             .map(|state| state.operation.clone())
+    }
+
+    /// Refuse to take a lock while this thread holds instance-locations (MASTER_SPEC §32.8).
+    ///
+    /// The order is an instance or base lock first, then the content-store lock, then
+    /// instance-locations, and nothing at all while instance-locations is held. Every operation
+    /// that took the locks the other way round would let two of them each wait for a lock the
+    /// other holds, and the two answers a pinning scan reads (the live rows and both Recently
+    /// deleted roots) are only trustworthy while nothing can change between them. A wrong order
+    /// is a bug that only shows under load in a real run, so it is refused here with an error that
+    /// names both locks, in every build: a release build must not deadlock where a test build
+    /// panics.
+    ///
+    /// The check is the *thread's*, not the process's and not one manager's: another thread
+    /// holding instance-locations is another operation's lock, and a thread that holds it and
+    /// asks for something else is a deadlock waiting for itself.
+    fn refuse_lock_while_holding_locations(
+        &self,
+        resource: &LockResource,
+        operation: &str,
+    ) -> Result<(), LockRefusal> {
+        if !thread_holds_locations() {
+            return Ok(());
+        }
+        let held = LockResource::InstanceLocations
+            .lock_name()
+            .unwrap_or_else(|_| "instance-locations".into());
+        let asked = resource
+            .lock_name()
+            .unwrap_or_else(|_| format!("{resource:?}"));
+        Err(LockRefusal::Unavailable(LauncherError::Generic {
+            code: "ERR_LOCK_ORDER".into(),
+            message: format!(
+                "lock order (MASTER_SPEC §32.8): '{operation}' asked for '{asked}' while this \
+                 thread holds '{held}'. Take the instance or base lock first, then the content \
+                 store, then instance-locations, and take nothing while it is held. Nothing was \
+                 acquired."
+            ),
+        }))
     }
 
     /// The operation of the live holder of `resource`, when one holds it. A free
@@ -606,6 +698,13 @@ impl LockManager {
                 operation: operation.to_string(),
             });
         }
+        // A locations hold is recorded against the thread that took it, so every later take on
+        // this thread is refused and no take anywhere is refused because of it.
+        if matches!(resource, LockResource::InstanceLocations) {
+            let thread = std::thread::current().id();
+            record_location_hold(thread);
+            guard.location_holder = Some(thread);
+        }
         guard
     }
 
@@ -658,6 +757,7 @@ impl LockManager {
         timeout: Duration,
         cancel: Option<&CancellationToken>,
     ) -> Result<LockGuard, LockRefusal> {
+        self.refuse_lock_while_holding_locations(&resource, operation)?;
         let (lock_name, lock_path, key) =
             self.prepare(&resource).map_err(LockRefusal::Unavailable)?;
         let deadline = Instant::now() + timeout;
@@ -735,6 +835,7 @@ impl LockManager {
         timeout: Duration,
         cancel: Option<&CancellationToken>,
     ) -> Result<LockGuard, LockRefusal> {
+        self.refuse_lock_while_holding_locations(&resource, operation)?;
         let (lock_name, lock_path, key) =
             self.prepare(&resource).map_err(LockRefusal::Unavailable)?;
         let deadline = Instant::now() + timeout;
@@ -863,6 +964,7 @@ impl LockManager {
                     key: key.to_path_buf(),
                     held: Arc::clone(&self.held),
                     change: None,
+                    location_holder: None,
                 })
             }
             Ok(false) => {

@@ -251,6 +251,25 @@ pub fn clone_instance(
         return Err(error);
     }
 
+    // The pin a clone publishes is the base its source was pinned to, so it takes that base's lock
+    // and reads the record under it before anything of the clone exists, and holds that lock until
+    // the row is in (MASTER_SPEC §32.8). A base a removal has left unusable refuses the clone here,
+    // where there is nothing to undo; the same check after the promotion leaves a folder whose
+    // manifest pins a base, with no row and no clone reported.
+    let base_hold = match &source_manifest.base {
+        agora_game_api::BaseReference::Pinned { id, .. } => {
+            match super::hold_base_for_imported_pin(ctx, id, "clone") {
+                Ok(hold) => Some(hold),
+                Err(error) => {
+                    let _ = std::fs::remove_dir_all(&staging);
+                    return Err(error);
+                }
+            }
+        }
+        agora_game_api::BaseReference::Unpinned { .. } => None,
+    };
+    let _base_hold = base_hold;
+
     let destination = ctx
         .paths
         .instance_dir(&new_id)
@@ -306,7 +325,13 @@ pub fn clone_instance(
     }
 
     // The identity row and the base record it is keyed from go together: a clone whose pin
-    // was not published would look like an instance nothing pins.
+    // was not published would look like an instance nothing pins. The base's lock was taken
+    // before the folder was promoted and is still held here, so the pin cannot be published to a
+    // base a removal finished with in between.
+    #[cfg(debug_assertions)]
+    if let agora_game_api::BaseReference::Pinned { id, .. } = &source_manifest.base {
+        ctx.test_seams.create_pin_pause_point(id);
+    }
     let inserted = crate::db::in_one_transaction(&conn, |conn| -> Result<(), InstanceError> {
         conn.execute(
             "INSERT INTO instances (instance_id, game, name, created_at, last_launched_at)
