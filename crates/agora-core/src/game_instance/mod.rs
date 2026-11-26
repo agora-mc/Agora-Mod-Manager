@@ -378,7 +378,7 @@ fn hold_base_for_new_pin(
 > {
     let (hold, found) = lock_base_for_pin(ctx, base_id, operation)?;
     match found {
-        crate::game_base::PinnableBase::Ready(record) => Ok((hold, record)),
+        crate::game_base::PinnableBase::Ready(record) => Ok((hold, *record)),
         _ => Err(InstanceError::Other(format!(
             "the base {base_id} this instance would pin is gone: its record is not there any \
              more, so a removal finished while the instance was being made. Try again."

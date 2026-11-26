@@ -592,7 +592,7 @@ fn base_folder_is_intact(manifest: &BaseManifest) -> bool {
 #[derive(Debug)]
 pub(crate) enum PinnableBase {
     /// A healthy record whose folder is really there: a pin may name it.
-    Ready(BaseManifest),
+    Ready(Box<BaseManifest>),
     /// Nothing is at the record's own path, so this machine has never had that base.
     Absent,
     /// A record is there and is not one a pin may name: it is damaged, it names another base, the
@@ -622,7 +622,7 @@ pub(crate) fn pinnable_base(paths: &AppPaths, base_id: &str) -> Result<PinnableB
                 && base_folder_present(folder)
                 && !is_reparse_point_or_symlink(folder)
             {
-                Ok(PinnableBase::Ready(*manifest))
+                Ok(PinnableBase::Ready(manifest))
             } else {
                 Ok(PinnableBase::Unusable)
             }
