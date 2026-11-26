@@ -1406,7 +1406,7 @@ pub fn create_snapshot_full(
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         snapshot: snapshot.clone(),
         files,
-        scope: Some(capture_root_states(instance_dir, entries)),
+        scope: Some(capture_root_states(instance_dir, entries)?),
         content_refs: aux.content_refs.clone(),
         state: aux.state.clone(),
     };
@@ -1939,7 +1939,20 @@ fn restore_snapshot_impl(
     let preserved_recovery_dir = recover_interrupted_restore(instance_dir)?;
     let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
     let zip_path = snapshot_zip_path(instance_dir, snapshot_id);
-    if !manifest_path.exists() && !zip_path.exists() {
+    // Fail closed (§32.13): only "the operating system said not found" means this snapshot is not
+    // there. An unreadable location is its own answer, never "nothing found".
+    let mut found = false;
+    for path in [&manifest_path, &zip_path] {
+        match agora_game_api::probe(path) {
+            agora_game_api::Probe::Present(_) => found = true,
+            agora_game_api::Probe::Absent => {}
+            agora_game_api::Probe::CantTell(error) => return Err(format!(
+                "cannot tell what is at {}, so snapshot {snapshot_id} cannot be checked: {error}",
+                path.display()
+            )),
+        }
+    }
+    if !found {
         return Err(format!("snapshot {snapshot_id} not found"));
     }
 
@@ -1973,13 +1986,24 @@ fn restore_snapshot_impl(
     let original = capture_root_states(
         instance_dir,
         &covered.iter().map(String::as_str).collect::<Vec<_>>(),
-    );
+    )?;
 
     let pre_dir = pre_restore_dir(instance_dir);
-    if pre_dir.exists() {
+    // Fail closed (§32.13): a backup folder that cannot be examined is reported, not treated as
+    // absent — the material in it may be the only copy of what a previous restore moved aside.
+    match agora_game_api::probe(&pre_dir) {
         // recover_interrupted_restore has already dealt with any recognised
         // recovery material, so anything still here is unaccounted for.
-        preserve_orphaned_recovery_dir(instance_dir, &pre_dir)?;
+        agora_game_api::Probe::Present(_) => {
+            preserve_orphaned_recovery_dir(instance_dir, &pre_dir)?;
+        }
+        agora_game_api::Probe::Absent => {}
+        agora_game_api::Probe::CantTell(error) => {
+            return Err(format!(
+                "cannot tell what is at {}, so this restore will not start over it: {error}",
+                pre_dir.display()
+            ))
+        }
     }
     fs::create_dir_all(&pre_dir).map_err(|e| format!("failed to create pre-restore dir: {e}"))?;
 
@@ -2008,7 +2032,25 @@ fn restore_snapshot_impl(
     let mut moved_current = Vec::new();
     for entry_name in &covered {
         let src = instance_dir.join(entry_name);
-        if fs::symlink_metadata(&src).is_ok() {
+        // Whether the root is there decides whether it is moved aside; "I could not look" is not
+        // "it is not there" (§32.13), so an unreadable one stops the restore before anything moves.
+        let present = match agora_game_api::probe(&src) {
+            agora_game_api::Probe::Present(_) => true,
+            agora_game_api::Probe::Absent => false,
+            agora_game_api::Probe::CantTell(error) => {
+                let rollback =
+                    rollback_restore(instance_dir, &pre_dir, &[], &moved_current, &restore_id);
+                let _ = fs::remove_dir_all(&extract_dir);
+                let _ = fs::remove_file(restore_journal_path(instance_dir));
+                return Err(combine_restore_error(
+                    format!(
+                        "cannot tell whether {entry_name} is there, so it was not replaced: {error}"
+                    ),
+                    rollback,
+                ));
+            }
+        };
+        if present {
             let dst = pre_dir.join(entry_name);
             if let Some(parent) = dst.parent() {
                 fs::create_dir_all(parent).map_err(|e| format!("failed to create parent: {e}"))?;
@@ -2186,17 +2228,32 @@ fn recover_interrupted_restore(instance_dir: &Path) -> Result<Option<PathBuf>, S
         .iter()
         .filter(|root| {
             root.state == RootState::Absent
-                && fs::symlink_metadata(instance_dir.join(&root.name)).is_ok()
+                // "Not found" is the only answer that means the root is not there to undo. An
+                // unreadable one is treated as present, so rollback reports it rather than
+                // silently leaving a promoted root in place (§32.13).
+                && !agora_game_api::probe(instance_dir.join(&root.name)).is_absent()
         })
         .map(|root| root.name.clone())
         .collect();
-    let backed_up: Vec<String> = journal
+    let mut backed_up: Vec<String> = Vec::new();
+    for root in journal
         .original
         .iter()
         .filter(|root| root.state != RootState::Absent)
-        .map(|root| root.name.clone())
-        .filter(|name| pre_dir.join(name).exists())
-        .collect();
+    {
+        match agora_game_api::probe(pre_dir.join(&root.name)) {
+            agora_game_api::Probe::Present(_) => backed_up.push(root.name.clone()),
+            // A root with no backup had not moved when the process stopped; nothing to put back.
+            agora_game_api::Probe::Absent => {}
+            agora_game_api::Probe::CantTell(error) => {
+                return Err(format!(
+                    "cannot tell whether the backup of '{}' is there, so the interrupted restore \
+                     is not undone automatically: {error}",
+                    root.name
+                ))
+            }
+        }
+    }
     let mut displace = promoted;
     displace.extend(backed_up.iter().cloned());
 
@@ -2591,22 +2648,45 @@ fn write_root(relative: &str) -> Result<String, String> {
 /// Record the live state of each scope root at capture time.
 ///
 /// Uses `symlink_metadata` so a link is classified as what it is rather than
-/// as whatever it points at.
-fn capture_root_states(instance_dir: &Path, entries: &[&str]) -> Vec<SnapshotRoot> {
-    entries
-        .iter()
-        .map(|name| {
-            let state = match fs::symlink_metadata(instance_dir.join(name)) {
-                Ok(metadata) if metadata.is_dir() => RootState::Directory,
-                Ok(_) => RootState::File,
-                Err(_) => RootState::Absent,
-            };
-            SnapshotRoot {
-                name: (*name).to_string(),
-                state,
+/// as whatever it points at. The lookup is injected so a failing one can be exercised (see
+/// [`capture_root_states`]).
+///
+/// A root that cannot be examined is cannot-tell, not absent (§32.13). What this records decides
+/// whether a restore moves the root aside and whether an interruption removes it, so "I could not
+/// look" must never become "it is not there".
+fn capture_root_states_with(
+    instance_dir: &Path,
+    entries: &[&str],
+    metadata: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<Vec<SnapshotRoot>, String> {
+    let mut states = Vec::with_capacity(entries.len());
+    for name in entries {
+        let root = instance_dir.join(name);
+        // The injected lookup answers "is it there, and what is it"; a result that says "there is
+        // something but I will not describe it" is the only case left over, and it is cannot-tell.
+        let state = match metadata(&root) {
+            Ok(metadata) if metadata.is_dir() => RootState::Directory,
+            Ok(_) => RootState::File,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => RootState::Absent,
+            Err(error) => {
+                return Err(format!(
+                    "cannot tell whether '{}' is there, so this snapshot cannot record what it \
+                     owns: {error}",
+                    root.display()
+                ))
             }
-        })
-        .collect()
+        };
+        states.push(SnapshotRoot {
+            name: (*name).to_string(),
+            state,
+        });
+    }
+    Ok(states)
+}
+
+/// [`capture_root_states_with`] against the live filesystem.
+fn capture_root_states(instance_dir: &Path, entries: &[&str]) -> Result<Vec<SnapshotRoot>, String> {
+    capture_root_states_with(instance_dir, entries, |path| fs::symlink_metadata(path))
 }
 
 /// Decide which roots this snapshot may replace.
@@ -4143,8 +4223,42 @@ mod tests {
         }
     }
 
+    /// A root whose metadata cannot be read is cannot-tell, not absent.
+    ///
+    /// What a restore records about a root decides whether it is moved aside and whether an
+    /// interruption removes it, so "I could not look" must never become "it is not there". The
+    /// metadata lookup is injected so the failure can be exercised without the OS failing on cue.
     #[test]
-    fn interrupted_restore_is_recovered_before_a_new_attempt() {
+    fn a_root_that_cannot_be_examined_is_cannot_tell_not_absent() {
+        let tmp = TempDir::new().unwrap();
+        let inst = make_instance(&tmp);
+        let refused = capture_root_states_with(&inst, &["mods"], |path| {
+            if path.ends_with("mods") {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))
+            } else {
+                fs::symlink_metadata(path)
+            }
+        })
+        .expect_err("a root that cannot be examined is cannot-tell");
+        assert!(
+            refused.contains("mods") && refused.contains("cannot tell"),
+            "{refused}"
+        );
+
+        // The control: what is there and what is not are still told apart.
+        let states = capture_root_states_with(&inst, &["mods", "datapacks"], |path| {
+            fs::symlink_metadata(path)
+        })
+        .unwrap();
+        assert_eq!(states[0].state, RootState::Directory);
+        assert_eq!(states[1].state, RootState::Absent);
+    }
+
+    #[test]
+    fn an_interrupted_restore_is_recovered_before_a_new_attempt() {
         let tmp = TempDir::new().unwrap();
         let inst = make_instance(&tmp);
         fs::write(

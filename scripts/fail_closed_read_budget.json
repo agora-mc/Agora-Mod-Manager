@@ -19,7 +19,7 @@
     "crates/agora-core/src/registry_bundle.rs": 7,
     "crates/agora-core/src/registry_sync.rs": 43,
     "crates/agora-core/src/session_ledger.rs": 25,
-    "crates/agora-core/src/snapshot.rs": 60,
+    "crates/agora-core/src/snapshot.rs": 56,
     "crates/agora-core/src/startup_recovery.rs": 0,
     "crates/agora-game-minecraft/src/launcher_import_service.rs": 49,
     "crates/agora-game-minecraft/src/recently_deleted.rs": 7
