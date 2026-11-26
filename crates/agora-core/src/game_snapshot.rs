@@ -333,7 +333,10 @@ pub fn capture_data(
             }
         }
     }
-    for profile in crate::loadout::list_profiles(&dir)? {
+    // A damaged loadout record cannot be read, so its content items cannot be named here. It is
+    // reported by `list_profiles` where a person can act on it, and it stays on disk, so nothing is
+    // recorded as "this snapshot does not need it".
+    for profile in crate::loadout::list_profiles(&dir)?.profiles {
         if let Some(state) = &profile.game {
             for item in &state.content {
                 refs.insert(item.item.clone());

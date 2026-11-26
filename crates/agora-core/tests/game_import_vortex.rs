@@ -1259,7 +1259,7 @@ fn chosen_profiles() -> Vec<String> {
 
 fn enabled_count(ctx: &CoreContext, instance: &str, profile: &str) -> usize {
     let dir = ctx.paths.instance_dir(instance).unwrap();
-    let profiles = agora_core::loadout::list_profiles(&dir).unwrap();
+    let profiles = agora_core::loadout::list_profiles(&dir).unwrap().profiles;
     profiles
         .iter()
         .find(|p| p.name == profile)
@@ -1419,6 +1419,7 @@ fn loadout(f: &Fixture, instance: &str, name: &str) -> agora_core::loadout::Load
     let dir = f.ctx.paths.instance_dir(instance).unwrap();
     agora_core::loadout::list_profiles(&dir)
         .expect("the loadouts list")
+        .profiles
         .into_iter()
         .find(|profile| profile.name == name)
         .unwrap_or_else(|| panic!("no loadout '{name}' on {instance}"))

@@ -6601,10 +6601,16 @@ async fn run_loadout_command(
             if !instance_dir.exists() {
                 anyhow::bail!("Instance '{}' not found", instance);
             }
-            let profiles = agora_core::loadout::list_profiles(&instance_dir)
+            let listing = agora_core::loadout::list_profiles(&instance_dir)
                 .map_err(|e| anyhow::anyhow!("Failed to list loadouts: {e}"))?;
+            let profiles = &listing.profiles;
             if json {
                 println!("{}", serde_json::to_string_pretty(&profiles)?);
+                // Machine output stays an array of profiles; the records that could not be read go
+                // to stderr so a script's stdout stays parseable and a person still sees them.
+                for damaged in &listing.damaged {
+                    eprintln!("Unreadable loadout record: {damaged}");
+                }
             } else {
                 let manifest = agora_core::game_instance::get_manifest(ctx, &instance).ok();
                 let definition = manifest
@@ -6656,6 +6662,10 @@ async fn run_loadout_command(
                     })
                     .collect();
                 print_table(&["Name", "Created", "Entries", "Saves"], &rows);
+                // A record that cannot be read is named, never silently left out of the list.
+                for damaged in &listing.damaged {
+                    println!("  Unreadable: {damaged}");
+                }
             }
         }
         LoadoutCmd::Apply {

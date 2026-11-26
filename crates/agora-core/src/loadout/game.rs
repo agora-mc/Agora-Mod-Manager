@@ -214,6 +214,7 @@ pub fn create_game_profile(
         let dir = instance_dir(ctx, instance_id)?;
         let single_claimed = loadout::list_profiles(&dir)
             .map_err(|e| e.to_string())?
+            .profiles
             .iter()
             .any(|profile| {
                 profile.name != name
@@ -948,7 +949,7 @@ mod tests {
 
         let done = update_game_profile(&s.ctx, "test-instance", &s.def, "base").unwrap();
         assert_eq!(done.name, "base");
-        let profiles = loadout::list_profiles(&s.dir).unwrap();
+        let profiles = loadout::list_profiles(&s.dir).unwrap().profiles;
         let game = profiles[0].game.as_ref().unwrap();
         assert!(
             !game

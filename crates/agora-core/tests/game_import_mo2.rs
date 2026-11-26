@@ -1550,7 +1550,7 @@ fn two_profiles_import_merged_with_a_loadout_for_each() {
         );
     }
     let dir = f.ctx.paths.instance_dir(instance).unwrap();
-    let loadouts = agora_core::loadout::list_profiles(&dir).unwrap();
+    let loadouts = agora_core::loadout::list_profiles(&dir).unwrap().profiles;
     let enabled = |profile_name: &str| -> std::collections::BTreeMap<String, bool> {
         let profile = loadouts
             .iter()
@@ -1717,7 +1717,7 @@ fn f1a_merged_profile_without_own_settings_uses_shared_not_profile_1() {
     let instance = &report.instances[0];
     let dir = f.ctx.paths.instance_dir(instance).unwrap();
 
-    let loadouts = agora_core::loadout::list_profiles(&dir).unwrap();
+    let loadouts = agora_core::loadout::list_profiles(&dir).unwrap().profiles;
     let get_loadout = |name: &str| {
         loadouts
             .iter()
