@@ -164,12 +164,13 @@ impl ArchiveLimits {
 
     /// A world a player exported, or one they downloaded: a folder of region files, one of which
     /// may be hundreds of megabytes. Carried over from `worlds::MAX_IMPORT_ENTRIES` and
-    /// `MAX_IMPORT_BYTES`, which had no per-entry limit of its own, so the per-entry limit is the
-    /// total: nothing a world archive holds is refused for its size alone.
+    /// `MAX_IMPORT_BYTES`, which had no per-entry limit of its own — hence 2 GiB, which is the
+    /// largest a region file plausibly gets and no reason to hold a 16 GiB one open (owner's call,
+    /// §32.3). The total stays at what the old code allowed.
     pub const WORLD_ARCHIVE: Self = Self {
         preset: "world archive",
         max_entries: 200_000,
-        max_entry_bytes: 16 * GIB,
+        max_entry_bytes: 2 * GIB,
         max_total_bytes: 16 * GIB,
         max_ratio: 0,
         bounds_the_listing: true,

@@ -1082,7 +1082,8 @@ mod tests {
     }
 
     #[test]
-    fn import_rejects_an_archive_without_a_world() {        let (root, service) = fixture();
+    fn import_rejects_an_archive_without_a_world() {
+        let (root, service) = fixture();
         let archive = root.path().join("empty.zip");
         let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
         zip.start_file("readme.txt", zip::write::SimpleFileOptions::default())

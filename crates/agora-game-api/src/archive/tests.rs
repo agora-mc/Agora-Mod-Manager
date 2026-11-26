@@ -239,8 +239,12 @@ fn the_presets_carry_the_limits_the_call_sites_used() {
     );
     assert_eq!(
         ArchiveLimits::WORLD_ARCHIVE.max_entry_bytes,
+        2 * 1024 * MIB,
+        "the old code had no per-entry limit; 2 GiB is the largest a region file plausibly gets"
+    );
+    assert_eq!(
         ArchiveLimits::WORLD_ARCHIVE.max_total_bytes,
-        "a world archive had no per-entry limit of its own"
+        16 * 1024 * MIB
     );
 
     let listing_checks: Vec<bool> = [
