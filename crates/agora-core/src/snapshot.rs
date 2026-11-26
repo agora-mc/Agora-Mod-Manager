@@ -1438,15 +1438,18 @@ pub(crate) fn create_snapshot_full_with_pause(
         }
     }
 
+    // The seam sits in the window the pending record exists to close: the capture has decided what
+    // each file reuses or adds, and has not yet published the record that names those objects.
+    if let Some(pause) = pause {
+        pause();
+    }
+
     let hashes: Vec<String> = planned.iter().map(|plan| plan.sha256.clone()).collect();
     let pending = crate::content_store::pending::begin_pending_use(
         &snapshot_store_paths(instance_dir),
         &hashes,
         "snapshot capture",
     )?;
-    if let Some(pause) = pause {
-        pause();
-    }
 
     let mut files: Vec<SnapshotFileEntry> = Vec::with_capacity(planned.len());
     let mut live_index = Vec::with_capacity(planned.len());

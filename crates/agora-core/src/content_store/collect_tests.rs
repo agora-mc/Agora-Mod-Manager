@@ -185,7 +185,9 @@ fn a_capture_reusing_a_blob_keeps_it_while_a_collection_runs() {
     .unwrap();
 
     // A second capture reuses the blob the first one stored: same size, time and identity. The
-    // pause sits after that decision and before the manifest that names it is published.
+    // pause sits in the window between that decision and the record that names the objects: a
+    // collection running there must not be able to make the capture publish a manifest naming a
+    // blob it never placed.
     let fired = Arc::new(AtomicBool::new(false));
     let fired_in_pause = Arc::clone(&fired);
     let collect_ctx = Ctx::for_testing(ctx.paths.root().to_path_buf());
