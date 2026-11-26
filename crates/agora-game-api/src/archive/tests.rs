@@ -1530,3 +1530,24 @@ fn a_rar_that_changed_since_it_was_opened_is_refused() {
         "no part of an archive nothing measured reaches a folder"
     );
 }
+
+#[test]
+fn a_tar_gz_whose_gzip_trailer_is_wrong_is_refused() {
+    // The gzip trailer — CRC-32 and the uncompressed length — comes *after* the tar end marker, so a
+    // reader that stops at the marker never checks it and calls a corrupt stream a good archive.
+    let mut bytes = tar_gz_bytes(&[("mods/a.esp", b"data")]);
+    let good = SafeArchive::open_bytes(bytes.clone(), ArchiveLimits::PACK).expect("a good tar.gz");
+    assert_eq!(good.file_entries().count(), 1);
+
+    let trailer = bytes.len() - 8;
+    bytes[trailer] ^= 0xFF;
+    let error = SafeArchive::open_bytes(bytes.clone(), ArchiveLimits::PACK)
+        .err()
+        .expect("the trailer CRC no longer matches");
+    assert!(matches!(error, ArchiveError::Corrupt { .. }), "{error:?}");
+
+    assert!(
+        SafeArchive::open_bytes(bytes[..trailer + 2].to_vec(), ArchiveLimits::PACK).is_err(),
+        "a trailer that is not all there is the same kind of lie"
+    );
+}

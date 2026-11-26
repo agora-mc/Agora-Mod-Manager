@@ -935,6 +935,9 @@ impl SafeArchive {
                         return Ok(());
                     }
                 }
+                // The gzip trailer is after the tar end marker, and this walk reads the file again:
+                // it checks the stream's own end rather than trusting the listing's read of it.
+                drain_stream(archive.into_inner(), self.format, &path)?;
                 Ok(())
             }
             ArchiveFormat::SevenZ => {
@@ -2105,7 +2108,37 @@ fn list_tar(
             unix_mode: Some(entry.header().mode().unwrap_or(0o644)),
         });
     }
+    // A `tar.gz`'s gzip trailer — the CRC-32 and the uncompressed length — sits *after* the tar end
+    // marker. Stopping at the marker never looks at it, so a stream whose CRC is wrong or whose
+    // trailer is cut short is reported as a good archive (MASTER_SPEC §32.13).
+    drain_stream(archive.into_inner(), format, path)?;
     Ok(entries)
+}
+
+/// Read a decompressed stream to its end, so the decoder checks its own trailer.
+///
+/// For a plain tar this reads the padding after the end marker and finds nothing; for a `tar.gz` it
+/// is the only place the gzip trailer is checked at all.
+fn drain_stream(
+    mut reader: Box<dyn Read>,
+    format: ArchiveFormat,
+    path: &str,
+) -> Result<(), ArchiveError> {
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(ArchiveError::Corrupt {
+                    path: path.to_string(),
+                    format,
+                    reason: format!("the stream does not end where its trailer says: {error}"),
+                })
+            }
+        }
+    }
 }
 
 /// The count and total a listing has reached so far, held to the preset.
