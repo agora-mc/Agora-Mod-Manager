@@ -31,9 +31,7 @@ fn write(root: &Path, relative: &str, bytes: &[u8]) {
 
 /// One instance holding a file in every tracked entry, plus the two files a snapshot must not own:
 /// one at the instance root and one in a folder the package does not declare.
-fn instance() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
+fn fill(root: &Path) {
     write(root, "mods/a.jar", b"mod a");
     write(root, "mods/b.jar.disabled", b"mod b");
     write(root, "config/a.toml", b"config");
@@ -51,6 +49,11 @@ fn instance() -> tempfile::TempDir {
         b"the user's own file, not snapshot state",
     );
     write(root, "undeclared/keep.txt", b"a folder Agora does not own");
+}
+
+fn instance() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fill(dir.path());
     dir
 }
 
@@ -81,6 +84,49 @@ fn a_full_snapshot_captures_exactly_the_golden_file_set() {
         .collect();
     captured.sort();
     assert_eq!(captured, GOLDEN);
+}
+
+/// The same file set, through the entry point the CLI and the desktop use: a manual capture goes
+/// through `SnapshotService`, which reads the package's declaration. The low-level function above
+/// proves the folder list; this proves the path a person's "Create snapshot" takes.
+#[test]
+fn a_manual_capture_through_the_service_captures_the_golden_file_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = agora_game_minecraft::testing_context(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let dir = ctx.paths.instance_dir("golden-instance").unwrap();
+    fill(&dir);
+    fs::write(
+        dir.join("instance_manifest.json"),
+        serde_json::json!({
+            "instance_id": "golden-instance",
+            "name": "Golden",
+            "minecraft_version": "1.21.1",
+            "loader": "fabric",
+            "loader_version": "0.16.0",
+            "mods": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let snapshot = agora_core::snapshot_service::SnapshotService::new(ctx.clone())
+        .create("golden-instance", Some("golden"))
+        .expect("the service captures what the package declares");
+
+    let mut captured: Vec<String> = snapshot::snapshot_file_entries(&dir, &snapshot.id)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.relative_path)
+        .collect();
+    captured.sort();
+    assert_eq!(captured, GOLDEN);
+    assert!(
+        !captured
+            .iter()
+            .any(|path| path == "notes.txt" || path.starts_with("undeclared")),
+        "the service owns only the declared folders: {captured:?}"
+    );
 }
 
 #[test]

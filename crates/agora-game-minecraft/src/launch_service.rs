@@ -2051,6 +2051,59 @@ mod tests {
         }
     }
 
+    /// The launch path's pre-launch snapshot, pinned to an exact file set.
+    ///
+    /// The package's list is checked on its own elsewhere; this is the path a launch actually takes
+    /// (`create_or_reuse_snapshot`), so a change to what a launch captures shows up here as a
+    /// different list rather than as a surprise after a crash.
+    #[test]
+    fn a_launch_point_captures_exactly_the_prelaunch_golden_file_set() {
+        const PRELAUNCH_GOLDEN: &[&str] = &[
+            "config/a.toml",
+            "datapacks/pack.zip",
+            "defaultconfigs/b.toml",
+            "instance_manifest.json",
+            "kubejs/server.js",
+            "mods/a.jar",
+            "mods/b.jar.disabled",
+            "options.txt",
+            "resourcepacks/pack.zip",
+            "shaderpacks/shader.zip",
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let inst = tmp.path().join("instance");
+        for (relative, bytes) in [
+            ("mods/a.jar", "mod a"),
+            ("mods/b.jar.disabled", "mod b"),
+            ("config/a.toml", "config"),
+            ("defaultconfigs/b.toml", "config"),
+            ("kubejs/server.js", "script"),
+            ("resourcepacks/pack.zip", "pack"),
+            ("shaderpacks/shader.zip", "shader"),
+            ("datapacks/pack.zip", "data"),
+            ("saves/world/level.dat", "world"),
+            ("options.txt", "options"),
+        ] {
+            let path = inst.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        std::fs::write(inst.join("instance_manifest.json"), b"{}").unwrap();
+        // Neither of these is snapshot state, and a launch must not capture them.
+        std::fs::write(inst.join("notes.txt"), b"the user's own file").unwrap();
+        std::fs::create_dir_all(inst.join("undeclared")).unwrap();
+        std::fs::write(inst.join("undeclared").join("keep.txt"), b"not ours").unwrap();
+
+        let id = create_or_reuse_snapshot(&inst).expect("a launch takes its pre-launch point");
+        let mut captured: Vec<String> = agora_core::snapshot::snapshot_file_entries(&inst, &id)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.relative_path)
+            .collect();
+        captured.sort();
+        assert_eq!(captured, PRELAUNCH_GOLDEN);
+    }
+
     #[test]
     fn prelaunch_snapshot_excludes_saves_and_reuses_in_o1() {
         let tmp = tempfile::tempdir().unwrap();
