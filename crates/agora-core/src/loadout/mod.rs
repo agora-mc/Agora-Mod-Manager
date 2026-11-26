@@ -556,7 +556,9 @@ pub fn list_profiles(instance_dir: &Path) -> Result<LoadoutListing, String> {
         let content = match fs::read(&path) {
             Ok(content) => content,
             Err(error) => {
-                listing.damaged.push(format!("{describe} cannot be read: {error}"));
+                listing
+                    .damaged
+                    .push(format!("{describe} cannot be read: {error}"));
                 continue;
             }
         };
@@ -566,9 +568,7 @@ pub fn list_profiles(instance_dir: &Path) -> Result<LoadoutListing, String> {
         }
     }
 
-    listing
-        .profiles
-        .sort_by(|a, b| a.name.cmp(&b.name));
+    listing.profiles.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(listing)
 }
 

@@ -596,8 +596,10 @@ fn capture_files_in_scope(
         .instance_dir(instance_id)
         .map_err(|e| e.to_string())?;
     let mut files = capture_files(ctx, instance_id, definition, DeclaredFolders::All)?;
-    let captured: std::collections::BTreeSet<&str> =
-        files.iter().map(|file| file.relative_path.as_str()).collect();
+    let captured: std::collections::BTreeSet<&str> = files
+        .iter()
+        .map(|file| file.relative_path.as_str())
+        .collect();
     let mut extra = Vec::new();
     for folder in recorded {
         // A recorded scope entry is a folder or a single file, and the manifest does not say which:

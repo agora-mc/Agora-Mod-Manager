@@ -1994,17 +1994,16 @@ fn restore_snapshot_impl(
                 fs::create_dir_all(parent).map_err(|e| format!("failed to create parent: {e}"))?;
             }
             if let Err(error) = fs::rename(&src, &dst) {
-                let rollback =
-                    rollback_restore(
-                        instance_dir,
-                        &pre_dir,
-                        &[],
-                        &moved_current,
-                        &restore_id,
-                        &retired,
-                        &journal.moved_files,
-                        &journal.restored_files,
-                    );
+                let rollback = rollback_restore(
+                    instance_dir,
+                    &pre_dir,
+                    &[],
+                    &moved_current,
+                    &restore_id,
+                    &retired,
+                    &journal.moved_files,
+                    &journal.restored_files,
+                );
                 let _ = fs::remove_dir_all(&extract_dir);
                 let _ = fs::remove_file(restore_journal_path(instance_dir));
                 return Err(combine_restore_error(
@@ -2548,10 +2547,11 @@ fn is_under(path: &Path, folder: &Path) -> bool {
     let mut path = path.components().peekable();
     for component in folder.components() {
         match path.next() {
-            Some(part) if agora_game_api::same_spelling(
-                Path::new(&part.as_os_str().to_string_lossy().to_string()),
-                Path::new(&component.as_os_str().to_string_lossy().to_string()),
-            ) => {}
+            Some(part)
+                if agora_game_api::same_spelling(
+                    Path::new(&part.as_os_str().to_string_lossy().to_string()),
+                    Path::new(&component.as_os_str().to_string_lossy().to_string()),
+                ) => {}
             _ => return false,
         }
     }
@@ -2975,7 +2975,9 @@ fn rollback_restore(
         let displaced = failed_dir.join(relative);
         if let Some(parent) = displaced.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
-                errors.push(format!("could not prepare displacement for {relative}: {e}"));
+                errors.push(format!(
+                    "could not prepare displacement for {relative}: {e}"
+                ));
                 continue;
             }
         }

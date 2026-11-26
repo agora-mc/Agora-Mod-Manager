@@ -1519,4 +1519,3 @@ fn the_undo_of_a_restore_that_wrote_a_retired_folder_puts_it_back() {
         b"created since"
     );
 }
-
