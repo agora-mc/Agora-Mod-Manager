@@ -75,6 +75,13 @@ pub struct ArchiveLimits {
     /// reason to lose the mod's id. The per-entry limit still applies to each entry as it is read,
     /// which is where such a job's real bound lives.
     pub bounds_the_listing: bool,
+    /// Whether [`Self::max_entries`] counts the folders an archive records as well as its files.
+    ///
+    /// Carried over per call site: the runtime, plugin package, world, pack and mod-archive counters
+    /// were `ZipArchive::len()`, which counts every record including a folder's, so a package of
+    /// empty folders is not a way around them. A backup's counter was its manifest's file list, so
+    /// it counts files.
+    pub counts_folders: bool,
 }
 
 const MIB: u64 = 1024 * 1024;
@@ -89,6 +96,7 @@ impl ArchiveLimits {
         max_total_bytes: 2 * GIB,
         max_ratio: 200,
         bounds_the_listing: true,
+        counts_folders: true,
     };
 
     /// A mod archive added to the content store, or a technic-style zip.
@@ -99,6 +107,7 @@ impl ArchiveLimits {
         max_total_bytes: 2 * GIB,
         max_ratio: 200,
         bounds_the_listing: true,
+        counts_folders: true,
     };
 
     /// An instance backup or a snapshot: written by Agora, so its sizes are its own claim. The
@@ -110,6 +119,7 @@ impl ArchiveLimits {
         max_total_bytes: 64 * GIB,
         max_ratio: 0,
         bounds_the_listing: true,
+        counts_folders: false,
     };
 
     /// A downloaded plugin package: small, and code, so the tightest preset.
@@ -120,6 +130,7 @@ impl ArchiveLimits {
         max_total_bytes: 64 * MIB,
         max_ratio: 200,
         bounds_the_listing: true,
+        counts_folders: true,
     };
 
     /// Reading metadata out of a jar, nested jars included. The nesting depth and the number of
@@ -136,6 +147,7 @@ impl ArchiveLimits {
         max_total_bytes: 0,
         max_ratio: 0,
         bounds_the_listing: false,
+        counts_folders: false,
     };
 
     /// A downloaded game runtime: a JRE zip or tar.gz. Large files, few entries, and Agora checks
@@ -147,6 +159,7 @@ impl ArchiveLimits {
         max_total_bytes: 2 * GIB,
         max_ratio: 0,
         bounds_the_listing: true,
+        counts_folders: true,
     };
 
     /// A world a player exported, or one they downloaded: a folder of region files, one of which
@@ -160,6 +173,7 @@ impl ArchiveLimits {
         max_total_bytes: 16 * GIB,
         max_ratio: 0,
         bounds_the_listing: true,
+        counts_folders: true,
     };
 }
 
@@ -616,9 +630,15 @@ impl SafeArchive {
             None => 0,
         };
         let archive = Self::from_source(source, limits, rar)?;
-        // A compressed tar stores no per-entry compressed size, so the ratio it can be held to is
-        // what the whole archive claims against how large it is.
-        if archive.format == ArchiveFormat::TarGz && archive.limits.max_ratio > 0 {
+        // A format that records no compressed size per entry cannot be held to the ratio entry by
+        // entry, so the whole archive's claim against the bytes it is becomes the check: a tar.gz's
+        // stream, a 7z's blocks (solid ones share a pack, so a member's own size says nothing about
+        // what it cost). A zip keeps its per-entry check, which is the tighter of the two.
+        let per_entry_compressed = archive
+            .entries
+            .iter()
+            .any(|entry| entry.compressed.is_some());
+        if !per_entry_compressed && archive.limits.max_ratio > 0 {
             let ratio = ratio_of(archive.total_declared, stored);
             if ratio > archive.limits.max_ratio {
                 return Err(ArchiveError::RatioExceeded {
@@ -976,12 +996,17 @@ impl SafeArchive {
             ArchiveFormat::SevenZ => self.list_sevenz()?,
             ArchiveFormat::Tar => {
                 let source = self.open_reader()?;
-                list_tar(source, ArchiveFormat::Tar, &self.label())?
+                list_tar(source, ArchiveFormat::Tar, &self.label(), &self.limits)?
             }
             ArchiveFormat::TarGz => {
                 let source = self.open_reader()?;
                 let decoder = flate2::read::GzDecoder::new(source);
-                list_tar(Box::new(decoder), ArchiveFormat::TarGz, &self.label())?
+                list_tar(
+                    Box::new(decoder),
+                    ArchiveFormat::TarGz,
+                    &self.label(),
+                    &self.limits,
+                )?
             }
             ArchiveFormat::Rar => self.list_rar()?,
         };
@@ -1125,10 +1150,12 @@ impl SafeArchive {
                 names: duplicated,
             });
         }
-        // The whole listing is still totalled, because the tar.gz ratio and `total_declared_bytes`
+        // The whole listing is still totalled, because the ratio check and `total_declared_bytes`
         // are about the archive and not about the job; only the *refusals* follow the preset.
         let held_to_the_listing = self.limits.bounds_the_listing;
+        let mut records = 0usize;
         for entry in entries {
+            records += 1;
             if entry.kind != EntryKind::File {
                 continue;
             }
@@ -1137,26 +1164,20 @@ impl SafeArchive {
             if !held_to_the_listing {
                 continue;
             }
-            if entry.size > self.limits.max_entry_bytes {
-                return Err(ArchiveError::TooLarge {
-                    path,
-                    format: self.format,
-                    preset: self.limits.preset,
-                    entry: entry.name.clone(),
-                    bytes: entry.size,
-                    limit: self.limits.max_entry_bytes,
-                });
-            }
-            if total > self.limits.max_total_bytes {
-                return Err(ArchiveError::TooLarge {
-                    path,
-                    format: self.format,
-                    preset: self.limits.preset,
-                    entry: entry.name.clone(),
-                    bytes: total,
-                    limit: self.limits.max_total_bytes,
-                });
-            }
+            let counted = if self.limits.counts_folders {
+                records
+            } else {
+                files
+            };
+            hold_running_listing(
+                &self.limits,
+                self.format,
+                &path,
+                &entry.name,
+                counted,
+                entry.size,
+                total,
+            )?;
             if self.limits.max_ratio > 0 {
                 if let Some(compressed) = entry.compressed {
                     let ratio = ratio_of(entry.size, compressed);
@@ -1173,12 +1194,17 @@ impl SafeArchive {
                 }
             }
         }
-        if held_to_the_listing && files > self.limits.max_entries {
+        let counted = if self.limits.counts_folders {
+            records
+        } else {
+            files
+        };
+        if held_to_the_listing && counted > self.limits.max_entries {
             return Err(ArchiveError::TooManyEntries {
                 path,
                 format: self.format,
                 preset: self.limits.preset,
-                count: files,
+                count: counted,
                 limit: self.limits.max_entries,
             });
         }
@@ -1838,6 +1864,7 @@ fn list_tar(
     reader: Box<dyn Read>,
     format: ArchiveFormat,
     path: &str,
+    limits: &ArchiveLimits,
 ) -> Result<Vec<ArchiveEntry>, ArchiveError> {
     let mut archive = tar::Archive::new(reader);
     let listed = archive.entries().map_err(|error| ArchiveError::Corrupt {
@@ -1845,7 +1872,9 @@ fn list_tar(
         format,
         reason: format!("{error}"),
     })?;
-    let mut entries = Vec::new();
+    let mut entries: Vec<ArchiveEntry> = Vec::new();
+    let mut files = 0usize;
+    let mut total = 0u64;
     for entry in listed {
         let entry = entry.map_err(|error| ArchiveError::Corrupt {
             path: path.to_string(),
@@ -1860,10 +1889,24 @@ fn list_tar(
             // file, and every one of them is a way out of the destination.
             _ => EntryKind::Link,
         };
+        let size = entry.size();
+        if kind == EntryKind::File {
+            files += 1;
+            total = total.saturating_add(size);
+            // A tar.gz is decompressed just to be listed, so the stream is refused the moment it
+            // has claimed more than the preset allows rather than after all of it has been read
+            // (MASTER_SPEC §32.3).
+            let counted = if limits.counts_folders {
+                entries.len() + 1
+            } else {
+                files
+            };
+            hold_running_listing(limits, format, path, &name, counted, size, total)?;
+        }
         entries.push(ArchiveEntry {
             name,
             kind,
-            size: entry.size(),
+            size,
             compressed: None,
             unix_mode: Some(entry.header().mode().unwrap_or(0o644)),
         });
@@ -1871,6 +1914,54 @@ fn list_tar(
     Ok(entries)
 }
 
+/// The count and total a listing has reached so far, held to the preset.
+///
+/// Shared by the walk over a finished listing and by the walk over a `tar.gz` as it decompresses,
+/// which is the same rules decided at two moments: a compressed tar has to be inflated to be listed
+/// at all, so refusing it only once every entry has been read is refusing it after the work was done.
+fn hold_running_listing(
+    limits: &ArchiveLimits,
+    format: ArchiveFormat,
+    path: &str,
+    entry: &str,
+    counted: usize,
+    size: u64,
+    total: u64,
+) -> Result<(), ArchiveError> {
+    if !limits.bounds_the_listing {
+        return Ok(());
+    }
+    if size > limits.max_entry_bytes {
+        return Err(ArchiveError::TooLarge {
+            path: path.to_string(),
+            format,
+            preset: limits.preset,
+            entry: entry.to_string(),
+            bytes: size,
+            limit: limits.max_entry_bytes,
+        });
+    }
+    if total > limits.max_total_bytes {
+        return Err(ArchiveError::TooLarge {
+            path: path.to_string(),
+            format,
+            preset: limits.preset,
+            entry: entry.to_string(),
+            bytes: total,
+            limit: limits.max_total_bytes,
+        });
+    }
+    if counted > limits.max_entries {
+        return Err(ArchiveError::TooManyEntries {
+            path: path.to_string(),
+            format,
+            preset: limits.preset,
+            count: counted,
+            limit: limits.max_entries,
+        });
+    }
+    Ok(())
+}
 /// The entry names a zip declares more than once, and nothing else.
 ///
 /// [`SafeArchive::open`] refuses such an archive, so a caller that reads its own listing does not

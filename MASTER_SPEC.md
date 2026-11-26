@@ -5621,6 +5621,13 @@ three path comparators.
     skipped with a recorded reason and the outer metadata still comes back.
   - **Every entry is copied to the end of its stream**, so a `Stored` entry that declares more bytes
     than it holds meets the decoder's CRC check instead of a trusting count.
+  - **A limit never loosens on the way here.** The entry count includes the folders an archive
+    records wherever the call site counted `ZipArchive::len()` (runtime, plugin package, world, pack,
+    mod archive), and files only where it counted a manifest's file list (backup). A format with no
+    compressed size per entry — a 7z, a solid one especially — is held to the ratio the whole archive
+    claims against the bytes it is; a zip keeps its tighter per-entry check. A `tar.gz` is refused
+    while the stream is read, not after it has been inflated: the header that declares more than the
+    preset allows is the refusal, and the decompression stops there.
   - **An extraction never writes into a live folder.** A destination that already holds the player's
     files (an instance's `config/`, a pack's overrides) is written into a folder the reader makes
     beside it, and the caller publishes that folder only after the whole extraction succeeded; on

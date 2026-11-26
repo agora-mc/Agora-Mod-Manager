@@ -182,6 +182,7 @@ fn small_limits() -> ArchiveLimits {
         max_total_bytes: 48,
         max_ratio: 0,
         bounds_the_listing: true,
+        counts_folders: true,
     }
 }
 
@@ -1069,4 +1070,106 @@ fn an_extraction_reads_the_archive_once() {
         "one parse to list, one to extract the 200 entries"
     );
     drop(dir);
+}
+
+/// A tar with one header and no bytes behind it: the shape a stream has when the listing is all
+/// that was ever going to arrive.
+fn tar_with_one_header(declared: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut header = [0u8; 512];
+    header[..9].copy_from_slice(b"big.bin\0\0");
+    header[100..108].copy_from_slice(b"0000644\0");
+    header[108..116].copy_from_slice(b"0000000\0");
+    header[116..124].copy_from_slice(b"0000000\0");
+    header[124..136].copy_from_slice(format!("{declared:011o}\0").as_bytes());
+    header[136..148].copy_from_slice(b"00000000000\0");
+    header[148..156].copy_from_slice(b"        ");
+    header[156] = b'0';
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+    let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+    header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+    out.extend_from_slice(&header);
+    out.extend(std::iter::repeat_n(0u8, 1024));
+    out
+}
+
+fn gzipped(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// A zip of three empty folders and two files: five records, two of them files.
+fn zip_with_folders() -> Vec<u8> {
+    use std::io::Write as _;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options: zip::write::SimpleFileOptions = Default::default();
+    for folder in ["a/", "b/", "c/"] {
+        zip.add_directory(folder, options).unwrap();
+    }
+    for (name, bytes) in [("a/x.txt", &b"x"[..]), ("b/y.txt", &b"y"[..])] {
+        zip.start_file(name, options).unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+#[test]
+fn a_preset_that_counted_folders_still_counts_them() {
+    // The runtime, plugin, world, pack and mod-archive counters were `ZipArchive::len()`, which
+    // counts every record: a package of empty folders is not a way around them.
+    let bytes = zip_with_folders();
+    let mut folding = small_limits();
+    folding.counts_folders = true;
+    let error = SafeArchive::open_bytes(bytes.clone(), folding)
+        .err()
+        .expect("five records is one more than four");
+    match error {
+        ArchiveError::TooManyEntries { count, limit, .. } => {
+            assert_eq!(count, 5);
+            assert_eq!(limit, 4);
+        }
+        other => panic!("unexpected error {other:?}"),
+    }
+
+    // A job whose counter was its manifest's file list counts files, and the same archive is
+    // inside its limit.
+    let mut files_only = small_limits();
+    files_only.counts_folders = false;
+    SafeArchive::open_bytes(bytes, files_only).expect("two files, four allowed");
+}
+
+#[test]
+fn a_sevenz_with_no_per_entry_sizes_is_held_to_the_whole_archive_ratio() {
+    // A 7z records no compressed size per entry, so the entry-by-entry ratio a zip gets cannot be
+    // taken: left unchecked, a block of zeros is a bomb nothing counts.
+    let zeros = vec![0u8; 20 * 1024 * 1024];
+    let bytes = sevenz_bytes(&[("big.bin", &zeros)]);
+    let error = SafeArchive::open_bytes(bytes, ArchiveLimits::PACK)
+        .err()
+        .expect("twenty megabytes of zeros out of a few kilobytes is not a pack");
+    assert!(
+        matches!(error, ArchiveError::RatioExceeded { .. }),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_tar_gz_is_refused_as_it_streams_not_after_it_has_been_read() {
+    // A compressed tar is inflated to be listed at all, so the header that declares more than the
+    // preset allows has to be refused there and then. Read to its end first, the stream fails as a
+    // truncated archive instead, which is a different thing and a later one.
+    let mut limits = small_limits();
+    limits.max_entry_bytes = 1024 * 1024;
+    limits.max_total_bytes = 4 * 1024 * 1024;
+    let bytes = gzipped(&tar_with_one_header(4 * 1024 * 1024));
+    let error = SafeArchive::open_bytes(bytes, limits)
+        .err()
+        .expect("four megabytes is over a one-megabyte entry");
+    assert!(
+        matches!(error, ArchiveError::TooLarge { .. }),
+        "the size is what refuses it: {error:?}"
+    );
 }
