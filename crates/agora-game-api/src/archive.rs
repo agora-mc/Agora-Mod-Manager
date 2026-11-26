@@ -1643,6 +1643,7 @@ impl SafeArchive {
                 root,
                 destination: resolved,
                 report,
+                replaced: None,
             }),
             Err(error) => {
                 let _ = std::fs::remove_dir_all(&root);
@@ -1664,6 +1665,8 @@ pub struct StagedExtraction {
     /// beside the folder it was staged in, never across a volume.
     destination: PathBuf,
     report: ExtractReport,
+    /// The folder beside the staging folder that holds files a publish replaced, while it runs.
+    replaced: Option<PathBuf>,
 }
 
 impl StagedExtraction {
@@ -1721,12 +1724,13 @@ impl StagedExtraction {
             planned.push((strict, replacement, target));
         }
 
-        // 2. Move, setting aside what is replaced.
-        let replaced_root = staging.join("replaced");
-        std::fs::create_dir_all(&replaced_root).map_err(|error| ArchiveError::Write {
-            path: replaced_root.display().to_string(),
-            error: error.to_string(),
+        // 2. Move, setting aside what is replaced. The set-aside area is a folder of its own beside
+        //    the staging folder, never inside it, so no entry of the archive can share its path.
+        let replaced_root = fresh_folder_beside(&staging).map_err(|error| ArchiveError::Write {
+            path: staging.display().to_string(),
+            error: format!("could not make a folder for the files being replaced: {error}"),
         })?;
+        self.replaced = Some(replaced_root.clone());
         let mut done: Vec<(PathBuf, PathBuf, Option<PathBuf>)> = Vec::new();
         let mut made_folders: Vec<PathBuf> = Vec::new();
         for (strict, from, target) in planned {
@@ -1735,11 +1739,7 @@ impl StagedExtraction {
             };
             note_missing_folders(&destination, parent, &mut made_folders);
             if let Err(error) = std::fs::create_dir_all(parent) {
-                undo_publish(&done, &made_folders);
-                return Err(ArchiveError::Write {
-                    path: parent.display().to_string(),
-                    error: error.to_string(),
-                });
+                return Err(self.undo(&done, &made_folders, None, parent, error));
             }
             let aside = if std::fs::symlink_metadata(&target).is_ok() {
                 match join_under(&replaced_root, &strict) {
@@ -1751,56 +1751,82 @@ impl StagedExtraction {
                         match std::fs::rename(&target, &where_to) {
                             Ok(()) => Some(where_to),
                             Err(error) => {
-                                undo_publish(&done, &made_folders);
-                                return Err(ArchiveError::Write {
-                                    path: target.display().to_string(),
-                                    error: error.to_string(),
-                                });
+                                return Err(self.undo(&done, &made_folders, None, &target, error));
                             }
                         }
                     }
                     Err(error) => {
-                        undo_publish(&done, &made_folders);
-                        return Err(ArchiveError::Write {
-                            path: target.display().to_string(),
-                            error: error.to_string(),
-                        });
+                        let error = std::io::Error::other(error.to_string());
+                        return Err(self.undo(&done, &made_folders, None, &target, error));
                     }
                 }
             } else {
                 None
             };
             if let Err(error) = std::fs::rename(&from, &target) {
-                if let Some(aside) = &aside {
-                    let _ = std::fs::rename(aside, &target);
-                }
-                undo_publish(&done, &made_folders);
-                return Err(ArchiveError::Write {
-                    path: target.display().to_string(),
-                    error: error.to_string(),
-                });
+                let pending = aside.map(|aside| (target.clone(), aside));
+                return Err(self.undo(&done, &made_folders, pending, &target, error));
             }
             done.push((target, from, aside));
         }
 
-        // 3. Committed: the staging folder has done its job and Drop must not look for it again.
+        // 3. Committed: both folders have done their job and Drop must not look for them again.
         self.root.clear();
+        self.replaced = None;
         let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_dir_all(&replaced_root);
         Ok(std::mem::take(&mut self.report))
     }
-}
 
-/// Undo a publish that could not finish: the new files go back into staging, in reverse order, and
-/// each original comes back where it was. A folder this run created and left empty goes too.
-fn undo_publish(done: &[(PathBuf, PathBuf, Option<PathBuf>)], made_folders: &[PathBuf]) {
-    for (target, from, aside) in done.iter().rev() {
-        let _ = std::fs::rename(target, from);
-        if let Some(aside) = aside {
-            let _ = std::fs::rename(aside, target);
+    /// Undo a publish that could not finish: the new files go back into staging, in reverse order,
+    /// and each original comes back where it was. A folder this run created and left empty goes too.
+    ///
+    /// `pending` is the file being moved when the publish failed, if it had already been set aside.
+    /// If any original cannot be put back, both folders are **kept** (Drop would otherwise delete the
+    /// set-aside originals with them) and the error says where the player's files are.
+    fn undo(
+        &mut self,
+        done: &[(PathBuf, PathBuf, Option<PathBuf>)],
+        made_folders: &[PathBuf],
+        pending: Option<(PathBuf, PathBuf)>,
+        failed_at: &Path,
+        error: std::io::Error,
+    ) -> ArchiveError {
+        let mut stranded: Vec<String> = Vec::new();
+        if let Some((target, aside)) = pending {
+            if std::fs::rename(&aside, &target).is_err() {
+                stranded.push(aside.display().to_string());
+            }
         }
-    }
-    for folder in made_folders.iter().rev() {
-        let _ = std::fs::remove_dir(folder);
+        for (target, from, aside) in done.iter().rev() {
+            let _ = std::fs::rename(target, from);
+            if let Some(aside) = aside {
+                if std::fs::rename(aside, target).is_err() {
+                    stranded.push(aside.display().to_string());
+                }
+            }
+        }
+        for folder in made_folders.iter().rev() {
+            let _ = std::fs::remove_dir(folder);
+        }
+        if stranded.is_empty() {
+            return ArchiveError::Write {
+                path: failed_at.display().to_string(),
+                error: error.to_string(),
+            };
+        }
+        // Keep both folders: they hold the only copy of what could not be put back.
+        self.root.clear();
+        self.replaced = None;
+        ArchiveError::Write {
+            path: failed_at.display().to_string(),
+            error: format!(
+                "{error}; the publish was undone except for {} file(s) that could not be put back, \
+                 which are kept at: {}",
+                stranded.len(),
+                stranded.join(", ")
+            ),
+        }
     }
 }
 
@@ -1827,6 +1853,9 @@ impl Drop for StagedExtraction {
     fn drop(&mut self) {
         if !self.root.as_os_str().is_empty() {
             let _ = std::fs::remove_dir_all(&self.root);
+        }
+        if let Some(replaced) = &self.replaced {
+            let _ = std::fs::remove_dir_all(replaced);
         }
     }
 }

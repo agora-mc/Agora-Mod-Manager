@@ -1426,6 +1426,35 @@ fn a_folder_where_the_file_goes_is_refused_before_anything_moves() {
     assert!(left.is_empty(), "{left:?}");
 }
 
+#[test]
+fn an_archive_entry_named_like_the_set_aside_area_does_not_meet_the_players_file() {
+    // The files a publish replaces are set aside somewhere the archive's own entries cannot be. An
+    // archive that carries `replaced/config/a.toml` next to `config/a.toml` must publish both as the
+    // archive has them, and the player's old `config/a.toml` must not turn up in either.
+    let bytes = zip_bytes(&[
+        ("config/a.toml", b"new a"),
+        ("replaced/config/a.toml", b"the archive's own replaced/"),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("instance");
+    std::fs::create_dir_all(dest.join("config")).unwrap();
+    std::fs::write(dest.join("config/a.toml"), b"the player's old a").unwrap();
+
+    let mut archive = SafeArchive::open_bytes(bytes, ArchiveLimits::PACK).unwrap();
+    let staged = archive
+        .stage(&dest, NamePolicy::Refuse, &mut |_| Select::Write, &|| false)
+        .unwrap();
+    staged.publish_into().expect("nothing is in the way");
+
+    assert_eq!(std::fs::read(dest.join("config/a.toml")).unwrap(), b"new a");
+    assert_eq!(
+        std::fs::read(dest.join("replaced/config/a.toml")).unwrap(),
+        b"the archive's own replaced/"
+    );
+    let left = staging_folders_beside(dir.path());
+    assert!(left.is_empty(), "{left:?}");
+}
+
 /// A backend that records the listing it was staged with, and can refuse staging.
 struct StagingRar {
     admitted: std::sync::Arc<std::sync::Mutex<Vec<RarEntry>>>,
