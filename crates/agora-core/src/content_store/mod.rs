@@ -17,9 +17,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use agora_game_api::{
-    classify_entry_name, ArchiveError, ArchiveLimits, EntryName, NamePolicy, RelPath, SafeArchive,
-    Select, StrictRelPath,
+    classify_entry_name, ArchiveError, ArchiveLimits, EntryName, RelPath, SafeArchive, Select,
+    StrictRelPath,
 };
+/// How an import treats entries whose names a disk cannot hold, and the entries it left out: the
+/// game contract's types, re-exported so a CLI or desktop caller needs one import, not two.
+pub use agora_game_api::{NamePolicy, SkippedEntry};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -223,6 +226,11 @@ pub enum AddOutcome {
         item: ContentItem,
         #[serde(alias = "new")]
         objects_new: usize,
+        /// The archive entries that were left out because a disk cannot hold them, present only
+        /// when the caller asked for [`NamePolicy::WithoutThem`]. Never silent: a front end shows
+        /// this list to the person who asked for the import (MASTER_SPEC §32.3).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skipped: Vec<SkippedEntry>,
     },
     Existing {
         item: ContentItem,
@@ -232,6 +240,9 @@ pub enum AddOutcome {
         objects_restored: usize,
         #[serde(alias = "present")]
         objects_present: usize,
+        /// See [`AddOutcome::Added`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skipped: Vec<SkippedEntry>,
     },
 }
 
@@ -240,6 +251,14 @@ impl AddOutcome {
         match self {
             AddOutcome::Added { item, .. } => item,
             AddOutcome::Existing { item, .. } => item,
+        }
+    }
+
+    /// The entries that were not stored because a disk cannot hold their names.
+    pub fn skipped(&self) -> &[SkippedEntry] {
+        match self {
+            AddOutcome::Added { skipped, .. } => skipped,
+            AddOutcome::Existing { skipped, .. } => skipped,
         }
     }
 
@@ -318,6 +337,18 @@ pub enum ContentError {
     AmbiguousPrefix { prefix: String, matches: String },
     #[error("invalid path '{path}': {reason}")]
     InvalidPath { path: String, reason: String },
+    /// Entries whose names a disk cannot hold: a Windows reserved name, a trailing dot or space, a
+    /// `:`, an illegal character, or two names one case-insensitive disk stores as one.
+    ///
+    /// Refused by default, with every offending entry named, because an import that silently drops
+    /// files is worse than one that stops. A caller may instead ask for the entries that can be
+    /// written ([`NamePolicy::WithoutThem`]) and is then handed the rest in
+    /// [`AddOutcome::skipped`] (MASTER_SPEC §32.3).
+    #[error("{}", unwritable_names_message(archive, entries))]
+    UnwritableNames {
+        archive: String,
+        entries: Vec<SkippedEntry>,
+    },
     #[error("item has no files")]
     EmptyItem,
     #[error("archive entry '{path}' declared size {declared} but yielded more")]
@@ -373,6 +404,19 @@ pub enum ContentError {
     InvalidSetting(String),
     #[error("instance '{0}' is running; stop it before changing how its files are stored")]
     InstanceBusy(String),
+}
+
+/// The refusal for names a disk cannot hold, with every entry and its reason on its own line.
+fn unwritable_names_message(archive: &str, entries: &[SkippedEntry]) -> String {
+    let mut message = format!(
+        "'{archive}' has {} entr{} a disk cannot hold, so nothing was imported:",
+        entries.len(),
+        if entries.len() == 1 { "y" } else { "ies" }
+    );
+    for entry in entries {
+        message.push_str(&format!("\n  '{}' {}", entry.name, entry.reason));
+    }
+    message
 }
 
 // ---------------------------------------------------------------------------
@@ -743,16 +787,12 @@ fn archive_error(error: ArchiveError) -> ContentError {
                      cannot be told"
                     .into(),
         },
-        ArchiveError::UnsafeNames { entries, .. } => {
-            let first = entries.into_iter().next();
-            match first {
-                Some(entry) => ContentError::InvalidPath {
-                    path: entry.name,
-                    reason: entry.reason,
-                },
-                None => ContentError::Other("an archive has entries a disk cannot hold".into()),
-            }
-        }
+        // A name a disk cannot hold is the one refusal a person can answer: the entries are named,
+        // and a caller may ask to import the rest (`NamePolicy::WithoutThem`).
+        ArchiveError::UnsafeNames { path, entries } => ContentError::UnwritableNames {
+            archive: path,
+            entries,
+        },
         other => ContentError::CorruptArchive(other.to_string()),
     }
 }
@@ -769,7 +809,8 @@ fn archive_error(error: ArchiveError) -> ContentError {
 fn stage_archive(
     ctx: &Ctx,
     archive: &mut SafeArchive,
-) -> Result<(Vec<StagedEntry>, StagingGuard, PathBuf), ContentError> {
+    names: NamePolicy,
+) -> Result<(Vec<StagedEntry>, Vec<SkippedEntry>, StagingGuard, PathBuf), ContentError> {
     // Untrusted sizes: check free disk space.
     let content_root = ctx.paths.content_root();
     std::fs::create_dir_all(&content_root)?;
@@ -785,12 +826,7 @@ fn stage_archive(
     let guard = StagingGuard::new(&staging_dir);
 
     let report = archive
-        .extract_checked(
-            &staging_dir,
-            NamePolicy::Refuse,
-            &mut |_| Select::Write,
-            &|| false,
-        )
+        .extract_checked(&staging_dir, names, &mut |_| Select::Write, &|| false)
         .map_err(archive_error)?;
     if report.written.is_empty() {
         return Err(ContentError::EmptyItem);
@@ -814,7 +850,7 @@ fn stage_archive(
             sha256,
         });
     }
-    Ok((staged_entries, guard, staging_dir))
+    Ok((staged_entries, report.skipped, guard, staging_dir))
 }
 
 /// Every file entry in a zip, 7z, tar, tar.gz or RAR archive, without extracting anything.
@@ -892,12 +928,31 @@ pub fn contains_hash(ctx: &Ctx, sha256: &str) -> Result<bool, ContentError> {
 /// never its extension. Zip and 7z are read in process; RAR is read through Windows' own
 /// `tar.exe` (`rar.rs`), because the only mature RAR library is not GPL-compatible. All three go
 /// through the same path, size and free-space rules and leave nothing behind when refused.
+///
+/// An entry whose name a disk cannot hold refuses the whole import, naming every one. A
+/// user-facing caller that wants to offer the person the files that *can* be written asks with
+/// [`add_archive_with_names`] instead (MASTER_SPEC §32.3).
 pub fn add_archive(
     ctx: &Ctx,
     archive_path: &Path,
     name: Option<&str>,
 ) -> Result<AddOutcome, ContentError> {
-    add_archive_with_source(ctx, archive_path, name, |sha256, path| {
+    add_archive_with_names(ctx, archive_path, name, NamePolicy::Refuse)
+}
+
+/// [`add_archive`] with the caller's answer about entries whose names a disk cannot hold.
+///
+/// [`NamePolicy::Refuse`] is the default everywhere, including every internal caller (a backup
+/// import, a conversion, a catalog install): nothing is ever skipped without the person asking.
+/// [`NamePolicy::WithoutThem`] is what a user-facing import offers once it has shown the refusal,
+/// and the entries it leaves out come back in [`AddOutcome::skipped`].
+pub fn add_archive_with_names(
+    ctx: &Ctx,
+    archive_path: &Path,
+    name: Option<&str>,
+    names: NamePolicy,
+) -> Result<AddOutcome, ContentError> {
+    add_archive_with_source_and_names(ctx, archive_path, name, names, |sha256, path| {
         ContentSource::Archive {
             path: path.to_string(),
             sha256: sha256.to_string(),
@@ -915,7 +970,19 @@ pub fn add_archive_with_source(
     name: Option<&str>,
     source: impl FnOnce(&str, &str) -> ContentSource,
 ) -> Result<AddOutcome, ContentError> {
-    add_archive_replacing(ctx, archive_path, name, &HashSet::new(), source)
+    add_archive_with_source_and_names(ctx, archive_path, name, NamePolicy::Refuse, source)
+}
+
+/// [`add_archive_with_source`] with the caller's answer about entries whose names a disk cannot
+/// hold; see [`add_archive_with_names`].
+fn add_archive_with_source_and_names(
+    ctx: &Ctx,
+    archive_path: &Path,
+    name: Option<&str>,
+    names: NamePolicy,
+    source: impl FnOnce(&str, &str) -> ContentSource,
+) -> Result<AddOutcome, ContentError> {
+    add_archive_replacing(ctx, archive_path, name, names, &HashSet::new(), source)
 }
 
 /// [`add_archive_with_source`] that replaces the stored objects whose SHA-256 is in `replace`,
@@ -926,13 +993,14 @@ pub fn add_archive_replacing(
     ctx: &Ctx,
     archive_path: &Path,
     name: Option<&str>,
+    names: NamePolicy,
     replace: &HashSet<String>,
     source: impl FnOnce(&str, &str) -> ContentSource,
 ) -> Result<AddOutcome, ContentError> {
     let _lock = ctx
         .lock_manager
         .acquire(LockResource::ContentStore, "content-add")?;
-    add_archive_replacing_locked(ctx, archive_path, name, replace, source)
+    add_archive_replacing_locked(ctx, archive_path, name, names, replace, source)
 }
 
 /// [`add_archive_replacing`] for a caller that already holds the content-store
@@ -941,6 +1009,7 @@ pub(crate) fn add_archive_replacing_locked(
     ctx: &Ctx,
     archive_path: &Path,
     name: Option<&str>,
+    names: NamePolicy,
     replace: &HashSet<String>,
     source: impl FnOnce(&str, &str) -> ContentSource,
 ) -> Result<AddOutcome, ContentError> {
@@ -959,11 +1028,12 @@ pub(crate) fn add_archive_replacing_locked(
     // A RAR is read out of process, and its backend lists, extracts and checks through the same
     // reader (`rar.rs`), so the whole import is handed to it. Every other format is read here, and
     // one this build cannot read is refused by the reader rather than by a magic-number table here.
-    let (staged_entries, mut guard, staging_dir) = if rar::is_rar(archive_path)? {
-        rar::stage_rar(ctx, archive_path)?
+    let (staged_entries, skipped, mut guard, staging_dir) = if rar::is_rar(archive_path)? {
+        let (entries, guard, staging_dir) = rar::stage_rar(ctx, archive_path)?;
+        (entries, Vec::new(), guard, staging_dir)
     } else {
         let mut archive = open_archive(archive_path)?;
-        stage_archive(ctx, &mut archive)?
+        stage_archive(ctx, &mut archive, names)?
     };
 
     // 5. Store objects, record counts, compute item ID
@@ -978,7 +1048,7 @@ pub(crate) fn add_archive_replacing_locked(
 
     let source = source(&archive_sha256, &archive_display_path);
 
-    let outcome = finish_adding(ctx, &item_name, staged_entries, source, replace)?;
+    let outcome = finish_adding(ctx, &item_name, staged_entries, source, replace, skipped)?;
     guard.active = false;
     let _ = std::fs::remove_dir_all(&staging_dir);
     Ok(outcome)
@@ -1191,7 +1261,14 @@ pub fn add_collected(
         },
     )?;
 
-    let outcome = finish_adding(ctx, item_name, staged_entries, source, &HashSet::new())?;
+    let outcome = finish_adding(
+        ctx,
+        item_name,
+        staged_entries,
+        source,
+        &HashSet::new(),
+        Vec::new(),
+    )?;
     guard.active = false;
     let _ = std::fs::remove_dir_all(&staging_dir);
     Ok(outcome)
@@ -1309,6 +1386,7 @@ fn finish_adding(
     staged_entries: Vec<StagedEntry>,
     source: ContentSource,
     replace: &HashSet<String>,
+    skipped: Vec<SkippedEntry>,
 ) -> Result<AddOutcome, ContentError> {
     // Entries with the same bytes share one object. Each group runs on one thread, in order: its
     // first entry places the object and the others then find it present. So two threads never
@@ -1372,9 +1450,14 @@ fn finish_adding(
             objects_new,
             objects_restored,
             objects_present,
+            skipped,
         })
     } else {
-        Ok(AddOutcome::Added { item, objects_new })
+        Ok(AddOutcome::Added {
+            item,
+            objects_new,
+            skipped,
+        })
     }
 }
 
@@ -1754,11 +1837,13 @@ pub fn derive_item(
             objects_new: 0,
             objects_restored: 0,
             objects_present: present.len(),
+            skipped: Vec::new(),
         })
     } else {
         Ok(AddOutcome::Added {
             item,
             objects_new: 0,
+            skipped: Vec::new(),
         })
     }
 }

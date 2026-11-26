@@ -26,6 +26,8 @@ use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::path::{join_under, validate_path_set, PathError, PathSetError, RelPath, StrictRelPath};
 
 /// How much of one archive a job accepts.
@@ -251,7 +253,7 @@ pub struct ArchiveEntry {
 }
 
 /// An entry the caller was told about instead of given a file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkippedEntry {
     /// The name as the archive stores it.
     pub name: String,

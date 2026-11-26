@@ -72,7 +72,9 @@ fn identical_bytes_in_one_batch_store_one_object() {
 
     let out = add_folder(&ctx, &folder, Some("Dupes")).unwrap();
     match &out {
-        AddOutcome::Added { item, objects_new } => {
+        AddOutcome::Added {
+            item, objects_new, ..
+        } => {
             assert_eq!(*objects_new, 2, "two distinct byte strings, two objects");
             assert_eq!(item.files.len(), 4);
         }
