@@ -847,13 +847,15 @@ fn world_prefix(archive: &SafeArchive) -> LauncherResult<String> {
     let mut best: Option<String> = None;
     for entry in archive.file_entries() {
         let path = entry.name.replace('\\', "/");
-        if !path.ends_with("level.dat") {
+        // The file has to *be* `level.dat`: `backup-level.dat` ends with it and is not a world, so
+        // a level file an archive keeps as a copy cannot pick the folder.
+        let (parent, file) = match path.rsplit_once('/') {
+            Some((parent, file)) => (parent, file),
+            None => ("", path.as_str()),
+        };
+        if file != "level.dat" {
             continue;
         }
-        let parent = path
-            .rsplit_once('/')
-            .map(|(parent, _)| parent)
-            .unwrap_or_default();
         let prefix = if parent.is_empty() {
             String::new()
         } else {
@@ -1055,8 +1057,32 @@ mod tests {
     }
 
     #[test]
-    fn import_rejects_an_archive_without_a_world() {
+    fn a_level_file_kept_as_a_copy_does_not_pick_the_folder() {
+        // `backup-level.dat` at the archive's root ends with `level.dat`, and "shallowest wins"
+        // then picked the root: the import took the copy and none of the world.
         let (root, service) = fixture();
+        let archive = root.path().join("copies.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("backup-level.dat", options).unwrap();
+        zip.write_all(&level_dat("Old", 1, 0)).unwrap();
+        zip.start_file("MyWorld/level.dat", options).unwrap();
+        zip.write_all(&level_dat("Real", 1, 0)).unwrap();
+        zip.start_file("MyWorld/region/r.0.0.mca", options).unwrap();
+        zip.write_all(b"region").unwrap();
+        zip.finish().unwrap();
+
+        let folder = service.import("inst", &archive).unwrap();
+        let saves = root.path().join("instances/inst/saves");
+        assert!(
+            saves.join(&folder).join("region/r.0.0.mca").is_file(),
+            "the world's own folder, not the root the copy sits in"
+        );
+        assert!(!saves.join(&folder).join("backup-level.dat").exists());
+    }
+
+    #[test]
+    fn import_rejects_an_archive_without_a_world() {        let (root, service) = fixture();
         let archive = root.path().join("empty.zip");
         let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
         zip.start_file("readme.txt", zip::write::SimpleFileOptions::default())
