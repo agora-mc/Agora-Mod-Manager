@@ -907,6 +907,12 @@ impl SafeArchive {
                     format: self.format,
                     reason: format!("{error}"),
                 })?;
+                // One table for the whole walk: a `tar.gz` with fifty thousand entries would
+                // otherwise search the listing once per entry it hands over.
+                let by_name: HashMap<&str, &ArchiveEntry> = entries
+                    .iter()
+                    .map(|entry| (entry.name.as_str(), entry))
+                    .collect();
                 for entry in listed {
                     let mut entry = entry.map_err(|error| ArchiveError::Corrupt {
                         path: path.clone(),
@@ -916,7 +922,7 @@ impl SafeArchive {
                     let name = entry_name_of(&entry, self.format, &path)?;
                     // The listing was taken from these same bytes, so an entry it did not show
                     // means the two disagree: refuse rather than read a name nothing checked.
-                    let Some(known) = entries.iter().find(|known| known.name == name) else {
+                    let Some(known) = by_name.get(name.as_str()).copied() else {
                         return Err(ArchiveError::Corrupt {
                             path: path.clone(),
                             format: self.format,
@@ -946,8 +952,12 @@ impl SafeArchive {
                     sevenz_rust2::ArchiveReader::new(&mut source, sevenz_rust2::Password::empty())
                         .map_err(|error| sevenz_error(&path, error))?;
                 let mut failure: Option<ArchiveError> = None;
+                let by_name: HashMap<&str, &ArchiveEntry> = entries
+                    .iter()
+                    .map(|entry| (entry.name.as_str(), entry))
+                    .collect();
                 let result = reader.for_each_entries(|entry, entry_reader| {
-                    let Some(known) = entries.iter().find(|known| known.name == entry.name) else {
+                    let Some(known) = by_name.get(entry.name.as_str()).copied() else {
                         failure = Some(ArchiveError::Corrupt {
                             path: path.clone(),
                             format: ArchiveFormat::SevenZ,
@@ -980,13 +990,12 @@ impl SafeArchive {
                     }
                     // Members of one block share the decoder: this one's bytes are read to the end
                     // whether or not they were wanted, or the next member decodes from a position
-                    // that is not its own.
-                    if let Err(error) = std::io::copy(&mut *entry_reader, &mut std::io::sink()) {
-                        failure = Some(ArchiveError::Corrupt {
-                            path: path.clone(),
-                            format: ArchiveFormat::SevenZ,
-                            reason: format!("entry '{}': {error}", entry.name),
-                        });
+                    // that is not its own. A person who asked to stop should not wait for a member
+                    // nobody wanted, so cancellation is asked between buffers here too.
+                    if let Err(error) =
+                        drain_unwanted(&mut *entry_reader, cancelled, &path, entry.name.as_str())
+                    {
+                        failure = Some(error);
                         return Err(sevenz_rust2::Error::Other("stopped".into()));
                     }
                     Ok(true)
@@ -1485,10 +1494,18 @@ impl SafeArchive {
             .enumerate()
             .map(|(index, (_, name, _))| (name.as_str(), index))
             .collect();
-        let modes: Vec<Option<u32>> = plan
-            .iter()
-            .map(|(_, name, _)| self.entry_mode(name))
-            .collect();
+        let modes: Vec<Option<u32>> = {
+            // One table for the whole plan: a fifty-thousand-entry world would otherwise scan the
+            // listing once per entry to find its own mode.
+            let modes_by_name: HashMap<&str, Option<u32>> = self
+                .entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.unix_mode))
+                .collect();
+            plan.iter()
+                .map(|(_, name, _)| modes_by_name.get(name.as_str()).copied().flatten())
+                .collect()
+        };
         let mut delivered = vec![false; plan.len()];
         let mut written_now: Vec<String> = Vec::new();
 
@@ -1633,15 +1650,8 @@ impl SafeArchive {
             }
         }
     }
-
-    /// The Unix mode an entry recorded, where it recorded one.
-    fn entry_mode(&self, name: &str) -> Option<u32> {
-        self.entries
-            .iter()
-            .find(|entry| entry.name == name)
-            .and_then(|entry| entry.unix_mode)
-    }
 }
+
 /// An extraction written to a folder of its own, not yet published.
 ///
 /// Dropping one removes the folder, so a caller that returns early on a later error leaves nothing
@@ -2091,16 +2101,17 @@ fn list_tar(
         if kind == EntryKind::File {
             files += 1;
             total = total.saturating_add(size);
-            // A tar.gz is decompressed just to be listed, so the stream is refused the moment it
-            // has claimed more than the preset allows rather than after all of it has been read
-            // (MASTER_SPEC §32.3).
-            let counted = if limits.counts_folders {
-                entries.len() + 1
-            } else {
-                files
-            };
-            hold_running_listing(limits, format, path, &name, counted, size, total)?;
         }
+        // A tar.gz is decompressed just to be listed, so the stream is refused the moment it claims
+        // more than the preset allows rather than after all of it has been read (MASTER_SPEC §32.3).
+        // A folder record counts where the preset counts folders: an archive of empty folders is
+        // otherwise the one shape that passes a count no file ever reaches.
+        let counted = if limits.counts_folders {
+            entries.len() + 1
+        } else {
+            files
+        };
+        hold_running_listing(limits, format, path, &name, counted, size, total)?;
         entries.push(ArchiveEntry {
             name,
             kind,
@@ -2136,6 +2147,39 @@ fn drain_stream(
                     path: path.to_string(),
                     format,
                     reason: format!("the stream does not end where its trailer says: {error}"),
+                })
+            }
+        }
+    }
+}
+
+/// Drain one member of a solid 7z block that nobody asked for, asking between buffers whether the
+/// person who started this has stopped.
+///
+/// The bytes have to be read for the next member to decode from where it should — that is the solid
+/// block's own rule — but a member can be gigabytes long, and "stop" that waits for it is not a stop.
+fn drain_unwanted(
+    mut reader: impl Read,
+    cancelled: &dyn Fn() -> bool,
+    path: &str,
+    entry: &str,
+) -> Result<(), ArchiveError> {
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        if cancelled() {
+            return Err(ArchiveError::Cancelled {
+                path: path.to_string(),
+            });
+        }
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(ArchiveError::Corrupt {
+                    path: path.to_string(),
+                    format: ArchiveFormat::SevenZ,
+                    reason: format!("entry '{entry}': {error}"),
                 })
             }
         }

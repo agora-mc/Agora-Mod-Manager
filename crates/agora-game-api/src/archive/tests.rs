@@ -1698,3 +1698,82 @@ fn names_the_zip_crate_reads_as_one_are_caught_even_when_the_bytes_differ() {
         other => panic!("unexpected error {other:?}"),
     }
 }
+
+/// A tar.gz of `count` folder records with a block that is not a header after them: an archive whose
+/// count is over the preset never reads that far.
+fn tar_gz_of_folders_then_garbage(count: usize) -> Vec<u8> {
+    let mut tar = Vec::new();
+    for index in 0..count {
+        let mut header = [0u8; 512];
+        let name = format!("d{index}/");
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        header[100..108].copy_from_slice(b"0000755\0");
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        header[124..136].copy_from_slice(b"00000000000\0");
+        header[136..148].copy_from_slice(b"00000000000\0");
+        header[148..156].copy_from_slice(b"        ");
+        header[156] = b'5';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+        header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+        tar.extend_from_slice(&header);
+    }
+    tar.extend(std::iter::repeat_n(0xEEu8, 512));
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(&tar).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[test]
+fn a_tar_gz_of_too_many_folders_is_refused_as_it_streams() {
+    // Folders count where the preset counts folders, and a stream is held to the count while it is
+    // being read: the block after the folders is not a header at all, so an archive refused only
+    // after its listing is complete would report a damaged archive instead of a count.
+    let mut limits = small_limits();
+    limits.max_entries = 3;
+    let bytes = tar_gz_of_folders_then_garbage(5);
+    let error = SafeArchive::open_bytes(bytes, limits)
+        .err()
+        .expect("five folder records, three allowed");
+    assert!(
+        matches!(error, ArchiveError::TooManyEntries { count: 4, .. }),
+        "the count refuses it while streaming: {error:?}"
+    );
+}
+
+#[test]
+fn stopping_while_an_unwanted_solid_member_is_drained_is_noticed() {
+    // A solid 7z decodes every member of a block in order, so a member nobody asked for is drained
+    // rather than stepped over. The person who asked to stop must not wait for it: cancellation is
+    // asked between buffers, and the extraction ends as cancelled rather than finishing the drain.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Incompressible, so the archive is not refused by the ratio check before the drain is reached.
+    let mut seed = 0x1234_5678u32;
+    let big: Vec<u8> = (0..512 * 1024)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 16) as u8
+        })
+        .collect();
+    let bytes = solid_sevenz_bytes(&[("a.bin", &big)]);
+    let mut archive = SafeArchive::open_bytes(bytes, ArchiveLimits::PACK).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("out");
+    // One member, and nothing is wanted, so the only reads are its drain. The first call is the entry
+    // check before it; the second is inside the drain, and says stop — which is the whole point: a
+    // stop that is only noticed between entries waits for the member under way.
+    let calls = AtomicUsize::new(0);
+    let cancelled = || calls.fetch_add(1, Ordering::SeqCst) >= 1;
+    let error = archive
+        .extract_checked(
+            &dest,
+            NamePolicy::Refuse,
+            &mut |_| Select::LeaveOut("not this one".to_string()),
+            &cancelled,
+        )
+        .err()
+        .expect("the drain noticed the stop");
+    assert!(matches!(error, ArchiveError::Cancelled { .. }), "{error:?}");
+}
