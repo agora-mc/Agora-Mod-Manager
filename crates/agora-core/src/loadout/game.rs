@@ -61,9 +61,13 @@ pub struct GameLoadoutRules {
 }
 
 /// The part of a game instance's setup a loadout records.
+///
+/// Every field except `layer_order` and `save_folder` is required. They were all written by the
+/// first version of this record, so a section without one is a record that lost its state, not one
+/// that records nothing: applying an empty loadout would turn every managed layer off, clear the
+/// lists and switch the instance to the shared saves (MASTER_SPEC §26.10, §32.7).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameLoadout {
-    #[serde(default)]
     pub content: Vec<GameLoadoutContent>,
     /// Content layer order (layer ids, lowest priority first, matching `LayerStack`).
     /// Empty (including loadouts saved before this field existed) leaves the instance's
@@ -71,13 +75,9 @@ pub struct GameLoadout {
     /// place at the end.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub layer_order: Vec<String>,
-    #[serde(default)]
     pub plugin_lists: Vec<GameLoadoutPluginList>,
-    #[serde(default)]
     pub inis: Vec<GameLoadoutIni>,
-    #[serde(default)]
     pub rules: Vec<GameLoadoutRules>,
-    #[serde(default)]
     pub saves: SavesChoice,
     /// The own save folder this loadout uses. `Some(scope)` names a folder under the instance;
     /// `None` with `saves = Own` means the instance's single own folder, adopted from before

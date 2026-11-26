@@ -2123,6 +2123,70 @@ mod tests {
         assert!(read_profile(&dir, "empty").is_err());
     }
 
+    /// A game section whose state is missing is damaged, not an empty loadout.
+    ///
+    /// A game's section records its content layers, its lists and its save choice. An empty one
+    /// applies as "turn every managed layer off, clear the lists, and use the shared saves" — the
+    /// one thing a damaged record must never do (MASTER_SPEC §26.10, §32.7).
+    #[test]
+    fn a_game_section_without_its_state_is_damaged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("game-instance");
+        fs::create_dir_all(&dir).unwrap();
+        // A game instance's manifest names its game; the section has to match it to be applied.
+        fs::write(
+            dir.join("instance_manifest.json"),
+            serde_json::json!({"instance_id": "game-instance", "name": "G", "game": "skyrim-se"})
+                .to_string(),
+        )
+        .unwrap();
+        let profiles_dir = loadouts_dir(&dir);
+        fs::create_dir_all(&profiles_dir).unwrap();
+
+        for (name, game) in [
+            ("empty-game", serde_json::json!({})),
+            (
+                "contentless",
+                serde_json::json!({"plugin_lists": [], "inis": [], "rules": [], "saves": "shared"}),
+            ),
+        ] {
+            let record = serde_json::json!({
+                "schema_version": LOADOUT_SCHEMA_VERSION,
+                "name": name,
+                "created_at": "2026-01-01T00:00:00Z",
+                "sections": {"skyrim-se": {
+                    "enabled_mods": [], "covers": null, "items": null, "game": game,
+                }},
+            });
+            fs::write(
+                profiles_dir.join(format!("{name}.json")),
+                serde_json::to_vec_pretty(&record).unwrap(),
+            )
+            .unwrap();
+
+            let listing = list_profiles(&dir).unwrap();
+
+            assert!(
+                !listing.profiles.iter().any(|profile| profile.name == name),
+                "{name} is not read as a loadout: {:?}",
+                listing.profiles
+            );
+            assert!(
+                listing
+                    .damaged
+                    .iter()
+                    .any(|line| line.contains(&format!("{name}.json"))),
+                "the damaged record is named: {:?}",
+                listing.damaged
+            );
+            assert!(
+                read_profile(&dir, name).is_err(),
+                "{name} is refused for apply"
+            );
+            fs::remove_file(profiles_dir.join(format!("{name}.json"))).unwrap();
+        }
+    }
+
     #[test]
     fn a_section_filed_under_another_game_is_damaged() {
         let tmp = tempfile::tempdir().unwrap();
