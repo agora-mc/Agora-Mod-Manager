@@ -1874,14 +1874,23 @@ pub fn restore_snapshot(
 pub fn restore_scope(instance_dir: &Path, snapshot_id: &str) -> Result<Vec<String>, String> {
     validate_snapshot_id(snapshot_id)?;
     let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
-    let manifest = if manifest_path.is_file() {
-        read_manifest_file(&manifest_path, snapshot_id)?
-    } else {
-        let file = fs::File::open(snapshot_zip_path(instance_dir, snapshot_id))
-            .map_err(|e| format!("failed to open snapshot zip: {e}"))?;
-        let mut archive =
-            zip::ZipArchive::new(file).map_err(|e| format!("failed to read snapshot zip: {e}"))?;
-        read_manifest(&mut archive, snapshot_id)?
+    // Fail closed (§32.13): only "the operating system said not found" means this snapshot predates
+    // manifests. A path that cannot be examined is its own error, not a fall back to the archive.
+    let manifest = match agora_game_api::probe(&manifest_path) {
+        agora_game_api::Probe::Present(_) => read_manifest_file(&manifest_path, snapshot_id)?,
+        agora_game_api::Probe::Absent => {
+            let file = fs::File::open(snapshot_zip_path(instance_dir, snapshot_id))
+                .map_err(|e| format!("failed to open snapshot zip: {e}"))?;
+            let mut archive = zip::ZipArchive::new(file)
+                .map_err(|e| format!("failed to read snapshot zip: {e}"))?;
+            read_manifest(&mut archive, snapshot_id)?
+        }
+        agora_game_api::Probe::CantTell(error) => {
+            return Err(format!(
+                "cannot tell what is at {}, so this snapshot's scope cannot be read: {error}",
+                manifest_path.display()
+            ))
+        }
     };
     Ok(resolve_restore_coverage(&manifest)?
         .roots()

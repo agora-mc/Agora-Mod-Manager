@@ -534,10 +534,23 @@ pub struct LoadoutListing {
     pub damaged: Vec<String>,
 }
 
+/// Whether something is at `path`, failing closed: a path that cannot be examined is an error, never
+/// "nothing there" (MASTER_SPEC §32.13).
+fn is_present(path: &Path) -> Result<bool, String> {
+    match agora_game_api::probe(path) {
+        agora_game_api::Probe::Present(_) => Ok(true),
+        agora_game_api::Probe::Absent => Ok(false),
+        agora_game_api::Probe::CantTell(error) => Err(format!(
+            "cannot tell what is at {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 /// List all loadout profiles for an instance.
 pub fn list_profiles(instance_dir: &Path) -> Result<LoadoutListing, String> {
     let profiles_dir = loadouts_dir(instance_dir);
-    if !profiles_dir.is_dir() {
+    if !is_present(&profiles_dir)? {
         return Ok(LoadoutListing::default());
     }
 
@@ -761,7 +774,7 @@ fn set_entry_enabled(
 
     if should_enable {
         // Currently disabled → enable
-        if disabled.exists() {
+        if is_present(&disabled)? {
             fs::rename(&disabled, &original)
                 .map_err(|e| format!("Cannot enable {}: {e}", entry.filename))?;
             journal.push((disabled, original));
@@ -769,7 +782,7 @@ fn set_entry_enabled(
         entry.enabled = true;
     } else {
         // Currently enabled → disable
-        if original.exists() {
+        if is_present(&original)? {
             fs::rename(&original, &disabled)
                 .map_err(|e| format!("Cannot disable {}: {e}", entry.filename))?;
             journal.push((original, disabled));
@@ -887,18 +900,23 @@ pub fn delete_profile(instance_dir: &Path, profile_name: &str) -> Result<(), Str
     let safe_name = sanitize_profile_name(profile_name);
     let profile_path = profiles_dir.join(format!("{safe_name}.json"));
 
-    if !profile_path.exists() {
+    if !is_present(&profile_path)? {
         return Err(format!("Profile '{profile_name}' not found"));
     }
 
     fs::remove_file(&profile_path).map_err(|e| format!("Cannot delete profile: {e}"))?;
 
-    if profiles_dir.exists() {
-        let remaining: Vec<_> = fs::read_dir(&profiles_dir)
-            .map_err(|e| format!("Cannot read loadouts dir: {e}"))?
-            .filter_map(|e| e.ok())
-            .collect();
-        if remaining.is_empty() {
+    if is_present(&profiles_dir)? {
+        // Every entry is read: a directory whose entries cannot be listed says nothing about whether
+        // it is empty, and removing the folder would take the remaining records with it.
+        let mut remaining = 0usize;
+        for entry in
+            fs::read_dir(&profiles_dir).map_err(|e| format!("Cannot read loadouts dir: {e}"))?
+        {
+            entry.map_err(|e| format!("Cannot read loadouts dir: {e}"))?;
+            remaining += 1;
+        }
+        if remaining == 0 {
             let _ = fs::remove_dir(&profiles_dir);
         }
     }
