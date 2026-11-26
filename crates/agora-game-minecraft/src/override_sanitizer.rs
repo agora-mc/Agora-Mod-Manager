@@ -347,12 +347,13 @@ mod tests {
             EntryName::Writable(path) => assert_eq!(path.as_str(), "config/mod/settings.toml"),
             other => panic!("unexpected {other:?}"),
         }
-        // A `.` component and a trailing dot are names a disk cannot hold, so they are reported
-        // rather than quietly rewritten to a different file.
-        assert!(matches!(
-            classify_entry_name("./config/./mod.toml"),
-            EntryName::Unwritable { .. }
-        ));
+        // A `.` component names the folder it is in, so `./config/./mod.toml` is `config/mod.toml`
+        // and not a different file. A trailing dot *is* a name a disk cannot hold, so it is reported
+        // rather than quietly rewritten.
+        match classify_entry_name("./config/./mod.toml") {
+            EntryName::Writable(path) => assert_eq!(path.as_str(), "config/mod.toml"),
+            other => panic!("unexpected {other:?}"),
+        }
         assert!(matches!(
             classify_entry_name("config/mod.toml."),
             EntryName::Unwritable { .. }
