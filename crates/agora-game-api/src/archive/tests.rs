@@ -393,6 +393,58 @@ fn a_reserved_name_is_refused_and_named() {
 }
 
 #[test]
+fn a_dot_component_is_normalized_not_refused() {
+    // Zip tools write `./main.js`. A `.` component names the folder it is in, so dropping it keeps
+    // the file inside the root; refusing it would refuse a package that unpacks perfectly well.
+    let (dir, dest) = extract_dir();
+    let mut archive =
+        SafeArchive::open_bytes(zip_bytes(&[("./main.js", b"x")]), ArchiveLimits::PACK).unwrap();
+    let report = archive
+        .extract(&dest, NamePolicy::Refuse)
+        .expect("a `./` prefix is not a name a disk cannot hold");
+    assert_eq!(report.written, vec!["main.js".to_string()]);
+    assert!(dest.join("main.js").is_file());
+    assert!(report.skipped.is_empty());
+    drop(dir);
+}
+
+#[test]
+fn a_preview_and_the_extraction_answer_the_same_way_about_names() {
+    // `left_out_names` is the answer a preview needs: it decides without creating anything, and it is
+    // the same decision the extraction makes, so an install cannot fail after a preview passed.
+    let bytes = zip_bytes(&[
+        ("plugin.json", b"{}"),
+        ("textures/aux.dds", b"data"),
+        ("assets/Readme.txt", b"x"),
+        ("assets/README.TXT", b"y"),
+    ]);
+    let archive = SafeArchive::open_bytes(bytes, ArchiveLimits::PLUGIN_PACKAGE).unwrap();
+    let error = archive
+        .left_out_names(NamePolicy::Refuse)
+        .expect_err("two names a disk cannot hold refuse the package");
+    match &error {
+        ArchiveError::UnsafeNames { entries, .. } => {
+            let named: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+            assert!(named.contains(&"textures/aux.dds"), "{named:?}");
+            assert!(named.contains(&"assets/README.TXT"), "{named:?}");
+        }
+        other => panic!("unexpected error {other:?}"),
+    }
+
+    let skipped = archive
+        .left_out_names(NamePolicy::WithoutThem)
+        .expect("the caller may opt in to doing without them");
+    let names: Vec<&str> = skipped.iter().map(|entry| entry.name.as_str()).collect();
+    assert!(names.contains(&"textures/aux.dds"), "{names:?}");
+    assert!(names.contains(&"assets/README.TXT"), "{names:?}");
+    assert!(!names.contains(&"plugin.json"), "{names:?}");
+
+    // Nothing was created: a preview leaves the disk alone.
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn a_name_that_ends_in_a_dot_is_refused() {
     let (dir, dest) = extract_dir();
     let mut archive =

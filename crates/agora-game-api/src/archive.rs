@@ -266,6 +266,14 @@ pub fn classify_entry_name(name: &str) -> EntryName {
             reason: "it has a '..' component, so it leaves the extraction root".to_string(),
         };
     }
+    // A `.` component names the folder it is in. Zip tools write `./main.js`, and dropping the part
+    // cannot leave the root, so it is not a name a disk cannot hold — and refusing it would refuse
+    // packages that unpack perfectly well.
+    let normalized = normalized
+        .split('/')
+        .filter(|part| *part != ".")
+        .collect::<Vec<&str>>()
+        .join("/");
     match RelPath::strict(normalized) {
         Ok(strict) => EntryName::Writable(strict),
         Err(error) => EntryName::Unwritable {
@@ -986,24 +994,16 @@ impl SafeArchive {
         self.extract_checked(dest, policy, select, &|| false)
     }
 
-    /// [`SafeArchive::extract_where`] for a caller whose operation a person can stop: `cancelled` is
-    /// asked before every entry, and an answer of `true` ends the extraction with
-    /// [`ArchiveError::Cancelled`] after the entries already written stay written (the caller's
-    /// staging directory is thrown away, as it was before the bytes arrived).
-    pub fn extract_checked(
-        &mut self,
-        dest: &Path,
-        policy: NamePolicy,
+    /// What an extraction would write, and what it would leave out: the naming rules and the case
+    /// collision check, decided once, before any file is created.
+    ///
+    /// A preview that a later install must match calls [`SafeArchive::check_names`], which runs this
+    /// same decision, so "may these names be written" has one answer rather than two.
+    fn plan(
+        &self,
         select: &mut dyn FnMut(&str) -> Select,
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<ExtractReport, ArchiveError> {
-        self.written_so_far.clear();
+    ) -> Result<PlannedExtraction, ArchiveError> {
         let path = self.label();
-        std::fs::create_dir_all(dest).map_err(|error| ArchiveError::Destination {
-            path: dest.display().to_string(),
-            reason: error.to_string(),
-        })?;
-
         let mut plan: Vec<(StrictRelPath, String, u64)> = Vec::new();
         let mut skipped: Vec<SkippedEntry> = Vec::new();
         // Only the names a disk cannot hold make the refusal: an entry the caller's own rule leaves
@@ -1093,6 +1093,52 @@ impl SafeArchive {
             }
         }
 
+        Ok(PlannedExtraction {
+            write: plan,
+            skipped,
+            unwritable,
+        })
+    }
+
+    /// The entries an extraction would leave out, and the refusal it would make, decided without
+    /// creating anything.
+    ///
+    /// A preview and the install that follows it must answer the same way, so both ask this instead
+    /// of each carrying a copy of the naming rules (§32.3).
+    pub fn left_out_names(&self, policy: NamePolicy) -> Result<Vec<SkippedEntry>, ArchiveError> {
+        let planned = self.plan(&mut |_| Select::Write)?;
+        if !planned.unwritable.is_empty() && policy == NamePolicy::Refuse {
+            return Err(ArchiveError::UnsafeNames {
+                path: self.label(),
+                entries: planned.unwritable,
+            });
+        }
+        Ok(planned.skipped)
+    }
+
+    /// [`SafeArchive::extract_where`] for a caller whose operation a person can stop: `cancelled` is
+    /// asked before every entry, and an answer of `true` ends the extraction with
+    /// [`ArchiveError::Cancelled`] after the entries already written stay written (the caller's
+    /// staging directory is thrown away, as it was before the bytes arrived).
+    pub fn extract_checked(
+        &mut self,
+        dest: &Path,
+        policy: NamePolicy,
+        select: &mut dyn FnMut(&str) -> Select,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ExtractReport, ArchiveError> {
+        self.written_so_far.clear();
+        let path = self.label();
+        std::fs::create_dir_all(dest).map_err(|error| ArchiveError::Destination {
+            path: dest.display().to_string(),
+            reason: error.to_string(),
+        })?;
+
+        let PlannedExtraction {
+            write: plan,
+            skipped,
+            unwritable,
+        } = self.plan(select)?;
         if !unwritable.is_empty() && policy == NamePolicy::Refuse {
             return Err(ArchiveError::UnsafeNames {
                 path: path.clone(),
@@ -1169,6 +1215,16 @@ impl SafeArchive {
             .find(|entry| entry.name == name)
             .and_then(|entry| entry.unix_mode)
     }
+}
+
+/// An extraction decided but not yet performed: what would be written, what the caller's own rule
+/// leaves out, and the names a disk cannot hold (which refuse the extraction unless the caller opted
+/// in to doing without them).
+#[derive(Debug, Clone, Default)]
+struct PlannedExtraction {
+    write: Vec<(StrictRelPath, String, u64)>,
+    skipped: Vec<SkippedEntry>,
+    unwritable: Vec<SkippedEntry>,
 }
 
 /// Where one entry's bytes are going, and what they are allowed to be. One shape for every format,
