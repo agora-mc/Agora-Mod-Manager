@@ -1140,6 +1140,53 @@ fn a_clone_refuses_a_pin_to_a_base_left_unusable() {
     assert_eq!(clones, 0, "a refused clone publishes no row");
 }
 
+/// A clone's base is judged before its folder is promoted, so a refusal leaves nothing behind. A
+/// folder whose manifest pins a base, with no row and no clone reported, is an instance nothing
+/// lists and nothing removes — and it names a base a removal has already taken away
+/// (MASTER_SPEC §32.8).
+#[test]
+fn a_clone_refused_its_base_leaves_no_folder_and_no_pin() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    pinned_instance(&ctx, "source", base_id);
+    // The folder is gone and the record is left behind: a removal that could not finish, which
+    // makes the base unusable for a pin.
+    fs::remove_dir_all(&base_dir).unwrap();
+
+    let cloned = game_instance::clone_instance(
+        &ctx,
+        "source",
+        "Copy",
+        &test_game_definition(),
+        game_instance::CloneOptions::default(),
+    );
+    assert!(
+        cloned.is_err(),
+        "a clone must not publish a pin to a base that is not usable"
+    );
+
+    let mut folders: Vec<String> = fs::read_dir(ctx.paths.instances_root())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    folders.sort();
+    assert_eq!(
+        folders,
+        vec!["source".to_string()],
+        "the refused clone left a folder behind: {folders:?}"
+    );
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM instances WHERE instance_id <> 'source'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0, "a refused clone publishes no row");
+}
+
 /// A base's recorded folder that is a plain file holds no files an instance could run from, but
 /// the record is healthy and something is at the path, so both old questions ("is the record
 /// readable", "is something there") answered yes. Only "is it a folder?" catches it, and a pin to
