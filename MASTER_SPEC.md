@@ -5637,10 +5637,16 @@ three path comparators.
   `import.rs` and `pack_update.rs` follow the import protocol (C2); `backup.rs` and `snapshot.rs` sit
   inside restore protocols and move with them (C2). `launch_planner`'s native extraction keeps its
   own admission rules but asks the reader whether two entries share a name.
-- **RAR's first backend is `content_store/rar.rs`** (Windows' `tar.exe`, listing and `-xOf` per
-  entry), so the reader's RAR seam is filled rather than declared. A RAR the repository may commit
-  does not exist yet, so the happy path is unproven; the real-RAR tests stay `#[ignore]`d because
-  they read a user's Vortex folder.
+- **RAR's first backend is `content_store/rar.rs`** (Windows' `tar.exe`), so the reader's RAR seam is
+  filled rather than declared. **It never names a member to `tar.exe`**: bsdtar reads the arguments
+  after `--` as patterns, so `-xOf archive -- "[ab].txt"` prints `a.txt`'s and `b.txt`'s bytes and a
+  member called `[ELLE] x.txt` matches nothing. The backend lists (the limits are checked on the
+  listing), extracts the whole archive once into a folder of its own, checks the extracted tree
+  against the listing — files, sizes, no link or reparse point — and serves reads from that copy,
+  with the reader's classification, duplicate and name rules unchanged and the real size on disk
+  re-checked. No member data goes through a pipe. A RAR the repository may commit does not exist
+  yet, so the tests read an archive `tar.exe` reads the same way (a zip) and the real-RAR ones stay
+  `#[ignore]`d because they read a user's Vortex folder.
 - **Guard:** private path validators, direct archive opens outside the reader, and path comparisons
   outside the comparison module (in recovery, trust and staging code) are counted.
 
