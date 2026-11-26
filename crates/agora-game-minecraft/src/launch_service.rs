@@ -15,6 +15,7 @@ use agora_core::models::InstanceManifest;
 use agora_core::network::NetworkPolicy;
 use agora_core::process_identity::{self, ProcessIdentity};
 use agora_core::process_session_manager::ProcessSession;
+use agora_core::snapshot::{create_snapshot_scoped, snapshot_file_entries};
 use agora_core::task_scheduler::BlockingPriority;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -1430,11 +1431,12 @@ fn create_or_reuse_snapshot(instance_dir: &Path) -> LauncherResult<String> {
 
 fn create_fresh_prelaunch_snapshot(instance_dir: &Path, scope: &[&str]) -> LauncherResult<String> {
     let snapshot =
-        agora_core::snapshot::create_snapshot_scoped(instance_dir, Some("pre-launch"), scope)
-            .map_err(|error| LauncherError::Generic {
+        create_snapshot_scoped(instance_dir, Some("pre-launch"), scope).map_err(|error| {
+            LauncherError::Generic {
                 code: "ERR_SNAPSHOT_CREATE".into(),
                 message: error.to_string(),
-            })?;
+            }
+        })?;
     // create_snapshot_scoped writes the scoped reuse receipt from the same
     // metadata traversal that created the snapshot.
     Ok(snapshot.id)
@@ -2095,7 +2097,7 @@ mod tests {
         std::fs::write(inst.join("undeclared").join("keep.txt"), b"not ours").unwrap();
 
         let id = create_or_reuse_snapshot(&inst).expect("a launch takes its pre-launch point");
-        let mut captured: Vec<String> = agora_core::snapshot::snapshot_file_entries(&inst, &id)
+        let mut captured: Vec<String> = snapshot_file_entries(&inst, &id)
             .unwrap()
             .into_iter()
             .map(|entry| entry.relative_path)

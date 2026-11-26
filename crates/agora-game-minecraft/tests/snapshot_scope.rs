@@ -3,7 +3,7 @@
 //! Core reads the declaration instead of holding a folder list of its own, so these tests pin the
 //! list core now reads and prove a restore stays inside it.
 
-use agora_core::snapshot;
+use agora_core::{db, snapshot, snapshot_service::SnapshotService};
 use std::fs;
 use std::path::Path;
 
@@ -93,7 +93,7 @@ fn a_full_snapshot_captures_exactly_the_golden_file_set() {
 fn a_manual_capture_through_the_service_captures_the_golden_file_set() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = agora_game_minecraft::testing_context(tmp.path().join("app_data"));
-    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
     let dir = ctx.paths.instance_dir("golden-instance").unwrap();
     fill(&dir);
     fs::write(
@@ -110,7 +110,7 @@ fn a_manual_capture_through_the_service_captures_the_golden_file_set() {
     )
     .unwrap();
 
-    let snapshot = agora_core::snapshot_service::SnapshotService::new(ctx.clone())
+    let snapshot = SnapshotService::new(ctx.clone())
         .create("golden-instance", Some("golden"))
         .expect("the service captures what the package declares");
 
