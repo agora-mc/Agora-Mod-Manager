@@ -707,3 +707,79 @@ fn taking_a_lock_while_holding_instance_locations_is_refused() {
         .acquire(LockResource::Base("a-base".into()), "test waiter")
         .unwrap();
 }
+
+/// A restore cut off just after its rename: the files are back under `instances/` with the
+/// marker the delete wrote, the trash entry is still there, and no row was published. Finishing
+/// it publishes the pin (the row) and clears the entry, and a pinning scan reads the live rows
+/// and Recently deleted apart: unless recovery holds instance-locations across both, a base
+/// removal can read the rows before the insert and the trash after the tidy and delete a base
+/// the instance still needs.
+#[test]
+fn a_restore_recovery_cannot_publish_a_pin_while_a_base_removal_decides() {
+    let (dir, ctx) = fixture();
+    let base_id = "test-base";
+    let base_dir = base_fixture(&ctx, dir.path(), base_id);
+    pinned_instance(&ctx, "pinned", base_id);
+    let entry = game_instance::delete(&ctx, "pinned")
+        .unwrap()
+        .trash_entry_id
+        .unwrap();
+    // The state a crash leaves: the entry marked, the folder moved, no row yet.
+    let entry_dir = ctx.paths.recently_deleted_games_root().join(&entry);
+    fs::write(
+        entry_dir.join("restoring.json"),
+        br#"{"new_id":"pinned","new_name":"pinned"}"#,
+    )
+    .unwrap();
+    fs::write(
+        entry_dir
+            .join("instance")
+            .join(".agora-restore-marker.json"),
+        serde_json::json!({ "entry_id": entry }).to_string(),
+    )
+    .unwrap();
+    fs::rename(
+        entry_dir.join("instance"),
+        ctx.paths.instance_dir("pinned").unwrap(),
+    )
+    .unwrap();
+
+    // The removal's pause between its two pinning reads runs the recovery, exactly where a
+    // startup pass of another Agora program would land.
+    let recovery_ctx = ctx.clone();
+    let fired = AtomicBool::new(false);
+    let warnings: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let removal = game_base::remove_base_with(
+        &ctx.paths,
+        base_id,
+        || {
+            if fired.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let (actions, said) = trash::recover_interrupted_reporting(&recovery_ctx);
+            assert!(
+                actions.is_empty(),
+                "recovery published a pin while a base removal held instance-locations: {actions:?}"
+            );
+            *warnings.lock().unwrap() = said;
+        },
+        |path| std::fs::metadata(path),
+        |path| std::fs::remove_file(path),
+    );
+    assert!(fired.load(Ordering::SeqCst), "the pause was reached");
+    let said = warnings.lock().unwrap().clone();
+    assert!(
+        said.iter()
+            .any(|warning| warning.contains("instance-locations")),
+        "recovery must hold instance-locations, and say which lock kept it back: {said:?}"
+    );
+    assert!(
+        matches!(&removal, Err(BaseError::InUse { instances }) if instances == &vec!["pinned".to_string()]),
+        "a base the restorable instance still pins was removed: {removal:?}"
+    );
+    assert!(
+        base_dir.join("game.exe").is_file(),
+        "the base pinned by the restorable instance was removed"
+    );
+    assert!(ctx.paths.base_manifest_path(base_id).is_file());
+}
