@@ -116,7 +116,9 @@ async function installMock(page: Page) {
           return Promise.resolve({ id: 'snap-1', label: 'Recovery snapshot', created_at: '2026-11-12T21:00:00Z', file_count: 1, size_estimate: 1024, is_lkg: false, is_current_lkg: false, is_pre_restore: false });
         }
         if (command === 'delete_snapshot') return Promise.resolve(null);
-        if (command === 'restore_snapshot') return Promise.resolve(null);
+        if (command === 'restore_snapshot') {
+          return Promise.resolve({ snapshotId: 'snap-1', coverage: 'exact', restoredRoots: ['mods'], preservedRoots: [] });
+        }
 
         if (command === 'check_instance_health') {
           return Promise.resolve({ score: 'green', blockers: [], warnings: [], recommendations: [], scan_token: 'scan' });
