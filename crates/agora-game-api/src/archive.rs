@@ -59,6 +59,13 @@ pub struct ArchiveLimits {
     pub max_total_bytes: u64,
     /// Most uncompressed bytes one compressed byte may become. `0` does not check.
     pub max_ratio: u64,
+    /// Whether [`Self::max_entry_bytes`] also refuses the whole archive at listing time.
+    ///
+    /// It is `true` for a job that reads or writes every entry, where one oversized entry is a
+    /// refusal whatever happens next. A job that reads only some entries (a jar's metadata) says
+    /// `false`: a 40 MiB texture no metadata reader ever asks for is no reason to lose the mod's id,
+    /// and the limit still applies to each entry as it is read.
+    pub per_entry_at_listing: bool,
 }
 
 const MIB: u64 = 1024 * 1024;
@@ -72,6 +79,7 @@ impl ArchiveLimits {
         max_entry_bytes: 500 * MIB,
         max_total_bytes: 2 * GIB,
         max_ratio: 200,
+        per_entry_at_listing: true,
     };
 
     /// A mod archive added to the content store, or a technic-style zip.
@@ -81,6 +89,7 @@ impl ArchiveLimits {
         max_entry_bytes: 500 * MIB,
         max_total_bytes: 2 * GIB,
         max_ratio: 200,
+        per_entry_at_listing: true,
     };
 
     /// An instance backup or a snapshot: written by Agora, so its sizes are its own claim. The
@@ -91,6 +100,7 @@ impl ArchiveLimits {
         max_entry_bytes: GIB,
         max_total_bytes: 64 * GIB,
         max_ratio: 0,
+        per_entry_at_listing: true,
     };
 
     /// A downloaded plugin package: small, and code, so the tightest preset.
@@ -100,16 +110,21 @@ impl ArchiveLimits {
         max_entry_bytes: 16 * MIB,
         max_total_bytes: 64 * MIB,
         max_ratio: 200,
+        per_entry_at_listing: true,
     };
 
     /// Reading metadata out of a jar, nested jars included. The nesting depth and the number of
     /// nested jars are the caller's business; this bounds one archive's entries and bytes.
+    ///
+    /// The per-entry limit applies to each entry the reader asks for, not to the listing: a mod jar's
+    /// big texture is never read, so it cannot fail the jar's metadata.
     pub const JAR_METADATA: Self = Self {
         preset: "jar metadata",
         max_entries: 10_000,
         max_entry_bytes: 32 * MIB,
         max_total_bytes: 128 * MIB,
         max_ratio: 0,
+        per_entry_at_listing: false,
     };
 
     /// A downloaded game runtime: a JRE zip or tar.gz. Large files, few entries, and Agora checks
@@ -120,6 +135,7 @@ impl ArchiveLimits {
         max_entry_bytes: 500 * MIB,
         max_total_bytes: 2 * GIB,
         max_ratio: 0,
+        per_entry_at_listing: true,
     };
 }
 
@@ -964,7 +980,7 @@ impl SafeArchive {
                 continue;
             }
             files += 1;
-            if entry.size > self.limits.max_entry_bytes {
+            if self.limits.per_entry_at_listing && entry.size > self.limits.max_entry_bytes {
                 return Err(ArchiveError::TooLarge {
                     path,
                     format: self.format,

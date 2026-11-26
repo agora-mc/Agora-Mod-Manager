@@ -159,6 +159,7 @@ fn small_limits() -> ArchiveLimits {
         max_entry_bytes: 32,
         max_total_bytes: 48,
         max_ratio: 0,
+        per_entry_at_listing: true,
     }
 }
 
@@ -293,6 +294,22 @@ fn a_stored_entry_that_over_declares_its_size_is_refused() {
         ),
         "{error:?}"
     );
+}
+
+#[test]
+fn the_per_entry_limit_is_a_read_limit_where_the_preset_says_so() {
+    // `JAR_METADATA` reads a handful of entries, so a jar holding one literal that no metadata reader
+    // asks for lists fine and is refused only when someone asks for that entry.
+    let big = vec![0u8; (32 * 1024 * 1024) + 1024];
+    let bytes = zip_bytes(&[("assets/big.bin", &big), ("fabric.mod.json", b"{}")]);
+    let mut archive = SafeArchive::open_bytes(bytes, ArchiveLimits::JAR_METADATA)
+        .expect("an entry nobody reads does not fail the listing");
+    assert_eq!(archive.file_entries().count(), 2);
+    assert_eq!(archive.read("fabric.mod.json").unwrap(), b"{}");
+    let error = archive
+        .read("assets/big.bin")
+        .expect_err("reading the big entry is what the limit stops");
+    assert!(matches!(error, ArchiveError::TooLarge { .. }), "{error:?}");
 }
 
 #[test]

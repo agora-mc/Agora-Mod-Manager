@@ -3255,28 +3255,46 @@ Embedded-Dependencies-Mod: a.jar
     }
 
     #[test]
-    fn an_entry_above_the_preset_refuses_the_jar_rather_than_trusting_the_rest() {
-        // `JAR_METADATA`'s per-entry limit is where a nested jar used to be skipped at read time.
-        // The listing refuses it instead, so the rest of the jar is not read on the strength of a
-        // size the archive itself declared (MASTER_SPEC §32.13); health falls back to the manifest.
+    fn a_nested_jar_over_the_per_entry_limit_is_skipped_not_provided() {
+        // `JAR_METADATA`'s per-entry limit is applied to the entries the reader actually reads, and a
+        // nested jar it means to parse is one of them: it is skipped with a recorded reason, and the
+        // outer mod's own metadata still comes back (MASTER_SPEC §32.3, §32.13).
         let big = vec![0u8; (MAX_ENTRY_BYTES + 1) as usize];
         let jar = build_test_jar_binary(&[
             (
                 "fabric.mod.json",
-                br#"{"id":"outer","jars":[{"file":"big.jar"}]}"# as &[u8],
+                br#"{"id":"outer","version":"1.0.0","jars":[{"file":"big.jar"}]}"# as &[u8],
             ),
             ("big.jar", &big),
         ]);
         let parsed = parse_jar_metadata_for_loader_with_status(&jar, "fabric");
         let _ = std::fs::remove_file(&jar);
-        assert_eq!(parsed.status, ParseStatus::Failed);
+        assert_eq!(parsed.status, ParseStatus::Partial);
         assert!(parsed.metadata.provided_mods.is_empty());
-        assert_eq!(parsed.diagnostics.len(), 1);
-        assert_eq!(
-            parsed.diagnostics[0].kind,
-            ParseDiagnosticKind::ArchiveOpenFailed
-        );
-        assert!(parsed.diagnostics[0].message.contains("big.jar"));
+        assert_eq!(parsed.metadata.mod_jar_id.as_deref(), Some("outer"));
+        assert!(parsed.diagnostics.iter().any(|diagnostic| diagnostic.kind
+            == ParseDiagnosticKind::IoFailure
+            && diagnostic.entry_path.as_deref() == Some("big.jar")));
+    }
+
+    #[test]
+    fn a_big_asset_the_reader_never_reads_does_not_fail_the_jar() {
+        // A 40 MiB texture is larger than the per-entry limit and is never read, so it is no reason
+        // to lose the whole jar's metadata.
+        let big = vec![0u8; 40 * 1024 * 1024];
+        let jar = build_test_jar_binary(&[
+            (
+                "fabric.mod.json",
+                br#"{"id":"outer","version":"1.0.0","depends":{"minecraft":"1.20.1"}}"# as &[u8],
+            ),
+            ("assets/outer/big.png", &big),
+        ]);
+        let parsed = parse_jar_metadata_for_loader_with_status(&jar, "fabric");
+        let _ = std::fs::remove_file(&jar);
+        assert_eq!(parsed.status, ParseStatus::Complete);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(parsed.metadata.mod_jar_id.as_deref(), Some("outer"));
+        assert_eq!(parsed.metadata.mod_version.as_deref(), Some("1.0.0"));
     }
 
     #[test]
