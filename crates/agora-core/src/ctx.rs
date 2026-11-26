@@ -94,6 +94,8 @@ pub struct CoreContext {
     pub http_clients: HttpClients,
     /// Clock for time-sensitive operations.
     pub clock: Arc<dyn Clock>,
+    /// Settings shared by this context and its clones.
+    pub settings_cache: Arc<crate::settings::SettingsCache>,
     /// Cross-process filesystem lock manager.
     pub lock_manager: LockManager,
     /// State owned by game packages (catalogs, caches), keyed by type.
@@ -184,12 +186,16 @@ impl CoreContext {
 
         // 2. Fatal: initialize / migrate local_state.db.
         let db_path = paths.local_state_db();
+        let test_seams = crate::test_seams::TestSeams::default();
         // Every adapter reaches the network through this context, so this is
         // the one place the outbound policy has to be installed. Until it is,
         // `network_gate` denies — a missing policy must not read as consent.
-        crate::network_gate::install(Arc::new(crate::network_gate::SettingsGate::new(
-            db_path.clone(),
-        )));
+        crate::network_gate::install(Arc::new(
+            crate::network_gate::SettingsGate::with_context_seams(
+                db_path.clone(),
+                test_seams.clone(),
+            ),
+        ));
         let local_state_report = crate::db::init_local_state_db_with(&db_path, local_state_options)
             .map_err(|e| {
                 // A typed error already says what happened and what the player
@@ -662,6 +668,7 @@ impl CoreContext {
             })?,
             extensions: Extensions::default(),
             clock: Arc::new(WallClock),
+            settings_cache: Arc::new(crate::settings::SettingsCache::default()),
             progress_sink: Arc::new(NoopProgressSink),
             event_sink: Arc::new(NoopEventSink),
             operation_manager: OperationManager::new(),
@@ -669,7 +676,7 @@ impl CoreContext {
             process_session_manager: ProcessSessionManager::new(),
             games,
             registry_trust: registry_trust.clone(),
-            test_seams: crate::test_seams::TestSeams::default(),
+            test_seams,
         };
         ctx.extensions.insert(behaviour_runtime);
 
@@ -711,6 +718,7 @@ impl CoreContext {
             http_clients: HttpClients::for_testing(reqwest::Client::new()),
             extensions: Extensions::default(),
             clock: Arc::new(WallClock),
+            settings_cache: Arc::new(crate::settings::SettingsCache::default()),
             lock_manager,
             progress_sink: Arc::new(NoopProgressSink),
             event_sink: Arc::new(NoopEventSink),

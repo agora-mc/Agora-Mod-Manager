@@ -3,6 +3,22 @@ use rusqlite::Connection;
 use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
 
+/// One settings cache per context, shared by its clones.
+#[derive(Default)]
+pub struct SettingsCache {
+    _stub: (),
+}
+
+impl SettingsCache {
+    /// Check the database version and refresh the settings used by this context.
+    pub fn refresh(&self, _ctx: &Ctx) -> LauncherResult<()> {
+        Err(LauncherError::Generic {
+            code: "ERR_NETWORK_SETTINGS_UNREADABLE".into(),
+            message: "Settings cache refresh is not implemented".into(),
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SettingsService — core-owned typed service
 // ---------------------------------------------------------------------------

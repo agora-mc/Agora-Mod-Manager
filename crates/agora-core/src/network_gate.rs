@@ -30,6 +30,7 @@
 
 use crate::error::{LauncherError, LauncherResult};
 use crate::http_client::ClientCategory;
+use crate::test_seams::{SettingsCacheEvent, TestSeams};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -72,11 +73,34 @@ impl NetworkGate for AllowAll {
 /// the local settings database on every request.
 pub struct SettingsGate {
     db_path: PathBuf,
+    test_seams: Option<TestSeams>,
 }
 
 impl SettingsGate {
     pub fn new(db_path: PathBuf) -> Self {
-        Self { db_path }
+        Self {
+            db_path,
+            test_seams: None,
+        }
+    }
+
+    /// Construct the settings gate for a context, including its test seams.
+    pub fn for_context(ctx: &crate::ctx::Ctx) -> Self {
+        Self::with_context_seams(ctx.paths.local_state_db(), ctx.test_seams.clone())
+    }
+
+    pub(crate) fn with_context_seams(db_path: PathBuf, test_seams: TestSeams) -> Self {
+        Self {
+            db_path,
+            test_seams: Some(test_seams),
+        }
+    }
+
+    fn observe(&self, event: SettingsCacheEvent) {
+        if let Some(seams) = &self.test_seams {
+            // The legacy reader reports I/O observations without fault substitution.
+            let _ = seams.settings_cache_event(event);
+        }
     }
 }
 
@@ -118,6 +142,7 @@ fn endpoint_setting(category: ClientCategory) -> Option<&'static str> {
 
 impl NetworkGate for SettingsGate {
     fn check(&self, category: ClientCategory) -> LauncherResult<()> {
+        self.observe(SettingsCacheEvent::OpenConnection);
         let conn = crate::db::local_state_connection(&self.db_path).map_err(|error| {
             // An unreadable settings store cannot establish that the user
             // permits this request, so it does not.
@@ -130,6 +155,7 @@ impl NetworkGate for SettingsGate {
             }
         })?;
 
+        self.observe(SettingsCacheEvent::ReadValues);
         if crate::db::lockdown_denies_network(&conn)? {
             return Err(LauncherError::Generic {
                 code: "ERR_NETWORK_LOCKDOWN".into(),

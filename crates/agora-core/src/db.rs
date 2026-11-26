@@ -1102,6 +1102,12 @@ pub fn run_migrations_to(conn: &Connection, target: i64) -> anyhow::Result<Vec<S
     run_migration_steps(conn, MIGRATIONS, target)
 }
 
+/// Schema step 32 adds the settings version inside the migration transaction.
+#[allow(dead_code)] // Registered with the migration runner when step 32 is implemented.
+fn migrate_v32(_conn: &Connection) -> anyhow::Result<()> {
+    anyhow::bail!("schema step 32 has not been implemented")
+}
+
 struct MigrationStep {
     version: i64,
     name: &'static str,
@@ -2798,6 +2804,12 @@ fn cross_namespace_orphans(conn: &Connection) -> anyhow::Result<Vec<String>> {
     }
     out.sort();
     Ok(out)
+}
+
+/// Read the settings version from the caller's database snapshot.
+/// A missing version row is a read failure.
+pub fn settings_version(_conn: &Connection) -> anyhow::Result<i64> {
+    anyhow::bail!("settings version read has not been implemented")
 }
 
 /// Read a JSON-encoded setting from user_settings.

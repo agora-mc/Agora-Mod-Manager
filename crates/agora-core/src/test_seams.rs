@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 pub use crate::game_tool_swap::{RunHook, VolumeSeam, WriteFaultHook};
 
@@ -32,6 +33,10 @@ pub struct TestSeams(Arc<Seams>);
 /// production operation makes on every pass is one atomic load and no lock.
 #[derive(Default)]
 struct Seams {
+    settings_cache: Mutex<Option<SettingsCacheHook>>,
+    settings_cache_hook_installed: AtomicBool,
+    settings_refresh_period: Mutex<Option<Duration>>,
+    settings_refresh_period_hits: AtomicUsize,
     volume: Mutex<Option<VolumeSeam>>,
     volume_installed: AtomicBool,
     volume_hits: AtomicUsize,
@@ -70,6 +75,60 @@ struct Seams {
     process_view: Mutex<Option<Arc<dyn crate::process_identity::ProcessView>>>,
     process_view_installed: AtomicBool,
     process_view_hits: AtomicUsize,
+}
+
+/// Observable database work during a settings gate check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsCacheEvent {
+    OpenConnection,
+    ReadVersion,
+    BeforeValuesRead,
+    ReadValues,
+}
+
+type SettingsCacheHook = Arc<dyn Fn(SettingsCacheEvent) -> rusqlite::Result<()> + Send + Sync>;
+
+impl TestSeams {
+    /// Observe cache I/O and pause after the version SELECT, before reading values.
+    /// A fault at `ReadVersion` or `ReadValues` stands in for an error from that read.
+    pub fn set_settings_cache_hook(&self, hook: SettingsCacheHook) {
+        *slot(&self.0.settings_cache) = Some(hook);
+        self.0
+            .settings_cache_hook_installed
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn settings_cache_event(&self, event: SettingsCacheEvent) -> rusqlite::Result<()> {
+        if !self.0.settings_cache_hook_installed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let hook = slot(&self.0.settings_cache).clone();
+        match hook {
+            Some(hook) => hook(event),
+            None => Ok(()),
+        }
+    }
+
+    /// Override the backstop period. Use the context's clock to advance it.
+    pub fn set_settings_refresh_period(&self, period: Duration) {
+        *slot(&self.0.settings_refresh_period) = Some(period);
+    }
+
+    #[allow(dead_code)] // Read when the cache is implemented.
+    pub(crate) fn settings_refresh_period_override(&self) -> Option<Duration> {
+        let period = *slot(&self.0.settings_refresh_period);
+        if period.is_some() {
+            self.0
+                .settings_refresh_period_hits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        period
+    }
+
+    /// Count how often a refresh used the test's period override.
+    pub fn settings_refresh_period_hits(&self) -> usize {
+        self.0.settings_refresh_period_hits.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(debug_assertions)]

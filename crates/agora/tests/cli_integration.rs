@@ -103,6 +103,57 @@ fn run_agora(data_dir: &Path, args: &[&str]) -> std::process::Output {
     run_command(agora_command(data_dir, args), args)
 }
 
+#[tokio::test]
+async fn cli_lockdown_revokes_the_next_request_in_a_live_context() {
+    use agora_core::app_paths::AppPaths;
+    use agora_core::ctx::Ctx;
+    use agora_core::game_registry::GameRegistryBuilder;
+    use agora_core::http_client::{checked_get_bytes, ClientCategory};
+    use agora_core::test_seams::SettingsCacheEvent;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    let root = tempfile::tempdir().unwrap();
+    let (ctx, _) = Ctx::initialize(
+        AppPaths::from_root(root.path().to_owned()),
+        GameRegistryBuilder::default(),
+    )
+    .unwrap();
+    let version_reads = Arc::new(AtomicUsize::new(0));
+    ctx.test_seams.set_settings_cache_hook({
+        let version_reads = Arc::clone(&version_reads);
+        Arc::new(move |event| {
+            if event == SettingsCacheEvent::ReadVersion {
+                version_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        })
+    });
+    // An invalid URL lets us establish the gate allowed the request without a DNS lookup.
+    let request = || {
+        checked_get_bytes(
+            &ctx.http_clients,
+            ClientCategory::ConsentedContent,
+            "invalid URL",
+        )
+    };
+    assert_eq!(request().await.unwrap_err().code(), "ERR_INVALID_URL");
+    let before = version_reads.load(Ordering::SeqCst);
+    let output = run_agora(
+        root.path(),
+        &["settings", "set", "network_lockdown_enabled", "true"],
+    );
+    assert!(
+        output.status.success(),
+        "CLI failed to enable Lockdown: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let denied = request().await.unwrap_err();
+    assert_eq!(denied.code(), "ERR_NETWORK_LOCKDOWN", "{denied}");
+    let after = version_reads.load(Ordering::SeqCst);
+    assert!(before > 0 && after > before, "CLI Lockdown was observed, but the live gate did not check the settings version before both requests ({before} -> {after})");
+}
+
 /// Helper: run with `--json` flag prepended.
 fn run_agora_json(data_dir: &Path, args: &[&str]) -> std::process::Output {
     let mut full_args: Vec<&str> = vec!["--json"];

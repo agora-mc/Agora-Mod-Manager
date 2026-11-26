@@ -26,7 +26,8 @@ use crate::error::{LauncherError, LauncherResult};
 use crate::network;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -377,6 +378,18 @@ impl ClientCategory {
 #[derive(Debug, Clone)]
 pub struct HttpClients {
     by_category: [reqwest::Client; ClientCategory::ALL.len()],
+    test_dns: Option<TestDns>,
+}
+
+type ResolveTestHost = dyn Fn(&reqwest::Url) -> std::io::Result<Vec<SocketAddr>> + Send + Sync;
+
+#[derive(Clone)]
+struct TestDns(Arc<ResolveTestHost>);
+
+impl std::fmt::Debug for TestDns {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TestDns")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -664,6 +677,7 @@ impl HttpClients {
                 code: "ERR_HTTP_CLIENT_BUILD".into(),
                 message: "HTTP client table size does not match the category list".into(),
             })?,
+            test_dns: None,
         })
     }
 
@@ -675,7 +689,15 @@ impl HttpClients {
     pub fn for_testing(client: reqwest::Client) -> Self {
         Self {
             by_category: std::array::from_fn(|_| client.clone()),
+            test_dns: None,
         }
+    }
+
+    /// Substitute DNS results for the async GET URL policy in tests.
+    #[doc(hidden)]
+    pub fn with_test_dns(mut self, resolve: Arc<ResolveTestHost>) -> Self {
+        self.test_dns = Some(TestDns(resolve));
+        self
     }
 
     /// Get the raw client for a category.
@@ -775,6 +797,15 @@ pub fn check_request_url_with_policy(
     url: &str,
     policy: HostPolicy<'_>,
 ) -> LauncherResult<reqwest::Url> {
+    check_request_url_resolving(category, url, policy, None)
+}
+
+fn check_request_url_resolving(
+    category: ClientCategory,
+    url: &str,
+    policy: HostPolicy<'_>,
+    test_dns: Option<&TestDns>,
+) -> LauncherResult<reqwest::Url> {
     let parsed = reqwest::Url::parse(url).map_err(|_| LauncherError::Generic {
         code: "ERR_INVALID_URL".into(),
         message: format!("Cannot parse URL: {url}"),
@@ -869,7 +900,11 @@ pub fn check_request_url_with_policy(
     //    Every resolved address is checked, not just the first: a host that
     //    resolves to both a public and a private address must not pass because
     //    the public one happened to sort first.
-    match parsed.socket_addrs(|| None) {
+    let addresses = match test_dns {
+        Some(resolve) => (resolve.0)(&parsed),
+        None => parsed.socket_addrs(|| None),
+    };
+    match addresses {
         Ok(addrs) if !addrs.is_empty() => {
             if addrs.iter().any(|addr| is_blocked_ip(addr.ip())) {
                 return Err(LauncherError::Generic {
@@ -1107,7 +1142,7 @@ pub async fn checked_request_with_policy(
     // Lockdown Mode.
     crate::network_gate::authorize(category)?;
     // Validate initial URL against category policies.
-    let _validated = check_request_url_with_policy(category, url, policy)?;
+    let _validated = check_request_url_resolving(category, url, policy, clients.test_dns.as_ref())?;
 
     let client = clients.get(category);
 
@@ -1160,7 +1195,12 @@ pub async fn checked_request_with_policy(
                 })?;
 
             // Re-validate the redirect target against the same policies.
-            let _ = check_request_url_with_policy(category, next_url.as_str(), policy)?;
+            let _ = check_request_url_resolving(
+                category,
+                next_url.as_str(),
+                policy,
+                clients.test_dns.as_ref(),
+            )?;
 
             remaining_redirects -= 1;
             current_url = next_url.to_string();
