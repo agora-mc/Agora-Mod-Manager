@@ -302,6 +302,20 @@ pub enum ArchiveError {
     /// The archive needs a password. Nothing is written from an archive that cannot be read.
     #[error("'{path}' is password-protected, which Agora does not read")]
     PasswordProtected { path: String },
+    /// Two or more entries share one name, so an archive holds bytes no reader can tell apart.
+    ///
+    /// The zip crate keeps only the last of several same-named records, so this cannot be found in
+    /// a listing that goes through it: the reader counts what the archive itself declares. Nothing
+    /// is read from an archive whose content is ambiguous.
+    #[error(
+        "'{path}' holds more than one entry named {}",
+        .names.join(", ")
+    )]
+    DuplicateNames {
+        path: String,
+        format: ArchiveFormat,
+        names: Vec<String>,
+    },
     /// More file entries than the preset allows.
     #[error(
         "'{path}' holds {count} files, more than the {limit} a {format} archive of this kind may",
@@ -846,6 +860,7 @@ impl SafeArchive {
                 format: ArchiveFormat::Zip,
                 reason: format!("{error}"),
             })?;
+        let central_directory_at = zip.central_directory_start();
         let mut entries = Vec::with_capacity(zip.len());
         for index in 0..zip.len() {
             let entry = zip.by_index(index).map_err(|error| ArchiveError::Corrupt {
@@ -868,6 +883,26 @@ impl SafeArchive {
                 size: entry.size(),
                 compressed: Some(entry.compressed_size()),
                 unix_mode: entry.unix_mode(),
+            });
+        }
+        drop(zip);
+        // The crate keeps only the last of several same-named records, so the listing above cannot
+        // show them: the central directory is counted instead, and an archive that hides one entry
+        // behind another is refused rather than silently read as the last one (MASTER_SPEC §32.13).
+        let declared =
+            zip_declared_entry_names(source.as_mut(), central_directory_at).map_err(|error| {
+                ArchiveError::Corrupt {
+                    path: path.clone(),
+                    format: ArchiveFormat::Zip,
+                    reason: format!("its central directory could not be read: {error}"),
+                }
+            })?;
+        let duplicated = names_declared_more_than_once(&declared);
+        if !duplicated.is_empty() {
+            return Err(ArchiveError::DuplicateNames {
+                path,
+                format: ArchiveFormat::Zip,
+                names: duplicated,
             });
         }
         Ok(entries)
@@ -909,6 +944,21 @@ impl SafeArchive {
         let path = self.label();
         let mut files = 0usize;
         let mut total = 0u64;
+        // A tar, a 7z and a RAR list every record they hold, so two entries with one name show up
+        // here; a zip hides the second behind the first, so `list_zip` counts that one itself.
+        let file_names: Vec<String> = entries
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::File)
+            .map(|entry| entry.name.clone())
+            .collect();
+        let duplicated = names_declared_more_than_once(&file_names);
+        if !duplicated.is_empty() {
+            return Err(ArchiveError::DuplicateNames {
+                path,
+                format: self.format,
+                names: duplicated,
+            });
+        }
         for entry in entries {
             if entry.kind != EntryKind::File {
                 continue;
@@ -1482,6 +1532,96 @@ fn copy_from_tar(
         format: context.format,
         reason: format!("no entry is named '{name}'"),
     })
+}
+
+/// The entry names a zip declares more than once, and nothing else.
+///
+/// [`SafeArchive::open`] refuses such an archive, so a caller that reads its own listing does not
+/// need this: it exists for one that streams a jar itself and must still answer "is any entry hiding
+/// behind another name" with the reader's rule rather than its own copy. Empty for a zip whose names
+/// are all distinct; a file that is not a zip is [`ArchiveError::UnknownFormat`].
+pub fn duplicate_zip_entry_names(path: &Path) -> Result<Vec<String>, ArchiveError> {
+    let source = Source::from_path(path)?;
+    if detect_format(&source)? != ArchiveFormat::Zip {
+        return Err(ArchiveError::UnknownFormat {
+            path: source.label(),
+        });
+    }
+    let mut reader = match &source {
+        Source::Path(path) => {
+            let file = std::fs::File::open(path).map_err(|error| ArchiveError::Unreadable {
+                path: path.display().to_string(),
+                error: error.to_string(),
+            })?;
+            Box::new(file) as Box<dyn ReadSeek>
+        }
+        Source::Bytes(bytes) => Box::new(std::io::Cursor::new(Arc::clone(bytes))),
+    };
+    let label = source.label();
+    let start = {
+        let archive =
+            zip::ZipArchive::new(reader.as_mut()).map_err(|error| ArchiveError::Corrupt {
+                path: label.clone(),
+                format: ArchiveFormat::Zip,
+                reason: format!("{error}"),
+            })?;
+        archive.central_directory_start()
+    };
+    let declared = zip_declared_entry_names(reader.as_mut(), start).map_err(|error| {
+        ArchiveError::Corrupt {
+            path: label,
+            format: ArchiveFormat::Zip,
+            reason: format!("its central directory could not be read: {error}"),
+        }
+    })?;
+    Ok(names_declared_more_than_once(&declared))
+}
+
+/// The file names a zip's own central directory declares, in the order it declares them.
+///
+/// `zip::ZipArchive` presents one entry per *name*, so it cannot answer "does this archive hold two
+/// records with the same name". Reading the directory's fixed headers can: the name length is at
+/// offset 28, the extra and comment lengths at 30 and 32, and a name needs no zip64 field to be read.
+/// A directory record (a name ending in `/`) is left out: one folder recorded twice is the same
+/// folder, not two different contents under one name.
+fn zip_declared_entry_names(reader: &mut dyn ReadSeek, start: u64) -> std::io::Result<Vec<String>> {
+    use std::io::SeekFrom;
+    const SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+    reader.seek(SeekFrom::Start(start))?;
+    let mut header = [0u8; 46];
+    let mut names = Vec::new();
+    loop {
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        }
+        if header[..4] != SIGNATURE {
+            break;
+        }
+        let field = |at: usize| usize::from(u16::from_le_bytes([header[at], header[at + 1]]));
+        let (name_length, extra_length, comment_length) = (field(28), field(30), field(32));
+        let mut name = vec![0u8; name_length];
+        reader.read_exact(&mut name)?;
+        reader.seek_relative((extra_length + comment_length) as i64)?;
+        let name = String::from_utf8_lossy(&name).into_owned();
+        if !name.ends_with('/') {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+/// The names that appear more than once, each once, in the order they were first seen.
+fn names_declared_more_than_once(names: &[String]) -> Vec<String> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut duplicated: Vec<String> = Vec::new();
+    for name in names {
+        if !seen.insert(name.as_str()) && !duplicated.iter().any(|known| known == name) {
+            duplicated.push(name.clone());
+        }
+    }
+    duplicated
 }
 
 fn zip_entry_kind<R: Read + ?Sized>(entry: &zip::read::ZipFile<'_, R>, name: &str) -> EntryKind {

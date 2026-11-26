@@ -205,6 +205,96 @@ fn the_presets_carry_the_limits_the_call_sites_used() {
     assert_eq!(ArchiveLimits::RUNTIME.max_total_bytes, 2 * 1024 * MIB);
 }
 
+/// A zip with one `Stored` entry whose local header and central record both claim `extra` bytes
+/// more than the entry holds: the shape a lying size header has.
+fn zip_that_over_declares_by(extra: u32) -> Vec<u8> {
+    let mut bytes = zip_bytes(&[("mods/mod.jar", b"0123456789")]);
+    let data = b"0123456789".len() as u32;
+    let declared = data + extra;
+    // The local header, then every central-directory record, carry the sizes twice.
+    bytes[18..22].copy_from_slice(&declared.to_le_bytes());
+    bytes[22..26].copy_from_slice(&declared.to_le_bytes());
+    let mut at = 0usize;
+    while at + 46 <= bytes.len() {
+        if &bytes[at..at + 4] == b"PK\x01\x02" {
+            bytes[at + 20..at + 24].copy_from_slice(&declared.to_le_bytes());
+            bytes[at + 24..at + 28].copy_from_slice(&declared.to_le_bytes());
+            at += 46;
+        } else {
+            at += 1;
+        }
+    }
+    bytes
+}
+
+#[test]
+fn two_entries_with_one_name_refuse_the_archive() {
+    // The zip crate keeps only the last of several same-named records, so a listing that goes
+    // through it cannot see the collision: an archive whose bytes hide one entry behind another is
+    // exactly the shape a classpath check refuses. The reader counts the central directory's own
+    // records and names them.
+    let duplicate = zip_with_one_duplicated_name();
+    let error = SafeArchive::open_bytes(duplicate, ArchiveLimits::PACK)
+        .err()
+        .expect("two records, one name");
+    match error {
+        ArchiveError::DuplicateNames { names, .. } => {
+            assert_eq!(names, vec!["a.txt".to_string()]);
+        }
+        other => panic!("unexpected error {other:?}"),
+    }
+
+    // A tar stores every header, so the listing itself shows both.
+    let error = SafeArchive::open_bytes(
+        raw_tar(&[("config/a.toml", b"one"), ("config/a.toml", b"two")]),
+        ArchiveLimits::PACK,
+    )
+    .err()
+    .expect("two headers, one name");
+    assert!(
+        matches!(error, ArchiveError::DuplicateNames { .. }),
+        "{error:?}"
+    );
+}
+
+/// A zip holding two records with **one** name: `zip::ZipWriter` refuses to write that, so the
+/// second name is renamed in place afterwards. This is the shape a classpath check has to catch,
+/// because the zip crate keeps only the last of the two.
+fn zip_with_one_duplicated_name() -> Vec<u8> {
+    let mut bytes = zip_bytes(&[("a.txt", b"first"), ("b.txt", b"second")]);
+    let mut at = 0usize;
+    while at + 5 <= bytes.len() {
+        if &bytes[at..at + 5] == b"b.txt" {
+            bytes[at..at + 5].copy_from_slice(b"a.txt");
+            at += 5;
+        } else {
+            at += 1;
+        }
+    }
+    bytes
+}
+
+#[test]
+fn a_stored_entry_that_over_declares_its_size_is_refused() {
+    // A `Stored` entry has no stream to stop at, so the only thing that can catch a header claiming
+    // more bytes than the entry holds is reading to the end and checking the CRC over what arrived.
+    // The extra bytes here are the central directory that follows, which a trusting reader would
+    // hand over as if they were the entry's own (MASTER_SPEC §32.13).
+    let bytes = zip_that_over_declares_by(8);
+    let mut archive = SafeArchive::open_bytes(bytes, ArchiveLimits::PACK)
+        .expect("the listing is well formed: only the entry lies");
+    let error = archive
+        .read("mods/mod.jar")
+        .expect_err("the CRC is over the bytes the entry really holds");
+    assert!(
+        matches!(
+            error,
+            ArchiveError::Corrupt { .. } | ArchiveError::EntrySizeLies { .. }
+        ),
+        "{error:?}"
+    );
+}
+
 #[test]
 fn more_entries_than_the_preset_allows_is_refused() {
     let names: Vec<String> = (0..5).map(|i| format!("file{i}.txt")).collect();
