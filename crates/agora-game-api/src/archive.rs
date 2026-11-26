@@ -1137,13 +1137,16 @@ impl SafeArchive {
         let mut files = 0usize;
         let mut total = 0u64;
         // A tar, a 7z and a RAR list every record they hold, so two entries with one name show up
-        // here; a zip hides the second behind the first, so `list_zip` counts that one itself.
-        let file_names: Vec<String> = entries
+        // here — a name that is a file once and a folder once included; a zip hides the second
+        // behind the first, so `list_zip` counts that one itself.
+        let declared: Vec<DeclaredName> = entries
             .iter()
-            .filter(|entry| entry.kind == EntryKind::File)
-            .map(|entry| entry.name.clone())
+            .map(|entry| DeclaredName {
+                name: entry.name.trim_end_matches('/').to_string(),
+                is_directory: entry.kind == EntryKind::Directory,
+            })
             .collect();
-        let duplicated = names_declared_more_than_once(&file_names);
+        let duplicated = names_declared_more_than_once(&declared);
         if !duplicated.is_empty() {
             return Err(ArchiveError::DuplicateNames {
                 path,
@@ -1260,7 +1263,19 @@ impl SafeArchive {
         let mut unwritable: Vec<SkippedEntry> = Vec::new();
         for entry in &self.entries {
             match entry.kind {
-                EntryKind::Directory => continue,
+                // A folder record names a folder, so nothing is written for it — but its name is
+                // read like any other: `../outside/` is a way out of the destination whichever
+                // record it is written as, and it is refused rather than stepped over (§32.3).
+                EntryKind::Directory => {
+                    if let EntryName::Escapes { reason } = classify_entry_name(&entry.name) {
+                        return Err(ArchiveError::Escapes {
+                            path: path.clone(),
+                            entry: entry.name.clone(),
+                            reason,
+                        });
+                    }
+                    continue;
+                }
                 EntryKind::Link => {
                     return Err(ArchiveError::LinkEntry {
                         path: path.clone(),
@@ -2013,7 +2028,16 @@ pub fn duplicate_zip_entry_names(path: &Path) -> Result<Vec<String>, ArchiveErro
 /// offset 28, the extra and comment lengths at 30 and 32, and a name needs no zip64 field to be read.
 /// A directory record (a name ending in `/`) is left out: one folder recorded twice is the same
 /// folder, not two different contents under one name.
-fn zip_declared_entry_names(reader: &mut dyn ReadSeek, start: u64) -> std::io::Result<Vec<String>> {
+/// One name a zip's central directory declares, and whether that record is a folder.
+struct DeclaredName {
+    name: String,
+    is_directory: bool,
+}
+
+fn zip_declared_entry_names(
+    reader: &mut dyn ReadSeek,
+    start: u64,
+) -> std::io::Result<Vec<DeclaredName>> {
     use std::io::SeekFrom;
     const SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
     reader.seek(SeekFrom::Start(start))?;
@@ -2030,37 +2054,137 @@ fn zip_declared_entry_names(reader: &mut dyn ReadSeek, start: u64) -> std::io::R
         }
         let field = |at: usize| usize::from(u16::from_le_bytes([header[at], header[at + 1]]));
         let (name_length, extra_length, comment_length) = (field(28), field(30), field(32));
-        let mut name = vec![0u8; name_length];
-        reader.read_exact(&mut name)?;
-        reader.seek_relative((extra_length + comment_length) as i64)?;
-        let name = String::from_utf8_lossy(&name).into_owned();
-        if !name.ends_with('/') {
-            names.push(name);
-        }
+        let general_purpose = u16::from_le_bytes([header[8], header[9]]);
+        let mut raw_name = vec![0u8; name_length];
+        reader.read_exact(&mut raw_name)?;
+        let mut extra = vec![0u8; extra_length];
+        reader.read_exact(&mut extra)?;
+        reader.seek_relative(comment_length as i64)?;
+        // Decoded the way the zip crate decodes it, so two records it reads as one name are seen
+        // as one name here too, and two it reads as different names are not collapsed into one by a
+        // lossy conversion (MASTER_SPEC §32.3).
+        let name = decode_zip_name(&raw_name, general_purpose, &extra).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "an entry's name cannot be decoded, so it cannot be checked",
+            )
+        })?;
+        let is_directory = name.ends_with('/');
+        let name = name.trim_end_matches('/').to_string();
+        names.push(DeclaredName { name, is_directory });
     }
     Ok(names)
 }
 
+/// The name a zip record declares, decoded the way the zip crate decodes it.
+///
+/// UTF-8 when the record's general-purpose flag says so; otherwise CP437, which is what a zip
+/// written before UTF-8 was allowed means by those bytes; and the Info-ZIP Unicode Path extra field
+/// when it is there and its own check value matches the raw name. A byte sequence that is neither
+/// (`None`) is a name nothing can compare, so the caller refuses rather than guesses.
+fn decode_zip_name(raw: &[u8], general_purpose: u16, extra: &[u8]) -> Option<String> {
+    const UTF8_FLAG: u16 = 0x0800;
+    if general_purpose & UTF8_FLAG != 0 {
+        return String::from_utf8(raw.to_vec()).ok();
+    }
+    if let Some(unicode) = unicode_path_name(raw, extra) {
+        return Some(unicode);
+    }
+    Some(cp437(raw))
+}
+
+/// The 0x7075 field: a UTF-8 spelling of the name, valid only when its CRC is the raw name's.
+fn unicode_path_name(raw: &[u8], extra: &[u8]) -> Option<String> {
+    const UNICODE_PATH: u16 = 0x7075;
+    let mut rest = extra;
+    while rest.len() >= 4 {
+        let id = u16::from_le_bytes([rest[0], rest[1]]);
+        let size = usize::from(u16::from_le_bytes([rest[2], rest[3]]));
+        let data = rest.get(4..4 + size)?;
+        rest = rest.get(4 + size..).unwrap_or_default();
+        if id != UNICODE_PATH || size < 5 || data[0] != 1 {
+            continue;
+        }
+        let expected = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+        let mut crc = flate2::Crc::new();
+        crc.update(raw);
+        if crc.sum() != expected {
+            continue;
+        }
+        return String::from_utf8(data[5..].to_vec()).ok();
+    }
+    None
+}
+
+/// CP437's upper half, which is what those bytes mean in a zip that predates UTF-8 names.
+const CP437_HIGH: [char; 128] = [
+    '\u{00C7}', '\u{00FC}', '\u{00E9}', '\u{00E2}', '\u{00E4}', '\u{00E0}', '\u{00E5}', '\u{00E7}',
+    '\u{00EA}', '\u{00EB}', '\u{00E8}', '\u{00EF}', '\u{00EE}', '\u{00EC}', '\u{00C4}', '\u{00C5}',
+    '\u{00C9}', '\u{00E6}', '\u{00C6}', '\u{00F4}', '\u{00F6}', '\u{00F2}', '\u{00FB}', '\u{00F9}',
+    '\u{00FF}', '\u{00D6}', '\u{00DC}', '\u{00A2}', '\u{00A3}', '\u{00A5}', '\u{20A7}', '\u{0192}',
+    '\u{00E1}', '\u{00ED}', '\u{00F3}', '\u{00FA}', '\u{00F1}', '\u{00D1}', '\u{00AA}', '\u{00BA}',
+    '\u{00BF}', '\u{2310}', '\u{00AC}', '\u{00BD}', '\u{00BC}', '\u{00A1}', '\u{00AB}', '\u{00BB}',
+    '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{2561}', '\u{2562}', '\u{2556}',
+    '\u{2555}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255D}', '\u{255C}', '\u{255B}', '\u{2510}',
+    '\u{2514}', '\u{2534}', '\u{252C}', '\u{251C}', '\u{2500}', '\u{253C}', '\u{255E}', '\u{255F}',
+    '\u{255A}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256C}', '\u{2567}',
+    '\u{2568}', '\u{2564}', '\u{2565}', '\u{2559}', '\u{2558}', '\u{2552}', '\u{2553}', '\u{256B}',
+    '\u{256A}', '\u{2518}', '\u{250C}', '\u{2588}', '\u{2584}', '\u{258C}', '\u{2590}', '\u{2580}',
+    '\u{03B1}', '\u{00DF}', '\u{0393}', '\u{03C0}', '\u{03A3}', '\u{03C3}', '\u{00B5}', '\u{03C4}',
+    '\u{03A6}', '\u{0398}', '\u{03A9}', '\u{03B4}', '\u{221E}', '\u{03C6}', '\u{03B5}', '\u{2229}',
+    '\u{2261}', '\u{00B1}', '\u{2265}', '\u{2264}', '\u{2320}', '\u{2321}', '\u{00F7}', '\u{2248}',
+    '\u{00B0}', '\u{2219}', '\u{00B7}', '\u{221A}', '\u{207F}', '\u{00B2}', '\u{25A0}', '\u{00A0}',
+];
+
+fn cp437(raw: &[u8]) -> String {
+    raw.iter()
+        .map(|byte| {
+            if *byte < 0x80 {
+                char::from(*byte)
+            } else {
+                CP437_HIGH[usize::from(*byte) - 0x80]
+            }
+        })
+        .collect()
+}
+
 /// The names that appear more than once, each once, in the order they were first seen.
-fn names_declared_more_than_once(names: &[String]) -> Vec<String> {
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+///
+/// A folder recorded twice is one folder and is left alone. A name that is a file once and a folder
+/// once is not: no disk holds both, and whichever the reader picked would be the other one silently
+/// lost.
+fn names_declared_more_than_once(names: &[DeclaredName]) -> Vec<String> {
+    let mut files: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut folders: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut duplicated: Vec<String> = Vec::new();
-    for name in names {
-        if !seen.insert(name.as_str()) && !duplicated.iter().any(|known| known == name) {
-            duplicated.push(name.clone());
+    for declared in names {
+        let name = declared.name.as_str();
+        let seen_twice = if declared.is_directory {
+            // A folder recorded twice is one folder: archive tools write the parent before every
+            // child, and refusing that would refuse ordinary archives.
+            folders.insert(name);
+            false
+        } else {
+            !files.insert(name)
+        };
+        let clash = files.contains(name) && folders.contains(name);
+        if (seen_twice || clash) && !duplicated.iter().any(|known| known == name) {
+            duplicated.push(declared.name.clone());
         }
     }
     duplicated
 }
 
 fn zip_entry_kind<R: Read + ?Sized>(entry: &zip::read::ZipFile<'_, R>, name: &str) -> EntryKind {
-    if entry.is_dir() || name.ends_with('/') {
-        return EntryKind::Directory;
-    }
+    // A record that claims a symlink's mode is a link however it is spelled, and that is asked
+    // first: a link written as `textures/` rather than `textures` must not pass as a folder.
     if let Some(mode) = entry.unix_mode() {
         if (mode & 0o170000) == 0o120000 {
             return EntryKind::Link;
         }
+    }
+    if entry.is_dir() || name.ends_with('/') {
+        return EntryKind::Directory;
     }
     EntryKind::File
 }

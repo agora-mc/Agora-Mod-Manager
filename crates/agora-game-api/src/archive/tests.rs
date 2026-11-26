@@ -1177,3 +1177,122 @@ fn a_tar_gz_is_refused_as_it_streams_not_after_it_has_been_read() {
         "the size is what refuses it: {error:?}"
     );
 }
+
+#[test]
+fn cp437_names_are_decoded_not_flattened() {
+    // A zip written before UTF-8 names means CP437 by those bytes. Decoded lossily, `üü` and `ÇÇ`
+    // are both two replacement characters, so two distinct entries looked like one archive hiding
+    // an entry behind another.
+    let bytes = zip_with_raw_names([[0x81, 0x81], [0x80, 0x80]]);
+    let archive =
+        SafeArchive::open_bytes(bytes, ArchiveLimits::PACK).expect("two distinct names, not one");
+    let names: Vec<&str> = archive.file_entries().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["\u{00FC}\u{00FC}", "\u{00C7}\u{00C7}"]);
+
+    // And two records the decoder reads as one name are still refused.
+    let bytes = zip_with_raw_names([[0x81, 0x81], [0x81, 0x81]]);
+    let error = SafeArchive::open_bytes(bytes, ArchiveLimits::PACK)
+        .err()
+        .expect("one name declared twice");
+    match error {
+        ArchiveError::DuplicateNames { names, .. } => {
+            assert_eq!(names, vec!["\u{00FC}\u{00FC}".to_string()]);
+        }
+        other => panic!("unexpected error {other:?}"),
+    }
+}
+
+/// A zip whose two entries' names are these raw bytes, two bytes each: the writer only takes `str`,
+/// so an ASCII name is written and the same number of bytes is patched in its place.
+fn zip_with_raw_names(names: [[u8; 2]; 2]) -> Vec<u8> {
+    let mut bytes = zip_bytes(&[("aa", b"one"), ("bb", b"two")]);
+    for (placeholder, raw) in [b"aa".as_slice(), b"bb".as_slice()].into_iter().zip(names) {
+        // Every occurrence: the local header and the central record both carry the name.
+        let mut at = 0;
+        while at + placeholder.len() <= bytes.len() {
+            if &bytes[at..at + placeholder.len()] == placeholder {
+                bytes[at..at + raw.len()].copy_from_slice(&raw);
+                at += raw.len();
+            } else {
+                at += 1;
+            }
+        }
+    }
+    bytes
+}
+
+#[test]
+fn a_name_that_is_a_file_once_and_a_folder_once_is_refused() {
+    // No disk holds both, and the listing would pick one while the other vanished without a word.
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options: zip::write::SimpleFileOptions = Default::default();
+    zip.add_directory("a/", options).unwrap();
+    zip.start_file("a", options).unwrap();
+    zip.write_all(b"here and there").unwrap();
+    let bytes = zip.finish().unwrap().into_inner();
+    let error = SafeArchive::open_bytes(bytes, ArchiveLimits::PACK)
+        .err()
+        .expect("one name, two records");
+    match error {
+        ArchiveError::DuplicateNames { names, .. } => assert_eq!(names, vec!["a".to_string()]),
+        other => panic!("unexpected error {other:?}"),
+    }
+}
+
+#[test]
+fn a_folder_record_that_leaves_the_destination_is_refused() {
+    // A folder record writes nothing itself, but it names a place: `../outside/` is a way out of
+    // the destination whichever kind of record it is spelled as.
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zip.add_directory("../outside/", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    let bytes = zip.finish().unwrap().into_inner();
+    let mut archive = SafeArchive::open_bytes(bytes, ArchiveLimits::PACK).unwrap();
+    let (dir, dest) = extract_dir();
+    let error = archive
+        .extract(&dest, NamePolicy::Refuse)
+        .expect_err("a folder outside the root");
+    assert!(matches!(error, ArchiveError::Escapes { .. }), "{error:?}");
+    drop(dir);
+}
+
+#[test]
+fn a_zip_folder_that_claims_a_symlinks_mode_is_refused() {
+    // Read as a folder it writes nothing; read as a link it is a way out. The mode decides.
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zip.add_symlink(
+        "textures/",
+        "..",
+        zip::write::SimpleFileOptions::default().unix_permissions(0o120777),
+    )
+    .unwrap();
+    let bytes = zip.finish().unwrap().into_inner();
+    let mut archive = SafeArchive::open_bytes(bytes, ArchiveLimits::PACK).unwrap();
+    let (dir, dest) = extract_dir();
+    let error = archive
+        .extract(&dest, NamePolicy::Refuse)
+        .expect_err("a record that claims a symlink's mode");
+    assert!(matches!(error, ArchiveError::LinkEntry { .. }), "{error:?}");
+    drop(dir);
+}
+
+#[test]
+fn a_folder_recorded_twice_is_one_folder() {
+    // Archive tools write a parent folder more than once and mean one folder; refusing that would
+    // refuse ordinary archives, so only a *file* declared twice is a duplicate.
+    let mut builder = tar::Builder::new(Vec::new());
+    for _ in 0..2 {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "config/", &[][..])
+            .unwrap();
+    }
+    let bytes = builder.into_inner().unwrap();
+    let archive =
+        SafeArchive::open_bytes(bytes, ArchiveLimits::PACK).expect("one folder, written twice");
+    assert_eq!(archive.file_entries().count(), 0);
+}
