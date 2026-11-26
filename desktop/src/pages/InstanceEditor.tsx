@@ -88,6 +88,7 @@ import {
   createSnapshot,
   restoreSnapshot,
   deleteSnapshot,
+  describeRestoreCoverage,
   detectDrift,
   checkInstanceHealth,
   openInstanceFolder,
@@ -2734,12 +2735,19 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                         setSnapshotBusy(snap.id);
                         setError(null);
                         const run = async (force: boolean) => {
-                          await restoreSnapshot(instanceId, snap.id, force);
+                          const outcome = await restoreSnapshot(instanceId, snap.id, force);
                           // An expanded diff compared the pre-restore files;
                           // it would keep showing changes the restore undid.
                           setSnapshotDiff(null);
                           await reloadInstance();
-                          setStatus('Snapshot restored.');
+                          // What the restore covered, in words: a folder the snapshot captured but
+                          // the game no longer declares is restored anyway and named there, so it
+                          // is never restored quietly (MASTER_SPEC §32.7).
+                          setStatus(
+                            ['Snapshot restored.', describeRestoreCoverage(outcome)]
+                              .filter(Boolean)
+                              .join(' '),
+                          );
                         };
                         try {
                           await run(false);
