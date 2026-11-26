@@ -182,7 +182,13 @@ test('an empty library says what to do, and adding an archive confirms it', asyn
   await boot(page, {
     ...library([]),
     pick_open_file: '/mods/Odin Patch.zip',
-    games_content_add: { status: 'added', item: odinHere, objectsNew: 1, objectsRestored: 0 },
+    games_content_add: {
+      status: 'added',
+      item: odinHere,
+      objectsNew: 1,
+      objectsRestored: 0,
+      skipped: [],
+    },
   });
   await openLibrary(page);
 
@@ -190,6 +196,35 @@ test('an empty library says what to do, and adding an archive confirms it', asyn
   await expect(empty).toContainText('Nothing in your Skyrim SE library yet');
   await empty.getByRole('button', { name: 'Add an archive…' }).click();
   await expect(page.getByText('Added Odin Patch (1 file).', { exact: true })).toBeVisible();
+});
+
+test('an archive with a file Windows cannot name says so, and offers to add the rest', async ({
+  page,
+}) => {
+  await boot(
+    page,
+    {
+      ...library([]),
+      pick_open_file: '/mods/Odin Patch.zip',
+    },
+    {
+      failures: {
+        games_content_add: {
+          code: 'UNWRITABLE_NAMES',
+          message:
+            "'odin.zip' has 1 entry a disk cannot hold, so nothing was imported:\n  'Data/con.txt' component 'con.txt' uses Windows device name 'con'",
+        },
+      },
+    },
+  );
+  await openLibrary(page);
+
+  await page.getByTestId('library-empty').getByRole('button', { name: 'Add an archive…' }).click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toContainText('Data/con.txt');
+  await expect(dialog.getByRole('button', { name: 'Add without them' })).toBeVisible();
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+  await expect(page.getByRole('alert')).toContainText('Data/con.txt');
 });
 
 test('a stored item can be checked, and the check says what is wrong with it', async ({ page }) => {

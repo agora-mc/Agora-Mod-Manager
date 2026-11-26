@@ -22,11 +22,20 @@ export interface StoreItem {
   gameIds: string[];
 }
 
+export interface StoreSkippedEntry {
+  /** The entry name exactly as the archive stores it. */
+  name: string;
+  /** Why it was not stored, in words that name the problem. */
+  reason: string;
+}
+
 export interface StoreAdded {
   status: 'added' | 'existing';
   item: StoreItem;
   objectsNew: number;
   objectsRestored: number;
+  /** Entries left out because a disk cannot hold their names. Empty unless the caller opted in. */
+  skipped: StoreSkippedEntry[];
 }
 
 export type VerifyProblemKind = 'missing' | 'size_mismatch' | 'hash_mismatch' | 'unprotected' | 'corrupt_manifest';
@@ -97,9 +106,23 @@ function hasItemList(value: unknown): value is { items: unknown[] } {
 /**
  * Add an archive or a folder to the store. A blank name keeps the item's own. `gameId` records the
  * game whose Library added it, unless the item already names one.
+ *
+ * An archive entry whose name a disk cannot hold refuses the whole import with the code
+ * `UNWRITABLE_NAMES` and the entries in `details.entries`. `withoutUnwritableNames` is the answer to
+ * that refusal: the files that can be written are stored and the rest come back in `skipped`.
  */
-export const addToStore = (sourcePath: string, name: string | null, gameId: string | null = null) =>
-  invoke<StoreAdded>('games_content_add', { sourcePath, name, gameId });
+export const addToStore = (
+  sourcePath: string,
+  name: string | null,
+  gameId: string | null = null,
+  withoutUnwritableNames = false,
+) =>
+  invoke<StoreAdded>('games_content_add', {
+    sourcePath,
+    name,
+    gameId,
+    withoutUnwritableNames,
+  });
 
 /** Check a stored item. `full` hashes every file. */
 export const verifyStored = (itemId: string, full: boolean) =>
