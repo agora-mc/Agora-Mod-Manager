@@ -204,6 +204,35 @@ fn the_presets_carry_the_limits_the_call_sites_used() {
     assert_eq!(ArchiveLimits::RUNTIME.max_entries, 10_000);
     assert_eq!(ArchiveLimits::RUNTIME.max_entry_bytes, 500 * MIB);
     assert_eq!(ArchiveLimits::RUNTIME.max_total_bytes, 2 * 1024 * MIB);
+
+    assert_eq!(ArchiveLimits::WORLD_ARCHIVE.max_entries, 200_000);
+    assert_eq!(
+        ArchiveLimits::WORLD_ARCHIVE.max_total_bytes,
+        16 * 1024 * MIB
+    );
+    assert_eq!(
+        ArchiveLimits::WORLD_ARCHIVE.max_entry_bytes,
+        ArchiveLimits::WORLD_ARCHIVE.max_total_bytes,
+        "a world archive had no per-entry limit of its own"
+    );
+
+    let listing_checks: Vec<bool> = [
+        ArchiveLimits::PACK,
+        ArchiveLimits::MOD_ARCHIVE,
+        ArchiveLimits::BACKUP,
+        ArchiveLimits::PLUGIN_PACKAGE,
+        ArchiveLimits::RUNTIME,
+        ArchiveLimits::WORLD_ARCHIVE,
+        ArchiveLimits::JAR_METADATA,
+    ]
+    .into_iter()
+    .map(|limits| limits.per_entry_at_listing)
+    .collect();
+    assert_eq!(
+        listing_checks,
+        vec![true, true, true, true, true, true, false],
+        "only the metadata reader bounds the entries it reads instead of the listing"
+    );
 }
 
 /// A zip with one `Stored` entry whose local header and central record both claim `extra` bytes
