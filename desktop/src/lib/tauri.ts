@@ -779,7 +779,9 @@ export interface RecentlyDeletedEntry {
   expires_at: string;
   size_bytes: number;
 }
-export interface RestoreOutcome {
+/** What restoring an instance from Recently deleted did: its row, and whether the name had to
+ *  change to avoid colliding with a live instance. */
+export interface RestoreDeletedInstanceOutcome {
   instance_id: string;
   original_instance_id: string;
   renamed: boolean;
@@ -787,7 +789,7 @@ export interface RestoreOutcome {
 export const listRecentlyDeleted = () =>
   invoke<RecentlyDeletedEntry[]>('list_recently_deleted');
 export const restoreDeletedInstance = (entryId: string) =>
-  invoke<RestoreOutcome>('restore_deleted_instance', { entryId });
+  invoke<RestoreDeletedInstanceOutcome>('restore_deleted_instance', { entryId });
 export const purgeDeletedInstance = (entryId: string) =>
   invoke<void>('purge_deleted_instance', { entryId });
 export const unlockInstance = (instanceId: string) =>

@@ -87,8 +87,6 @@ describe('InstanceRecoveryTab', () => {
   });
 
   it('repeats what the restore reported about a folder the game no longer tracks', async () => {
-    // `RestoreOutcome` is declared twice in lib/tauri (deleted-instance restore and snapshot
-    // restore), so the merged type wants fields a snapshot restore does not return.
     vi.mocked(restoreSnapshot).mockResolvedValueOnce({
       snapshotId: 'snap-good',
       coverage: 'exact',
@@ -97,7 +95,7 @@ describe('InstanceRecoveryTab', () => {
       notices: [
         "folder 'state/characters' is no longer tracked by none; restored from the snapshot anyway",
       ],
-    } as never);
+    });
     render(<InstanceRecoveryTab instanceId="inst" />);
     fireEvent.click(await screen.findByRole('button', { name: 'Restore to it' }));
 
