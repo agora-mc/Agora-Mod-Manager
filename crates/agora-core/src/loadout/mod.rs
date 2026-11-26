@@ -71,9 +71,12 @@ pub struct LoadoutProfile {
 }
 
 /// One game's contribution to a stored loadout record, as it appears under `sections`.
+///
+/// `enabled_mods` is required: every writer of this version fills it in, so a section without it is
+/// a record that lost its state. Reading that as an empty list would apply as "turn everything
+/// off", which is the one thing a damaged record must never do.
 #[derive(Serialize, Deserialize)]
 struct StoredSection {
-    #[serde(default)]
     enabled_mods: Vec<String>,
     #[serde(default)]
     covers: Option<LoadoutCoverage>,
@@ -93,10 +96,13 @@ struct StoredProfile {
 }
 
 /// The record a version before schema 32 wrote: one game's state in flat fields.
+///
+/// `enabled_mods` is required here for the same reason it is required in a section: it is the one
+/// field every writer of the flat format wrote, so a flat-shaped record without it is damaged rather
+/// than empty. (`covers`, `items` and `game` were added later, so they stay optional.)
 #[derive(Serialize, Deserialize)]
 struct LegacyProfile {
     name: String,
-    #[serde(default)]
     enabled_mods: Vec<String>,
     created_at: String,
     #[serde(default)]
@@ -2047,6 +2053,74 @@ mod tests {
         create_profile(&dir, "versioned").unwrap();
         let listing = list_profiles(&dir).unwrap();
         assert_eq!(listing.profiles.len(), 1, "{:?}", listing.damaged);
+    }
+
+    /// A record whose `schema_version` was lost is not read as the flat format: the flat format's
+    /// required field is not where a versioned record keeps its state, so reading it as one would
+    /// produce an empty profile, which applies as "turn everything off".
+    #[test]
+    fn a_record_whose_version_was_stripped_is_damaged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = setup_instance(&tmp, &["sodium.jar"]);
+        create_profile(&dir, "stripped").unwrap();
+        let path = loadouts_dir(&dir).join("stripped.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record
+            .as_object_mut()
+            .expect("an object")
+            .remove("schema_version");
+        fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let listing = list_profiles(&dir).unwrap();
+
+        assert!(listing.profiles.is_empty(), "nothing is read from it");
+        assert!(
+            listing
+                .damaged
+                .iter()
+                .any(|line| line.contains("stripped.json")),
+            "the damaged record is named: {:?}",
+            listing.damaged
+        );
+        assert!(
+            read_profile(&dir, "stripped").is_err(),
+            "and it is refused for apply"
+        );
+    }
+
+    /// A section with no state in it is damaged too: a version this code writes always fills the
+    /// section in, so an empty one is a record that lost its state, not one that records nothing.
+    #[test]
+    fn a_section_without_its_required_fields_is_damaged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = setup_instance(&tmp, &["sodium.jar"]);
+        let profiles_dir = loadouts_dir(&dir);
+        fs::create_dir_all(&profiles_dir).unwrap();
+        let record = serde_json::json!({
+            "schema_version": LOADOUT_SCHEMA_VERSION,
+            "name": "empty",
+            "created_at": "2026-01-01T00:00:00Z",
+            "sections": {"minecraft": {}},
+        });
+        fs::write(
+            profiles_dir.join("empty.json"),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+
+        let listing = list_profiles(&dir).unwrap();
+
+        assert!(listing.profiles.is_empty(), "nothing is read from it");
+        assert!(
+            listing
+                .damaged
+                .iter()
+                .any(|line| line.contains("empty.json")),
+            "the damaged record is named: {:?}",
+            listing.damaged
+        );
+        assert!(read_profile(&dir, "empty").is_err());
     }
 
     #[test]
