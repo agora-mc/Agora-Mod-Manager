@@ -19,7 +19,7 @@
     "crates/agora-core/src/registry_bundle.rs": 7,
     "crates/agora-core/src/registry_sync.rs": 43,
     "crates/agora-core/src/session_ledger.rs": 25,
-    "crates/agora-core/src/snapshot.rs": 43,
+    "crates/agora-core/src/snapshot.rs": 42,
     "crates/agora-core/src/startup_recovery.rs": 0,
     "crates/agora-game-minecraft/src/launcher_import_service.rs": 49,
     "crates/agora-game-minecraft/src/recently_deleted.rs": 7
@@ -27,7 +27,7 @@
   "directories": {
     "crates/agora-core/src/content_store": {
       "convert.rs": 1,
-      "mod.rs": 17,
+      "mod.rs": 15,
       "place.rs": 4,
       "protect.rs": 0,
       "rar.rs": 7,

@@ -2922,7 +2922,9 @@ mod tests {
 
     use super::*;
     use crate::launcher_import::{ContentInventory, LaunchStrategy};
-    use agora_core::{instance_runtime, lock_manager::LockManager, process_identity};
+    use agora_core::{
+        content_store, instance_runtime, lock_manager::LockManager, process_identity, snapshot,
+    };
 
     /// A fresh temp directory for one test. The random component matters:
     /// `%TEMP%` is shared, and a name built from the process id and a
@@ -3702,7 +3704,7 @@ name=Dup Instance
         assert!(instance_dir.join("mods").join("sodium.jar").exists());
 
         // Verify DB registration.
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let row = agora_core::db::get_instance(&conn, "test-import").unwrap();
         assert!(row.is_some());
         assert_eq!(row.unwrap().name, "Test Import");
@@ -3834,7 +3836,7 @@ name=Dup Instance
             serde_json::json!("prism")
         );
 
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let row = agora_core::db::get_instance(&conn, "memory-copied")
             .unwrap()
             .unwrap();
@@ -3942,7 +3944,7 @@ name=Dup Instance
             };
 
         svc.execute(plan(ItemAction::New, None)).await.unwrap();
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let existing = find_instance_import_by_source(&conn, "prism", "prism:loc", "loc-key")
             .unwrap()
             .unwrap();
@@ -3952,10 +3954,7 @@ name=Dup Instance
         // Another move holds the owner locations for this instance.
         let _held = ctx
             .lock_manager
-            .acquire(
-                agora_core::lock_manager::LockResource::InstanceLocations,
-                "test-holds-locations",
-            )
+            .acquire(LockResource::InstanceLocations, "test-holds-locations")
             .unwrap();
 
         let result = svc
@@ -4043,7 +4042,7 @@ name=Dup Instance
         svc.execute(plan_new).await.unwrap();
 
         // Now create update plan.
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let existing = find_instance_import_by_source(&conn, "prism", "prism:upd", "upd-key")
             .unwrap()
             .unwrap();
@@ -4106,8 +4105,7 @@ name=Dup Instance
         std::fs::create_dir_all(&final_dir).unwrap();
         mark_owner(&staging, "recover-new-job");
         mark_owner(&final_dir, "recover-new-job");
-        let connection =
-            agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let connection = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         agora_core::db::upsert_instance_import_job(
             &connection,
@@ -4133,8 +4131,7 @@ name=Dup Instance
         assert!(!warnings.is_empty());
         assert!(!staging.exists());
         assert!(!final_dir.exists());
-        let connection =
-            agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let connection = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         assert!(agora_core::db::list_instance_import_jobs(&connection)
             .unwrap()
             .is_empty());
@@ -4157,8 +4154,7 @@ name=Dup Instance
         mark_owner(&staging, "recover-update-job");
         mark_owner(&final_dir, "recover-update-job");
         mark_owner(&quarantine, "recover-update-job");
-        let connection =
-            agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let connection = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         agora_core::db::upsert_instance_import_job(
             &connection,
@@ -4195,8 +4191,6 @@ name=Dup Instance
 
     #[test]
     fn recovery_cannot_move_quarantine_between_collection_listings() {
-        use agora_core::{content_store, snapshot};
-
         let ctx = test_ctx();
         let final_dir = ctx.paths.instance_dir("recover-during-collect").unwrap();
         let quarantine = ctx
