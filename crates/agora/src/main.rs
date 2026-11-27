@@ -15144,8 +15144,8 @@ fn run_content_migrate(
                 println!("The snapshot object migration needs a hand: {reason}");
                 println!(
                     "`{command}` sets that journal aside and walks the old store again. It deletes \
-                     nothing that is not already in the content store; a file whose bytes match no \
-                     name of its own is kept and named."
+                     nothing that is not already in the content store; a legacy file whose SHA-256 \
+                     differs from its name is kept and named, never deleted."
                 );
             }
             std::process::exit(needs_a_hand_code())
