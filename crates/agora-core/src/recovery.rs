@@ -224,12 +224,14 @@ pub fn write<T: Serialize>(path: &Path, journal: &T) -> LauncherResult<()> {
     }
     let bytes = serde_json::to_vec_pretty(journal)
         .map_err(|e| journal_error(format!("could not write the journal: {e}")))?;
-    let tmp = temporary_path(path);
-    let written = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()
-    })();
+    let tmp = path.with_file_name(format!(".journal-{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|error| journal_error(format!("could not create {}: {error}", tmp.display())))?;
+    let written = file.write_all(&bytes).and_then(|()| file.sync_all());
+    drop(file);
     if let Err(error) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(journal_error(format!(
@@ -245,16 +247,6 @@ pub fn write<T: Serialize>(path: &Path, journal: &T) -> LauncherResult<()> {
         ))
     })?;
     Ok(())
-}
-
-/// The temporary file a journal is built in before it is published.
-fn temporary_path(path: &Path) -> PathBuf {
-    let mut name = match path.file_name() {
-        Some(name) => name.to_os_string(),
-        None => std::ffi::OsString::from("journal"),
-    };
-    name.push(".tmp");
-    path.with_file_name(name)
 }
 
 /// Write the marker file that proves an operation owns a path.
@@ -2215,5 +2207,18 @@ mod tests {
             payload.new_version, "2.0.0",
             "the payload was read again from a file that changed"
         );
+    }
+
+    #[test]
+    fn writing_a_journal_leaves_a_file_at_the_old_temporary_name_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("operation.json");
+        let old_temp = journal.with_extension("json.tmp");
+        std::fs::write(&old_temp, b"existing bytes").unwrap();
+
+        write(&journal, &serde_json::json!({"state": "running"})).unwrap();
+
+        assert_eq!(std::fs::read(old_temp).unwrap(), b"existing bytes");
+        assert!(journal.is_file());
     }
 }
