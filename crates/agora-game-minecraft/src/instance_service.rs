@@ -898,6 +898,7 @@ impl InstanceService {
     }
 
     pub fn rename(&self, instance_id: &str, name: &str) -> LauncherResult<()> {
+        agora_core::settings::admit_major_action(&self.ctx)?;
         let instance_id = self.validate_id(instance_id)?;
         if name.trim().is_empty() {
             return Err(LauncherError::Generic {

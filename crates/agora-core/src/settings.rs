@@ -282,6 +282,19 @@ pub fn admit_major_action(ctx: &Ctx) -> LauncherResult<()> {
     ctx.settings_cache.refresh(ctx)
 }
 
+/// Refuse a major action whose settings could not be checked, from a database path alone.
+///
+/// For the jobs that run outside a context — a scheduled catalog sync, a framework repair that
+/// only holds the app paths — there is no cache to share and nobody to share it with, so the
+/// check is one read of its own. It is still a version check against the same database the
+/// context's cache reads, which is what makes "a setting the user just changed" and "a settings
+/// store nobody can read" arrive as different answers.
+pub fn admit_action_at(db_path: &std::path::Path) -> LauncherResult<()> {
+    SettingsCache::new()
+        .load(&SettingsReads::standalone(db_path.to_path_buf()))
+        .map(drop)
+}
+
 // ---------------------------------------------------------------------------
 // SettingsService — core-owned typed service
 // ---------------------------------------------------------------------------

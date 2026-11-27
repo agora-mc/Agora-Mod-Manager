@@ -2218,6 +2218,10 @@ pub fn repair_framework(
     base_id: &str,
     framework: &FrameworkDefinition,
 ) -> Result<FrameworkRepair, BaseError> {
+    // Repairing a base copies files into it, so it is a major action (§32.9): a settings store
+    // nobody can read refuses before anything is written, and the base is left as it was.
+    crate::settings::admit_action_at(&paths.local_state_db())
+        .map_err(|error| BaseError::Other(error.to_string()))?;
     if !is_plain_base_id(base_id) {
         return Err(BaseError::NotFound(base_id.to_string()));
     }

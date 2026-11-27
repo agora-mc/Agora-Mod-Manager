@@ -156,6 +156,10 @@ impl SnapshotService {
         snapshot_id: &str,
         force_while_running: bool,
     ) -> LauncherResult<RestoreOutcome> {
+        // A restore replaces live files and takes an undo snapshot that overwrites the previous
+        // one, so it is a major action (§32.9): refuse while the settings cannot be read rather
+        // than deciding with an answer nobody verified.
+        crate::settings::admit_major_action(&self.ctx)?;
         let instance_dir = self.ctx.paths.instance_dir(instance_id)?;
         let is_game_instance = self.is_game_instance(instance_id)?;
         let _guard = if is_game_instance && force_while_running {

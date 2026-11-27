@@ -208,6 +208,10 @@ fn install_local_inner(
     lock_manager: &LockManager,
     timeout: Option<Duration>,
 ) -> LauncherResult<InstalledBundle> {
+    // A catalog import replaces what every page shows, so it is a major action (§32.9): refuse
+    // before the promotion if the settings that decide what the launcher may publish cannot be
+    // read at all.
+    crate::settings::admit_action_at(local_state_path)?;
     // The rollback comparison in `install_bundle_bytes_checked` and the commit
     // it guards must see the same catalog. Sync holds this lock across its
     // check-and-commit, so a local install must hold it too.
@@ -257,6 +261,10 @@ async fn check_and_download_update_inner(
     compiled: &RegistryTrust,
     now: i64,
 ) -> LauncherResult<RegistryStatus> {
+    // Before the transport and before anything is promoted: a catalog update is a major action,
+    // and its settings must be readable (§32.9). The network switch below says whether syncing is
+    // wanted; this says whether the answer can be trusted at all.
+    crate::settings::admit_action_at(local_state_path)?;
     let conn =
         db::local_state_connection(local_state_path).map_err(|e| LauncherError::Generic {
             code: "ERR_DB".into(),
