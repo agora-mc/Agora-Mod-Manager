@@ -31,10 +31,13 @@
 use crate::java::{self, JavaInstallation};
 use crate::launch::{self, LoaderInfo, VersionInfo};
 use crate::loader_manifests;
-use agora_core::download;
-use agora_core::error::{LauncherError, LauncherResult};
-use agora_core::network::{
-    self, check_launch_request, check_launch_request_with, NetworkCategory, NetworkPolicy,
+use agora_core::{
+    download,
+    error::{LauncherError, LauncherResult},
+    network::{
+        self, check_launch_request, check_launch_request_with, NetworkCategory, NetworkPolicy,
+    },
+    network_gate,
 };
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
@@ -112,7 +115,7 @@ impl LaunchHttpClients {
                 // A redirect is a new request, so it asks the live gate again (MASTER_SPEC §32.9);
                 // Lockdown turned on during a download stops the hop even though the first request
                 // was allowed. The refusal travels out through the request's own error.
-                if let Err(denial) = agora_core::network_gate::authorize(category.client_category()) {
+                if let Err(denial) = network_gate::authorize(category.client_category()) {
                     return attempt.error(denial);
                 }
                 if redirect_target_is_safe(attempt.url(), category) {
@@ -958,7 +961,7 @@ pub async fn resolve(request: ResolveRequest) -> LauncherResult<ResolvedLaunchPl
         &request.network_policy,
         // This path is a launch request built by an adapter and carries no context; the
         // process gate is that adapter's context gate in production, where there is one.
-        &*agora_core::network_gate::current(),
+        &*network_gate::current(),
     )
     .await?;
 
@@ -4030,7 +4033,7 @@ pub(crate) async fn load_json_cache_first<T: serde::de::DeserializeOwned>(
     cache_path: &Path,
     expected_sha1: Option<&str>,
     policy: &NetworkPolicy,
-    gate: &dyn agora_core::network_gate::NetworkGate,
+    gate: &dyn network_gate::NetworkGate,
     category: NetworkCategory,
 ) -> LauncherResult<T> {
     // Phase 1: Try to serve from cache. Hold onto a stale-but-valid parse
