@@ -2269,6 +2269,7 @@ fn read_manifest(path: &std::path::Path) -> LauncherResult<Option<InstanceManife
 mod tests {
     use super::*;
     use agora_core::operation_manager::OpStatus;
+    use agora_core::db::local_state_connection;
     use std::path::PathBuf;
 
     fn context() -> (Ctx, PathBuf) {
@@ -2287,7 +2288,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let ctx = crate::testing_context(root.path().to_owned());
         agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let manifest: InstanceManifest = serde_json::from_value(serde_json::json!({
             "instance_id": "inst", "name": "Original", "minecraft_version": "1.21",
             "loader": "fabric", "loader_version": "0.16.0", "is_locked": false,
@@ -2372,7 +2373,7 @@ mod tests {
             pack_icon_url: None,
             template_id: None,
         };
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         agora_core::db::upsert_instance(&conn, crate::GAME_ID, &prepare_row("inst", &request))
             .unwrap();
         let manifest: InstanceManifest = serde_json::from_value(serde_json::json!({
@@ -2441,7 +2442,7 @@ mod tests {
             pack_icon_url: None,
             template_id: None,
         };
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         agora_core::db::upsert_instance(&conn, crate::GAME_ID, &prepare_row("inst", &request))
             .unwrap();
         drop(conn);
@@ -2523,7 +2524,7 @@ mod tests {
             std::fs::read(dir.join("mods").join("a.jar")).unwrap(),
             b"original"
         );
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         assert!(
             !agora_core::db::get_instance(&conn, "inst")
                 .unwrap()
@@ -2645,7 +2646,7 @@ mod tests {
         };
         let row = prepare_row("test", &request);
         assert_eq!(row.jvm_memory_mode, "auto");
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         let manifest = manifest_from_request("test", &request);
         let dir = ctx.paths.instance_dir("test").unwrap();
@@ -2706,7 +2707,7 @@ mod tests {
             template_id: None,
         };
         let row = prepare_row("gc-test", &request);
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         drop(conn);
 
@@ -2730,7 +2731,7 @@ mod tests {
             service
                 .update_jvm("gc-test", 4096, input, true, "", "manual")
                 .unwrap();
-            let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+            let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
             let row = agora_core::db::get_instance(&conn, "gc-test")
                 .unwrap()
                 .expect("fixture row should exist");
@@ -2774,7 +2775,7 @@ mod tests {
             template_id: None,
         };
         let row = prepare_row("gc-invalid", &request);
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         drop(conn);
 
@@ -2782,7 +2783,7 @@ mod tests {
         service
             .update_jvm("gc-invalid", 4096, "low_latency", true, "", "manual")
             .unwrap();
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let before = agora_core::db::get_instance(&conn, "gc-invalid")
             .unwrap()
             .expect("fixture row should exist");
@@ -2795,7 +2796,7 @@ mod tests {
             assert_eq!(error.code(), "ERR_INVALID_JVM_GC");
             assert!(error.to_string().contains(invalid));
 
-            let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+            let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
             let after = agora_core::db::get_instance(&conn, "gc-invalid")
                 .unwrap()
                 .expect("fixture row should exist");
@@ -2877,7 +2878,7 @@ mod tests {
             template_id: None,
         };
         let row = prepare_row("delegated", &request);
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         let instance_dir = ctx.paths.instance_dir("delegated").unwrap();
         std::fs::create_dir_all(&instance_dir).unwrap();
@@ -2975,7 +2976,7 @@ mod tests {
             template_id: None,
         };
         let row = prepare_row("original", &request);
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         drop(conn);
         // Create source directory and manifest
@@ -3010,7 +3011,7 @@ mod tests {
         assert!(cloned_dir.join("saves").join("world.dat").exists());
 
         let cloned_conn =
-            agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+            local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let cloned_detail = agora_core::db::get_instance(&cloned_conn, "Clone").unwrap();
         assert!(cloned_detail.is_some());
         assert_eq!(cloned_detail.unwrap().name, "Clone");
@@ -3037,7 +3038,7 @@ mod tests {
             template_id: None,
         };
         let row = prepare_row("locked", &request);
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         agora_core::db::set_locked(&conn, "locked", true).unwrap();
         drop(conn);
@@ -3066,7 +3067,7 @@ mod tests {
         // source's locked flag in either the DB row or the manifest.
         assert!(!clone_row.is_locked);
         let cloned_conn =
-            agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+            local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let cloned_row = agora_core::db::get_instance(&cloned_conn, "Clone")
             .unwrap()
             .unwrap();
@@ -3103,7 +3104,7 @@ mod tests {
             template_id: None,
         };
         let row = prepare_row("doomed", &request);
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         // A survivor, so the deleted pack is not the only thing to select.
         let survivor_request = CreateInstanceRequest {
@@ -3213,7 +3214,7 @@ $#
             template_id: None,
         };
         let row = prepare_row("delop", &request);
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         let manifest = manifest_from_request("delop", &request);
         let dir = ctx.paths.instance_dir("delop").unwrap();
@@ -3267,7 +3268,7 @@ $#
                 template_id: None,
             };
             let row = prepare_row("src", &request);
-            let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+            let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
             agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
             drop(conn);
             let src_dir = ctx.paths.instance_dir("src").unwrap();
@@ -3346,7 +3347,7 @@ $#
             template_id: None,
         };
         let row = prepare_row("source-pack", &request);
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row).unwrap();
         drop(conn);
         let src_dir = ctx.paths.instance_dir("source-pack").unwrap();
@@ -3381,7 +3382,7 @@ $#
         )
         .unwrap();
         // Persist pack inventory for source
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         agora_core::db::replace_instance_pack_files(&conn, "source-pack", &pack_files).unwrap();
         drop(conn);
 
@@ -3417,7 +3418,7 @@ $#
             Some(crate::pack_inventory::pack_content_hash(&live_files).as_str())
         );
         // DB inventory for clone must exist and match live files (recomputed, not empty)
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let db_files = agora_core::db::list_instance_pack_files(&conn, "ClonedPack").unwrap();
         assert!(!db_files.is_empty());
         assert_eq!(db_files, live_files);
@@ -3453,7 +3454,7 @@ $#
         /// An instance with files, pack inventory, import provenance and launch history.
         fn seed(ctx: &Ctx, id: &str) {
             let req = request(id);
-            let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+            let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
             agora_core::db::upsert_instance(&conn, crate::GAME_ID, &prepare_row(id, &req)).unwrap();
             let dir = ctx.paths.instance_dir(id).unwrap();
             std::fs::create_dir_all(dir.join("mods")).unwrap();
@@ -3507,7 +3508,7 @@ $#
         }
 
         fn db_state(ctx: &Ctx, id: &str) -> String {
-            let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+            let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
             serde_json::to_string(&crate::recently_deleted::capture_db_state(&conn, id).unwrap())
                 .unwrap()
         }
@@ -3708,7 +3709,7 @@ $#
                 .unwrap()
                 .unwrap();
             assert_eq!(manifest.instance_id, "pack-restored");
-            let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+            let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
             assert_eq!(
                 agora_core::db::list_instance_pack_files(&conn, "pack-restored")
                     .unwrap()
@@ -4045,7 +4046,7 @@ $#
                 .unwrap();
             assert_eq!(row.import_source.as_deref(), Some("curseforge"));
             // Re-importing the original must never resolve to the clone.
-            let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+            let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
             let found = agora_core::db::find_instance_import_by_source(
                 &conn,
                 "curseforge",
@@ -4068,7 +4069,7 @@ $#
             seed(&ctx, "pack");
             {
                 let conn =
-                    agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+                    local_state_connection(&ctx.paths.local_state_db()).unwrap();
                 conn.execute(
                     "INSERT INTO mcp_approval_grants (tool_name, instance_id, state, granted_at)
                      VALUES ('tool.x', 'pack', 'granted', '2026-01-01T00:00:00Z')",
@@ -4086,7 +4087,7 @@ $#
             service.delete("pack").unwrap();
             // A brand-new instance takes the id.
             seed(&ctx, "pack");
-            let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+            let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
             for table in ["mcp_approval_grants", "crash_events"] {
                 let leaked: i64 = conn
                     .query_row(
@@ -4149,7 +4150,7 @@ $#
             seed(&ctx, "pack");
             {
                 let conn =
-                    agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+                    local_state_connection(&ctx.paths.local_state_db()).unwrap();
                 conn.execute_batch(
                     "CREATE TRIGGER review_block_clone_import BEFORE INSERT ON instance_imports
                      WHEN NEW.installation_key = 'clone'
@@ -4185,7 +4186,7 @@ $#
         #[test]
         fn every_instance_id_table_is_covered() {
             let (ctx, root) = context();
-            let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+            let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
             let mut covered: Vec<String> = crate::recently_deleted::instance_tables(&conn)
                 .unwrap()
                 .into_iter()
@@ -4270,7 +4271,7 @@ $#
             seed(&ctx, "pack");
             {
                 let conn =
-                    agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+                    local_state_connection(&ctx.paths.local_state_db()).unwrap();
                 conn.execute(
                     "INSERT INTO mcp_approval_grants (tool_name, instance_id, state, granted_at)
                      VALUES ('tool.x', 'pack', 'granted', '2026-01-01T00:00:00Z')",
@@ -4291,7 +4292,7 @@ $#
             }
             let service = InstanceService::new(ctx.clone());
             service.delete("pack").unwrap();
-            let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+            let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
             let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
             assert_eq!(count("SELECT COUNT(*) FROM crash_survival_mods"), 0);
             let entry = service.list_recently_deleted(DAYS).unwrap().remove(0);
@@ -4320,7 +4321,7 @@ $#
             seed(&ctx, "pack");
             let before = {
                 let conn =
-                    agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+                    local_state_connection(&ctx.paths.local_state_db()).unwrap();
                 crate::recently_deleted::capture_db_state(&conn, "pack").unwrap()
             };
             let service = InstanceService::new(ctx.clone());
@@ -4328,7 +4329,7 @@ $#
             // Crash simulation: the folder is in the entry but the rows are back.
             {
                 let mut conn =
-                    agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+                    local_state_connection(&ctx.paths.local_state_db()).unwrap();
                 crate::recently_deleted::replay_db_state(&mut conn, &before, "pack", "pack", None)
                     .unwrap();
             }
@@ -4357,7 +4358,7 @@ $#
             seed(&ctx, "pack");
             {
                 let conn =
-                    agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+                    local_state_connection(&ctx.paths.local_state_db()).unwrap();
                 conn.execute(
                     "UPDATE instances SET created_at = 'other' WHERE instance_id='pack'",
                     [],
