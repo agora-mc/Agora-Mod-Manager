@@ -190,8 +190,11 @@ fn read_settings(
             .seams
             .settings_cache_event(crate::test_seams::SettingsCacheEvent::OpenConnection)
             .map_err(|error| unreadable("could not open the settings database", &error))?;
+        // Read-only, so a check cannot make the database it is checking: an admission against a
+        // data root whose settings store is missing refuses and leaves no file behind, instead of
+        // creating an empty one that the next read would then report on (MASTER_SPEC §32.11).
         state.connection = Some(
-            crate::db::local_state_connection(&reads.db_path)
+            crate::db::local_state_connection_read_only(&reads.db_path)
                 .map_err(|error| unreadable("could not open the settings database", &error))?,
         );
     }

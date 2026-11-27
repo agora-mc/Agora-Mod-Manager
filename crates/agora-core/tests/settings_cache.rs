@@ -418,3 +418,22 @@ fn c4_a_warm_check_hands_out_the_snapshot_it_already_holds() {
         "the new snapshot carries the values the write stored"
     );
 }
+
+#[test]
+fn c4_an_admission_check_never_creates_a_settings_database() {
+    let root = tempfile::tempdir().unwrap();
+    let db_path = root.path().join("local_state.db");
+    let error = agora_core::settings::admit_action_at(&db_path)
+        .expect_err("an admission against a data root with no database must refuse");
+    assert_eq!(error.code(), "ERR_NETWORK_SETTINGS_UNREADABLE", "{error}");
+    assert!(
+        !db_path.exists(),
+        "the admission check created the settings database it could not read"
+    );
+    for sidecar in ["local_state.db-wal", "local_state.db-shm"] {
+        assert!(
+            !root.path().join(sidecar).exists(),
+            "the admission check created {sidecar}"
+        );
+    }
+}
