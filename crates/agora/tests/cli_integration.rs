@@ -4884,6 +4884,107 @@ fn games_content_remove_refusal_shows_the_instance_name() {
     assert!(!stderr.contains("mc1"), "it does not show the id: {stderr}");
 }
 
+/// A removal's result carries what its collection did, so the person who asked reads it there
+/// instead of the core printing it (MASTER_SPEC §32.8).
+#[test]
+fn games_content_remove_reports_what_the_collection_did() {
+    let (_tmp, data_dir) = temp_data_dir();
+    let mod_dir = tempfile::tempdir().unwrap();
+    std::fs::write(mod_dir.path().join("readme.txt"), b"mod content").unwrap();
+    let added = run_agora(
+        &data_dir,
+        &[
+            "games",
+            "content",
+            "add",
+            mod_dir.path().to_str().unwrap(),
+            "--name",
+            "reclaim-me",
+        ],
+    );
+    assert!(added.status.success());
+
+    let list: serde_json::Value =
+        serde_json::from_slice(&run_agora_json(&data_dir, &["games", "content", "list"]).stdout)
+            .unwrap();
+    let item_id = list[0]["item_id"].as_str().unwrap().to_string();
+
+    let removed = run_agora_json(&data_dir, &["games", "content", "remove", &item_id]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let value = assert_json_stdout(&removed);
+    assert_eq!(value["status"], "removed");
+    let collection = &value["collection"];
+    assert_eq!(collection["refused"], false, "{value}");
+    assert_eq!(
+        collection["reclaimed"], 0,
+        "the object was written a moment ago, so the grace period keeps it: {value}"
+    );
+    let summary = collection["summary"].as_str().expect("a summary line");
+    assert!(
+        summary.contains("grace period"),
+        "the report says why nothing was reclaimed: {value}"
+    );
+
+    // The human line carries the same sentence.
+    let text = run_agora(
+        &data_dir,
+        &["games", "content", "add", mod_dir.path().to_str().unwrap()],
+    );
+    assert!(text.status.success());
+    let list: serde_json::Value =
+        serde_json::from_slice(&run_agora_json(&data_dir, &["games", "content", "list"]).stdout)
+            .unwrap();
+    let second = list[0]["item_id"].as_str().unwrap().to_string();
+    let removed = run_agora(&data_dir, &["games", "content", "remove", &second]);
+    assert!(removed.status.success());
+    let stdout = String::from_utf8_lossy(&removed.stdout);
+    assert!(
+        stdout.contains("removed: ") && stdout.contains("grace period"),
+        "the removal prints what its collection did: {stdout}"
+    );
+}
+
+/// Deleting a snapshot reports the same way: the snapshot is gone, and the answer says what its
+/// collection freed or kept (MASTER_SPEC §32.8).
+#[test]
+fn snapshots_delete_reports_what_the_collection_did() {
+    let (_tmp, data_dir) = temp_data_dir();
+    create_loader_instance(&data_dir, "gc-src", &["sodium.jar"]);
+    let created = run_agora(
+        &data_dir,
+        &["snapshots", "create", "gc-src", "--label", "gc-one"],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let list: serde_json::Value =
+        serde_json::from_slice(&run_agora_json(&data_dir, &["snapshots", "list", "gc-src"]).stdout)
+            .unwrap();
+    let snapshot_id = list[0]["id"].as_str().unwrap().to_string();
+
+    let deleted = run_agora_json(&data_dir, &["snapshots", "delete", "gc-src", &snapshot_id]);
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    let value = assert_json_stdout(&deleted);
+    assert_eq!(value["status"], "deleted");
+    let collection = &value["collection"];
+    assert_eq!(collection["refused"], false, "{value}");
+    let summary = collection["summary"].as_str().expect("a summary line");
+    assert!(
+        !summary.is_empty(),
+        "the delete answers with a report: {value}"
+    );
+}
+
 #[test]
 fn games_content_list_shows_an_unreadable_record_as_damaged() {
     let (_tmp, data_dir) = temp_data_dir();

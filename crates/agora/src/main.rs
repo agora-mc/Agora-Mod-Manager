@@ -5567,17 +5567,21 @@ async fn run_snapshots_command(
             if !instance_dir.exists() {
                 anyhow::bail!("Instance '{}' not found", instance);
             }
-            agora_core::snapshot::delete_snapshot(&instance_dir, &snapshot_id)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let report =
+                agora_core::snapshot::delete_snapshot_with_report(&instance_dir, &snapshot_id)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+            // The delete succeeded; the report says what its collection freed, or why it freed
+            // nothing. It is the caller's to print, not the core's (MASTER_SPEC §32.8).
+            let collection = report.outcome();
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({"status": "deleted", "instanceId": instance, "snapshotId": snapshot_id})
+                    serde_json::json!({"status": "deleted", "instanceId": instance, "snapshotId": snapshot_id, "collection": collection})
                 );
             } else {
                 println!(
-                    "Deleted snapshot '{}' for instance '{}'",
-                    snapshot_id, instance
+                    "Deleted snapshot '{snapshot_id}' for instance '{instance}': {}.",
+                    collection.summary
                 );
             }
         }
@@ -8519,22 +8523,26 @@ async fn run_command(
                     item,
                     ignore_unreadable_snapshots,
                 } => {
-                    match agora_core::content_store::remove_item_with_options(
+                    match agora_core::content_store::remove_item_with_report(
                         ctx,
                         &item,
                         agora_core::content_store::RemoveOptions {
                             ignore_unreadable_snapshots,
                         },
                     ) {
-                        Ok(()) => {
+                        Ok(report) => {
+                            // The item is gone either way; the report says what its collection
+                            // freed, or why it freed nothing (MASTER_SPEC §32.8).
+                            let collection = report.outcome();
                             if json {
                                 let out = serde_json::json!({
                                     "status": "removed",
                                     "item": item,
+                                    "collection": collection,
                                 });
                                 println!("{}", serde_json::to_string_pretty(&out)?);
                             } else {
-                                println!("Content item '{item}' removed.");
+                                println!("Content item '{item}' removed: {}.", collection.summary);
                             }
                         }
                         Err(e) => {
