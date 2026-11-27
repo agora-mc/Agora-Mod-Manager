@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -12,11 +12,11 @@ use crate::app_paths::AppPaths;
 use crate::artifact_receipt::receipt_path;
 use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
-use crate::lock_manager::{LockRefusal, LockResource};
-use crate::process_identity::{self, OsProcesses};
+use crate::lock_manager::{LockManager, LockRefusal, LockResource};
+use crate::process_identity::{self, OsProcesses, ProcessView};
 use crate::recovery::{
     self, ContentProof, Decision, Envelope, JournalProblem, JournalRead, OwnedPath, PathIdentity,
-    PathProof, ProofResult, RecoveryCapability,
+    PathProof, ProofResult, ReadOnlyDecision, RecoveryCapability,
 };
 
 const RESOURCE: LockResource = LockResource::ContentStore;
@@ -26,6 +26,7 @@ const RESTART_COMMAND: &str = "agora games content migrate --restart";
 #[derive(Debug)]
 pub enum MigrationOutcome {
     NothingToDo,
+    /// Work counted in this migration round. The completed journal keeps cumulative counts.
     Done(MigrationReport),
     Busy,
     NeedsHand(MigrationRefusal),
@@ -75,9 +76,43 @@ pub struct MigrationReport {
     pub left_alone: Vec<(PathBuf, String)>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     mismatch_hashes: BTreeMap<PathBuf, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    mismatch_metadata: BTreeMap<PathBuf, MismatchMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MismatchMetadata {
+    size: u64,
+    mtime: Duration,
+    before_epoch: bool,
+}
+
+impl MismatchMetadata {
+    fn read(entry: &Metadata) -> Option<Self> {
+        let modified = match entry.modified() {
+            Ok(modified) => modified,
+            // An unknown timestamp cannot establish that the file is unchanged.
+            Err(_) => return None,
+        };
+        let (mtime, before_epoch) = match modified.duration_since(UNIX_EPOCH) {
+            Ok(mtime) => (mtime, false),
+            Err(error) => (error.duration(), true),
+        };
+        Some(Self {
+            size: entry.len(),
+            mtime,
+            before_epoch,
+        })
+    }
 }
 
 impl MigrationReport {
+    fn unchanged_mismatch(&self, path: &Path, entry: &Metadata) -> Option<&MismatchMetadata> {
+        self.mismatch_metadata
+            .get(path)
+            .filter(|recorded| MismatchMetadata::read(entry).as_ref() == Some(*recorded))
+    }
+
     fn unchanged_since(&self, previous: &Self) -> bool {
         self.moved == 0
             && self.already_present == 0
@@ -155,7 +190,8 @@ struct MigrationJournal {
 pub fn journal_path(paths: &AppPaths) -> PathBuf {
     paths
         .content_root()
-        .join("migrations/snapshot-objects.json")
+        .join("migrations")
+        .join("snapshot-objects.json")
 }
 
 pub(crate) fn legacy_root(paths: &AppPaths) -> PathBuf {
@@ -204,7 +240,8 @@ pub(crate) enum JournalStatus {
     Absent,
     Running,
     Done,
-    PendingReopen,
+    Pending(Option<&'static str>),
+    Busy(String),
     NeedsHand(Option<&'static str>, MigrationRefusal),
 }
 
@@ -214,81 +251,117 @@ pub fn migrate_snapshot_objects(ctx: &Ctx) -> LauncherResult<MigrationOutcome> {
 
 /// The finished migration's own record, read from its journal without writing anything.
 ///
-/// `None` when there is no finished record: no journal, one still running, or one that cannot be
-/// read. A command that has just been told there is nothing to do asks this to report what the
-/// migration that did run moved, instead of saying nothing happened at all.
-pub fn migration_status(paths: &AppPaths) -> Option<MigrationReport> {
-    match read_journal(&legacy_root(paths), &journal_path(paths)) {
+/// A missing or still-running journal has no finished record. Unreadable journals return the error.
+pub fn migration_status(paths: &AppPaths) -> Result<Option<MigrationReport>, String> {
+    let path = journal_path(paths);
+    let could_not_read = |problem| {
+        format!(
+            "Could not read the finished migration record at {}: {problem}",
+            path.display()
+        )
+    };
+    match read_journal(&legacy_root(paths), &path) {
         JournalRead::Valid(journal) if journal.envelope().state == State::Done => journal
             .payload::<MigrationJournal>()
-            .ok()
-            .map(|journal| journal.report),
-        _ => None,
+            .map(|journal| Some(journal.report))
+            .map_err(could_not_read),
+        JournalRead::Unusable(problem) => Err(could_not_read(problem)),
+        _ => Ok(None),
     }
 }
 
 /// Inspect the journal and legacy directory without opening or hashing objects.
-pub(crate) fn journal_status(paths: &AppPaths) -> JournalStatus {
+pub(crate) fn journal_status(paths: &AppPaths, view: &dyn ProcessView) -> (JournalStatus, usize) {
     let root = legacy_root(paths);
     let read = match read_journal(&root, &journal_path(paths)) {
         JournalRead::Unusable(problem) => {
-            return JournalStatus::NeedsHand(
-                None,
-                MigrationRefusal::UnusableJournal(problem.to_string()),
+            return (
+                JournalStatus::NeedsHand(
+                    None,
+                    MigrationRefusal::UnusableJournal(problem.to_string()),
+                ),
+                0,
             );
         }
         read => read,
     };
-    let state = match &read {
-        JournalRead::Valid(journal) => Some(match journal.envelope().state {
-            State::Running => "running",
-            State::Done => "done",
-        }),
-        _ => None,
+    let JournalRead::Valid(journal) = &read else {
+        let status = inspect_pending(&root, None)
+            .unwrap_or_else(|cause| JournalStatus::NeedsHand(None, cause));
+        return (status, 0);
     };
-    match inspect_legacy_store(&root, read) {
-        Ok(status) => status,
-        Err(cause) => JournalStatus::NeedsHand(state, cause),
+    let state = match journal.envelope().state {
+        State::Running => "running",
+        State::Done => "done",
+    };
+    let payload = match journal.payload::<MigrationJournal>() {
+        Ok(payload) => payload,
+        Err(problem) => {
+            return (
+                JournalStatus::NeedsHand(
+                    Some(state),
+                    MigrationRefusal::UnusableJournal(problem.to_string()),
+                ),
+                0,
+            );
+        }
+    };
+    if payload.envelope.state == State::Done {
+        let status = inspect_pending(&root, Some(&payload.report))
+            .unwrap_or_else(|cause| JournalStatus::NeedsHand(Some(state), cause));
+        return (status, payload.report.mismatched.len());
     }
+
+    let proof = LegacyProof {
+        root: &root,
+        identity: payload.legacy_identity,
+    };
+    let locks = LockManager::new(paths.locks_root());
+    let status = match recovery::decide_readonly(&locks, &RESOURCE, || read, &proof, view) {
+        ReadOnlyDecision::Nothing => JournalStatus::Absent,
+        ReadOnlyDecision::Busy(reason) => JournalStatus::Busy(reason),
+        ReadOnlyDecision::UnprovenWriter(reason) => JournalStatus::NeedsHand(
+            Some(state),
+            MigrationRefusal::Other(format!(
+                "{reason} Check the journal's writer record before attempting recovery."
+            )),
+        ),
+        ReadOnlyDecision::NeedsHand(reason) => {
+            JournalStatus::NeedsHand(Some(state), MigrationRefusal::Other(reason))
+        }
+        ReadOnlyDecision::WouldAct(_, _) => match inspect_running(&root) {
+            Ok(()) => JournalStatus::Running,
+            Err(cause) => JournalStatus::NeedsHand(Some(state), cause),
+        },
+    };
+    (status, 0)
 }
 
-fn inspect_legacy_store(
+fn inspect_running(root: &Path) -> Result<(), MigrationRefusal> {
+    if legacy_directory_present(root)? {
+        scan_legacy_store(root)?;
+    }
+    Ok(())
+}
+
+fn inspect_pending(
     root: &Path,
-    read: JournalRead<State>,
+    finished: Option<&MigrationReport>,
 ) -> Result<JournalStatus, MigrationRefusal> {
-    let present = legacy_directory_present(root)?;
-    let JournalRead::Valid(journal) = read else {
-        if present {
+    if legacy_directory_present(root)? {
+        if has_pending_objects(root, finished)? {
             scan_legacy_store(root)?;
+            return Ok(JournalStatus::Pending(finished.map(|_| "done")));
         }
-        return Ok(JournalStatus::Absent);
-    };
-    match journal.envelope().state {
-        State::Done => {
-            if !present || !has_legacy_objects(root)? {
-                return Ok(JournalStatus::Done);
-            }
+        if finished.is_none() {
             scan_legacy_store(root)?;
-            Ok(JournalStatus::PendingReopen)
-        }
-        State::Running => {
-            let journal = journal
-                .payload::<MigrationJournal>()
-                .map_err(|problem| MigrationRefusal::UnusableJournal(problem.to_string()))?;
-            let proof = LegacyProof {
-                root,
-                identity: journal.legacy_identity,
-            };
-            if let ProofResult::CantTell(reason) = proof.prove(root) {
-                return Err(MigrationRefusal::Other(reason));
-            }
-            if present {
-                scan_legacy_store(root)?;
-            }
-            // Without taking the store lock, doctor cannot tell whether this run is still active.
-            Ok(JournalStatus::Running)
         }
     }
+    Ok(if finished.is_some() {
+        JournalStatus::Done
+    } else {
+        JournalStatus::Absent
+    })
 }
 
 /// Archive an unusable journal and start from the legacy files still on disk.
@@ -351,7 +424,7 @@ fn run(ctx: &Ctx, mut restart: bool) -> LauncherResult<MigrationOutcome> {
                     if !present {
                         return Ok(MigrationOutcome::NothingToDo);
                     }
-                    match has_legacy_objects(&root) {
+                    match has_pending_objects(&root, Some(&journal.report)) {
                         Ok(true) => {}
                         Ok(false) => return Ok(MigrationOutcome::NothingToDo),
                         Err(cause) => return Ok(MigrationOutcome::NeedsHand(cause)),
@@ -437,8 +510,11 @@ fn legacy_directory_present(root: &Path) -> Result<bool, MigrationRefusal> {
     }
 }
 
-/// A retired store is only reopened when its object layout contains a regular file.
-fn has_legacy_objects(root: &Path) -> Result<bool, MigrationRefusal> {
+/// Look for a regular object file that has not already been kept as an unchanged mismatch.
+fn has_pending_objects(
+    root: &Path,
+    finished: Option<&MigrationReport>,
+) -> Result<bool, MigrationRefusal> {
     for shard in legacy_entries(root)? {
         let shard = shard.map_err(|error| legacy_io(root, error))?.path();
         if !is_shard(&shard)
@@ -451,7 +527,11 @@ fn has_legacy_objects(root: &Path) -> Result<bool, MigrationRefusal> {
             let file = file.map_err(|error| legacy_io(&shard, error))?.path();
             if object_name(root, &file).is_some()
                 && legacy_metadata(&file)?.is_some_and(|entry| {
-                    entry.is_file() && !agora_game_api::is_a_reparse_point(&entry)
+                    entry.is_file()
+                        && !agora_game_api::is_a_reparse_point(&entry)
+                        && !finished.is_some_and(|report| {
+                            report.unchanged_mismatch(&file, &entry).is_some()
+                        })
                 })
             {
                 return Ok(true);
@@ -552,6 +632,12 @@ fn read_journal(root: &Path, path: &Path) -> JournalRead<State> {
             )));
         }
         if let Err(problem) = journal.payload::<MigrationJournal>() {
+            if envelope.state == State::Done {
+                return JournalRead::Unusable(JournalProblem::Malformed(format!(
+                    "Could not read the finished migration record at {}: {problem}",
+                    path.display()
+                )));
+            }
             return JournalRead::Unusable(problem);
         }
     }
@@ -573,7 +659,7 @@ impl ContentProof for LegacyProof<'_> {
                 ProofResult::Proven
             }
             Ok(_) => ProofResult::CantTell(format!(
-                "{} is no longer the legacy directory recorded in the journal",
+                "{} is no longer the legacy directory recorded in the journal. Put the recorded directory back before retrying",
                 path.display()
             )),
             Err(error) => ProofResult::CantTell(format!(
@@ -653,15 +739,34 @@ fn migrate(
                 }
                 continue;
             };
+            if let Some(previous) = &journal.previous_done {
+                if let Some(recorded) = previous.unchanged_mismatch(&file, &kind) {
+                    journal.report.mismatched.push(file.clone());
+                    if let Some(hash) = previous.mismatch_hashes.get(&file) {
+                        journal
+                            .report
+                            .mismatch_hashes
+                            .insert(file.clone(), hash.clone());
+                    }
+                    journal
+                        .report
+                        .mismatch_metadata
+                        .insert(file, recorded.clone());
+                    continue;
+                }
+            }
             let actual = super::hash_file_path(&file).map_err(|error| file_error(&file, error))?;
             if !actual.eq_ignore_ascii_case(name) {
                 if !journal.report.mismatched.contains(&file) {
                     journal.report.mismatched.push(file.clone());
                 }
-                if journal.report.mismatch_hashes.get(&file) != Some(&actual) {
-                    journal.report.mismatch_hashes.insert(file, actual);
-                    recovery::write(path, &journal)?;
+                journal.report.mismatch_hashes.insert(file.clone(), actual);
+                if let Some(recorded) = MismatchMetadata::read(&kind) {
+                    journal.report.mismatch_metadata.insert(file, recorded);
+                } else {
+                    journal.report.mismatch_metadata.remove(&file);
                 }
+                recovery::write(path, &journal)?;
                 continue;
             }
 
@@ -681,6 +786,7 @@ fn migrate(
             }
             journal.report.mismatched.retain(|path| path != &file);
             journal.report.mismatch_hashes.remove(&file);
+            journal.report.mismatch_metadata.remove(&file);
             // Placement flushes the destination shard. Its parent entries also have to survive
             // the crash that could follow removal of the only other copy.
             sync_parent(destination.parent().expect("object has a shard directory"))?;
@@ -745,23 +851,30 @@ fn migrate(
         }
     }
     journal.report.sort_findings();
-    let unchanged = if let Some(previous) = previous {
-        let unchanged = journal.report.unchanged_since(&previous);
-        // The scan refreshes mismatches so a repaired object no longer appears among them.
-        // Merge the counts at completion so a resumed pass does not add them twice.
+    let unchanged = previous
+        .as_ref()
+        .is_some_and(|previous| journal.report.unchanged_since(previous));
+    let round_counts = (
+        journal.report.moved,
+        journal.report.already_present,
+        journal.report.replaced_damaged,
+    );
+    if let Some(previous) = previous {
+        // Merge the counts only in the finished record so a resumed pass does not add them twice.
         journal.report.moved += previous.moved;
         journal.report.already_present += previous.already_present;
         journal.report.replaced_damaged += previous.replaced_damaged;
-        unchanged
-    } else {
-        false
-    };
+    }
     recovery::write(path, &journal)?;
     if unchanged {
-        Ok(MigrationOutcome::NothingToDo)
-    } else {
-        Ok(MigrationOutcome::Done(journal.report))
+        return Ok(MigrationOutcome::NothingToDo);
     }
+    (
+        journal.report.moved,
+        journal.report.already_present,
+        journal.report.replaced_damaged,
+    ) = round_counts;
+    Ok(MigrationOutcome::Done(journal.report))
 }
 
 fn record_left(report: &mut MigrationReport, path: &Path, reason: &str) -> bool {

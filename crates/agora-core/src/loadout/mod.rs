@@ -729,10 +729,7 @@ pub fn apply_profile_with_undo(
             crate::snapshot::restore_snapshot(instance_dir, &undo.id, entries).map(|_| ());
         return Err(LoadoutApplyError::Apply { error, rollback });
     }
-    if let Err(error) = crate::lkg::run_retention(instance_dir) {
-        eprintln!("{}", LoadoutApplyError::Retention(error));
-    }
-    Ok(())
+    crate::lkg::run_retention(instance_dir).map_err(LoadoutApplyError::Retention)
 }
 
 /// Set each item the profile records to the state it records.
@@ -1454,7 +1451,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_with_undo_succeeds_when_retention_fails_after_the_apply() {
+    fn apply_with_undo_reports_retention_failure_after_the_apply() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = setup_instance(&tmp, &["sodium.jar"]);
         create_profile(&dir, "all-on").unwrap();
@@ -1472,7 +1469,12 @@ mod tests {
 
         assert!(dir.join("mods/sodium.jar").is_file());
         assert!(read_manifest(&dir).unwrap().mods[0].enabled);
-        assert!(result.is_ok(), "{result:?}");
+        let error = result.expect_err("the caller gets the retention failure");
+        assert!(
+            matches!(&error, LoadoutApplyError::Retention(_)),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("Loadout applied"));
     }
 
     #[test]

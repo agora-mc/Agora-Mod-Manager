@@ -2756,7 +2756,19 @@ async fn async_main() {
     // listener all recover the same things (MASTER_SPEC §32.11). A journal that belongs to a live
     // operation in another process is left alone and reported, never recovered underneath it; a
     // case that needs a hand is reported, not raised.
-    let recovery_report = agora_core::startup_recovery::run_at_startup(&ctx);
+    let recovery_report = if matches!(
+        &cli.command,
+        Commands::Games {
+            action: GamesCmd::Content {
+                action: ContentCmd::Migrate { .. }
+            },
+            ..
+        }
+    ) {
+        agora_core::startup_recovery::run_before_snapshot_migration(&ctx)
+    } else {
+        agora_core::startup_recovery::run_at_startup(&ctx)
+    };
     for action in &recovery_report.actions {
         progress.log("info", action);
         eprintln!("{action}");
@@ -15070,8 +15082,8 @@ fn run_content_migrate(
         }
         if fresh {
             println!(
-                "Moved {} snapshot object(s) into the content store in total: {} were already there and {} \
-                 damaged copy(ies) were replaced.",
+                "Snapshot object migration: {} moved into the content store, {} already present \
+                 (legacy copy removed), {} damaged copy(ies) replaced.",
                 report.moved, report.already_present, report.replaced_damaged
             );
         } else {
@@ -15104,18 +15116,20 @@ fn run_content_migrate(
         Ok(MigrationOutcome::Done(report)) => print_report(&report, json, true),
         // Nothing to move now: either the migration already ran and left its record, or there was
         // never an old store here. The record is the honest answer to "what did it move?".
-        Ok(MigrationOutcome::NothingToDo) => match migration_status(paths) {
-            Some(report) => print_report(&report, json, false),
-            None => {
-                if json {
-                    let out = serde_json::json!({ "status": "nothing_to_do" });
-                    println!("{}", serde_json::to_string_pretty(&out)?);
-                } else {
-                    println!("Nothing to move: no old snapshot store is left.");
+        Ok(MigrationOutcome::NothingToDo) => {
+            match migration_status(paths).map_err(anyhow::Error::msg)? {
+                Some(report) => print_report(&report, json, false),
+                None => {
+                    if json {
+                        let out = serde_json::json!({ "status": "nothing_to_do" });
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                    } else {
+                        println!("Nothing to move: no old snapshot store is left.");
+                    }
+                    Ok(())
                 }
-                Ok(())
             }
-        },
+        }
         Ok(MigrationOutcome::Busy) => {
             let message = "Another Agora process holds the content store, so nothing was moved. \
                            Run this again when it has finished.";

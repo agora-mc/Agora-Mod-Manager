@@ -84,6 +84,13 @@ impl StartupRecoveryReport {
 /// every adapter; the adapter reports the result its own way. Never raises: each journal's own
 /// outcome is a line in the report.
 pub fn run_at_startup(ctx: &Ctx) -> StartupRecoveryReport {
+    let mut report = run_before_snapshot_migration(ctx);
+    recover_snapshot_objects(ctx, &mut report);
+    report
+}
+
+/// Run steps 1–4 when the caller is handling the snapshot migration itself.
+pub fn run_before_snapshot_migration(ctx: &Ctx) -> StartupRecoveryReport {
     let mut report = StartupRecoveryReport::default();
 
     // 1. Game packages (game-specific recovery stays behind the registry hook).
@@ -113,7 +120,11 @@ pub fn run_at_startup(ctx: &Ctx) -> StartupRecoveryReport {
     report.actions.extend(actions);
     report.warnings.extend(warnings);
 
-    // 5. Move legacy snapshot objects while the content store is idle.
+    report
+}
+
+// 5. Move legacy snapshot objects while the content store is idle.
+fn recover_snapshot_objects(ctx: &Ctx, report: &mut StartupRecoveryReport) {
     match migrate_snapshot_objects(ctx) {
         Ok(MigrationOutcome::NothingToDo) => {}
         Ok(MigrationOutcome::Busy) => report.warnings.push(
@@ -122,10 +133,10 @@ pub fn run_at_startup(ctx: &Ctx) -> StartupRecoveryReport {
         ),
         Ok(MigrationOutcome::Done(migration)) => {
             report.actions.push(format!(
-                "Moved {} snapshot objects in total ({} repaired), kept {} existing content objects and {} legacy entries.",
-                migration.moved + migration.replaced_damaged,
-                migration.replaced_damaged,
+                "Snapshot object migration: {} moved, {} already in the store (legacy copy removed), {} repaired, {} legacy entries kept.",
+                migration.moved,
                 migration.already_present,
+                migration.replaced_damaged,
                 migration.mismatched.len() + migration.left_alone.len()
             ));
             for path in migration.mismatched {
@@ -148,6 +159,4 @@ pub fn run_at_startup(ctx: &Ctx) -> StartupRecoveryReport {
             .warnings
             .push(format!("Snapshot object migration stopped. {error}")),
     }
-
-    report
 }

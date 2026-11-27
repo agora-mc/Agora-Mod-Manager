@@ -697,6 +697,8 @@ pub enum ReadOnlyDecision<S> {
     /// The operation's lock is held — or could not be asked about — or its recorded writer may
     /// still be running.
     Busy(String),
+    /// The journal does not establish whether its recorded writer is still alive.
+    UnprovenWriter(String),
     /// Something about this journal cannot be decided safely, with the reason.
     NeedsHand(String),
     /// Recovery *would* act on this journal, through the capability [`decide`] would hand out. The
@@ -821,11 +823,9 @@ pub(crate) fn decide_reading<S: JournalState>(
 /// * a lock that cannot be asked at all is also [`ReadOnlyDecision::Busy`]: a journal whose owner
 ///   cannot be asked about may still be running, and "may still be running" is what busy says.
 ///
-/// A writer that may still be alive is busy; a liveness answer of "could not tell" is busy too, for
-/// the same reason — never [`ReadOnlyDecision::WouldAct`]. A caller that must *act* turns "could not
-/// tell" into a hand instead ([`Examined::CantTellLiveness`]), because acting on an unknown is
-/// worse than not acting; a report only has to be honest that the operation may be running. `view`
-/// is the process table the writer's liveness is read from.
+/// A proven live writer is busy. An unproven writer is reported separately so callers can explain
+/// whether their operation needs help before it can recover. `view` is the process table the
+/// writer's liveness is read from.
 pub fn decide_readonly<S: JournalState>(
     locks: &LockManager,
     resource: &LockResource,
@@ -844,8 +844,7 @@ pub fn decide_readonly<S: JournalState>(
         LockProbe::Free => match examine(resource, read(), proof, view, None) {
             Examined::Nothing => ReadOnlyDecision::Nothing,
             Examined::Busy(why) => ReadOnlyDecision::Busy(why),
-            // The operation may still be running, which is what a report says "busy" for.
-            Examined::CantTellLiveness(why) => ReadOnlyDecision::Busy(format!(
+            Examined::CantTellLiveness(why) => ReadOnlyDecision::UnprovenWriter(format!(
                 "The journal cannot say whether the operation is still running, so it may still be \
                  going: {why}. Nothing was changed."
             )),

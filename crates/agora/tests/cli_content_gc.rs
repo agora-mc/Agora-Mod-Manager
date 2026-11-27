@@ -291,23 +291,33 @@ fn gc_with_the_override_names_each_ignored_snapshot_and_its_risk() {
 // agora games content migrate
 // ---------------------------------------------------------------------------
 
-/// Every command runs the startup pass first, and the pass moves the old store.
+/// An ordinary command runs the startup migration and reports each kind of work.
 #[test]
 fn any_command_moves_the_old_snapshot_store_first() {
     let (dir, paths) = prepared_root();
     let legacy = legacy_object(&paths, b"old store");
+    let duplicate = legacy_object(&paths, b"duplicate");
+    orphan_object(&paths, b"duplicate", Duration::ZERO);
+    let repaired = legacy_object(&paths, b"repair destination");
+    let damaged = orphan_object(&paths, b"repair destination", Duration::ZERO);
+    fs::write(&damaged, b"damaged").unwrap();
+    fs::write(legacy.parent().unwrap().join("stray.tmp"), b"kept").unwrap();
 
     let output = agora(dir.path(), &["games", "content", "list"]);
 
     assert!(output.status.success(), "{}", text(&output));
-    assert!(!legacy.exists(), "{}", text(&output));
+    assert!(
+        !legacy.exists() && !duplicate.exists() && !repaired.exists(),
+        "{}",
+        text(&output)
+    );
     assert!(paths
         .content_object_path(&sha256_hex(b"old store"))
         .is_file());
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .to_lowercase()
-            .contains("snapshot"),
+        String::from_utf8_lossy(&output.stderr).contains(
+            "1 moved, 1 already in the store (legacy copy removed), 1 repaired, 1 legacy entries kept"
+        ),
         "the pass says what it moved, on stderr: {}",
         text(&output)
     );
@@ -315,14 +325,42 @@ fn any_command_moves_the_old_snapshot_store_first() {
 
 #[test]
 fn migrate_with_nothing_to_move_says_so() {
-    let (dir, _paths) = prepared_root();
+    let (dir, paths) = prepared_root();
     let output = agora(dir.path(), &["games", "content", "migrate", "--json"]);
     assert!(output.status.success(), "{}", text(&output));
     let parsed = json_of(&output);
-    assert!(
-        parsed["status"] == "nothing_to_do" || parsed["status"] == "done",
-        "{parsed}"
+    assert_eq!(parsed["status"], "nothing_to_do", "{parsed}");
+    assert!(!journal(&paths).exists());
+}
+
+#[test]
+fn migrate_names_an_unreadable_finished_record() {
+    let (dir, paths) = prepared_root();
+    legacy_object(&paths, b"already migrated");
+    let output = agora(dir.path(), &["games", "content", "migrate", "--json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let path = journal(&paths);
+    let mut finished: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    finished["report"] = serde_json::Value::Null;
+    let damaged = serde_json::to_vec(&finished).unwrap();
+    fs::write(&path, &damaged).unwrap();
+
+    let output = agora(dir.path(), &["games", "content", "migrate", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(MIGRATION_NEEDS_A_HAND),
+        "{}",
+        text(&output)
     );
+    let report = json_of(&output);
+    assert_eq!(report["status"], "needs_hand", "{report}");
+    let reason = report["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("Could not read the finished") && reason.contains(path.to_str().unwrap()),
+        "{reason}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), damaged);
 }
 
 #[test]
@@ -368,6 +406,7 @@ fn migrate_restart_sets_the_damaged_journal_aside_and_finishes() {
     let parsed = json_of(&output);
     assert_eq!(parsed["status"], "done", "{parsed}");
     assert_eq!(parsed["moved"], 1, "{parsed}");
+    assert!(!text(&output).contains("needs a hand"), "{}", text(&output));
     assert!(!legacy.exists());
     let set_aside = fs::read_dir(damaged.parent().unwrap())
         .unwrap()
@@ -383,7 +422,8 @@ fn migrate_restart_sets_the_damaged_journal_aside_and_finishes() {
 #[test]
 fn migrate_lists_kept_mismatches_by_path() {
     let (dir, paths) = prepared_root();
-    let good = legacy_object(&paths, b"moved at startup");
+    let good = legacy_object(&paths, b"moved by the command");
+    let second = legacy_object(&paths, b"also moved by the command");
     let claimed = sha256_hex(b"what the name promises");
     let bad = paths
         .root()
@@ -392,13 +432,17 @@ fn migrate_lists_kept_mismatches_by_path() {
         .join(&claimed);
     fs::create_dir_all(bad.parent().unwrap()).unwrap();
     fs::write(&bad, b"something else").unwrap();
-    // The startup pass of this very command finishes the move; `migrate` then reports it.
     let output = agora(dir.path(), &["games", "content", "migrate", "--json"]);
 
     assert!(output.status.success(), "{}", text(&output));
     let parsed = json_of(&output);
-    assert_eq!(parsed["moved"], 1, "{parsed}");
-    assert!(!good.exists());
+    assert_eq!(parsed["moved"], 2, "{parsed}");
+    assert!(!good.exists() && !second.exists());
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("legacy snapshot object"),
+        "{}",
+        text(&output)
+    );
     let mismatched = parsed["mismatched"]
         .as_array()
         .unwrap_or_else(|| panic!("the report lists kept mismatches: {parsed}"));
@@ -414,9 +458,50 @@ fn migrate_lists_kept_mismatches_by_path() {
     let output = agora(dir.path(), &["games", "content", "migrate", "--json"]);
     assert!(output.status.success(), "{}", text(&output));
     let parsed = json_of(&output);
-    assert_eq!(parsed["moved"], 2, "{parsed}");
+    assert_eq!(parsed["moved"], 1, "{parsed}");
     assert_eq!(parsed["mismatched"], serde_json::json!([]), "{parsed}");
     assert!(!bad.exists());
+}
+
+#[test]
+fn migrate_reports_busy_without_a_startup_retry_warning() {
+    let (dir, paths) = prepared_root();
+    let legacy = legacy_object(&paths, b"waits for the lock");
+    let manager = LockManager::new(paths.locks_root());
+    let _guard = manager
+        .acquire(LockResource::ContentStore, "test holder")
+        .unwrap();
+
+    let output = agora(dir.path(), &["games", "content", "migrate", "--json"]);
+    assert_eq!(output.status.code(), Some(11), "{}", text(&output));
+    assert_eq!(json_of(&output)["status"], "busy");
+    assert!(
+        !text(&output).contains("will retry on startup"),
+        "{}",
+        text(&output)
+    );
+    assert!(legacy.exists() && !journal(&paths).exists());
+}
+
+#[test]
+fn migrate_needs_a_hand_when_a_file_replaces_the_finished_legacy_root() {
+    let (dir, paths) = prepared_root();
+    let legacy = legacy_object(&paths, b"moved before replacement");
+    let output = agora(dir.path(), &["games", "content", "migrate", "--json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let root = legacy.parent().unwrap().parent().unwrap();
+    fs::remove_dir_all(root).unwrap();
+    fs::write(root, b"unexpected file").unwrap();
+
+    let output = agora(dir.path(), &["games", "content", "migrate", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(MIGRATION_NEEDS_A_HAND),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(json_of(&output)["status"], "needs_hand");
+    assert_eq!(fs::read(root).unwrap(), b"unexpected file");
 }
 
 #[test]
@@ -604,6 +689,133 @@ fn doctor_lists_a_done_migration_with_pending_objects_without_reopening_it() {
 }
 
 #[test]
+fn doctor_lists_legacy_objects_before_the_first_start() {
+    let (dir, paths) = prepared_root();
+    let pending = legacy_object(&paths, b"a pre-B3a object");
+
+    let output = agora(dir.path(), &["doctor", "--json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let report = json_of(&output);
+    let entry = migration_entry(&report);
+    assert!(entry["state"].is_null(), "{entry}");
+    assert_eq!(entry["outcome"], "wouldFinish", "{entry}");
+    assert_eq!(entry["command"], "agora games content migrate", "{entry}");
+    assert!(pending.exists() && !journal(&paths).exists());
+}
+
+#[test]
+fn doctor_has_one_informational_line_for_kept_mismatches() {
+    let (dir, paths) = prepared_root();
+    let first = legacy_object(&paths, b"first expected object");
+    let second = legacy_object(&paths, b"second expected object");
+    fs::write(&first, b"wrong bytes").unwrap();
+    fs::write(&second, b"also wrong").unwrap();
+    let output = agora(dir.path(), &["games", "content", "migrate", "--json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let journal_before = fs::read(journal(&paths)).unwrap();
+
+    let output = agora(dir.path(), &["doctor", "--json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let report = json_of(&output);
+    let recovery = &report["recovery"];
+    assert!(
+        recovery["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["kind"] != "snapshot-object-migration"),
+        "{recovery}"
+    );
+    let notes: Vec<_> = recovery["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|note| note.as_str().filter(|line| line.contains("mismatched")))
+        .collect();
+    assert_eq!(notes.len(), 1, "{recovery}");
+    assert!(
+        notes[0].contains("2 mismatched")
+            && notes[0].contains(first.parent().unwrap().parent().unwrap().to_str().unwrap()),
+        "{notes:?}"
+    );
+    let plain = agora(dir.path(), &["doctor"]);
+    assert!(plain.status.success(), "{}", text(&plain));
+    assert!(text(&plain).contains(notes[0]), "{}", text(&plain));
+    assert_eq!(fs::read(journal(&paths)).unwrap(), journal_before);
+    assert!(first.exists() && second.exists());
+}
+
+#[test]
+fn doctor_needs_a_hand_when_the_running_migrations_writer_cannot_be_proven() {
+    let (dir, paths) = prepared_root();
+    let link = linked_legacy_shard(&paths);
+    let output = agora(dir.path(), &["games", "content", "migrate"]);
+    assert_eq!(
+        output.status.code(),
+        Some(MIGRATION_NEEDS_A_HAND),
+        "{}",
+        text(&output)
+    );
+    remove_folder_link(&link);
+    let path = journal(&paths);
+    let mut running: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    running["writer"] = serde_json::Value::Null;
+    let journal_before = serde_json::to_vec(&running).unwrap();
+    fs::write(&path, &journal_before).unwrap();
+
+    let output = agora(dir.path(), &["doctor", "--json"]);
+    assert_eq!(output.status.code(), Some(10), "{}", text(&output));
+    let report = json_of(&output);
+    let entry = migration_entry(&report);
+    assert_eq!(entry["state"], "running", "{entry}");
+    assert_eq!(entry["outcome"], "needsHand", "{entry}");
+    assert!(entry["command"].is_null(), "{entry}");
+    assert!(
+        entry["reason"]
+            .as_str()
+            .unwrap()
+            .contains("records no writing process"),
+        "{entry}"
+    );
+    assert_eq!(fs::read(path).unwrap(), journal_before);
+}
+
+#[test]
+fn doctor_refuses_a_running_migration_when_the_legacy_root_was_replaced() {
+    let (dir, paths) = prepared_root();
+    let link = linked_legacy_shard(&paths);
+    let output = agora(dir.path(), &["games", "content", "migrate"]);
+    assert_eq!(
+        output.status.code(),
+        Some(MIGRATION_NEEDS_A_HAND),
+        "{}",
+        text(&output)
+    );
+    remove_folder_link(&link);
+    let root = link.parent().unwrap();
+    fs::rename(root, dir.path().join("original-snapshot-objects")).unwrap();
+    let pending = legacy_object(&paths, b"belongs to the replacement");
+    let path = journal(&paths);
+    let journal_before = fs::read(&path).unwrap();
+
+    let output = agora(dir.path(), &["doctor", "--json"]);
+    assert_eq!(output.status.code(), Some(10), "{}", text(&output));
+    let report = json_of(&output);
+    let entry = migration_entry(&report);
+    assert_eq!(entry["state"], "running", "{entry}");
+    assert_eq!(entry["outcome"], "needsHand", "{entry}");
+    assert!(entry["command"].is_null(), "{entry}");
+    let reason = entry["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("no longer the legacy directory")
+            && reason.contains(root.to_str().unwrap()),
+        "{reason}"
+    );
+    assert_eq!(fs::read(path).unwrap(), journal_before);
+    assert!(pending.exists());
+}
+
+#[test]
 fn doctor_lists_a_running_migration_while_the_store_lock_is_held() {
     let (dir, paths) = prepared_root();
     let link = linked_legacy_shard(&paths);
@@ -625,10 +837,10 @@ fn doctor_lists_a_running_migration_while_the_store_lock_is_held() {
     let report = json_of(&output);
     let entry = migration_entry(&report);
     assert_eq!(entry["state"], "running", "{entry}");
-    assert_eq!(entry["outcome"], "wouldFinish", "{entry}");
-    assert_eq!(entry["command"], "agora games content migrate", "{entry}");
-
-    let output = agora(dir.path(), &["games", "content", "migrate", "--json"]);
-    assert_eq!(output.status.code(), Some(11), "{}", text(&output));
-    assert_eq!(json_of(&output)["status"], "busy");
+    assert_eq!(entry["outcome"], "busy", "{entry}");
+    assert!(entry["command"].is_null(), "{entry}");
+    assert!(
+        entry["reason"].as_str().unwrap().contains("test holder"),
+        "{entry}"
+    );
 }

@@ -170,7 +170,7 @@ pub fn report_with(paths: &AppPaths, view: &dyn ProcessView) -> RecoveryReport {
     );
     file_journals(paths, &mut report);
     recently_deleted(paths, &mut report);
-    snapshot_object_migration(paths, &mut report);
+    snapshot_object_migration(paths, view, &mut report);
     report
 }
 
@@ -693,13 +693,24 @@ fn read_children(dir: PathBuf, suffix: Option<&str>) -> std::result::Result<Vec<
 /// The pre-B3a snapshot-object migration's journal (MASTER_SPEC §32.8).
 ///
 /// Report unfinished work and migration refusals using a read-only inspection.
-fn snapshot_object_migration(paths: &AppPaths, report: &mut RecoveryReport) {
+fn snapshot_object_migration(
+    paths: &AppPaths,
+    view: &dyn ProcessView,
+    report: &mut RecoveryReport,
+) {
     use crate::content_store::migrate::{
-        journal_path, journal_status, JournalStatus, MIGRATE_COMMAND,
+        journal_path, journal_status, legacy_root, JournalStatus, MIGRATE_COMMAND,
     };
 
     let path = journal_path(paths);
-    let (state, outcome, reason, command) = match journal_status(paths) {
+    let (status, mismatched) = journal_status(paths, view);
+    if mismatched > 0 {
+        report.notes.push(format!(
+            "Snapshot object migration kept {mismatched} mismatched legacy object(s) in {}.",
+            legacy_root(paths).display()
+        ));
+    }
+    let (state, outcome, reason, command) = match status {
         JournalStatus::Absent | JournalStatus::Done => return,
         JournalStatus::Running => (
             Some("running"),
@@ -708,13 +719,14 @@ fn snapshot_object_migration(paths: &AppPaths, report: &mut RecoveryReport) {
                 .into(),
             Some(MIGRATE_COMMAND),
         ),
-        JournalStatus::PendingReopen => (
-            Some("done"),
+        JournalStatus::Pending(state) => (
+            state,
             RecoveryOutcome::WouldFinish,
-            "The old snapshot store still contains object files. The next start reopens the migration and checks them."
+            "The old snapshot store contains object files awaiting migration. The next start checks them."
                 .into(),
             Some(MIGRATE_COMMAND),
         ),
+        JournalStatus::Busy(reason) => (Some("running"), RecoveryOutcome::Busy, reason, None),
         JournalStatus::NeedsHand(state, cause) => (
             state,
             RecoveryOutcome::NeedsHand,

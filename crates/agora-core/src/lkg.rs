@@ -385,14 +385,6 @@ pub fn retention_plan_with_sizes(
     entries_newest_first: &[RetentionEntry],
     policy: &RetentionPolicy,
 ) -> Vec<String> {
-    retention_plan_with_cap(entries_newest_first, policy, Some(policy.size_cap_bytes))
-}
-
-fn retention_plan_with_cap(
-    entries_newest_first: &[RetentionEntry],
-    policy: &RetentionPolicy,
-    size_cap: Option<u64>,
-) -> Vec<String> {
     use std::collections::HashSet;
 
     let mut keep = HashSet::new();
@@ -445,7 +437,7 @@ fn retention_plan_with_cap(
         .filter(|entry| keep.contains(&entry.id))
         .map(|entry| entry.size_bytes)
         .sum();
-    if let Some(size_cap) = size_cap.filter(|cap| retained_size > *cap) {
+    if retained_size > policy.size_cap_bytes {
         let mut candidates: Vec<&RetentionEntry> = entries_newest_first
             .iter()
             .rev() // oldest first within each safety tier
@@ -465,7 +457,7 @@ fn retention_plan_with_cap(
             }
         });
         for entry in candidates {
-            if retained_size <= size_cap {
+            if retained_size <= policy.size_cap_bytes {
                 break;
             }
             if keep.remove(&entry.id) {
@@ -495,13 +487,10 @@ pub struct RetentionRoundReport {
 impl RetentionRoundReport {
     pub fn summary(&self) -> String {
         let mut lines = Vec::new();
-        if !self.unmeasured_snapshots.is_empty() {
-            lines.push("skipped size-based eviction".to_string());
-            for (id, reason) in &self.unmeasured_snapshots {
-                lines.push(format!(
-                    "kept snapshot {id} because its size could not be measured ({reason})"
-                ));
-            }
+        for (id, reason) in &self.unmeasured_snapshots {
+            lines.push(format!(
+                "kept snapshot {id} because its size could not be measured ({reason})"
+            ));
         }
         if let Some(collection) = &self.collection {
             lines.push(collection.summary());
@@ -626,25 +615,20 @@ fn run_retention_round(
             }
         })
         .collect();
-    let size_cap = report
-        .unmeasured_snapshots
-        .is_empty()
-        .then_some(policy.size_cap_bytes);
-    let to_evict = retention_plan_with_cap(&entries, policy, size_cap);
-    if let Some(size_cap) = size_cap {
-        let kept_manual_size: u64 = entries
-            .iter()
-            .filter(|entry| entry.is_preserved && !to_evict.contains(&entry.id))
-            .map(|entry| entry.size_bytes)
-            .sum();
-        if kept_manual_size > size_cap {
-            eprintln!(
-                "snapshots you made in {} use {} MB, over the {} MB limit; they are kept, but automatic snapshots may not fit. Delete some to free space.",
-                instance_dir.display(),
-                kept_manual_size / 1_000_000,
-                size_cap / 1_000_000
-            );
-        }
+    // Unmeasured snapshots stay protected and contribute zero to the measured total.
+    let to_evict = retention_plan_with_sizes(&entries, policy);
+    let kept_manual_size: u64 = entries
+        .iter()
+        .filter(|entry| entry.is_preserved && !to_evict.contains(&entry.id))
+        .map(|entry| entry.size_bytes)
+        .sum();
+    if kept_manual_size > policy.size_cap_bytes {
+        eprintln!(
+            "snapshots you made in {} use {} MB, over the {} MB limit; they are kept, but automatic snapshots may not fit. Delete some to free space.",
+            instance_dir.display(),
+            kept_manual_size / 1_000_000,
+            policy.size_cap_bytes / 1_000_000
+        );
     }
 
     // The whole batch goes first, then one collection over what is left: a collection between two
@@ -1594,6 +1578,7 @@ mod batch_tests {
             .iter()
             .any(|entry| entry.id == snapshot.id && !entry.is_unreadable()));
         let healthy = crate::snapshot::create_snapshot(&dir, Some("healthy"), &[]).unwrap();
+        assert!(crate::snapshot::snapshot_storage_size(&dir, &healthy.id).unwrap() > 1);
         let policy = RetentionPolicy {
             size_cap_bytes: 1,
             ..RetentionPolicy::default()
@@ -1604,9 +1589,8 @@ mod batch_tests {
             .expect("unmeasured snapshots belong in the round report");
         let summary = report.summary();
         assert!(summary.contains(&snapshot.id), "{summary}");
-        assert!(summary.contains("size-based eviction"), "{summary}");
         assert!(manifest.is_file() && zip.is_file());
-        assert!(crate::snapshot::snapshot_manifest_path(&dir, &healthy.id).is_file());
+        assert!(!crate::snapshot::snapshot_manifest_path(&dir, &healthy.id).exists());
     }
 
     #[test]
@@ -1631,7 +1615,6 @@ mod batch_tests {
         let summary = report.summary();
         assert!(summary.contains(&snapshot.id), "{summary}");
         assert!(summary.contains(&hash), "{summary}");
-        assert!(summary.contains("size-based eviction"), "{summary}");
         assert!(crate::snapshot::snapshot_manifest_path(&dir, &snapshot.id).is_file());
     }
 

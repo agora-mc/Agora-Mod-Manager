@@ -12,7 +12,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
@@ -377,7 +377,7 @@ fn reopened_migration_keeps_completed_counts_and_updates_findings() {
         migrate::migrate_snapshot_objects(&ctx).unwrap(),
         MigrationOutcome::NothingToDo
     ));
-    let quiet = migrate::migration_status(&ctx.paths).unwrap();
+    let quiet = migrate::migration_status(&ctx.paths).unwrap().unwrap();
     assert_eq!(
         (quiet.moved, quiet.already_present, quiet.replaced_damaged),
         (1, 1, 1)
@@ -400,7 +400,7 @@ fn reopened_migration_keeps_completed_counts_and_updates_findings() {
             repaired.already_present,
             repaired.replaced_damaged
         ),
-        (2, 1, 1)
+        (1, 0, 0)
     );
     assert_eq!(repaired.mismatched, vec![mismatch]);
     let mut expected_left_alone = first.left_alone;
@@ -408,6 +408,32 @@ fn reopened_migration_keeps_completed_counts_and_updates_findings() {
     expected_left_alone.sort_unstable();
     assert_eq!(repaired.left_alone, expected_left_alone);
     assert!(!repair.exists());
+    let completed = migrate::migration_status(&ctx.paths).unwrap().unwrap();
+    assert_eq!(
+        (
+            completed.moved,
+            completed.already_present,
+            completed.replaced_damaged
+        ),
+        (2, 1, 1)
+    );
+}
+
+#[test]
+fn migration_status_distinguishes_an_unreadable_record_from_absence() {
+    let (_dir, ctx) = fixture();
+    assert!(migrate::migration_status(&ctx.paths).unwrap().is_none());
+    fs::create_dir_all(legacy_root(&ctx)).unwrap();
+    done(migrate::migrate_snapshot_objects(&ctx).unwrap());
+    let path = migrate::journal_path(&ctx.paths);
+    let mut finished: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    finished["report"] = serde_json::Value::Null;
+    fs::write(&path, serde_json::to_vec(&finished).unwrap()).unwrap();
+
+    let error =
+        migrate::migration_status(&ctx.paths).expect_err("the finished report is unreadable");
+    assert!(error.contains(&path.display().to_string()), "{error}");
 }
 
 #[test]
@@ -420,6 +446,8 @@ fn startup_is_quiet_for_an_unchanged_mismatch_and_migrates_it_after_repair() {
         vec![bad.clone()]
     );
 
+    let path = migrate::journal_path(&ctx.paths);
+    let journal_before = fs::read(&path).unwrap();
     let quiet = crate::startup_recovery::run_at_startup(&ctx);
     assert!(
         quiet.actions.is_empty() && quiet.warnings.is_empty(),
@@ -427,8 +455,17 @@ fn startup_is_quiet_for_an_unchanged_mismatch_and_migrates_it_after_repair() {
     );
     assert!(!migrate::legacy_store_active(&ctx.paths));
     assert_eq!(fs::read(&bad).unwrap(), b"delivered");
+    assert_eq!(fs::read(&path).unwrap(), journal_before);
 
-    fs::write(&bad, b"still wrong").unwrap();
+    // Change the mtime while keeping the size fixed.
+    let older = fs::metadata(&bad).unwrap().modified().unwrap() - Duration::from_secs(60);
+    fs::write(&bad, b"bad bytes").unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&bad)
+        .unwrap()
+        .set_modified(older)
+        .unwrap();
     let changed = crate::startup_recovery::run_at_startup(&ctx);
     assert!(
         changed.warnings.iter().any(|line| line.contains(&hash)),
@@ -443,11 +480,44 @@ fn startup_is_quiet_for_an_unchanged_mismatch_and_migrates_it_after_repair() {
     fs::write(&bad, b"promised").unwrap();
     let repaired = crate::startup_recovery::run_at_startup(&ctx);
     assert!(
-        repaired.actions.iter().any(|line| line.contains("Moved 1")),
+        repaired.actions.iter().any(|line| line.contains("1 moved")),
         "{repaired:?}"
     );
     assert!(!bad.exists());
     assert_eq!(object_bytes(&ctx, &hash).as_deref(), Some(&b"promised"[..]));
+}
+
+#[test]
+fn a_legacy_root_replaced_by_a_file_after_done_needs_a_hand() {
+    let (_dir, ctx) = fixture();
+    let root = legacy_root(&ctx);
+    fs::create_dir_all(&root).unwrap();
+    done(migrate::migrate_snapshot_objects(&ctx).unwrap());
+    fs::remove_dir(&root).unwrap();
+    fs::write(&root, b"unexpected file").unwrap();
+
+    let outcome = migrate::migrate_snapshot_objects(&ctx).unwrap();
+    assert!(
+        matches!(outcome, MigrationOutcome::NeedsHand(_)),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn a_legacy_root_replaced_by_a_link_after_done_needs_a_hand() {
+    let (_dir, ctx) = fixture();
+    let root = legacy_root(&ctx);
+    fs::create_dir_all(&root).unwrap();
+    done(migrate::migrate_snapshot_objects(&ctx).unwrap());
+    fs::remove_dir(&root).unwrap();
+    let target = ctx.paths.root().join("replacement");
+    fs::create_dir(&target).unwrap();
+    assert!(make_folder_link(&target, &root));
+
+    let outcome = migrate::migrate_snapshot_objects(&ctx).unwrap();
+    assert!(
+        matches!(outcome, MigrationOutcome::NeedsHand(migrate::MigrationRefusal::LegacyLink(path)) if path == root)
+    );
 }
 
 #[test]
@@ -456,9 +526,24 @@ fn after_the_migration_a_collection_leaves_the_legacy_store_alone() {
     let _dir_live = instance_with_file(&ctx, "live", b"unused");
     let bad = plant_legacy(&ctx, &sha256_hex(b"promised"), b"delivered");
     done(migrate::migrate_snapshot_objects(&ctx).unwrap());
+    let orphan_hash = sha256_hex(b"an old orphan");
+    let orphan = ctx.paths.content_object_path(&orphan_hash);
+    fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    fs::write(&orphan, b"an old orphan").unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&orphan)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(2 * 3600))
+        .unwrap();
 
     let report = content_store::collect::collect_with_ctx(&ctx, &CollectRequest::default());
 
+    assert!(!report.refused(), "{report:?}");
+    assert!(
+        report.deleted.contains(&orphan_hash) && !orphan.exists(),
+        "{report:?}"
+    );
     assert!(
         bad.exists(),
         "a kept mismatch is not swept once the store is retired: {report:?}"

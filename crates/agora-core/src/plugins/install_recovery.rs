@@ -1369,7 +1369,10 @@ pub fn journal_report(
                 "The journal is already settled: recovery has nothing to do.".to_string(),
                 true,
             ),
-            recovery::ReadOnlyDecision::Busy(why) => (recovery::RecoveryOutcome::Busy, why, true),
+            recovery::ReadOnlyDecision::Busy(why)
+            | recovery::ReadOnlyDecision::UnprovenWriter(why) => {
+                (recovery::RecoveryOutcome::Busy, why, true)
+            }
             recovery::ReadOnlyDecision::NeedsHand(why) => {
                 (recovery::RecoveryOutcome::NeedsHand, why, true)
             }
