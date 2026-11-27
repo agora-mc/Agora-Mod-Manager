@@ -4251,7 +4251,7 @@ async fn download_library_with_pin(
                 return Ok(());
             }
         }
-        check_launch_request(&policy, lib_category)?;
+        check_launch_request(policy, lib_category)?;
         let bytes = download_verified_inner(client, &artifact.url, lib_category).await?;
         if download::sha256_hex(&bytes) != sha256.as_str() {
             return Err(LauncherError::HashMismatch);
@@ -4281,7 +4281,7 @@ async fn download_library_with_pin(
     if observed_cache_matches(path, artifact.size) {
         return Ok(());
     }
-    check_launch_request(&policy, lib_category)?;
+    check_launch_request(policy, lib_category)?;
     let bytes = download_verified_inner(client, &artifact.url, lib_category).await?;
     let observed = download::sha256_hex(&bytes);
     atomic_write(path, &bytes)?;

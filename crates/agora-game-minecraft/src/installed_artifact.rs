@@ -739,7 +739,7 @@ pub fn adopt_asset_objects(
         }
 
         // Not in cache, not in installed source — check network policy
-        check_launch_request(&network_policy, NetworkCategory::MojangContent)?;
+        check_launch_request(network_policy, NetworkCategory::MojangContent)?;
         // If network is allowed, we'd download. But in the adopted profile
         // materialize path, we may want to error instead since we expected
         // assets to already be installed.
