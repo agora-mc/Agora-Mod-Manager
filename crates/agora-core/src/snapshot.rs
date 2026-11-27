@@ -3189,6 +3189,16 @@ fn list_snapshots_with(
 /// Delete a snapshot. A user-requested delete waits briefly for a passing instance move or scan;
 /// if the lock is still busy it refuses, with the holder named in the retry message.
 pub fn delete_snapshot(instance_dir: &Path, snapshot_id: &str) -> Result<(), String> {
+    delete_snapshot_collecting(instance_dir, snapshot_id, None).map(|_| ())
+}
+
+/// [`delete_snapshot`] whose result carries what the collection did with the objects the snapshot
+/// no longer holds: what it reclaimed, what it kept and why. Deleting the snapshot succeeds either
+/// way; showing the report is the adapter's job (MASTER_SPEC §32.8).
+pub fn delete_snapshot_with_report(
+    instance_dir: &Path,
+    snapshot_id: &str,
+) -> Result<crate::content_store::collect::CollectReport, String> {
     delete_snapshot_collecting(instance_dir, snapshot_id, None)
 }
 
@@ -3202,7 +3212,7 @@ pub(crate) fn delete_snapshot_collecting(
     instance_dir: &Path,
     snapshot_id: &str,
     grace: Option<std::time::Duration>,
-) -> Result<(), String> {
+) -> Result<crate::content_store::collect::CollectReport, String> {
     let manager = LockManager::new(snapshot_store_paths(instance_dir).locks_root());
     let store = manager
         .acquire(LockResource::ContentStore, "snapshot-delete")
@@ -3232,10 +3242,9 @@ pub(super) fn delete_snapshot_with(
     locations: &LockGuard,
     store: &LockGuard,
     grace: Option<std::time::Duration>,
-) -> Result<(), String> {
+) -> Result<crate::content_store::collect::CollectReport, String> {
     delete_snapshot_records(instance_dir, snapshot_id)?;
-    finish_snapshot_delete(instance_dir, snapshot_id, locations, store, grace, None)?;
-    Ok(())
+    finish_snapshot_delete(instance_dir, snapshot_id, locations, store, grace)
 }
 
 /// Remove one snapshot's own records — its manifest or zip, the receipt beside it and its
@@ -3271,33 +3280,27 @@ pub(super) fn delete_snapshot_records(
 }
 
 /// Collect after a snapshot (or a whole batch of them) has been removed, and tidy an empty
-/// snapshots folder.
+/// snapshots folder. The report says what the collection freed, or why it freed nothing.
 fn finish_snapshot_delete(
     instance_dir: &Path,
     snapshot_id: &str,
     _locations: &LockGuard,
     store: &LockGuard,
     grace: Option<std::time::Duration>,
-    request: Option<&crate::content_store::collect::CollectRequest>,
 ) -> Result<crate::content_store::collect::CollectReport, String> {
     // Nothing names this snapshot's objects now: the one collection decides whether any record
     // still does, and says why it kept them if it cannot tell.
-    let owned;
-    let request = match request {
-        Some(request) => request,
-        None => {
-            owned = crate::content_store::collect::CollectRequest {
-                store: crate::content_store::collect::LockRequest::Held,
-                locations: crate::content_store::collect::LockRequest::Held,
-                grace,
-                ignore_unreadable_snapshots: false,
-                pause: None,
-            };
-            &owned
-        }
-    };
-    let report = crate::content_store::collect::collect_at_instance(instance_dir, request)
-        .map_err(|error| format!("snapshot {snapshot_id} was deleted, but {error}"))?;
+    let report = crate::content_store::collect::collect_at_instance(
+        instance_dir,
+        &crate::content_store::collect::CollectRequest {
+            store: crate::content_store::collect::LockRequest::Held,
+            locations: crate::content_store::collect::LockRequest::Held,
+            grace,
+            ignore_unreadable_snapshots: false,
+            pause: None,
+        },
+    )
+    .map_err(|error| format!("snapshot {snapshot_id} was deleted, but {error}"))?;
     let _ = store;
 
     let dir = snapshots_dir(instance_dir);
@@ -3411,7 +3414,7 @@ pub(crate) fn prune_unreferenced_objects_with_pause(
     if report.refused() {
         return Err(format!(
             "nothing was swept from the object stores: {}",
-            report.summary()
+            report.refusal_reasons()
         ));
     }
     Ok(())

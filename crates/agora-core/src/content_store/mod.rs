@@ -2404,11 +2404,14 @@ pub fn remove_item(ctx: &Ctx, item_id_or_prefix: &str) -> Result<(), ContentErro
     remove_item_with_options(ctx, item_id_or_prefix, RemoveOptions::default())
 }
 
-pub fn remove_item_with_options(
+/// [`remove_item`] whose result carries what the collection did with the objects the item named:
+/// what it reclaimed, what it kept and why. The removal itself succeeds either way; the report is
+/// for the person who asked for it, and printing it is the adapter's job (MASTER_SPEC §32.8).
+pub fn remove_item_with_report(
     ctx: &Ctx,
     item_id_or_prefix: &str,
     options: RemoveOptions,
-) -> Result<(), ContentError> {
+) -> Result<collect::CollectReport, ContentError> {
     let _lock = ctx
         .lock_manager
         .acquire(LockResource::ContentStore, "content-remove")?;
@@ -2587,17 +2590,19 @@ pub fn remove_item_with_options(
             ignore_unreadable_snapshots: options.ignore_unreadable_snapshots,
         },
     );
-    if report.refused() {
-        eprintln!(
-            "[content] removed {item_id}, but no stored object was reclaimed: {}",
-            report.summary()
-        );
-    }
-
     // 3. Clean up any staging leftovers
     clean_staging_dir(&ctx.paths);
 
-    Ok(())
+    Ok(report)
+}
+
+/// [`remove_item_with_report`] when the caller only needs the removal to have happened.
+pub fn remove_item_with_options(
+    ctx: &Ctx,
+    item_id_or_prefix: &str,
+    options: RemoveOptions,
+) -> Result<(), ContentError> {
+    remove_item_with_report(ctx, item_id_or_prefix, options).map(|_| ())
 }
 
 #[cfg(test)]

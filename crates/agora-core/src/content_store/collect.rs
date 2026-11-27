@@ -89,7 +89,7 @@ impl Default for CollectRequest {
 
 /// What one collection did.
 #[derive(Debug, Default)]
-pub(crate) struct CollectReport {
+pub struct CollectReport {
     /// The object names it removed, from either store.
     pub deleted: Vec<String>,
     /// The object names it kept only because they are younger than the grace period.
@@ -105,20 +105,51 @@ pub(crate) struct CollectReport {
     pub notes: Vec<String>,
 }
 
+/// What one collection did, as an adapter hands it back to the person who asked: one line for a
+/// person, and the two facts a front end words its own line from (MASTER_SPEC §32.8).
+///
+/// A removal, a snapshot delete and a retention round all report through this, so the CLI and the
+/// desktop say the same thing about the same collection. Nothing here is a failure of the
+/// operation that asked for the collection: the item or snapshot is gone either way.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectOutcome {
+    /// One line: what was reclaimed, or that nothing was and why. Begins in lower case so a caller
+    /// can put it after a colon, and reads as "nothing was reclaimed: <why>" when it refused.
+    pub summary: String,
+    /// How many stored objects it freed.
+    pub reclaimed: usize,
+    /// Whether it refused to delete anything at all. `summary` says why.
+    pub refused: bool,
+}
+
 impl CollectReport {
     /// Whether the collection refused to delete anything.
-    pub(crate) fn refused(&self) -> bool {
+    pub fn refused(&self) -> bool {
         !self.refusals.is_empty()
     }
 
+    /// Why it deleted nothing, as one line; empty when it deleted what it could.
+    pub fn refusal_reasons(&self) -> String {
+        self.refusals.join("; ")
+    }
+
+    /// What a caller shows the person who asked, or writes to the support log.
+    pub fn outcome(&self) -> CollectOutcome {
+        CollectOutcome {
+            summary: self.summary(),
+            reclaimed: self.deleted.len(),
+            refused: self.refused(),
+        }
+    }
+
     /// One line for a person: what was reclaimed, or what was not and why.
-    pub(crate) fn summary(&self) -> String {
+    pub fn summary(&self) -> String {
         let mut parts = Vec::new();
         if self.refused() {
-            parts.push(format!(
-                "kept every stored object: {}",
-                self.refusals.join("; ")
-            ));
+            // Nothing was deleted at all, so the reasons are the report: a caller puts this after
+            // "nothing was reclaimed:".
+            parts.push(format!("nothing was reclaimed: {}", self.refusal_reasons()));
         } else {
             if !self.deleted.is_empty() {
                 parts.push(format!("reclaimed {} object(s)", self.deleted.len()));

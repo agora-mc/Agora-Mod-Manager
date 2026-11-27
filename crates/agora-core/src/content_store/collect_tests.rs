@@ -374,6 +374,49 @@ fn a_snapshot_blob_survives_until_the_last_snapshot_goes() {
     );
 }
 
+/// A snapshot delete's own result carries what the collection did, so the CLI and the desktop can
+/// say what was reclaimed instead of the core printing it (MASTER_SPEC §32.8).
+#[test]
+fn a_snapshot_delete_reports_what_its_collection_reclaimed() {
+    let (_dir, ctx) = fixture();
+    let dir = instance_with_file(&ctx, "live", b"snapshot bytes");
+    let snap = snapshot::create_snapshot(&dir, None, &["mods"]).unwrap();
+    let hash = sha256_hex(b"snapshot bytes");
+
+    let report = snapshot::delete_snapshot_collecting(&dir, &snap.id, Some(Duration::ZERO))
+        .expect("the delete and its collection ran");
+    assert!(
+        !report.refused(),
+        "the collection ran: {:?}",
+        report.refusals
+    );
+    let outcome = report.outcome();
+    assert_eq!(outcome.reclaimed, 1, "the freed object is reported");
+    assert_eq!(report.deleted, vec![hash]);
+}
+
+/// The delete an adapter calls carries the report as well, including a collection that keeps
+/// everything: a fresh object is inside the grace period, and the report says so rather than
+/// leaving the caller to guess (MASTER_SPEC §32.8).
+#[test]
+fn a_snapshot_delete_through_the_adapter_entry_point_reports_keeping_a_fresh_object() {
+    let (_dir, ctx) = fixture();
+    let dir = instance_with_file(&ctx, "fresh", b"fresh bytes");
+    let snap = snapshot::create_snapshot(&dir, None, &["mods"]).unwrap();
+    let hash = sha256_hex(b"fresh bytes");
+
+    let report = snapshot::delete_snapshot_with_report(&dir, &snap.id)
+        .expect("the delete and its collection ran");
+    let outcome = report.outcome();
+    assert!(!outcome.refused, "{outcome:?}");
+    assert_eq!(outcome.reclaimed, 0, "{outcome:?}");
+    assert!(
+        outcome.summary.contains("grace period"),
+        "the report says why the object stayed: {outcome:?}"
+    );
+    assert!(object_exists(&ctx, &hash));
+}
+
 #[test]
 fn an_object_inside_the_grace_period_is_kept_and_freed_after_it() {
     let (_dir, ctx) = fixture();
@@ -621,6 +664,44 @@ fn removing_an_item_frees_only_what_nothing_else_names() {
         "another item's object is untouched"
     );
     assert!(ctx.paths.content_item_path(&theirs_id).is_file());
+}
+
+/// The removal's own result carries what the collection did, so the caller can say what was
+/// reclaimed instead of the core printing it (MASTER_SPEC §32.8).
+#[test]
+fn a_removal_reports_what_its_collection_reclaimed() {
+    let (_dir, ctx) = fixture();
+    let work = tempfile::tempdir().unwrap();
+    let file = work.path().join("mine.jar");
+    fs::write(&file, b"mine only").unwrap();
+    let item_id = content_store::add_file(&ctx, &file, Some("mine"), None)
+        .unwrap()
+        .item()
+        .item_id
+        .clone();
+    let hash = sha256_hex(b"mine only");
+
+    let report = content_store::remove_item_with_report(
+        &ctx,
+        &item_id,
+        content_store::RemoveOptions::default(),
+    )
+    .unwrap();
+
+    assert!(
+        !report.refused(),
+        "the collection ran: {:?}",
+        report.refusals
+    );
+    assert_eq!(
+        report.deleted,
+        vec![hash],
+        "the report names the object the removal freed"
+    );
+    let outcome = report.outcome();
+    assert_eq!(outcome.reclaimed, 1);
+    assert!(!outcome.refused);
+    assert_eq!(outcome.summary, "reclaimed 1 object(s)");
 }
 
 // ---------------------------------------------------------------------------
