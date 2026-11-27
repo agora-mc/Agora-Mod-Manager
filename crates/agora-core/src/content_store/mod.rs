@@ -610,6 +610,10 @@ impl Drop for StagingGuard {
 }
 
 fn clean_staging_dir(paths: &AppPaths) {
+    clean_staging_dir_with(paths, &process_identity::OsProcesses);
+}
+
+fn clean_staging_dir_with(paths: &AppPaths, processes: &dyn process_identity::ProcessView) {
     let staging_root = paths.content_staging_dir();
     let entries = match std::fs::read_dir(&staging_root) {
         Ok(entries) => entries,
@@ -633,7 +637,7 @@ fn clean_staging_dir(paths: &AppPaths) {
                 // can be here while it is still filling it: sweeping it would delete a file
                 // another writer is about to place. A folder whose owner is still running, or
                 // whose name cannot be read as one, stays.
-                if staging_entry_belongs_to_a_running_process(&entry.file_name()) {
+                if staging_entry_belongs_to_a_running_process(&entry.file_name(), processes) {
                     continue;
                 }
                 to_remove.push(entry.path());
@@ -656,7 +660,10 @@ fn clean_staging_dir(paths: &AppPaths) {
 /// Whether a staging folder's name says a process that is still running owns it. Anything this
 /// cannot read as a live process's folder — a name it does not understand, a process it cannot
 /// ask about — answers yes, which keeps the folder.
-fn staging_entry_belongs_to_a_running_process(name: &std::ffi::OsStr) -> bool {
+fn staging_entry_belongs_to_a_running_process(
+    name: &std::ffi::OsStr,
+    processes: &dyn process_identity::ProcessView,
+) -> bool {
     let Some(name) = name.to_str() else {
         return true;
     };
@@ -666,7 +673,7 @@ fn staging_entry_belongs_to_a_running_process(name: &std::ffi::OsStr) -> bool {
     let Ok(pid) = pid.parse::<u32>() else {
         return true;
     };
-    process_identity::capture(pid).is_ok()
+    !matches!(processes.lookup(pid), process_identity::Lookup::Absent)
 }
 
 fn hash_file_path(path: &Path) -> Result<String, std::io::Error> {
@@ -704,10 +711,7 @@ pub(super) fn hash_file_counting(path: &Path) -> Result<(String, u64), std::io::
 /// Copy `src` to `dst` while hashing the bytes, reading through `buf`. Returns the bytes copied and
 /// their SHA-256 (lowercase hex).
 ///
-/// The staged bytes are synced before this returns, so every path that stages through here — an
-/// added item's files, a folder add, one object on its way in — has them durable before the rename
-/// that gives them their name. A crash between the write and the rename must not leave an object
-/// that reads back as the content it is not.
+/// Placement syncs the staged bytes immediately before they enter the store.
 fn copy_and_hash(src: &Path, dst: &Path, buf: &mut [u8]) -> Result<(u64, String), std::io::Error> {
     use std::io::Write;
     let mut file_in = std::fs::File::open(src)?;
@@ -723,7 +727,6 @@ fn copy_and_hash(src: &Path, dst: &Path, buf: &mut [u8]) -> Result<(u64, String)
         staged_out.write_all(&buf[..n])?;
         hasher.update(&buf[..n]);
     }
-    staged_out.sync_all()?;
     Ok((bytes_written, format!("{:x}", hasher.finalize())))
 }
 
@@ -1329,32 +1332,57 @@ fn place_object(
     entry: &StagedEntry,
     replace: bool,
 ) -> Result<Placed, ContentError> {
+    place_object_with_rename(paths, entry, replace, |from, to| {
+        crate::recovery::durable_rename(from, to, true)
+    })
+}
+
+fn place_object_with_rename(
+    paths: &AppPaths,
+    entry: &StagedEntry,
+    replace: bool,
+    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<Placed, ContentError> {
     let obj_path = paths.content_object_path(&entry.sha256);
     if let Some(parent) = obj_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    if obj_path.exists() && !replace && object_is_trustworthy(&obj_path, entry.size, &entry.sha256)?
-    {
+    let present = match std::fs::symlink_metadata(&obj_path) {
+        Ok(metadata) if metadata.is_file() => true,
+        Ok(_) => {
+            return Err(ContentError::Other(format!(
+                "{} is not an object file",
+                obj_path.display()
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if present && !replace && object_is_trustworthy(&obj_path, entry.size, &entry.sha256)? {
         let _ = std::fs::remove_file(&entry.staged_path);
         if protect::protection(&obj_path)? != Protection::Protected {
             protect::protect(&obj_path)?;
         }
-        Ok(Placed::Present)
-    } else if obj_path.exists() {
-        // The object no longer holds what its name says (changed while unprotected, or
-        // truncated): the staged bytes are the real content, so they replace it. Protecting
-        // the old bytes as they are would turn a corruption into the recorded truth.
-        protect::unprotect(&obj_path)?;
-        std::fs::remove_file(&obj_path)?;
-        std::fs::rename(&entry.staged_path, &obj_path)?;
-        protect::protect_by_handle(&obj_path)?;
-        Ok(Placed::New)
-    } else {
-        std::fs::rename(&entry.staged_path, &obj_path)?;
-        protect::protect_by_handle(&obj_path)?;
-        Ok(Placed::New)
+        return Ok(Placed::Present);
     }
+
+    sync_staged_object(&entry.staged_path)?;
+    // Windows protection denies DELETE. Clear it for the replacement but leave the old name in
+    // place until the rename succeeds. Restore the protection if the rename fails.
+    let unprotect =
+        cfg!(windows) && present && protect::protection(&obj_path)? == Protection::Protected;
+    if unprotect {
+        protect::unprotect(&obj_path)?;
+    }
+    if let Err(error) = rename(&entry.staged_path, &obj_path) {
+        if unprotect {
+            protect::protect(&obj_path)?;
+        }
+        return Err(error.into());
+    }
+    protect::protect_by_handle(&obj_path)?;
+    Ok(Placed::New)
 }
 
 /// Put the bytes of `source` into the one object store, returning the object's SHA-256 and size.
@@ -1373,8 +1401,8 @@ pub(crate) fn place_object_from_file(
     Ok((sha256, size))
 }
 
-/// One file's bytes on their way into the store: written into this writer's own staging folder,
-/// hashed in the same pass, and synced, all before the content-store lock is taken.
+/// One file's bytes on their way into the store: written into this writer's own staging folder
+/// and hashed in the same pass, before the content-store lock is taken.
 ///
 /// Staging outside the lock is what keeps a capture or an import from holding the store lock for
 /// the length of a file copy. Only the question "is a trustworthy object already here?" and the
@@ -1456,7 +1484,6 @@ pub(crate) fn place_object_from_bytes_locked(
     let mut guard = StagingGuard::new(&staging_dir);
     let staged_path = staging_dir.join("object");
     std::fs::write(&staged_path, bytes)?;
-    sync_staged_object(&staged_path)?;
     place_staged(paths, staged_path, size, sha256.clone())?;
     guard.active = false;
     let _ = std::fs::remove_dir_all(&staging_dir);
@@ -1843,6 +1870,28 @@ pub fn record_game_if_missing(
         write_manifest_atomic(&ctx.paths, &item)?;
     }
     Ok(item)
+}
+
+/// Record the watcher classification only while the icon in its add result is still current.
+pub(crate) fn record_watched_download_game(
+    ctx: &Ctx,
+    observed: &ContentItem,
+    game_id: &str,
+) -> Result<(), ContentError> {
+    let _lock = ctx
+        .lock_manager
+        .acquire(LockResource::ContentStore, "content-metadata")?;
+    let mut current = get_item(ctx, &observed.item_id)?;
+    if current.icon_sha256 != observed.icon_sha256 {
+        return Ok(());
+    }
+    if let Some(icon) = &current.icon_sha256 {
+        if !is_sha256_hex(icon) || !ctx.paths.content_object_path(icon).is_file() {
+            return Ok(());
+        }
+    }
+    current.game_id = Some(game_id.to_string());
+    write_manifest_atomic(&ctx.paths, &current)
 }
 
 /// [`set_item_metadata`] for a caller that already holds the content-store lock. Taking the lock
@@ -2603,6 +2652,93 @@ pub fn remove_item_with_options(
     options: RemoveOptions,
 ) -> Result<(), ContentError> {
     remove_item_with_report(ctx, item_id_or_prefix, options).map(|_| ())
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    fn staged_object(paths: &AppPaths, bytes: &[u8]) -> StagedEntry {
+        let staged_path = paths.root().join("staged");
+        std::fs::write(&staged_path, bytes).unwrap();
+        StagedEntry {
+            rel_path: validate_entry_path("staged").unwrap(),
+            staged_path,
+            size: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        }
+    }
+
+    #[test]
+    fn a_failed_replacement_leaves_the_old_object_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_root(dir.path().to_path_buf());
+        let entry = staged_object(&paths, b"correct bytes");
+        let object = paths.content_object_path(&entry.sha256);
+        std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+        std::fs::write(&object, b"damaged").unwrap();
+        protect::protect(&object).unwrap();
+        let result = place_object_with_rename(&paths, &entry, true, |_, _| {
+            Err(std::io::Error::other("test refused rename"))
+        });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("test refused rename"));
+        assert_eq!(
+            std::fs::read(&object).expect("replacement lost the old object"),
+            b"damaged"
+        );
+        assert_eq!(protect::protection(&object).unwrap(), Protection::Protected);
+        assert_eq!(place_object(&paths, &entry, true).unwrap(), Placed::New);
+        assert_eq!(std::fs::read(&object).unwrap(), b"correct bytes");
+        protect::unprotect(&object).unwrap();
+    }
+
+    #[test]
+    fn staging_open_failure_stops_placement_before_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_root(dir.path().to_path_buf());
+        let entry = staged_object(&paths, b"missing staged object");
+        std::fs::remove_file(&entry.staged_path).unwrap();
+        let tried_rename = std::cell::Cell::new(false);
+        let result = place_object_with_rename(&paths, &entry, false, |_, _| {
+            tried_rename.set(true);
+            Err(std::io::Error::other(
+                "rename should not have been attempted",
+            ))
+        });
+        assert!(result.is_err());
+        assert!(
+            !tried_rename.get(),
+            "rename ran without a staged-file flush"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_process_lookup_keeps_the_staging_folder() {
+        struct Unreadable;
+        impl process_identity::ProcessView for Unreadable {
+            fn lookup(&self, _pid: u32) -> process_identity::Lookup {
+                process_identity::Lookup::CantTell("test process table is unreadable".into())
+            }
+
+            fn job_members(&self, _job: &str) -> Result<usize, String> {
+                unreachable!("staging ownership only needs the PID")
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_root(dir.path().to_path_buf());
+        let stage = paths.content_staging_dir().join("12345-in-progress");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("object"), b"still writing").unwrap();
+        clean_staging_dir_with(&paths, &Unreadable);
+        assert!(
+            stage.join("object").is_file(),
+            "an unreadable PID is not proof of death"
+        );
+    }
 }
 
 #[cfg(test)]

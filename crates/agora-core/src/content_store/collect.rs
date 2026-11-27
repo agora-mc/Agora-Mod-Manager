@@ -182,11 +182,14 @@ impl CollectReport {
 ///
 /// `identity` is the one liveness check (32.13) as a function, so a context's seam reaches it and a
 /// caller without a context still asks the real process table.
-pub(crate) fn collect(
+fn collect(
     paths: &AppPaths,
     identity: &dyn Fn(&ProcessIdentity) -> ProcessCheck,
     request: &CollectRequest,
+    after_live_listing: Option<&(dyn Fn() + Send + Sync)>,
 ) -> Result<CollectReport, String> {
+    #[cfg(test)]
+    COLLECTION_COUNT.set(COLLECTION_COUNT.get() + 1);
     let manager = LockManager::new(paths.locks_root());
     // Store lock first, then instance locations: the order every caller uses, so two collectors
     // and an instance move cannot deadlock.
@@ -235,7 +238,9 @@ pub(crate) fn collect(
     if let Err(error) = owners.read_items(paths, &mut keep, &mut report) {
         report.refusals.push(error);
     }
-    if let Err(error) = owners.read_instances(paths, request, &mut keep, &mut report) {
+    if let Err(error) =
+        owners.read_instances(paths, request, &mut keep, &mut report, after_live_listing)
+    {
         report.refusals.push(error);
     }
 
@@ -295,6 +300,7 @@ pub(crate) fn collect_with_ctx(ctx: &crate::ctx::Ctx, request: &CollectRequest) 
         &ctx.paths,
         &|identity| ctx.process_check(identity),
         &request,
+        ctx.test_seams.object_collection_after_live().as_deref(),
     ) {
         Ok(report) => report,
         Err(error) => CollectReport {
@@ -315,7 +321,18 @@ pub(crate) fn collect_at_instance(
         &paths,
         &|identity| crate::process_identity::check(identity),
         request,
+        None,
     )
+}
+
+#[cfg(test)]
+thread_local! {
+    static COLLECTION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_collection_count() -> usize {
+    COLLECTION_COUNT.replace(0)
 }
 
 /// Take one lock for a collection.
@@ -434,6 +451,7 @@ impl Owners {
         request: &CollectRequest,
         keep: &mut HashSet<String>,
         report: &mut CollectReport,
+        after_live_listing: Option<&(dyn Fn() + Send + Sync)>,
     ) -> Result<(), String> {
         let mut instances: Vec<PathBuf> = Vec::new();
         let mut collect_folder = |path: &Path, report: &mut CollectReport| -> Result<(), String> {
@@ -456,6 +474,9 @@ impl Owners {
             Ok(())
         };
         self.folder_entries(&paths.instances_root(), report, &mut collect_folder)?;
+        if let Some(hook) = after_live_listing {
+            hook();
+        }
 
         for root in [
             paths.recently_deleted_root(),
@@ -768,11 +789,19 @@ fn read_object_root(
     candidates: &mut Vec<(String, PathBuf)>,
     recent: &mut Vec<String>,
 ) -> Result<(), String> {
-    let shards = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(format!(
+                "{} is a link or not a folder, so the objects in it cannot be listed; nothing is deleted",
+                root.display()
+            ));
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("cannot list {}: {error}", root.display())),
-    };
+        Err(error) => return Err(format!("cannot inspect {}: {error}", root.display())),
+    }
+    let shards = std::fs::read_dir(root)
+        .map_err(|error| format!("cannot list {}: {error}", root.display()))?;
     for shard in shards {
         let shard = shard
             .map_err(|error| format!("cannot read an entry in {}: {error}", root.display()))?

@@ -279,7 +279,7 @@ pub(crate) fn rename_directory(from: &Path, to: &Path) -> std::io::Result<()> {
     durable_rename(from, to, false)
 }
 
-fn durable_rename(from: &Path, to: &Path, replace: bool) -> std::io::Result<()> {
+pub(crate) fn durable_rename(from: &Path, to: &Path, replace: bool) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;

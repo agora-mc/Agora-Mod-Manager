@@ -519,9 +519,32 @@ pub fn run_backup_retention(
     instance_dir: &Path,
     policy: &BackupRetentionPolicy,
 ) -> Result<Vec<String>, String> {
+    run_backup_retention_with_report(instance_dir, policy).map(|(evicted, _)| evicted)
+}
+
+type BackupRetentionResult = (
+    Vec<String>,
+    Option<crate::content_store::collect::CollectReport>,
+);
+
+fn run_backup_retention_with_report(
+    instance_dir: &Path,
+    policy: &BackupRetentionPolicy,
+) -> Result<BackupRetentionResult, String> {
+    use crate::content_store::collect::{self, CollectRequest, LockRequest};
+    use crate::lock_manager::{LockManager, LockResource};
+
+    let paths = crate::snapshot::snapshot_store_paths(instance_dir);
+    let manager = LockManager::new(paths.locks_root());
+    let _store = manager
+        .acquire(LockResource::ContentStore, "backup-retention")
+        .map_err(|error| error.to_string())?;
+    let _locations =
+        crate::snapshot::lock_snapshot_locations(instance_dir, "backup-retention", true)?;
+
     // Concurrency guard: never mutate snapshots while a restore holds the marker.
     if instance_dir.join(crate::snapshot::RESTORE_MARKER).exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
 
     let snapshots = match crate::snapshot::list_snapshots(instance_dir) {
@@ -530,13 +553,13 @@ pub fn run_backup_retention(
             // `list_snapshots` errors precisely when the restore marker is
             // present (`snapshot.rs:1769`).  Treat it as "skip retention".
             if error.contains("Previous restore was interrupted") {
-                return Ok(Vec::new());
+                return Ok((Vec::new(), None));
             }
             return Err(error);
         }
     };
     if snapshots.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
 
     // A recovery pointer that cannot be read is "cannot tell", not "nothing was
@@ -554,19 +577,30 @@ pub fn run_backup_retention(
         if instance_dir.join(crate::snapshot::RESTORE_MARKER).exists() {
             break;
         }
-        match crate::snapshot::delete_snapshot(instance_dir, &id) {
+        match crate::snapshot::delete_snapshot_records(instance_dir, &id) {
             Ok(()) => evicted.push(id),
             Err(error) => errors.push(format!("{id}: {error}")),
         }
     }
-    if errors.is_empty() {
-        Ok(evicted)
-    } else {
-        Err(format!(
+    if !errors.is_empty() {
+        return Err(format!(
             "backup retention could not remove: {}",
             errors.join("; ")
-        ))
+        ));
     }
+    let report = if evicted.is_empty() {
+        None
+    } else {
+        Some(collect::collect_at_instance(
+            instance_dir,
+            &CollectRequest {
+                store: LockRequest::Held,
+                locations: LockRequest::Held,
+                ..CollectRequest::default()
+            },
+        )?)
+    };
+    Ok((evicted, report))
 }
 
 // ---------------------------------------------------------------------------
@@ -920,10 +954,9 @@ fn read_and_validate_manifest<R: Read + std::io::Seek>(
     }
     drop(manifest_entry);
 
-    let mut manifest: BackupManifest = serde_json::from_slice(&manifest_bytes)
+    let manifest: BackupManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| format!("failed to parse backup manifest: {error}"))?;
     validate_backup_manifest(&manifest)?;
-    normalize_backup_hashes(&mut manifest);
     Ok(manifest)
 }
 
@@ -1182,13 +1215,16 @@ pub fn import_backup(
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|error| format!("failed to read backup zip: {error}"))?;
 
-    let manifest = read_and_validate_manifest(&mut archive)?;
+    let mut manifest = read_and_validate_manifest(&mut archive)?;
     validate_zip_file_set(&mut archive, &manifest)?;
     verify_zip_entries_hash(&mut archive, &manifest)?;
 
     if manifest.kind == BackupKind::GameInstance {
-        return import_game_backup(instance_dir, artifact_path, &manifest);
+        let member_hashes = content_objects(&manifest.content_items);
+        normalize_backup_hashes(&mut manifest);
+        return import_game_backup(instance_dir, artifact_path, &manifest, member_hashes);
     }
+    normalize_backup_hashes(&mut manifest);
 
     // Phase 2: stage the validated content to a sibling directory on the same
     // volume as `instance_dir` so promotions are same-volume renames.
@@ -1894,7 +1930,9 @@ pub fn read_backup_manifest(artifact_path: &Path) -> Result<BackupManifest, Stri
         .map_err(|error| format!("failed to open backup artifact: {error}"))?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|error| format!("failed to read backup zip: {error}"))?;
-    read_and_validate_manifest(&mut archive)
+    let mut manifest = read_and_validate_manifest(&mut archive)?;
+    normalize_backup_hashes(&mut manifest);
+    Ok(manifest)
 }
 
 /// What a backup import would need, before anything is downloaded or written.
@@ -2250,6 +2288,7 @@ fn import_game_backup(
     instance_dir: &Path,
     artifact_path: &Path,
     manifest: &BackupManifest,
+    member_hashes: BTreeMap<String, u64>,
 ) -> Result<crate::snapshot::Snapshot, String> {
     if instance_dir.join(crate::snapshot::RESTORE_MARKER).exists() {
         return Err(
@@ -2422,12 +2461,14 @@ fn import_game_backup(
         }
 
         if manifest.includes_content_bytes {
-            for (hash, size) in content_objects(&manifest.content_items) {
+            for (hash, size) in member_hashes {
                 let name = content_object_zip_path(&hash);
                 let mut zip_entry = archive.by_name(&name).map_err(|error| {
                     format!("backup content object {name} missing during stage: {error}")
                 })?;
-                let dest = staging_dir.join(CONTENT_OBJECTS_PREFIX).join(&hash);
+                let dest = staging_dir
+                    .join(CONTENT_OBJECTS_PREFIX)
+                    .join(hash.to_ascii_lowercase());
                 if let Some(parent) = dest.parent() {
                     fs::create_dir_all(parent)
                         .map_err(|error| format!("failed to create staging parent: {error}"))?;
@@ -2708,12 +2749,23 @@ pub async fn apply_instance_retention(
     instance_id: &str,
     policy: BackupRetentionPolicy,
 ) -> crate::error::LauncherResult<Vec<String>> {
+    apply_instance_retention_with_report(ctx, instance_id, policy)
+        .await
+        .map(|(evicted, _)| evicted)
+}
+
+/// Apply backup retention and return its one collection report along with the evicted IDs.
+pub async fn apply_instance_retention_with_report(
+    ctx: &crate::ctx::Ctx,
+    instance_id: &str,
+    policy: BackupRetentionPolicy,
+) -> crate::error::LauncherResult<BackupRetentionResult> {
     let sanitized = crate::paths::sanitize_id(instance_id);
     let instance_dir = ctx.paths.instance_dir(&sanitized)?;
     ctx.task_scheduler
         .run_blocking(
             crate::task_scheduler::BlockingPriority::Background,
-            move || run_backup_retention(&instance_dir, &policy),
+            move || run_backup_retention_with_report(&instance_dir, &policy),
         )
         .await
         .map_err(|e| backup_error(format!("Backup retention task failed: {e}")))?
@@ -3351,6 +3403,79 @@ mod tests {
         // Verify the two older snapshots are gone.
         assert!(crate::snapshot::snapshot_file_index(&instance, &a.id).is_err());
         assert!(crate::snapshot::snapshot_file_index(&instance, &b.id).is_err());
+    }
+
+    #[test]
+    fn backup_retention_collects_once_for_multiple_evictions() {
+        let tmp = TempDir::new().unwrap();
+        let instance = tmp.path().join("instances").join("retained");
+        fs::create_dir_all(&instance).unwrap();
+        for index in 0..3 {
+            fs::write(instance.join("options.txt"), index.to_string()).unwrap();
+            create_snapshot(&instance, None, &["options.txt"]).unwrap();
+        }
+        crate::content_store::collect::take_collection_count();
+        let evicted =
+            run_backup_retention(&instance, &BackupRetentionPolicy::keep_last(1)).unwrap();
+        assert_eq!(evicted.len(), 2);
+        assert_eq!(crate::content_store::collect::take_collection_count(), 1);
+    }
+
+    #[test]
+    fn bundled_uppercase_member_imports_with_lowercase_digest() {
+        let tmp = TempDir::new().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let ctx = crate::ctx::Ctx::for_testing(source.path().to_path_buf());
+        let bytes = b"content in an uppercase ZIP member";
+        let file = source.path().join("mod.jar");
+        fs::write(&file, bytes).unwrap();
+        let added = crate::content_store::add_file(&ctx, &file, None, None).unwrap();
+        let mut item = added.item().clone();
+        let canonical_hash = item.files[0].sha256.clone();
+        let zip_hash = canonical_hash.to_ascii_uppercase();
+        item.files[0].sha256 = zip_hash.clone();
+        let manifest = BackupManifest {
+            kind: BackupKind::GameInstance,
+            schema_version: BACKUP_SCHEMA_VERSION,
+            instance_id: "source".into(),
+            snapshot: crate::snapshot::Snapshot {
+                id: "upper-member".into(),
+                label: None,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                file_count: 0,
+                size_estimate: 0,
+                origin: None,
+                unreadable: None,
+            },
+            files: Vec::new(),
+            exported_at: "2026-01-01T00:00:00Z".into(),
+            scope_entries: Vec::new(),
+            state: Some(serde_json::json!({})),
+            content_refs: vec![item.item_id.clone()],
+            content_items: vec![item.clone()],
+            includes_content_bytes: true,
+        };
+        let artifact = tmp.path().join("upper.agorabak");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&artifact).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file(BACKUP_MANIFEST_NAME, options).unwrap();
+        serde_json::to_writer(&mut zip, &manifest).unwrap();
+        zip.start_file(content_object_zip_path(&zip_hash), options)
+            .unwrap();
+        zip.write_all(bytes).unwrap();
+        zip.finish().unwrap();
+
+        let instance = tmp.path().join("instances").join("destination");
+        import_backup(&instance, &artifact).unwrap();
+        let saved: crate::content_store::ContentItem = serde_json::from_slice(
+            &fs::read(content_item_path_for(&instance, &item.item_id)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved.files[0].sha256, canonical_hash);
+        assert_eq!(
+            fs::read(content_object_path_for(&instance, &canonical_hash)).unwrap(),
+            bytes
+        );
     }
 
     #[test]

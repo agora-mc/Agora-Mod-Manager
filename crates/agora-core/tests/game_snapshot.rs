@@ -723,7 +723,9 @@ fn a_backup_without_bytes_imports_when_objects_exist_and_lists_missing_ones() {
     )
     .unwrap();
     for file in &parsed.files {
-        let _ = std::fs::remove_file(h.ctx.paths.content_object_path(&file.sha256));
+        let object = h.ctx.paths.content_object_path(&file.sha256);
+        content_store::protect::unprotect(&object).unwrap();
+        std::fs::remove_file(&object).unwrap();
     }
     let missing_dir = h.ctx.paths.instance_dir("fresh-missing").unwrap();
     let error = backup::import_backup(&missing_dir, &artifact).unwrap_err();

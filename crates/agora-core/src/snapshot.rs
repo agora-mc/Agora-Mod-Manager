@@ -1407,8 +1407,8 @@ pub(crate) fn create_snapshot_full_with_pause(
         entry: LiveFileIndexEntry,
         sha256: String,
         size: u64,
-        /// The staged bytes of a new or changed file: staged, hashed and synced once, here, outside
-        /// the store lock. A file the cache says is unchanged needs none of that.
+        /// A new or changed file is staged and hashed once outside the store lock. Placement syncs
+        /// it before rename. A file the cache says is unchanged needs no advance staging.
         staged: Option<crate::content_store::StagedObject>,
     }
     let mut planned: Vec<Planned> = Vec::with_capacity(current.len());
@@ -1841,52 +1841,10 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
         return Err(error);
     }
 
-    #[cfg(not(windows))]
-    {
-        if let Err(error) = fs::rename(&temp, path) {
-            let _ = fs::remove_file(&temp);
-            return Err(format!("failed to commit snapshot metadata: {error}"));
-        }
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    {
-        match fs::rename(&temp, path) {
-            Ok(()) => return Ok(()),
-            Err(first_error) => {
-                // Modern Windows filesystems normally support replacement,
-                // but keep a rollback fallback for platform/filesystem cases
-                // where replacing an existing destination is rejected.
-                if !path.exists() {
-                    let _ = fs::remove_file(&temp);
-                    return Err(format!("failed to commit snapshot metadata: {first_error}"));
-                }
-                let backup = parent.join(format!(
-                    ".{file_name}.{}-{}.bak",
-                    std::process::id(),
-                    uuid::Uuid::new_v4()
-                ));
-                if let Err(stage_error) = fs::rename(path, &backup) {
-                    let _ = fs::remove_file(&temp);
-                    return Err(format!(
-                        "failed to commit snapshot metadata: {first_error}; \
-                         replacement fallback could not stage the old file: {stage_error}"
-                    ));
-                }
-                if let Err(commit_error) = fs::rename(&temp, path) {
-                    let _ = fs::remove_file(&temp);
-                    let _ = fs::rename(&backup, path);
-                    return Err(format!(
-                        "failed to commit snapshot metadata after staging the old file: \
-                         {commit_error}"
-                    ));
-                }
-                let _ = fs::remove_file(&backup);
-            }
-        }
-        Ok(())
-    }
+    crate::recovery::durable_rename(&temp, path, true).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        format!("failed to commit snapshot metadata: {error}")
+    })
 }
 
 /// Restore an instance to a snapshot.
@@ -2524,10 +2482,12 @@ pub(crate) const VERIFIED_RECEIPT_SUFFIX: &str = ".agora-verified";
 /// Not a path validator: it compares whole file names, and the folder they are in is chosen by the
 /// caller.
 pub(crate) fn looks_like_snapshot_manifest(name: &str) -> bool {
-    name.ends_with(".json")
-        && !name.ends_with(".agora-verified.json")
-        && name != "live-file-index.json"
-        && name != "mutation-journal.json"
+    let Some(id) = name.strip_suffix(".json") else {
+        return false;
+    };
+    !id.to_ascii_lowercase().ends_with(VERIFIED_RECEIPT_SUFFIX)
+        && !id.eq_ignore_ascii_case("live-file-index")
+        && !id.eq_ignore_ascii_case("mutation-journal")
 }
 
 /// Every object hash and content-store item id one snapshot manifest names, read fresh.
@@ -2637,16 +2597,10 @@ pub(crate) fn validate_snapshot_id(snapshot_id: &str) -> Result<(), String> {
     {
         return Err("invalid snapshot id".into());
     }
-    // A manifest and the receipt beside an object are both `<name>.json` in the same folder. An id
-    // whose manifest is `<id>.json` ending in `.agora-verified` would read as a receipt, so the
-    // collection would skip the manifest and free the blobs it names (MASTER_SPEC §32.8).
-    if snapshot_id
-        .to_ascii_lowercase()
-        .ends_with(VERIFIED_RECEIPT_SUFFIX)
-    {
+    // Every valid ID must produce a manifest the collector will read (MASTER_SPEC §32.8).
+    if !looks_like_snapshot_manifest(&format!("{snapshot_id}.json")) {
         return Err(format!(
-            "invalid snapshot id {snapshot_id}: a snapshot whose id ends in {VERIFIED_RECEIPT_SUFFIX} \
-             would be read as the receipt beside an object, not as a snapshot"
+            "invalid snapshot id {snapshot_id}: the manifest name is reserved"
         ));
     }
     Ok(())
@@ -4808,9 +4762,15 @@ mod id_tests {
     /// id that ends like a receipt would be read as a receipt: `list_snapshots` and the collector
     /// would skip the manifest and free the blobs it names (MASTER_SPEC §32.8).
     #[test]
-    fn a_snapshot_id_that_ends_like_a_receipt_is_refused() {
-        assert!(validate_snapshot_id("snap.agora-verified").is_err());
-        assert!(validate_snapshot_id("snap.AGORA-VERIFIED").is_err());
+    fn every_reserved_snapshot_id_is_refused() {
+        for id in ["live-file-index", "mutation-journal", "snap.agora-verified"] {
+            assert!(!looks_like_snapshot_manifest(&format!("{id}.json")));
+            assert!(
+                validate_snapshot_id(id).is_err(),
+                "accepted reserved id {id}"
+            );
+            assert!(validate_snapshot_id(&id.to_ascii_uppercase()).is_err());
+        }
         assert!(validate_snapshot_id("plain-id").is_ok());
     }
 }

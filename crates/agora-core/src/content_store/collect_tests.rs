@@ -112,6 +112,67 @@ fn live_identity() -> ProcessIdentity {
     crate::process_identity::capture_self().expect("this process is in the table")
 }
 
+fn assert_link_refuses_collection(ctx: &Ctx, link: &Path) {
+    let hash = content_store::store_object_bytes(ctx, b"an unowned object").unwrap();
+    let report = content_store::collect::collect_with_ctx(ctx, &CollectRequest::default());
+    assert!(
+        report.refused(),
+        "collection followed or ignored {}",
+        link.display()
+    );
+    assert!(report
+        .refusals
+        .iter()
+        .any(|why| why.contains(&link.display().to_string())));
+    assert!(object_exists(ctx, &hash));
+}
+
+#[test]
+fn linked_object_roots_refuse_collection() {
+    for legacy in [false, true] {
+        let (_dir, ctx) = fixture();
+        let root = if legacy {
+            ctx.paths.root().join("snapshot-objects")
+        } else {
+            ctx.paths.content_objects_dir()
+        };
+        let target = ctx.paths.root().join("other-profile-objects");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        assert!(make_folder_link(&target, &root));
+        assert_link_refuses_collection(&ctx, &root);
+    }
+}
+
+#[test]
+fn a_linked_object_shard_refuses_collection() {
+    let (_dir, ctx) = fixture();
+    let target = ctx.paths.root().join("linked-shard");
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(ctx.paths.content_objects_dir()).unwrap();
+    let shard = ctx.paths.content_objects_dir().join("00");
+    assert!(make_folder_link(&target, &shard));
+    assert_link_refuses_collection(&ctx, &shard);
+}
+
+#[test]
+fn a_dangling_instance_manifest_link_refuses_collection() {
+    let (_dir, ctx) = fixture();
+    let instance = ctx.paths.instance_dir("dangling").unwrap();
+    let target = ctx.paths.root().join("manifest-target");
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(&instance).unwrap();
+    let link = instance.join("instance_manifest.json");
+    assert!(make_folder_link(&target, &link));
+    fs::rename(&target, ctx.paths.root().join("moved-target")).unwrap();
+    assert!(fs::symlink_metadata(&link).is_ok());
+    assert_eq!(
+        fs::metadata(&link).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert_link_refuses_collection(&ctx, &link);
+}
+
 // ---------------------------------------------------------------------------
 // 1. An owner location that is a link: nothing is deleted, and the path is named
 // ---------------------------------------------------------------------------

@@ -94,15 +94,9 @@ impl PendingGuard {
                 )
             })?;
         self.active = false;
-        let published = match publish() {
-            Ok(published) => published,
-            Err(error) => {
-                // Nothing names the objects now, so the record goes with the operation: they are
-                // an operation's leftovers, not a live operation's.
-                let _ = std::fs::remove_file(&self.path);
-                return Err(error);
-            }
-        };
+        // A failed durability check can happen after an owner was renamed into place. Retain its
+        // pending record until the process is gone if publication cannot be confirmed.
+        let published = publish()?;
         // A record left behind only keeps objects a later collection would free, so a failure to
         // remove it is not worth failing a published operation over: the next collection that
         // finds this process gone clears it and says so.
