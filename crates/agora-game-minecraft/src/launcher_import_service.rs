@@ -2102,6 +2102,25 @@ impl LauncherImportService {
                     let _ = rollback_staging();
                     return Err(error);
                 }
+                // The swap is a move between owner locations: the old tree leaves `instances/` for
+                // the quarantine, and the staged tree takes its place. The instance-locations lock
+                // is held across both renames (through the rollback paths and the quarantined
+                // tree's removal), so a collection cannot list the owners between them and see
+                // neither tree — the case in which it frees the blobs the returning tree needs
+                // (MASTER_SPEC §32.8). A busy lock means another move is in flight: refuse and
+                // leave both trees where they are.
+                let _locations = self
+                    .ctx
+                    .lock_manager
+                    .wait_instance_locations("launcher-import-update")
+                    .map_err(|error| LauncherError::Generic {
+                        code: "ERR_IMPORT_LOCATIONS_BUSY".into(),
+                        message: format!(
+                        "the update of {} could not start: instance locations are busy ({error}); \
+                         nothing was changed",
+                        final_dir.display()
+                    ),
+                    })?;
                 if final_dir.exists() {
                     std::fs::rename(&final_dir, quarantine).map_err(|e| {
                         LauncherError::Generic {
@@ -2571,6 +2590,17 @@ fn recover_one_job(
         )
     } else if job.state.contains("update") {
         let line = if let Some(quarantine) = quarantine {
+            // The instance guard is already held. Keep the returning tree in one of the two
+            // locations a collector sees throughout its scan, including a rollback of this move.
+            let _locations = match ctx.lock_manager.try_instance_locations("import-recover") {
+                Ok(guard) => guard,
+                Err(error) => {
+                    return Some(format!(
+                        "The interrupted import for {} was left alone: instance locations are busy ({error}). Nothing was changed.",
+                        job.instance_id
+                    ));
+                }
+            };
             if final_dir.exists() && !import_owns(&final_dir, &job.job_id) {
                 return Some(format!(
                     "The interrupted import for {} was left alone: its final directory is not \
@@ -2892,7 +2922,9 @@ mod tests {
 
     use super::*;
     use crate::launcher_import::{ContentInventory, LaunchStrategy};
-    use agora_core::{instance_runtime, lock_manager::LockManager, process_identity};
+    use agora_core::{
+        content_store, instance_runtime, lock_manager::LockManager, process_identity, snapshot,
+    };
 
     /// A fresh temp directory for one test. The random component matters:
     /// `%TEMP%` is shared, and a name built from the process id and a
@@ -3672,7 +3704,7 @@ name=Dup Instance
         assert!(instance_dir.join("mods").join("sodium.jar").exists());
 
         // Verify DB registration.
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let row = agora_core::db::get_instance(&conn, "test-import").unwrap();
         assert!(row.is_some());
         assert_eq!(row.unwrap().name, "Test Import");
@@ -3804,7 +3836,7 @@ name=Dup Instance
             serde_json::json!("prism")
         );
 
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let row = agora_core::db::get_instance(&conn, "memory-copied")
             .unwrap()
             .unwrap();
@@ -3856,6 +3888,115 @@ name=Dup Instance
             bytes_total: 100,
         };
         assert_eq!(halfway.fraction(), 0.5);
+    }
+
+    /// An update import renames the old instance folder into `staging/.agora-quarantine-*` and the
+    /// staged tree into its place. That is a move between owner locations, so it happens under the
+    /// instance-locations lock: while another operation holds it, the update refuses and leaves both
+    /// trees where they are (MASTER_SPEC §32.8).
+    #[tokio::test]
+    async fn test_update_refuses_while_instance_locations_are_held() {
+        let ctx = test_ctx();
+        let svc = LauncherImportService::new(ctx.clone());
+
+        let src_root = test_tmp("loc-src");
+        std::fs::create_dir_all(src_root.join("mods")).unwrap();
+        std::fs::write(src_root.join("mods").join("a.jar"), b"mod a").unwrap();
+
+        let plan =
+            |action: ItemAction, existing: Option<InstanceImportRecord>| LauncherImportPlan {
+                batch_fingerprint: String::new(),
+                items: vec![PerItemPlan {
+                    fingerprint: plan_fingerprint(
+                        "loc-key",
+                        LauncherKind::Prism,
+                        "loc-inst",
+                        &action,
+                        false,
+                    ),
+                    destination_id: "loc-inst".to_string(),
+                    destination_name: "Loc Instance".to_string(),
+                    action,
+                    source_key: "loc-key".to_string(),
+                    launcher_kind: LauncherKind::Prism,
+                    installation_key: "prism:loc".to_string(),
+                    source_path: src_root.to_string_lossy().to_string(),
+                    loader_tuple: Some(LoaderTuple {
+                        loader: "vanilla".to_string(),
+                        loader_version: String::new(),
+                        minecraft_version: String::new(),
+                    }),
+                    total_bytes: 6,
+                    total_files: 1,
+                    preserve_settings: false,
+                    sanitized_settings: LaunchSettingsPreview {
+                        memory_mb: None,
+                        java_path: None,
+                        jvm_args: Vec::new(),
+                    },
+                    existing_import: existing,
+                    blockers: Vec::new(),
+                    warnings: Vec::new(),
+                }],
+                peak_bytes: 6,
+                total_files: 1,
+                batch_blockers: Vec::new(),
+            };
+
+        svc.execute(plan(ItemAction::New, None)).await.unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let existing = find_instance_import_by_source(&conn, "prism", "prism:loc", "loc-key")
+            .unwrap()
+            .unwrap();
+        let final_dir = ctx.paths.instances_root().join("loc-inst");
+        let before = std::fs::read_dir(&final_dir).unwrap().count();
+
+        // Another Agora holds the owner locations. It runs on its own thread, as another process
+        // would: a lock this thread held itself would be a lock-order refusal, not contention.
+        let other = Ctx::for_testing(ctx.paths.root().to_path_buf());
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _held = other
+                .lock_manager
+                .acquire(LockResource::InstanceLocations, "test-holds-locations")
+                .unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+
+        let result = svc
+            .execute(plan(ItemAction::Update, Some(existing)))
+            .await
+            .unwrap();
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let message = match &result.outcomes[0] {
+            PerItemOutcome::Failed { error, .. } => error.clone(),
+            other => panic!("an update with the locations held must fail, got {other:?}"),
+        };
+        assert!(
+            message.contains("instance locations are busy"),
+            "the failure says why: {message}"
+        );
+
+        // Nothing moved: the instance is where it was, with what it had, and nothing was quarantined.
+        assert_eq!(std::fs::read_dir(&final_dir).unwrap().count(), before);
+        let quarantines: Vec<_> = std::fs::read_dir(ctx.paths.staging_root())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".agora-quarantine-loc-inst-")
+            })
+            .collect();
+        assert!(
+            quarantines.is_empty(),
+            "a refused update leaves no quarantined tree: {quarantines:?}"
+        );
     }
 
     #[tokio::test]
@@ -3912,7 +4053,7 @@ name=Dup Instance
         svc.execute(plan_new).await.unwrap();
 
         // Now create update plan.
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let existing = find_instance_import_by_source(&conn, "prism", "prism:upd", "upd-key")
             .unwrap()
             .unwrap();
@@ -3975,8 +4116,7 @@ name=Dup Instance
         std::fs::create_dir_all(&final_dir).unwrap();
         mark_owner(&staging, "recover-new-job");
         mark_owner(&final_dir, "recover-new-job");
-        let connection =
-            agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let connection = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         agora_core::db::upsert_instance_import_job(
             &connection,
@@ -4002,8 +4142,7 @@ name=Dup Instance
         assert!(!warnings.is_empty());
         assert!(!staging.exists());
         assert!(!final_dir.exists());
-        let connection =
-            agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let connection = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         assert!(agora_core::db::list_instance_import_jobs(&connection)
             .unwrap()
             .is_empty());
@@ -4026,8 +4165,7 @@ name=Dup Instance
         mark_owner(&staging, "recover-update-job");
         mark_owner(&final_dir, "recover-update-job");
         mark_owner(&quarantine, "recover-update-job");
-        let connection =
-            agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let connection = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         agora_core::db::upsert_instance_import_job(
             &connection,
@@ -4060,6 +4198,92 @@ name=Dup Instance
                 .is_empty(),
             "a finished rollback must clear its job row so it cannot re-run"
         );
+    }
+
+    #[test]
+    fn recovery_cannot_move_quarantine_between_collection_listings() {
+        let ctx = test_ctx();
+        let final_dir = ctx.paths.instance_dir("recover-during-collect").unwrap();
+        let quarantine = ctx
+            .paths
+            .staging_root()
+            .join(".agora-quarantine-recover-during-collect");
+        std::fs::create_dir_all(&final_dir).unwrap();
+        std::fs::create_dir_all(ctx.paths.staging_root()).unwrap();
+        std::fs::write(final_dir.join("old.txt"), b"snapshot only bytes").unwrap();
+        let snap = snapshot::create_snapshot(&final_dir, None, &["old.txt"]).unwrap();
+        let hash = snapshot::snapshot_file_index(&final_dir, &snap.id)
+            .unwrap()
+            .remove(0)
+            .sha256;
+        std::fs::rename(&final_dir, &quarantine).unwrap();
+        mark_owner(&quarantine, "collect-recovery-job");
+        let conn = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db::upsert_instance_import_job(
+            &conn,
+            &InstanceImportJob {
+                job_id: "collect-recovery-job".into(),
+                instance_id: "recover-during-collect".into(),
+                launcher_kind: "prism".into(),
+                source_instance_key: "source".into(),
+                staging_path: ctx
+                    .paths
+                    .staging_root()
+                    .join(".agora-import-recover-during-collect")
+                    .to_string_lossy()
+                    .into_owned(),
+                final_path: final_dir.to_string_lossy().into_owned(),
+                quarantine_path: Some(quarantine.to_string_lossy().into_owned()),
+                state: "swapping_update".into(),
+                plan_fingerprint: "plan".into(),
+                error: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .unwrap();
+
+        let file = ctx.paths.root().join("trigger.jar");
+        std::fs::write(&file, b"unrelated item").unwrap();
+        let item = content_store::add_file(&ctx, &file, None, None)
+            .unwrap()
+            .item()
+            .item_id
+            .clone();
+        let other = Ctx::for_testing(ctx.paths.root().to_path_buf());
+        let recovery = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = recovery.clone();
+        ctx.test_seams
+            .set_object_grace(Some(std::time::Duration::ZERO));
+        ctx.test_seams
+            .set_object_collection_after_live(Some(std::sync::Arc::new(move || {
+                // Recovery is another Agora: its own thread, so the collector's held locks are
+                // contention to it rather than this thread's lock order.
+                *observed.lock().unwrap() = std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| recover_interrupted_jobs(&other))
+                        .join()
+                        .unwrap()
+                });
+            })));
+
+        let report =
+            content_store::remove_item_with_report(&ctx, &item, Default::default()).unwrap();
+        assert!(!report.refused(), "{}", report.summary());
+        assert!(
+            ctx.paths.content_object_path(&hash).is_file(),
+            "collection lost the snapshot blob"
+        );
+        assert!(recovery
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("instance locations")));
+        assert!(quarantine.is_dir());
+        recover_interrupted_jobs(&ctx);
+        assert!(final_dir.join("old.txt").is_file());
+        assert!(!quarantine.exists());
     }
 
     /// Crash after promotion but before provenance commit. An already-open desktop could have

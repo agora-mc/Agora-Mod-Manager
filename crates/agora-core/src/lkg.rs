@@ -480,11 +480,59 @@ pub fn retention_plan_with_sizes(
 /// Lists snapshots, cross-references LKG state, evicts those exceeding the
 /// configured category counts and size cap.
 pub fn run_retention(instance_dir: &Path) -> Result<(), String> {
-    // Retention is automatic housekeeping. Hold the locations lock once for the whole round so an
-    // instance cannot move between live and Recently deleted while we decide what to delete, and
-    // so each delete does not try to take a non-reentrant lock again. A collision that outlasts the
-    // short wait means another operation is in flight: skip this round, delete nothing, keep going.
-    let locations =
+    run_retention_with_grace(instance_dir, None)
+}
+
+/// [`run_retention`] whose result carries what the round's one collection did: what it reclaimed,
+/// what it kept and why, or `None` when the round evicted nothing and did not collect.
+pub fn run_retention_with_report(
+    instance_dir: &Path,
+) -> Result<Option<crate::content_store::collect::CollectReport>, String> {
+    run_retention_with_pause(instance_dir, None, None)
+}
+
+/// [`run_retention`] with the object collector's grace period chosen: `None` is the hour production
+/// uses, and a test passes zero to see what the round frees.
+pub(crate) fn run_retention_with_grace(
+    instance_dir: &Path,
+    grace: Option<std::time::Duration>,
+) -> Result<(), String> {
+    run_retention_with_pause(instance_dir, grace, None).map(|_| ())
+}
+
+/// [`run_retention_with_grace`] with the collection's pause installed, so a test can say the round
+/// collects once rather than once per evicted snapshot (MASTER_SPEC §32.8).
+pub(crate) fn run_retention_with_pause(
+    instance_dir: &Path,
+    grace: Option<std::time::Duration>,
+    pause: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+) -> Result<Option<crate::content_store::collect::CollectReport>, String> {
+    // Retention is automatic housekeeping. Hold the content-store lock and then the locations lock
+    // once for the whole round, in the collector's order, so an instance cannot move between live
+    // and Recently deleted while we decide what to delete, and so each delete does not try to take
+    // a non-reentrant lock again. A collision that outlasts the short wait means another operation
+    // is in flight: skip this round, delete nothing, keep going.
+    let paths = crate::snapshot::snapshot_store_paths(instance_dir);
+    let manager = crate::lock_manager::LockManager::new(paths.locks_root());
+    // Held for the whole round, from the first listing to the last delete: the batch each delete
+    // removes and the one collection after it are one decision, and an instance move or another
+    // collection cannot slip between them.
+    let _store = match manager.acquire_with_timeout(
+        crate::lock_manager::LockResource::ContentStore,
+        "snapshot-retention",
+        std::time::Duration::from_secs(30),
+        None,
+    ) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!(
+                "skipping snapshot retention for {}: the content store is busy: {error}",
+                instance_dir.display()
+            );
+            return Ok(None);
+        }
+    };
+    let _locations =
         match crate::snapshot::lock_snapshot_locations(instance_dir, "snapshot-retention", true) {
             Ok(guard) => guard,
             Err(error) => {
@@ -492,14 +540,14 @@ pub fn run_retention(instance_dir: &Path) -> Result<(), String> {
                     "skipping snapshot retention for {}: {error}",
                     instance_dir.display()
                 );
-                return Ok(());
+                return Ok(None);
             }
         };
 
     let snapshots = crate::snapshot::list_snapshots(instance_dir)
         .map_err(|e| format!("list_snapshots: {e}"))?;
     if snapshots.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let lkg = read_lkg_state(instance_dir)?;
@@ -555,26 +603,43 @@ pub fn run_retention(instance_dir: &Path) -> Result<(), String> {
         );
     }
 
+    // The whole batch goes first, then one collection over what is left: a collection between two
+    // evictions could free an object a later eviction in the same round still names, and a round is
+    // one decision (MASTER_SPEC §32.8).
     let mut errors = Vec::new();
+    let mut removed = 0usize;
     for id in &to_evict {
-        if let Err(error) = crate::snapshot::delete_snapshot_with(
-            instance_dir,
-            id,
-            crate::snapshot::list_snapshot_scan_dir,
-            &locations,
-        ) {
-            errors.push(format!("{id}: {error}"));
+        match crate::snapshot::delete_snapshot_records(instance_dir, id) {
+            Ok(()) => removed += 1,
+            Err(error) => errors.push(format!("{id}: {error}")),
         }
     }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
+    if !errors.is_empty() {
+        return Err(format!(
             "snapshot retention could not remove: {}",
             errors.join("; ")
-        ))
+        ));
     }
+    let mut report = None;
+    if removed > 0 {
+        report = Some(
+            crate::content_store::collect::collect_at_instance(
+                instance_dir,
+                &crate::content_store::collect::CollectRequest {
+                    store: crate::content_store::collect::LockRequest::Held,
+                    locations: crate::content_store::collect::LockRequest::Held,
+                    grace,
+                    ignore_unreadable_snapshots: false,
+                    pause,
+                },
+            )
+            .unwrap_or_else(|error| crate::content_store::collect::CollectReport {
+                refusals: vec![error],
+                ..Default::default()
+            }),
+        );
+    }
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
@@ -1424,5 +1489,122 @@ mod tests {
         };
         let entries = vec![manual, retention("undo", 1, false, false, true)];
         assert!(retention_plan_with_sizes(&entries, &RetentionPolicy::default()).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    /// An instance folder in the layout `snapshot_store_paths` expects, so the object store lands
+    /// beside `instances/` and not in a temp folder. The manifest is readable, because a round of
+    /// retention now runs a collection, and a collection that cannot read an owner manifest keeps
+    /// every object and says so.
+    fn temp_instance() -> (TempDir, std::path::PathBuf) {
+        let root = TempDir::new().unwrap();
+        let dir = root.path().join("instances").join("batch-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = serde_json::json!({
+            "manifest_version": 2,
+            "instance_id": "batch-test",
+            "name": "batch-test",
+            "minecraft_version": "1.20.1",
+            "loader": "fabric",
+            "loader_version": "0.15.11",
+            "mods": [],
+            "resourcepacks": [],
+            "shaders": [],
+            "datapacks": [],
+            "worlds": [],
+            "game_data": { "game_id": "minecraft" }
+        });
+        std::fs::write(
+            dir.join("instance_manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        (root, dir)
+    }
+
+    /// A round of retention is one decision: it removes its whole batch, then collects once. A
+    /// collection between two evictions could free an object a later eviction in the same round
+    /// still names (MASTER_SPEC §32.8).
+    #[test]
+    fn a_round_of_retention_evicts_its_batch_and_then_collects_once() {
+        let (_root, dir) = temp_instance();
+        for index in 0..8 {
+            std::fs::create_dir_all(dir.join("mods")).unwrap();
+            std::fs::write(
+                dir.join("mods").join(format!("m{index}.jar")),
+                [index as u8; 32],
+            )
+            .unwrap();
+            crate::snapshot::create_snapshot(&dir, Some(&format!("auto-{index}")), &["mods"])
+                .unwrap();
+        }
+        let before = crate::snapshot::list_snapshots(&dir).unwrap().len();
+
+        let collections = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&collections);
+        run_retention_with_pause(
+            &dir,
+            Some(std::time::Duration::ZERO),
+            Some(Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })),
+        )
+        .unwrap();
+
+        let after = crate::snapshot::list_snapshots(&dir).unwrap().len();
+        assert!(
+            after < before,
+            "the round evicted something, so the count below means something ({before} -> {after})"
+        );
+        assert_eq!(
+            collections.load(Ordering::SeqCst),
+            1,
+            "a round of retention runs one collection for its whole batch"
+        );
+    }
+
+    /// Retention is automatic, so its report is not for a person to read: the round hands it back
+    /// to the caller that runs it, and a round that evicted nothing never collected (MASTER_SPEC
+    /// §32.8).
+    #[test]
+    fn a_round_of_retention_reports_what_its_one_collection_reclaimed() {
+        let (_root, dir) = temp_instance();
+        assert!(
+            run_retention_with_report(&dir).unwrap().is_none(),
+            "a round with no snapshots evicts nothing, so it has no collection to report"
+        );
+
+        // One file per snapshot, gone from the instance again once its snapshot is taken: each
+        // evicted snapshot is then the only record that names its own object, so the round has
+        // something to free.
+        std::fs::create_dir_all(dir.join("mods")).unwrap();
+        for index in 0..8 {
+            let file = dir.join("mods").join(format!("m{index}.jar"));
+            std::fs::write(&file, [index as u8; 32]).unwrap();
+            crate::snapshot::create_snapshot(&dir, Some(&format!("auto-{index}")), &["mods"])
+                .unwrap();
+            std::fs::remove_file(&file).unwrap();
+        }
+
+        let report = run_retention_with_pause(&dir, Some(std::time::Duration::ZERO), None)
+            .unwrap()
+            .expect("the round evicted snapshots, so it collected and has a report");
+        let outcome = report.outcome();
+        assert!(!outcome.refused, "{outcome:?}");
+        assert!(
+            outcome.reclaimed > 0,
+            "the objects only the evicted snapshots named are freed, and the round says how many: {outcome:?}"
+        );
+        assert!(
+            outcome.summary.starts_with("reclaimed "),
+            "the support log gets one line about what the round did: {outcome:?}"
+        );
     }
 }

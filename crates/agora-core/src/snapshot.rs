@@ -7,7 +7,7 @@ use std::time::UNIX_EPOCH;
 use serde::{Deserialize, Serialize};
 
 use crate::app_paths::AppPaths;
-use crate::lock_manager::{LockGuard, LockManager};
+use crate::lock_manager::{LockGuard, LockManager, LockResource};
 
 use sha2::Digest;
 #[cfg(unix)]
@@ -547,10 +547,39 @@ fn snapshot_app_root(instance_dir: &Path) -> PathBuf {
     }
 }
 
+/// The paths a capture writes through: the shared object store, the lock files and the owner
+/// records all belong to the app data root the instance is in.
+pub(crate) fn snapshot_store_paths(instance_dir: &Path) -> AppPaths {
+    AppPaths::from_root(snapshot_app_root(instance_dir))
+}
+
+/// The legacy `snapshot-objects` location of one blob. Nothing writes here any more: it is read
+/// until B3b has moved what is here into the content store.
 pub(crate) fn snapshot_blob_path(instance_dir: &Path, hash: &str) -> PathBuf {
     snapshot_objects_dir(instance_dir)
         .join(&hash[..2.min(hash.len())])
         .join(hash)
+}
+
+/// Where a snapshot blob's bytes are: the one content store first, then the legacy
+/// `snapshot-objects` store until it has been migrated (MASTER_SPEC §32.8).
+///
+/// A location counts only when it can be trusted. The content store is judged by its own rule — an
+/// object it protected, of the recorded size — which is the rule `content_store::read_object_bytes`
+/// applies; the legacy store is judged by its receipt or a full hash, exactly as before. A caller
+/// that reads the bytes then verifies them again as it always has, so this only chooses the place.
+pub(crate) fn snapshot_blob_source(instance_dir: &Path, hash: &str, size: u64) -> Option<PathBuf> {
+    let content = snapshot_store_paths(instance_dir).content_object_path(hash);
+    if crate::content_store::object_is_trustworthy(&content, size, hash).unwrap_or(false) {
+        return Some(content);
+    }
+    let legacy = snapshot_blob_path(instance_dir, hash);
+    let receipt =
+        crate::artifact_receipt::is_verified(&legacy, "sha256", hash, i64::try_from(size).ok());
+    if legacy.is_file() && (receipt || blob_file_matches(&legacy, hash, size)) {
+        return Some(legacy);
+    }
+    None
 }
 
 /// Legacy v1/v2 snapshots are retained as ZIPs and remain readable.
@@ -1082,16 +1111,7 @@ fn snapshot_blob_is_available(instance_dir: &Path, hash: &str, size: u64) -> boo
     if validate_blob_hash(hash).is_err() {
         return false;
     }
-    let path = snapshot_blob_path(instance_dir, hash);
-    if crate::artifact_receipt::is_verified(&path, "sha256", hash, i64::try_from(size).ok()) {
-        return true;
-    }
-    if !blob_file_matches(&path, hash, size) {
-        return false;
-    }
-    let _ =
-        crate::artifact_receipt::record_verified(&path, "sha256", hash, i64::try_from(size).ok());
-    true
+    snapshot_blob_source(instance_dir, hash, size).is_some()
 }
 
 /// Return the metadata receipt associated with a snapshot, if it is valid.
@@ -1346,7 +1366,26 @@ pub fn create_snapshot_full(
     origin: SnapshotOrigin,
     aux: &SnapshotAux,
 ) -> Result<Snapshot, String> {
+    create_snapshot_full_with_pause(instance_dir, label, entries, origin, aux, None)
+}
+
+/// Where a capture can be paused, so a test can run a collection in the window between deciding to
+/// reuse an object and publishing the manifest that names it (MASTER_SPEC §32.8). Production always
+/// passes `None`.
+pub(crate) type CapturePause = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+/// [`create_snapshot_full`] with a pause the test seam installs.
+pub(crate) fn create_snapshot_full_with_pause(
+    instance_dir: &Path,
+    label: Option<&str>,
+    entries: &[&str],
+    origin: SnapshotOrigin,
+    aux: &SnapshotAux,
+    pause: Option<&CapturePause>,
+) -> Result<Snapshot, String> {
     let id = uuid::Uuid::new_v4().to_string();
+    // The store this capture writes through, decided once before the first folder exists.
+    let paths = snapshot_store_paths(instance_dir);
 
     fs::create_dir_all(snapshots_dir(instance_dir))
         .map_err(|e| format!("failed to create snapshots dir: {e}"))?;
@@ -1360,26 +1399,101 @@ pub fn create_snapshot_full(
         .collect::<std::collections::BTreeMap<_, _>>();
     let (current, metadata_fingerprint) =
         collect_live_file_metadata_with_fingerprint(instance_dir, entries)?;
-    let mut files: Vec<SnapshotFileEntry> = Vec::with_capacity(current.len());
-    let mut live_index = Vec::with_capacity(current.len());
+
+    // What every captured file's object will be, decided before anything is placed: the pending
+    // record has to name all of them, or a collection running during the capture could free an
+    // object between the file that reuses it and the manifest that publishes it.
+    struct Planned {
+        entry: LiveFileIndexEntry,
+        sha256: String,
+        size: u64,
+        /// A new or changed file is staged and hashed once outside the store lock. Placement syncs
+        /// it before rename. A file the cache says is unchanged needs no advance staging.
+        staged: Option<crate::content_store::StagedObject>,
+    }
+    let mut planned: Vec<Planned> = Vec::with_capacity(current.len());
+    for entry in current {
+        let cached = previous.get(&entry.relative_path).filter(|cached| {
+            cached.size == entry.size
+                && cached.modified_ns == entry.modified_ns
+                && cached.file_identity == entry.file_identity
+        });
+        match cached {
+            // What the cache says is not the same question as what the store holds: the object may
+            // have been collected since the cache was written, and this capture has published no
+            // record yet. So the cache decides only what has to be staged; the store is asked
+            // again, under its lock, before the capture leans on an object it did not place.
+            Some(cached) => planned.push(Planned {
+                entry,
+                sha256: cached.sha256.clone(),
+                size: cached.size,
+                staged: None,
+            }),
+            None => {
+                let source = instance_dir.join(Path::new(&entry.relative_path));
+                let staged = crate::content_store::stage_object_from_file(&paths, &source)
+                    .map_err(|e| e.to_string())?;
+                if staged.size != entry.size {
+                    return Err(format!(
+                        "{} changed while it was being captured (the walk saw {} bytes, reading it \
+                         got {}); take the snapshot again",
+                        entry.relative_path, entry.size, staged.size
+                    ));
+                }
+                planned.push(Planned {
+                    entry,
+                    sha256: staged.sha256.clone(),
+                    size: staged.size,
+                    staged: Some(staged),
+                });
+            }
+        }
+    }
+
+    // The seam sits in the window the pending record exists to close: the capture has decided what
+    // each file reuses or adds, and has not yet published the record that names those objects.
+    if let Some(pause) = pause {
+        pause();
+    }
+
+    let hashes: Vec<String> = planned.iter().map(|plan| plan.sha256.clone()).collect();
+    let pending =
+        crate::content_store::pending::begin_pending_use(&paths, &hashes, "snapshot capture")?;
+
+    let mut files: Vec<SnapshotFileEntry> = Vec::with_capacity(planned.len());
+    let mut live_index = Vec::with_capacity(planned.len());
     let mut total_size: u64 = 0;
 
-    for mut entry in current {
-        let cached = previous.get(&entry.relative_path);
-        let reused = cached
-            .filter(|cached| {
-                cached.size == entry.size
-                    && cached.modified_ns == entry.modified_ns
-                    && cached.file_identity == entry.file_identity
-                    && snapshot_blob_is_available(instance_dir, &cached.sha256, cached.size)
-            })
-            .map(|cached| (cached.sha256.clone(), cached.size));
-        let (sha256, size) = if let Some(reused) = reused {
-            reused
-        } else {
-            let source = instance_dir.join(Path::new(&entry.relative_path));
-            store_snapshot_object(instance_dir, &source)?
-        };
+    for plan in planned {
+        let Planned {
+            entry,
+            sha256,
+            size,
+            staged,
+        } = plan;
+        match staged {
+            Some(staged) => staged.place(&paths).map_err(|e| e.to_string())?,
+            None => {
+                // Nothing was staged, so this capture is reusing an object already in a store. Ask
+                // the store, not the cache: a collection is free to have taken it before this
+                // capture registered anything, and a manifest that names a blob nobody placed is a
+                // restore that cannot happen. Placing it again is the answer.
+                if !snapshot_blob_is_available(instance_dir, &sha256, size) {
+                    let source = instance_dir.join(Path::new(&entry.relative_path));
+                    let (placed_hash, placed_size) =
+                        crate::content_store::place_object_from_file(&paths, &source)
+                            .map_err(|e| e.to_string())?;
+                    if placed_hash != sha256 || placed_size != size {
+                        return Err(format!(
+                            "{} changed while it was being captured (expected {sha256} of {size} \
+                             bytes, stored {placed_hash} of {placed_size}); take the snapshot again",
+                            entry.relative_path
+                        ));
+                    }
+                }
+            }
+        }
+        let mut entry = entry;
         entry.sha256 = sha256.clone();
         files.push(SnapshotFileEntry {
             relative_path: entry.relative_path.clone(),
@@ -1413,7 +1527,11 @@ pub fn create_snapshot_full(
 
     let manifest_json = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| format!("failed to serialize manifest: {e}"))?;
-    atomic_write(&snapshot_manifest_path(instance_dir, &id), &manifest_json)?;
+    // The manifest names every object this capture reused or added, so publishing it and dropping
+    // the pending record happen under one hold of the store lock: a collection sees the record or
+    // the manifest, and never the moment in between.
+    pending
+        .published(|| atomic_write(&snapshot_manifest_path(instance_dir, &id), &manifest_json))?;
     let _ = write_live_file_index_cache(instance_dir, live_index);
     // Reuse the fingerprint produced by the same traversal that built the
     // snapshot. This removes the former second full tree walk.
@@ -1425,57 +1543,6 @@ pub fn create_snapshot_full(
     );
     mark_snapshot_ready(instance_dir)?;
     Ok(snapshot)
-}
-
-/// Store bytes in the snapshot object store, returning the SHA-256 and size.
-fn store_snapshot_object_bytes(instance_dir: &Path, bytes: &[u8]) -> Result<(String, u64), String> {
-    let objects_dir = snapshot_objects_dir(instance_dir);
-    fs::create_dir_all(&objects_dir)
-        .map_err(|e| format!("failed to create snapshot object store: {e}"))?;
-    let hash = sha256_hex(bytes);
-    let size = bytes.len() as u64;
-    let destination = snapshot_blob_path(instance_dir, &hash);
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create snapshot object prefix: {e}"))?;
-    }
-    if destination.is_file()
-        && (crate::artifact_receipt::is_verified(
-            &destination,
-            "sha256",
-            &hash,
-            i64::try_from(size).ok(),
-        ) || blob_file_matches(&destination, &hash, size))
-    {
-        return Ok((hash, size));
-    }
-    let temp_path = objects_dir.join(format!(
-        ".{}.{}.tmp",
-        uuid::Uuid::new_v4(),
-        std::process::id()
-    ));
-    let mut temp_file = fs::File::create(&temp_path)
-        .map_err(|e| format!("failed to create snapshot object: {e}"))?;
-    temp_file
-        .write_all(bytes)
-        .map_err(|e| format!("failed to write snapshot object: {e}"))?;
-    temp_file
-        .sync_all()
-        .map_err(|e| format!("failed to sync snapshot object: {e}"))?;
-    drop(temp_file);
-    if destination.exists() {
-        fs::remove_file(&destination)
-            .map_err(|e| format!("failed to replace snapshot object: {e}"))?;
-    }
-    fs::rename(&temp_path, &destination)
-        .map_err(|e| format!("failed to commit snapshot object: {e}"))?;
-    let _ = crate::artifact_receipt::record_verified(
-        &destination,
-        "sha256",
-        &hash,
-        i64::try_from(size).ok(),
-    );
-    Ok((hash, size))
 }
 
 /// Create a snapshot whose entries are declared state files supplied as data,
@@ -1499,6 +1566,8 @@ pub fn create_snapshot_from_data(
     folders: &[&str],
 ) -> Result<Snapshot, String> {
     let id = uuid::Uuid::new_v4().to_string();
+    // The store this capture writes through, decided once before the first folder exists.
+    let paths = snapshot_store_paths(instance_dir);
     fs::create_dir_all(snapshots_dir(instance_dir))
         .map_err(|e| format!("failed to create snapshots dir: {e}"))?;
     fs::create_dir_all(snapshot_objects_dir(instance_dir))
@@ -1506,6 +1575,15 @@ pub fn create_snapshot_from_data(
 
     let mut entries = Vec::with_capacity(files.len());
     let mut total_size = 0u64;
+    // The bytes are in hand, so every hash is known before the first object lands: one pending
+    // record covers them all until the manifest that names them is published.
+    let hashes: Vec<String> = files
+        .iter()
+        .filter_map(|file| file.contents.as_deref())
+        .map(sha256_hex)
+        .collect();
+    let pending =
+        crate::content_store::pending::begin_pending_use(&paths, &hashes, "snapshot capture")?;
     let mut roots: std::collections::BTreeMap<String, RootState> =
         std::collections::BTreeMap::new();
     for file in files {
@@ -1529,7 +1607,8 @@ pub fn create_snapshot_from_data(
         roots.entry(name).or_insert(state);
         match &file.contents {
             Some(bytes) => {
-                let (hash, size) = store_snapshot_object_bytes(instance_dir, bytes)?;
+                let (hash, size) = crate::content_store::place_object_from_bytes(&paths, bytes)
+                    .map_err(|e| e.to_string())?;
                 total_size += size;
                 entries.push(SnapshotFileEntry {
                     relative_path: file.relative_path.clone(),
@@ -1571,7 +1650,8 @@ pub fn create_snapshot_from_data(
     };
     let manifest_json = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| format!("failed to serialize manifest: {e}"))?;
-    atomic_write(&snapshot_manifest_path(instance_dir, &id), &manifest_json)?;
+    pending
+        .published(|| atomic_write(&snapshot_manifest_path(instance_dir, &id), &manifest_json))?;
     mark_snapshot_ready(instance_dir)?;
     Ok(snapshot)
 }
@@ -1641,7 +1721,13 @@ pub fn restore_snapshot_data_with(
                 )
             })?;
         validate_blob_hash(blob_hash)?;
-        let bytes = fs::read(snapshot_blob_path(instance_dir, blob_hash)).map_err(|e| {
+        let blob_path = snapshot_blob_source(instance_dir, blob_hash, entry.size).ok_or_else(|| {
+            format!(
+                "failed to open snapshot object for {}: no object store holds {blob_hash} of {} bytes whose bytes match the hash (missing, or a hash mismatch)",
+                entry.relative_path, entry.size
+            )
+        })?;
+        let bytes = fs::read(&blob_path).map_err(|e| {
             format!(
                 "failed to open snapshot object for {}: {e}",
                 entry.relative_path
@@ -1724,93 +1810,6 @@ fn live_target(instance_dir: &Path, relative_path: &str) -> Result<PathBuf, Stri
         .map_err(|error| format!("refusing to restore '{relative_path}': {error}"))
 }
 
-fn store_snapshot_object(instance_dir: &Path, source: &Path) -> Result<(String, u64), String> {
-    let objects_dir = snapshot_objects_dir(instance_dir);
-    fs::create_dir_all(&objects_dir)
-        .map_err(|e| format!("failed to create snapshot object store: {e}"))?;
-    let temp_path = objects_dir.join(format!(
-        ".{}.{}.tmp",
-        uuid::Uuid::new_v4(),
-        std::process::id()
-    ));
-    let source_file =
-        fs::File::open(source).map_err(|e| format!("failed to read {}: {e}", source.display()))?;
-    let mut reader = BufReader::new(source_file);
-    let temp_file = fs::File::create(&temp_path)
-        .map_err(|e| format!("failed to create snapshot object: {e}"))?;
-    let mut writer = BufWriter::new(temp_file);
-    let mut hasher = sha2::Sha256::new();
-    let mut size = 0u64;
-    let mut buffer = vec![0u8; 1024 * 1024];
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|e| format!("failed to read {}: {e}", source.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        writer
-            .write_all(&buffer[..read])
-            .map_err(|e| format!("failed to write snapshot object: {e}"))?;
-        size += read as u64;
-    }
-    let hash = format!("{:x}", hasher.finalize());
-    writer
-        .flush()
-        .map_err(|e| format!("failed to flush snapshot object: {e}"))?;
-    writer
-        .get_ref()
-        .sync_all()
-        .map_err(|e| format!("failed to sync snapshot object: {e}"))?;
-
-    let destination = snapshot_blob_path(instance_dir, &hash);
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create snapshot object prefix: {e}"))?;
-    }
-    if destination.exists() {
-        let already_verified = crate::artifact_receipt::is_verified(
-            &destination,
-            "sha256",
-            &hash,
-            i64::try_from(size).ok(),
-        );
-        if already_verified || blob_file_matches(&destination, &hash, size) {
-            fs::remove_file(&temp_path)
-                .map_err(|e| format!("failed to discard duplicate snapshot object: {e}"))?;
-            if !already_verified {
-                let _ = crate::artifact_receipt::record_verified(
-                    &destination,
-                    "sha256",
-                    &hash,
-                    i64::try_from(size).ok(),
-                );
-            }
-        } else {
-            fs::remove_file(&destination)
-                .map_err(|e| format!("failed to replace corrupt snapshot object: {e}"))?;
-            fs::rename(&temp_path, &destination)
-                .map_err(|e| format!("failed to replace snapshot object: {e}"))?;
-        }
-    } else if let Err(error) = fs::rename(&temp_path, &destination) {
-        if destination.exists() {
-            fs::remove_file(&temp_path).map_err(|cleanup| {
-                format!("failed to discard duplicate snapshot object: {cleanup}")
-            })?;
-        } else {
-            return Err(format!("failed to commit snapshot object: {error}"));
-        }
-    }
-    let _ = crate::artifact_receipt::record_verified(
-        &destination,
-        "sha256",
-        &hash,
-        i64::try_from(size).ok(),
-    );
-    Ok((hash, size))
-}
-
 pub(crate) fn blob_file_matches(path: &Path, expected_hash: &str, expected_size: u64) -> bool {
     let Ok(file) = fs::File::open(path) else {
         return false;
@@ -1865,52 +1864,10 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
         return Err(error);
     }
 
-    #[cfg(not(windows))]
-    {
-        if let Err(error) = fs::rename(&temp, path) {
-            let _ = fs::remove_file(&temp);
-            return Err(format!("failed to commit snapshot metadata: {error}"));
-        }
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    {
-        match fs::rename(&temp, path) {
-            Ok(()) => return Ok(()),
-            Err(first_error) => {
-                // Modern Windows filesystems normally support replacement,
-                // but keep a rollback fallback for platform/filesystem cases
-                // where replacing an existing destination is rejected.
-                if !path.exists() {
-                    let _ = fs::remove_file(&temp);
-                    return Err(format!("failed to commit snapshot metadata: {first_error}"));
-                }
-                let backup = parent.join(format!(
-                    ".{file_name}.{}-{}.bak",
-                    std::process::id(),
-                    uuid::Uuid::new_v4()
-                ));
-                if let Err(stage_error) = fs::rename(path, &backup) {
-                    let _ = fs::remove_file(&temp);
-                    return Err(format!(
-                        "failed to commit snapshot metadata: {first_error}; \
-                         replacement fallback could not stage the old file: {stage_error}"
-                    ));
-                }
-                if let Err(commit_error) = fs::rename(&temp, path) {
-                    let _ = fs::remove_file(&temp);
-                    let _ = fs::rename(&backup, path);
-                    return Err(format!(
-                        "failed to commit snapshot metadata after staging the old file: \
-                         {commit_error}"
-                    ));
-                }
-                let _ = fs::remove_file(&backup);
-            }
-        }
-        Ok(())
-    }
+    crate::recovery::durable_rename(&temp, path, true).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        format!("failed to commit snapshot metadata: {error}")
+    })
 }
 
 /// Restore an instance to a snapshot.
@@ -2389,7 +2346,13 @@ fn extract_and_verify(
                     )
                 })?;
             validate_blob_hash(blob_hash)?;
-            let blob_path = snapshot_blob_path(instance_dir, blob_hash);
+            let blob_path =
+                snapshot_blob_source(instance_dir, blob_hash, file_entry.size).ok_or_else(|| {
+                    format!(
+                        "failed to open snapshot object for {}: no object store holds {blob_hash} of {} bytes whose bytes match the hash (missing, or a hash mismatch)",
+                        file_entry.relative_path, file_entry.size
+                    )
+                })?;
             let input = fs::File::open(&blob_path).map_err(|e| {
                 format!(
                     "failed to open snapshot object for {}: {e}",
@@ -2533,6 +2496,44 @@ fn read_manifest_file(path: &Path, snapshot_id: &str) -> Result<SnapshotManifest
     Ok(manifest)
 }
 
+/// What a verification receipt beside a snapshot or an object is called, appended to its name.
+pub(crate) const VERIFIED_RECEIPT_SUFFIX: &str = ".agora-verified";
+
+/// Whether this file name looks like a snapshot manifest, as opposed to the helper files that live
+/// beside one (`live-file-index.json`, `mutation-journal.json`) or a verification receipt.
+///
+/// Not a path validator: it compares whole file names, and the folder they are in is chosen by the
+/// caller.
+pub(crate) fn looks_like_snapshot_manifest(name: &str) -> bool {
+    let Some(id) = name.strip_suffix(".json") else {
+        return false;
+    };
+    !id.to_ascii_lowercase().ends_with(VERIFIED_RECEIPT_SUFFIX)
+        && !id.eq_ignore_ascii_case("live-file-index")
+        && !id.eq_ignore_ascii_case("mutation-journal")
+}
+
+/// Every object hash and content-store item id one snapshot manifest names, read fresh.
+///
+/// This is the collector's view of a snapshot: it never trusts a cached index, and it fails with the
+/// reason rather than returning an empty list, because an unreadable manifest may name any object.
+pub(crate) fn snapshot_manifest_references(
+    path: &Path,
+    snapshot_id: &str,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let manifest = read_manifest_file(path, snapshot_id)?;
+    let hashes = manifest
+        .files
+        .iter()
+        .filter_map(|file| file.blob_sha256.as_deref().or(file.sha256.as_deref()))
+        .filter(|hash| validate_blob_hash(hash).is_ok())
+        // Object names are lowercase hex, and a manifest may carry either case: a collection that
+        // compared them as written would free an object a snapshot still names (MASTER_SPEC §32.8).
+        .map(str::to_ascii_lowercase)
+        .collect();
+    Ok((hashes, manifest.content_refs.clone()))
+}
+
 fn validate_manifest(manifest: &SnapshotManifest, snapshot_id: &str) -> Result<(), String> {
     if manifest.schema_version == 0 || manifest.schema_version > SNAPSHOT_SCHEMA_VERSION {
         return Err(format!(
@@ -2618,6 +2619,12 @@ pub(crate) fn validate_snapshot_id(snapshot_id: &str) -> Result<(), String> {
         || snapshot_id.contains('\\')
     {
         return Err("invalid snapshot id".into());
+    }
+    // Every valid ID must produce a manifest the collector will read (MASTER_SPEC §32.8).
+    if !looks_like_snapshot_manifest(&format!("{snapshot_id}.json")) {
+        return Err(format!(
+            "invalid snapshot id {snapshot_id}: the manifest name is reserved"
+        ));
     }
     Ok(())
 }
@@ -3159,23 +3166,74 @@ fn list_snapshots_with(
 /// Delete a snapshot. A user-requested delete waits briefly for a passing instance move or scan;
 /// if the lock is still busy it refuses, with the holder named in the retry message.
 pub fn delete_snapshot(instance_dir: &Path, snapshot_id: &str) -> Result<(), String> {
+    delete_snapshot_collecting(instance_dir, snapshot_id, None).map(|_| ())
+}
+
+/// [`delete_snapshot`] whose result carries what the collection did with the objects the snapshot
+/// no longer holds: what it reclaimed, what it kept and why. Deleting the snapshot succeeds either
+/// way; showing the report is the adapter's job (MASTER_SPEC §32.8).
+pub fn delete_snapshot_with_report(
+    instance_dir: &Path,
+    snapshot_id: &str,
+) -> Result<crate::content_store::collect::CollectReport, String> {
+    delete_snapshot_collecting(instance_dir, snapshot_id, None)
+}
+
+/// Delete one snapshot and then collect what it no longer holds (MASTER_SPEC §32.8).
+///
+/// The collector's lock order decides this one: the content store first, then instance locations,
+/// held from the collection's first listing to its last delete. `grace` is the collector's grace
+/// period for a newly written object; `None` is the hour production uses, and a test passes zero to
+/// see what deleting the last snapshot frees.
+pub(crate) fn delete_snapshot_collecting(
+    instance_dir: &Path,
+    snapshot_id: &str,
+    grace: Option<std::time::Duration>,
+) -> Result<crate::content_store::collect::CollectReport, String> {
+    let manager = LockManager::new(snapshot_store_paths(instance_dir).locks_root());
+    let store = manager
+        .acquire(LockResource::ContentStore, "snapshot-delete")
+        .map_err(|error| format!("snapshot delete could not lock the content store: {error}"))?;
     let locations = lock_snapshot_locations(instance_dir, "snapshot-delete", true)?;
     delete_snapshot_with(
         instance_dir,
         snapshot_id,
         list_snapshot_scan_dir,
         &locations,
+        &store,
+        grace,
     )
 }
 
-/// Delete a snapshot whose caller already holds InstanceLocations. The guard is proof the
-/// non-reentrant lock is held: retention takes it once for a whole round and passes it to every
-/// delete, so no delete tries to take the lock again.
+/// Delete a snapshot whose caller already holds InstanceLocations and the content-store lock, then
+/// collect.
+///
+/// The guards are proof the non-reentrant locks are held: retention takes them once for a whole
+/// round and passes them to every delete, so no delete tries to take either again. Store first,
+/// then locations, is the collector's order, and a caller that has one without the other refuses
+/// rather than reaching for it here (MASTER_SPEC §32.8).
 pub(super) fn delete_snapshot_with(
     instance_dir: &Path,
     snapshot_id: &str,
-    list_dir: impl Fn(&Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>>,
-    _locations: &LockGuard,
+    _list_dir: impl Fn(&Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>>,
+    locations: &LockGuard,
+    store: &LockGuard,
+    grace: Option<std::time::Duration>,
+) -> Result<crate::content_store::collect::CollectReport, String> {
+    delete_snapshot_records(instance_dir, snapshot_id)?;
+    finish_snapshot_delete(instance_dir, snapshot_id, locations, store, grace)
+}
+
+/// Remove one snapshot's own records — its manifest or zip, the receipt beside it and its
+/// fingerprint — and judge no object.
+///
+/// Separated from the collection so a batch (retention's whole plan) removes everything it is going
+/// to remove first, then runs **one** collection over the result: per-snapshot collections made a
+/// round of retention free objects a later eviction still named inside the same round
+/// (MASTER_SPEC §32.8).
+pub(super) fn delete_snapshot_records(
+    instance_dir: &Path,
+    snapshot_id: &str,
 ) -> Result<(), String> {
     validate_snapshot_id(snapshot_id)?;
     let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
@@ -3183,17 +3241,7 @@ pub(super) fn delete_snapshot_with(
     if !manifest_path.exists() && !zip_path.exists() {
         return Err(format!("snapshot {snapshot_id} not found"));
     }
-    let mut blobs = Vec::new();
     if manifest_path.is_file() {
-        if let Ok(manifest) = read_manifest_file(&manifest_path, snapshot_id) {
-            blobs = manifest
-                .files
-                .iter()
-                .filter_map(|file| file.blob_sha256.as_deref().or(file.sha256.as_deref()))
-                .filter(|hash| validate_blob_hash(hash).is_ok())
-                .map(str::to_string)
-                .collect();
-        }
         fs::remove_file(&manifest_path)
             .map_err(|e| format!("failed to delete snapshot manifest: {e}"))?;
         if let Some(name) = manifest_path.file_name().and_then(|name| name.to_str()) {
@@ -3205,19 +3253,32 @@ pub(super) fn delete_snapshot_with(
         fs::remove_file(&zip_path).map_err(|e| format!("failed to delete snapshot zip: {e}"))?;
     }
     let _ = fs::remove_file(snapshot_fingerprint_path(instance_dir, snapshot_id));
+    Ok(())
+}
 
-    for hash in blobs {
-        if !blob_is_referenced_by_any_snapshot(instance_dir, &hash, &list_dir) {
-            let path = snapshot_blob_path(instance_dir, &hash);
-            let _ = fs::remove_file(&path);
-            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                let _ = fs::remove_file(path.with_file_name(format!("{name}.agora-verified.json")));
-            }
-            if let Some(parent) = path.parent() {
-                let _ = fs::remove_dir(parent);
-            }
-        }
-    }
+/// Collect after a snapshot (or a whole batch of them) has been removed, and tidy an empty
+/// snapshots folder. The report says what the collection freed, or why it freed nothing.
+fn finish_snapshot_delete(
+    instance_dir: &Path,
+    snapshot_id: &str,
+    _locations: &LockGuard,
+    store: &LockGuard,
+    grace: Option<std::time::Duration>,
+) -> Result<crate::content_store::collect::CollectReport, String> {
+    // Nothing names this snapshot's objects now: the one collection decides whether any record
+    // still does, and says why it kept them if it cannot tell.
+    let report = crate::content_store::collect::collect_at_instance(
+        instance_dir,
+        &crate::content_store::collect::CollectRequest {
+            store: crate::content_store::collect::LockRequest::Held,
+            locations: crate::content_store::collect::LockRequest::Held,
+            grace,
+            ignore_unreadable_snapshots: false,
+            pause: None,
+        },
+    )
+    .map_err(|error| format!("snapshot {snapshot_id} was deleted, but {error}"))?;
+    let _ = store;
 
     let dir = snapshots_dir(instance_dir);
     if dir.exists()
@@ -3228,8 +3289,7 @@ pub(super) fn delete_snapshot_with(
     {
         let _ = fs::remove_dir(&dir);
     }
-
-    Ok(())
+    Ok(report)
 }
 
 /// Take instance locations for snapshot cleanup. `wait` uses the short bounded wait for operations
@@ -3239,8 +3299,7 @@ pub(crate) fn lock_snapshot_locations(
     operation: &str,
     wait: bool,
 ) -> Result<LockGuard, String> {
-    let paths = AppPaths::from_root(snapshot_app_root(instance_dir));
-    let manager = LockManager::new(paths.locks_root());
+    let manager = LockManager::new(snapshot_store_paths(instance_dir).locks_root());
     let acquired = if wait {
         manager.wait_instance_locations(operation)
     } else {
@@ -3255,139 +3314,6 @@ pub(super) fn list_snapshot_scan_dir(dir: &Path) -> std::io::Result<Vec<std::io:
             .map(|entry| entry.map(|entry| entry.path()))
             .collect()
     })
-}
-
-/// The reachability scan with its directory listing injected, so a listing
-/// entry that fails can be exercised without depending on the OS to fail on
-/// cue. The caller holds InstanceLocations and production always lists the real filesystem.
-/// Whether a blob may still be needed by some snapshot.
-///
-/// Fails closed: the object store is shared by every instance, so if any
-/// snapshot directory or manifest cannot be read right now (a sharing
-/// violation and a half-written file look the same), the blob is reported as
-/// referenced and kept. Leaving an orphan blob costs disk space; deleting a
-/// needed one costs a restore point.
-fn blob_is_referenced_by_any_snapshot(
-    instance_dir: &Path,
-    hash: &str,
-    list_dir: impl Fn(&Path) -> std::io::Result<Vec<std::io::Result<PathBuf>>>,
-) -> bool {
-    if let Err(error) = validate_blob_hash(hash) {
-        // A malformed hash cannot be compared, so reachability is unknown. Both
-        // production callers filter hashes before reaching here; keep the blob
-        // rather than rely on that forever.
-        eprintln!("snapshot blob cleanup skipped: invalid blob hash: {error}");
-        return true;
-    }
-    let instances_root = instance_dir.parent().unwrap_or(instance_dir);
-    let mut dirs: Vec<PathBuf> = match list_dir(instances_root) {
-        Ok(entries) => {
-            let mut dirs = Vec::new();
-            for entry in entries {
-                match entry {
-                    Ok(entry) => dirs.push(entry.join(".agora_snapshots")),
-                    Err(error) => {
-                        eprintln!(
-                            "snapshot blob cleanup skipped: cannot list an instance: {error}"
-                        );
-                        return true;
-                    }
-                }
-            }
-            dirs
-        }
-        Err(error) => {
-            eprintln!("snapshot blob cleanup skipped: cannot list instances: {error}");
-            return true;
-        }
-    };
-    dirs.push(snapshots_dir(instance_dir));
-
-    // A deleted instance keeps its `.agora_snapshots` inside the moved folder,
-    // so it can still be restored. Both trash roots are siblings of `instances`
-    // under the app data root, which `AppPaths` already owns; core needs no
-    // knowledge of the game that put the instance there.
-    let app_root = snapshot_app_root(instance_dir);
-    let paths = AppPaths::from_root(app_root);
-    for root in [
-        paths.recently_deleted_root(),
-        paths.recently_deleted_games_root(),
-    ] {
-        let entries = match list_dir(&root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                eprintln!(
-                    "snapshot blob cleanup skipped: cannot list trash root {}: {error}",
-                    root.display()
-                );
-                return true;
-            }
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    eprintln!(
-                        "snapshot blob cleanup skipped: cannot list a trash entry in {}: {error}",
-                        root.display()
-                    );
-                    return true;
-                }
-            };
-            dirs.push(entry.join("instance").join(".agora_snapshots"));
-        }
-    }
-
-    for dir in dirs {
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                eprintln!(
-                    "snapshot blob cleanup skipped: cannot read {}: {error}",
-                    dir.display()
-                );
-                return true;
-            }
-        };
-        for entry in entries {
-            let Ok(entry) = entry else {
-                return true;
-            };
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            let is_manifest = name.ends_with(".json")
-                && !name.ends_with(".agora-verified.json")
-                && name != "live-file-index.json"
-                && name != "mutation-journal.json";
-            if !is_manifest {
-                continue;
-            }
-            let Some(id) = path.file_stem().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            match read_manifest_file(&path, id) {
-                Ok(manifest) => {
-                    if manifest.files.iter().any(|file| {
-                        file.blob_sha256.as_deref().or(file.sha256.as_deref()) == Some(hash)
-                    }) {
-                        return true;
-                    }
-                }
-                Err(error) => {
-                    eprintln!(
-                        "snapshot blob cleanup skipped: cannot read manifest {}: {error}",
-                        path.display()
-                    );
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }
 
 /// Return the physical storage estimate used by retention for a snapshot.
@@ -3406,7 +3332,15 @@ pub fn snapshot_storage_size(instance_dir: &Path, snapshot_id: &str) -> u64 {
                 .filter_map(|file| file.blob_sha256.as_deref().or(file.sha256.as_deref()))
                 .filter(|hash| validate_blob_hash(hash).is_ok())
                 .map(|hash| {
-                    fs::metadata(snapshot_blob_path(instance_dir, hash))
+                    // Whichever store holds the blob, and the legacy location as the last guess so a
+                    // damaged blob still counts its size against the cap.
+                    let path = snapshot_blob_path(instance_dir, hash);
+                    fs::metadata(&path)
+                        .or_else(|_| {
+                            fs::metadata(
+                                snapshot_store_paths(instance_dir).content_object_path(hash),
+                            )
+                        })
                         .map(|m| m.len())
                         .unwrap_or(0)
                 })
@@ -3417,38 +3351,49 @@ pub fn snapshot_storage_size(instance_dir: &Path, snapshot_id: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Remove content-addressed objects that are no longer referenced by any
-/// instance snapshot manifest. Garbage collection is best-effort at lifecycle
-/// boundaries; restore correctness never depends on it.
+/// Remove content-addressed objects that no owner record names any more, in both stores
+/// (MASTER_SPEC §32.8).
+///
+/// This is the same collection that a snapshot delete and an item removal run; it is the entry point
+/// for a caller that only wants the sweep. Garbage collection is best-effort at lifecycle
+/// boundaries: a refusal here leaves objects for the next one, and restore correctness never depends
+/// on it.
 pub fn prune_unreferenced_objects(instance_dir: &Path) -> Result<(), String> {
-    let root = snapshot_objects_dir(instance_dir);
-    if !root.is_dir() {
-        return Ok(());
+    prune_unreferenced_objects_with_grace(instance_dir, None)
+}
+
+/// [`prune_unreferenced_objects`] with the collector's grace period chosen: `None` is the hour
+/// production uses, and a test passes zero to see what a sweep frees.
+pub(crate) fn prune_unreferenced_objects_with_grace(
+    instance_dir: &Path,
+    grace: Option<std::time::Duration>,
+) -> Result<(), String> {
+    prune_unreferenced_objects_with_pause(instance_dir, grace, None)
+}
+
+/// [`prune_unreferenced_objects_with_grace`] with the collector's pause installed: the test hook
+/// fires once every owner record has been listed and before the first delete.
+pub(crate) fn prune_unreferenced_objects_with_pause(
+    instance_dir: &Path,
+    grace: Option<std::time::Duration>,
+    pause: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+) -> Result<(), String> {
+    let report = crate::content_store::collect::collect_at_instance(
+        instance_dir,
+        &crate::content_store::collect::CollectRequest {
+            store: crate::content_store::collect::LockRequest::Wait,
+            locations: crate::content_store::collect::LockRequest::Try,
+            grace,
+            ignore_unreadable_snapshots: false,
+            pause,
+        },
+    )?;
+    if report.refused() {
+        return Err(format!(
+            "nothing was swept from the object stores: {}",
+            report.refusal_reasons()
+        ));
     }
-    let _locations = lock_snapshot_locations(instance_dir, "snapshot-prune", false)?;
-    let prefixes =
-        fs::read_dir(&root).map_err(|e| format!("failed to scan snapshot object store: {e}"))?;
-    for prefix in prefixes {
-        let prefix = prefix.map_err(|e| format!("failed to read snapshot object prefix: {e}"))?;
-        if !prefix.path().is_dir() {
-            continue;
-        }
-        for entry in fs::read_dir(prefix.path())
-            .map_err(|e| format!("failed to scan snapshot objects: {e}"))?
-        {
-            let entry = entry.map_err(|e| format!("failed to read snapshot object: {e}"))?;
-            let Some(hash) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            if validate_blob_hash(&hash).is_ok()
-                && !blob_is_referenced_by_any_snapshot(instance_dir, &hash, list_snapshot_scan_dir)
-            {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-        let _ = fs::remove_dir(prefix.path());
-    }
-    let _ = fs::remove_dir(root);
     Ok(())
 }
 
@@ -3547,11 +3492,55 @@ mod tests {
     }
 
     fn count_snapshot_objects(instance_dir: &Path) -> usize {
-        fs::read_dir(snapshot_objects_dir(instance_dir))
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|prefix| fs::read_dir(prefix.path()).unwrap().count())
+        // Snapshots write into the one content store; a store captured before the migration still
+        // holds its blobs in `snapshot-objects`. Count both, so a test about reachability is the
+        // same test before and after the move.
+        let object_stores = [
+            snapshot_objects_dir(instance_dir),
+            snapshot_store_paths(instance_dir).content_objects_dir(),
+        ];
+        object_stores
+            .iter()
+            .filter_map(|root| fs::read_dir(root).ok())
+            .flat_map(|prefixes| prefixes.filter_map(Result::ok))
+            .map(|prefix| {
+                fs::read_dir(prefix.path())
+                    .map(|entries| entries.filter_map(Result::ok).count())
+                    .unwrap_or(0)
+            })
             .sum()
+    }
+
+    /// Make `link` point at `target`: a junction on Windows (no administrator needed) and a
+    /// symlink elsewhere. Returns whether the link exists, so a test can fail rather than pass
+    /// without exercising it.
+    fn make_folder_link(target: &Path, link: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false);
+            made && std::fs::symlink_metadata(link)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
+    /// Whether any object store still holds a file with this object name: the snapshots write into
+    /// the content store, and a store captured before the migration is in `snapshot-objects`.
+    fn blob_exists_in_any_store(instance_dir: &Path, hash: &str) -> bool {
+        snapshot_blob_path(instance_dir, hash).is_file()
+            || snapshot_store_paths(instance_dir)
+                .content_object_path(hash)
+                .is_file()
     }
 
     fn hash_of_first_blob(dir: &Path, id: &str) -> String {
@@ -3583,13 +3572,35 @@ mod tests {
     }
 
     #[test]
-    fn review_invalid_blob_hash_is_kept_not_treated_as_unreferenced() {
+    fn review_a_manifest_naming_a_malformed_hash_keeps_the_objects_it_names() {
         let tmp = TempDir::new().unwrap();
-        let a = tmp.path().join("inst-a");
+        let instances = tmp.path().join("instances");
+        let a = instances.join("inst-a");
         fs::create_dir_all(a.join("mods")).unwrap();
+        fs::write(a.join("mods").join("kept.jar"), b"keep me").unwrap();
+        let snap = create_snapshot(&a, Some("a")).unwrap();
+        let hash = hash_of_first_blob(&a, &snap.id);
+
+        // A record that names an object it cannot spell is still a record: the entries it names
+        // properly keep their objects, and the malformed name matches no object at all.
+        let manifest_path = snapshot_manifest_path(&a, &snap.id);
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        manifest["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "relative_path": "mods/other.jar",
+                "size": 3,
+                "sha256": "not-a-sha256",
+                "blob_sha256": "not-a-sha256",
+            }));
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        super::prune_unreferenced_objects_with_grace(&a, Some(std::time::Duration::ZERO)).unwrap();
         assert!(
-            super::blob_is_referenced_by_any_snapshot(&a, "not-a-sha256", list_snapshot_scan_dir),
-            "a malformed hash cannot prove a blob is safe to delete"
+            blob_exists_in_any_store(&a, &hash),
+            "a manifest that names an object must keep it, whatever else it spells wrong"
         );
     }
 
@@ -3614,29 +3625,30 @@ mod tests {
     }
 
     #[test]
-    fn review_delete_keeps_blob_when_an_instance_entry_cannot_be_listed() {
+    fn review_delete_keeps_blob_when_an_instance_location_is_a_link() {
         let tmp = TempDir::new().unwrap();
         let (a, b, hash, snap_a) = two_instances_sharing_a_blob(&tmp);
-        let instances_root = a.parent().unwrap().to_path_buf();
-        // delete_snapshot removes the manifest before it checks reachability,
-        // so only the other instance could still hold the blob.
+        // The other instance is reached through a link. Which objects it holds cannot be judged
+        // without following a tree this collection was not asked about, so nothing is deleted.
+        let link = tmp.path().join("instances").join("linked");
+        if !make_folder_link(&b, &link) {
+            eprintln!(
+                "skipped: this process cannot create a folder link, so the check does not run"
+            );
+            return;
+        }
         fs::remove_file(snapshot_manifest_path(&a, &snap_a.id)).unwrap();
-        fs::rename(&b, tmp.path().join("moved-b")).unwrap();
-        // One entry of the instances root cannot be listed. It may hold a
-        // snapshot that needs the blob, so reachability cannot be decided.
-        let blocked = instances_root.clone();
-        let referenced = super::blob_is_referenced_by_any_snapshot(&a, &hash, |dir| {
-            if dir == blocked {
-                Ok(vec![Err(std::io::Error::other(
-                    "cannot list instance entry",
-                ))])
-            } else {
-                fs::read_dir(dir).map(|entries| entries.map(|e| e.map(|e| e.path())).collect())
-            }
-        });
+
+        let error =
+            super::prune_unreferenced_objects_with_grace(&a, Some(std::time::Duration::ZERO))
+                .expect_err("a linked instance must stop the collection");
         assert!(
-            referenced,
-            "an unreadable instance entry must count as 'may reference' and keep the blob"
+            error.contains("is a link") && error.contains(&link.display().to_string()),
+            "the refusal names the link: {error}"
+        );
+        assert!(
+            blob_exists_in_any_store(&a, &hash),
+            "a collection that cannot judge a linked instance must delete nothing"
         );
     }
 
@@ -3645,8 +3657,10 @@ mod tests {
         for trash_root in ["recently-deleted", "recently-deleted-games"] {
             let tmp = TempDir::new().unwrap();
             let (a, b, hash, snap_a) = two_instances_sharing_a_blob(&tmp);
-            let blob = snapshot_blob_path(&a, &hash);
-            assert!(blob.is_file(), "setup: shared blob should exist");
+            assert!(
+                blob_exists_in_any_store(&a, &hash),
+                "setup: shared blob should exist"
+            );
 
             // The other snapshot travels with its instance into Recently
             // deleted; its `.agora_snapshots` folder is inside the moved folder.
@@ -3656,7 +3670,7 @@ mod tests {
 
             delete_snapshot(&a, &snap_a.id).unwrap();
             assert!(
-                blob.is_file(),
+                blob_exists_in_any_store(&a, &hash),
                 "{trash_root}: blob needed only by a trashed snapshot was deleted"
             );
         }
@@ -3671,7 +3685,6 @@ mod tests {
         fs::write(a.join("mods").join("only.jar"), b"only here").unwrap();
         let snap = create_snapshot(&a, Some("a")).unwrap();
         let hash = hash_of_first_blob(&a, &snap.id);
-        let blob = snapshot_blob_path(&a, &hash);
 
         // The root exists but cannot be listed (a file where a directory was
         // expected). There may be a snapshot in it: "can't tell" keeps the blob.
@@ -3679,7 +3692,7 @@ mod tests {
 
         delete_snapshot(&a, &snap.id).unwrap();
         assert!(
-            blob.is_file(),
+            blob_exists_in_any_store(&a, &hash),
             "an unreadable trash root must keep the blob"
         );
     }
@@ -3707,9 +3720,8 @@ mod tests {
             .next()
             .expect("snapshot a records a blob hash")
             .to_string();
-        let blob = snapshot_blob_path(&a, &hash);
         assert!(
-            blob.is_file(),
+            blob_exists_in_any_store(&a, &hash),
             "setup: shared blob should exist before delete"
         );
 
@@ -3720,7 +3732,7 @@ mod tests {
         delete_snapshot(&a, &snap_a.id).unwrap();
 
         assert!(
-            blob.is_file(),
+            blob_exists_in_any_store(&a, &hash),
             "shared blob {hash} was removed while snapshot {} may still need it",
             snap_b.id
         );
@@ -3762,7 +3774,7 @@ mod tests {
         fs::write(snapshots_dir(&a).join("live-file-index.json"), b"garbage").unwrap();
         fs::write(snapshots_dir(&a).join("mutation-journal.json"), b"garbage").unwrap();
         assert!(count_snapshot_objects(&a) > 0);
-        delete_snapshot(&a, &snap.id).unwrap();
+        delete_snapshot_collecting(&a, &snap.id, Some(std::time::Duration::ZERO)).unwrap();
         assert!(!snapshot_objects_dir(&a).exists() || count_snapshot_objects(&a) == 0);
     }
 
@@ -4160,7 +4172,9 @@ mod tests {
             .blob_sha256
             .as_deref()
             .unwrap();
-        let content = fs::read(snapshot_blob_path(&inst, hash)).unwrap();
+        let content =
+            fs::read(snapshot_blob_source(&inst, hash, 11).expect("the object is in a store"))
+                .unwrap();
         assert_eq!(content, b"mod content");
     }
 
@@ -4173,7 +4187,9 @@ mod tests {
         let manifest_path = snapshot_manifest_path(&inst, &snap.id);
         assert!(manifest_path.exists());
 
-        delete_snapshot(&inst, &snap.id).unwrap();
+        // Grace zero: this test is about what deleting the last snapshot frees, and the fixture
+        // wrote its objects a moment ago.
+        delete_snapshot_collecting(&inst, &snap.id, Some(std::time::Duration::ZERO)).unwrap();
         assert!(!manifest_path.exists());
         assert_eq!(count_snapshot_objects(&inst), 0);
     }
@@ -4252,7 +4268,12 @@ mod tests {
             .blob_sha256
             .as_deref()
             .unwrap();
-        fs::write(snapshot_blob_path(&inst, hash), b"bad content").unwrap();
+        // Fixture: a stored object of the recorded size whose bytes are no longer the recorded
+        // ones. Restore must notice that and leave the live instance alone.
+        let stored = snapshot_store_paths(&inst).content_object_path(hash);
+        crate::content_store::protect::unprotect(&stored).unwrap();
+        let same_length_other_bytes = vec![0u8; fs::metadata(&stored).unwrap().len() as usize];
+        fs::write(&stored, &same_length_other_bytes).unwrap();
 
         let error = restore_snapshot(&inst, &snapshot.id).unwrap_err();
         assert!(error.contains("hash mismatch"));
@@ -4679,7 +4700,11 @@ mod tests {
         let inst = make_instance(&tmp);
         let id = "legacy-scopeless";
         fs::create_dir_all(snapshots_dir(&inst)).unwrap();
-        let blob = store_snapshot_object(&inst, &inst.join("options.txt")).unwrap();
+        let blob = crate::content_store::place_object_from_file(
+            &snapshot_store_paths(&inst),
+            &inst.join("options.txt"),
+        )
+        .unwrap();
         let manifest = serde_json::json!({
             "schema_version": 3,
             "snapshot": {
@@ -4757,5 +4782,26 @@ mod tests {
             zip.write_all(contents).unwrap();
         }
         zip.finish().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+
+    /// A manifest and the receipt beside an object are both `<name>.json` in the same folder, so an
+    /// id that ends like a receipt would be read as a receipt: `list_snapshots` and the collector
+    /// would skip the manifest and free the blobs it names (MASTER_SPEC §32.8).
+    #[test]
+    fn every_reserved_snapshot_id_is_refused() {
+        for id in ["live-file-index", "mutation-journal", "snap.agora-verified"] {
+            assert!(!looks_like_snapshot_manifest(&format!("{id}.json")));
+            assert!(
+                validate_snapshot_id(id).is_err(),
+                "accepted reserved id {id}"
+            );
+            assert!(validate_snapshot_id(&id.to_ascii_uppercase()).is_err());
+        }
+        assert!(validate_snapshot_id("plain-id").is_ok());
     }
 }

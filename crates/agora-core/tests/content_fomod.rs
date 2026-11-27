@@ -81,6 +81,10 @@ impl Fx {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = Ctx::for_testing(tmp.path().join("data"));
+        // These tests are about what a removal frees; their fixtures write objects a moment before
+        // the sweep runs, so the production hour of grace would keep every one of them.
+        ctx.test_seams
+            .set_object_grace(Some(std::time::Duration::ZERO));
         Fx {
             _tmp: tmp,
             work: tempfile::tempdir().unwrap(),

@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { addInstanceContent, removeStored } from '@/features/games/content/api';
-import { minecraftAddStoredContent } from '@/lib/tauri';
+import { minecraftAddStoredContent, type CollectOutcome } from '@/lib/tauri';
 
 /** One instance that has a library item. */
 export interface LibraryInstance {
@@ -175,12 +175,15 @@ export async function listUnusedItems(): Promise<UnusedListing> {
  * Remove one item from the store. Refused while an instance uses it, or when a
  * snapshot manifest is unreadable. Pass `ignoreUnreadableSnapshots` only after
  * the person chose to leave those snapshots unable to restore the item.
+ *
+ * The reply is what the removal's collection did with the objects the item named (MASTER_SPEC
+ * §32.8); the Library says it beside the confirmation.
  */
 export async function removeLibraryItem(
   itemId: string,
   ignoreUnreadableSnapshots = false,
-): Promise<void> {
-  await removeStored(itemId, ignoreUnreadableSnapshots);
+): Promise<CollectOutcome> {
+  return removeStored(itemId, ignoreUnreadableSnapshots);
 }
 
 /** Every instance of every game, for the Add-to-instance picker. */

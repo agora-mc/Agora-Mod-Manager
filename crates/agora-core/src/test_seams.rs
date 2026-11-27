@@ -70,7 +70,12 @@ struct Seams {
     process_view: Mutex<Option<Arc<dyn crate::process_identity::ProcessView>>>,
     process_view_installed: AtomicBool,
     process_view_hits: AtomicUsize,
+    /// The grace period an object collection gives a newly written object.
+    object_grace: Mutex<Option<std::time::Duration>>,
+    object_collection_after_live: Mutex<Option<ObjectCollectionHook>>,
 }
+
+type ObjectCollectionHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(debug_assertions)]
 type InstallHook = Arc<dyn Fn(crate::plugins::install::InstallCrashPoint) + Send + Sync>;
@@ -158,6 +163,35 @@ impl TestSeams {
     /// How many times an installed process-table stand-in was read with this context.
     pub fn process_view_hits(&self) -> usize {
         self.0.process_view_hits.load(Ordering::Relaxed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Object collection grace
+// ---------------------------------------------------------------------------
+
+impl TestSeams {
+    /// Set the grace period an object collection gives a newly written object, or clear it to the
+    /// hour production uses (MASTER_SPEC §32.8).
+    ///
+    /// A test that wants to see what a collection frees passes zero: a fixture writes its objects
+    /// milliseconds before the collection runs, so the real hour would keep every one of them.
+    pub fn set_object_grace(&self, grace: Option<std::time::Duration>) {
+        *slot(&self.0.object_grace) = grace;
+    }
+
+    /// The grace period this context's collections use, `None` for the production hour.
+    pub(crate) fn object_grace(&self) -> Option<std::time::Duration> {
+        *slot(&self.0.object_grace)
+    }
+
+    /// Run a test's hook after collection lists live instances and before it lists other owners.
+    pub fn set_object_collection_after_live(&self, hook: Option<ObjectCollectionHook>) {
+        *slot(&self.0.object_collection_after_live) = hook;
+    }
+
+    pub(crate) fn object_collection_after_live(&self) -> Option<ObjectCollectionHook> {
+        slot(&self.0.object_collection_after_live).clone()
     }
 }
 

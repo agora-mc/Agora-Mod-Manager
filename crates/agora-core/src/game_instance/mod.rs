@@ -732,7 +732,13 @@ pub fn adopt_imported_snapshot(
             "snapshot {snapshot_id} has no hash for its instance manifest"
         ))
     })?;
-    let bytes = std::fs::read(crate::snapshot::snapshot_blob_path(&instance_dir, hash))?;
+    let blob_path = crate::snapshot::snapshot_blob_source(&instance_dir, hash, entry.size)
+        .ok_or_else(|| {
+            InstanceError::Other(format!(
+                "snapshot {snapshot_id}'s instance manifest is not in any object store"
+            ))
+        })?;
+    let bytes = std::fs::read(&blob_path)?;
     if bytes.len() as u64 != entry.size
         || !crate::snapshot::sha256_hex(&bytes).eq_ignore_ascii_case(hash)
     {

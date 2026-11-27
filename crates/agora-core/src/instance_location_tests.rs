@@ -127,44 +127,52 @@ fn contend(ctx: &Ctx) -> LockGuard {
         .expect("the contender thread holds the locations lock")
 }
 
+/// Whether some store still holds an object with this name. A capture writes into the one content
+/// store; a store captured before the migration keeps its blobs in `snapshot-objects`.
+fn object_in_any_store(instance_dir: &Path, hash: &str) -> bool {
+    snapshot::snapshot_blob_path(instance_dir, hash).is_file()
+        || snapshot::snapshot_store_paths(instance_dir)
+            .content_object_path(hash)
+            .is_file()
+}
+
 fn snapshot_move_race(restore: bool) {
-    let (_dir, ctx) = fixture();
+    let (dir, ctx) = fixture();
     let a = instance(&ctx, "first", None);
     let b = instance(&ctx, "second", None);
     let first = snapshot::create_snapshot(&a, None, &["tracked.txt"]).unwrap();
     snapshot::create_snapshot(&b, None, &["tracked.txt"]).unwrap();
     let hash = format!("{:x}", Sha256::digest(b"shared snapshot bytes"));
-    let blob = snapshot::snapshot_blob_path(&a, &hash);
-    assert!(blob.is_file());
+    assert!(object_in_any_store(&a, &hash));
     let entry = restore.then(|| {
         game_instance::delete(&ctx, "second")
             .unwrap()
             .trash_entry_id
             .unwrap()
     });
-    let pause_root = if restore {
-        ctx.paths.instances_root()
-    } else {
-        ctx.paths.recently_deleted_games_root()
-    };
-    let fired = AtomicBool::new(false);
-    let locations = contend(&ctx);
-    snapshot::delete_snapshot_with(
-        &a,
-        &first.id,
-        |dir| {
-            let entries = snapshot::list_snapshot_scan_dir(dir);
-            if dir == pause_root && !fired.swap(true, Ordering::SeqCst) {
-                attempt_move(&ctx, entry.as_deref());
-            }
-            entries
-        },
-        &locations,
+    // Only the other instance's snapshot still names the blob, so the sweep would free it unless
+    // moving that instance into or out of Recently deleted waits for the collection.
+    fs::remove_file(
+        a.join(".agora_snapshots")
+            .join(format!("{}.json", first.id)),
     )
     .unwrap();
-    assert!(fired.load(Ordering::SeqCst), "the scan reached the pause");
+
+    let fired = Arc::new(AtomicBool::new(false));
+    let fired_in_hook = Arc::clone(&fired);
+    let move_ctx = Ctx::for_testing(dir.path().to_path_buf());
+    let pause = Arc::new(move || {
+        if !fired_in_hook.swap(true, Ordering::SeqCst) {
+            attempt_move(&move_ctx, entry.as_deref());
+        }
+    });
+    snapshot::prune_unreferenced_objects_with_pause(&a, Some(Duration::ZERO), Some(pause)).unwrap();
     assert!(
-        blob.is_file(),
+        fired.load(Ordering::SeqCst),
+        "the collection reached the pause"
+    );
+    assert!(
+        object_in_any_store(&a, &hash),
         "cleanup deleted a blob still needed by the moving instance"
     );
     assert_eq!(
@@ -190,10 +198,12 @@ fn snapshot_delete_refuses_contended_location_lock() {
     let a = instance(&ctx, "first", None);
     let first = snapshot::create_snapshot(&a, None, &["tracked.txt"]).unwrap();
     let hash = format!("{:x}", Sha256::digest(b"shared snapshot bytes"));
-    let blob = snapshot::snapshot_blob_path(&a, &hash);
     let _held = contend(&ctx);
     let delete = snapshot::delete_snapshot(&a, &first.id);
-    assert!(blob.is_file(), "a blocked scan must leave the blob alone");
+    assert!(
+        object_in_any_store(&a, &hash),
+        "a blocked scan must leave the blob alone"
+    );
     assert!(snapshot::list_snapshots(&a)
         .unwrap()
         .iter()
@@ -207,17 +217,19 @@ fn snapshot_prune_refuses_contended_location_lock() {
     let a = instance(&ctx, "first", None);
     let first = snapshot::create_snapshot(&a, None, &["tracked.txt"]).unwrap();
     let hash = format!("{:x}", Sha256::digest(b"shared snapshot bytes"));
-    let blob = snapshot::snapshot_blob_path(&a, &hash);
     // Make the blob an orphan so the independent prune would delete it.
     fs::remove_file(
         a.join(".agora_snapshots")
             .join(format!("{}.json", first.id)),
     )
     .unwrap();
-    assert!(blob.is_file());
+    assert!(object_in_any_store(&a, &hash));
     let _held = contend(&ctx);
     let prune = snapshot::prune_unreferenced_objects(&a);
-    assert!(blob.is_file(), "a blocked prune must leave the blob alone");
+    assert!(
+        object_in_any_store(&a, &hash),
+        "a blocked prune must leave the blob alone"
+    );
     assert!(prune.unwrap_err().contains("instance-locations"));
 }
 

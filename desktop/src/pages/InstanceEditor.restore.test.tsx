@@ -54,6 +54,8 @@ beforeEach(() => {
       case 'get_dependency_graph': return [];
       case 'list_loadout_profiles': return { profiles: [], damaged: [] };
       case 'list_snapshots': return [SNAPSHOT];
+      case 'delete_snapshot':
+        return { summary: 'nothing was reclaimed: a linked object root', reclaimed: 0, refused: true };
       case 'restore_snapshot':
         return {
           snapshotId: 'snap-1', coverage: 'exact', restoredRoots: ['mods', 'characters'],
@@ -87,5 +89,15 @@ describe('restore from the instance editor', () => {
 
     await screen.findByText(/no longer tracked by minecraft/);
     expect(screen.getByText(/Snapshot restored\./)).toBeTruthy();
+  });
+
+  it('shows the collection result after deleting a snapshot', async () => {
+    render(editor('alpha'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Backups & Versions' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Snapshots' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Confirm' }));
+
+    expect(await screen.findByText(/nothing was reclaimed: a linked object root/i)).toBeInTheDocument();
   });
 });

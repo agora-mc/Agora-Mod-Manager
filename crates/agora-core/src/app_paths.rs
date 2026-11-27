@@ -270,6 +270,13 @@ impl AppPaths {
         self.content_root().join("staging")
     }
 
+    /// Directory for the records an in-flight operation writes before it reuses or adds an object
+    /// (`content/pending/`), so a collection keeps those objects until the operation's own record
+    /// is published (MASTER_SPEC §32.8).
+    pub fn content_pending_dir(&self) -> PathBuf {
+        self.content_root().join("pending")
+    }
+
     /// Root directory for user-file journaled swaps (`user-files/`).
     pub fn user_files_root(&self) -> PathBuf {
         self.root.join("user-files")

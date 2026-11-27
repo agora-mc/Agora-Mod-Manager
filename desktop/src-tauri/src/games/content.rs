@@ -583,25 +583,30 @@ pub async fn games_content_verify(
     .map_err(|_| GamesError::new(TASK_FAILED, "Checking the item did not finish."))?
 }
 
-/// Remove an item from the store. Refused while an instance uses it; the error names them.
+/// Remove an item from the store. Refused while an instance uses it; the error names them. The
+/// reply says what the removal's collection did with the objects the item named, so the Library can
+/// tell the person what was reclaimed, or why nothing was (MASTER_SPEC §32.8).
 #[tauri::command]
 pub async fn games_content_remove(
     app: tauri::AppHandle,
     item_id: String,
     ignore_unreadable_snapshots: Option<bool>,
-) -> Result<(), GamesError> {
+) -> Result<content_store::collect::CollectOutcome, GamesError> {
     let item_id = checked_id(&item_id)?;
-    tokio::task::spawn_blocking(move || -> Result<(), GamesError> {
-        let ctx = crate::core_context(&app)?;
-        content_store::remove_item_with_options(
-            &ctx,
-            &item_id,
-            content_store::RemoveOptions {
-                ignore_unreadable_snapshots: ignore_unreadable_snapshots.unwrap_or(false),
-            },
-        )
-        .map_err(content_error)
-    })
+    tokio::task::spawn_blocking(
+        move || -> Result<content_store::collect::CollectOutcome, GamesError> {
+            let ctx = crate::core_context(&app)?;
+            content_store::remove_item_with_report(
+                &ctx,
+                &item_id,
+                content_store::RemoveOptions {
+                    ignore_unreadable_snapshots: ignore_unreadable_snapshots.unwrap_or(false),
+                },
+            )
+            .map(|report| report.outcome())
+            .map_err(content_error)
+        },
+    )
     .await
     .map_err(|_| GamesError::new(TASK_FAILED, "Removing the item did not finish."))?
 }

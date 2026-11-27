@@ -160,6 +160,7 @@ error_codes! {
     ImportHash = "ERR_IMPORT_HASH", Install, 1;
     ImportHashConfirmation = "ERR_IMPORT_HASH_CONFIRMATION", Install, 1;
     ImportHttpClient = "ERR_IMPORT_HTTP_CLIENT", Install, 1;
+    ImportLocationsBusy = "ERR_IMPORT_LOCATIONS_BUSY", Install, 1;
     ImportMissingCfg = "ERR_IMPORT_MISSING_CFG", Install, 1;
     ImportMissingFile = "ERR_IMPORT_MISSING_FILE", Install, 1;
     ImportMissingIndex = "ERR_IMPORT_MISSING_INDEX", Install, 1;

@@ -3369,7 +3369,9 @@ pub fn add_content_locked(
         enabled: true,
         mount_path: mount_rel,
         source_path: source_rel,
-        source: LayerSource::Content { content: item_id },
+        source: LayerSource::Content {
+            content: item_id.clone(),
+        },
         whiteouts: Vec::new(),
         own_copy: false,
     };
@@ -3386,8 +3388,22 @@ pub fn add_content_locked(
     crate::game_snapshot::snapshot_before_change_locked(ctx, instance_id, "before-content-add")
         .map_err(DeployError::Other)?;
 
+    // The item has to be there when the layer that names it is published: a removal that ran
+    // between the read above and this write would have freed the objects the layer needs. So the
+    // store lock is taken after the instance guard this caller holds (the documented order, so two
+    // writers and a collection cannot deadlock), the item is read again inside that hold, and the
+    // manifest is written under it (MASTER_SPEC §32.8).
+    let _store = ctx
+        .lock_manager
+        .acquire(
+            crate::lock_manager::LockResource::ContentStore,
+            "content-add-layer",
+        )
+        .map_err(|e| DeployError::Other(e.to_string()))?;
+    let _item = crate::content_store::get_item(ctx, &item_id)?;
     manifest.layers = LayerStack::new(layers)?;
     write_instance_manifest_atomic(ctx, instance_id, &manifest)?;
+    drop(_store);
 
     Ok(new_layer)
 }

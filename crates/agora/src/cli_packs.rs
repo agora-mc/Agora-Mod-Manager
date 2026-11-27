@@ -776,8 +776,8 @@ pub async fn run_backup(
             require_instance(data_dir, &instance)?;
             let policy = agora_core::backup::BackupRetentionPolicy::keep_last(keep);
             let doomed = agora_core::backup::preview_instance_retention(ctx, &instance, &policy)?;
-            let removed = if doomed.is_empty() {
-                Vec::new()
+            let (removed, collection) = if doomed.is_empty() {
+                (Vec::new(), None)
             } else {
                 if !yes {
                     eprintln!("These snapshots would be deleted:");
@@ -792,15 +792,19 @@ pub async fn run_backup(
                         anyhow::bail!("Prune cancelled; nothing was deleted.");
                     }
                 }
-                agora_core::backup::apply_instance_retention(ctx, &instance, policy).await?
+                agora_core::backup::apply_instance_retention_with_report(ctx, &instance, policy)
+                    .await?
             };
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({"status": "pruned", "instanceId": instance, "removed": removed})
+                    serde_json::json!({"status": "pruned", "instanceId": instance, "removed": removed, "collection": collection.map(|report| report.outcome())})
                 );
             } else {
                 println!("Removed {} snapshot(s) from '{instance}'", removed.len());
+                if let Some(report) = collection {
+                    println!("{}", report.summary());
+                }
             }
         }
     }

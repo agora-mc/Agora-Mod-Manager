@@ -1,7 +1,7 @@
 {
   "files": {
     "crates/agora-core/src/artifact_hash.rs": 0,
-    "crates/agora-core/src/backup.rs": 24,
+    "crates/agora-core/src/backup.rs": 20,
     "crates/agora-core/src/db.rs": 14,
     "crates/agora-core/src/game_base/mod.rs": 14,
     "crates/agora-core/src/game_instance/trash.rs": 9,
@@ -19,7 +19,7 @@
     "crates/agora-core/src/registry_bundle.rs": 7,
     "crates/agora-core/src/registry_sync.rs": 43,
     "crates/agora-core/src/session_ledger.rs": 25,
-    "crates/agora-core/src/snapshot.rs": 52,
+    "crates/agora-core/src/snapshot.rs": 42,
     "crates/agora-core/src/startup_recovery.rs": 0,
     "crates/agora-game-minecraft/src/launcher_import_service.rs": 49,
     "crates/agora-game-minecraft/src/recently_deleted.rs": 7
@@ -27,10 +27,12 @@
   "directories": {
     "crates/agora-core/src/content_store": {
       "convert.rs": 1,
-      "mod.rs": 18,
+      "mod.rs": 15,
       "place.rs": 4,
       "protect.rs": 0,
-      "rar.rs": 7
+      "rar.rs": 7,
+      "collect.rs": 2,
+      "pending.rs": 0
     }
   }
 }

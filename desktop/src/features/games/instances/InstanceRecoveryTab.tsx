@@ -9,6 +9,7 @@ import { useConfirm } from '@/components/ui/confirm';
 import {
   createSnapshot,
   deleteSnapshot,
+  describeCollection,
   describeRestoreCoverage,
   detectDrift,
   errorCode,
@@ -364,9 +365,13 @@ export function InstanceRecoveryTab({ instanceId }: InstanceRecoveryTabProps) {
                         tone: 'danger',
                       });
                       if (!yes) return;
-                      await deleteSnapshot(instanceId, snapshot.id);
+                      const collected = await deleteSnapshot(instanceId, snapshot.id);
                       await reload();
-                      setStatus('Snapshot deleted.');
+                      setStatus(
+                        ['Snapshot deleted.', describeCollection(collected)]
+                          .filter(Boolean)
+                          .join(' '),
+                      );
                     })
                   }
                   className="text-xs text-destructive hover:underline disabled:opacity-50"

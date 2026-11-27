@@ -7,6 +7,7 @@
  */
 
 import { invoke } from '@tauri-apps/api/core';
+import type { CollectOutcome } from '@/lib/tauri';
 
 export type SourceKind = 'archive' | 'folder' | 'fomod' | 'thunderstore' | 'mo2' | 'catalog' | 'unknown';
 
@@ -132,9 +133,12 @@ export const verifyStored = (itemId: string, full: boolean) =>
  * Remove an item from the store. Refused while an instance or a snapshot uses
  * it. `ignoreUnreadableSnapshots` is the explicit override for snapshots whose
  * manifests cannot be read; the core names each one it ignored.
+ *
+ * The reply is what the removal's collection did with the objects the item named: what it
+ * reclaimed, or nothing was reclaimed and why (MASTER_SPEC §32.8).
  */
 export const removeStored = (itemId: string, ignoreUnreadableSnapshots = false) =>
-  invoke<void>('games_content_remove', { itemId, ignoreUnreadableSnapshots });
+  invoke<CollectOutcome>('games_content_remove', { itemId, ignoreUnreadableSnapshots });
 
 /** The content layers an instance has, in load order. Rejects if the reply is not that list. */
 export async function listInstanceContent(instanceId: string): Promise<InstanceContentList> {

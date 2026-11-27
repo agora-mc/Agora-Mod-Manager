@@ -15,7 +15,7 @@ use std::time::UNIX_EPOCH;
 use agora_game_api::{ContentLayout, DownloadAdd, DownloadRecognition};
 use serde::{Deserialize, Serialize};
 
-use crate::content_store::{self, ContentError, ItemMetadata};
+use crate::content_store::{self, ContentError};
 use crate::ctx::Ctx;
 use crate::error::LauncherError;
 use crate::game_support;
@@ -626,18 +626,7 @@ pub fn add(ctx: &Ctx, sha256: &str) -> Result<AddDownloadOutcome, DownloadsError
     };
     let item = outcome.item();
     let item_id = item.item_id.clone();
-    let metadata = ItemMetadata {
-        description: item.description.clone(),
-        page_url: item.page_url.clone(),
-        version: item.version.clone(),
-        game_id: Some(classified.game_id.clone()),
-        catalog_id: item.catalog_id.clone(),
-        provider: item.provider.clone(),
-        provider_id: item.provider_id.clone(),
-        provider_origin: item.provider_origin.clone(),
-        icon_sha256: item.icon_sha256.clone(),
-    };
-    content_store::set_item_metadata(ctx, &item_id, metadata)?;
+    content_store::record_watched_download_game(ctx, item, &classified.game_id)?;
 
     let result = match &classified.add {
         DownloadAdd::Archive => match crate::content_fomod::parse(ctx, &item_id) {
@@ -884,6 +873,44 @@ fn checked_hash(sha256: &str) -> Result<String, DownloadsError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn watcher_does_not_republish_an_icon_replaced_and_collected_after_its_read() {
+        use super::*;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Ctx::for_testing(dir.path().to_path_buf());
+        ctx.test_seams
+            .set_object_grace(Some(std::time::Duration::ZERO));
+        let path = dir.path().join("mod.jar");
+        std::fs::write(&path, b"a mod").unwrap();
+        let id = content_store::add_file(&ctx, &path, None, None)
+            .unwrap()
+            .item()
+            .item_id
+            .clone();
+        let image = |byte| [b"\x89PNG\r\n\x1a\n".as_slice(), &[byte; 16]].concat();
+        assert!(crate::library::save_icon(&ctx, &id, &image(1)).unwrap());
+        let watcher_read = content_store::get_item(&ctx, &id).unwrap();
+        let a = watcher_read.icon_sha256.as_ref().unwrap();
+
+        // Run the other writer and the sweep before the watcher publishes its earlier read.
+        assert!(crate::library::save_icon(&ctx, &id, &image(2)).unwrap());
+        let with_b = content_store::get_item(&ctx, &id).unwrap();
+        let b = with_b.icon_sha256.unwrap();
+        assert_ne!(a, &b);
+        let report = content_store::collect::collect_with_ctx(&ctx, &Default::default());
+        assert!(report.deleted.contains(a), "{}", report.summary());
+        assert!(!ctx.paths.content_object_path(a).exists());
+
+        content_store::record_watched_download_game(&ctx, &watcher_read, "minecraft").unwrap();
+        let item = content_store::get_item(&ctx, &id).unwrap();
+        assert_eq!(
+            item.icon_sha256.as_deref(),
+            Some(b.as_str()),
+            "watcher republished collected icon A"
+        );
+        assert_eq!(item.game_id, with_b.game_id);
+    }
     use super::*;
 
     #[test]

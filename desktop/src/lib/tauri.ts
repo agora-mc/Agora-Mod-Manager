@@ -2708,8 +2708,35 @@ export const describeRestoreCoverage = (outcome: RestoreOutcome): string | null 
   return notes.length > 0 ? notes.join(' ') : null;
 };
 
+/**
+ * Serialized `content_store::collect::CollectOutcome` (MASTER_SPEC §32.8): what the collection a
+ * removal or a snapshot delete ran did with the objects nothing names any more.
+ */
+export interface CollectOutcome {
+  /** One line: what was reclaimed, or that nothing was and why. */
+  summary: string;
+  /** How many stored objects the collection freed. */
+  reclaimed: number;
+  /** Nothing at all was freed; `summary` says why. */
+  refused: boolean;
+}
+
+/**
+ * One sentence for a person from a collection's report: "Reclaimed 3 object(s).", or
+ * "Nothing was reclaimed: <why>." A report that is missing or blank says nothing at all rather than
+ * telling the person nothing happened.
+ */
+export const describeCollection = (
+  outcome: CollectOutcome | null | undefined,
+): string | null => {
+  const summary = outcome?.summary?.trim();
+  if (!summary) return null;
+  const sentence = summary.charAt(0).toUpperCase() + summary.slice(1);
+  return sentence.endsWith('.') ? sentence : `${sentence}.`;
+};
+
 export const deleteSnapshot = (instanceId: string, snapshotId: string) =>
-  invoke<void>('delete_snapshot', { instanceId, snapshotId });
+  invoke<CollectOutcome>('delete_snapshot', { instanceId, snapshotId });
 
 /** Serialized `template_service::TemplateJvm`. Every field is optional; `null`
  *  means "leave the instance's own value alone". */
