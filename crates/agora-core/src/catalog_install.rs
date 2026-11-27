@@ -1747,7 +1747,11 @@ async fn fetch_bytes(
 ///
 /// This is for re-fetching content a backup named but no longer holds. It never falls back to a
 /// different release or asset: the bytes must match the recorded hash or the caller is told.
+///
+/// `gate` is the caller's context's gate (MASTER_SPEC 32.9): it is asked before the transport,
+/// so a refusal produces no request whatever transport is used.
 pub async fn fetch_recorded_archive(
+    gate: &dyn crate::network_gate::NetworkGate,
     transport: &dyn CatalogTransport,
     item: &GameCatalogItem,
     recorded: &ContentSource,
@@ -1793,7 +1797,7 @@ pub async fn fetch_recorded_archive(
         .iter()
         .find(|source| source.strategy == "github_release")
     {
-        crate::network_gate::authorize(ClientCategory::GitHub)?;
+        gate.check(ClientCategory::GitHub)?;
         let mut page = 1;
         loop {
             let (releases, total_pages) = transport.releases_page(&source.identifier, page).await?;
@@ -1845,7 +1849,7 @@ pub async fn fetch_recorded_archive(
             )
         })?;
         let host = url.host_str().unwrap_or_default().to_string();
-        crate::network_gate::authorize(ClientCategory::PinnedArtifact)?;
+        gate.check(ClientCategory::PinnedArtifact)?;
         let bytes = transport.fetch(&source.identifier, Some(&host)).await?;
         verify(&bytes)?;
         return Ok(bytes);

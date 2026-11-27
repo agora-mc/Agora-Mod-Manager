@@ -301,9 +301,13 @@ fn the_library_makes_no_network_request() {
     add_file(&ctx, &file, None, None).unwrap();
 
     let checks = Arc::new(AtomicUsize::new(0));
-    network_gate::install(Arc::new(CountingGate {
+    let gate: network_gate::SharedGate = Arc::new(CountingGate {
         checks: checks.clone(),
-    }));
+    });
+    // The context's own clients ask the context's gate (MASTER_SPEC 32.9), and clients built
+    // without a context ask the process-wide one: count both.
+    network_gate::install(Arc::clone(&gate));
+    let ctx = ctx.with_network_gate(gate);
 
     let listing = library::list(&ctx).unwrap();
     assert_eq!(listing.items.len(), 1);
