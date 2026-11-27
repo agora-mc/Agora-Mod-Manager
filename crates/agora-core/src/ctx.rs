@@ -119,6 +119,11 @@ pub struct CoreContext {
     /// them, so a hook reaches the operation wherever it runs; no other context
     /// sees them. Empty in production, so each seam costs one cheap check.
     pub test_seams: crate::test_seams::TestSeams,
+    /// This context's outbound gate, shared with its HTTP clients (MASTER_SPEC §32.9).
+    ///
+    /// It reads this context's settings cache, so a request from this context answers by this
+    /// context's database even when another context exists in the same process.
+    pub gate: crate::network_gate::SharedGate,
 }
 
 /// The main context type alias — use `Ctx` throughout the codebase.
@@ -646,7 +651,7 @@ impl CoreContext {
             crate::http_client::configure_proxy(crate::http_client::saved_proxy(&conn));
         }
 
-        let ctx = Self {
+        let mut ctx = Self {
             lock_manager: LockManager::new(paths.locks_root()),
             external_data_root: None,
             paths,
@@ -668,17 +673,23 @@ impl CoreContext {
             games,
             registry_trust: registry_trust.clone(),
             test_seams,
+            // Replaced below, once the context exists and its gate can read its cache. Until then
+            // nothing here can make a request, and denying is the safe placeholder.
+            gate: Arc::new(crate::network_gate::DenyAll),
         };
         ctx.extensions.insert(behaviour_runtime);
 
-        // 6b. Install the outbound policy now that the context exists. Every adapter reaches the
-        //     network through this context, so this is the one place it has to be installed;
-        //     until it is, `network_gate` denies, and a missing policy must not read as consent.
-        //     The gate reads through this context's settings cache, so a second process's
-        //     Lockdown reaches the next request here (§32.9).
-        crate::network_gate::install(Arc::new(crate::network_gate::SettingsGate::for_context(
-            &ctx,
-        )));
+        // 6b. Give the context its outbound policy, now that it exists. Every request this context
+        //     makes asks this gate: it reads through this context's settings cache, so a second
+        //     process's Lockdown reaches the next request here, and a second context in this
+        //     process is not affected (§32.9). It is also installed process-wide, for the clients
+        //     built outside a context — in production there is one context per process, so that is
+        //     the same gate; failing closed is what happens when an adapter installs none.
+        let gate: crate::network_gate::SharedGate =
+            Arc::new(crate::network_gate::SettingsGate::for_context(&ctx));
+        ctx.gate = Arc::clone(&gate);
+        ctx.http_clients = ctx.http_clients.clone().with_gate(Arc::clone(&gate));
+        crate::network_gate::install(gate);
 
         // 7. Let game packages load their catalogs from the signed registry
         //    (or fall back to embedded data when there is none).
@@ -707,15 +718,18 @@ impl CoreContext {
         let paths = AppPaths::from_root(root);
         let lock_manager = LockManager::new(paths.locks_root());
         let _ = std::fs::create_dir_all(paths.locks_root());
-        // Outbound requests are denied until an adapter installs a policy, so
-        // a test context installs a permissive one. Production adapters must
-        // install `SettingsGate` instead — there is no production constructor
-        // that yields an unrestricted gate.
-        crate::network_gate::install(std::sync::Arc::new(crate::network_gate::AllowAll));
+        // A test context's own clients are permissive, and only its own: the gate is not
+        // installed process-wide, so a test that needs refusal sets its gate on its own context
+        // and no other test in the same process inherits it. Production adapters install
+        // `SettingsGate` instead — there is no production constructor that yields an unrestricted
+        // gate.
+        let gate: crate::network_gate::SharedGate =
+            std::sync::Arc::new(crate::network_gate::AllowAll);
         Self {
             paths,
             external_data_root,
-            http_clients: HttpClients::for_testing(reqwest::Client::new()),
+            http_clients: HttpClients::for_testing(reqwest::Client::new())
+                .with_gate(std::sync::Arc::clone(&gate)),
             extensions: Extensions::default(),
             clock: Arc::new(WallClock),
             settings_cache: Arc::new(crate::settings::SettingsCache::default()),
@@ -728,6 +742,7 @@ impl CoreContext {
             games: Arc::new(crate::game_registry::GameRegistry::empty()),
             registry_trust: crate::registry_bundle::RegistryTrust::unverified_debug(),
             test_seams: crate::test_seams::TestSeams::default(),
+            gate,
         }
     }
 
@@ -759,6 +774,22 @@ impl CoreContext {
     pub fn with_http_clients(mut self, clients: HttpClients) -> Self {
         self.http_clients = clients;
         self
+    }
+
+    /// Give this context its own outbound gate, and hand it to its HTTP clients.
+    ///
+    /// The gate belongs to the context (MASTER_SPEC §32.9): two contexts in one process each ask
+    /// their own settings, and a test that wants a refusing or panicking gate sets it on its own
+    /// context rather than on a process-wide slot every other test shares.
+    pub fn with_network_gate(mut self, gate: crate::network_gate::SharedGate) -> Self {
+        self.gate = Arc::clone(&gate);
+        self.http_clients = self.http_clients.with_gate(gate);
+        self
+    }
+
+    /// This context's outbound gate: the same one its HTTP clients ask.
+    pub fn network_gate(&self) -> crate::network_gate::SharedGate {
+        Arc::clone(&self.gate)
     }
 
     /// Replace the process session manager (e.g., for testing with a shared

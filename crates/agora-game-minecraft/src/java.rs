@@ -26,15 +26,24 @@ use std::path::{Path, PathBuf};
 // Test injection point for inspect_java
 // ---------------------------------------------------------------------------
 
-// One mock for the process, not one per thread: provisioning runs on a blocking
-// worker, so a thread-local mock set by the test would not be seen by the code
-// under test. Isolation comes from the test runner instead — nextest gives each
-// test its own process.
+// One mock per thread, and a second one for the whole process.
+//
+// A test that inspects on the thread it runs on uses the thread mock, so tests in one binary do
+// not see each other's mock (plain `cargo test` runs them in threads of one process). A test whose
+// code under test inspects from a blocking worker thread — provisioning does — cannot reach a
+// thread mock, so it arms the process-wide one instead and keeps it for the duration of its own
+// guard.
 #[cfg(test)]
 type MockInspectFn = Option<fn(&Path) -> Option<JavaInstallation>>;
 
 #[cfg(test)]
-static MOCK_INSPECT: std::sync::Mutex<MockInspectFn> = std::sync::Mutex::new(None);
+thread_local! {
+    static MOCK_INSPECT: std::cell::RefCell<MockInspectFn> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+static MOCK_INSPECT_FOR_WORKERS: std::sync::Mutex<MockInspectFn> = std::sync::Mutex::new(None);
 
 /// RAII guard that restores the previous mock on drop.
 #[cfg(test)]
@@ -44,35 +53,60 @@ pub struct MockInspectGuard(Option<fn(&Path) -> Option<JavaInstallation>>);
 impl Drop for MockInspectGuard {
     fn drop(&mut self) {
         let prev = self.0.take();
-        if let Ok(mut slot) = MOCK_INSPECT.lock() {
-            *slot = prev;
-        }
+        MOCK_INSPECT.with(|cell| {
+            cell.replace(prev);
+        });
     }
 }
 
-/// Set a mock for `inspect_java` (test-only).
+/// Set a mock for `inspect_java` on this thread (test-only).
 ///
-/// Returns a [`MockInspectGuard`] that restores the previous mock when dropped. The mock is
-/// process-wide because provisioning runs on a blocking worker, where a thread-local mock set by
-/// the test would not be seen; run these tests with nextest, which gives each test its own process.
+/// Returns a [`MockInspectGuard`] that restores the previous mock when dropped.
 #[cfg(test)]
 pub fn set_mock_inspect(f: Option<fn(&Path) -> Option<JavaInstallation>>) -> MockInspectGuard {
-    match MOCK_INSPECT.lock() {
+    MOCK_INSPECT.with(|cell| {
+        let prev = cell.replace(f);
+        MockInspectGuard(prev)
+    })
+}
+
+/// Set a mock for `inspect_java` for every thread (test-only).
+///
+/// For a test whose code under test inspects from a worker thread. It is process-wide, so the test
+/// must be one whose runner isolates it — nextest does; under `cargo test`, a test that needs this
+/// should also hold the serial lock its file shares.
+#[cfg(test)]
+pub fn set_mock_inspect_for_workers(
+    f: Option<fn(&Path) -> Option<JavaInstallation>>,
+) -> WorkerMockInspectGuard {
+    match MOCK_INSPECT_FOR_WORKERS.lock() {
         Ok(mut slot) => {
             let prev = slot.take();
             *slot = f;
-            MockInspectGuard(prev)
+            WorkerMockInspectGuard(prev)
         }
         Err(poisoned) => {
             let mut slot = poisoned.into_inner();
             let prev = slot.take();
             *slot = f;
-            MockInspectGuard(prev)
+            WorkerMockInspectGuard(prev)
         }
     }
 }
 
-// ---------------------------------------------------------------------------
+/// RAII guard for [`set_mock_inspect_for_workers`].
+#[cfg(test)]
+pub struct WorkerMockInspectGuard(Option<fn(&Path) -> Option<JavaInstallation>>);
+
+#[cfg(test)]
+impl Drop for WorkerMockInspectGuard {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        if let Ok(mut slot) = MOCK_INSPECT_FOR_WORKERS.lock() {
+            *slot = prev;
+        }
+    }
+}
 // JavaSource
 // ---------------------------------------------------------------------------
 
@@ -142,11 +176,13 @@ const INSPECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub fn inspect_java(path: &Path) -> Option<JavaInstallation> {
     #[cfg(test)]
     {
-        let mocked = match MOCK_INSPECT.lock() {
+        // This thread's mock first, then the one armed for worker threads.
+        let thread_mock = MOCK_INSPECT.with(|cell| cell.borrow().to_owned());
+        let worker_mock = match MOCK_INSPECT_FOR_WORKERS.lock() {
             Ok(slot) => *slot,
             Err(poisoned) => *poisoned.into_inner(),
         };
-        if let Some(Some(inst)) = mocked.map(|f| f(path)) {
+        if let Some(Some(inst)) = thread_mock.or(worker_mock).map(|f| f(path)) {
             return Some(inst);
         }
     }

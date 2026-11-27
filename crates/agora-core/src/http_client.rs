@@ -375,11 +375,18 @@ impl ClientCategory {
 /// category list makes that class of mistake impossible to reintroduce: a new
 /// variant fails to compile in [`ClientCategory::index`] instead of silently
 /// aliasing an existing client.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpClients {
     by_category: [reqwest::Client; ClientCategory::ALL.len()],
     test_dns: Option<TestDns>,
     test_host_policy: Option<HostPolicy<'static>>,
+    /// The gate these clients ask before every request and redirect hop.
+    ///
+    /// It belongs to the context the clients were built for, so two contexts in one process each
+    /// answer by their own settings. Clients built without a context (`HttpClients::new()` outside
+    /// one) fall back to the process-wide gate, which is the context's own gate in production,
+    /// where a process has one context.
+    gate: crate::network_gate::SharedGate,
 }
 
 type ResolveTestHost = dyn Fn(&reqwest::Url) -> std::io::Result<Vec<SocketAddr>> + Send + Sync;
@@ -390,6 +397,19 @@ struct TestDns(Arc<ResolveTestHost>);
 impl std::fmt::Debug for TestDns {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("TestDns")
+    }
+}
+
+/// The gate has no `Debug` of its own; a client set is identified by what it can reach, and the
+/// gate it carries is named rather than printed.
+impl std::fmt::Debug for HttpClients {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpClients")
+            .field("test_dns", &self.test_dns)
+            .field("test_host_policy", &self.test_host_policy)
+            .field("gate", &"<gate>")
+            .finish_non_exhaustive()
     }
 }
 
@@ -680,6 +700,7 @@ impl HttpClients {
             })?,
             test_dns: None,
             test_host_policy: None,
+            gate: crate::network_gate::current(),
         })
     }
 
@@ -693,7 +714,27 @@ impl HttpClients {
             by_category: std::array::from_fn(|_| client.clone()),
             test_dns: None,
             test_host_policy: None,
+            gate: Arc::new(crate::network_gate::AllowAll),
         }
+    }
+
+    /// These clients with a different gate: the context's own, or a test's stand-in.
+    pub fn with_gate(mut self, gate: crate::network_gate::SharedGate) -> Self {
+        self.gate = gate;
+        self
+    }
+
+    /// The gate these clients ask before every request and redirect hop.
+    pub fn gate(&self) -> &crate::network_gate::SharedGate {
+        &self.gate
+    }
+
+    /// Authorize one request in these clients' gate, or explain why not.
+    ///
+    /// Every checked helper starts here, so a client set carries the policy it was built for
+    /// rather than whatever the process last installed.
+    pub fn authorize(&self, category: ClientCategory) -> LauncherResult<()> {
+        self.gate.check(category)
     }
 
     /// Substitute DNS results for checked request and redirect validation in tests.
@@ -1212,7 +1253,7 @@ fn next_redirect_hop(
     // A redirect is a new request: the answer the gate gave for the previous hop does not carry
     // over, and the policy may have changed while this one was in flight (MASTER_SPEC §32.9).
     // This runs before the target is resolved or contacted, so a refusal produces no traffic.
-    crate::network_gate::authorize(category)?;
+    clients.authorize(category)?;
     clients.validate_url(category, next_url.as_str(), policy)?;
     *remaining -= 1;
     Ok(next_url)
@@ -1248,7 +1289,7 @@ pub async fn checked_request_with_policy(
     // Authorization first: URL validation resolves the hostname, so checking
     // the gate afterwards would already have produced network activity under
     // Lockdown Mode.
-    crate::network_gate::authorize(category)?;
+    clients.authorize(category)?;
     // Validate initial URL against category policies.
     let _validated = clients.validate_url(category, url, policy)?;
 
@@ -1301,7 +1342,7 @@ pub async fn checked_send(
     body: Option<Vec<u8>>,
     content_type: Option<&str>,
 ) -> LauncherResult<reqwest::Response> {
-    crate::network_gate::authorize(category)?;
+    clients.authorize(category)?;
     clients.validate_url(category, url, HostPolicy::Allowlist)?;
     let client = clients.get(category);
     let mut current_method = method;
@@ -1582,7 +1623,7 @@ pub async fn checked_request_with_headers(
     url: &str,
     headers: Vec<(String, String)>,
 ) -> LauncherResult<reqwest::Response> {
-    crate::network_gate::authorize(category)?;
+    clients.authorize(category)?;
     let _validated = clients.validate_url(category, url, HostPolicy::Allowlist)?;
     let client = clients.get(category);
 
@@ -1644,7 +1685,7 @@ pub fn blocking_checked_request_with_policy(
     url: &str,
     policy: HostPolicy<'_>,
 ) -> LauncherResult<reqwest::blocking::Response> {
-    crate::network_gate::authorize(category)?;
+    clients.authorize(category)?;
     let _validated = clients.validate_url(category, url, policy)?;
 
     // Build a blocking client with the same security posture and proxy.
@@ -1734,12 +1775,12 @@ pub fn blocking_checked_get_bytes_with_policy(
 /// A redirect is refused rather than followed: the caller posted a body to a specific endpoint,
 /// and silently replaying it elsewhere is exactly what the async path only does for 307/308.
 pub fn blocking_checked_post_json(
-    _clients: &HttpClients,
+    clients: &HttpClients,
     category: ClientCategory,
     url: &str,
     body: &serde_json::Value,
 ) -> LauncherResult<Vec<u8>> {
-    crate::network_gate::authorize(category)?;
+    clients.authorize(category)?;
     check_request_url(category, url)?;
 
     let client = build_blocking_client(category)?;

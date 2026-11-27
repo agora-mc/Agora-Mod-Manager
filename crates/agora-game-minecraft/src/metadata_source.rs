@@ -64,10 +64,11 @@ impl ModrinthMetadataSource {
 
 impl MetadataSource for ModrinthMetadataSource {
     fn available(&self) -> LauncherResult<()> {
-        // The Privacy switch first (a plain settings read, no network), then the process gate,
-        // which is where Lockdown Mode is enforced.
+        // The Privacy switch first (a plain settings read, no network), then this context's gate,
+        // which is where Lockdown Mode is enforced. The gate is the context's, not the process's:
+        // a second context in the same process answers by its own settings.
         crate::modrinth::ModrinthService::new(self.ctx.clone()).check_network_enabled()?;
-        network_gate::authorize(ClientCategory::Modrinth)
+        self.ctx.network_gate().check(ClientCategory::Modrinth)
     }
 
     fn projects(&self, project_ids: &[String]) -> LauncherResult<Vec<ProjectDetails>> {
@@ -193,9 +194,10 @@ mod tests {
         db::set_setting(&conn, "network_modrinth_enabled", &serde_json::json!(false)).unwrap();
         drop(conn);
 
-        // A local state with the Modrinth network switch off must answer first, without the
-        // process gate or an HTTP client ever being consulted.
-        network_gate::install(Arc::new(PanicGate));
+        // A local state with the Modrinth network switch off must answer first, without the gate
+        // or an HTTP client ever being consulted. The gate is this context's, so installing it here
+        // cannot reach another test in the same process.
+        let ctx = ctx.with_network_gate(Arc::new(PanicGate));
         let source = ModrinthMetadataSource::new(ctx);
         let error = source.available().unwrap_err();
         assert_eq!(error.code(), "ERR_NETWORK_DISABLED");

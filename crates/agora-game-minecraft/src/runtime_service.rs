@@ -166,8 +166,8 @@ mod tests {
         .unwrap();
     }
 
-    fn mocked_inspect() -> crate::java::MockInspectGuard {
-        crate::java::set_mock_inspect(Some(|path| {
+    fn mocked_inspect() -> crate::java::WorkerMockInspectGuard {
+        crate::java::set_mock_inspect_for_workers(Some(|path| {
             Some(crate::java::JavaInstallation {
                 path: path.to_path_buf(),
                 version: 21,

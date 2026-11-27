@@ -33,7 +33,8 @@ async fn lockdown_committed_after_the_first_request_blocks_the_redirect() {
     let ctx = Ctx::for_testing(root.path().to_owned());
     let db_path = ctx.paths.local_state_db();
     db::init_local_state_db(&db_path).unwrap();
-    network_gate::install(Arc::new(SettingsGate::for_context(&ctx)));
+    let gate: std::sync::Arc<dyn agora_core::network_gate::NetworkGate> =
+        Arc::new(SettingsGate::for_context(&ctx));
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -45,15 +46,17 @@ async fn lockdown_committed_after_the_first_request_blocks_the_redirect() {
         .build()
         .unwrap();
     let dns_calls = Arc::new(AtomicUsize::new(0));
-    let clients = HttpClients::for_testing(client).with_test_dns({
-        let dns_calls = Arc::clone(&dns_calls);
-        Arc::new(move |url| {
-            assert_eq!(url.host_str(), Some("settings-cache.invalid"));
-            dns_calls.fetch_add(1, Ordering::SeqCst);
-            // Used only by URL policy. Transport connects exclusively to the local proxy.
-            Ok(vec!["93.184.216.34:80".parse().unwrap()])
-        })
-    });
+    let clients = HttpClients::for_testing(client)
+        .with_gate(gate)
+        .with_test_dns({
+            let dns_calls = Arc::clone(&dns_calls);
+            Arc::new(move |url| {
+                assert_eq!(url.host_str(), Some("settings-cache.invalid"));
+                dns_calls.fetch_add(1, Ordering::SeqCst);
+                // Used only by URL policy. Transport connects exclusively to the local proxy.
+                Ok(vec!["93.184.216.34:80".parse().unwrap()])
+            })
+        });
 
     let (finished, stop) = mpsc::channel::<()>();
     let server = std::thread::spawn(move || {

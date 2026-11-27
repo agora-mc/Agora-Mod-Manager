@@ -186,7 +186,8 @@ fn exchange(
     let ctx = Ctx::for_testing(root.path().to_owned());
     let db_path = ctx.paths.local_state_db();
     db::init_local_state_db(&db_path).unwrap();
-    network_gate::install(Arc::new(SettingsGate::for_context(&ctx)));
+    let gate: std::sync::Arc<dyn agora_core::network_gate::NetworkGate> =
+        Arc::new(SettingsGate::for_context(&ctx));
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -203,6 +204,7 @@ fn exchange(
         .unwrap();
     let looked_up = Arc::new(AtomicUsize::new(0));
     let clients = HttpClients::for_testing(client)
+        .with_gate(gate)
         .with_test_host_policy(HostPolicy::UserConsented)
         .with_test_dns({
             let looked_up = looked_up.clone();

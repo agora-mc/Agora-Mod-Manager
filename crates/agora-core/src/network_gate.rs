@@ -177,7 +177,9 @@ impl NetworkGate for SettingsGate {
     }
 }
 
-type SharedGate = Arc<dyn NetworkGate>;
+/// A gate, shared: a context holds one and its HTTP clients hold the same one, so a clone of
+/// either answers from the same settings.
+pub type SharedGate = Arc<dyn NetworkGate>;
 
 fn slot() -> &'static RwLock<Option<SharedGate>> {
     static SLOT: OnceLock<RwLock<Option<SharedGate>>> = OnceLock::new();
