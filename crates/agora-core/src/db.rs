@@ -1104,23 +1104,48 @@ pub fn run_migrations_to(conn: &Connection, target: i64) -> anyhow::Result<Vec<S
 
 /// Schema step 32: the settings version (MASTER_SPEC §32.9).
 ///
-/// One row, never deleted, holding a number every settings write bumps in the same
-/// transaction as the value. A reader compares that one number with the one it last loaded
-/// against, so the CLI and the desktop can see each other's Lockdown within one request
-/// instead of opening a connection and loading every setting per request.
+/// One row, never deleted, holding a number every settings write bumps. The bump lives in SQLite
+/// triggers rather than in the Rust writers, so it happens for *any* write to `user_settings` — the
+/// two public setters, a migration, a hand edit, a future feature that writes raw SQL — in that
+/// write's own transaction. A writer cannot forget it, and the value and its version cannot be
+/// committed apart.
 ///
-/// The row starts at 1 rather than at the number of settings, because what matters is that
-/// it changes; the older rows have no version to preserve. It is created here, inside the
-/// migration transaction, so a database that fails to migrate does not have half a version.
-/// A write in a database that has no such table (a pre-32 migration step, which runs before
-/// this one) is not versioned; a write in a database that has the table but no row refuses.
+/// A trigger that finds no version row aborts the write: a value nobody published a version for is
+/// one no other process would ever see. A database from before this step has no table and no
+/// triggers yet, so the older migration steps that write settings need no version (and must not
+/// have one — they run before this step creates it).
+///
+/// The row starts at 1 because what matters is that it changes; the older rows have no version to
+/// preserve. Everything here is `IF NOT EXISTS` / `OR IGNORE`, so a database that lost its
+/// recorded version and replays the step keeps the version it had.
 fn migrate_v32(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS settings_version (
              id INTEGER PRIMARY KEY CHECK (id = 1),
              version INTEGER NOT NULL
          );
-         INSERT OR IGNORE INTO settings_version (id, version) VALUES (1, 1);",
+         INSERT OR IGNORE INTO settings_version (id, version) VALUES (1, 1);
+
+         CREATE TRIGGER IF NOT EXISTS user_settings_version_insert
+         AFTER INSERT ON user_settings BEGIN
+             UPDATE settings_version SET version = version + 1 WHERE id = 1;
+             SELECT RAISE(ABORT, 'the settings version row is missing, so this settings write cannot publish a version other processes would see')
+               WHERE NOT EXISTS (SELECT 1 FROM settings_version WHERE id = 1);
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS user_settings_version_update
+         AFTER UPDATE ON user_settings BEGIN
+             UPDATE settings_version SET version = version + 1 WHERE id = 1;
+             SELECT RAISE(ABORT, 'the settings version row is missing, so this settings write cannot publish a version other processes would see')
+               WHERE NOT EXISTS (SELECT 1 FROM settings_version WHERE id = 1);
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS user_settings_version_delete
+         AFTER DELETE ON user_settings BEGIN
+             UPDATE settings_version SET version = version + 1 WHERE id = 1;
+             SELECT RAISE(ABORT, 'the settings version row is missing, so this settings delete cannot publish a version other processes would see')
+               WHERE NOT EXISTS (SELECT 1 FROM settings_version WHERE id = 1);
+         END;",
     )?;
     Ok(())
 }
@@ -2846,14 +2871,10 @@ pub fn settings_version(conn: &Connection) -> anyhow::Result<i64> {
 
 /// Publish a settings write: bump the version in the caller's transaction.
 ///
-/// Called inside the transaction that writes the value, so a reader either sees both or
-/// neither. A database from before step 32 has no version row yet (the migration steps that
-/// write settings run before the table is created), and needs none. Once the table exists, a
-/// missing row is refused: a value nobody published a version for must not be read as current.
-fn bump_settings_version(conn: &Connection) -> anyhow::Result<()> {
-    if !table_exists(conn, "settings_version")? {
-        return Ok(());
-    }
+/// Kept for the rare caller that rewrites settings wholesale without going through
+/// [`set_setting`]; the ordinary path does not need it, because the triggers on `user_settings`
+/// bump the version themselves.
+pub fn bump_settings_version(conn: &Connection) -> anyhow::Result<()> {
     let bumped = conn.execute(
         "UPDATE settings_version SET version = version + 1 WHERE id = 1",
         [],
@@ -2863,49 +2884,6 @@ fn bump_settings_version(conn: &Connection) -> anyhow::Result<()> {
             "the settings version row is missing, so this settings write cannot publish a \
              version other processes would see"
         );
-    }
-    Ok(())
-}
-
-/// Run a settings write and its version bump as one transaction.
-///
-/// The value and the version must reach other processes together: a value committed without
-/// its version is a setting another process keeps ignoring, and a version without its value is
-/// a reload that finds the old one. Nested in a caller's transaction (the seeding run) it uses
-/// a savepoint, so the caller still commits once.
-fn with_settings_version(
-    conn: &Connection,
-    write: impl FnOnce() -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    let standalone = conn.is_autocommit();
-    if standalone {
-        conn.execute_batch("BEGIN IMMEDIATE")?;
-    } else {
-        conn.execute_batch("SAVEPOINT settings_write")?;
-    }
-    let outcome = write()
-        .and_then(|()| bump_settings_version(conn))
-        .and_then(|()| {
-            if standalone {
-                conn.execute_batch("COMMIT")?;
-            } else {
-                conn.execute_batch("RELEASE settings_write")?;
-            }
-            Ok(())
-        });
-    if let Err(error) = outcome {
-        // A vetoed COMMIT has already rolled the transaction back; anything else leaves it
-        // open, and a caller that keeps a half-written transaction is worse than one that
-        // rolls it back.
-        if conn.is_autocommit() {
-            return Err(error);
-        }
-        if standalone {
-            let _ = conn.execute_batch("ROLLBACK");
-        } else {
-            let _ = conn.execute_batch("ROLLBACK TO settings_write; RELEASE settings_write");
-        }
-        return Err(error);
     }
     Ok(())
 }
@@ -3037,19 +3015,17 @@ pub fn lockdown_value_denies(raw: Option<serde_json::Value>) -> crate::error::La
 
 /// Upsert a JSON-encoded setting into user_settings.
 ///
-/// The value and the settings version are committed together, so another process that checks
-/// the version before its next request sees this write or the previous one, never a value with
-/// a stale version.
+/// The version bump is not written here: the triggers on `user_settings` add it inside this
+/// statement's own transaction, so a raw writer gets the same treatment and no writer can forget
+/// it. One statement is one commit, which is what another process's next check sees.
 pub fn set_setting(conn: &Connection, key: &str, value: &serde_json::Value) -> anyhow::Result<()> {
     let text = serde_json::to_string(value)?;
-    with_settings_version(conn, || {
-        conn.execute(
-            "INSERT INTO user_settings (key, value_json) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
-            rusqlite::params![key, text],
-        )?;
-        Ok(())
-    })
+    conn.execute(
+        "INSERT INTO user_settings (key, value_json) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+        rusqlite::params![key, text],
+    )?;
+    Ok(())
 }
 
 /// Insert or update an instance: its identity row in `instances`, and the Minecraft
