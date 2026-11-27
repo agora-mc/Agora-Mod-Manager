@@ -1828,6 +1828,7 @@ impl LauncherImportService {
                         &minecraft_root,
                         &mc_version,
                         policy,
+                        &*self.ctx.network_gate(),
                     )
                     .await
                     {
@@ -2045,6 +2046,7 @@ impl LauncherImportService {
                         &minecraft_root,
                         &mc_version,
                         policy,
+                        &*self.ctx.network_gate(),
                     )
                     .await
                     {

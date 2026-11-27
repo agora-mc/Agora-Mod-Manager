@@ -842,6 +842,7 @@ pub async fn run_instance(
             let versions = agora_game_minecraft::minecraft_metadata::list_snapshot_versions(
                 &ctx.paths.minecraft_runtime_root(),
                 &policy,
+                &*ctx.network_gate(),
             )
             .await?;
             if json {

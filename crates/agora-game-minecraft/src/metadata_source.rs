@@ -18,7 +18,6 @@ use agora_core::{
     error::{LauncherError, LauncherResult},
     http_client::{self, ClientCategory},
     library::{MetadataSource, ProjectDetails, ProjectVersion},
-    network_gate,
 };
 use serde::Deserialize;
 
@@ -178,7 +177,7 @@ mod tests {
 
     struct PanicGate;
 
-    impl network_gate::NetworkGate for PanicGate {
+    impl agora_core::network_gate::NetworkGate for PanicGate {
         fn check(&self, _category: ClientCategory) -> LauncherResult<()> {
             panic!("the metadata source reached the network gate while the switch was off");
         }

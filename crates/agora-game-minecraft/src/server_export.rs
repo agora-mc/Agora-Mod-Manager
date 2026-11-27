@@ -409,6 +409,7 @@ async fn required_java_major(
         &ctx.paths.minecraft_runtime_root(),
         mc_version,
         policy,
+        &*ctx.network_gate(),
     )
     .await
     {
@@ -1064,6 +1065,7 @@ async fn download_vanilla_server(
         &ctx.paths.minecraft_runtime_root(),
         mc_version,
         policy,
+        &*ctx.network_gate(),
     )
     .await?;
     let server = info

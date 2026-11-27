@@ -628,6 +628,7 @@ impl ImportService {
                 &minecraft_root,
                 &result.minecraft_version,
                 &policy,
+                &*self.ctx.network_gate(),
             )
             .await
             {
