@@ -798,6 +798,10 @@ fn built(tmp: &TempDir, build: Option<&str>) -> (AppPaths, std::path::PathBuf, I
     let install_dir = tmp.path().join("source_install");
     std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::create_dir_all(&install_dir).unwrap();
+    // A data root has a settings database; the framework repair asks it what the user permits
+    // before it copies anything, and an unreadable store refuses rather than guessing (§32.9).
+    agora_core::db::init_local_state_db(&AppPaths::from_root(data_dir.clone()).local_state_db())
+        .unwrap();
     setup_fake_install(&install_dir);
     let runtime = RuntimeIdentity {
         game: GameId::new("skyrim-se").unwrap(),
