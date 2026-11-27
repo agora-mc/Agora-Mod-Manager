@@ -15120,14 +15120,15 @@ fn run_content_migrate(
             }
         },
         Ok(MigrationOutcome::Busy) => {
+            let message = "Another Agora process holds the content store, so nothing was moved. \
+                           Run this again when it has finished.";
             if json {
                 let out = serde_json::json!({ "status": "busy" });
                 println!("{}", serde_json::to_string_pretty(&out)?);
+                eprintln!("{message}");
+            } else {
+                println!("{message}");
             }
-            eprintln!(
-                "Another Agora process holds the content store, so nothing was moved. Run this \
-                 again when it has finished."
-            );
             std::process::exit(busy_code())
         }
         Ok(MigrationOutcome::NeedsHand(reason)) => {
