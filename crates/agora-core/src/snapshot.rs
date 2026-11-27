@@ -574,8 +574,9 @@ pub(crate) fn snapshot_blob_source(
     size: u64,
 ) -> Result<Option<PathBuf>, String> {
     let paths = snapshot_store_paths(instance_dir);
-    let content = paths.content_object_path(hash);
-    if content_blob_is_trustworthy(&content, size, hash)? {
+    let canonical_hash = hash.to_ascii_lowercase();
+    let content = paths.content_object_path(&canonical_hash);
+    if content_blob_is_trustworthy(&content, size, &canonical_hash)? {
         return Ok(Some(content));
     }
     if crate::content_store::migrate::legacy_store_active(&paths) {
@@ -602,7 +603,7 @@ pub(crate) fn snapshot_blob_source(
         }
     }
     // Migration may have published the object after the first lookup.
-    Ok(content_blob_is_trustworthy(&content, size, hash)?.then_some(content))
+    Ok(content_blob_is_trustworthy(&content, size, &canonical_hash)?.then_some(content))
 }
 
 fn content_blob_is_trustworthy(path: &Path, size: u64, hash: &str) -> Result<bool, String> {
@@ -3385,38 +3386,51 @@ pub(super) fn list_snapshot_scan_dir(dir: &Path) -> std::io::Result<Vec<std::io:
 /// intentionally conservative for a size-cap policy.
 pub fn snapshot_storage_size(instance_dir: &Path, snapshot_id: &str) -> Result<u64, String> {
     validate_snapshot_id(snapshot_id)?;
-    let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
-    if let Ok(manifest) = read_manifest_file(&manifest_path, snapshot_id) {
-        let paths = snapshot_store_paths(instance_dir);
-        let legacy_active = crate::content_store::migrate::legacy_store_active(&paths);
-        let mut size = snapshot_object_check(&manifest_path, fs::metadata(&manifest_path))?
-            .map_or(0, |metadata| metadata.len());
-        for hash in manifest
-            .files
-            .iter()
-            .filter_map(|file| file.blob_sha256.as_deref().or(file.sha256.as_deref()))
-            .filter(|hash| validate_blob_hash(hash).is_ok())
-        {
-            // Count physical bytes even when a blob is damaged.
-            if legacy_active {
-                let legacy = snapshot_blob_path(instance_dir, hash);
-                if let Some(metadata) = legacy_blob_metadata(&paths, &legacy)? {
-                    size += metadata.len();
-                    continue;
-                }
+    let path = snapshot_manifest_path(instance_dir, snapshot_id);
+    let Some(manifest_size) = snapshot_file_size(&path)? else {
+        let zip = snapshot_zip_path(instance_dir, snapshot_id);
+        return snapshot_file_size(&zip)?
+            .ok_or_else(|| format!("snapshot archive {} is missing", zip.display()));
+    };
+    let manifest = read_manifest_file(&path, snapshot_id)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let paths = snapshot_store_paths(instance_dir);
+    let legacy_active = crate::content_store::migrate::legacy_store_active(&paths);
+    let mut size = manifest_size;
+    for file in manifest.files.iter().filter(|file| !file.absent) {
+        let hash = file
+            .blob_sha256
+            .as_deref()
+            .or(file.sha256.as_deref())
+            .ok_or_else(|| format!("snapshot has no content hash for {}", file.relative_path))?;
+        validate_blob_hash(hash)?;
+        // Count physical bytes even when a blob is damaged.
+        if legacy_active {
+            let legacy = snapshot_blob_path(instance_dir, hash);
+            if let Some(metadata) = legacy_blob_metadata(&paths, &legacy)? {
+                size += metadata.len();
+                continue;
             }
-            let content = paths.content_object_path(hash);
-            size += snapshot_object_check(&content, fs::metadata(&content))?
-                .map_or(0, |metadata| metadata.len());
         }
-        return Ok(size);
+        let content = paths.content_object_path(&hash.to_ascii_lowercase());
+        size += snapshot_file_size(&content)?
+            .ok_or_else(|| format!("snapshot object {} is missing", content.display()))?;
     }
-    let zip = snapshot_zip_path(instance_dir, snapshot_id);
-    Ok(snapshot_object_check(&zip, fs::metadata(&zip))?.map_or(0, |metadata| metadata.len()))
+    Ok(size)
 }
 
-/// Remove content-addressed objects that no owner record names any more, in both stores
-/// (MASTER_SPEC §32.8).
+fn snapshot_file_size(path: &Path) -> Result<Option<u64>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(entry) if entry.is_file() && !agora_game_api::is_a_reparse_point(&entry) => {
+            Ok(Some(entry.len()))
+        }
+        Ok(_) => Err(format!("{} is not a plain file", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("could not measure {}: {error}", path.display())),
+    }
+}
+
+/// Remove content-addressed objects that no owner record names any more (MASTER_SPEC §32.8).
 ///
 /// This is the same collection that a snapshot delete and an item removal run; it is the entry point
 /// for a caller that only wants the sweep. Garbage collection is best-effort at lifecycle
@@ -3454,7 +3468,7 @@ pub(crate) fn prune_unreferenced_objects_with_pause(
     )?;
     if report.refused() {
         return Err(format!(
-            "nothing was swept from the object stores: {}",
+            "nothing was swept from the content store: {}",
             report.refusal_reasons()
         ));
     }

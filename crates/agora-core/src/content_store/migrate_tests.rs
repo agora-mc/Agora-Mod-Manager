@@ -3,7 +3,7 @@
 //! Before B3a, snapshots kept their blobs in a second store, `<root>/snapshot-objects/<xx>/<hash>`.
 //! The migration moves each one into the one content store, re-hashed; keeps and reports anything
 //! whose bytes do not match its name; resumes after a crash (a journal on the §32.11 envelope); and,
-//! once it is done, nothing reads or sweeps the old store any more.
+//! once it is done, fallback reads stop until another migration run starts.
 //!
 //! These tests were written before the code (owner's routing, 2026-11-26). The names below are the
 //! API the brief asks for; if one has to change, say why in the report — what each test asserts
@@ -17,7 +17,7 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 
 use crate::content_store::collect::CollectRequest;
-use crate::content_store::migrate::{self, MigrationOutcome};
+use crate::content_store::migrate::{self, LegacyStoreState, MigrationOutcome};
 use crate::content_store::{self, protect};
 use crate::ctx::Ctx;
 use crate::lock_manager::{LockManager, LockResource};
@@ -147,6 +147,36 @@ fn a_snapshot_captured_before_the_move_restores_from_the_content_store_afterward
 }
 
 #[test]
+fn a_snapshot_with_an_uppercase_manifest_hash_restores_after_migration() {
+    let (_dir, ctx) = fixture();
+    let bytes = b"legacy bytes";
+    let dir = instance_with_file(&ctx, "live", bytes);
+    let snap = snapshot::create_snapshot(&dir, None, &["mods"]).unwrap();
+    let hash = sha256_hex(bytes);
+    let upper = hash.to_ascii_uppercase();
+    let legacy = demote_to_legacy(&ctx, &hash);
+    fs::remove_file(legacy).unwrap();
+    let legacy = plant_legacy(&ctx, &upper, bytes);
+    let manifest = snapshot::snapshot_manifest_path(&dir, &snap.id);
+    let json = fs::read_to_string(&manifest).unwrap();
+    assert!(json.contains(&hash));
+    fs::write(&manifest, json.replace(&hash, &upper)).unwrap();
+
+    assert_eq!(
+        snapshot::snapshot_blob_source(&dir, &upper, bytes.len() as u64).unwrap(),
+        Some(legacy.clone())
+    );
+    done(migrate::migrate_snapshot_objects(&ctx).unwrap());
+
+    assert!(!legacy.exists());
+    let source = snapshot::snapshot_blob_source(&dir, &upper, bytes.len() as u64).unwrap();
+    assert_eq!(source, Some(ctx.paths.content_object_path(&hash)));
+    fs::write(dir.join("mods/kept.jar"), b"changed later").unwrap();
+    snapshot::restore_snapshot(&dir, &snap.id, &["mods"]).unwrap();
+    assert_eq!(fs::read(dir.join("mods/kept.jar")).unwrap(), bytes);
+}
+
+#[test]
 fn a_legacy_object_whose_bytes_do_not_match_its_name_is_kept_and_reported() {
     let (_dir, ctx) = fixture();
     let claimed = sha256_hex(b"what the name promises");
@@ -181,6 +211,70 @@ fn a_good_copy_already_in_the_store_is_kept_and_the_legacy_duplicate_goes() {
     assert_eq!(report.moved, 0, "{report:?}");
     assert!(!legacy.exists());
     assert_eq!(object_bytes(&ctx, &hash).as_deref(), Some(&b"twice"[..]));
+}
+
+#[test]
+fn a_matching_writable_destination_is_protected_before_the_legacy_copy_goes() {
+    let (_dir, ctx) = fixture();
+    let hash = sha256_hex(b"twice");
+    let legacy = plant_legacy(&ctx, &hash, b"twice");
+    let destination = ctx.paths.content_object_path(&hash);
+    fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    fs::write(&destination, b"twice").unwrap();
+
+    let report = done(migrate::migrate_snapshot_objects(&ctx).unwrap());
+
+    assert_eq!(report.already_present, 1);
+    assert_eq!(
+        protect::protection(&destination).unwrap(),
+        protect::Protection::Protected
+    );
+    assert!(!legacy.exists());
+}
+
+#[test]
+fn a_destination_that_changes_before_unlink_leaves_the_legacy_copy_and_receipt() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    for change_before_blob_unlink in [false, true] {
+        let (_dir, ctx) = fixture();
+        let hash = sha256_hex(b"last good copy");
+        let legacy = plant_legacy(&ctx, &hash, b"last good copy");
+        crate::artifact_receipt::record_verified(&legacy, "sha256", &hash, Some(14)).unwrap();
+        let receipt = crate::artifact_receipt::receipt_path(&legacy);
+        let destination = ctx.paths.content_object_path(&hash);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let blob = legacy.clone();
+        ctx.test_seams
+            .set_snapshot_migration_before_unlink(Arc::new(move |unlink| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                if (unlink == blob) == change_before_blob_unlink {
+                    protect::unprotect(&destination).unwrap();
+                    fs::write(&destination, b"short").unwrap();
+                }
+            }));
+
+        let outcome = migrate::migrate_snapshot_objects(&ctx).unwrap();
+
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            if change_before_blob_unlink { 2 } else { 1 }
+        );
+        assert!(matches!(outcome, MigrationOutcome::NeedsHand(reason) if reason.contains(&hash)));
+        assert_eq!(fs::read(&legacy).unwrap(), b"last good copy");
+        assert_eq!(receipt.exists(), !change_before_blob_unlink);
+        assert_eq!(
+            migrate::legacy_store_state(&ctx.paths),
+            LegacyStoreState::Active
+        );
+        let journal = fs::read(migrate::journal_path(&ctx.paths)).unwrap();
+        let journal: serde_json::Value = serde_json::from_slice(&journal).unwrap();
+        assert_eq!(journal["state"], "running");
+    }
 }
 
 /// The content store trusts a protected object of the right size without hashing it. The
@@ -223,6 +317,71 @@ fn after_the_migration_the_legacy_store_is_not_read() {
         "a finished migration stops the fallback read"
     );
     assert!(late.exists());
+}
+
+#[test]
+fn the_next_migration_run_moves_an_object_that_arrived_after_done() {
+    let (_dir, ctx) = fixture();
+    fs::create_dir_all(legacy_root(&ctx)).unwrap();
+    done(migrate::migrate_snapshot_objects(&ctx).unwrap());
+    let hash = sha256_hex(b"late");
+    let late = plant_legacy(&ctx, &hash, b"late");
+    ctx.test_seams
+        .set_snapshot_migration_stop_after_place(Some(1));
+
+    assert!(migrate::migrate_snapshot_objects(&ctx).is_err());
+    assert_eq!(ctx.test_seams.snapshot_migration_stops(), 1);
+    assert!(migrate::legacy_store_active(&ctx.paths));
+    assert!(late.exists());
+
+    ctx.test_seams.set_snapshot_migration_stop_after_place(None);
+    assert_eq!(
+        done(migrate::migrate_snapshot_objects(&ctx).unwrap()).moved,
+        1
+    );
+    assert!(!late.exists());
+    assert_eq!(object_bytes(&ctx, &hash).as_deref(), Some(&b"late"[..]));
+    assert!(!migrate::legacy_store_active(&ctx.paths));
+}
+
+#[test]
+fn startup_is_quiet_for_an_unchanged_mismatch_and_migrates_it_after_repair() {
+    let (_dir, ctx) = fixture();
+    let hash = sha256_hex(b"promised");
+    let bad = plant_legacy(&ctx, &hash, b"delivered");
+    assert_eq!(
+        done(migrate::migrate_snapshot_objects(&ctx).unwrap()).mismatched,
+        vec![bad.clone()]
+    );
+
+    let quiet = crate::startup_recovery::run_at_startup(&ctx);
+    assert!(
+        quiet.actions.is_empty() && quiet.warnings.is_empty(),
+        "{quiet:?}"
+    );
+    assert!(!migrate::legacy_store_active(&ctx.paths));
+    assert_eq!(fs::read(&bad).unwrap(), b"delivered");
+
+    fs::write(&bad, b"still wrong").unwrap();
+    let changed = crate::startup_recovery::run_at_startup(&ctx);
+    assert!(
+        changed.warnings.iter().any(|line| line.contains(&hash)),
+        "{changed:?}"
+    );
+    let quiet = crate::startup_recovery::run_at_startup(&ctx);
+    assert!(
+        quiet.actions.is_empty() && quiet.warnings.is_empty(),
+        "{quiet:?}"
+    );
+
+    fs::write(&bad, b"promised").unwrap();
+    let repaired = crate::startup_recovery::run_at_startup(&ctx);
+    assert!(
+        repaired.actions.iter().any(|line| line.contains("Moved 1")),
+        "{repaired:?}"
+    );
+    assert!(!bad.exists());
+    assert_eq!(object_bytes(&ctx, &hash).as_deref(), Some(&b"promised"[..]));
 }
 
 #[test]
@@ -346,6 +505,7 @@ fn a_held_store_lock_is_busy_and_moves_nothing() {
 #[test]
 fn an_unreadable_journal_needs_a_hand_and_the_fallback_stays() {
     let (_dir, ctx) = fixture();
+    let instance = instance_with_file(&ctx, "live", b"unused");
     let legacy = plant_legacy(&ctx, &sha256_hex(b"keep reading"), b"keep reading");
     let journal = migrate::journal_path(&ctx.paths);
     fs::create_dir_all(journal.parent().unwrap()).unwrap();
@@ -362,11 +522,35 @@ fn an_unreadable_journal_needs_a_hand_and_the_fallback_stays() {
         "nothing moves under a journal nobody can read"
     );
     assert!(migrate::legacy_store_active(&ctx.paths));
+    assert!(matches!(
+        migrate::legacy_store_state(&ctx.paths),
+        LegacyStoreState::Unknown(reason) if reason.contains("journal")
+    ));
+    assert_eq!(
+        snapshot::snapshot_blob_source(&instance, &sha256_hex(b"keep reading"), 12).unwrap(),
+        Some(legacy)
+    );
     assert_eq!(
         fs::read(&journal).unwrap(),
         b"{ not a journal",
         "the damaged journal is evidence"
     );
+}
+
+#[test]
+fn a_legacy_root_that_is_a_file_is_uncertain_even_after_done() {
+    let (_dir, ctx) = fixture();
+    let root = legacy_root(&ctx);
+    fs::create_dir_all(&root).unwrap();
+    done(migrate::migrate_snapshot_objects(&ctx).unwrap());
+    fs::remove_dir(&root).unwrap();
+    fs::write(root, b"unexpected file").unwrap();
+
+    assert!(migrate::legacy_store_active(&ctx.paths));
+    assert!(matches!(
+        migrate::legacy_store_state(&ctx.paths),
+        LegacyStoreState::Unknown(reason) if reason.contains("snapshot-objects")
+    ));
 }
 
 /// The way out for a damaged journal (MASTER_SPEC §32.11: every "needs a hand" has one). The move

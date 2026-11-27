@@ -82,12 +82,28 @@ struct Seams {
     snapshot_migration_stop_after_place: Mutex<Option<usize>>,
     #[cfg(test)]
     snapshot_migration_stops: AtomicUsize,
+    #[cfg(test)]
+    snapshot_migration_before_unlink: Mutex<Option<SnapshotMigrationUnlinkHook>>,
 }
 
 type ObjectCollectionHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
+type SnapshotMigrationUnlinkHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
+#[cfg(test)]
 impl TestSeams {
+    pub(crate) fn set_snapshot_migration_before_unlink(&self, hook: SnapshotMigrationUnlinkHook) {
+        *slot(&self.0.snapshot_migration_before_unlink) = Some(hook);
+    }
+
+    pub(crate) fn snapshot_migration_before_unlink(&self, path: &Path) {
+        let hook = slot(&self.0.snapshot_migration_before_unlink).clone();
+        if let Some(hook) = hook {
+            hook(path);
+        }
+    }
+
     pub fn set_snapshot_migration_stop_after_place(&self, after: Option<usize>) {
         *slot(&self.0.snapshot_migration_stop_after_place) = after;
     }

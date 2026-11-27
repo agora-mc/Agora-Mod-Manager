@@ -128,20 +128,33 @@ fn assert_link_refuses_collection(ctx: &Ctx, link: &Path) {
 }
 
 #[test]
-fn linked_object_roots_refuse_collection() {
-    for legacy in [false, true] {
-        let (_dir, ctx) = fixture();
-        let root = if legacy {
-            ctx.paths.root().join("snapshot-objects")
-        } else {
-            ctx.paths.content_objects_dir()
-        };
-        let target = ctx.paths.root().join("other-profile-objects");
-        fs::create_dir_all(&target).unwrap();
-        fs::create_dir_all(root.parent().unwrap()).unwrap();
-        assert!(make_folder_link(&target, &root));
-        assert_link_refuses_collection(&ctx, &root);
-    }
+fn a_linked_content_object_root_refuses_collection() {
+    let (_dir, ctx) = fixture();
+    let root = ctx.paths.content_objects_dir();
+    let target = ctx.paths.root().join("other-profile-objects");
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(root.parent().unwrap()).unwrap();
+    assert!(make_folder_link(&target, &root));
+    assert_link_refuses_collection(&ctx, &root);
+}
+
+#[test]
+fn a_linked_legacy_object_root_is_outside_collection() {
+    let (_dir, ctx) = fixture();
+    let root = ctx.paths.root().join("snapshot-objects");
+    let target = ctx.paths.root().join("other-profile-objects");
+    let other_hash = sha256_hex(b"another profile");
+    let other_object = target.join(&other_hash[..2]).join(&other_hash);
+    fs::create_dir_all(other_object.parent().unwrap()).unwrap();
+    fs::write(&other_object, b"another profile").unwrap();
+    assert!(make_folder_link(&target, &root));
+    let orphan = content_store::store_object_bytes(&ctx, b"an unowned object").unwrap();
+
+    let report = content_store::collect::collect_with_ctx(&ctx, &CollectRequest::default());
+
+    assert!(!report.refused(), "{:?}", report.refusals);
+    assert_eq!(report.deleted, vec![orphan]);
+    assert!(other_object.is_file());
 }
 
 #[test]
@@ -519,7 +532,7 @@ fn an_object_inside_the_grace_period_is_kept_and_freed_after_it() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. The legacy store: read, restored from, and collected by the same rule
+// 5. Legacy reads and collection after migration
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -547,7 +560,7 @@ fn a_snapshot_whose_blobs_are_only_in_the_legacy_store_still_restores() {
 }
 
 #[test]
-fn an_unreferenced_legacy_blob_is_collected_while_a_referenced_one_is_kept() {
+fn an_unreferenced_legacy_blob_is_only_collected_after_it_moves_to_the_content_store() {
     let (_dir, ctx) = fixture();
     let dir = instance_with_file(&ctx, "live", b"referenced bytes");
     let snap = snapshot::create_snapshot(&dir, None, &["mods"]).unwrap();
@@ -566,26 +579,37 @@ fn an_unreferenced_legacy_blob_is_collected_while_a_referenced_one_is_kept() {
     fs::remove_file(&stored).unwrap();
     fs::write(&legacy_orphan, b"nobody's bytes").unwrap();
 
-    let report = crate::content_store::collect::collect_with_ctx(
-        &ctx,
-        &CollectRequest {
-            store: LockRequest::Wait,
-            locations: LockRequest::Wait,
-            grace: None,
-            ignore_unreadable_snapshots: false,
-            pause: None,
-        },
-    );
+    // Even a damaged migration journal cannot expose legacy objects to collection.
+    let journal = content_store::migrate::journal_path(&ctx.paths);
+    fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    fs::write(journal, b"{ damaged journal").unwrap();
+    let request = CollectRequest {
+        store: LockRequest::Wait,
+        locations: LockRequest::Wait,
+        grace: Some(Duration::ZERO),
+        ignore_unreadable_snapshots: false,
+        pause: None,
+    };
+    let report = crate::content_store::collect::collect_with_ctx(&ctx, &request);
     assert!(!report.refused(), "{:?}", report.refusals);
-    assert!(
-        legacy_referenced.is_file(),
-        "the snapshot still names this blob, so it stays"
-    );
-    assert!(
-        !legacy_orphan.exists(),
-        "nothing names this blob, so it goes"
-    );
-    assert!(snap.id.len() > 10);
+    assert!(legacy_referenced.is_file());
+    assert!(legacy_orphan.is_file());
+
+    let outcome = content_store::migrate::restart_snapshot_object_migration(&ctx).unwrap();
+    assert!(matches!(
+        outcome,
+        content_store::migrate::MigrationOutcome::Done(_)
+    ));
+    assert!(!legacy_orphan.exists());
+    assert!(!legacy_referenced.exists());
+    assert!(object_exists(&ctx, &orphan));
+
+    let report = crate::content_store::collect::collect_with_ctx(&ctx, &request);
+    assert!(!report.refused(), "{:?}", report.refusals);
+    assert_eq!(report.deleted, vec![orphan.clone()]);
+    assert!(!object_exists(&ctx, &orphan));
+    assert!(object_exists(&ctx, &referenced));
+    snapshot::restore_snapshot(&dir, &snap.id, &["mods"]).unwrap();
 }
 
 // ---------------------------------------------------------------------------
