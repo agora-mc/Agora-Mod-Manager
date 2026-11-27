@@ -753,7 +753,10 @@ fn the_rebuild_keeps_rowids_so_a_report_names_the_row_it_meant() {
 
     let report = init_local_state_db_with(&path, &LocalStateOpenOptions::default())
         .expect("an orphan the database arrived with does not stop the upgrade");
-    assert_eq!(report.migrated_to, 31);
+    assert_eq!(
+        report.migrated_to,
+        agora_core::db::LOCAL_STATE_SCHEMA_VERSION
+    );
     let warned = report.warnings.join("\n");
     assert!(
         warned.contains("instance_pack_gaps row 2"),

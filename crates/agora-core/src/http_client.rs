@@ -26,7 +26,8 @@ use crate::error::{LauncherError, LauncherResult};
 use crate::network;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -377,6 +378,19 @@ impl ClientCategory {
 #[derive(Debug, Clone)]
 pub struct HttpClients {
     by_category: [reqwest::Client; ClientCategory::ALL.len()],
+    test_dns: Option<TestDns>,
+    test_host_policy: Option<HostPolicy<'static>>,
+}
+
+type ResolveTestHost = dyn Fn(&reqwest::Url) -> std::io::Result<Vec<SocketAddr>> + Send + Sync;
+
+#[derive(Clone)]
+struct TestDns(Arc<ResolveTestHost>);
+
+impl std::fmt::Debug for TestDns {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TestDns")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -664,6 +678,8 @@ impl HttpClients {
                 code: "ERR_HTTP_CLIENT_BUILD".into(),
                 message: "HTTP client table size does not match the category list".into(),
             })?,
+            test_dns: None,
+            test_host_policy: None,
         })
     }
 
@@ -675,7 +691,37 @@ impl HttpClients {
     pub fn for_testing(client: reqwest::Client) -> Self {
         Self {
             by_category: std::array::from_fn(|_| client.clone()),
+            test_dns: None,
+            test_host_policy: None,
         }
+    }
+
+    /// Substitute DNS results for checked request and redirect validation in tests.
+    #[doc(hidden)]
+    pub fn with_test_dns(mut self, resolve: Arc<ResolveTestHost>) -> Self {
+        self.test_dns = Some(TestDns(resolve));
+        self
+    }
+
+    /// Let redirect fixtures use the consented HTTP category with synthetic hosts.
+    #[doc(hidden)]
+    pub fn with_test_host_policy(mut self, policy: HostPolicy<'static>) -> Self {
+        self.test_host_policy = Some(policy);
+        self
+    }
+
+    fn validate_url(
+        &self,
+        category: ClientCategory,
+        url: &str,
+        policy: HostPolicy<'_>,
+    ) -> LauncherResult<reqwest::Url> {
+        check_request_url_resolving(
+            category,
+            url,
+            self.test_host_policy.unwrap_or(policy),
+            self.test_dns.as_ref(),
+        )
     }
 
     /// Get the raw client for a category.
@@ -775,6 +821,15 @@ pub fn check_request_url_with_policy(
     url: &str,
     policy: HostPolicy<'_>,
 ) -> LauncherResult<reqwest::Url> {
+    check_request_url_resolving(category, url, policy, None)
+}
+
+fn check_request_url_resolving(
+    category: ClientCategory,
+    url: &str,
+    policy: HostPolicy<'_>,
+    test_dns: Option<&TestDns>,
+) -> LauncherResult<reqwest::Url> {
     let parsed = reqwest::Url::parse(url).map_err(|_| LauncherError::Generic {
         code: "ERR_INVALID_URL".into(),
         message: format!("Cannot parse URL: {url}"),
@@ -869,7 +924,11 @@ pub fn check_request_url_with_policy(
     //    Every resolved address is checked, not just the first: a host that
     //    resolves to both a public and a private address must not pass because
     //    the public one happened to sort first.
-    match parsed.socket_addrs(|| None) {
+    let addresses = match test_dns {
+        Some(resolve) => (resolve.0)(&parsed),
+        None => parsed.socket_addrs(|| None),
+    };
+    match addresses {
         Ok(addrs) if !addrs.is_empty() => {
             if addrs.iter().any(|addr| is_blocked_ip(addr.ip())) {
                 return Err(LauncherError::Generic {
@@ -1053,6 +1112,30 @@ pub fn transport_failure_from(error: reqwest::Error) -> LauncherError {
     transport_failure()
 }
 
+/// The refusal a failed request carries when the gate refused one of its redirect hops.
+///
+/// A redirect policy that answers a hop with `attempt.error(..)` has nothing but `reqwest`'s error
+/// to hand back, and the caller must not read a denied hop as a network hiccup: it is a decision.
+/// So the error is found in the source chain and returned as the refusal it was.
+pub fn denial_from_request_error(error: &reqwest::Error) -> Option<LauncherError> {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if let Some(denial) = current.downcast_ref::<LauncherError>() {
+            return Some(denial.clone());
+        }
+        source = current.source();
+    }
+    None
+}
+
+/// Map one request's failure: a refused redirect hop keeps its refusal, anything else is transport.
+pub fn request_error(error: reqwest::Error) -> LauncherError {
+    match denial_from_request_error(&error) {
+        Some(denial) => denial,
+        None => transport_failure_from(error),
+    }
+}
+
 fn describe_transport_error(error: reqwest::Error) -> String {
     let kind = if error.is_timeout() {
         "timed out"
@@ -1096,6 +1179,66 @@ pub async fn checked_request(
 /// The same policy is applied to the initial URL and every redirect hop, so a
 /// `SignedManifest` pinned artifact cannot escape to an off-domain host via a
 /// redirect.
+fn next_redirect_hop(
+    clients: &HttpClients,
+    category: ClientCategory,
+    policy: HostPolicy<'_>,
+    original_url: &str,
+    current_url: &str,
+    location: &str,
+    remaining: &mut u8,
+) -> LauncherResult<reqwest::Url> {
+    if *remaining == 0 {
+        return Err(LauncherError::Generic {
+            code: "ERR_TOO_MANY_REDIRECTS".into(),
+            message: format!(
+                "Too many redirects for {}",
+                network::sanitized_url_for_log(original_url)
+            ),
+        });
+    }
+    // Relative redirects resolve against the URL that answered.
+    let next_url = reqwest::Url::parse(current_url)
+        .ok()
+        .and_then(|base| {
+            reqwest::Url::parse(location)
+                .or_else(|_| base.join(location))
+                .ok()
+        })
+        .ok_or_else(|| LauncherError::Generic {
+            code: "ERR_INVALID_REDIRECT".into(),
+            message: format!("Cannot resolve redirect Location: {location}"),
+        })?;
+    // A redirect is a new request: the answer the gate gave for the previous hop does not carry
+    // over, and the policy may have changed while this one was in flight (MASTER_SPEC §32.9).
+    // This runs before the target is resolved or contacted, so a refusal produces no traffic.
+    crate::network_gate::authorize(category)?;
+    clients.validate_url(category, next_url.as_str(), policy)?;
+    *remaining -= 1;
+    Ok(next_url)
+}
+
+/// The `Location` a redirecting response names.
+fn redirect_location(response: &reqwest::Response) -> LauncherResult<String> {
+    location_header(response.headers())
+}
+
+/// The blocking form of [`redirect_location`].
+fn blocking_redirect_location(response: &reqwest::blocking::Response) -> LauncherResult<String> {
+    location_header(response.headers())
+}
+
+fn location_header(headers: &reqwest::header::HeaderMap) -> LauncherResult<String> {
+    headers
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .ok_or_else(|| LauncherError::Generic {
+            code: "ERR_REDIRECT_NO_LOCATION".into(),
+            message: "Redirect without Location header".into(),
+        })
+}
+
 pub async fn checked_request_with_policy(
     clients: &HttpClients,
     category: ClientCategory,
@@ -1107,7 +1250,7 @@ pub async fn checked_request_with_policy(
     // Lockdown Mode.
     crate::network_gate::authorize(category)?;
     // Validate initial URL against category policies.
-    let _validated = check_request_url_with_policy(category, url, policy)?;
+    let _validated = clients.validate_url(category, url, policy)?;
 
     let client = clients.get(category);
 
@@ -1126,43 +1269,16 @@ pub async fn checked_request_with_policy(
         // Check if the response is a redirect.
         let status = response.status();
         if status.is_redirection() {
-            if remaining_redirects == 0 {
-                return Err(LauncherError::Generic {
-                    code: "ERR_TOO_MANY_REDIRECTS".into(),
-                    message: format!(
-                        "Too many redirects for {}",
-                        network::sanitized_url_for_log(url)
-                    ),
-                });
-            }
-
-            // Get the Location header.
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| LauncherError::Generic {
-                    code: "ERR_REDIRECT_NO_LOCATION".into(),
-                    message: "Redirect without Location header".to_string(),
-                })?;
-
-            // Resolve relative redirects against the current URL.
-            let next_url = reqwest::Url::parse(&current_url)
-                .ok()
-                .and_then(|base| {
-                    reqwest::Url::parse(location)
-                        .or_else(|_| base.join(location))
-                        .ok()
-                })
-                .ok_or_else(|| LauncherError::Generic {
-                    code: "ERR_INVALID_REDIRECT".into(),
-                    message: format!("Cannot resolve redirect Location: {location}"),
-                })?;
-
-            // Re-validate the redirect target against the same policies.
-            let _ = check_request_url_with_policy(category, next_url.as_str(), policy)?;
-
-            remaining_redirects -= 1;
+            let location = redirect_location(&response)?;
+            let next_url = next_redirect_hop(
+                clients,
+                category,
+                policy,
+                url,
+                &current_url,
+                &location,
+                &mut remaining_redirects,
+            )?;
             current_url = next_url.to_string();
             continue;
         }
@@ -1186,7 +1302,7 @@ pub async fn checked_send(
     content_type: Option<&str>,
 ) -> LauncherResult<reqwest::Response> {
     crate::network_gate::authorize(category)?;
-    check_request_url(category, url)?;
+    clients.validate_url(category, url, HostPolicy::Allowlist)?;
     let client = clients.get(category);
     let mut current_method = method;
     let mut current_url = url.to_string();
@@ -1213,35 +1329,16 @@ pub async fn checked_send(
         if !response.status().is_redirection() {
             return Ok(response);
         }
-        if remaining_redirects == 0 {
-            return Err(LauncherError::Generic {
-                code: "ERR_TOO_MANY_REDIRECTS".into(),
-                message: format!(
-                    "Too many redirects for {}",
-                    network::sanitized_url_for_log(url)
-                ),
-            });
-        }
-        let location = response
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| LauncherError::Generic {
-                code: "ERR_REDIRECT_NO_LOCATION".into(),
-                message: "Redirect without Location header".into(),
-            })?;
-        let next_url = reqwest::Url::parse(&current_url)
-            .ok()
-            .and_then(|base| {
-                reqwest::Url::parse(location)
-                    .or_else(|_| base.join(location))
-                    .ok()
-            })
-            .ok_or_else(|| LauncherError::Generic {
-                code: "ERR_INVALID_REDIRECT".into(),
-                message: "Cannot resolve redirect Location".into(),
-            })?;
-        check_request_url(category, next_url.as_str())?;
+        let location = redirect_location(&response)?;
+        let next_url = next_redirect_hop(
+            clients,
+            category,
+            HostPolicy::Allowlist,
+            url,
+            &current_url,
+            &location,
+            &mut remaining_redirects,
+        )?;
 
         match response.status().as_u16() {
             307 | 308 => {}
@@ -1252,7 +1349,6 @@ pub async fn checked_send(
         }
         current_url = next_url.to_string();
         first_request = false;
-        remaining_redirects -= 1;
     }
 }
 
@@ -1487,7 +1583,7 @@ pub async fn checked_request_with_headers(
     headers: Vec<(String, String)>,
 ) -> LauncherResult<reqwest::Response> {
     crate::network_gate::authorize(category)?;
-    let _validated = check_request_url(category, url)?;
+    let _validated = clients.validate_url(category, url, HostPolicy::Allowlist)?;
     let client = clients.get(category);
 
     let mut remaining_redirects: u8 = 10;
@@ -1506,39 +1602,16 @@ pub async fn checked_request_with_headers(
         crate::connectivity::record_reachable();
 
         if response.status().is_redirection() {
-            if remaining_redirects == 0 {
-                return Err(LauncherError::Generic {
-                    code: "ERR_TOO_MANY_REDIRECTS".into(),
-                    message: format!(
-                        "Too many redirects for {}",
-                        network::sanitized_url_for_log(url)
-                    ),
-                });
-            }
-
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| LauncherError::Generic {
-                    code: "ERR_REDIRECT_NO_LOCATION".into(),
-                    message: "Redirect without Location header".into(),
-                })?;
-
-            let next_url = reqwest::Url::parse(&current_url)
-                .ok()
-                .and_then(|base| {
-                    reqwest::Url::parse(location)
-                        .or_else(|_| base.join(location))
-                        .ok()
-                })
-                .ok_or_else(|| LauncherError::Generic {
-                    code: "ERR_INVALID_REDIRECT".into(),
-                    message: format!("Cannot resolve redirect Location: {location}"),
-                })?;
-
-            let _ = check_request_url(category, next_url.as_str())?;
-            remaining_redirects -= 1;
+            let location = redirect_location(&response)?;
+            let next_url = next_redirect_hop(
+                clients,
+                category,
+                HostPolicy::Allowlist,
+                url,
+                &current_url,
+                &location,
+                &mut remaining_redirects,
+            )?;
             current_url = next_url.to_string();
             first = false;
             continue;
@@ -1566,13 +1639,13 @@ pub fn blocking_checked_request(
 /// instead of the category allowlist (used by consented-content imports that
 /// run inside blocking workers).
 pub fn blocking_checked_request_with_policy(
-    _clients: &HttpClients,
+    clients: &HttpClients,
     category: ClientCategory,
     url: &str,
     policy: HostPolicy<'_>,
 ) -> LauncherResult<reqwest::blocking::Response> {
     crate::network_gate::authorize(category)?;
-    let _validated = check_request_url_with_policy(category, url, policy)?;
+    let _validated = clients.validate_url(category, url, policy)?;
 
     // Build a blocking client with the same security posture and proxy.
     let client = build_blocking_client(category)?;
@@ -1588,39 +1661,16 @@ pub fn blocking_checked_request_with_policy(
         crate::connectivity::record_reachable();
 
         if response.status().is_redirection() {
-            if remaining_redirects == 0 {
-                return Err(LauncherError::Generic {
-                    code: "ERR_TOO_MANY_REDIRECTS".into(),
-                    message: format!(
-                        "Too many redirects for {}",
-                        network::sanitized_url_for_log(url)
-                    ),
-                });
-            }
-
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| LauncherError::Generic {
-                    code: "ERR_REDIRECT_NO_LOCATION".into(),
-                    message: "Redirect without Location header".into(),
-                })?;
-
-            let next_url = reqwest::Url::parse(&current_url)
-                .ok()
-                .and_then(|base| {
-                    reqwest::Url::parse(location)
-                        .or_else(|_| base.join(location))
-                        .ok()
-                })
-                .ok_or_else(|| LauncherError::Generic {
-                    code: "ERR_INVALID_REDIRECT".into(),
-                    message: format!("Cannot resolve redirect Location: {location}"),
-                })?;
-
-            let _ = check_request_url_with_policy(category, next_url.as_str(), policy)?;
-            remaining_redirects -= 1;
+            let location = blocking_redirect_location(&response)?;
+            let next_url = next_redirect_hop(
+                clients,
+                category,
+                policy,
+                url,
+                &current_url,
+                &location,
+                &mut remaining_redirects,
+            )?;
             current_url = next_url.to_string();
             continue;
         }

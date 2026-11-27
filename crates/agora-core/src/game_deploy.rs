@@ -3627,6 +3627,7 @@ pub fn add_to_instance_while_running(
     item_id: &str,
     allow_while_running: bool,
 ) -> Result<AddToInstance, AddToInstanceError> {
+    crate::game_instance::admit(ctx).map_err(AddToInstanceError::Instance)?;
     let guard = guard_for(ctx, instance_id, "content-add", allow_while_running)
         .map_err(AddToInstanceError::Deploy)?;
     add_to_instance_locked(ctx, &guard, item_id)

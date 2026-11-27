@@ -408,7 +408,10 @@ pub fn ensure_runtime(
         return Ok(inst);
     }
 
-    // 3. Check network policy before any download.
+    // 3. Check the plan's network policy before any download. The live gate is asked by the
+    //    request itself (`blocking_checked_request`, and again for each redirect hop), so a
+    //    Lockdown committed while this ran still stops the download; asking it here too would
+    //    refuse a runtime that is already in the archive cache and needs no network at all.
     network_policy.check(NetworkCategory::JavaRuntime)?;
     check_cancelled(progress, major, "ensure_runtime")?;
 

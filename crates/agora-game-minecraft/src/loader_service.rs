@@ -13,7 +13,7 @@ use agora_core::{
     error::{LauncherError, LauncherResult},
     event_sink::{CoreEvent, EventStatus, ProgressEvent, ProgressPhase},
     models::{InstanceManifest, InstanceRow},
-    network::{NetworkCategory, NetworkPolicy},
+    network::{check_launch_request, NetworkCategory, NetworkPolicy},
     operation_manager::OpHandle,
 };
 use std::collections::BTreeMap;
@@ -545,7 +545,7 @@ impl LoaderService {
             }
         }
 
-        if let Err(e) = policy.check(NetworkCategory::LoaderMetadataAndContent) {
+        if let Err(e) = check_launch_request(&policy, NetworkCategory::LoaderMetadataAndContent) {
             let e = attach_reinstall_context(e, adopt_failure.as_deref());
             op.fail(e.to_string());
             return Err(e);
@@ -713,7 +713,7 @@ impl LoaderService {
             None
         };
         let result = async {
-            policy.check(NetworkCategory::LoaderMetadataAndContent)?;
+            check_launch_request(policy, NetworkCategory::LoaderMetadataAndContent)?;
             let java_path = self
                 .resolve_installer_java(minecraft_root, &tuple.minecraft_version, policy, op)
                 .await?;
@@ -1099,12 +1099,34 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> LauncherResult<()> {
     })
 }
 
+/// Run the same installer-spawn path with the integration test executable as Java.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[doc(hidden)]
+pub async fn run_installer_for_testing(
+    java_path: &Path,
+    installer_path: &Path,
+    loader: &str,
+    minecraft_root: &Path,
+) -> LauncherResult<i32> {
+    run_installer_process(java_path, installer_path, loader, minecraft_root)
+        .await
+        .map(|result| result.exit_code)
+}
+
 async fn run_installer_process(
     java_path: &Path,
     installer_path: &Path,
     loader: &str,
     minecraft_root: &Path,
 ) -> LauncherResult<InstallerProcessResult> {
+    // A Forge or NeoForge installer is not a local tool: its `--installClient` action fetches the
+    // vanilla artifacts and libraries it is missing from the network, in a process Agora does not
+    // sit in front of. Every one of those downloads would therefore bypass the request gate, so
+    // the gate is asked before the process exists at all (MASTER_SPEC §32.9). The installer only
+    // runs for loaders that install this way.
+    agora_core::network_gate::authorize(
+        NetworkCategory::LoaderMetadataAndContent.client_category(),
+    )?;
     let mut command = tokio::process::Command::new(java_path);
     command
         .args([

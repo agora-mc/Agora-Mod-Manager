@@ -281,6 +281,7 @@ impl LaunchService {
         request: LaunchRequest,
         progress: &dyn LaunchProgress,
     ) -> LauncherResult<LaunchResult> {
+        agora_core::settings::admit_major_action(&self.ctx)?;
         validate_instance_id(&request.instance_id)?;
         let lock = self
             .ctx
@@ -328,6 +329,7 @@ impl LaunchService {
         action: LaunchRecoveryAction,
         progress: &dyn LaunchProgress,
     ) -> LauncherResult<LaunchResult> {
+        agora_core::settings::admit_major_action(&self.ctx)?;
         validate_instance_id(&request.instance_id)?;
         let lock = self
             .ctx
@@ -341,8 +343,11 @@ impl LaunchService {
             LaunchRecoveryAction::None => {}
             LaunchRecoveryAction::ProvisionJava { major } => {
                 progress.phase("recovery", "Provisioning the required Java runtime");
+                // The policy goes to `runtime_manager::ensure_runtime`, which checks it before a
+                // download, and the live gate is asked by each request the download makes. A
+                // runtime that is already installed needs neither, so recovery must not refuse
+                // it here.
                 let policy = agora_core::network::NetworkPolicy::from_ctx(&self.ctx)?;
-                policy.check(agora_core::network::NetworkCategory::JavaRuntime)?;
                 let runtimes_root = self.ctx.paths.java_runtimes_root();
                 provision_java_reporting(&self.ctx, runtimes_root, major, policy, progress).await?;
             }
@@ -783,9 +788,8 @@ impl LaunchService {
                     "provisioning-java",
                     "Provisioning the required Java runtime",
                 );
-                request
-                    .network_policy
-                    .check(agora_core::network::NetworkCategory::JavaRuntime)?;
+                // No permission check here: provisioning may finish from an archive already on
+                // disk, and `ensure_runtime` asks before it downloads anything.
                 let ensured = provision_java_reporting(
                     &self.ctx,
                     request.runtimes_root.clone(),

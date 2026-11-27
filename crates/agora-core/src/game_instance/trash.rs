@@ -846,6 +846,7 @@ pub fn restore(
     entry_id: &str,
     new_name: Option<&str>,
 ) -> Result<RestoreOutcome, InstanceError> {
+    super::admit(ctx)?;
     let root = ctx.paths.recently_deleted_games_root();
     let stored = read_entry_file(&root, entry_id)?;
     let original = stored.entry.instance_id.clone();

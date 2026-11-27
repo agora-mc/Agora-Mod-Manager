@@ -25,7 +25,7 @@ use core_api::ctx::Ctx;
 use core_api::error::{LauncherError, LauncherResult};
 use core_api::helpers::read_manifest;
 use core_api::http_client::{self, ClientCategory, HttpClients};
-use core_api::network::{NetworkCategory, NetworkPolicy};
+use core_api::network::{check_launch_request, NetworkCategory, NetworkPolicy};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -261,6 +261,7 @@ async fn export_ready_server_impl(
     world: Option<&str>,
     allow_unverified_loader: bool,
 ) -> LauncherResult<ExportResult> {
+    agora_core::settings::admit_major_action(ctx)?;
     let id = core_api::paths::sanitize_id(instance_id);
     let instance_dir = ctx.paths.instance_dir(&id)?;
     if !instance_dir.is_dir() {
@@ -1072,7 +1073,7 @@ async fn download_vanilla_server(
             code: "ERR_EXPORT_NO_SERVER_JAR".into(),
             message: format!("Minecraft {mc_version} publishes no server jar."),
         })?;
-    policy.check(NetworkCategory::MojangContent)?;
+    check_launch_request(policy, NetworkCategory::MojangContent)?;
     let bytes = http_client::checked_get_bytes(
         &ctx.http_clients,
         ClientCategory::MojangContent,
@@ -1135,7 +1136,7 @@ async fn fetch_loader_bytes(
     url: &str,
     file_name: &str,
 ) -> LauncherResult<Vec<u8>> {
-    policy.check(NetworkCategory::LoaderMetadataAndContent)?;
+    check_launch_request(policy, NetworkCategory::LoaderMetadataAndContent)?;
     loader_manifests::ensure_allowed_domain(url).inspect_err(|_| {
         eprintln!(
             "[server-export] rejected loader host file={file_name} url={}",

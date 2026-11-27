@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 /// Expected schema version for the mutable local SQLite database.
 /// Migrations are applied sequentially on startup.
-pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 31;
+pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 32;
 
 /// The game whose columns `minecraft_instances` holds.
 ///
@@ -332,6 +332,20 @@ pub fn init_local_state_db_with(
         report.warnings.extend(run_migrations(&conn)?);
     }
     report.migrated_to = schema_version(&conn)?;
+
+    // The version only moves because these triggers fire, and a database at the current step is
+    // never re-migrated: a trigger lost to a hand edit or a table rebuild would silently stop
+    // every other process from noticing a settings change. Checked on every startup, recreated
+    // here, and reported rather than fixed quietly (MASTER_SPEC §32.9).
+    let reinstalled = ensure_settings_version_triggers(&conn)?;
+    if !reinstalled.is_empty() {
+        report.warnings.push(format!(
+            "The settings version trigger(s) {} were missing from local_state.db and have been \
+             reinstalled. Settings written while they were gone did not publish a version, so any \
+             setting changed since the database last had them should be checked.",
+            reinstalled.join(", ")
+        ));
+    }
 
     seed_default_settings(&conn)?;
     Ok(report)
@@ -1102,6 +1116,113 @@ pub fn run_migrations_to(conn: &Connection, target: i64) -> anyhow::Result<Vec<S
     run_migration_steps(conn, MIGRATIONS, target)
 }
 
+/// Schema step 32: the settings version (MASTER_SPEC §32.9).
+///
+/// One row, never deleted, holding a number every settings write bumps. The bump lives in SQLite
+/// triggers rather than in the Rust writers, so it happens for *any* write to `user_settings` — the
+/// two public setters, a migration, a hand edit, a future feature that writes raw SQL — in that
+/// write's own transaction. A writer cannot forget it, and the value and its version cannot be
+/// committed apart.
+///
+/// A trigger that finds no version row aborts the write: a value nobody published a version for is
+/// one no other process would ever see. A database from before this step has no table and no
+/// triggers yet, so the older migration steps that write settings need no version (and must not
+/// have one — they run before this step creates it).
+///
+/// The row starts at 1 because what matters is that it changes; the older rows have no version to
+/// preserve. Everything here is `IF NOT EXISTS` / `OR IGNORE`, so a database that lost its
+/// recorded version and replays the step keeps the version it had.
+fn migrate_v32(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS settings_version (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             version INTEGER NOT NULL
+         );
+         INSERT OR IGNORE INTO settings_version (id, version) VALUES (1, 1);",
+    )?;
+    install_settings_version_triggers(conn)
+}
+
+/// The three triggers schema step 32 installs on `user_settings`, with the SQL that installs each.
+///
+/// They are named and kept here, rather than inlined in the step, because a database can lose one:
+/// a hand edit, a tool that rebuilt `user_settings`, a future migration that recreated the table.
+/// [`ensure_settings_version_triggers`] puts them back, and the names are how it looks for them.
+const SETTINGS_VERSION_TRIGGERS: [(&str, &str); 3] = [
+    (
+        "user_settings_version_insert",
+        "CREATE TRIGGER IF NOT EXISTS user_settings_version_insert
+         AFTER INSERT ON user_settings BEGIN
+             UPDATE settings_version SET version = version + 1 WHERE id = 1;
+             SELECT RAISE(ABORT, 'the settings version row is missing, so this settings write cannot publish a version other processes would see')
+               WHERE NOT EXISTS (SELECT 1 FROM settings_version WHERE id = 1);
+         END;",
+    ),
+    (
+        "user_settings_version_update",
+        "CREATE TRIGGER IF NOT EXISTS user_settings_version_update
+         AFTER UPDATE ON user_settings BEGIN
+             UPDATE settings_version SET version = version + 1 WHERE id = 1;
+             SELECT RAISE(ABORT, 'the settings version row is missing, so this settings write cannot publish a version other processes would see')
+               WHERE NOT EXISTS (SELECT 1 FROM settings_version WHERE id = 1);
+         END;",
+    ),
+    (
+        "user_settings_version_delete",
+        "CREATE TRIGGER IF NOT EXISTS user_settings_version_delete
+         AFTER DELETE ON user_settings BEGIN
+             UPDATE settings_version SET version = version + 1 WHERE id = 1;
+             SELECT RAISE(ABORT, 'the settings version row is missing, so this settings delete cannot publish a version other processes would see')
+               WHERE NOT EXISTS (SELECT 1 FROM settings_version WHERE id = 1);
+         END;",
+    ),
+];
+
+/// Install the version triggers, leaving the ones that are already there alone.
+fn install_settings_version_triggers(conn: &Connection) -> anyhow::Result<()> {
+    for (_, sql) in SETTINGS_VERSION_TRIGGERS {
+        conn.execute_batch(sql)?;
+    }
+    Ok(())
+}
+
+/// Put back any version trigger this database lost, and say which ones were missing.
+///
+/// The version only moves because these triggers fire, and nothing else notices if one is gone: the
+/// settings would keep working, and every other process would keep reading a version that never
+/// changes, which is the stale-permission window the cache exists to close (§32.9). So the
+/// database's own shape is checked — after migrations, and at every startup for a database that is
+/// already at the current step — and a missing trigger is recreated inside one transaction. If it
+/// cannot be recreated the error is returned: an initialiser that cannot guarantee the invariant
+/// refuses rather than opening a database whose writes are invisible to everyone else.
+pub fn ensure_settings_version_triggers(conn: &Connection) -> anyhow::Result<Vec<&'static str>> {
+    let mut installed = std::collections::HashSet::new();
+    {
+        let mut statement =
+            conn.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'")?;
+        let names = statement.query_map([], |row| row.get::<_, String>(0))?;
+        for name in names {
+            installed.insert(name?);
+        }
+    }
+    if SETTINGS_VERSION_TRIGGERS
+        .iter()
+        .all(|(name, _)| installed.contains(*name))
+    {
+        return Ok(Vec::new());
+    }
+
+    let transaction = conn.unchecked_transaction()?;
+    install_settings_version_triggers(&transaction)?;
+    transaction.commit()?;
+
+    Ok(SETTINGS_VERSION_TRIGGERS
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !installed.contains(*name))
+        .collect())
+}
+
 struct MigrationStep {
     version: i64,
     name: &'static str,
@@ -1299,6 +1420,12 @@ const MIGRATIONS: &[MigrationStep] = &[
         name: "one instance identity table",
         foreign_keys_off: true,
         run: migrate_v31,
+    },
+    MigrationStep {
+        version: 32,
+        name: "settings version",
+        foreign_keys_off: false,
+        run: migrate_v32,
     },
 ];
 
@@ -2800,6 +2927,21 @@ fn cross_namespace_orphans(conn: &Connection) -> anyhow::Result<Vec<String>> {
     Ok(out)
 }
 
+/// Read the settings version from the caller's database snapshot.
+///
+/// The number only means something together with the values read from the same snapshot, so
+/// callers that cache settings read both inside one transaction. A missing row is an error:
+/// it means the write that should have published a version did not, and guessing one would
+/// let a reader keep values the writer has already replaced.
+pub fn settings_version(conn: &Connection) -> anyhow::Result<i64> {
+    let version = conn.query_row(
+        "SELECT version FROM settings_version WHERE id = 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(version)
+}
+
 /// Read a JSON-encoded setting from user_settings.
 pub fn get_setting(conn: &Connection, key: &str) -> anyhow::Result<Option<serde_json::Value>> {
     let mut stmt = conn.prepare("SELECT value_json FROM user_settings WHERE key = ?1")?;
@@ -2832,14 +2974,25 @@ pub fn is_network_enabled(conn: &Connection, key: &str) -> bool {
     if is_lockdown_enabled(conn) {
         return false;
     }
-    match crate::settings_registry::read_bool(conn, key) {
-        Ok(Some(enabled)) => enabled,
-        Ok(None) => {
+    match get_setting(conn, key) {
+        Ok(raw) => switch_enabled(key, raw),
+        // Could not tell: that is not permission.
+        Err(_) => false,
+    }
+}
+
+/// Whether a declared network switch permits its request, from a value already read.
+///
+/// Shared by the readers that consult the database and by the settings cache (§32.9), so a
+/// cached answer and a freshly read one cannot disagree about what a stored value means. A key
+/// the registry does not declare as a boolean is a code bug: it is reported once and denied.
+pub fn switch_enabled(key: &str, raw: Option<serde_json::Value>) -> bool {
+    match crate::settings_registry::read_bool_from(key, raw) {
+        Some(enabled) => enabled,
+        None => {
             crate::settings_registry::report_undeclared_switch(key);
             false
         }
-        // Could not tell: that is not permission.
-        Err(_) => false,
     }
 }
 
@@ -2880,6 +3033,14 @@ pub fn lockdown_denies_network(conn: &Connection) -> crate::error::LauncherResul
             message: format!("Could not read the Lockdown Mode setting: {error}"),
         }
     })?;
+    lockdown_value_denies(raw)
+}
+
+/// Whether a read Lockdown Mode value forbids network access.
+///
+/// Shared by the per-request readers and by the settings cache (§32.9), so a cached answer and
+/// a freshly read one cannot disagree. A value that is present but not understood denies.
+pub fn lockdown_value_denies(raw: Option<serde_json::Value>) -> crate::error::LauncherResult<bool> {
     let Some(value) = raw else {
         return Ok(false);
     };
@@ -2907,6 +3068,10 @@ pub fn lockdown_denies_network(conn: &Connection) -> crate::error::LauncherResul
 }
 
 /// Upsert a JSON-encoded setting into user_settings.
+///
+/// The version bump is not written here: the triggers on `user_settings` add it inside this
+/// statement's own transaction, so a raw writer gets the same treatment and no writer can forget
+/// it. One statement is one commit, which is what another process's next check sees.
 pub fn set_setting(conn: &Connection, key: &str, value: &serde_json::Value) -> anyhow::Result<()> {
     let text = serde_json::to_string(value)?;
     conn.execute(

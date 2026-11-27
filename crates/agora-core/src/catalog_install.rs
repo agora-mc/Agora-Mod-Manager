@@ -452,6 +452,7 @@ pub async fn install(
     request: InstallRequest<'_>,
     announce: &mut dyn FnMut(&CatalogPlan),
 ) -> LauncherResult<InstallReport> {
+    crate::settings::admit_major_action(ctx)?;
     let manifest = game_instance::get_manifest(ctx, request.instance_id)
         .map_err(|e| generic("ERR_INSTANCE_NOT_FOUND", e))?;
     if request.item.game != manifest.game.as_str() {
@@ -737,6 +738,7 @@ pub fn import_manual_file(
     item: &GameCatalogItem,
     file: &Path,
 ) -> LauncherResult<(String, HashReport)> {
+    crate::settings::admit_major_action(ctx)?;
     let source = item
         .download_sources
         .iter()

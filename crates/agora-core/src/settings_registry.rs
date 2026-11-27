@@ -443,16 +443,34 @@ pub fn read(conn: &Connection, key: &str) -> LauncherResult<Option<Value>> {
 /// to the legacy raw read). A present-but-invalid value is read as the setting's
 /// fail direction.
 pub fn read_bool(conn: &Connection, key: &str) -> LauncherResult<Option<bool>> {
-    let Some(definition) = lookup(key) else {
-        return Ok(None);
-    };
-    if !matches!(definition.kind, SettingKind::Bool { .. }) {
+    if !is_declared_bool(key) {
         return Ok(None);
     }
     let raw = crate::db::get_setting(conn, key).map_err(storage_error)?;
+    Ok(read_bool_from(key, raw))
+}
+
+/// Whether the registry declares `key` as a boolean switch.
+pub fn is_declared_bool(key: &str) -> bool {
+    matches!(
+        lookup(key).map(|definition| definition.kind),
+        Some(SettingKind::Bool { .. })
+    )
+}
+
+/// Read a boolean switch from a value that has already been read.
+///
+/// The same interpretation for the database readers and for the settings cache (§32.9), so a
+/// cached answer cannot differ from a freshly read one. `Ok(None)` means the key is not a
+/// declared boolean; a present-but-invalid value reads as the setting's fail direction.
+pub fn read_bool_from(key: &str, raw: Option<Value>) -> Option<bool> {
+    let definition = lookup(key)?;
+    if !matches!(definition.kind, SettingKind::Bool { .. }) {
+        return None;
+    }
     match read_typed(definition, raw) {
-        Some(Value::Bool(value)) => Ok(Some(value)),
-        _ => Ok(None),
+        Some(Value::Bool(value)) => Some(value),
+        _ => None,
     }
 }
 

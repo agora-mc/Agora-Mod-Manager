@@ -484,6 +484,8 @@ pub fn apply_game_profile_with_undo(
     profile_name: &str,
     allow_while_running: bool,
 ) -> Result<(), LoadoutApplyError> {
+    crate::settings::admit_major_action(ctx)
+        .map_err(|error| LoadoutApplyError::Profile(error.to_string()))?;
     let dir = instance_dir(ctx, instance_id).map_err(LoadoutApplyError::Profile)?;
     let profile = loadout::read_profile(&dir, profile_name).map_err(LoadoutApplyError::Profile)?;
     let state = profile.game.ok_or_else(|| {

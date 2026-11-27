@@ -277,6 +277,7 @@ impl WorldService {
     /// Change the name the game shows. The folder keeps its name, so data
     /// pack choices and Quick Play shortcuts that point at it keep working.
     pub fn rename(&self, instance_id: &str, folder: &str, new_name: &str) -> LauncherResult<()> {
+        agora_core::settings::admit_major_action(&self.ctx)?;
         let new_name = new_name.trim();
         if new_name.is_empty() {
             return Err(error("ERR_WORLD_NAME", "A world needs a name."));
