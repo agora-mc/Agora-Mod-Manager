@@ -26,7 +26,7 @@ use crate::java::{self, JavaInstallation, JavaSource};
 use crate::runtime_catalog::{RuntimeCatalog, RuntimeCatalogEntry};
 use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::lock_manager::{LockManager, LockResource};
-use agora_core::network::{NetworkCategory, NetworkPolicy};
+use agora_core::network::{check_launch_request, NetworkCategory, NetworkPolicy};
 use agora_core::operation_manager::OpHandle;
 use agora_game_api::{ArchiveError, ArchiveLimits, NamePolicy, SafeArchive, Select};
 use chrono::{DateTime, Utc};
@@ -409,7 +409,7 @@ pub fn ensure_runtime(
     }
 
     // 3. Check network policy before any download.
-    network_policy.check(NetworkCategory::JavaRuntime)?;
+    check_launch_request(&network_policy, NetworkCategory::JavaRuntime)?;
     check_cancelled(progress, major, "ensure_runtime")?;
 
     // 4. Download (or reuse cached) archive — no recursion.

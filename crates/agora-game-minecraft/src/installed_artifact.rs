@@ -24,7 +24,7 @@
 
 use crate::installed_profile::{InstalledProfileReceipt, ProfileIssue};
 use agora_core::error::{LauncherError, LauncherResult};
-use agora_core::network::{NetworkCategory, NetworkPolicy};
+use agora_core::network::{check_launch_request, NetworkCategory, NetworkPolicy};
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::Sha256;
 use std::collections::BTreeMap;
@@ -739,7 +739,7 @@ pub fn adopt_asset_objects(
         }
 
         // Not in cache, not in installed source — check network policy
-        network_policy.check(NetworkCategory::MojangContent)?;
+        check_launch_request(&network_policy, NetworkCategory::MojangContent)?;
         // If network is allowed, we'd download. But in the adopted profile
         // materialize path, we may want to error instead since we expected
         // assets to already be installed.

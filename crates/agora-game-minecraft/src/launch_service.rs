@@ -12,7 +12,7 @@ use agora_core::instance_runtime;
 use agora_core::lkg::{classify_launch, LaunchEvents, LaunchOutcome};
 use agora_core::lock_manager::{LockGuard, LockResource};
 use agora_core::models::InstanceManifest;
-use agora_core::network::NetworkPolicy;
+use agora_core::network::{check_launch_request, NetworkPolicy};
 use agora_core::process_identity::{self, ProcessIdentity};
 use agora_core::process_session_manager::ProcessSession;
 use agora_core::snapshot::create_snapshot_scoped;
@@ -344,7 +344,7 @@ impl LaunchService {
             LaunchRecoveryAction::ProvisionJava { major } => {
                 progress.phase("recovery", "Provisioning the required Java runtime");
                 let policy = agora_core::network::NetworkPolicy::from_ctx(&self.ctx)?;
-                policy.check(agora_core::network::NetworkCategory::JavaRuntime)?;
+                check_launch_request(&policy, agora_core::network::NetworkCategory::JavaRuntime)?;
                 let runtimes_root = self.ctx.paths.java_runtimes_root();
                 provision_java_reporting(&self.ctx, runtimes_root, major, policy, progress).await?;
             }

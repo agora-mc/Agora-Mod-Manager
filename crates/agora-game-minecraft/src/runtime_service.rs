@@ -3,7 +3,7 @@ use crate::runtime_catalog::RuntimeCatalog;
 use crate::runtime_manager::{self, RuntimeProgress};
 use agora_core::ctx::Ctx;
 use agora_core::error::{LauncherError, LauncherResult};
-use agora_core::network::{NetworkCategory, NetworkPolicy};
+use agora_core::network::{check_launch_request, NetworkCategory, NetworkPolicy};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -56,7 +56,7 @@ impl RuntimeService {
             });
         }
 
-        policy.check(NetworkCategory::JavaRuntime)?;
+        check_launch_request(&policy, NetworkCategory::JavaRuntime)?;
 
         let runtimes_root = self.ctx.paths.java_runtimes_root();
         let catalog = self.effective_catalog();

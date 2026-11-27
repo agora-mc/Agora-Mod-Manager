@@ -131,6 +131,40 @@ impl NetworkPolicy {
     }
 }
 
+impl NetworkCategory {
+    /// The client category this launch category is governed by.
+    ///
+    /// The launch planner names five categories and the request gate names the endpoints they
+    /// reach; this is the one place the two vocabularies meet, so a lockout on either side lands
+    /// on the same switch.
+    pub fn client_category(self) -> crate::http_client::ClientCategory {
+        match self {
+            NetworkCategory::MicrosoftAuthentication => {
+                crate::http_client::ClientCategory::Microsoft
+            }
+            NetworkCategory::MojangMetadata => crate::http_client::ClientCategory::MojangMetadata,
+            NetworkCategory::MojangContent => crate::http_client::ClientCategory::MojangContent,
+            NetworkCategory::LoaderMetadataAndContent => crate::http_client::ClientCategory::Loader,
+            NetworkCategory::JavaRuntime => crate::http_client::ClientCategory::JavaRuntime,
+        }
+    }
+}
+
+/// Check one launch-time request: the plan's policy, then the live gate (MASTER_SPEC §32.9).
+///
+/// The plan carries the policy the settings said when the launch started, which is right for the
+/// things a launch decides up front (a disabled category is a plan that says so). It is wrong for
+/// anything that changed since: Lockdown turned on during a download, a switch the user flipped
+/// while the game was starting. So the gate — which reads the version through the context's cache
+/// before every request — gets the last word.
+pub fn check_launch_request(
+    policy: &NetworkPolicy,
+    category: NetworkCategory,
+) -> LauncherResult<()> {
+    policy.check(category)?;
+    crate::network_gate::authorize(category.client_category())
+}
+
 fn category_bit(category: NetworkCategory) -> u8 {
     match category {
         NetworkCategory::MicrosoftAuthentication => BIT_MSA,

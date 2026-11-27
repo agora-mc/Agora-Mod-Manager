@@ -33,7 +33,7 @@ use crate::launch::{self, LoaderInfo, VersionInfo};
 use crate::loader_manifests;
 use agora_core::download;
 use agora_core::error::{LauncherError, LauncherResult};
-use agora_core::network::{self, NetworkCategory, NetworkPolicy};
+use agora_core::network::{self, check_launch_request, NetworkCategory, NetworkPolicy};
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -106,6 +106,12 @@ impl LaunchHttpClients {
                 // original URL plus each followed redirect).
                 if attempt.previous().len() > MAX_REDIRECTS {
                     return attempt.stop();
+                }
+                // A redirect is a new request, so it asks the live gate again (MASTER_SPEC §32.9);
+                // Lockdown turned on during a download stops the hop even though the first request
+                // was allowed. The refusal travels out through the request's own error.
+                if let Err(denial) = agora_core::network_gate::authorize(category.client_category()) {
+                    return attempt.error(denial);
                 }
                 if redirect_target_is_safe(attempt.url(), category) {
                     attempt.follow()
@@ -1476,7 +1482,7 @@ async fn materialize_adopted_profile(
                         // curated pin can cover either a loader-hosted library
                         // or an ordinary Mojang library, so route through the
                         // category established by the artifact URL.
-                        policy.check(lib_category)?;
+                        check_launch_request(&policy, lib_category)?;
                         let bytes = download_verified_inner(
                             clients.for_category(lib_category),
                             &artifact.url,
@@ -3021,12 +3027,12 @@ async fn download_sha1_atomic(
         }
     }
     // Cache miss: check policy before opening a socket.
-    policy.check(category)?;
+    check_launch_request(policy, category)?;
     let response = client
         .get(url)
         .send()
         .await
-        .map_err(agora_core::http_client::transport_failure_from)?;
+        .map_err(agora_core::http_client::request_error)?;
     agora_core::connectivity::record_reachable();
     if !response.status().is_success() {
         return Err(LauncherError::Generic {
@@ -3040,7 +3046,7 @@ async fn download_sha1_atomic(
     let bytes = response
         .bytes()
         .await
-        .map_err(agora_core::http_client::transport_failure_from)?
+        .map_err(agora_core::http_client::request_error)?
         .to_vec();
     if !artifact_matches(&bytes, Some(&resolved_sha1), expected_size) {
         return Err(LauncherError::HashMismatch);
@@ -3086,12 +3092,12 @@ async fn resolve_sidecar_sha1(
     let sidecar_url = format!("{artifact_url}.sha1");
     ensure_artifact_url_for_category(&sidecar_url, category)?;
     // Cache miss: check policy before fetching the sidecar.
-    policy.check(category)?;
+    check_launch_request(policy, category)?;
     let response = client
         .get(&sidecar_url)
         .send()
         .await
-        .map_err(agora_core::http_client::transport_failure_from)?;
+        .map_err(agora_core::http_client::request_error)?;
     agora_core::connectivity::record_reachable();
     let final_url = response.url().as_str();
     ensure_artifact_url_for_category(final_url, category)?;
@@ -3107,7 +3113,7 @@ async fn resolve_sidecar_sha1(
     let text = response
         .text()
         .await
-        .map_err(agora_core::http_client::transport_failure_from)?;
+        .map_err(agora_core::http_client::request_error)?;
     let hash = parse_sha1_sidecar(&text).ok_or_else(|| LauncherError::Generic {
         code: "ERR_ARTIFACT_HASH_INVALID".into(),
         message: format!("Artifact SHA-1 sidecar is invalid: {sidecar_url}"),
@@ -4053,7 +4059,7 @@ pub(crate) async fn load_json_cache_first<T: serde::de::DeserializeOwned>(
     // Phase 2: Check policy. If the category is disabled, return the stale
     // cache (if valid) rather than a policy error. This enables offline
     // launches from a stale-but-valid manifest.
-    if let Err(policy_err) = policy.check(category) {
+    if let Err(policy_err) = check_launch_request(policy, category) {
         if let Some(parsed) = stale_parsed {
             return Ok(parsed);
         }
@@ -4245,7 +4251,7 @@ async fn download_library_with_pin(
                 return Ok(());
             }
         }
-        policy.check(lib_category)?;
+        check_launch_request(&policy, lib_category)?;
         let bytes = download_verified_inner(client, &artifact.url, lib_category).await?;
         if download::sha256_hex(&bytes) != sha256.as_str() {
             return Err(LauncherError::HashMismatch);
@@ -4275,7 +4281,7 @@ async fn download_library_with_pin(
     if observed_cache_matches(path, artifact.size) {
         return Ok(());
     }
-    policy.check(lib_category)?;
+    check_launch_request(&policy, lib_category)?;
     let bytes = download_verified_inner(client, &artifact.url, lib_category).await?;
     let observed = download::sha256_hex(&bytes);
     atomic_write(path, &bytes)?;
@@ -4332,7 +4338,7 @@ async fn download_verified_inner(
         .get(url)
         .send()
         .await
-        .map_err(agora_core::http_client::transport_failure_from)?;
+        .map_err(agora_core::http_client::request_error)?;
     agora_core::connectivity::record_reachable();
     // Defense-in-depth: verify the final response URL is category-safe.
     let final_url = response.url().as_str();
@@ -4347,7 +4353,7 @@ async fn download_verified_inner(
         .bytes()
         .await
         .map(|b| b.to_vec())
-        .map_err(agora_core::http_client::transport_failure_from)
+        .map_err(agora_core::http_client::request_error)
 }
 
 #[cfg(test)]

@@ -1112,6 +1112,30 @@ pub fn transport_failure_from(error: reqwest::Error) -> LauncherError {
     transport_failure()
 }
 
+/// The refusal a failed request carries when the gate refused one of its redirect hops.
+///
+/// A redirect policy that answers a hop with `attempt.error(..)` has nothing but `reqwest`'s error
+/// to hand back, and the caller must not read a denied hop as a network hiccup: it is a decision.
+/// So the error is found in the source chain and returned as the refusal it was.
+pub fn denial_from_request_error(error: &reqwest::Error) -> Option<LauncherError> {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if let Some(denial) = current.downcast_ref::<LauncherError>() {
+            return Some(denial.clone());
+        }
+        source = current.source();
+    }
+    None
+}
+
+/// Map one request's failure: a refused redirect hop keeps its refusal, anything else is transport.
+pub fn request_error(error: reqwest::Error) -> LauncherError {
+    match denial_from_request_error(&error) {
+        Some(denial) => denial,
+        None => transport_failure_from(error),
+    }
+}
+
 fn describe_transport_error(error: reqwest::Error) -> String {
     let kind = if error.is_timeout() {
         "timed out"

@@ -8,7 +8,7 @@ use crate::launch::{MojangVersionManifest, MojangVersionRef, VersionInfo};
 use crate::launch_planner;
 use crate::launch_planner::LaunchHttpClients;
 use agora_core::error::{LauncherError, LauncherResult};
-use agora_core::network::{NetworkCategory, NetworkPolicy};
+use agora_core::network::{check_launch_request, NetworkCategory, NetworkPolicy};
 use std::path::Path;
 
 const VERSION_MANIFEST_URL: &str =
@@ -56,7 +56,7 @@ pub async fn ensure_base_version_metadata(
     }
 
     // 2. Check network policy before any outward request.
-    policy.check(NetworkCategory::MojangMetadata)?;
+    check_launch_request(policy, NetworkCategory::MojangMetadata)?;
 
     // 3. Build redirect-safe HTTP clients (reuses planner's policy).
     let clients = LaunchHttpClients::new()?;
@@ -112,7 +112,7 @@ pub async fn list_snapshot_versions(
     minecraft_root: &Path,
     policy: &NetworkPolicy,
 ) -> LauncherResult<Vec<String>> {
-    policy.check(NetworkCategory::MojangMetadata)?;
+    check_launch_request(policy, NetworkCategory::MojangMetadata)?;
     let clients = LaunchHttpClients::new()?;
     let manifest: MojangVersionManifest = launch_planner::load_json_cache_first(
         clients.for_category(NetworkCategory::MojangMetadata),
