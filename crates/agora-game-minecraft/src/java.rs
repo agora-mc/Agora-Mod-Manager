@@ -26,15 +26,15 @@ use std::path::{Path, PathBuf};
 // Test injection point for inspect_java
 // ---------------------------------------------------------------------------
 
-// Thread-local mock so parallel tests do not interfere with each other.
+// One mock for the process, not one per thread: provisioning runs on a blocking
+// worker, so a thread-local mock set by the test would not be seen by the code
+// under test. Isolation comes from the test runner instead — nextest gives each
+// test its own process.
 #[cfg(test)]
 type MockInspectFn = Option<fn(&Path) -> Option<JavaInstallation>>;
 
 #[cfg(test)]
-thread_local! {
-    static MOCK_INSPECT: std::cell::RefCell<MockInspectFn> =
-        const { std::cell::RefCell::new(None) };
-}
+static MOCK_INSPECT: std::sync::Mutex<MockInspectFn> = std::sync::Mutex::new(None);
 
 /// RAII guard that restores the previous mock on drop.
 #[cfg(test)]
@@ -44,22 +44,32 @@ pub struct MockInspectGuard(Option<fn(&Path) -> Option<JavaInstallation>>);
 impl Drop for MockInspectGuard {
     fn drop(&mut self) {
         let prev = self.0.take();
-        MOCK_INSPECT.with(|cell| {
-            cell.replace(prev);
-        });
+        if let Ok(mut slot) = MOCK_INSPECT.lock() {
+            *slot = prev;
+        }
     }
 }
 
 /// Set a mock for `inspect_java` (test-only).
 ///
-/// Returns a [`MockInspectGuard`] that restores the previous mock when
-/// dropped. Uses a thread-local so parallel tests are isolated.
+/// Returns a [`MockInspectGuard`] that restores the previous mock when dropped. The mock is
+/// process-wide because provisioning runs on a blocking worker, where a thread-local mock set by
+/// the test would not be seen; run these tests with nextest, which gives each test its own process.
 #[cfg(test)]
 pub fn set_mock_inspect(f: Option<fn(&Path) -> Option<JavaInstallation>>) -> MockInspectGuard {
-    MOCK_INSPECT.with(|cell| {
-        let prev = cell.replace(f);
-        MockInspectGuard(prev)
-    })
+    match MOCK_INSPECT.lock() {
+        Ok(mut slot) => {
+            let prev = slot.take();
+            *slot = f;
+            MockInspectGuard(prev)
+        }
+        Err(poisoned) => {
+            let mut slot = poisoned.into_inner();
+            let prev = slot.take();
+            *slot = f;
+            MockInspectGuard(prev)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -132,11 +142,11 @@ const INSPECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub fn inspect_java(path: &Path) -> Option<JavaInstallation> {
     #[cfg(test)]
     {
-        let result = MOCK_INSPECT.with(|cell| {
-            let guard = cell.borrow();
-            guard.as_ref().map(|f| f(path))
-        });
-        if let Some(Some(inst)) = result {
+        let mocked = match MOCK_INSPECT.lock() {
+            Ok(slot) => *slot,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+        if let Some(Some(inst)) = mocked.map(|f| f(path)) {
             return Some(inst);
         }
     }

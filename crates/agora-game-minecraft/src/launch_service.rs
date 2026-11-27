@@ -343,8 +343,11 @@ impl LaunchService {
             LaunchRecoveryAction::None => {}
             LaunchRecoveryAction::ProvisionJava { major } => {
                 progress.phase("recovery", "Provisioning the required Java runtime");
+                // The policy goes to `runtime_manager::ensure_runtime`, which checks it before a
+                // download, and the live gate is asked by each request the download makes. A
+                // runtime that is already installed needs neither, so recovery must not refuse
+                // it here.
                 let policy = agora_core::network::NetworkPolicy::from_ctx(&self.ctx)?;
-                check_launch_request(&policy, agora_core::network::NetworkCategory::JavaRuntime)?;
                 let runtimes_root = self.ctx.paths.java_runtimes_root();
                 provision_java_reporting(&self.ctx, runtimes_root, major, policy, progress).await?;
             }
