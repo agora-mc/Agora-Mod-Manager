@@ -7,8 +7,11 @@
 use crate::launch::{MojangVersionManifest, MojangVersionRef, VersionInfo};
 use crate::launch_planner;
 use crate::launch_planner::LaunchHttpClients;
-use agora_core::error::{LauncherError, LauncherResult};
-use agora_core::network::{check_launch_request_with, NetworkCategory, NetworkPolicy};
+use agora_core::{
+    error::{LauncherError, LauncherResult},
+    network::{check_launch_request_with, NetworkCategory, NetworkPolicy},
+    network_gate::NetworkGate,
+};
 use std::path::Path;
 
 const VERSION_MANIFEST_URL: &str =
@@ -29,7 +32,7 @@ pub async fn ensure_base_version_metadata(
     minecraft_root: &Path,
     version_id: &str,
     policy: &NetworkPolicy,
-    gate: &dyn agora_core::network_gate::NetworkGate,
+    gate: &dyn NetworkGate,
 ) -> LauncherResult<VersionInfo> {
     if version_id.is_empty()
         || version_id.contains('/')
@@ -113,7 +116,7 @@ pub async fn ensure_base_version_metadata(
 pub async fn list_snapshot_versions(
     minecraft_root: &Path,
     policy: &NetworkPolicy,
-    gate: &dyn agora_core::network_gate::NetworkGate,
+    gate: &dyn NetworkGate,
 ) -> LauncherResult<Vec<String>> {
     check_launch_request_with(gate, policy, NetworkCategory::MojangMetadata)?;
     let clients = LaunchHttpClients::new()?;
