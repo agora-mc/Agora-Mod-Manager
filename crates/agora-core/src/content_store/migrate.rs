@@ -160,8 +160,49 @@ pub fn legacy_store_active(paths: &AppPaths) -> bool {
     legacy_store_state(paths) != LegacyStoreState::Retired
 }
 
+/// What the migration journal says, read without taking a lock and without writing anything, so a
+/// read-only report (`agora doctor`) can say what a start would make of it.
+#[derive(Debug)]
+pub(crate) enum JournalStatus {
+    /// No migration was started here: nothing to finish, and nothing to report.
+    Absent,
+    /// A run is in progress, or was cut short. The next start finishes it.
+    Running,
+    /// The migration finished. The journal is its record, not work recovery has left to do.
+    Done,
+    /// A journal is there but cannot be acted on, with the reason.
+    Unusable(String),
+}
+
 pub fn migrate_snapshot_objects(ctx: &Ctx) -> LauncherResult<MigrationOutcome> {
     run(ctx, false)
+}
+
+/// The finished migration's own record, read from its journal without writing anything.
+///
+/// `None` when there is no finished record: no journal, one still running, or one that cannot be
+/// read. A command that has just been told there is nothing to do asks this to report what the
+/// migration that did run moved, instead of saying nothing happened at all.
+pub fn migration_status(paths: &AppPaths) -> Option<MigrationReport> {
+    match read_journal(&legacy_root(paths), &journal_path(paths)) {
+        JournalRead::Valid(journal) if journal.envelope().state == State::Done => journal
+            .payload::<MigrationJournal>()
+            .ok()
+            .map(|journal| journal.report),
+        _ => None,
+    }
+}
+
+/// [`JournalStatus`] for `paths`: the journal's state, or why it cannot be read.
+pub(crate) fn journal_status(paths: &AppPaths) -> JournalStatus {
+    match read_journal(&legacy_root(paths), &journal_path(paths)) {
+        JournalRead::Absent => JournalStatus::Absent,
+        JournalRead::Unusable(problem) => JournalStatus::Unusable(problem.to_string()),
+        JournalRead::Valid(journal) => match journal.envelope().state {
+            State::Running => JournalStatus::Running,
+            State::Done => JournalStatus::Done,
+        },
+    }
 }
 
 /// Archive an unusable journal and start from the legacy files still on disk.

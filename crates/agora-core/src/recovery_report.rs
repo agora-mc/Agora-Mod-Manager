@@ -69,6 +69,8 @@ pub enum JournalKind {
     DatabaseRecovery,
     /// A delete or a restore into, or out of, Recently deleted.
     RecentlyDeleted,
+    /// Moving the pre-B3a `snapshot-objects` store into the content store.
+    SnapshotObjectMigration,
 }
 
 impl JournalKind {
@@ -81,6 +83,7 @@ impl JournalKind {
             JournalKind::UserFiles => "user-files",
             JournalKind::DatabaseRecovery => "database-recovery",
             JournalKind::RecentlyDeleted => "recently-deleted",
+            JournalKind::SnapshotObjectMigration => "snapshot-object-migration",
         }
     }
 }
@@ -167,6 +170,7 @@ pub fn report_with(paths: &AppPaths, view: &dyn ProcessView) -> RecoveryReport {
     );
     file_journals(paths, &mut report);
     recently_deleted(paths, &mut report);
+    snapshot_object_migration(paths, &mut report);
     report
 }
 
@@ -680,6 +684,56 @@ fn read_children(dir: PathBuf, suffix: Option<&str>) -> std::result::Result<Vec<
     }
     found.sort();
     Ok(found)
+}
+
+// ---------------------------------------------------------------------------
+// The snapshot object migration
+// ---------------------------------------------------------------------------
+
+/// The pre-B3a snapshot-object migration's journal (MASTER_SPEC §32.8).
+///
+/// Two states are a person's business: a run that is going, or was cut short, which the next start
+/// finishes; and a journal that cannot be read, which no start will act on and which
+/// `agora games content migrate --restart` resolves. A finished record is not listed: it is the
+/// migration's receipt, not work recovery has left to do. Nothing here takes a lock or writes: the
+/// journal is read as the file it is, so a report can say what a start would do without doing it.
+fn snapshot_object_migration(paths: &AppPaths, report: &mut RecoveryReport) {
+    use crate::content_store::migrate::{journal_path, journal_status, JournalStatus};
+
+    let path = journal_path(paths);
+    let (state, outcome, reason, command) = match journal_status(paths) {
+        JournalStatus::Absent | JournalStatus::Done => return,
+        JournalStatus::Running => (
+            Some("running".to_string()),
+            RecoveryOutcome::WouldFinish,
+            "A start finishes moving the old snapshot objects into the content store, re-hashing \
+             each one. A file whose bytes do not match its name is kept and named, never deleted, \
+             and nothing leaves the old store before a verified copy is in the new one."
+                .to_string(),
+            "agora games content migrate".to_string(),
+        ),
+        JournalStatus::Unusable(problem) => (
+            None,
+            RecoveryOutcome::NeedsHand,
+            format!(
+                "The migration journal cannot be acted on ({problem}), so a start moves nothing \
+                 and the old store stays as it is. `agora games content migrate --restart` sets \
+                 the journal aside and walks the old store again; nothing is deleted that is not \
+                 already in the content store."
+            ),
+            "agora games content migrate --restart".to_string(),
+        ),
+    };
+    report.entries.push(JournalEntry {
+        kind: JournalKind::SnapshotObjectMigration,
+        // The legacy store the journal covers: the app's own fixed `snapshot-objects` folder.
+        resource: "snapshot-objects".to_string(),
+        path: path.display().to_string(),
+        state,
+        outcome,
+        reason,
+        command: Some(command),
+    });
 }
 
 // ---------------------------------------------------------------------------
