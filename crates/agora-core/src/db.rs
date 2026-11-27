@@ -2942,25 +2942,6 @@ pub fn settings_version(conn: &Connection) -> anyhow::Result<i64> {
     Ok(version)
 }
 
-/// Publish a settings write: bump the version in the caller's transaction.
-///
-/// Kept for the rare caller that rewrites settings wholesale without going through
-/// [`set_setting`]; the ordinary path does not need it, because the triggers on `user_settings`
-/// bump the version themselves.
-pub fn bump_settings_version(conn: &Connection) -> anyhow::Result<()> {
-    let bumped = conn.execute(
-        "UPDATE settings_version SET version = version + 1 WHERE id = 1",
-        [],
-    )?;
-    if bumped != 1 {
-        anyhow::bail!(
-            "the settings version row is missing, so this settings write cannot publish a \
-             version other processes would see"
-        );
-    }
-    Ok(())
-}
-
 /// Read a JSON-encoded setting from user_settings.
 pub fn get_setting(conn: &Connection, key: &str) -> anyhow::Result<Option<serde_json::Value>> {
     let mut stmt = conn.prepare("SELECT value_json FROM user_settings WHERE key = ?1")?;
