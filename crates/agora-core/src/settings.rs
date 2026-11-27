@@ -51,6 +51,11 @@ impl SettingsReads {
 /// it was read, which is why the gate asks for a fresh one before every request.
 pub struct SettingsSnapshot {
     version: i64,
+    /// When the values were read: the backstop period counts from here, so a warm check cannot
+    /// postpone the reload that catches a write nobody versioned.
+    loaded_at: SystemTime,
+    /// When this snapshot was last checked: a clock that is now earlier than this has moved
+    /// backwards, and the time it has been trusted is unknown.
     checked_at: SystemTime,
     values: HashMap<String, serde_json::Value>,
 }
@@ -121,11 +126,17 @@ impl SettingsCache {
 
     /// The settings as of now, reading the version and reloading only when they changed.
     pub fn load(&self, reads: &SettingsReads) -> LauncherResult<Arc<SettingsSnapshot>> {
-        // A poisoned lock means a refresh panicked mid-read. The values it left are not a
-        // snapshot anybody verified, so they are dropped rather than trusted.
+        // A poisoned lock means a refresh panicked mid-read, with the values it was building and
+        // a connection whose transaction nobody finished. Neither is a snapshot anyone verified,
+        // so both are dropped: the next check opens the database again and reads it fresh.
         let mut state = match self.state.lock() {
             Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                state.snapshot = None;
+                state.connection = None;
+                state
+            }
         };
         let period = reads
             .seams
@@ -133,12 +144,18 @@ impl SettingsCache {
             .unwrap_or(SETTINGS_REFRESH_PERIOD);
         let now = reads.clock.now();
         let expired = state.snapshot.as_ref().is_none_or(|snapshot| {
-            match now.duration_since(snapshot.checked_at) {
+            // The backstop period counts from the last *load*: a request every few seconds must
+            // not keep postponing the reload that catches a change nobody versioned.
+            let period_passed = match now.duration_since(snapshot.loaded_at) {
                 Ok(elapsed) => elapsed >= period,
-                // The clock moved backwards, so no elapsed time can be established. That is
-                // not evidence the period has not passed.
+                // The clock moved backwards, so no elapsed time can be established. That is not
+                // evidence the period has not passed.
                 Err(_) => true,
-            }
+            };
+            // And a clock that moved backwards since the last *check* means the time this
+            // snapshot has been trusted is unknown, so it is not trusted further.
+            let clock_moved_backwards = now < snapshot.checked_at;
+            period_passed || clock_moved_backwards
         });
         if expired {
             state.connection = None;
@@ -193,7 +210,16 @@ fn read_settings(
         .filter(|snapshot| snapshot.version == version && !expired)
         .cloned();
     let snapshot = match cached {
-        Some(snapshot) => snapshot,
+        Some(snapshot) => {
+            // The version still matches and nothing expired, so the values stand. The check is
+            // recorded for the backwards-clock rule, but the period keeps running from the load.
+            Arc::new(SettingsSnapshot {
+                version: snapshot.version,
+                loaded_at: snapshot.loaded_at,
+                checked_at: now,
+                values: snapshot.values.clone(),
+            })
+        }
         None => {
             reads
                 .seams
@@ -208,6 +234,7 @@ fn read_settings(
             })?;
             Arc::new(SettingsSnapshot {
                 version,
+                loaded_at: now,
                 checked_at: now,
                 values,
             })
@@ -402,15 +429,20 @@ fn parse_bool_value(value: serde_json::Value) -> bool {
 // ---------------------------------------------------------------------------
 
 /// List all settings as (key, raw_JSON_string) pairs.
+///
+/// A row SQLite cannot hand back as text (a value stored with another type, a damaged page)
+/// fails the whole read rather than being skipped: a setting nobody can read is not a setting
+/// that is absent, and the callers of this function decide permissions from it.
 pub fn list(conn: &Connection) -> anyhow::Result<Vec<(String, String)>> {
     let mut stmt = conn.prepare("SELECT key, value_json FROM user_settings ORDER BY key")?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(rows)
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 /// List all settings as (key, parsed_JSON_value) pairs.
