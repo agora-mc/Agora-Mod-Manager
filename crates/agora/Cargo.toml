@@ -39,6 +39,7 @@ agora-game-minecraft = { path = "../agora-game-minecraft", features = ["test-sup
 # Test helper only: the Skyrim definition ships as an official plugin.
 agora-game-creation = { path = "../agora-game-creation" }
 rusqlite = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 
 # Builds the .mrpack fixtures for the `pack update` tests. Already in the lock

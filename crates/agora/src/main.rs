@@ -1371,6 +1371,20 @@ enum ContentCmd {
         #[arg(long)]
         ignore_unreadable_snapshots: bool,
     },
+    /// Move the old `snapshot-objects` store into the content store, re-hashing every object.
+    Migrate {
+        /// Set a migration journal that cannot be read aside and walk the old store again.
+        #[arg(long)]
+        restart: bool,
+    },
+    /// Free every stored object that no record names any more: one collection over both object
+    /// stores, printing what it reclaimed, or that nothing was reclaimed and why.
+    Gc {
+        /// Free objects even while a snapshot manifest cannot be read. Each ignored snapshot is
+        /// named on stderr, and it may no longer restore the files it holds.
+        #[arg(long)]
+        ignore_unreadable_snapshots: bool,
+    },
     /// Show or change whether instances share mod files, and optionally convert existing ones.
     Share {
         /// Share file bytes between instances as hard links (saves space, files cannot be edited).
@@ -8566,6 +8580,34 @@ async fn run_command(
                         }
                     }
                 }
+                ContentCmd::Gc {
+                    ignore_unreadable_snapshots,
+                } => {
+                    let report = agora_core::content_store::collect::request_collection(
+                        ctx,
+                        ignore_unreadable_snapshots,
+                    );
+                    // The collection's report goes back to the caller (MASTER_SPEC §32.8): one
+                    // line saying what it reclaimed, or that it reclaimed nothing and why.
+                    let collection = report.outcome();
+                    if json {
+                        let out = serde_json::json!({
+                            "status": "collected",
+                            "collection": collection,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                    } else {
+                        println!("Content store: {}.", collection.summary);
+                    }
+                    // A snapshot the person told this collection to ignore is named with the risk
+                    // it carries: the objects kept for it may be a restore's only copy.
+                    for failure in &report.failures {
+                        eprintln!("{failure}");
+                    }
+                }
+                ContentCmd::Migrate { restart } => {
+                    run_content_migrate(ctx, paths, json, restart)?;
+                }
                 ContentCmd::Share {
                     on,
                     off,
@@ -14978,6 +15020,148 @@ fn print_base_problems(problems: &[agora_core::game_base::BaseProblem]) {
         eprintln!(
             "Warning: a file hardlinked to the store install changed, so the store install changed with it. Until Agora's write layer exists, declare files the game writes in its definition, or use a Copied base. A store's verify/repair restores the original."
         );
+    }
+}
+
+/// `agora games content migrate`: the old `snapshot-objects` store into the content store.
+///
+/// Per outcome (MASTER_SPEC §32.8 "Migration", §32.11 "every needs-a-hand result has a way out"):
+/// a finished move reports what it moved and every file it kept; `--restart`, named as the way out,
+/// sets a journal nobody can read aside and walks the store again; a busy content store is exit
+/// `11`, and a journal that needs a hand is exit `72` and names that command.
+fn run_content_migrate(
+    ctx: &agora_core::ctx::Ctx,
+    paths: &agora_core::app_paths::AppPaths,
+    json: bool,
+    restart: bool,
+) -> anyhow::Result<()> {
+    use agora_core::content_store::migrate::{
+        migrate_snapshot_objects, migration_status, restart_snapshot_object_migration,
+        MigrationOutcome, MigrationReport,
+    };
+    /// The code docs/CLI.md gives "dependency, decision, or migration failure".
+    fn needs_a_hand_code() -> i32 {
+        agora_core::error_code::ErrorCode::MigrationFailed.exit_code()
+    }
+    /// The code a busy resource already uses: ask again when the other Agora has finished.
+    fn busy_code() -> i32 {
+        agora_core::error_code::ErrorCode::InstanceLocked.exit_code()
+    }
+    fn print_report(report: &MigrationReport, json: bool, fresh: bool) -> anyhow::Result<()> {
+        if json {
+            let out = serde_json::json!({
+                "status": "done",
+                "moved": report.moved,
+                "already_present": report.already_present,
+                "replaced_damaged": report.replaced_damaged,
+                "mismatched": report
+                    .mismatched
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>(),
+                "left_alone": report
+                    .left_alone
+                    .iter()
+                    .map(|(path, reason)| serde_json::json!({
+                        "path": path.display().to_string(),
+                        "reason": reason,
+                    }))
+                    .collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            return Ok(());
+        }
+        if fresh {
+            println!(
+                "Moved {} snapshot object(s) into the content store: {} were already there and {} \
+                 damaged copy(ies) were replaced.",
+                report.moved, report.already_present, report.replaced_damaged
+            );
+        } else {
+            println!(
+                "The snapshot object migration already finished: {} moved, {} already there and \
+                 {} damaged copy(ies) replaced.",
+                report.moved, report.already_present, report.replaced_damaged
+            );
+        }
+        // Kept files are the report's other half: a mismatch is a file this build will not guess
+        // about, and a person may want it back under its right name.
+        for path in &report.mismatched {
+            println!(
+                "Kept {} because its SHA-256 does not match its name.",
+                path.display()
+            );
+        }
+        for (path, reason) in &report.left_alone {
+            println!("Kept {} ({reason}).", path.display());
+        }
+        Ok(())
+    }
+
+    let outcome = if restart {
+        restart_snapshot_object_migration(ctx)
+    } else {
+        migrate_snapshot_objects(ctx)
+    };
+    match outcome {
+        Ok(MigrationOutcome::Done(report)) => print_report(&report, json, true),
+        // Nothing to move now: either the migration already ran and left its record, or there was
+        // never an old store here. The record is the honest answer to "what did it move?".
+        Ok(MigrationOutcome::NothingToDo) => match migration_status(paths) {
+            Some(report) => print_report(&report, json, false),
+            None => {
+                if json {
+                    let out = serde_json::json!({ "status": "nothing_to_do" });
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                } else {
+                    println!("Nothing to move: no old snapshot store is left.");
+                }
+                Ok(())
+            }
+        },
+        Ok(MigrationOutcome::Busy) => {
+            if json {
+                let out = serde_json::json!({ "status": "busy" });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            }
+            eprintln!(
+                "Another Agora process holds the content store, so nothing was moved. Run this \
+                 again when it has finished."
+            );
+            std::process::exit(busy_code())
+        }
+        Ok(MigrationOutcome::NeedsHand(reason)) => {
+            let command = "agora games content migrate --restart";
+            if json {
+                let out = serde_json::json!({
+                    "status": "needs_hand",
+                    "reason": reason,
+                    "command": command,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                println!("The snapshot object migration needs a hand: {reason}");
+                println!(
+                    "`{command}` sets that journal aside and walks the old store again. It deletes \
+                     nothing that is not already in the content store; a file whose bytes match no \
+                     name of its own is kept and named."
+                );
+            }
+            std::process::exit(needs_a_hand_code())
+        }
+        Err(error) => {
+            let code = exit_code_from_launcher_error(&error);
+            if json {
+                let out = serde_json::json!({
+                    "error": error.to_string(),
+                    "exitCode": code,
+                });
+                eprintln!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                eprintln!("Error: {error}");
+            }
+            std::process::exit(code)
+        }
     }
 }
 

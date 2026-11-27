@@ -162,12 +162,14 @@ fn gc_keeps_a_new_object_and_says_why() {
     let parsed = json_of(&output);
     assert_eq!(parsed["collection"]["reclaimed"], 0, "{parsed}");
     assert!(fresh.exists(), "an object inside the grace period is kept");
+    // The sentence names the rule, not a duration: the collector's grace is a context seam, so a
+    // summary that hardcoded "an hour" would be wrong for a round that runs with another one.
     assert!(
         parsed["collection"]["summary"]
             .as_str()
             .unwrap_or_default()
             .to_lowercase()
-            .contains("hour"),
+            .contains("grace period"),
         "the summary says why nothing was reclaimed: {parsed}"
     );
 }
