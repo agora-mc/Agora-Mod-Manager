@@ -1,9 +1,12 @@
 use crate::java::{self, JavaInstallation};
 use crate::runtime_catalog::RuntimeCatalog;
 use crate::runtime_manager::{self, RuntimeProgress};
-use agora_core::ctx::Ctx;
-use agora_core::error::{LauncherError, LauncherResult};
-use agora_core::network::NetworkPolicy;
+use agora_core::{
+    ctx::Ctx,
+    db,
+    error::{LauncherError, LauncherResult},
+    network::NetworkPolicy,
+};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -91,13 +94,12 @@ impl RuntimeService {
         if !db_path.exists() {
             return Ok("automatic".to_string());
         }
-        let conn = agora_core::db::local_state_connection(&db_path).map_err(|error| {
-            LauncherError::Generic {
+        let conn =
+            db::local_state_connection(&db_path).map_err(|error| LauncherError::Generic {
                 code: "ERR_LOCAL_STATE_FAILED".into(),
                 message: error.to_string(),
-            }
-        })?;
-        Ok(agora_core::db::get_setting(&conn, "java_runtime_mode")
+            })?;
+        Ok(db::get_setting(&conn, "java_runtime_mode")
             .ok()
             .flatten()
             .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -116,12 +118,11 @@ impl RuntimeService {
         if !db_path.exists() {
             return Ok(NetworkPolicy::all_enabled());
         }
-        let conn = agora_core::db::local_state_connection(&db_path).map_err(|error| {
-            LauncherError::Generic {
+        let conn =
+            db::local_state_connection(&db_path).map_err(|error| LauncherError::Generic {
                 code: "ERR_LOCAL_STATE_FAILED".into(),
                 message: error.to_string(),
-            }
-        })?;
+            })?;
         Ok(NetworkPolicy::from_db(&conn))
     }
 }
@@ -131,7 +132,7 @@ mod tests {
     use super::*;
     use crate::runtime_catalog::{RuntimeCatalog, RuntimeCatalogEntry};
     use crate::runtime_manager::{managed_entry_path, NoopProgress, RuntimeReceipt};
-    use agora_core::network::{NetworkCategory, NetworkPolicy};
+    use agora_core::network::NetworkPolicy;
     use agora_core::network_gate::{install, SettingsGate};
     use serde_json::json;
     use std::sync::Arc;
@@ -180,9 +181,9 @@ mod tests {
     fn locked_down_context() -> (tempfile::TempDir, Ctx) {
         let root = tempfile::tempdir().unwrap();
         let ctx = crate::testing_context(root.path().to_owned());
-        agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::set_setting(&conn, "network_lockdown_enabled", &json!(true)).unwrap();
+        db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+        let conn = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        db::set_setting(&conn, "network_lockdown_enabled", &json!(true)).unwrap();
         install(Arc::new(SettingsGate::for_context(&ctx)));
         (root, ctx)
     }
@@ -217,6 +218,5 @@ mod tests {
             .await
             .expect_err("a missing runtime has to be downloaded, and Lockdown forbids that");
         assert_eq!(error.code(), "ERR_NETWORK_LOCKDOWN", "{error}");
-        let _ = NetworkCategory::JavaRuntime;
     }
 }
