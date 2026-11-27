@@ -9,6 +9,9 @@ mod collect_tests;
 pub mod convert;
 #[cfg(test)]
 mod import_bench;
+pub mod migrate;
+#[cfg(test)]
+mod migrate_tests;
 pub mod pending;
 pub mod place;
 pub mod protect;
@@ -1401,6 +1404,26 @@ pub(crate) fn place_object_from_file(
     Ok((sha256, size))
 }
 
+/// Place a verified file while the caller holds the content-store lock.
+///
+/// Recheck the hash during staging so a source that changed after verification cannot be
+/// published under the expected name. A caller that found damage can force a replacement.
+fn place_object_from_file_locked(
+    paths: &AppPaths,
+    source: &Path,
+    expected_hash: &str,
+    replace: bool,
+) -> Result<(), ContentError> {
+    let staged = stage_object_from_file(paths, source)?;
+    if staged.sha256 != expected_hash {
+        return Err(ContentError::Other(format!(
+            "{} changed while it was being staged",
+            source.display()
+        )));
+    }
+    staged.place_locked(paths, replace)
+}
+
 /// One file's bytes on their way into the store: written into this writer's own staging folder
 /// and hashed in the same pass, before the content-store lock is taken.
 ///
@@ -1442,12 +1465,17 @@ impl StagedObject {
     pub(crate) fn place(self, paths: &AppPaths) -> Result<(), ContentError> {
         let manager = LockManager::new(paths.locks_root());
         let _lock = manager.acquire(LockResource::ContentStore, "content-place")?;
-        place_staged(
-            paths,
-            self.staged_path.clone(),
-            self.size,
-            self.sha256.clone(),
-        )?;
+        self.place_locked(paths, false)
+    }
+
+    fn place_locked(self, paths: &AppPaths, replace: bool) -> Result<(), ContentError> {
+        let entry = StagedEntry {
+            rel_path: validate_entry_path("object")?,
+            staged_path: self.staged_path,
+            size: self.size,
+            sha256: self.sha256,
+        };
+        place_object(paths, &entry, replace)?;
         Ok(())
     }
 }

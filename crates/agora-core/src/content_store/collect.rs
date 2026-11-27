@@ -1,9 +1,7 @@
 //! The one collection that frees unreferenced objects (MASTER_SPEC §32.8).
 //!
-//! Two stores hold content-addressed bytes: `content/objects` (the content store, and where every
-//! snapshot writes now) and `snapshot-objects` (the store snapshots used before that move, read and
-//! collected until the migration has run). This module collects both against one reference set,
-//! worked out fresh from the owners' own records at this moment — no index kept beside the files.
+//! The collector sweeps `content/objects` against a reference set built from current owner records.
+//! The snapshot migration brings legacy objects into this store before collection can free them.
 //!
 //! The rule that matters more than the code: **"can't tell" always means "keep"**. A collection
 //! deletes nothing at all, and says why, when any owner record, listing, pending record or object
@@ -178,7 +176,7 @@ impl CollectReport {
     }
 }
 
-/// Collect every object that nothing uses, in both stores.
+/// Collect every object in the content store that nothing uses.
 ///
 /// `identity` is the one liveness check (32.13) as a function, so a context's seam reaches it and a
 /// caller without a context still asks the real process table.
@@ -244,17 +242,21 @@ fn collect(
         report.refusals.push(error);
     }
 
-    // Every object time, in both stores, before the first delete: an unreadable time keeps
-    // everything rather than being guessed at.
+    // Read every object time in the content store before the first delete. An unreadable time
+    // keeps everything. The migration owns the legacy store.
     let mut candidates = Vec::new();
     let mut recent = Vec::new();
     let grace = request.grace.unwrap_or(OBJECT_GRACE);
     let now = SystemTime::now();
-    for root in object_roots(paths) {
-        if let Err(error) = read_object_root(&root, &keep, grace, now, &mut candidates, &mut recent)
-        {
-            report.refusals.push(error);
-        }
+    if let Err(error) = read_object_root(
+        &paths.content_objects_dir(),
+        &keep,
+        grace,
+        now,
+        &mut candidates,
+        &mut recent,
+    ) {
+        report.refusals.push(error);
     }
     if report.refused() {
         // Something could not be read: the listing is incomplete and nothing is deleted.
@@ -358,15 +360,6 @@ fn acquire(
             resource.lock_name().unwrap_or_default()
         )),
     }
-}
-
-/// The two object stores this collection owns. The legacy one is emptied by the migration (B3b) and
-/// read only until then.
-fn object_roots(paths: &AppPaths) -> Vec<PathBuf> {
-    vec![
-        paths.content_objects_dir(),
-        paths.root().join("snapshot-objects"),
-    ]
 }
 
 /// The object hashes the item records name: files, a saved icon, and a hash a source published.

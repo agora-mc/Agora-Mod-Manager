@@ -839,6 +839,7 @@ error_codes! {
     MigrationUnresolvable = "ERR_MIGRATION_UNRESOLVABLE", Recovery, 1;
     RecoveryJournal = "ERR_RECOVERY_JOURNAL", Recovery, 1;
     RecoveryRefused = "ERR_RECOVERY_REFUSED", Recovery, 1;
+    SnapshotObjectMigration = "ERR_SNAPSHOT_OBJECT_MIGRATION", Recovery, 1;
     // ---- Other ----
     AppDataDir = "ERR_APP_DATA_DIR", Other, 1;
     AppPaths = "ERR_APP_PATHS", Other, 1;

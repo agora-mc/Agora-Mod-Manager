@@ -5802,9 +5802,10 @@ Mod files live in `content/objects` with its own sweep, and snapshots keep a sec
   instance creating a pinned base holds the base's lock (first in that order) from choosing the
   base until its pin's row is published, and re-reads the record under it, so a removal cannot
   finish between those two moments undetected.
-- **Migration:** snapshot objects are moved in and re-hashed; mismatches are kept and reported;
-  resumable (a journal on the 32.11 envelope). The old `snapshot-objects` reads and sweep are removed
-  once it has run.
+- **Migration:** snapshot objects are re-hashed and moved into the content store. Mismatches are kept
+  and reported. The §32.11 journal allows a stopped migration to resume. A completed journal disables
+  fallback reads between runs. A later run that finds legacy objects reopens the journal and checks
+  them again. The collector sweeps only the content store.
 - `plugins/blobs` stays separate (a per-plugin key-value store, not content-addressed).
 - **Tests:** removing a mod a snapshot holds keeps the object; deleting the last snapshot frees it;
   an unreadable owner record or pending record deletes nothing; a capture that reuses a blob while a

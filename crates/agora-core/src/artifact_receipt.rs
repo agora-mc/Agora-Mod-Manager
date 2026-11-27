@@ -145,7 +145,7 @@ fn normalized_size(size: Option<i64>) -> Option<u64> {
     size.and_then(|value| u64::try_from(value).ok())
 }
 
-fn receipt_path(path: &Path) -> PathBuf {
+pub(crate) fn receipt_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
