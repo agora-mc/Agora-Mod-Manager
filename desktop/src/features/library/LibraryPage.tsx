@@ -33,7 +33,7 @@ import {
 } from '@/features/games/content/api';
 import { isGamesError, MINECRAFT_GAME_ID } from '@/features/games/shared/types';
 import { cn } from '@/lib/utils';
-import { deleteSnapshot } from '@/lib/tauri';
+import { deleteSnapshot, describeCollection, type CollectOutcome } from '@/lib/tauri';
 import {
   addLibraryItem,
   fillMissingLibraryDetails,
@@ -288,8 +288,11 @@ export function LibraryPage({
     clearMessages();
     setBusy(item.itemId);
     try {
+      // What the removal's collection did with the objects the item named, whichever branch below
+      // removed it: the person who asked reads it beside the confirmation (MASTER_SPEC §32.8).
+      let collected: CollectOutcome | null = null;
       try {
-        await removeLibraryItem(item.itemId);
+        collected = await removeLibraryItem(item.itemId);
       } catch (error) {
         // An unreadable snapshot may still need the item. The core names the
         // snapshot and the command; offer to delete it, or to remove anyway.
@@ -308,7 +311,7 @@ Delete ${live.length === 1 ? 'that snapshot' : `those ${live.length} snapshots`}
           for (const snapshot of live) {
             await deleteSnapshot(snapshot.instanceId, snapshot.snapshotId);
           }
-          await removeLibraryItem(item.itemId);
+          collected = await removeLibraryItem(item.itemId);
         } else if (await confirm({
           title: `Remove ${item.name} anyway?`,
           body: `${error.message}
@@ -317,13 +320,15 @@ Those snapshots will no longer be able to restore this item.`,
           confirmLabel: 'Remove anyway',
           tone: 'danger',
         })) {
-          await removeLibraryItem(item.itemId, true);
+          collected = await removeLibraryItem(item.itemId, true);
         } else {
           setActionError(`Could not remove ${item.name}: ${error.message}`);
           return;
         }
       }
-      setNotice(`Removed ${item.name}.`);
+      setNotice(
+        [`Removed ${item.name}.`, describeCollection(collected)].filter(Boolean).join(' '),
+      );
       setReports((current) => {
         const next = { ...current };
         delete next[item.itemId];

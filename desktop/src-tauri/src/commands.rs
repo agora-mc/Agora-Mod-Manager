@@ -5400,22 +5400,38 @@ pub async fn apply_instance_template(
     .map_err(|e| template_error(format!("Template apply task failed: {e}")))?
 }
 
+/// Delete a snapshot and run the instance's retention round. The reply says what the delete's own
+/// collection did; the retention round is automatic housekeeping, so its report goes to the support
+/// log rather than to the person who deleted one snapshot (MASTER_SPEC §32.8).
 #[tauri::command]
 pub async fn delete_snapshot(
     app: tauri::AppHandle,
     _state: tauri::State<'_, LauncherState>,
     instance_id: String,
     snapshot_id: String,
-) -> LauncherResult<()> {
+) -> LauncherResult<agora_core::content_store::collect::CollectOutcome> {
     let sanitized = paths::sanitize_id(&instance_id);
     let instance_dir =
         paths::instance_dir(&app, &sanitized).map_err(|e| LauncherError::Generic {
             code: "ERR_PATH".into(),
             message: e.to_string(),
         })?;
-    tokio::task::spawn_blocking(move || {
-        agora_core::snapshot::delete_snapshot(&instance_dir, &snapshot_id)?;
-        agora_core::lkg::run_retention(&instance_dir)
+    tokio::task::spawn_blocking(move || -> Result<_, String> {
+        let report =
+            agora_core::snapshot::delete_snapshot_with_report(&instance_dir, &snapshot_id)?;
+        match agora_core::lkg::run_retention_with_report(&instance_dir) {
+            Ok(Some(round)) => crate::auth::log_line(&format!(
+                "snapshot retention after deleting {} for {}: {}",
+                snapshot_id,
+                instance_dir.display(),
+                round.outcome().summary
+            )),
+            Ok(None) => {}
+            Err(error) => crate::auth::log_line(&format!(
+                "snapshot retention after deleting a snapshot failed: {error}"
+            )),
+        }
+        Ok(report.outcome())
     })
     .await
     .map_err(|e| LauncherError::Generic {

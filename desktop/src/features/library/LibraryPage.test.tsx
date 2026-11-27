@@ -194,6 +194,45 @@ describe('LibraryPage', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('The store item is missing.');
   });
 
+  it('says what removing an item reclaimed, and why when nothing was', async () => {
+    // What the removal's collection answered, in order: one that freed objects, then one that
+    // freed nothing and said why (MASTER_SPEC §32.8).
+    const reports = [
+      { summary: 'reclaimed 2 object(s)', reclaimed: 2, refused: false },
+      {
+        summary: 'nothing was reclaimed: a snapshot manifest cannot be read',
+        reclaimed: 0,
+        refused: true,
+      },
+    ];
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (command: string, args: unknown) => {
+      if (command === 'games_content_remove') return reports.shift();
+      return base(command, args);
+    });
+
+    render(<ConfirmProvider><LibraryPage /></ConfirmProvider>);
+    await screen.findByText('A saved description.');
+
+    await userEvent.click(screen.getByRole('button', { name: 'More for First item' }));
+    await userEvent.click(await screen.findByRole('menuitem', { name: /Remove from library/ }));
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Remove' }));
+    await waitFor(() => {
+      expect(screen.getByRole('status')).toHaveTextContent(
+        'Removed First item. Reclaimed 2 object(s).',
+      );
+    });
+
+    await userEvent.click(screen.getByRole('button', { name: 'More for Second item' }));
+    await userEvent.click(await screen.findByRole('menuitem', { name: /Remove from library/ }));
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Remove' }));
+    await waitFor(() => {
+      expect(screen.getByRole('status')).toHaveTextContent(
+        'Removed Second item. Nothing was reclaimed: a snapshot manifest cannot be read.',
+      );
+    });
+  });
+
   it('removes only the unused items the user selects and confirms', async () => {
     const unusedItem = {
       itemId: 'e'.repeat(64),
