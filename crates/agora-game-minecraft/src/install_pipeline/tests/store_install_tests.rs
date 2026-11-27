@@ -323,7 +323,21 @@ fn two_instances_installing_the_same_mod_share_one_object() {
         })
         .collect();
     assert_eq!(hashes[0], hashes[1], "both placements use one object");
-    assert_eq!(store_objects(&ctx).len(), 1, "the bytes are stored once");
+    // The store also holds the blobs of the recovery snapshot an install takes (snapshots store
+    // their bytes in `content/objects` now), so the question is how many objects hold *this jar's*
+    // bytes, not how many files the store holds.
+    let stored = store_objects(&ctx);
+    let copies = stored
+        .iter()
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name == hashes[0].as_str())
+        })
+        .count();
+    assert_eq!(
+        copies, 1,
+        "the bytes are stored once; the store holds {stored:?}"
+    );
 }
 
 #[test]

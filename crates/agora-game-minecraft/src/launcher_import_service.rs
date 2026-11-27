@@ -2102,6 +2102,25 @@ impl LauncherImportService {
                     let _ = rollback_staging();
                     return Err(error);
                 }
+                // The swap is a move between owner locations: the old tree leaves `instances/` for
+                // the quarantine, and the staged tree takes its place. The instance-locations lock
+                // is held across both renames (through the rollback paths and the quarantined
+                // tree's removal), so a collection cannot list the owners between them and see
+                // neither tree — the case in which it frees the blobs the returning tree needs
+                // (MASTER_SPEC §32.8). A busy lock means another move is in flight: refuse and
+                // leave both trees where they are.
+                let _locations = self
+                    .ctx
+                    .lock_manager
+                    .wait_instance_locations("launcher-import-update")
+                    .map_err(|error| LauncherError::Generic {
+                        code: "ERR_IMPORT_LOCATIONS_BUSY".into(),
+                        message: format!(
+                        "the update of {} could not start: instance locations are busy ({error}); \
+                         nothing was changed",
+                        final_dir.display()
+                    ),
+                    })?;
                 if final_dir.exists() {
                     std::fs::rename(&final_dir, quarantine).map_err(|e| {
                         LauncherError::Generic {
@@ -3856,6 +3875,107 @@ name=Dup Instance
             bytes_total: 100,
         };
         assert_eq!(halfway.fraction(), 0.5);
+    }
+
+    /// An update import renames the old instance folder into `staging/.agora-quarantine-*` and the
+    /// staged tree into its place. That is a move between owner locations, so it happens under the
+    /// instance-locations lock: while another operation holds it, the update refuses and leaves both
+    /// trees where they are (MASTER_SPEC §32.8).
+    #[tokio::test]
+    async fn test_update_refuses_while_instance_locations_are_held() {
+        let ctx = test_ctx();
+        let svc = LauncherImportService::new(ctx.clone());
+
+        let src_root = test_tmp("loc-src");
+        std::fs::create_dir_all(src_root.join("mods")).unwrap();
+        std::fs::write(src_root.join("mods").join("a.jar"), b"mod a").unwrap();
+
+        let plan =
+            |action: ItemAction, existing: Option<InstanceImportRecord>| LauncherImportPlan {
+                batch_fingerprint: String::new(),
+                items: vec![PerItemPlan {
+                    fingerprint: plan_fingerprint(
+                        "loc-key",
+                        LauncherKind::Prism,
+                        "loc-inst",
+                        &action,
+                        false,
+                    ),
+                    destination_id: "loc-inst".to_string(),
+                    destination_name: "Loc Instance".to_string(),
+                    action,
+                    source_key: "loc-key".to_string(),
+                    launcher_kind: LauncherKind::Prism,
+                    installation_key: "prism:loc".to_string(),
+                    source_path: src_root.to_string_lossy().to_string(),
+                    loader_tuple: Some(LoaderTuple {
+                        loader: "vanilla".to_string(),
+                        loader_version: String::new(),
+                        minecraft_version: String::new(),
+                    }),
+                    total_bytes: 6,
+                    total_files: 1,
+                    preserve_settings: false,
+                    sanitized_settings: LaunchSettingsPreview {
+                        memory_mb: None,
+                        java_path: None,
+                        jvm_args: Vec::new(),
+                    },
+                    existing_import: existing,
+                    blockers: Vec::new(),
+                    warnings: Vec::new(),
+                }],
+                peak_bytes: 6,
+                total_files: 1,
+                batch_blockers: Vec::new(),
+            };
+
+        svc.execute(plan(ItemAction::New, None)).await.unwrap();
+        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let existing = find_instance_import_by_source(&conn, "prism", "prism:loc", "loc-key")
+            .unwrap()
+            .unwrap();
+        let final_dir = ctx.paths.instances_root().join("loc-inst");
+        let before = std::fs::read_dir(&final_dir).unwrap().count();
+
+        // Another move holds the owner locations for this instance.
+        let _held = ctx
+            .lock_manager
+            .acquire(
+                agora_core::lock_manager::LockResource::InstanceLocations,
+                "test-holds-locations",
+            )
+            .unwrap();
+
+        let result = svc
+            .execute(plan(ItemAction::Update, Some(existing)))
+            .await
+            .unwrap();
+        let message = match &result.outcomes[0] {
+            PerItemOutcome::Failed { error, .. } => error.clone(),
+            other => panic!("an update with the locations held must fail, got {other:?}"),
+        };
+        assert!(
+            message.contains("instance locations are busy"),
+            "the failure says why: {message}"
+        );
+
+        // Nothing moved: the instance is where it was, with what it had, and nothing was quarantined.
+        assert_eq!(std::fs::read_dir(&final_dir).unwrap().count(), before);
+        let quarantines: Vec<_> = std::fs::read_dir(ctx.paths.staging_root())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".agora-quarantine-loc-inst-")
+            })
+            .collect();
+        assert!(
+            quarantines.is_empty(),
+            "a refused update leaves no quarantined tree: {quarantines:?}"
+        );
     }
 
     #[tokio::test]
