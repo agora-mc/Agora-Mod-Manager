@@ -339,7 +339,10 @@ pub(crate) fn collect_at_instance(
 /// locks, the way a user-requested delete does, and reports what it freed — or that it deleted
 /// nothing and why. The one choice it takes is the person's override for a snapshot manifest that
 /// cannot be read, which keeps that snapshot's objects and names it in `failures`, with the risk.
-pub fn request_collection(ctx: &crate::ctx::Ctx, ignore_unreadable_snapshots: bool) -> CollectReport {
+pub fn request_collection(
+    ctx: &crate::ctx::Ctx,
+    ignore_unreadable_snapshots: bool,
+) -> CollectReport {
     collect_with_ctx(
         ctx,
         &CollectRequest {

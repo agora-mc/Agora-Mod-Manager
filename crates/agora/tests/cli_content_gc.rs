@@ -127,7 +127,11 @@ fn gc_reclaims_an_old_object_nothing_names_and_says_so() {
     let output = agora(dir.path(), &["games", "content", "gc"]);
 
     assert!(output.status.success(), "{}", text(&output));
-    assert!(!orphan.exists(), "the orphan was reclaimed: {}", text(&output));
+    assert!(
+        !orphan.exists(),
+        "the orphan was reclaimed: {}",
+        text(&output)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
     assert!(
         stdout.contains("reclaimed") || stdout.contains("freed"),
@@ -185,7 +189,10 @@ fn gc_deletes_nothing_while_a_snapshot_manifest_cannot_be_read() {
     let parsed = json_of(&output);
     assert_eq!(parsed["collection"]["refused"], true, "{parsed}");
     assert_eq!(parsed["collection"]["reclaimed"], 0, "{parsed}");
-    assert!(orphan.exists(), "nothing is deleted while an owner record cannot be read");
+    assert!(
+        orphan.exists(),
+        "nothing is deleted while an owner record cannot be read"
+    );
     assert!(
         parsed["collection"]["summary"]
             .as_str()
@@ -207,7 +214,11 @@ fn gc_with_the_override_names_each_ignored_snapshot_and_its_risk() {
     );
 
     assert!(output.status.success(), "{}", text(&output));
-    assert!(!orphan.exists(), "the person chose to go ahead: {}", text(&output));
+    assert!(
+        !orphan.exists(),
+        "the person chose to go ahead: {}",
+        text(&output)
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("broken-snap") && stderr.to_lowercase().contains("restore"),
@@ -229,7 +240,9 @@ fn any_command_moves_the_old_snapshot_store_first() {
 
     assert!(output.status.success(), "{}", text(&output));
     assert!(!legacy.exists(), "{}", text(&output));
-    assert!(paths.content_object_path(&sha256_hex(b"old store")).is_file());
+    assert!(paths
+        .content_object_path(&sha256_hex(b"old store"))
+        .is_file());
     assert!(
         String::from_utf8_lossy(&output.stderr)
             .to_lowercase()
@@ -272,7 +285,10 @@ fn migrate_reports_a_damaged_journal_with_the_way_out() {
         parsed["command"], "agora games content migrate --restart",
         "{parsed}"
     );
-    assert!(legacy.exists(), "nothing moves under a journal nobody can read");
+    assert!(
+        legacy.exists(),
+        "nothing moves under a journal nobody can read"
+    );
     assert_eq!(fs::read(&damaged).unwrap(), b"{ not a journal");
 }
 
@@ -297,7 +313,10 @@ fn migrate_restart_sets_the_damaged_journal_aside_and_finishes() {
         .flatten()
         .filter(|entry| fs::read(entry.path()).ok().as_deref() == Some(b"{ not a journal"))
         .count();
-    assert_eq!(set_aside, 1, "the damaged journal is kept, beside the new one");
+    assert_eq!(
+        set_aside, 1,
+        "the damaged journal is kept, beside the new one"
+    );
 }
 
 #[test]
