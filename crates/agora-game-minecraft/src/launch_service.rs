@@ -12,7 +12,7 @@ use agora_core::instance_runtime;
 use agora_core::lkg::{classify_launch, LaunchEvents, LaunchOutcome};
 use agora_core::lock_manager::{LockGuard, LockResource};
 use agora_core::models::InstanceManifest;
-use agora_core::network::{check_launch_request, NetworkPolicy};
+use agora_core::network::NetworkPolicy;
 use agora_core::process_identity::{self, ProcessIdentity};
 use agora_core::process_session_manager::ProcessSession;
 use agora_core::snapshot::create_snapshot_scoped;
