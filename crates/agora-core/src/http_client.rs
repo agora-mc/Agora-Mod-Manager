@@ -1179,6 +1179,66 @@ pub async fn checked_request(
 /// The same policy is applied to the initial URL and every redirect hop, so a
 /// `SignedManifest` pinned artifact cannot escape to an off-domain host via a
 /// redirect.
+fn next_redirect_hop(
+    clients: &HttpClients,
+    category: ClientCategory,
+    policy: HostPolicy<'_>,
+    original_url: &str,
+    current_url: &str,
+    location: &str,
+    remaining: &mut u8,
+) -> LauncherResult<reqwest::Url> {
+    if *remaining == 0 {
+        return Err(LauncherError::Generic {
+            code: "ERR_TOO_MANY_REDIRECTS".into(),
+            message: format!(
+                "Too many redirects for {}",
+                network::sanitized_url_for_log(original_url)
+            ),
+        });
+    }
+    // Relative redirects resolve against the URL that answered.
+    let next_url = reqwest::Url::parse(current_url)
+        .ok()
+        .and_then(|base| {
+            reqwest::Url::parse(location)
+                .or_else(|_| base.join(location))
+                .ok()
+        })
+        .ok_or_else(|| LauncherError::Generic {
+            code: "ERR_INVALID_REDIRECT".into(),
+            message: format!("Cannot resolve redirect Location: {location}"),
+        })?;
+    // A redirect is a new request: the answer the gate gave for the previous hop does not carry
+    // over, and the policy may have changed while this one was in flight (MASTER_SPEC §32.9).
+    // This runs before the target is resolved or contacted, so a refusal produces no traffic.
+    crate::network_gate::authorize(category)?;
+    clients.validate_url(category, next_url.as_str(), policy)?;
+    *remaining -= 1;
+    Ok(next_url)
+}
+
+/// The `Location` a redirecting response names.
+fn redirect_location(response: &reqwest::Response) -> LauncherResult<String> {
+    location_header(response.headers())
+}
+
+/// The blocking form of [`redirect_location`].
+fn blocking_redirect_location(response: &reqwest::blocking::Response) -> LauncherResult<String> {
+    location_header(response.headers())
+}
+
+fn location_header(headers: &reqwest::header::HeaderMap) -> LauncherResult<String> {
+    headers
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .ok_or_else(|| LauncherError::Generic {
+            code: "ERR_REDIRECT_NO_LOCATION".into(),
+            message: "Redirect without Location header".into(),
+        })
+}
+
 pub async fn checked_request_with_policy(
     clients: &HttpClients,
     category: ClientCategory,
@@ -1209,47 +1269,16 @@ pub async fn checked_request_with_policy(
         // Check if the response is a redirect.
         let status = response.status();
         if status.is_redirection() {
-            if remaining_redirects == 0 {
-                return Err(LauncherError::Generic {
-                    code: "ERR_TOO_MANY_REDIRECTS".into(),
-                    message: format!(
-                        "Too many redirects for {}",
-                        network::sanitized_url_for_log(url)
-                    ),
-                });
-            }
-
-            // Get the Location header.
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| LauncherError::Generic {
-                    code: "ERR_REDIRECT_NO_LOCATION".into(),
-                    message: "Redirect without Location header".to_string(),
-                })?;
-
-            // Resolve relative redirects against the current URL.
-            let next_url = reqwest::Url::parse(&current_url)
-                .ok()
-                .and_then(|base| {
-                    reqwest::Url::parse(location)
-                        .or_else(|_| base.join(location))
-                        .ok()
-                })
-                .ok_or_else(|| LauncherError::Generic {
-                    code: "ERR_INVALID_REDIRECT".into(),
-                    message: format!("Cannot resolve redirect Location: {location}"),
-                })?;
-
-            // A redirect is a new request: the answer the gate gave for the first hop does not
-            // carry over, and Lockdown may have been turned on while this one was in flight
-            // (MASTER_SPEC §32.9).
-            crate::network_gate::authorize(category)?;
-            // Re-validate the redirect target against the same policies.
-            let _ = clients.validate_url(category, next_url.as_str(), policy)?;
-
-            remaining_redirects -= 1;
+            let location = redirect_location(&response)?;
+            let next_url = next_redirect_hop(
+                clients,
+                category,
+                policy,
+                url,
+                &current_url,
+                &location,
+                &mut remaining_redirects,
+            )?;
             current_url = next_url.to_string();
             continue;
         }
@@ -1300,38 +1329,16 @@ pub async fn checked_send(
         if !response.status().is_redirection() {
             return Ok(response);
         }
-        if remaining_redirects == 0 {
-            return Err(LauncherError::Generic {
-                code: "ERR_TOO_MANY_REDIRECTS".into(),
-                message: format!(
-                    "Too many redirects for {}",
-                    network::sanitized_url_for_log(url)
-                ),
-            });
-        }
-        let location = response
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| LauncherError::Generic {
-                code: "ERR_REDIRECT_NO_LOCATION".into(),
-                message: "Redirect without Location header".into(),
-            })?;
-        let next_url = reqwest::Url::parse(&current_url)
-            .ok()
-            .and_then(|base| {
-                reqwest::Url::parse(location)
-                    .or_else(|_| base.join(location))
-                    .ok()
-            })
-            .ok_or_else(|| LauncherError::Generic {
-                code: "ERR_INVALID_REDIRECT".into(),
-                message: "Cannot resolve redirect Location".into(),
-            })?;
-        // Every hop asks the gate again: the first answer was about the first URL, and the
-        // policy may have changed while this request was in flight (§32.9).
-        crate::network_gate::authorize(category)?;
-        clients.validate_url(category, next_url.as_str(), HostPolicy::Allowlist)?;
+        let location = redirect_location(&response)?;
+        let next_url = next_redirect_hop(
+            clients,
+            category,
+            HostPolicy::Allowlist,
+            url,
+            &current_url,
+            &location,
+            &mut remaining_redirects,
+        )?;
 
         match response.status().as_u16() {
             307 | 308 => {}
@@ -1342,7 +1349,6 @@ pub async fn checked_send(
         }
         current_url = next_url.to_string();
         first_request = false;
-        remaining_redirects -= 1;
     }
 }
 
@@ -1596,42 +1602,16 @@ pub async fn checked_request_with_headers(
         crate::connectivity::record_reachable();
 
         if response.status().is_redirection() {
-            if remaining_redirects == 0 {
-                return Err(LauncherError::Generic {
-                    code: "ERR_TOO_MANY_REDIRECTS".into(),
-                    message: format!(
-                        "Too many redirects for {}",
-                        network::sanitized_url_for_log(url)
-                    ),
-                });
-            }
-
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| LauncherError::Generic {
-                    code: "ERR_REDIRECT_NO_LOCATION".into(),
-                    message: "Redirect without Location header".into(),
-                })?;
-
-            let next_url = reqwest::Url::parse(&current_url)
-                .ok()
-                .and_then(|base| {
-                    reqwest::Url::parse(location)
-                        .or_else(|_| base.join(location))
-                        .ok()
-                })
-                .ok_or_else(|| LauncherError::Generic {
-                    code: "ERR_INVALID_REDIRECT".into(),
-                    message: format!("Cannot resolve redirect Location: {location}"),
-                })?;
-
-            // The next hop is a new request, so it asks the gate again: Lockdown may have been
-            // turned on while the first one was in flight (MASTER_SPEC §32.9).
-            crate::network_gate::authorize(category)?;
-            let _ = clients.validate_url(category, next_url.as_str(), HostPolicy::Allowlist)?;
-            remaining_redirects -= 1;
+            let location = redirect_location(&response)?;
+            let next_url = next_redirect_hop(
+                clients,
+                category,
+                HostPolicy::Allowlist,
+                url,
+                &current_url,
+                &location,
+                &mut remaining_redirects,
+            )?;
             current_url = next_url.to_string();
             first = false;
             continue;
@@ -1681,41 +1661,16 @@ pub fn blocking_checked_request_with_policy(
         crate::connectivity::record_reachable();
 
         if response.status().is_redirection() {
-            if remaining_redirects == 0 {
-                return Err(LauncherError::Generic {
-                    code: "ERR_TOO_MANY_REDIRECTS".into(),
-                    message: format!(
-                        "Too many redirects for {}",
-                        network::sanitized_url_for_log(url)
-                    ),
-                });
-            }
-
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| LauncherError::Generic {
-                    code: "ERR_REDIRECT_NO_LOCATION".into(),
-                    message: "Redirect without Location header".into(),
-                })?;
-
-            let next_url = reqwest::Url::parse(&current_url)
-                .ok()
-                .and_then(|base| {
-                    reqwest::Url::parse(location)
-                        .or_else(|_| base.join(location))
-                        .ok()
-                })
-                .ok_or_else(|| LauncherError::Generic {
-                    code: "ERR_INVALID_REDIRECT".into(),
-                    message: format!("Cannot resolve redirect Location: {location}"),
-                })?;
-
-            // A blocking hop asks the gate again, exactly as the async one does (§32.9).
-            crate::network_gate::authorize(category)?;
-            let _ = clients.validate_url(category, next_url.as_str(), policy)?;
-            remaining_redirects -= 1;
+            let location = blocking_redirect_location(&response)?;
+            let next_url = next_redirect_hop(
+                clients,
+                category,
+                policy,
+                url,
+                &current_url,
+                &location,
+                &mut remaining_redirects,
+            )?;
             current_url = next_url.to_string();
             continue;
         }
