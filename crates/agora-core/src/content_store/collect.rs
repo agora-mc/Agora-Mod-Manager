@@ -332,6 +332,26 @@ pub(crate) fn collect_at_instance(
     )
 }
 
+/// One collection the person asked for by running `agora games content gc` (MASTER_SPEC §32.8).
+///
+/// Nothing is removed first: this is the collector alone, over both object stores, against the
+/// owner records as they are now. It waits briefly for the content store and instance-locations
+/// locks, the way a user-requested delete does, and reports what it freed — or that it deleted
+/// nothing and why. The one choice it takes is the person's override for a snapshot manifest that
+/// cannot be read, which keeps that snapshot's objects and names it in `failures`, with the risk.
+pub fn request_collection(ctx: &crate::ctx::Ctx, ignore_unreadable_snapshots: bool) -> CollectReport {
+    collect_with_ctx(
+        ctx,
+        &CollectRequest {
+            store: LockRequest::Wait,
+            locations: LockRequest::Wait,
+            grace: None,
+            pause: None,
+            ignore_unreadable_snapshots,
+        },
+    )
+}
+
 #[cfg(test)]
 thread_local! {
     static COLLECTION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
