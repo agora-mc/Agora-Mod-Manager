@@ -4073,7 +4073,13 @@ pub(crate) async fn load_json_cache_first<T: serde::de::DeserializeOwned>(
             agora_core::connectivity::record_reachable();
             r
         }
-        Err(_) => {
+        Err(error) => {
+            // A hop the gate refused is a decision, not a network hiccup: it must not be
+            // reported as "offline" and must not fall back to a stale cache the user has just
+            // stopped trusting. The refusal names Lockdown or the switch that stopped it.
+            if let Some(denial) = agora_core::http_client::denial_from_request_error(&error) {
+                return Err(denial);
+            }
             agora_core::connectivity::record_unreachable();
             if let Some(parsed) = stale_parsed {
                 return Ok(parsed);
