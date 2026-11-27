@@ -2590,6 +2590,17 @@ fn recover_one_job(
         )
     } else if job.state.contains("update") {
         let line = if let Some(quarantine) = quarantine {
+            // The instance guard is already held. Keep the returning tree in one of the two
+            // locations a collector sees throughout its scan, including a rollback of this move.
+            let _locations = match ctx.lock_manager.try_instance_locations("import-recover") {
+                Ok(guard) => guard,
+                Err(error) => {
+                    return Some(format!(
+                        "The interrupted import for {} was left alone: instance locations are busy ({error}). Nothing was changed.",
+                        job.instance_id
+                    ));
+                }
+            };
             if final_dir.exists() && !import_owns(&final_dir, &job.job_id) {
                 return Some(format!(
                     "The interrupted import for {} was left alone: its final directory is not \
@@ -4180,6 +4191,87 @@ name=Dup Instance
                 .is_empty(),
             "a finished rollback must clear its job row so it cannot re-run"
         );
+    }
+
+    #[test]
+    fn recovery_cannot_move_quarantine_between_collection_listings() {
+        use agora_core::{content_store, snapshot};
+
+        let ctx = test_ctx();
+        let final_dir = ctx.paths.instance_dir("recover-during-collect").unwrap();
+        let quarantine = ctx
+            .paths
+            .staging_root()
+            .join(".agora-quarantine-recover-during-collect");
+        std::fs::create_dir_all(&final_dir).unwrap();
+        std::fs::create_dir_all(ctx.paths.staging_root()).unwrap();
+        std::fs::write(final_dir.join("old.txt"), b"snapshot only bytes").unwrap();
+        let snap = snapshot::create_snapshot(&final_dir, None, &["old.txt"]).unwrap();
+        let hash = snapshot::snapshot_file_index(&final_dir, &snap.id)
+            .unwrap()
+            .remove(0)
+            .sha256;
+        std::fs::rename(&final_dir, &quarantine).unwrap();
+        mark_owner(&quarantine, "collect-recovery-job");
+        let conn = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db::upsert_instance_import_job(
+            &conn,
+            &InstanceImportJob {
+                job_id: "collect-recovery-job".into(),
+                instance_id: "recover-during-collect".into(),
+                launcher_kind: "prism".into(),
+                source_instance_key: "source".into(),
+                staging_path: ctx
+                    .paths
+                    .staging_root()
+                    .join(".agora-import-recover-during-collect")
+                    .to_string_lossy()
+                    .into_owned(),
+                final_path: final_dir.to_string_lossy().into_owned(),
+                quarantine_path: Some(quarantine.to_string_lossy().into_owned()),
+                state: "swapping_update".into(),
+                plan_fingerprint: "plan".into(),
+                error: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .unwrap();
+
+        let file = ctx.paths.root().join("trigger.jar");
+        std::fs::write(&file, b"unrelated item").unwrap();
+        let item = content_store::add_file(&ctx, &file, None, None)
+            .unwrap()
+            .item()
+            .item_id
+            .clone();
+        let other = Ctx::for_testing(ctx.paths.root().to_path_buf());
+        let recovery = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = recovery.clone();
+        ctx.test_seams
+            .set_object_grace(Some(std::time::Duration::ZERO));
+        ctx.test_seams
+            .set_object_collection_after_live(Some(std::sync::Arc::new(move || {
+                *observed.lock().unwrap() = recover_interrupted_jobs(&other);
+            })));
+
+        let report =
+            content_store::remove_item_with_report(&ctx, &item, Default::default()).unwrap();
+        assert!(!report.refused(), "{}", report.summary());
+        assert!(
+            ctx.paths.content_object_path(&hash).is_file(),
+            "collection lost the snapshot blob"
+        );
+        assert!(recovery
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("instance locations")));
+        assert!(quarantine.is_dir());
+        recover_interrupted_jobs(&ctx);
+        assert!(final_dir.join("old.txt").is_file());
+        assert!(!quarantine.exists());
     }
 
     /// Crash after promotion but before provenance commit. An already-open desktop could have
