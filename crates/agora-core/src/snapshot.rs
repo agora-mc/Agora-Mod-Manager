@@ -1384,6 +1384,8 @@ pub(crate) fn create_snapshot_full_with_pause(
     pause: Option<&CapturePause>,
 ) -> Result<Snapshot, String> {
     let id = uuid::Uuid::new_v4().to_string();
+    // The store this capture writes through, decided once before the first folder exists.
+    let paths = snapshot_store_paths(instance_dir);
 
     fs::create_dir_all(snapshots_dir(instance_dir))
         .map_err(|e| format!("failed to create snapshots dir: {e}"))?;
@@ -1409,7 +1411,6 @@ pub(crate) fn create_snapshot_full_with_pause(
         /// the store lock. A file the cache says is unchanged needs none of that.
         staged: Option<crate::content_store::StagedObject>,
     }
-    let paths = snapshot_store_paths(instance_dir);
     let mut planned: Vec<Planned> = Vec::with_capacity(current.len());
     for entry in current {
         let cached = previous.get(&entry.relative_path).filter(|cached| {
@@ -1565,6 +1566,8 @@ pub fn create_snapshot_from_data(
     folders: &[&str],
 ) -> Result<Snapshot, String> {
     let id = uuid::Uuid::new_v4().to_string();
+    // The store this capture writes through, decided once before the first folder exists.
+    let paths = snapshot_store_paths(instance_dir);
     fs::create_dir_all(snapshots_dir(instance_dir))
         .map_err(|e| format!("failed to create snapshots dir: {e}"))?;
     fs::create_dir_all(snapshot_objects_dir(instance_dir))
@@ -1579,11 +1582,8 @@ pub fn create_snapshot_from_data(
         .filter_map(|file| file.contents.as_deref())
         .map(sha256_hex)
         .collect();
-    let pending = crate::content_store::pending::begin_pending_use(
-        &snapshot_store_paths(instance_dir),
-        &hashes,
-        "snapshot capture",
-    )?;
+    let pending =
+        crate::content_store::pending::begin_pending_use(&paths, &hashes, "snapshot capture")?;
     let mut roots: std::collections::BTreeMap<String, RootState> =
         std::collections::BTreeMap::new();
     for file in files {
@@ -1607,11 +1607,8 @@ pub fn create_snapshot_from_data(
         roots.entry(name).or_insert(state);
         match &file.contents {
             Some(bytes) => {
-                let (hash, size) = crate::content_store::place_object_from_bytes(
-                    &snapshot_store_paths(instance_dir),
-                    bytes,
-                )
-                .map_err(|e| e.to_string())?;
+                let (hash, size) = crate::content_store::place_object_from_bytes(&paths, bytes)
+                    .map_err(|e| e.to_string())?;
                 total_size += size;
                 entries.push(SnapshotFileEntry {
                     relative_path: file.relative_path.clone(),
