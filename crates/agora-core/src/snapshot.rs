@@ -526,7 +526,7 @@ struct LiveFileIndexEntry {
 /// root. Tests and callers that pass a standalone directory still get a
 /// sibling object store, while normal instances resolve to `<app>/snapshot-objects`.
 pub(crate) fn snapshot_objects_dir(instance_dir: &Path) -> PathBuf {
-    snapshot_app_root(instance_dir).join("snapshot-objects")
+    crate::content_store::migrate::legacy_root(&snapshot_store_paths(instance_dir))
 }
 
 /// The app data root a live instance belongs to. Shared stores and the trash
@@ -568,18 +568,85 @@ pub(crate) fn snapshot_blob_path(instance_dir: &Path, hash: &str) -> PathBuf {
 /// object it protected, of the recorded size — which is the rule `content_store::read_object_bytes`
 /// applies; the legacy store is judged by its receipt or a full hash, exactly as before. A caller
 /// that reads the bytes then verifies them again as it always has, so this only chooses the place.
-pub(crate) fn snapshot_blob_source(instance_dir: &Path, hash: &str, size: u64) -> Option<PathBuf> {
-    let content = snapshot_store_paths(instance_dir).content_object_path(hash);
-    if crate::content_store::object_is_trustworthy(&content, size, hash).unwrap_or(false) {
-        return Some(content);
+pub(crate) fn snapshot_blob_source(
+    instance_dir: &Path,
+    hash: &str,
+    size: u64,
+) -> Result<Option<PathBuf>, String> {
+    let paths = snapshot_store_paths(instance_dir);
+    let content = paths.content_object_path(hash);
+    if content_blob_is_trustworthy(&content, size, hash)? {
+        return Ok(Some(content));
     }
-    let legacy = snapshot_blob_path(instance_dir, hash);
-    let receipt =
-        crate::artifact_receipt::is_verified(&legacy, "sha256", hash, i64::try_from(size).ok());
-    if legacy.is_file() && (receipt || blob_file_matches(&legacy, hash, size)) {
-        return Some(legacy);
+    if crate::content_store::migrate::legacy_store_active(&paths) {
+        let legacy = snapshot_blob_path(instance_dir, hash);
+        if legacy_blob_metadata(&paths, &legacy)?.is_some() {
+            let receipt_path = crate::artifact_receipt::receipt_path(&legacy);
+            let receipt =
+                snapshot_object_check(&receipt_path, fs::symlink_metadata(&receipt_path))?
+                    .is_some_and(|entry| {
+                        entry.is_file() && !agora_game_api::is_a_reparse_point(&entry)
+                    })
+                    && crate::artifact_receipt::is_verified(
+                        &legacy,
+                        "sha256",
+                        hash,
+                        i64::try_from(size).ok(),
+                    );
+            if receipt
+                || snapshot_object_check(&legacy, check_blob_file(&legacy, hash, size))?
+                    == Some(true)
+            {
+                return Ok(Some(legacy));
+            }
+        }
     }
-    None
+    // Migration may have published the object after the first lookup.
+    Ok(content_blob_is_trustworthy(&content, size, hash)?.then_some(content))
+}
+
+fn content_blob_is_trustworthy(path: &Path, size: u64, hash: &str) -> Result<bool, String> {
+    use crate::content_store::ContentError;
+
+    match crate::content_store::object_is_trustworthy(path, size, hash) {
+        Ok(verified) => Ok(verified),
+        Err(ContentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "could not check snapshot object {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn snapshot_object_check<T>(path: &Path, result: std::io::Result<T>) -> Result<Option<T>, String> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "could not check snapshot object {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn legacy_blob_metadata(paths: &AppPaths, blob: &Path) -> Result<Option<fs::Metadata>, String> {
+    let root = crate::content_store::migrate::legacy_root(paths);
+    let Some(shard) = blob.parent() else {
+        return Ok(None);
+    };
+    if crate::content_store::migrate::object_name(&root, blob).is_none() {
+        return Ok(None);
+    }
+    for directory in [root.as_path(), shard] {
+        let Some(entry) = snapshot_object_check(directory, fs::symlink_metadata(directory))? else {
+            return Ok(None);
+        };
+        if !entry.is_dir() || agora_game_api::is_a_reparse_point(&entry) {
+            return Ok(None);
+        }
+    }
+    Ok(snapshot_object_check(blob, fs::symlink_metadata(blob))?
+        .filter(|entry| entry.is_file() && !agora_game_api::is_a_reparse_point(entry)))
 }
 
 /// Legacy v1/v2 snapshots are retained as ZIPs and remain readable.
@@ -881,7 +948,7 @@ pub fn snapshot_matches_live_incremental_scoped(
         let (hash, blob_valid) = if let Some(cached) = cached {
             (
                 cached.sha256.clone(),
-                snapshot_blob_is_available(instance_dir, &cached.sha256, cached.size),
+                snapshot_blob_is_available(instance_dir, &cached.sha256, cached.size)?,
             )
         } else {
             (hash_live_file(instance_dir, &entry.relative_path)?, true)
@@ -890,14 +957,15 @@ pub fn snapshot_matches_live_incremental_scoped(
         if !blob_valid {
             matches = false;
         }
-        if !reference
-            .get(&entry.relative_path)
-            .is_some_and(|(expected_hash, expected_size)| {
-                *expected_size == entry.size
-                    && expected_hash.eq_ignore_ascii_case(&hash)
-                    && snapshot_blob_is_available(instance_dir, expected_hash, *expected_size)
-            })
-        {
+        let reference_matches = match reference.get(&entry.relative_path) {
+            Some((expected_hash, expected_size))
+                if *expected_size == entry.size && expected_hash.eq_ignore_ascii_case(&hash) =>
+            {
+                snapshot_blob_is_available(instance_dir, expected_hash, *expected_size)?
+            }
+            _ => false,
+        };
+        if !reference_matches {
             matches = false;
         }
         refreshed.push(entry);
@@ -1107,11 +1175,11 @@ fn hash_live_file(instance_dir: &Path, relative_path: &str) -> Result<String, St
     Ok(sha256_hex(&contents))
 }
 
-fn snapshot_blob_is_available(instance_dir: &Path, hash: &str, size: u64) -> bool {
+fn snapshot_blob_is_available(instance_dir: &Path, hash: &str, size: u64) -> Result<bool, String> {
     if validate_blob_hash(hash).is_err() {
-        return false;
+        return Ok(false);
     }
-    snapshot_blob_source(instance_dir, hash, size).is_some()
+    Ok(snapshot_blob_source(instance_dir, hash, size)?.is_some())
 }
 
 /// Return the metadata receipt associated with a snapshot, if it is valid.
@@ -1389,8 +1457,6 @@ pub(crate) fn create_snapshot_full_with_pause(
 
     fs::create_dir_all(snapshots_dir(instance_dir))
         .map_err(|e| format!("failed to create snapshots dir: {e}"))?;
-    fs::create_dir_all(snapshot_objects_dir(instance_dir))
-        .map_err(|e| format!("failed to create snapshot object store: {e}"))?;
 
     let previous = read_live_file_index_cache(instance_dir)
         .unwrap_or_default()
@@ -1478,7 +1544,7 @@ pub(crate) fn create_snapshot_full_with_pause(
                 // the store, not the cache: a collection is free to have taken it before this
                 // capture registered anything, and a manifest that names a blob nobody placed is a
                 // restore that cannot happen. Placing it again is the answer.
-                if !snapshot_blob_is_available(instance_dir, &sha256, size) {
+                if !snapshot_blob_is_available(instance_dir, &sha256, size)? {
                     let source = instance_dir.join(Path::new(&entry.relative_path));
                     let (placed_hash, placed_size) =
                         crate::content_store::place_object_from_file(&paths, &source)
@@ -1570,8 +1636,6 @@ pub fn create_snapshot_from_data(
     let paths = snapshot_store_paths(instance_dir);
     fs::create_dir_all(snapshots_dir(instance_dir))
         .map_err(|e| format!("failed to create snapshots dir: {e}"))?;
-    fs::create_dir_all(snapshot_objects_dir(instance_dir))
-        .map_err(|e| format!("failed to create snapshot object store: {e}"))?;
 
     let mut entries = Vec::with_capacity(files.len());
     let mut total_size = 0u64;
@@ -1721,7 +1785,7 @@ pub fn restore_snapshot_data_with(
                 )
             })?;
         validate_blob_hash(blob_hash)?;
-        let blob_path = snapshot_blob_source(instance_dir, blob_hash, entry.size).ok_or_else(|| {
+        let blob_path = snapshot_blob_source(instance_dir, blob_hash, entry.size)?.ok_or_else(|| {
             format!(
                 "failed to open snapshot object for {}: no object store holds {blob_hash} of {} bytes whose bytes match the hash (missing, or a hash mismatch)",
                 entry.relative_path, entry.size
@@ -1811,28 +1875,28 @@ fn live_target(instance_dir: &Path, relative_path: &str) -> Result<PathBuf, Stri
 }
 
 pub(crate) fn blob_file_matches(path: &Path, expected_hash: &str, expected_size: u64) -> bool {
-    let Ok(file) = fs::File::open(path) else {
-        return false;
-    };
-    let Ok(metadata) = file.metadata() else {
-        return false;
-    };
-    if metadata.len() != expected_size {
-        return false;
+    matches!(
+        check_blob_file(path, expected_hash, expected_size),
+        Ok(true)
+    )
+}
+
+fn check_blob_file(path: &Path, expected_hash: &str, expected_size: u64) -> std::io::Result<bool> {
+    let file = fs::File::open(path)?;
+    if file.metadata()?.len() != expected_size {
+        return Ok(false);
     }
     let mut reader = BufReader::new(file);
     let mut hasher = sha2::Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
     loop {
-        let Ok(read) = reader.read(&mut buffer) else {
-            return false;
-        };
+        let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
     }
-    format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected_hash)
+    Ok(format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected_hash))
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
@@ -2347,7 +2411,7 @@ fn extract_and_verify(
                 })?;
             validate_blob_hash(blob_hash)?;
             let blob_path =
-                snapshot_blob_source(instance_dir, blob_hash, file_entry.size).ok_or_else(|| {
+                snapshot_blob_source(instance_dir, blob_hash, file_entry.size)?.ok_or_else(|| {
                     format!(
                         "failed to open snapshot object for {}: no object store holds {blob_hash} of {} bytes whose bytes match the hash (missing, or a hash mismatch)",
                         file_entry.relative_path, file_entry.size
@@ -3319,36 +3383,36 @@ pub(super) fn list_snapshot_scan_dir(dir: &Path) -> std::io::Result<Vec<std::io:
 /// Return the physical storage estimate used by retention for a snapshot.
 /// Shared objects may be counted by more than one snapshot, which is
 /// intentionally conservative for a size-cap policy.
-pub fn snapshot_storage_size(instance_dir: &Path, snapshot_id: &str) -> u64 {
-    if validate_snapshot_id(snapshot_id).is_err() {
-        return 0;
-    }
+pub fn snapshot_storage_size(instance_dir: &Path, snapshot_id: &str) -> Result<u64, String> {
+    validate_snapshot_id(snapshot_id)?;
     let manifest_path = snapshot_manifest_path(instance_dir, snapshot_id);
     if let Ok(manifest) = read_manifest_file(&manifest_path, snapshot_id) {
-        return fs::metadata(&manifest_path).map(|m| m.len()).unwrap_or(0)
-            + manifest
-                .files
-                .iter()
-                .filter_map(|file| file.blob_sha256.as_deref().or(file.sha256.as_deref()))
-                .filter(|hash| validate_blob_hash(hash).is_ok())
-                .map(|hash| {
-                    // Whichever store holds the blob, and the legacy location as the last guess so a
-                    // damaged blob still counts its size against the cap.
-                    let path = snapshot_blob_path(instance_dir, hash);
-                    fs::metadata(&path)
-                        .or_else(|_| {
-                            fs::metadata(
-                                snapshot_store_paths(instance_dir).content_object_path(hash),
-                            )
-                        })
-                        .map(|m| m.len())
-                        .unwrap_or(0)
-                })
-                .sum::<u64>();
+        let paths = snapshot_store_paths(instance_dir);
+        let legacy_active = crate::content_store::migrate::legacy_store_active(&paths);
+        let mut size = snapshot_object_check(&manifest_path, fs::metadata(&manifest_path))?
+            .map_or(0, |metadata| metadata.len());
+        for hash in manifest
+            .files
+            .iter()
+            .filter_map(|file| file.blob_sha256.as_deref().or(file.sha256.as_deref()))
+            .filter(|hash| validate_blob_hash(hash).is_ok())
+        {
+            // Count physical bytes even when a blob is damaged.
+            if legacy_active {
+                let legacy = snapshot_blob_path(instance_dir, hash);
+                if let Some(metadata) = legacy_blob_metadata(&paths, &legacy)? {
+                    size += metadata.len();
+                    continue;
+                }
+            }
+            let content = paths.content_object_path(hash);
+            size += snapshot_object_check(&content, fs::metadata(&content))?
+                .map_or(0, |metadata| metadata.len());
+        }
+        return Ok(size);
     }
-    fs::metadata(snapshot_zip_path(instance_dir, snapshot_id))
-        .map(|metadata| metadata.len())
-        .unwrap_or(0)
+    let zip = snapshot_zip_path(instance_dir, snapshot_id);
+    Ok(snapshot_object_check(&zip, fs::metadata(&zip))?.map_or(0, |metadata| metadata.len()))
 }
 
 /// Remove content-addressed objects that no owner record names any more, in both stores
@@ -4172,9 +4236,12 @@ mod tests {
             .blob_sha256
             .as_deref()
             .unwrap();
-        let content =
-            fs::read(snapshot_blob_source(&inst, hash, 11).expect("the object is in a store"))
-                .unwrap();
+        let content = fs::read(
+            snapshot_blob_source(&inst, hash, 11)
+                .unwrap()
+                .expect("the object is in a store"),
+        )
+        .unwrap();
         assert_eq!(content, b"mod content");
     }
 

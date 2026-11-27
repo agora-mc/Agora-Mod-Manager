@@ -743,6 +743,7 @@ pub fn adopt_imported_snapshot(
         ))
     })?;
     let blob_path = crate::snapshot::snapshot_blob_source(&instance_dir, hash, entry.size)
+        .map_err(InstanceError::Other)?
         .ok_or_else(|| {
             InstanceError::Other(format!(
                 "snapshot {snapshot_id}'s instance manifest is not in any object store"

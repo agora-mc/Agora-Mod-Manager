@@ -78,9 +78,34 @@ struct Seams {
     /// The grace period an object collection gives a newly written object.
     object_grace: Mutex<Option<std::time::Duration>>,
     object_collection_after_live: Mutex<Option<ObjectCollectionHook>>,
+    #[cfg(test)]
+    snapshot_migration_stop_after_place: Mutex<Option<usize>>,
+    #[cfg(test)]
+    snapshot_migration_stops: AtomicUsize,
 }
 
 type ObjectCollectionHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+impl TestSeams {
+    pub fn set_snapshot_migration_stop_after_place(&self, after: Option<usize>) {
+        *slot(&self.0.snapshot_migration_stop_after_place) = after;
+    }
+
+    pub(crate) fn snapshot_migration_should_stop(&self, placed: usize) -> bool {
+        let stop = *slot(&self.0.snapshot_migration_stop_after_place) == Some(placed);
+        if stop {
+            self.0
+                .snapshot_migration_stops
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        stop
+    }
+
+    pub(crate) fn snapshot_migration_stops(&self) -> usize {
+        self.0.snapshot_migration_stops.load(Ordering::Relaxed)
+    }
+}
 
 /// Observable database work during a settings gate check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

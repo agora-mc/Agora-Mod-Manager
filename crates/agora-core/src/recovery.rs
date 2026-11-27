@@ -83,6 +83,8 @@ const RECOVERY_OPERATION: &str = "recovery";
 pub enum OperationKind {
     /// Installing, updating or uninstalling a plugin package under the plugin-install lock.
     PluginInstall,
+    /// Moving pre-B3a snapshot objects under the content-store lock.
+    SnapshotObjectMigration,
 }
 
 impl OperationKind {
@@ -90,6 +92,7 @@ impl OperationKind {
     pub fn as_str(self) -> &'static str {
         match self {
             OperationKind::PluginInstall => "plugin-install",
+            OperationKind::SnapshotObjectMigration => "snapshot-object-migration",
         }
     }
 }
@@ -1210,6 +1213,58 @@ impl<'a, S> RecoveryCapability<'a, S> {
         self.journal_path.as_deref()
     }
 
+    /// Remove a plain file below a verified directory, refusing links along the relative path.
+    pub(crate) fn remove_file(&self, directory: &Path, path: &Path) -> LauncherResult<()> {
+        let relative = path.strip_prefix(directory).map_err(|_| {
+            refused(format!(
+                "{} is outside {}",
+                path.display(),
+                directory.display()
+            ))
+        })?;
+        let spelling = relative
+            .to_str()
+            .ok_or_else(|| refused(format!("{} has a non-Unicode name", path.display())))?;
+        let relative = agora_game_api::RelPath::strict(spelling)
+            .map_err(|error| refused(format!("{}: {error}", path.display())))?;
+        if !agora_game_api::same_spelling(path, &directory.join(relative.as_str())) {
+            return Err(refused(format!(
+                "{} changes under path validation",
+                path.display()
+            )));
+        }
+        if self.verified_identity(directory)?.is_none() {
+            return Ok(());
+        }
+
+        let mut current = directory.to_path_buf();
+        let mut parts = relative.as_str().split('/').peekable();
+        while let Some(part) = parts.next() {
+            current.push(part);
+            let metadata = match std::fs::symlink_metadata(&current) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(path_error(&current, error)),
+            };
+            let expected_type = if parts.peek().is_some() {
+                metadata.is_dir()
+            } else {
+                metadata.is_file()
+            };
+            if !expected_type || agora_game_api::is_a_reparse_point(&metadata) {
+                return Err(refused(format!(
+                    "{} is a link or has an unexpected file type",
+                    current.display()
+                )));
+            }
+        }
+        match std::fs::remove_file(&current) {
+            Ok(()) => sync_parent(&current).map_err(|error| path_error(&current, error)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(path_error(path, error)),
+        }
+    }
+
     /// Remove an owned folder.
     pub fn remove_dir(&mut self, path: &Path) -> LauncherResult<()> {
         if self.verified_identity(path)?.is_none() {
@@ -1446,6 +1501,10 @@ impl<'a, S> RecoveryCapability<'a, S> {
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
+
+fn path_error(path: &Path, error: std::io::Error) -> LauncherError {
+    journal_error(format!("{}: {error}", path.display()))
+}
 
 /// An error from writing or reading a journal, or from acting through a capability.
 fn journal_error(message: String) -> LauncherError {

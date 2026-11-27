@@ -212,12 +212,13 @@ fn a_damaged_store_object_of_the_same_size_is_replaced_by_the_good_legacy_copy()
 fn after_the_migration_the_legacy_store_is_not_read() {
     let (_dir, ctx) = fixture();
     let dir = instance_with_file(&ctx, "live", b"unused");
+    fs::create_dir_all(legacy_root(&ctx)).unwrap();
     done(migrate::migrate_snapshot_objects(&ctx).unwrap());
 
     // Something put a valid-looking object back in the old store after the migration finished.
     let late = plant_legacy(&ctx, &sha256_hex(b"late"), b"late");
     assert_eq!(
-        snapshot::snapshot_blob_source(&dir, &sha256_hex(b"late"), 4),
+        snapshot::snapshot_blob_source(&dir, &sha256_hex(b"late"), 4).unwrap(),
         None,
         "a finished migration stops the fallback read"
     );
@@ -249,11 +250,40 @@ fn before_the_migration_the_fallback_read_still_works() {
 
     assert!(migrate::legacy_store_active(&ctx.paths));
     assert_eq!(
-        snapshot::snapshot_blob_source(&dir, &hash, b"still legacy".len() as u64),
+        snapshot::snapshot_blob_source(&dir, &hash, b"still legacy".len() as u64).unwrap(),
         Some(legacy)
     );
     fs::write(dir.join("mods").join("kept.jar"), b"changed").unwrap();
     snapshot::restore_snapshot(&dir, &snap.id, &["mods"]).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn an_unreadable_legacy_blob_is_reported_and_kept() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let (_dir, ctx) = fixture();
+    let bytes = b"still legacy";
+    let dir = instance_with_file(&ctx, "live", bytes);
+    let hash = sha256_hex(bytes);
+    let legacy = plant_legacy(&ctx, &hash, bytes);
+    let exclusive_handle = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&legacy)
+        .unwrap();
+
+    let error = snapshot::snapshot_blob_source(&dir, &hash, bytes.len() as u64).unwrap_err();
+    assert!(error.contains("could not check snapshot object"), "{error}");
+    assert!(migrate::migrate_snapshot_objects(&ctx).is_err());
+    assert!(migrate::legacy_store_active(&ctx.paths));
+
+    drop(exclusive_handle);
+    assert_eq!(
+        snapshot::snapshot_blob_source(&dir, &hash, bytes.len() as u64).unwrap(),
+        Some(legacy)
+    );
+    done(migrate::migrate_snapshot_objects(&ctx).unwrap());
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +308,10 @@ fn an_empty_legacy_store_finishes_with_nothing_moved() {
     let (_dir, ctx) = fixture();
     fs::create_dir_all(legacy_root(&ctx)).unwrap();
     let report = done(migrate::migrate_snapshot_objects(&ctx).unwrap());
-    assert_eq!(report.moved + report.already_present + report.replaced_damaged, 0);
+    assert_eq!(
+        report.moved + report.already_present + report.replaced_damaged,
+        0
+    );
     assert!(!migrate::legacy_store_active(&ctx.paths));
 }
 
@@ -324,7 +357,10 @@ fn an_unreadable_journal_needs_a_hand_and_the_fallback_stays() {
         matches!(outcome, MigrationOutcome::NeedsHand(_)),
         "{outcome:?}"
     );
-    assert!(legacy.exists(), "nothing moves under a journal nobody can read");
+    assert!(
+        legacy.exists(),
+        "nothing moves under a journal nobody can read"
+    );
     assert!(migrate::legacy_store_active(&ctx.paths));
     assert_eq!(
         fs::read(&journal).unwrap(),
@@ -353,7 +389,11 @@ fn restarting_sets_a_damaged_journal_aside_and_finishes() {
         .flatten()
         .filter(|entry| fs::read(entry.path()).ok().as_deref() == Some(b"{ not a journal"))
         .collect();
-    assert_eq!(set_aside.len(), 1, "the damaged journal is kept beside the new one");
+    assert_eq!(
+        set_aside.len(),
+        1,
+        "the damaged journal is kept beside the new one"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -371,9 +411,11 @@ fn a_run_stopped_halfway_resumes_and_finishes() {
         .map(|bytes| plant_legacy(&ctx, &sha256_hex(bytes), bytes))
         .collect();
 
-    ctx.test_seams.set_snapshot_migration_stop_after_place(Some(2));
+    ctx.test_seams
+        .set_snapshot_migration_stop_after_place(Some(2));
     let stopped = migrate::migrate_snapshot_objects(&ctx);
     assert!(stopped.is_err(), "the seam stops the run: {stopped:?}");
+    assert_eq!(ctx.test_seams.snapshot_migration_stops(), 1);
     assert!(
         migrate::legacy_store_active(&ctx.paths),
         "a stopped run is not done"
@@ -383,7 +425,9 @@ fn a_run_stopped_halfway_resumes_and_finishes() {
     let dir = instance_with_file(&ctx, "live", b"unused");
     for bytes in &names {
         assert!(
-            snapshot::snapshot_blob_source(&dir, &sha256_hex(bytes), bytes.len() as u64).is_some(),
+            snapshot::snapshot_blob_source(&dir, &sha256_hex(bytes), bytes.len() as u64)
+                .unwrap()
+                .is_some(),
             "{:?} is readable while the migration is unfinished",
             String::from_utf8_lossy(bytes)
         );
@@ -394,7 +438,10 @@ fn a_run_stopped_halfway_resumes_and_finishes() {
 
     for (path, bytes) in planted.iter().zip(&names) {
         assert!(!path.exists(), "{path:?}");
-        assert_eq!(object_bytes(&ctx, &sha256_hex(bytes)).as_deref(), Some(*bytes));
+        assert_eq!(
+            object_bytes(&ctx, &sha256_hex(bytes)).as_deref(),
+            Some(*bytes)
+        );
     }
     assert!(!migrate::legacy_store_active(&ctx.paths));
 }
@@ -403,12 +450,17 @@ fn a_run_stopped_halfway_resumes_and_finishes() {
 #[test]
 fn mismatches_found_before_a_stop_are_still_reported_at_the_end() {
     let (_dir, ctx) = fixture();
-    let bad = plant_legacy(&ctx, &sha256_hex(b"aaa-promised"), b"aaa-delivered");
+    // The "5f" shard sorts before each good object's shard.
+    let bad = plant_legacy(&ctx, &sha256_hex(b"0"), b"aaa-delivered");
     for bytes in [&b"x1"[..], b"x2", b"x3"] {
         plant_legacy(&ctx, &sha256_hex(bytes), bytes);
     }
-    ctx.test_seams.set_snapshot_migration_stop_after_place(Some(1));
-    let _ = migrate::migrate_snapshot_objects(&ctx);
+    ctx.test_seams
+        .set_snapshot_migration_stop_after_place(Some(1));
+    assert!(migrate::migrate_snapshot_objects(&ctx).is_err());
+    assert_eq!(ctx.test_seams.snapshot_migration_stops(), 1);
+    // The resumed walk cannot rediscover the mismatch.
+    fs::remove_file(&bad).unwrap();
     ctx.test_seams.set_snapshot_migration_stop_after_place(None);
 
     let report = done(migrate::migrate_snapshot_objects(&ctx).unwrap());
@@ -474,7 +526,10 @@ fn files_that_are_not_objects_are_left_and_reported() {
         "and it is reported: {report:?}"
     );
     let receipt = object.with_file_name(format!("{hash}.agora-verified.json"));
-    assert!(!receipt.exists(), "the moved object's own receipt goes with it");
+    assert!(
+        !receipt.exists(),
+        "the moved object's own receipt goes with it"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -554,13 +554,13 @@ pub(crate) fn run_retention_with_pause(
     let entries: Vec<RetentionEntry> = snapshots
         .iter()
         .map(|snapshot| {
-            let measured = crate::snapshot::snapshot_storage_size(instance_dir, &snapshot.id);
+            let measured = crate::snapshot::snapshot_storage_size(instance_dir, &snapshot.id)?;
             let archive_size = if measured == 0 {
                 snapshot.size_estimate
             } else {
                 measured
             };
-            RetentionEntry {
+            Ok(RetentionEntry {
                 id: snapshot.id.clone(),
                 size_bytes: archive_size,
                 is_lkg: lkg.promoted_snapshot_ids.contains(&snapshot.id)
@@ -584,9 +584,9 @@ pub(crate) fn run_retention_with_pause(
                     .label
                     .as_deref()
                     .is_some_and(|label| label.starts_with("crash-doctor-")),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
     let policy = RetentionPolicy::default();
     let to_evict = retention_plan_with_sizes(&entries, &policy);
     let kept_manual_size: u64 = entries
@@ -660,7 +660,7 @@ mod tests {
     /// A bare `TempDir` must not be passed where an instance directory is expected:
     /// `snapshot_app_root` walks from the instance directory to its parent, so a bare temp
     /// folder resolves the app root — and with it the `locks/instance-locations.lock` and the
-    /// shared `snapshot-objects` store — to the *system* temp folder, which every test worker
+    /// shared content store — to the *system* temp folder, which every test worker
     /// shares. Under load, one worker's retention round then blocks another's past its short
     /// wait, and the round reads as skipped. Through `path()` the tests keep addressing the
     /// same directory they always did.

@@ -250,9 +250,16 @@ fn collect(
     let mut recent = Vec::new();
     let grace = request.grace.unwrap_or(OBJECT_GRACE);
     let now = SystemTime::now();
-    for root in object_roots(paths) {
-        if let Err(error) = read_object_root(&root, &keep, grace, now, &mut candidates, &mut recent)
-        {
+    for (root, legacy) in object_roots(paths) {
+        if let Err(error) = read_object_root(
+            &root,
+            legacy,
+            &keep,
+            grace,
+            now,
+            &mut candidates,
+            &mut recent,
+        ) {
             report.refusals.push(error);
         }
     }
@@ -360,13 +367,13 @@ fn acquire(
     }
 }
 
-/// The two object stores this collection owns. The legacy one is emptied by the migration (B3b) and
-/// read only until then.
-fn object_roots(paths: &AppPaths) -> Vec<PathBuf> {
-    vec![
-        paths.content_objects_dir(),
-        paths.root().join("snapshot-objects"),
-    ]
+/// The content store and, until migration retires it, the legacy store.
+fn object_roots(paths: &AppPaths) -> Vec<(PathBuf, bool)> {
+    let mut roots = vec![(paths.content_objects_dir(), false)];
+    if super::migrate::legacy_store_active(paths) {
+        roots.push((super::migrate::legacy_root(paths), true));
+    }
+    roots
 }
 
 /// The object hashes the item records name: files, a saved icon, and a hash a source published.
@@ -783,6 +790,7 @@ fn read_pending(
 /// Read one store: every object's name and time, and whether it may go.
 fn read_object_root(
     root: &Path,
+    legacy: bool,
     keep: &HashSet<String>,
     grace: Duration,
     now: SystemTime,
@@ -790,7 +798,9 @@ fn read_object_root(
     recent: &mut Vec<String>,
 ) -> Result<(), String> {
     match std::fs::symlink_metadata(root) {
-        Ok(metadata) if metadata.is_dir() => {}
+        Ok(metadata)
+            if metadata.is_dir() && (!legacy || !agora_game_api::is_a_reparse_point(&metadata)) => {
+        }
         Ok(_) => {
             return Err(format!(
                 "{} is a link or not a folder, so the objects in it cannot be listed; nothing is deleted",
@@ -807,7 +817,9 @@ fn read_object_root(
             .map_err(|error| format!("cannot read an entry in {}: {error}", root.display()))?
             .path();
         match std::fs::symlink_metadata(&shard) {
-            Ok(metadata) if metadata.is_dir() => {}
+            Ok(metadata)
+                if metadata.is_dir()
+                    && (!legacy || !agora_game_api::is_a_reparse_point(&metadata)) => {}
             // A link where a shard of the store should be names objects this collection cannot
             // see: listing it would judge an incomplete set, so nothing is deleted.
             Ok(_) => {
@@ -835,8 +847,16 @@ fn read_object_root(
                 // A receipt beside an object, a temp file on its way in: not an object.
                 continue;
             }
+            if legacy && super::migrate::object_name(root, &path).is_none() {
+                continue;
+            }
             let metadata = match std::fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.is_file() => metadata,
+                Ok(metadata)
+                    if metadata.is_file()
+                        && (!legacy || !agora_game_api::is_a_reparse_point(&metadata)) =>
+                {
+                    metadata
+                }
                 // Anything else under an object name — a link included — is something this
                 // collection cannot judge, so it stops rather than reads past it.
                 Ok(_) => {
@@ -851,7 +871,7 @@ fn read_object_root(
                     return Err(format!("cannot inspect {}: {error}", path.display()));
                 }
             };
-            if keep.contains(name) {
+            if keep.contains(name) || (legacy && keep.contains(&name.to_ascii_lowercase())) {
                 continue;
             }
             let modified = match metadata.modified() {
@@ -867,6 +887,25 @@ fn read_object_root(
             if age < grace {
                 recent.push(name.to_string());
                 continue;
+            }
+            if legacy {
+                // Preserve mismatches even if startup migration has stopped before retirement.
+                let actual = super::hash_file_path(&path)
+                    .map_err(|error| format!("cannot hash {}: {error}", path.display()))?;
+                if !actual.eq_ignore_ascii_case(name) {
+                    continue;
+                }
+                let receipt = crate::artifact_receipt::receipt_path(&path);
+                match std::fs::symlink_metadata(&receipt) {
+                    Ok(entry) if agora_game_api::is_a_reparse_point(&entry) => {
+                        return Err(format!("{} is a link or reparse point", receipt.display()));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!("cannot inspect {}: {error}", receipt.display()))
+                    }
+                }
             }
             candidates.push((name.to_string(), path));
         }

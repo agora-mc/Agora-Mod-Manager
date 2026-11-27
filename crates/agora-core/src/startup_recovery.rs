@@ -17,6 +17,7 @@
 //! 3. User-files sessions of finished runs ([`game_user_files::recover_finished_sessions`]).
 //! 4. Interrupted Recently deleted (trash) entries
 //!    ([`game_instance::trash::recover_interrupted_reporting`]).
+//! 5. Pre-B3a snapshot object migration ([`migrate_snapshot_objects`]).
 //!
 //! The one recovery that does NOT run here is the interrupted plugin install
 //! ([`plugins::install::recover_interrupted_installs`]): it must finish before the plugin
@@ -57,6 +58,7 @@
 //! Everything is reported, never raised: a journal that needs a hand comes back as a warning line,
 //! and startup continues.
 
+use crate::content_store::migrate::{migrate_snapshot_objects, MigrationOutcome};
 use crate::ctx::Ctx;
 use crate::game_tool_swap::Recovery;
 
@@ -110,6 +112,42 @@ pub fn run_at_startup(ctx: &Ctx) -> StartupRecoveryReport {
     let (actions, warnings) = crate::game_instance::trash::recover_interrupted_reporting(ctx);
     report.actions.extend(actions);
     report.warnings.extend(warnings);
+
+    // 5. Move legacy snapshot objects while the content store is idle.
+    match migrate_snapshot_objects(ctx) {
+        Ok(MigrationOutcome::NothingToDo) => {}
+        Ok(MigrationOutcome::Busy) => report.warnings.push(
+            "Snapshot object migration will retry on startup because the content store is busy."
+                .into(),
+        ),
+        Ok(MigrationOutcome::Done(migration)) => {
+            report.actions.push(format!(
+                "Moved {} snapshot objects ({} repaired), kept {} existing content objects and {} legacy entries.",
+                migration.moved + migration.replaced_damaged,
+                migration.replaced_damaged,
+                migration.already_present,
+                migration.mismatched.len() + migration.left_alone.len()
+            ));
+            for path in migration.mismatched {
+                report.warnings.push(format!(
+                    "Kept legacy snapshot object {} because its SHA-256 differs from its name.",
+                    path.display()
+                ));
+            }
+            for (path, reason) in migration.left_alone {
+                report.warnings.push(format!(
+                    "Kept legacy snapshot entry {} ({reason}).",
+                    path.display()
+                ));
+            }
+        }
+        Ok(MigrationOutcome::NeedsHand(reason)) => report
+            .warnings
+            .push(format!("Snapshot object migration needs a hand. {reason}")),
+        Err(error) => report
+            .warnings
+            .push(format!("Snapshot object migration stopped. {error}")),
+    }
 
     report
 }

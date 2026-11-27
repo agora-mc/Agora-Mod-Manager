@@ -1,7 +1,7 @@
 //! User-facing backup layer built on the content-addressed snapshot store.
 //!
 //! The internal snapshot store (`crates/agora-core/src/snapshot.rs:1`) is
-//! deduplicated and content-addressed: blobs live in `snapshot-objects/` and are
+//! deduplicated and content-addressed: blobs live in the shared object store and are
 //! shared across snapshots of the same instance.  An exported artifact cannot
 //! rely on that store — the destination (e.g. a Dropbox-synced folder) has none
 //! of those blobs — so an export is necessarily a **full materialisation**:
@@ -211,7 +211,7 @@ fn backup_file_name(instance_dir: &Path, snapshot_id: &str) -> String {
 
 /// The app data root an instance folder sits under. `import_backup` can be
 /// handed a path that does not exist yet, so this is derived from the folder,
-/// the same way `snapshot::snapshot_objects_dir` derives it.
+/// the same way `snapshot::snapshot_store_paths` derives it.
 fn data_root_for(instance_dir: &Path) -> PathBuf {
     let instances_root = instance_dir.parent().unwrap_or(instance_dir);
     if instances_root
@@ -613,7 +613,7 @@ fn run_backup_retention_with_report(
 /// The artifact is fully materialised: every file's bytes are copied from the
 /// content-addressed blob store (or, for legacy v1/v2 snapshots, from the
 /// legacy `.zip` archive) into the new zip, so the destination does not need
-/// any of the internal `snapshot-objects/` blobs.  If any source blob is
+/// any of the internal object stores. If any source blob is
 /// missing or fails hash verification, the export **fails and deletes the
 /// partial artifact** rather than silently producing a truncated zip.
 pub fn export_snapshot(
@@ -745,7 +745,7 @@ pub fn export_snapshot(
         if is_modern {
             for entry in &file_index {
                 let blob_path =
-                    crate::snapshot::snapshot_blob_source(instance_dir, &entry.sha256, entry.size);
+                    crate::snapshot::snapshot_blob_source(instance_dir, &entry.sha256, entry.size)?;
                 // Validate the blob before streaming it into the zip.
                 let blob_path = match blob_path {
                     Some(path) => path,
@@ -1330,8 +1330,6 @@ pub fn import_backup(
         .map_err(|error| format!("failed to create instance directory: {error}"))?;
     fs::create_dir_all(crate::snapshot::snapshots_dir(instance_dir))
         .map_err(|error| format!("failed to create snapshots dir: {error}"))?;
-    fs::create_dir_all(crate::snapshot::snapshot_objects_dir(instance_dir))
-        .map_err(|error| format!("failed to create snapshot object store: {error}"))?;
 
     let snapshot_id = manifest.snapshot.id.clone();
     // Fail closed if the snapshot already exists with different content.  A
@@ -1700,7 +1698,7 @@ pub fn export_game_snapshot(
                 instance_dir,
                 &entry.sha256,
                 entry.size,
-            ) {
+            )? {
                 Some(path) => path,
                 None => {
                     return Err(format!(
@@ -2513,8 +2511,6 @@ fn import_game_backup(
             .map_err(|error| format!("failed to create instance directory: {error}"))?;
         fs::create_dir_all(crate::snapshot::snapshots_dir(instance_dir))
             .map_err(|error| format!("failed to create snapshots dir: {error}"))?;
-        fs::create_dir_all(crate::snapshot::snapshot_objects_dir(instance_dir))
-            .map_err(|error| format!("failed to create snapshot object store: {error}"))?;
 
         for entry in &manifest.files {
             if entry.absent {
@@ -3106,6 +3102,7 @@ mod tests {
         let index = crate::snapshot::snapshot_file_index(&instance, &snapshot.id).unwrap();
         let first = &index[0];
         let blob_path = crate::snapshot::snapshot_blob_source(&instance, &first.sha256, first.size)
+            .unwrap()
             .expect("the capture stored the blob somewhere");
         crate::content_store::protect::unprotect(&blob_path).unwrap();
         std::fs::remove_file(&blob_path).unwrap();

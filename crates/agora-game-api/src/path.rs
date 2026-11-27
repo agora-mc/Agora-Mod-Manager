@@ -813,7 +813,7 @@ impl ReparseTag {
 /// Whether the metadata of a path says it is some kind of reparse point (Windows) or a symbolic link
 /// (Unix). Only the first half of the question: on Windows it does not say whether the tag redirects
 /// a name, which is what [`is_link`] answers.
-fn is_a_reparse_point(metadata: &std::fs::Metadata) -> bool {
+pub fn is_a_reparse_point(metadata: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
