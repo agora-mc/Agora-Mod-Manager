@@ -788,9 +788,8 @@ impl LaunchService {
                     "provisioning-java",
                     "Provisioning the required Java runtime",
                 );
-                request
-                    .network_policy
-                    .check(agora_core::network::NetworkCategory::JavaRuntime)?;
+                // No permission check here: provisioning may finish from an archive already on
+                // disk, and `ensure_runtime` asks before it downloads anything.
                 let ensured = provision_java_reporting(
                     &self.ctx,
                     request.runtimes_root.clone(),
