@@ -7,8 +7,11 @@
 use crate::launch::{MojangVersionManifest, MojangVersionRef, VersionInfo};
 use crate::launch_planner;
 use crate::launch_planner::LaunchHttpClients;
-use agora_core::error::{LauncherError, LauncherResult};
-use agora_core::network::{check_launch_request, NetworkCategory, NetworkPolicy};
+use agora_core::{
+    error::{LauncherError, LauncherResult},
+    network::{check_launch_request_with, NetworkCategory, NetworkPolicy},
+    network_gate::NetworkGate,
+};
 use std::path::Path;
 
 const VERSION_MANIFEST_URL: &str =
@@ -29,8 +32,8 @@ pub async fn ensure_base_version_metadata(
     minecraft_root: &Path,
     version_id: &str,
     policy: &NetworkPolicy,
+    gate: &dyn NetworkGate,
 ) -> LauncherResult<VersionInfo> {
-    // 0. Validate version_id to prevent path traversal.
     if version_id.is_empty()
         || version_id.contains('/')
         || version_id.contains('\\')
@@ -56,7 +59,7 @@ pub async fn ensure_base_version_metadata(
     }
 
     // 2. Check network policy before any outward request.
-    check_launch_request(policy, NetworkCategory::MojangMetadata)?;
+    check_launch_request_with(gate, policy, NetworkCategory::MojangMetadata)?;
 
     // 3. Build redirect-safe HTTP clients (reuses planner's policy).
     let clients = LaunchHttpClients::new()?;
@@ -71,6 +74,7 @@ pub async fn ensure_base_version_metadata(
         &manifest_path,
         None,
         policy,
+        gate,
         NetworkCategory::MojangMetadata,
     )
     .await?;
@@ -98,6 +102,7 @@ pub async fn ensure_base_version_metadata(
         &version_path,
         version_ref.sha1.as_deref(),
         policy,
+        gate,
         NetworkCategory::MojangMetadata,
     )
     .await?;
@@ -111,8 +116,9 @@ pub async fn ensure_base_version_metadata(
 pub async fn list_snapshot_versions(
     minecraft_root: &Path,
     policy: &NetworkPolicy,
+    gate: &dyn NetworkGate,
 ) -> LauncherResult<Vec<String>> {
-    check_launch_request(policy, NetworkCategory::MojangMetadata)?;
+    check_launch_request_with(gate, policy, NetworkCategory::MojangMetadata)?;
     let clients = LaunchHttpClients::new()?;
     let manifest: MojangVersionManifest = launch_planner::load_json_cache_first(
         clients.for_category(NetworkCategory::MojangMetadata),
@@ -122,6 +128,7 @@ pub async fn list_snapshot_versions(
             .join("version_manifest_v2.json"),
         None,
         policy,
+        gate,
         NetworkCategory::MojangMetadata,
     )
     .await?;

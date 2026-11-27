@@ -33,7 +33,9 @@ use crate::launch::{self, LoaderInfo, VersionInfo};
 use crate::loader_manifests;
 use agora_core::download;
 use agora_core::error::{LauncherError, LauncherResult};
-use agora_core::network::{self, check_launch_request, NetworkCategory, NetworkPolicy};
+use agora_core::network::{
+    self, check_launch_request, check_launch_request_with, NetworkCategory, NetworkPolicy,
+};
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -954,6 +956,9 @@ pub async fn resolve(request: ResolveRequest) -> LauncherResult<ResolvedLaunchPl
         &request.cache_dir,
         &request.base_version_id,
         &request.network_policy,
+        // This path is a launch request built by an adapter and carries no context; the
+        // process gate is that adapter's context gate in production, where there is one.
+        &*agora_core::network_gate::current(),
     )
     .await?;
 
@@ -4025,6 +4030,7 @@ pub(crate) async fn load_json_cache_first<T: serde::de::DeserializeOwned>(
     cache_path: &Path,
     expected_sha1: Option<&str>,
     policy: &NetworkPolicy,
+    gate: &dyn agora_core::network_gate::NetworkGate,
     category: NetworkCategory,
 ) -> LauncherResult<T> {
     // Phase 1: Try to serve from cache. Hold onto a stale-but-valid parse
@@ -4059,7 +4065,7 @@ pub(crate) async fn load_json_cache_first<T: serde::de::DeserializeOwned>(
     // Phase 2: Check policy. If the category is disabled, return the stale
     // cache (if valid) rather than a policy error. This enables offline
     // launches from a stale-but-valid manifest.
-    if let Err(policy_err) = check_launch_request(policy, category) {
+    if let Err(policy_err) = check_launch_request_with(gate, policy, category) {
         if let Some(parsed) = stale_parsed {
             return Ok(parsed);
         }

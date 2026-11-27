@@ -13,7 +13,7 @@ use agora_core::{
     error::{LauncherError, LauncherResult},
     event_sink::{CoreEvent, EventStatus, ProgressEvent, ProgressPhase},
     models::{InstanceManifest, InstanceRow},
-    network::{check_launch_request, NetworkCategory, NetworkPolicy},
+    network::{check_launch_request_with, NetworkCategory, NetworkPolicy},
     operation_manager::OpHandle,
 };
 use std::collections::BTreeMap;
@@ -479,6 +479,7 @@ impl LoaderService {
             &minecraft_root,
             &tuple.minecraft_version,
             &policy,
+            &*self.ctx.network_gate(),
         )
         .await
         {
@@ -545,7 +546,11 @@ impl LoaderService {
             }
         }
 
-        if let Err(e) = check_launch_request(&policy, NetworkCategory::LoaderMetadataAndContent) {
+        if let Err(e) = check_launch_request_with(
+            &*self.ctx.network_gate(),
+            &policy,
+            NetworkCategory::LoaderMetadataAndContent,
+        ) {
             let e = attach_reinstall_context(e, adopt_failure.as_deref());
             op.fail(e.to_string());
             return Err(e);
@@ -713,7 +718,11 @@ impl LoaderService {
             None
         };
         let result = async {
-            check_launch_request(policy, NetworkCategory::LoaderMetadataAndContent)?;
+            check_launch_request_with(
+                &*self.ctx.network_gate(),
+                policy,
+                NetworkCategory::LoaderMetadataAndContent,
+            )?;
             let java_path = self
                 .resolve_installer_java(minecraft_root, &tuple.minecraft_version, policy, op)
                 .await?;
@@ -795,6 +804,7 @@ impl LoaderService {
             minecraft_root,
             minecraft_version,
             policy,
+            &*self.ctx.network_gate(),
         )
         .await?;
         let required = crate::java::java_requirement_from_version(&version).major;

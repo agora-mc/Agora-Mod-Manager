@@ -1157,12 +1157,14 @@ async fn a_backup_fetch_is_refused_when_the_network_is_off() {
         snapshot::list_snapshots(&h.dir()).unwrap()[0].id
     ));
     let empty = TempDir::new().unwrap();
-    let ctx = fresh_context(&h.def, empty.path());
+    // The refusal is this context's own (MASTER_SPEC 32.9), not a process-wide slot another test
+    // could loosen.
+    let ctx = fresh_context(&h.def, empty.path())
+        .with_network_gate(Arc::new(agora_core::network_gate::DenyAll));
     let id = "network-off";
     let item = fake_catalog_item(&archive_sha);
     let transport = FakeCatalogTransport::with_archive(zip_archive_bytes());
 
-    agora_core::network_gate::install(Arc::new(agora_core::network_gate::DenyAll));
     let result =
         backup::import_instance_backup_with(&ctx, id, &artifact, true, &transport, |item_id| {
             if item_id == "fake-mod" {
@@ -1172,7 +1174,6 @@ async fn a_backup_fetch_is_refused_when_the_network_is_off() {
             }
         })
         .await;
-    agora_core::network_gate::install(Arc::new(agora_core::network_gate::AllowAll));
 
     let error = result.unwrap_err();
     assert!(

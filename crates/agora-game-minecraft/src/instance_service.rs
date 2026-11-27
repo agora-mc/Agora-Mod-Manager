@@ -1935,6 +1935,7 @@ impl InstanceService {
             &minecraft_root,
             &request.minecraft_version,
             &policy,
+            &*self.ctx.network_gate(),
         )
         .await
         .map_err(|e| {

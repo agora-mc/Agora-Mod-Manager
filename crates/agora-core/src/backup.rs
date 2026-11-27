@@ -2142,6 +2142,7 @@ where
                     )),
                     Some(catalog_item) => {
                         match crate::catalog_install::fetch_recorded_archive(
+                            &*ctx.network_gate(),
                             transport,
                             &catalog_item,
                             source,

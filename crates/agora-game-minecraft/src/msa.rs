@@ -2379,7 +2379,7 @@ pub async fn get_valid_credentials(clients: &HttpClients) -> MsaCredentialOutcom
     // A refused request is a temporary condition — Lockdown Mode or a disabled
     // endpoint — so stored credentials must be preserved rather than treated as
     // an invalidated session.
-    if let Err(error) = agora_core::network_gate::authorize(ClientCategory::Microsoft) {
+    if let Err(error) = clients.authorize(ClientCategory::Microsoft) {
         return MsaCredentialOutcome::RefreshFailed(error);
     }
     get_valid_credentials_inner(&LiveMsaRefreshHttp, clients).await
