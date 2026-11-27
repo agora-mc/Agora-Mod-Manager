@@ -3,6 +3,7 @@
 //! Pure logic — no filesystem or process dependencies.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 
@@ -384,6 +385,14 @@ pub fn retention_plan_with_sizes(
     entries_newest_first: &[RetentionEntry],
     policy: &RetentionPolicy,
 ) -> Vec<String> {
+    retention_plan_with_cap(entries_newest_first, policy, Some(policy.size_cap_bytes))
+}
+
+fn retention_plan_with_cap(
+    entries_newest_first: &[RetentionEntry],
+    policy: &RetentionPolicy,
+    size_cap: Option<u64>,
+) -> Vec<String> {
     use std::collections::HashSet;
 
     let mut keep = HashSet::new();
@@ -436,7 +445,7 @@ pub fn retention_plan_with_sizes(
         .filter(|entry| keep.contains(&entry.id))
         .map(|entry| entry.size_bytes)
         .sum();
-    if retained_size > policy.size_cap_bytes {
+    if let Some(size_cap) = size_cap.filter(|cap| retained_size > *cap) {
         let mut candidates: Vec<&RetentionEntry> = entries_newest_first
             .iter()
             .rev() // oldest first within each safety tier
@@ -456,7 +465,7 @@ pub fn retention_plan_with_sizes(
             }
         });
         for entry in candidates {
-            if retained_size <= policy.size_cap_bytes {
+            if retained_size <= size_cap {
                 break;
             }
             if keep.remove(&entry.id) {
@@ -476,37 +485,60 @@ pub fn retention_plan_with_sizes(
 // Retention (moved from desktop commands.rs — core-owned)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Default)]
+pub struct RetentionRoundReport {
+    /// Snapshots kept because their physical size could not be measured.
+    pub unmeasured_snapshots: BTreeMap<String, String>,
+    pub collection: Option<crate::content_store::collect::CollectReport>,
+}
+
+impl RetentionRoundReport {
+    pub fn summary(&self) -> String {
+        let mut lines = Vec::new();
+        if !self.unmeasured_snapshots.is_empty() {
+            lines.push("skipped size-based eviction".to_string());
+            for (id, reason) in &self.unmeasured_snapshots {
+                lines.push(format!(
+                    "kept snapshot {id} because its size could not be measured ({reason})"
+                ));
+            }
+        }
+        if let Some(collection) = &self.collection {
+            lines.push(collection.summary());
+        }
+        lines.join(". ")
+    }
+}
+
 /// Run snapshot retention for an instance directory using default policy.
 /// Lists snapshots, cross-references LKG state, evicts those exceeding the
 /// configured category counts and size cap.
 pub fn run_retention(instance_dir: &Path) -> Result<(), String> {
-    run_retention_with_grace(instance_dir, None)
+    if let Some(report) = run_retention_with_report(instance_dir)?
+        .filter(|report| !report.unmeasured_snapshots.is_empty())
+    {
+        eprintln!(
+            "snapshot retention for {}: {}",
+            instance_dir.display(),
+            report.summary()
+        );
+    }
+    Ok(())
 }
 
-/// [`run_retention`] whose result carries what the round's one collection did: what it reclaimed,
-/// what it kept and why, or `None` when the round evicted nothing and did not collect.
+/// Report any unmeasurable snapshots and the result of the round's collection.
 pub fn run_retention_with_report(
     instance_dir: &Path,
-) -> Result<Option<crate::content_store::collect::CollectReport>, String> {
-    run_retention_with_pause(instance_dir, None, None)
+) -> Result<Option<RetentionRoundReport>, String> {
+    run_retention_round(instance_dir, &RetentionPolicy::default(), None, None)
 }
 
-/// [`run_retention`] with the object collector's grace period chosen: `None` is the hour production
-/// uses, and a test passes zero to see what the round frees.
-pub(crate) fn run_retention_with_grace(
+fn run_retention_round(
     instance_dir: &Path,
-    grace: Option<std::time::Duration>,
-) -> Result<(), String> {
-    run_retention_with_pause(instance_dir, grace, None).map(|_| ())
-}
-
-/// [`run_retention_with_grace`] with the collection's pause installed, so a test can say the round
-/// collects once rather than once per evicted snapshot (MASTER_SPEC §32.8).
-pub(crate) fn run_retention_with_pause(
-    instance_dir: &Path,
+    policy: &RetentionPolicy,
     grace: Option<std::time::Duration>,
     pause: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
-) -> Result<Option<crate::content_store::collect::CollectReport>, String> {
+) -> Result<Option<RetentionRoundReport>, String> {
     // Retention is automatic housekeeping. Hold the content-store lock and then the locations lock
     // once for the whole round, in the collector's order, so an instance cannot move between live
     // and Recently deleted while we decide what to delete, and so each delete does not try to take
@@ -551,16 +583,22 @@ pub(crate) fn run_retention_with_pause(
     }
 
     let lkg = read_lkg_state(instance_dir)?;
+    let mut report = RetentionRoundReport::default();
     let entries: Vec<RetentionEntry> = snapshots
         .iter()
         .map(|snapshot| {
-            let measured = crate::snapshot::snapshot_storage_size(instance_dir, &snapshot.id)?;
-            let archive_size = if measured == 0 {
-                snapshot.size_estimate
-            } else {
-                measured
+            let measured = crate::snapshot::snapshot_storage_size(instance_dir, &snapshot.id);
+            let unmeasured = measured.is_err();
+            let archive_size = match measured {
+                Ok(size) => size,
+                Err(error) => {
+                    report
+                        .unmeasured_snapshots
+                        .insert(snapshot.id.clone(), error);
+                    0
+                }
             };
-            Ok(RetentionEntry {
+            RetentionEntry {
                 id: snapshot.id.clone(),
                 size_bytes: archive_size,
                 is_lkg: lkg.promoted_snapshot_ids.contains(&snapshot.id)
@@ -580,27 +618,33 @@ pub(crate) fn run_retention_with_pause(
                 // contents cannot be judged, and silently deleting it would
                 // remove the only copy of something a person may still want.
                 is_preserved: snapshot.is_preserved() || snapshot.is_unreadable(),
-                is_protected: snapshot
-                    .label
-                    .as_deref()
-                    .is_some_and(|label| label.starts_with("crash-doctor-")),
-            })
+                is_protected: unmeasured
+                    || snapshot
+                        .label
+                        .as_deref()
+                        .is_some_and(|label| label.starts_with("crash-doctor-")),
+            }
         })
-        .collect::<Result<_, String>>()?;
-    let policy = RetentionPolicy::default();
-    let to_evict = retention_plan_with_sizes(&entries, &policy);
-    let kept_manual_size: u64 = entries
-        .iter()
-        .filter(|entry| entry.is_preserved && !to_evict.contains(&entry.id))
-        .map(|entry| entry.size_bytes)
-        .sum();
-    if kept_manual_size > policy.size_cap_bytes {
-        eprintln!(
-            "snapshots you made in {} use {} MB, over the {} MB limit; they are kept, but automatic snapshots may not fit. Delete some to free space.",
-            instance_dir.display(),
-            kept_manual_size / 1_000_000,
-            policy.size_cap_bytes / 1_000_000
-        );
+        .collect();
+    let size_cap = report
+        .unmeasured_snapshots
+        .is_empty()
+        .then_some(policy.size_cap_bytes);
+    let to_evict = retention_plan_with_cap(&entries, policy, size_cap);
+    if let Some(size_cap) = size_cap {
+        let kept_manual_size: u64 = entries
+            .iter()
+            .filter(|entry| entry.is_preserved && !to_evict.contains(&entry.id))
+            .map(|entry| entry.size_bytes)
+            .sum();
+        if kept_manual_size > size_cap {
+            eprintln!(
+                "snapshots you made in {} use {} MB, over the {} MB limit; they are kept, but automatic snapshots may not fit. Delete some to free space.",
+                instance_dir.display(),
+                kept_manual_size / 1_000_000,
+                size_cap / 1_000_000
+            );
+        }
     }
 
     // The whole batch goes first, then one collection over what is left: a collection between two
@@ -620,9 +664,8 @@ pub(crate) fn run_retention_with_pause(
             errors.join("; ")
         ));
     }
-    let mut report = None;
     if removed > 0 {
-        report = Some(
+        report.collection = Some(
             crate::content_store::collect::collect_at_instance(
                 instance_dir,
                 &crate::content_store::collect::CollectRequest {
@@ -639,7 +682,7 @@ pub(crate) fn run_retention_with_pause(
             }),
         );
     }
-    Ok(report)
+    Ok((report.collection.is_some() || !report.unmeasured_snapshots.is_empty()).then_some(report))
 }
 
 // ---------------------------------------------------------------------------
@@ -1529,6 +1572,69 @@ mod batch_tests {
         (root, dir)
     }
 
+    #[test]
+    fn retention_reports_and_keeps_a_malformed_manifest_even_with_a_readable_zip() {
+        use std::io::Write;
+
+        let (_root, dir) = temp_instance();
+        let snapshot = crate::snapshot::create_snapshot(&dir, Some("old"), &[]).unwrap();
+        let manifest = crate::snapshot::snapshot_manifest_path(&dir, &snapshot.id);
+        let zip = crate::snapshot::snapshot_zip_path(&dir, &snapshot.id);
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&zip).unwrap());
+        archive
+            .start_file("manifest.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive
+            .write_all(&std::fs::read(&manifest).unwrap())
+            .unwrap();
+        archive.finish().unwrap();
+        std::fs::write(&manifest, b"{ malformed").unwrap();
+        assert!(crate::snapshot::list_snapshots(&dir)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.id == snapshot.id && !entry.is_unreadable()));
+        let healthy = crate::snapshot::create_snapshot(&dir, Some("healthy"), &[]).unwrap();
+        let policy = RetentionPolicy {
+            size_cap_bytes: 1,
+            ..RetentionPolicy::default()
+        };
+
+        let report = run_retention_round(&dir, &policy, None, None)
+            .unwrap()
+            .expect("unmeasured snapshots belong in the round report");
+        let summary = report.summary();
+        assert!(summary.contains(&snapshot.id), "{summary}");
+        assert!(summary.contains("size-based eviction"), "{summary}");
+        assert!(manifest.is_file() && zip.is_file());
+        assert!(crate::snapshot::snapshot_manifest_path(&dir, &healthy.id).is_file());
+    }
+
+    #[test]
+    fn retention_reports_and_keeps_a_snapshot_with_an_uninspectable_object() {
+        let (_root, dir) = temp_instance();
+        let bytes = b"snapshot object";
+        std::fs::create_dir_all(dir.join("mods")).unwrap();
+        std::fs::write(dir.join("mods/old.jar"), bytes).unwrap();
+        let snapshot = crate::snapshot::create_snapshot(&dir, Some("old"), &["mods"]).unwrap();
+        let paths = crate::snapshot::snapshot_store_paths(&dir);
+        let hash = crate::snapshot::snapshot_file_index(&dir, &snapshot.id).unwrap()[0]
+            .sha256
+            .clone();
+        let object = paths.content_object_path(&hash);
+        crate::content_store::protect::unprotect(&object).unwrap();
+        std::fs::remove_file(&object).unwrap();
+        std::fs::create_dir(&object).unwrap();
+
+        let report = run_retention_with_report(&dir)
+            .unwrap()
+            .expect("unmeasured snapshots belong in the round report");
+        let summary = report.summary();
+        assert!(summary.contains(&snapshot.id), "{summary}");
+        assert!(summary.contains(&hash), "{summary}");
+        assert!(summary.contains("size-based eviction"), "{summary}");
+        assert!(crate::snapshot::snapshot_manifest_path(&dir, &snapshot.id).is_file());
+    }
+
     /// A round of retention is one decision: it removes its whole batch, then collects once. A
     /// collection between two evictions could free an object a later eviction in the same round
     /// still names (MASTER_SPEC §32.8).
@@ -1549,8 +1655,9 @@ mod batch_tests {
 
         let collections = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&collections);
-        run_retention_with_pause(
+        run_retention_round(
             &dir,
+            &RetentionPolicy::default(),
             Some(std::time::Duration::ZERO),
             Some(Arc::new(move || {
                 counter.fetch_add(1, Ordering::SeqCst);
@@ -1593,10 +1700,15 @@ mod batch_tests {
             std::fs::remove_file(&file).unwrap();
         }
 
-        let report = run_retention_with_pause(&dir, Some(std::time::Duration::ZERO), None)
-            .unwrap()
-            .expect("the round evicted snapshots, so it collected and has a report");
-        let outcome = report.outcome();
+        let report = run_retention_round(
+            &dir,
+            &RetentionPolicy::default(),
+            Some(std::time::Duration::ZERO),
+            None,
+        )
+        .unwrap()
+        .expect("the round evicted snapshots, so it collected and has a report");
+        let outcome = report.collection.unwrap().outcome();
         assert!(!outcome.refused, "{outcome:?}");
         assert!(
             outcome.reclaimed > 0,
