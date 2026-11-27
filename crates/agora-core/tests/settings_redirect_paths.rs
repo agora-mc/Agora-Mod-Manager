@@ -4,7 +4,7 @@ use agora_core::ctx::Ctx;
 use agora_core::db;
 use agora_core::error::LauncherResult;
 use agora_core::http_client::{self, ClientCategory, HostPolicy, HttpClients, ProxySetting};
-use agora_core::network_gate::{self, SettingsGate};
+use agora_core::network_gate::SettingsGate;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;

@@ -3,7 +3,7 @@
 use agora_core::ctx::Ctx;
 use agora_core::db;
 use agora_core::http_client::{self, ClientCategory, HostPolicy, HttpClients};
-use agora_core::network_gate::{self, SettingsGate};
+use agora_core::network_gate::SettingsGate;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};

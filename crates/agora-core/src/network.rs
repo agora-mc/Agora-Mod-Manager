@@ -161,8 +161,22 @@ pub fn check_launch_request(
     policy: &NetworkPolicy,
     category: NetworkCategory,
 ) -> LauncherResult<()> {
+    check_launch_request_with(&*crate::network_gate::current(), policy, category)
+}
+
+/// The same check with an explicit gate — the caller's context's own (§32.9).
+///
+/// A launch request made by code that holds a context must ask that context's gate, so two
+/// contexts in one process each answer by their own settings. The plain
+/// [`check_launch_request`] is for the call sites that hold no context; it falls back to the
+/// process-wide gate, which is the context's own in production.
+pub fn check_launch_request_with(
+    gate: &dyn crate::network_gate::NetworkGate,
+    policy: &NetworkPolicy,
+    category: NetworkCategory,
+) -> LauncherResult<()> {
     policy.check(category)?;
-    crate::network_gate::authorize(category.client_category())
+    gate.check(category.client_category())
 }
 
 fn category_bit(category: NetworkCategory) -> u8 {
