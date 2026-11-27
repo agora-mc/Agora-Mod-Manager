@@ -163,3 +163,32 @@ fn c3_fix_raw_settings_writer_refuses_when_the_version_row_is_missing() {
         Ok(())
     });
 }
+
+#[test]
+fn c4_a_settings_version_trigger_dropped_by_hand_is_reinstalled_at_startup() {
+    let (root, raw) = state_db();
+    let path = root.path().join("local_state.db");
+    raw.execute_batch("DROP TRIGGER user_settings_version_update")
+        .unwrap();
+
+    let report =
+        db::init_local_state_db_with(&path, &db::LocalStateOpenOptions::default()).unwrap();
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("user_settings_version_update")),
+        "startup must say it reinstalled the missing trigger: {:?}",
+        report.warnings
+    );
+
+    let writer = db::local_state_connection(&path).unwrap();
+    let before = db::settings_version(&writer).unwrap();
+    db::set_setting(&writer, "network_lockdown_enabled", &json!(true)).unwrap();
+    let after = db::settings_version(&writer).unwrap();
+    assert_eq!(
+        after,
+        before + 1,
+        "a settings write updates a row, so the reinstalled UPDATE trigger must publish a version"
+    );
+}

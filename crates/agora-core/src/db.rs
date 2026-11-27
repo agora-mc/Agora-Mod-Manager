@@ -333,6 +333,20 @@ pub fn init_local_state_db_with(
     }
     report.migrated_to = schema_version(&conn)?;
 
+    // The version only moves because these triggers fire, and a database at the current step is
+    // never re-migrated: a trigger lost to a hand edit or a table rebuild would silently stop
+    // every other process from noticing a settings change. Checked on every startup, recreated
+    // here, and reported rather than fixed quietly (MASTER_SPEC §32.9).
+    let reinstalled = ensure_settings_version_triggers(&conn)?;
+    if !reinstalled.is_empty() {
+        report.warnings.push(format!(
+            "The settings version trigger(s) {} were missing from local_state.db and have been \
+             reinstalled. Settings written while they were gone did not publish a version, so any \
+             setting changed since the database last had them should be checked.",
+            reinstalled.join(", ")
+        ));
+    }
+
     seed_default_settings(&conn)?;
     Ok(report)
 }
@@ -1124,30 +1138,89 @@ fn migrate_v32(conn: &Connection) -> anyhow::Result<()> {
              id INTEGER PRIMARY KEY CHECK (id = 1),
              version INTEGER NOT NULL
          );
-         INSERT OR IGNORE INTO settings_version (id, version) VALUES (1, 1);
+         INSERT OR IGNORE INTO settings_version (id, version) VALUES (1, 1);",
+    )?;
+    install_settings_version_triggers(conn)
+}
 
-         CREATE TRIGGER IF NOT EXISTS user_settings_version_insert
+/// The three triggers schema step 32 installs on `user_settings`, with the SQL that installs each.
+///
+/// They are named and kept here, rather than inlined in the step, because a database can lose one:
+/// a hand edit, a tool that rebuilt `user_settings`, a future migration that recreated the table.
+/// [`ensure_settings_version_triggers`] puts them back, and the names are how it looks for them.
+const SETTINGS_VERSION_TRIGGERS: [(&str, &str); 3] = [
+    (
+        "user_settings_version_insert",
+        "CREATE TRIGGER IF NOT EXISTS user_settings_version_insert
          AFTER INSERT ON user_settings BEGIN
              UPDATE settings_version SET version = version + 1 WHERE id = 1;
              SELECT RAISE(ABORT, 'the settings version row is missing, so this settings write cannot publish a version other processes would see')
                WHERE NOT EXISTS (SELECT 1 FROM settings_version WHERE id = 1);
-         END;
-
-         CREATE TRIGGER IF NOT EXISTS user_settings_version_update
+         END;",
+    ),
+    (
+        "user_settings_version_update",
+        "CREATE TRIGGER IF NOT EXISTS user_settings_version_update
          AFTER UPDATE ON user_settings BEGIN
              UPDATE settings_version SET version = version + 1 WHERE id = 1;
              SELECT RAISE(ABORT, 'the settings version row is missing, so this settings write cannot publish a version other processes would see')
                WHERE NOT EXISTS (SELECT 1 FROM settings_version WHERE id = 1);
-         END;
-
-         CREATE TRIGGER IF NOT EXISTS user_settings_version_delete
+         END;",
+    ),
+    (
+        "user_settings_version_delete",
+        "CREATE TRIGGER IF NOT EXISTS user_settings_version_delete
          AFTER DELETE ON user_settings BEGIN
              UPDATE settings_version SET version = version + 1 WHERE id = 1;
              SELECT RAISE(ABORT, 'the settings version row is missing, so this settings delete cannot publish a version other processes would see')
                WHERE NOT EXISTS (SELECT 1 FROM settings_version WHERE id = 1);
          END;",
-    )?;
+    ),
+];
+
+/// Install the version triggers, leaving the ones that are already there alone.
+fn install_settings_version_triggers(conn: &Connection) -> anyhow::Result<()> {
+    for (_, sql) in SETTINGS_VERSION_TRIGGERS {
+        conn.execute_batch(sql)?;
+    }
     Ok(())
+}
+
+/// Put back any version trigger this database lost, and say which ones were missing.
+///
+/// The version only moves because these triggers fire, and nothing else notices if one is gone: the
+/// settings would keep working, and every other process would keep reading a version that never
+/// changes, which is the stale-permission window the cache exists to close (§32.9). So the
+/// database's own shape is checked — after migrations, and at every startup for a database that is
+/// already at the current step — and a missing trigger is recreated inside one transaction. If it
+/// cannot be recreated the error is returned: an initialiser that cannot guarantee the invariant
+/// refuses rather than opening a database whose writes are invisible to everyone else.
+pub fn ensure_settings_version_triggers(conn: &Connection) -> anyhow::Result<Vec<&'static str>> {
+    let mut installed = std::collections::HashSet::new();
+    {
+        let mut statement =
+            conn.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'")?;
+        let names = statement.query_map([], |row| row.get::<_, String>(0))?;
+        for name in names {
+            installed.insert(name?);
+        }
+    }
+    if SETTINGS_VERSION_TRIGGERS
+        .iter()
+        .all(|(name, _)| installed.contains(*name))
+    {
+        return Ok(Vec::new());
+    }
+
+    let transaction = conn.unchecked_transaction()?;
+    install_settings_version_triggers(&transaction)?;
+    transaction.commit()?;
+
+    Ok(SETTINGS_VERSION_TRIGGERS
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !installed.contains(*name))
+        .collect())
 }
 
 struct MigrationStep {
