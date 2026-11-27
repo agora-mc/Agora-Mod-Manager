@@ -60,7 +60,12 @@ async fn lockdown_committed_after_the_first_request_blocks_the_redirect() {
         let mut requests = Vec::new();
         loop {
             let mut stream = match listener.accept() {
-                Ok((stream, _)) => stream,
+                // On Windows an accepted socket inherits the listener's non-blocking mode; the
+                // request read below needs a blocking one.
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if !matches!(
                         stop.recv_timeout(Duration::from_millis(10)),
