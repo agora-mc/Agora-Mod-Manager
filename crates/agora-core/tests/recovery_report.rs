@@ -1154,20 +1154,18 @@ fn a_journal_whose_lock_is_held_is_busy_and_the_lock_is_left_alone() {
     assert_eq!(entry.command, None);
 }
 
-/// Whether a difference is one of SQLite's own `-shm` / `-wal` sidecars.
-///
-/// Their *existence and content* are the WAL's business, not the data root's: a reader
-/// materialises them, a writer's close checkpoints and may delete them, and the index they hold
-/// describes the log rather than any stored data. Comparing their bytes made this test fail for
-/// a difference that says nothing about what the report wrote — the fixture that builds the crash
-/// leaves a different wal-index by the time the report reads it. Every other file, `local_state.db`
-/// itself included, is still compared byte for byte.
+/// Whether a difference is SQLite's own bookkeeping rather than the data root's content: the
+/// `-shm` wal-index in any form (a reader rewrites it; the fixture that builds the crash leaves a
+/// different one by the time the report reads it), and a `-wal` that was only *added*. A changed or
+/// removed `-wal` is still a difference: a write that has not been checkpointed lives there.
 fn is_sqlite_sidecar(line: &str) -> bool {
-    let path = match line.split_once(": ") {
-        Some((difference, path)) if ["added", "changed", "removed"].contains(&difference) => path,
-        _ => line,
-    };
-    path.ends_with("local_state.db-shm") || path.ends_with("local_state.db-wal")
+    match line.split_once(": ") {
+        Some(("added", path)) => {
+            path.ends_with("local_state.db-shm") || path.ends_with("local_state.db-wal")
+        }
+        Some(("changed" | "removed", path)) => path.ends_with("local_state.db-shm"),
+        _ => false,
+    }
 }
 
 /// What differs between two snapshots, as names only — a snapshot of a database is not readable in
