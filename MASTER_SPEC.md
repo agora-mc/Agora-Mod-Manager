@@ -5777,6 +5777,12 @@ Mod files live in `content/objects` with its own sweep, and snapshots keep a sec
   newer than a grace period, and deletes nothing if any owner record, listing or pending record
   cannot be read, or if an owner location is a link it cannot follow safely (named in the refusal).
   `--ignore-unreadable-snapshots` stays as the person's explicit override, with the risk named.
+- **The collection's report goes back to the caller.** Removing an item, deleting a snapshot and
+  a retention round carry what the collection did in their own results (the report, or its one-line
+  summary: what was reclaimed, or that nothing was and why). The core never prints it. `agora games
+  content remove` and `agora snapshots delete` print it, and their `--json` carries it as
+  `collection`; the desktop shows it where the delete or removal is confirmed; automatic retention
+  writes it to the support log, because nobody asked for that round.
 - Until the stores are unified, the snapshot and content-store scans hold a single
   cross-process instance-locations lock from the first listing through the last manifest read.
   Moves between live and Recently deleted and purges take the same lock. Base removal, and a build
