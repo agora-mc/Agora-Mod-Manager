@@ -1085,9 +1085,8 @@ fn snapshot(root: &Path) -> Vec<(String, u64, Vec<u8>)> {
 /// journal or other file is added, removed or touched.
 ///
 /// One exception, named rather than hidden: SQLite materialises its `-shm` and `-wal` sidecars for
-/// any reader of a WAL database. They hold no part of the data root's content, the database file
-/// itself is unchanged, and a read-write connection (which is what `agora doctor` already uses to
-/// inspect the database) deletes them again on close. Reading the database without them would mean
+/// readers of a WAL database. An index is bookkeeping and a newly created WAL may have an empty
+/// header. A WAL with frames can hold database changes. Reading the database without them would mean
 /// declaring it immutable, which trusts a file another Agora may be writing to: reporting a journal
 /// the writer has not committed yet, or missing one it just wrote, is the fail-open bug this whole
 /// slice exists to remove.
@@ -1105,7 +1104,7 @@ fn asking_for_the_report_changes_nothing_in_the_data_root() {
 
     let differences: Vec<String> = changed(&before, &after)
         .into_iter()
-        .filter(|line| !is_sqlite_sidecar(line))
+        .filter(|line| !is_sqlite_sidecar(line, &paths, &after))
         .collect();
     assert_eq!(
         differences,
@@ -1136,7 +1135,7 @@ fn a_journal_whose_lock_is_held_is_busy_and_the_lock_is_left_alone() {
 
     let differences: Vec<String> = changed(&before, &after)
         .into_iter()
-        .filter(|line| !is_sqlite_sidecar(line))
+        .filter(|line| !is_sqlite_sidecar(line, &paths, &after))
         .collect();
     assert_eq!(
         differences,
@@ -1158,12 +1157,17 @@ fn a_journal_whose_lock_is_held_is_busy_and_the_lock_is_left_alone() {
 /// `-shm` wal-index in any form (a reader rewrites it; the fixture that builds the crash leaves a
 /// different one by the time the report reads it), and a `-wal` that was only *added*. A changed or
 /// removed `-wal` is still a difference: a write that has not been checkpointed lives there.
-fn is_sqlite_sidecar(line: &str) -> bool {
+fn is_sqlite_sidecar(line: &str, paths: &AppPaths, after: &[(String, u64, Vec<u8>)]) -> bool {
+    let db = paths.local_state_db();
     match line.split_once(": ") {
-        Some(("added", path)) => {
-            path.ends_with("local_state.db-shm") || path.ends_with("local_state.db-wal")
+        Some(("added" | "changed" | "removed", path))
+            if Path::new(path) == db.with_extension("db-shm") =>
+        {
+            true
         }
-        Some(("changed" | "removed", path)) => path.ends_with("local_state.db-shm"),
+        Some(("added", path)) if Path::new(path) == db.with_extension("db-wal") => after
+            .iter()
+            .any(|(name, len, _)| name == path && *len <= 32),
         _ => false,
     }
 }

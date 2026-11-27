@@ -8045,6 +8045,76 @@ v1 key deadbeef deadbeef deadbeef deadbeef
         serde_json::from_str(raw).unwrap()
     }
 
+    #[test]
+    fn c3_fix_local_catalog_install_refuses_a_missing_settings_version_before_promotion() {
+        let (dir, state, locks) = setup_sync_env();
+        let key = test_key(11);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let payload = sample_db_with_built_at("2026-11-15T12:00:00+00:00");
+        let header = header_for(
+            &key,
+            &payload,
+            "2026-11-15T12:00:00+00:00",
+            "2099-01-01T00:00:00+00:00",
+        );
+        write_bundle(dir.path(), "incoming.bundle", &key, &header, &payload);
+        let incoming = dir.path().join("incoming.bundle");
+        let active = paths::registry_bundle_path(dir.path()).unwrap();
+        let conn = db::local_state_connection(&state).unwrap();
+        assert_eq!(conn.execute("DELETE FROM settings_version", []).unwrap(), 1);
+
+        let result =
+            install_bundle_from_file_with_trust(dir.path(), &state, &incoming, &trust, &locks);
+        assert!(
+            !active.exists(),
+            "local install promoted a bundle despite missing settings version"
+        );
+        let error =
+            result.expect_err("valid signed input with unreadable settings must be refused");
+        assert_eq!(error.code(), "ERR_NETWORK_SETTINGS_UNREADABLE", "{error}");
+    }
+
+    #[tokio::test]
+    async fn c3_fix_catalog_update_refuses_a_missing_settings_version_before_transport_or_mutation()
+    {
+        let (dir, state, locks) = setup_sync_env();
+        let key = test_key(40);
+        let trust = RegistryTrust::with_key(test_public(&key));
+        let release = r#"[{"tag_name":"registry-2026-11-18","draft":false,"prerelease":false,
+            "assets":[{"id":3001,"name":"registry.bundle"}]}]"#;
+        let transport = FakeRegistryTransport::from_pages(vec![(1, release_json_to_list(release))]);
+        let conn = db::local_state_connection(&state).unwrap();
+        db::set_setting(
+            &conn,
+            "network_registry_sync_enabled",
+            &serde_json::json!(true),
+        )
+        .unwrap();
+        assert_eq!(conn.execute("DELETE FROM settings_version", []).unwrap(), 1);
+
+        let result = check_and_download_update_inner(
+            dir.path(),
+            &state,
+            true,
+            None,
+            None,
+            "agora-mc/Agora-Mod-Manager",
+            &locks,
+            &transport,
+            &trust,
+            1_000_000,
+        )
+        .await;
+        assert!(!paths::registry_bundle_path(dir.path()).unwrap().exists());
+        let pages = transport.pages_requested.lock().unwrap();
+        assert!(
+            pages.is_empty(),
+            "catalog update requested release pages despite missing settings version: {pages:?}"
+        );
+        let error = result.expect_err("catalog update must refuse unreadable settings");
+        assert_eq!(error.code(), "ERR_NETWORK_SETTINGS_UNREADABLE", "{error}");
+    }
+
     #[tokio::test]
     async fn catalog_sync_selects_catalog_release_past_desktop_and_plugin_releases() {
         let (dir, ls_path, locks) = setup_sync_env();

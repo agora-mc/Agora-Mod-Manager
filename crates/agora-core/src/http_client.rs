@@ -379,6 +379,7 @@ impl ClientCategory {
 pub struct HttpClients {
     by_category: [reqwest::Client; ClientCategory::ALL.len()],
     test_dns: Option<TestDns>,
+    test_host_policy: Option<HostPolicy<'static>>,
 }
 
 type ResolveTestHost = dyn Fn(&reqwest::Url) -> std::io::Result<Vec<SocketAddr>> + Send + Sync;
@@ -678,6 +679,7 @@ impl HttpClients {
                 message: "HTTP client table size does not match the category list".into(),
             })?,
             test_dns: None,
+            test_host_policy: None,
         })
     }
 
@@ -690,14 +692,36 @@ impl HttpClients {
         Self {
             by_category: std::array::from_fn(|_| client.clone()),
             test_dns: None,
+            test_host_policy: None,
         }
     }
 
-    /// Substitute DNS results for the async GET URL policy in tests.
+    /// Substitute DNS results for checked request and redirect validation in tests.
     #[doc(hidden)]
     pub fn with_test_dns(mut self, resolve: Arc<ResolveTestHost>) -> Self {
         self.test_dns = Some(TestDns(resolve));
         self
+    }
+
+    /// Let redirect fixtures use the consented HTTP category with synthetic hosts.
+    #[doc(hidden)]
+    pub fn with_test_host_policy(mut self, policy: HostPolicy<'static>) -> Self {
+        self.test_host_policy = Some(policy);
+        self
+    }
+
+    fn validate_url(
+        &self,
+        category: ClientCategory,
+        url: &str,
+        policy: HostPolicy<'_>,
+    ) -> LauncherResult<reqwest::Url> {
+        check_request_url_resolving(
+            category,
+            url,
+            self.test_host_policy.unwrap_or(policy),
+            self.test_dns.as_ref(),
+        )
     }
 
     /// Get the raw client for a category.
@@ -1142,7 +1166,7 @@ pub async fn checked_request_with_policy(
     // Lockdown Mode.
     crate::network_gate::authorize(category)?;
     // Validate initial URL against category policies.
-    let _validated = check_request_url_resolving(category, url, policy, clients.test_dns.as_ref())?;
+    let _validated = clients.validate_url(category, url, policy)?;
 
     let client = clients.get(category);
 
@@ -1199,12 +1223,7 @@ pub async fn checked_request_with_policy(
             // (MASTER_SPEC §32.9).
             crate::network_gate::authorize(category)?;
             // Re-validate the redirect target against the same policies.
-            let _ = check_request_url_resolving(
-                category,
-                next_url.as_str(),
-                policy,
-                clients.test_dns.as_ref(),
-            )?;
+            let _ = clients.validate_url(category, next_url.as_str(), policy)?;
 
             remaining_redirects -= 1;
             current_url = next_url.to_string();
@@ -1230,7 +1249,7 @@ pub async fn checked_send(
     content_type: Option<&str>,
 ) -> LauncherResult<reqwest::Response> {
     crate::network_gate::authorize(category)?;
-    check_request_url(category, url)?;
+    clients.validate_url(category, url, HostPolicy::Allowlist)?;
     let client = clients.get(category);
     let mut current_method = method;
     let mut current_url = url.to_string();
@@ -1288,7 +1307,7 @@ pub async fn checked_send(
         // Every hop asks the gate again: the first answer was about the first URL, and the
         // policy may have changed while this request was in flight (§32.9).
         crate::network_gate::authorize(category)?;
-        check_request_url(category, next_url.as_str())?;
+        clients.validate_url(category, next_url.as_str(), HostPolicy::Allowlist)?;
 
         match response.status().as_u16() {
             307 | 308 => {}
@@ -1534,7 +1553,7 @@ pub async fn checked_request_with_headers(
     headers: Vec<(String, String)>,
 ) -> LauncherResult<reqwest::Response> {
     crate::network_gate::authorize(category)?;
-    let _validated = check_request_url(category, url)?;
+    let _validated = clients.validate_url(category, url, HostPolicy::Allowlist)?;
     let client = clients.get(category);
 
     let mut remaining_redirects: u8 = 10;
@@ -1587,7 +1606,7 @@ pub async fn checked_request_with_headers(
             // The next hop is a new request, so it asks the gate again: Lockdown may have been
             // turned on while the first one was in flight (MASTER_SPEC §32.9).
             crate::network_gate::authorize(category)?;
-            let _ = check_request_url(category, next_url.as_str())?;
+            let _ = clients.validate_url(category, next_url.as_str(), HostPolicy::Allowlist)?;
             remaining_redirects -= 1;
             current_url = next_url.to_string();
             first = false;
@@ -1616,13 +1635,13 @@ pub fn blocking_checked_request(
 /// instead of the category allowlist (used by consented-content imports that
 /// run inside blocking workers).
 pub fn blocking_checked_request_with_policy(
-    _clients: &HttpClients,
+    clients: &HttpClients,
     category: ClientCategory,
     url: &str,
     policy: HostPolicy<'_>,
 ) -> LauncherResult<reqwest::blocking::Response> {
     crate::network_gate::authorize(category)?;
-    let _validated = check_request_url_with_policy(category, url, policy)?;
+    let _validated = clients.validate_url(category, url, policy)?;
 
     // Build a blocking client with the same security posture and proxy.
     let client = build_blocking_client(category)?;
@@ -1671,7 +1690,7 @@ pub fn blocking_checked_request_with_policy(
 
             // A blocking hop asks the gate again, exactly as the async one does (§32.9).
             crate::network_gate::authorize(category)?;
-            let _ = check_request_url_with_policy(category, next_url.as_str(), policy)?;
+            let _ = clients.validate_url(category, next_url.as_str(), policy)?;
             remaining_redirects -= 1;
             current_url = next_url.to_string();
             continue;

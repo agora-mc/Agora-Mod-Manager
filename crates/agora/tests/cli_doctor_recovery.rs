@@ -624,24 +624,23 @@ fn snapshot(root: &Path) -> Snapshot {
 
 /// Whether a path is one of SQLite's own `-shm` / `-wal` sidecars, which may appear when the data
 /// root is read.
-fn is_sqlite_sidecar(path: &str) -> bool {
-    path.ends_with("local_state.db-shm") || path.ends_with("local_state.db-wal")
+fn is_added_sqlite_sidecar(db: &Path, path: &str, len: u64) -> bool {
+    is_wal_index(db, path) || (Path::new(path) == db.with_extension("db-wal") && len <= 32)
 }
 
 /// Whether a path is SQLite's wal-index, which a reader rewrites. A changed or removed `-wal` is
 /// still a difference: a write that has not been checkpointed lives there.
-fn is_wal_index(path: &str) -> bool {
-    path.ends_with("local_state.db-shm")
+fn is_wal_index(db: &Path, path: &str) -> bool {
+    Path::new(path) == db.with_extension("db-shm")
 }
 
 /// `agora doctor` is read-only: every file the data root had when it was asked is unchanged
 /// afterwards, byte for byte, and nothing is removed or added — its own support log included, since
 /// `doctor` runs before the log is opened.
 ///
-/// SQLite materialises its own `-shm` and `-wal` sidecars for any reader of a WAL database; they
-/// hold no part of the data root's content, the database file itself is unchanged, and a read-write
-/// open (which `doctor` already does to inspect the database) deletes them again. Declaring the file
-/// immutable to avoid them would mean trusting a database another Agora may be writing to.
+/// A SQLite reader may maintain the WAL index and materialize an empty WAL header. Frames in
+/// an added WAL can hold real database changes. Declaring the file immutable to avoid the
+/// sidecars would mean trusting a database another Agora may be writing to.
 #[test]
 fn asking_doctor_changes_nothing_in_the_data_root() {
     let (dir, paths) = prepared_root();
@@ -656,6 +655,7 @@ fn asking_doctor_changes_nothing_in_the_data_root() {
         String::from_utf8_lossy(&doctor.stderr)
     );
     let after = snapshot(dir.path());
+    let db = paths.local_state_db();
 
     let mut differences: Vec<String> = Vec::new();
     for (path, value) in &before {
@@ -663,14 +663,14 @@ fn asking_doctor_changes_nothing_in_the_data_root() {
             Some(other) if other == value => {}
             // The fixture that builds the crash leaves a different wal-index by the time `doctor`
             // reads it, which says nothing about what `doctor` wrote.
-            Some(_) if is_wal_index(path) => {}
+            Some(_) if is_wal_index(&db, path) => {}
             Some(_) => differences.push(format!("changed: {path}")),
-            None if is_wal_index(path) => {}
+            None if is_wal_index(&db, path) => {}
             None => differences.push(format!("removed: {path}")),
         }
     }
-    for path in after.keys() {
-        if !before.contains_key(path) && !is_sqlite_sidecar(path) {
+    for (path, (len, _)) in &after {
+        if !before.contains_key(path) && !is_added_sqlite_sidecar(&db, path, *len) {
             differences.push(format!("added: {path}"));
         }
     }

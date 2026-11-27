@@ -92,7 +92,15 @@ impl LaunchHttpClients {
     }
 
     fn build_client(category: NetworkCategory) -> LauncherResult<reqwest::Client> {
-        let builder = reqwest::Client::builder()
+        let builder = Self::configure_client(category, reqwest::Client::builder());
+        Self::client_result(agora_core::http_client::apply_proxy(builder)?.build())
+    }
+
+    fn configure_client(
+        category: NetworkCategory,
+        builder: reqwest::ClientBuilder,
+    ) -> reqwest::ClientBuilder {
+        builder
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 // Enforce redirect depth limit (previous() includes the
                 // original URL plus each followed redirect).
@@ -109,13 +117,16 @@ impl LaunchHttpClients {
                     attempt.stop()
                 }
             }))
-            .user_agent("AgoraPlanner/1.0");
-        agora_core::http_client::apply_proxy(builder)?
-            .build()
-            .map_err(|e| LauncherError::Generic {
-                code: "ERR_NETWORK".into(),
-                message: format!("Failed to build launch HTTP client: {e}"),
-            })
+            .user_agent("AgoraPlanner/1.0")
+    }
+
+    fn client_result(
+        result: Result<reqwest::Client, reqwest::Error>,
+    ) -> LauncherResult<reqwest::Client> {
+        result.map_err(|e| LauncherError::Generic {
+            code: "ERR_NETWORK".into(),
+            message: format!("Failed to build launch HTTP client: {e}"),
+        })
     }
 
     pub(crate) fn for_category(&self, category: NetworkCategory) -> &reqwest::Client {
@@ -986,8 +997,48 @@ pub async fn materialize(resolved: ResolvedLaunchPlan) -> LauncherResult<Materia
 /// [`materialize`] that reports verified-file counts for the client JAR,
 /// libraries and assets through `on_files`.
 pub async fn materialize_with_progress(
+    resolved: ResolvedLaunchPlan,
+    on_files: Option<&crate::launch_stage::FileProgressFn<'_>>,
+) -> LauncherResult<MaterializedLaunchPlan> {
+    materialize_using(resolved, on_files, LaunchHttpClients::new()?).await
+}
+
+/// Drive ordinary launch materialization through a loopback TLS proxy in tests.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[doc(hidden)]
+pub async fn materialize_with_test_proxy(
+    resolved: ResolvedLaunchPlan,
+    on_files: Option<&crate::launch_stage::FileProgressFn<'_>>,
+    proxy: reqwest::Proxy,
+) -> LauncherResult<MaterializedLaunchPlan> {
+    let client = |category| {
+        LaunchHttpClients::client_result(
+            LaunchHttpClients::configure_client(
+                category,
+                reqwest::Client::builder()
+                    .proxy(proxy.clone())
+                    .danger_accept_invalid_certs(true)
+                    .timeout(std::time::Duration::from_secs(5)),
+            )
+            .build(),
+        )
+    };
+    materialize_using(
+        resolved,
+        on_files,
+        LaunchHttpClients {
+            mojang_metadata: client(NetworkCategory::MojangMetadata)?,
+            mojang_content: client(NetworkCategory::MojangContent)?,
+            loader: client(NetworkCategory::LoaderMetadataAndContent)?,
+        },
+    )
+    .await
+}
+
+async fn materialize_using(
     mut resolved: ResolvedLaunchPlan,
     on_files: Option<&crate::launch_stage::FileProgressFn<'_>>,
+    clients: LaunchHttpClients,
 ) -> LauncherResult<MaterializedLaunchPlan> {
     use crate::launch_stage::{FileKind, FileProgress};
     let report = |kind: FileKind, done: usize, total: usize| {
@@ -995,7 +1046,6 @@ pub async fn materialize_with_progress(
             callback(FileProgress { kind, done, total });
         }
     };
-    let clients = LaunchHttpClients::new()?;
     let libraries_dir = resolved.cache_dir.join("libraries");
     let versions_dir = resolved.cache_dir.join("versions");
     let logging_dir = resolved.cache_dir.join("logging");

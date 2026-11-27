@@ -1,4 +1,4 @@
-use agora_core::ctx::{Ctx, TestClock};
+use agora_core::ctx::{Clock, Ctx, TestClock};
 use agora_core::db;
 use agora_core::http_client::ClientCategory;
 use agora_core::network_gate::{NetworkGate, SettingsGate};
@@ -242,4 +242,143 @@ fn schema_step_32_adds_a_version_to_an_existing_database_and_preserves_settings(
         version,
         "reopening a migrated database with no settings writes must preserve its version"
     );
+}
+
+fn assert_blob_denies_refresh(key: &str) {
+    let (_root, ctx) = context();
+    let gate = SettingsGate::for_context(&ctx);
+    gate.check(CATEGORY).expect("initial permission");
+    let writer = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    db::set_setting(&writer, key, &json!(false)).unwrap();
+    assert_eq!(
+        writer
+            .execute(
+                "UPDATE user_settings SET value_json = X'74727565' WHERE key = ?1",
+                [key]
+            )
+            .unwrap(),
+        1
+    );
+
+    let error = gate
+        .check(CATEGORY)
+        .expect_err("a settings row that cannot decode from SQLite must deny the refresh");
+    assert_eq!(error.code(), "ERR_NETWORK_SETTINGS_UNREADABLE", "{error}");
+}
+
+#[test]
+fn c3_fix_a_lockdown_row_stored_as_a_blob_denies_the_refresh() {
+    assert_blob_denies_refresh(LOCKDOWN);
+}
+
+#[test]
+fn c3_fix_an_unrelated_setting_stored_as_a_blob_denies_the_refresh() {
+    assert_blob_denies_refresh("test.unreadable.setting");
+}
+
+fn write_lockdown_without_a_bump(ctx: &Ctx) {
+    let writer = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    writer
+        .set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)
+        .unwrap();
+    let version = db::settings_version(&writer).unwrap();
+    assert_eq!(
+        writer
+            .execute(
+                "UPDATE user_settings SET value_json = 'true' WHERE key = ?1",
+                [LOCKDOWN]
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db::settings_version(&writer).unwrap(),
+        version,
+        "fixture must leave the version unchanged"
+    );
+}
+
+#[test]
+fn c3_fix_a_panicking_refresh_discards_its_connection_and_snapshot() {
+    let (_root, ctx) = context();
+    let gate = SettingsGate::for_context(&ctx);
+    let armed = Arc::new(AtomicBool::new(false));
+    let panicked = Arc::new(AtomicBool::new(false));
+    let opens = Arc::new(AtomicUsize::new(0));
+    ctx.test_seams.set_settings_cache_hook({
+        let (armed, panicked, opens) = (armed.clone(), panicked.clone(), opens.clone());
+        Arc::new(move |event| {
+            if event == SettingsCacheEvent::OpenConnection {
+                opens.fetch_add(1, Ordering::SeqCst);
+            }
+            if event == SettingsCacheEvent::ReadVersion && armed.swap(false, Ordering::SeqCst) {
+                panicked.store(true, Ordering::SeqCst);
+                panic!("interrupt refresh while the cache mutex is held");
+            }
+            Ok(())
+        })
+    });
+    gate.check(CATEGORY).expect("warm with allowed settings");
+    let before = opens.load(Ordering::SeqCst);
+    assert!(
+        before > 0,
+        "connection observation did not run on the cold check"
+    );
+    armed.store(true, Ordering::SeqCst);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gate.check(CATEGORY))).is_err()
+    );
+    assert!(
+        panicked.load(Ordering::SeqCst),
+        "the mutex poison hook never ran"
+    );
+    write_lockdown_without_a_bump(&ctx);
+
+    let first = gate
+        .check(CATEGORY)
+        .expect_err("a poisoned refresh must never reuse cached permission");
+    let denied = if first.code() == "ERR_NETWORK_SETTINGS_UNREADABLE" {
+        gate.check(CATEGORY)
+            .expect_err("the next read must recover and see Lockdown")
+    } else {
+        first
+    };
+    assert_eq!(denied.code(), "ERR_NETWORK_LOCKDOWN", "{denied}");
+    assert!(
+        opens.load(Ordering::SeqCst) > before,
+        "recovery never opened a new connection"
+    );
+}
+
+#[test]
+fn c3_fix_clock_rollback_since_the_last_warm_check_expires_permission() {
+    #[derive(Default)]
+    struct RewindableClock {
+        seconds: AtomicUsize,
+        reads: AtomicUsize,
+    }
+    impl Clock for RewindableClock {
+        fn now(&self) -> SystemTime {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            SystemTime::UNIX_EPOCH + Duration::from_secs(self.seconds.load(Ordering::SeqCst) as u64)
+        }
+    }
+    let (_root, ctx) = context();
+    let clock = Arc::new(RewindableClock::default());
+    let ctx = ctx.with_clock(clock.clone());
+    let gate = SettingsGate::for_context(&ctx);
+    gate.check(CATEGORY).expect("load permission at t=0");
+    clock.seconds.store(29, Ordering::SeqCst);
+    gate.check(CATEGORY).expect("warm check at t=29");
+    write_lockdown_without_a_bump(&ctx);
+    clock.seconds.store(1, Ordering::SeqCst);
+    let reads = clock.reads.load(Ordering::SeqCst);
+    let result = gate.check(CATEGORY);
+    assert!(
+        reads >= 2 && clock.reads.load(Ordering::SeqCst) > reads,
+        "the test clock must be consulted on the warm and backwards checks"
+    );
+    let denied = result
+        .expect_err("t=1 is backwards from the last check at t=29 and must reload permission");
+    assert_eq!(denied.code(), "ERR_NETWORK_LOCKDOWN", "{denied}");
 }

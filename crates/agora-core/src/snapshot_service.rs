@@ -629,6 +629,33 @@ mod tests {
         assert!(!undo_scope.iter().any(|r| r == "saves"));
     }
 
+    #[test]
+    fn c3_fix_snapshot_restore_refuses_a_missing_settings_version_before_mutating() {
+        let (_root, service, ctx, id) = service();
+        let dir = ctx.paths.instance_dir(&id).unwrap();
+        let snapshot =
+            snapshot::create_snapshot_scoped(&dir, Some("restore target"), PRELAUNCH).unwrap();
+        let path = dir.join("mods/a.jar");
+        fs::write(&path, b"live bytes").unwrap();
+        let before_count = snapshot::list_snapshots(&dir).unwrap().len();
+        let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        assert_eq!(conn.execute("DELETE FROM settings_version", []).unwrap(), 1);
+
+        let result = service.restore(&id, &snapshot.id);
+        assert_eq!(
+            fs::read(path).unwrap(),
+            b"live bytes",
+            "restore changed the live file despite missing settings version"
+        );
+        assert_eq!(
+            snapshot::list_snapshots(&dir).unwrap().len(),
+            before_count,
+            "refusal must not create an undo snapshot"
+        );
+        let error = result.expect_err("restore must refuse unreadable settings");
+        assert_eq!(error.code(), "ERR_NETWORK_SETTINGS_UNREADABLE", "{error}");
+    }
+
     /// Regression: restoring a 26.2 migration snapshot on a 26.1.2 instance
     /// restored the manifest (the game launched 26.2) but left the DB row —
     /// which the editor header and library card read — on 26.1.2.

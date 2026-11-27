@@ -2282,6 +2282,56 @@ mod tests {
     }
 
     #[test]
+    fn c3_fix_minecraft_rename_refuses_a_missing_settings_version_before_mutating() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = crate::testing_context(root.path().to_owned());
+        agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let manifest: InstanceManifest = serde_json::from_value(serde_json::json!({
+            "instance_id": "inst", "name": "Original", "minecraft_version": "1.21",
+            "loader": "fabric", "loader_version": "0.16.0", "is_locked": false,
+            "mods": [], "resourcepacks": [], "shaders": [], "datapacks": [], "worlds": [],
+            "user_preferences": {}, "manifest_version": agora_core::models::CURRENT_MANIFEST_VERSION
+        }))
+        .unwrap();
+        let request = CreateInstanceRequest {
+            name: "Original".into(),
+            instance_id: "inst".into(),
+            minecraft_version: "1.21".into(),
+            loader: "fabric".into(),
+            loader_version: "0.16.0".into(),
+            jvm_memory_mb: None,
+            jvm_memory_mode: None,
+            jvm_gc: None,
+            jvm_custom_args: None,
+            jvm_always_pre_touch: None,
+            is_modpack: None,
+            pack_icon_url: None,
+            template_id: None,
+        };
+        agora_core::db::upsert_instance(&conn, crate::GAME_ID, &prepare_row("inst", &request))
+            .unwrap();
+        std::fs::create_dir_all(ctx.paths.instance_dir("inst").unwrap()).unwrap();
+        let path = ctx.paths.instance_manifest("inst").unwrap();
+        agora_core::helpers::atomic_write_manifest(&path, &manifest).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(conn.execute("DELETE FROM settings_version", []).unwrap(), 1);
+
+        let result = InstanceService::new(ctx).rename("inst", "Changed");
+        assert_eq!(
+            agora_core::db::get_instance(&conn, "inst")
+                .unwrap()
+                .unwrap()
+                .name,
+            "Original",
+            "rename changed the row despite missing settings version: {result:?}"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        let error = result.expect_err("rename must refuse unreadable settings");
+        assert_eq!(error.code(), "ERR_NETWORK_SETTINGS_UNREADABLE", "{error}");
+    }
+
+    #[test]
     fn a_pack_gap_is_over_once_the_file_is_in_the_manifest_by_any_route() {
         let manifest: InstanceManifest = serde_json::from_value(serde_json::json!({
             "instance_id": "inst", "name": "Inst", "minecraft_version": "1.21",

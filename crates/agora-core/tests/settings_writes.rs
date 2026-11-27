@@ -1,8 +1,6 @@
 use agora_core::{db, settings};
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use std::fs;
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -10,8 +8,6 @@ type WriteSetting = fn(&Connection, &str, bool) -> anyhow::Result<()>;
 
 #[test]
 fn every_settings_writer_commits_value_and_version_together() {
-    assert_all_sql_writers_are_covered();
-
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("local_state.db");
     db::init_local_state_db(&path).unwrap();
@@ -90,61 +86,80 @@ fn every_settings_writer_commits_value_and_version_together() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-// Force a new SQL writer to join the transaction cases above, or delegate to a writer already
-// exercised there. The pre-version migration is intentionally exempt.
-fn assert_all_sql_writers_are_covered() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let pattern = regex::Regex::new(
-        r#"(?i)\b(?:insert(?:\s+or\s+\w+)?\s+into|replace\s+into|delete\s+from|update(?:\s+or\s+\w+)?)\s+(?:main\.)?["`\[]?user_settings\b"#,
-    ).unwrap();
-    let test_module =
-        regex::Regex::new(r"(?m)^#\[cfg\(test\)\]\r?\nmod \w+ \{\r?\n(?s:.*?)^\}").unwrap();
-    let crate_sources = root
-        .join("crates")
-        .read_dir()
-        .unwrap()
-        .map(|entry| entry.unwrap().path().join("src"));
-    let mut pending: Vec<_> = crate_sources
-        .chain([root.join("desktop/src-tauri/src")])
-        .filter(|path| path.is_dir())
-        .collect();
-    while let Some(dir) = pending.pop() {
-        for entry in dir.read_dir().unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            if entry.file_type().unwrap().is_dir() {
-                pending.push(path);
-                continue;
-            }
-            if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
-                continue;
-            }
-            let source = fs::read_to_string(&path).unwrap();
-            for hit in pattern.find_iter(&source) {
-                if test_module
-                    .find_iter(&source)
-                    .any(|module| module.range().contains(&hit.start()))
-                {
-                    continue;
-                }
-                let owner = source[..hit.start()].lines().rev().find_map(|line| {
-                    let (prefix, name) = line.split_once("fn ")?;
-                    (!prefix.trim_start().starts_with('/')).then(|| name.split('(').next().unwrap())
-                });
-                let relative = path
-                    .strip_prefix(&root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                assert!(
-                    matches!((relative.as_str(), owner),
-                        ("crates/agora-core/src/db.rs", Some("set_setting" | "migrate_v10"))
-                        | ("crates/agora-core/src/settings.rs", Some("set"))
-                    ),
-                    "uncovered settings SQL writer at {relative}:{} in {owner:?}; delegate to a tested writer or add a transaction case",
-                    source[..hit.start()].lines().count(),
-                );
-            }
-        }
-    }
+fn state_db() -> (tempfile::TempDir, Connection) {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("local_state.db");
+    db::init_local_state_db(&path).unwrap();
+    let raw = Connection::open(path).unwrap();
+    (root, raw)
+}
+
+fn assert_raw_write_is_versioned(setup: &str, sql: &str) {
+    let (_root, raw) = state_db();
+    raw.execute_batch(setup).unwrap();
+    let before = db::settings_version(&raw).unwrap();
+    let tx = raw.unchecked_transaction().unwrap();
+    assert_eq!(tx.execute(sql, []).unwrap(), 1);
+    let after = db::settings_version(&tx).unwrap();
+    tx.rollback().unwrap();
+    assert_eq!(
+        db::settings_version(&raw).unwrap(),
+        before,
+        "the version bump must roll back with the settings write"
+    );
+    assert!(
+        after > before,
+        "raw settings SQL did not advance the version: {before} -> {after} ({sql})"
+    );
+}
+
+const SEED: &str = "INSERT INTO user_settings (key, value_json) VALUES ('test.raw', 'false')";
+
+#[test]
+fn c3_fix_raw_insert_bumps_the_version_inside_its_transaction() {
+    assert_raw_write_is_versioned("", SEED);
+}
+
+#[test]
+fn c3_fix_raw_update_with_a_sql_comment_bumps_the_version_inside_its_transaction() {
+    assert_raw_write_is_versioned(
+        SEED,
+        "UPDATE /* comment */ user_settings SET value_json = 'true' WHERE key = 'test.raw'",
+    );
+}
+
+#[test]
+fn c3_fix_raw_delete_bumps_the_version_inside_its_transaction() {
+    assert_raw_write_is_versioned(SEED, "DELETE FROM user_settings WHERE key = 'test.raw'");
+}
+
+fn assert_schema_32_refuses_missing_version(
+    erase: &str,
+    write: impl FnOnce(&Connection) -> anyhow::Result<()>,
+) {
+    let (_root, raw) = state_db();
+    assert_eq!(db::recorded_schema_version(&raw).unwrap(), 32);
+    raw.execute(SEED, []).unwrap();
+    raw.execute_batch(erase).unwrap();
+    let result = write(&raw);
+    let stored = db::get_setting(&raw, "test.raw").unwrap();
+    assert!(result.is_err() && stored == Some(json!(false)), "schema 32 must refuse and roll back a write when {erase} has run: result={result:?}, stored={stored:?}");
+}
+
+#[test]
+fn c3_fix_settings_writer_refuses_when_schema_32_has_no_version_table() {
+    assert_schema_32_refuses_missing_version("DROP TABLE settings_version", |conn| {
+        db::set_setting(conn, "test.raw", &json!(true))
+    });
+}
+
+#[test]
+fn c3_fix_raw_settings_writer_refuses_when_the_version_row_is_missing() {
+    assert_schema_32_refuses_missing_version("DELETE FROM settings_version", |conn| {
+        conn.execute(
+            "UPDATE user_settings SET value_json = 'true' WHERE key = 'test.raw'",
+            [],
+        )?;
+        Ok(())
+    });
 }

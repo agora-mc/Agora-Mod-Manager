@@ -1099,6 +1099,20 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> LauncherResult<()> {
     })
 }
 
+/// Run the same installer-spawn path with the integration test executable as Java.
+#[cfg(any(debug_assertions, feature = "test-support"))]
+#[doc(hidden)]
+pub async fn run_installer_for_testing(
+    java_path: &Path,
+    installer_path: &Path,
+    loader: &str,
+    minecraft_root: &Path,
+) -> LauncherResult<i32> {
+    run_installer_process(java_path, installer_path, loader, minecraft_root)
+        .await
+        .map(|result| result.exit_code)
+}
+
 async fn run_installer_process(
     java_path: &Path,
     installer_path: &Path,

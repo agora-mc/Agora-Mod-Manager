@@ -2708,6 +2708,47 @@ fn repairing_a_framework_copies_required_files_into_an_existing_base() {
 }
 
 #[test]
+fn c3_fix_framework_repair_refuses_a_missing_settings_version_before_copying() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, install_dir, install) = built(&tmp, Some("framework-admission"));
+    let ctx = agora_core::ctx::Ctx::for_testing(paths.root().to_owned());
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    std::fs::write(install_dir.join("skse64_loader.exe"), b"loader").unwrap();
+    let script = "Data/Scripts/SKSE.pex";
+    let framework = framework_with_required("skse64_loader.exe", &[script]);
+    let outcome = build_base_with_frameworks(
+        &paths,
+        &install,
+        &test_definition(),
+        &[&framework],
+        BaseMode::Copied,
+        Some(&tmp.path().join("AgoraBases")),
+        BuildOptions::default(),
+        &TestSeams::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = &outcome.manifest().base_id;
+    let manifest_path = paths.base_manifest_path(base_id);
+    let before = std::fs::read(&manifest_path).unwrap();
+    let destination = outcome.manifest().location.join(script);
+    assert!(!destination.exists());
+    std::fs::create_dir_all(install_dir.join("Data/Scripts")).unwrap();
+    std::fs::write(install_dir.join(script), b"script").unwrap();
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    assert_eq!(conn.execute("DELETE FROM settings_version", []).unwrap(), 1);
+
+    let result = repair_framework(&ctx.paths, base_id, &framework);
+    assert!(
+        !destination.exists(),
+        "framework repair copied a script despite missing settings version: {result:?}"
+    );
+    assert_eq!(std::fs::read(manifest_path).unwrap(), before);
+    let error = result.expect_err("repair must refuse unreadable settings");
+    assert!(error.to_string().contains("settings version"), "{error}");
+}
+
+#[test]
 fn repairing_says_when_the_source_install_lacks_the_files_too() {
     let tmp = TempDir::new().unwrap();
     let (paths, install_dir, install) = built(&tmp, Some("framework-repair-missing"));
