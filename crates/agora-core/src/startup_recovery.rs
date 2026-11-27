@@ -122,7 +122,7 @@ pub fn run_at_startup(ctx: &Ctx) -> StartupRecoveryReport {
         ),
         Ok(MigrationOutcome::Done(migration)) => {
             report.actions.push(format!(
-                "Moved {} snapshot objects ({} repaired), kept {} existing content objects and {} legacy entries.",
+                "Moved {} snapshot objects in total ({} repaired), kept {} existing content objects and {} legacy entries.",
                 migration.moved + migration.replaced_damaged,
                 migration.replaced_damaged,
                 migration.already_present,

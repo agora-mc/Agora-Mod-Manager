@@ -2472,8 +2472,7 @@ pub fn verify_all(
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RemoveOptions {
     /// Proceed even when a snapshot manifest cannot be read. The ignored
-    /// snapshots are named on stderr. The caller has told the user that those
-    /// snapshots will no longer be able to restore the item.
+    /// snapshots are named on stderr. Their objects may be reclaimed, which may prevent restore.
     pub ignore_unreadable_snapshots: bool,
 }
 
@@ -2597,7 +2596,9 @@ pub fn remove_item_with_report(
         if options.ignore_unreadable_snapshots {
             for snapshot in &snapshot_usage.unreadable {
                 eprintln!(
-                    "[content] removing {item_id} while ignoring unreadable snapshot '{}' of                      instance '{}' ({}): {}; delete it with: {}",
+                    "[content] Removing {item_id} while ignoring unreadable snapshot '{}' of \
+                     instance '{}' ({}). If collection proceeds, it may reclaim objects this \
+                     snapshot needs, so it may not restore. {}. Delete it with `{}`.",
                     snapshot.snapshot_id,
                     snapshot.instance_id,
                     snapshot.created_at,
@@ -2654,7 +2655,7 @@ pub fn remove_item_with_report(
 
     // 2. Then let the one collection decide what is unreferenced. It reads every owner record
     //    fresh — items, instance manifests, snapshot manifests here and in both Recently deleted
-    //    roots, pending records — frees what nothing names in either object store, and refuses to
+    //    roots, pending records — frees what nothing names in the shared object store, and refuses to
     //    free anything at all when a record, a listing or an object's time cannot be read. The
     //    removal itself has succeeded either way; the report says what was not reclaimed and why.
     let report = collect::collect_with_ctx(

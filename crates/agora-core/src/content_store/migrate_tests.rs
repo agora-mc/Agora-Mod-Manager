@@ -264,7 +264,9 @@ fn a_destination_that_changes_before_unlink_leaves_the_legacy_copy_and_receipt()
             hits.load(Ordering::Relaxed),
             if change_before_blob_unlink { 2 } else { 1 }
         );
-        assert!(matches!(outcome, MigrationOutcome::NeedsHand(reason) if reason.contains(&hash)));
+        assert!(
+            matches!(outcome, MigrationOutcome::NeedsHand(migrate::MigrationRefusal::Other(reason)) if reason.contains(&hash))
+        );
         assert_eq!(fs::read(&legacy).unwrap(), b"last good copy");
         assert_eq!(receipt.exists(), !change_before_blob_unlink);
         assert_eq!(
@@ -342,6 +344,70 @@ fn the_next_migration_run_moves_an_object_that_arrived_after_done() {
     assert!(!late.exists());
     assert_eq!(object_bytes(&ctx, &hash).as_deref(), Some(&b"late"[..]));
     assert!(!migrate::legacy_store_active(&ctx.paths));
+}
+
+#[test]
+fn reopened_migration_keeps_completed_counts_and_updates_findings() {
+    let (_dir, ctx) = fixture();
+    plant_legacy(&ctx, &sha256_hex(b"good"), b"good");
+    let duplicate = sha256_hex(b"duplicate");
+    plant_legacy(&ctx, &duplicate, b"duplicate");
+    let damaged = sha256_hex(b"damaged copy");
+    plant_legacy(&ctx, &damaged, b"damaged copy");
+    for (hash, bytes) in [(&duplicate, &b"duplicate"[..]), (&damaged, &b"bad"[..])] {
+        let destination = ctx.paths.content_object_path(hash);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(destination, bytes).unwrap();
+    }
+    let repair_hash = sha256_hex(b"repaired");
+    let repair = plant_legacy(&ctx, &repair_hash, b"wrong");
+    let mismatch = plant_legacy(&ctx, &sha256_hex(b"still mismatched"), b"also wrong");
+    let stray = legacy_root(&ctx).join("stray.tmp");
+    fs::write(&stray, b"left alone").unwrap();
+
+    let first = done(migrate::migrate_snapshot_objects(&ctx).unwrap());
+    assert_eq!(
+        (first.moved, first.already_present, first.replaced_damaged),
+        (1, 1, 1)
+    );
+    assert_eq!(first.mismatched.len(), 2);
+    assert_eq!(first.left_alone.len(), 1);
+
+    assert!(matches!(
+        migrate::migrate_snapshot_objects(&ctx).unwrap(),
+        MigrationOutcome::NothingToDo
+    ));
+    let quiet = migrate::migration_status(&ctx.paths).unwrap();
+    assert_eq!(
+        (quiet.moved, quiet.already_present, quiet.replaced_damaged),
+        (1, 1, 1)
+    );
+    assert_eq!(quiet.mismatched, first.mismatched);
+    assert_eq!(quiet.left_alone, first.left_alone);
+
+    let new_stray = legacy_root(&ctx).join("new.tmp");
+    fs::write(&new_stray, b"also left alone").unwrap();
+    fs::write(&repair, b"repaired").unwrap();
+    ctx.test_seams
+        .set_snapshot_migration_stop_after_place(Some(1));
+    assert!(migrate::migrate_snapshot_objects(&ctx).is_err());
+    assert_eq!(ctx.test_seams.snapshot_migration_stops(), 1);
+    ctx.test_seams.set_snapshot_migration_stop_after_place(None);
+    let repaired = done(migrate::migrate_snapshot_objects(&ctx).unwrap());
+    assert_eq!(
+        (
+            repaired.moved,
+            repaired.already_present,
+            repaired.replaced_damaged
+        ),
+        (2, 1, 1)
+    );
+    assert_eq!(repaired.mismatched, vec![mismatch]);
+    let mut expected_left_alone = first.left_alone;
+    expected_left_alone.push((new_stray, expected_left_alone[0].1.clone()));
+    expected_left_alone.sort_unstable();
+    assert_eq!(repaired.left_alone, expected_left_alone);
+    assert!(!repair.exists());
 }
 
 #[test]
@@ -514,7 +580,10 @@ fn an_unreadable_journal_needs_a_hand_and_the_fallback_stays() {
     let outcome = migrate::migrate_snapshot_objects(&ctx).unwrap();
 
     assert!(
-        matches!(outcome, MigrationOutcome::NeedsHand(_)),
+        matches!(
+            outcome,
+            MigrationOutcome::NeedsHand(migrate::MigrationRefusal::UnusableJournal(_))
+        ),
         "{outcome:?}"
     );
     assert!(
@@ -675,10 +744,9 @@ fn a_link_inside_the_legacy_store_is_named_and_left_alone() {
     let outcome = migrate::migrate_snapshot_objects(&ctx).unwrap();
 
     match &outcome {
-        MigrationOutcome::NeedsHand(reason) => assert!(
-            reason.contains(&hash[..2]),
-            "the refusal names the link: {reason}"
-        ),
+        MigrationOutcome::NeedsHand(migrate::MigrationRefusal::LegacyLink(path)) => {
+            assert_eq!(path, &link, "the refusal names the link");
+        }
         other => panic!("a link in the store must not let the migration finish: {other:?}"),
     }
     assert_eq!(fs::read(outside.join(&hash)).unwrap(), b"outside bytes");

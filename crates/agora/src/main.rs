@@ -1365,9 +1365,8 @@ enum ContentCmd {
     Remove {
         /// Item ID or unique prefix to remove.
         item: String,
-        /// Remove it even when a snapshot manifest cannot be read. The ignored
-        /// snapshots are named on stderr and can no longer restore the item; a
-        /// snapshot that cannot be read may lose files it needs to restore.
+        /// Remove it even when a snapshot manifest cannot be read. Each ignored snapshot is
+        /// named on stderr. Its objects may be reclaimed, so the snapshot may not restore.
         #[arg(long)]
         ignore_unreadable_snapshots: bool,
     },
@@ -1377,11 +1376,11 @@ enum ContentCmd {
         #[arg(long)]
         restart: bool,
     },
-    /// Free every stored object that no record names any more: one collection over both object
-    /// stores, printing what it reclaimed, or that nothing was reclaimed and why.
+    /// Reclaim unreferenced objects from `content/objects` only. The migration moves the old
+    /// `snapshot-objects` store.
     Gc {
-        /// Free objects even while a snapshot manifest cannot be read. Each ignored snapshot is
-        /// named on stderr, and it may no longer restore the files it holds.
+        /// Free objects even when a snapshot manifest cannot be read. Each ignored snapshot is
+        /// named on stderr. Its objects may be reclaimed, so the snapshot may not restore.
         #[arg(long)]
         ignore_unreadable_snapshots: bool,
     },
@@ -8599,8 +8598,7 @@ async fn run_command(
                     } else {
                         println!("Content store: {}.", collection.summary);
                     }
-                    // A snapshot the person told this collection to ignore is named with the risk
-                    // it carries: the objects kept for it may be a restore's only copy.
+                    // An ignored snapshot may lose the objects it needs to restore.
                     for failure in &report.failures {
                         eprintln!("{failure}");
                     }
@@ -15026,9 +15024,8 @@ fn print_base_problems(problems: &[agora_core::game_base::BaseProblem]) {
 /// `agora games content migrate`: the old `snapshot-objects` store into the content store.
 ///
 /// Per outcome (MASTER_SPEC §32.8 "Migration", §32.11 "every needs-a-hand result has a way out"):
-/// a finished move reports what it moved and every file it kept; `--restart`, named as the way out,
-/// sets a journal nobody can read aside and walks the store again; a busy content store is exit
-/// `11`, and a journal that needs a hand is exit `72` and names that command.
+/// A finished move reports what it moved and every file it kept. A refusal explains the cause
+/// and names the recovery command when there is one.
 fn run_content_migrate(
     ctx: &agora_core::ctx::Ctx,
     paths: &agora_core::app_paths::AppPaths,
@@ -15073,7 +15070,7 @@ fn run_content_migrate(
         }
         if fresh {
             println!(
-                "Moved {} snapshot object(s) into the content store: {} were already there and {} \
+                "Moved {} snapshot object(s) into the content store in total: {} were already there and {} \
                  damaged copy(ies) were replaced.",
                 report.moved, report.already_present, report.replaced_damaged
             );
@@ -15131,22 +15128,17 @@ fn run_content_migrate(
             }
             std::process::exit(busy_code())
         }
-        Ok(MigrationOutcome::NeedsHand(reason)) => {
-            let command = "agora games content migrate --restart";
+        Ok(MigrationOutcome::NeedsHand(cause)) => {
+            let reason = cause.to_string();
             if json {
                 let out = serde_json::json!({
                     "status": "needs_hand",
                     "reason": reason,
-                    "command": command,
+                    "command": cause.command(),
                 });
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
-                println!("The snapshot object migration needs a hand: {reason}");
-                println!(
-                    "`{command}` sets that journal aside and walks the old store again. It deletes \
-                     nothing that is not already in the content store; a legacy file whose SHA-256 \
-                     differs from its name is kept and named, never deleted."
-                );
+                println!("The snapshot object migration needs a hand. {reason}");
             }
             std::process::exit(needs_a_hand_code())
         }

@@ -20,13 +20,49 @@ use crate::recovery::{
 };
 
 const RESOURCE: LockResource = LockResource::ContentStore;
+pub(crate) const MIGRATE_COMMAND: &str = "agora games content migrate";
+const RESTART_COMMAND: &str = "agora games content migrate --restart";
 
 #[derive(Debug)]
 pub enum MigrationOutcome {
     NothingToDo,
     Done(MigrationReport),
     Busy,
-    NeedsHand(String),
+    NeedsHand(MigrationRefusal),
+}
+
+#[derive(Debug)]
+pub enum MigrationRefusal {
+    UnusableJournal(String),
+    LegacyLink(PathBuf),
+    Other(String),
+}
+
+impl MigrationRefusal {
+    pub fn command(&self) -> Option<&'static str> {
+        match self {
+            Self::UnusableJournal(_) => Some(RESTART_COMMAND),
+            Self::LegacyLink(_) => Some(MIGRATE_COMMAND),
+            Self::Other(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for MigrationRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnusableJournal(problem) => write!(
+                f,
+                "The migration journal cannot be used ({problem}). Run `{RESTART_COMMAND}` to set it aside and walk the old store again."
+            ),
+            Self::LegacyLink(path) => write!(
+                f,
+                "The legacy snapshot store has a link or reparse point at {}. Remove or replace it, then run `{MIGRATE_COMMAND}`.",
+                path.display()
+            ),
+            Self::Other(reason) => f.write_str(reason),
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -57,7 +93,9 @@ impl MigrationReport {
 
     fn sort_findings(&mut self) {
         self.mismatched.sort_unstable();
+        self.mismatched.dedup();
         self.left_alone.sort_unstable();
+        self.left_alone.dedup_by(|left, right| left.0 == right.0);
     }
 }
 
@@ -160,18 +198,14 @@ pub fn legacy_store_active(paths: &AppPaths) -> bool {
     legacy_store_state(paths) != LegacyStoreState::Retired
 }
 
-/// What the migration journal says, read without taking a lock and without writing anything, so a
-/// read-only report (`agora doctor`) can say what a start would make of it.
+/// The migration's status for `agora doctor`, inspected without taking a lock or writing.
 #[derive(Debug)]
 pub(crate) enum JournalStatus {
-    /// No migration was started here: nothing to finish, and nothing to report.
     Absent,
-    /// A run is in progress, or was cut short. The next start finishes it.
     Running,
-    /// The migration finished. The journal is its record, not work recovery has left to do.
     Done,
-    /// A journal is there but cannot be acted on, with the reason.
-    Unusable(String),
+    PendingReopen,
+    NeedsHand(Option<&'static str>, MigrationRefusal),
 }
 
 pub fn migrate_snapshot_objects(ctx: &Ctx) -> LauncherResult<MigrationOutcome> {
@@ -193,15 +227,67 @@ pub fn migration_status(paths: &AppPaths) -> Option<MigrationReport> {
     }
 }
 
-/// [`JournalStatus`] for `paths`: the journal's state, or why it cannot be read.
+/// Inspect the journal and legacy directory without opening or hashing objects.
 pub(crate) fn journal_status(paths: &AppPaths) -> JournalStatus {
-    match read_journal(&legacy_root(paths), &journal_path(paths)) {
-        JournalRead::Absent => JournalStatus::Absent,
-        JournalRead::Unusable(problem) => JournalStatus::Unusable(problem.to_string()),
-        JournalRead::Valid(journal) => match journal.envelope().state {
-            State::Running => JournalStatus::Running,
-            State::Done => JournalStatus::Done,
-        },
+    let root = legacy_root(paths);
+    let read = match read_journal(&root, &journal_path(paths)) {
+        JournalRead::Unusable(problem) => {
+            return JournalStatus::NeedsHand(
+                None,
+                MigrationRefusal::UnusableJournal(problem.to_string()),
+            );
+        }
+        read => read,
+    };
+    let state = match &read {
+        JournalRead::Valid(journal) => Some(match journal.envelope().state {
+            State::Running => "running",
+            State::Done => "done",
+        }),
+        _ => None,
+    };
+    match inspect_legacy_store(&root, read) {
+        Ok(status) => status,
+        Err(cause) => JournalStatus::NeedsHand(state, cause),
+    }
+}
+
+fn inspect_legacy_store(
+    root: &Path,
+    read: JournalRead<State>,
+) -> Result<JournalStatus, MigrationRefusal> {
+    let present = legacy_directory_present(root)?;
+    let JournalRead::Valid(journal) = read else {
+        if present {
+            scan_legacy_store(root)?;
+        }
+        return Ok(JournalStatus::Absent);
+    };
+    match journal.envelope().state {
+        State::Done => {
+            if !present || !has_legacy_objects(root)? {
+                return Ok(JournalStatus::Done);
+            }
+            scan_legacy_store(root)?;
+            Ok(JournalStatus::PendingReopen)
+        }
+        State::Running => {
+            let journal = journal
+                .payload::<MigrationJournal>()
+                .map_err(|problem| MigrationRefusal::UnusableJournal(problem.to_string()))?;
+            let proof = LegacyProof {
+                root,
+                identity: journal.legacy_identity,
+            };
+            if let ProofResult::CantTell(reason) = proof.prove(root) {
+                return Err(MigrationRefusal::Other(reason));
+            }
+            if present {
+                scan_legacy_store(root)?;
+            }
+            // Without taking the store lock, doctor cannot tell whether this run is still active.
+            Ok(JournalStatus::Running)
+        }
     }
 }
 
@@ -231,16 +317,29 @@ fn run(ctx: &Ctx, mut restart: bool) -> LauncherResult<MigrationOutcome> {
 
     loop {
         let read = read_journal(&root, &path);
+        if let JournalRead::Unusable(problem) = &read {
+            if !restart {
+                return Ok(MigrationOutcome::NeedsHand(
+                    MigrationRefusal::UnusableJournal(problem.to_string()),
+                ));
+            }
+            let archive = path.with_extension(format!("{}.json", uuid::Uuid::new_v4()));
+            recovery::durable_rename(&path, &archive, false)
+                .map_err(|error| file_error(&path, error))?;
+            restart = false;
+            continue;
+        }
+        let present = match legacy_directory_present(&root) {
+            Ok(present) => present,
+            Err(cause) => return Ok(MigrationOutcome::NeedsHand(cause)),
+        };
         let journal = match &read {
             JournalRead::Absent => {
-                let Some(entry) = metadata(&root)? else {
+                if !present {
                     return Ok(MigrationOutcome::NothingToDo);
-                };
-                let identity = if entry.is_dir() && !agora_game_api::is_a_reparse_point(&entry) {
-                    recovery::path_identity(&root).map_err(|error| file_error(&root, error))?
-                } else {
-                    None
-                };
+                }
+                let identity =
+                    recovery::path_identity(&root).map_err(|error| file_error(&root, error))?;
                 start_running(&root, &path, identity, None)?;
                 continue;
             }
@@ -249,27 +348,31 @@ fn run(ctx: &Ctx, mut restart: bool) -> LauncherResult<MigrationOutcome> {
                     migration_error(format!("Could not read {}: {error}", path.display()))
                 })?;
                 if journal.envelope.state == State::Done {
-                    let identity =
-                        recovery::path_identity(&root).map_err(|error| file_error(&root, error))?;
-                    if identity.is_none() || !has_legacy_objects(&root)? {
+                    if !present {
                         return Ok(MigrationOutcome::NothingToDo);
                     }
+                    match has_legacy_objects(&root) {
+                        Ok(true) => {}
+                        Ok(false) => return Ok(MigrationOutcome::NothingToDo),
+                        Err(cause) => return Ok(MigrationOutcome::NeedsHand(cause)),
+                    }
+                    let identity =
+                        recovery::path_identity(&root).map_err(|error| file_error(&root, error))?;
                     journal.report.sort_findings();
                     start_running(&root, &path, identity, Some(journal.report))?;
                     continue;
                 }
-                Some(journal)
+                journal
             }
-            JournalRead::Unusable(_) => None,
+            JournalRead::Unusable(_) => unreachable!("unusable journals are handled above"),
         };
         let proof = LegacyProof {
             root: &root,
-            identity: journal.as_ref().and_then(|journal| journal.legacy_identity),
+            identity: journal.legacy_identity,
         };
         // A previous invocation in this process may have returned an error. The same process
         // now holds the same lock again, so its earlier invocation has already stopped.
-        let self_writer = journal.as_ref().and_then(|journal| {
-            let writer = journal.envelope.writer.as_ref()?;
+        let self_writer = journal.envelope.writer.as_ref().and_then(|writer| {
             (writer.pid == std::process::id()
                 && process_identity::capture_self().as_ref() == Some(writer))
             .then_some(journal.envelope.operation_id.as_str())
@@ -285,23 +388,13 @@ fn run(ctx: &Ctx, mut restart: bool) -> LauncherResult<MigrationOutcome> {
         );
         match decision {
             Decision::Act(capability) => {
-                return migrate(
-                    ctx,
-                    &root,
-                    &path,
-                    journal.expect("an actionable decision has a validated payload"),
-                    &capability,
-                );
+                return migrate(ctx, &root, &path, journal, &capability);
             }
             Decision::Busy(_) => return Ok(MigrationOutcome::Busy),
             Decision::Nothing => return Ok(MigrationOutcome::NothingToDo),
-            Decision::NeedsHand(_) if restart => {
-                let archive = path.with_extension(format!("{}.json", uuid::Uuid::new_v4()));
-                recovery::durable_rename(&path, &archive, false)
-                    .map_err(|error| file_error(&path, error))?;
-                restart = false;
+            Decision::NeedsHand(reason) => {
+                return Ok(MigrationOutcome::NeedsHand(MigrationRefusal::Other(reason)));
             }
-            Decision::NeedsHand(reason) => return Ok(MigrationOutcome::NeedsHand(reason)),
         }
     }
 }
@@ -330,20 +423,34 @@ fn start_running(
     )
 }
 
+fn legacy_directory_present(root: &Path) -> Result<bool, MigrationRefusal> {
+    match legacy_metadata(root)? {
+        None => Ok(false),
+        Some(entry) if agora_game_api::is_a_reparse_point(&entry) => {
+            Err(MigrationRefusal::LegacyLink(root.to_path_buf()))
+        }
+        Some(entry) if entry.is_dir() => Ok(true),
+        Some(_) => Err(MigrationRefusal::Other(format!(
+            "{} is not a plain legacy directory.",
+            root.display()
+        ))),
+    }
+}
+
 /// A retired store is only reopened when its object layout contains a regular file.
-fn has_legacy_objects(root: &Path) -> LauncherResult<bool> {
-    for shard in fs::read_dir(root).map_err(|error| file_error(root, error))? {
-        let shard = shard.map_err(|error| file_error(root, error))?.path();
+fn has_legacy_objects(root: &Path) -> Result<bool, MigrationRefusal> {
+    for shard in legacy_entries(root)? {
+        let shard = shard.map_err(|error| legacy_io(root, error))?.path();
         if !is_shard(&shard)
-            || !metadata(&shard)?
+            || !legacy_metadata(&shard)?
                 .is_some_and(|entry| entry.is_dir() && !agora_game_api::is_a_reparse_point(&entry))
         {
             continue;
         }
-        for file in fs::read_dir(&shard).map_err(|error| file_error(&shard, error))? {
-            let file = file.map_err(|error| file_error(&shard, error))?.path();
+        for file in legacy_entries(&shard)? {
+            let file = file.map_err(|error| legacy_io(&shard, error))?.path();
             if object_name(root, &file).is_some()
-                && metadata(&file)?.is_some_and(|entry| {
+                && legacy_metadata(&file)?.is_some_and(|entry| {
                     entry.is_file() && !agora_game_api::is_a_reparse_point(&entry)
                 })
             {
@@ -352,6 +459,55 @@ fn has_legacy_objects(root: &Path) -> LauncherResult<bool> {
         }
     }
     Ok(false)
+}
+
+fn legacy_entries(path: &Path) -> Result<fs::ReadDir, MigrationRefusal> {
+    fs::read_dir(path).map_err(|error| legacy_io(path, error))
+}
+
+fn legacy_metadata(path: &Path) -> Result<Option<Metadata>, MigrationRefusal> {
+    metadata(path).map_err(|error| MigrationRefusal::Other(error.to_string()))
+}
+
+fn legacy_io(path: &Path, error: io::Error) -> MigrationRefusal {
+    MigrationRefusal::Other(file_error(path, error).to_string())
+}
+
+#[derive(Default)]
+struct LegacyEntries {
+    files: Vec<PathBuf>,
+    left_alone: Vec<(PathBuf, &'static str)>,
+}
+
+fn scan_legacy_store(root: &Path) -> Result<LegacyEntries, MigrationRefusal> {
+    let mut entries = LegacyEntries::default();
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in legacy_entries(&directory)? {
+            let entry = entry.map_err(|error| legacy_io(&directory, error))?.path();
+            let Some(kind) = legacy_metadata(&entry)? else {
+                continue;
+            };
+            if agora_game_api::is_a_reparse_point(&kind) {
+                return Err(MigrationRefusal::LegacyLink(entry));
+            }
+            if kind.is_dir() {
+                if directory != root || !is_shard(&entry) {
+                    entries
+                        .left_alone
+                        .push((entry.clone(), "unexpected directory"));
+                }
+                directories.push(entry);
+            } else if kind.is_file() {
+                entries.files.push(entry);
+            } else {
+                entries
+                    .left_alone
+                    .push((entry, "not a regular object file"));
+            }
+        }
+    }
+    Ok(entries)
 }
 
 fn ownership(root: &Path) -> Vec<OwnedPath> {
@@ -437,37 +593,23 @@ fn migrate(
 ) -> LauncherResult<MigrationOutcome> {
     let identity = capability.verified_identity(root)?;
     if identity != journal.legacy_identity {
-        return Ok(MigrationOutcome::NeedsHand(format!(
-            "{} changed while its ownership was being checked",
-            root.display()
+        return Ok(MigrationOutcome::NeedsHand(MigrationRefusal::Other(
+            format!(
+                "{} changed while its ownership was being checked",
+                root.display()
+            ),
         )));
     }
     if identity.is_some() {
-        let mut files = Vec::new();
-        let mut directories = vec![root.to_path_buf()];
-        while let Some(directory) = directories.pop() {
-            for entry in fs::read_dir(&directory).map_err(|error| file_error(&directory, error))? {
-                let entry = entry.map_err(|error| file_error(&directory, error))?.path();
-                let Some(kind) = metadata(&entry)? else {
-                    continue;
-                };
-                if agora_game_api::is_a_reparse_point(&kind) {
-                    return Ok(MigrationOutcome::NeedsHand(format!(
-                        "{} is a link or reparse point in the legacy snapshot store",
-                        entry.display()
-                    )));
-                }
-                if kind.is_dir() {
-                    if directory != root || !is_shard(&entry) {
-                        record_left(&mut journal.report, &entry, "unexpected directory");
-                    }
-                    directories.push(entry);
-                } else if kind.is_file() {
-                    files.push(entry);
-                } else {
-                    record_left(&mut journal.report, &entry, "not a regular object file");
-                }
-            }
+        let LegacyEntries {
+            mut files,
+            left_alone,
+        } = match scan_legacy_store(root) {
+            Ok(entries) => entries,
+            Err(cause) => return Ok(MigrationOutcome::NeedsHand(cause)),
+        };
+        for (entry, reason) in left_alone {
+            record_left(&mut journal.report, &entry, reason);
         }
         files.sort_unstable();
         if let Some(Ok(index)) = journal
@@ -486,10 +628,14 @@ fn migrate(
             let Some(kind) = metadata(&file)? else {
                 continue;
             };
-            if !kind.is_file() || agora_game_api::is_a_reparse_point(&kind) {
-                return Ok(MigrationOutcome::NeedsHand(format!(
-                    "{} is no longer a plain legacy file",
-                    file.display()
+            if agora_game_api::is_a_reparse_point(&kind) {
+                return Ok(MigrationOutcome::NeedsHand(MigrationRefusal::LegacyLink(
+                    file,
+                )));
+            }
+            if !kind.is_file() {
+                return Ok(MigrationOutcome::NeedsHand(MigrationRefusal::Other(
+                    format!("{} is no longer a plain legacy file", file.display()),
                 )));
             }
             let Some(name) = object_name(root, &file) else {
@@ -568,9 +714,8 @@ fn migrate(
             let receipt = receipt_path(&file);
             let receipt_to_remove = match metadata(&receipt)? {
                 Some(entry) if agora_game_api::is_a_reparse_point(&entry) => {
-                    return Ok(MigrationOutcome::NeedsHand(format!(
-                        "{} is a link or reparse point in the legacy snapshot store",
-                        receipt.display()
+                    return Ok(MigrationOutcome::NeedsHand(MigrationRefusal::LegacyLink(
+                        receipt,
                     )));
                 }
                 Some(entry) if entry.is_file() => Some(&receipt),
@@ -580,7 +725,9 @@ fn migrate(
                 #[cfg(test)]
                 ctx.test_seams.snapshot_migration_before_unlink(legacy_file);
                 if let Err(error) = check_destination_size(&ctx.paths, &destination, kind.len()) {
-                    return Ok(MigrationOutcome::NeedsHand(error.to_string()));
+                    return Ok(MigrationOutcome::NeedsHand(MigrationRefusal::Other(
+                        error.to_string(),
+                    )));
                 }
                 capability.remove_file(root, legacy_file)?;
             }
@@ -591,11 +738,24 @@ fn migrate(
     journal.envelope.owned.clear();
     journal.legacy_identity = None;
     journal.last_counted = None;
+    let previous = journal.previous_done.take();
+    if let Some(previous) = &previous {
+        for (path, reason) in &previous.left_alone {
+            record_left(&mut journal.report, path, reason);
+        }
+    }
     journal.report.sort_findings();
-    let unchanged = journal
-        .previous_done
-        .take()
-        .is_some_and(|previous| journal.report.unchanged_since(&previous));
+    let unchanged = if let Some(previous) = previous {
+        let unchanged = journal.report.unchanged_since(&previous);
+        // The scan refreshes mismatches so a repaired object no longer appears among them.
+        // Merge the counts at completion so a resumed pass does not add them twice.
+        journal.report.moved += previous.moved;
+        journal.report.already_present += previous.already_present;
+        journal.report.replaced_damaged += previous.replaced_damaged;
+        unchanged
+    } else {
+        false
+    };
     recovery::write(path, &journal)?;
     if unchanged {
         Ok(MigrationOutcome::NothingToDo)

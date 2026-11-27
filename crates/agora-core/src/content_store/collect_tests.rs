@@ -704,11 +704,11 @@ fn an_unreadable_snapshot_manifest_stops_the_collection_unless_ignored() {
     );
     assert!(!ignored.refused(), "{:?}", ignored.refusals);
     assert!(
-        ignored
-            .failures
-            .iter()
-            .any(|why| why
-                .contains("a snapshot that cannot be read may lose files it needs to restore")),
+        ignored.failures.iter().any(|why| {
+            why.contains("not counted as in use")
+                && why.contains("may have been reclaimed")
+                && why.contains("may not restore")
+        }),
         "the risk is named in the output: {:?}",
         ignored.failures
     );

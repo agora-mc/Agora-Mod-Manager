@@ -715,9 +715,9 @@ impl Owners {
                 }
                 Err(error) if request.ignore_unreadable_snapshots => {
                     report.failures.push(format!(
-                        "kept the objects of a snapshot that cannot be read ({}) because \
-                         --ignore-unreadable-snapshots was given, and a snapshot that cannot be \
-                         read may lose files it needs to restore: {error}",
+                        "Ignored unreadable snapshot {} because --ignore-unreadable-snapshots was \
+                         given. Its objects were not counted as in use and may have been reclaimed, \
+                         so the snapshot may not restore. {error}",
                         path.display()
                     ));
                 }

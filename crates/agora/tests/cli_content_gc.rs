@@ -11,6 +11,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, SystemTime};
 
 use agora_core::app_paths::AppPaths;
+use agora_core::lock_manager::{LockManager, LockResource};
 use sha2::{Digest, Sha256};
 
 const AGORA_BIN: &str = env!("CARGO_BIN_EXE_agora");
@@ -96,6 +97,42 @@ fn damage_journal(paths: &AppPaths) -> PathBuf {
     path
 }
 
+fn migration_entry(report: &serde_json::Value) -> &serde_json::Value {
+    report["recovery"]["entries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("doctor reports recovery entries: {report}"))
+        .iter()
+        .find(|entry| entry["kind"] == "snapshot-object-migration")
+        .unwrap_or_else(|| panic!("the migration journal is listed: {report}"))
+}
+
+fn linked_legacy_shard(paths: &AppPaths) -> PathBuf {
+    let target = paths.root().join("outside");
+    let link = paths.root().join("snapshot-objects").join("ab");
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    #[cfg(windows)]
+    {
+        let output = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", text(&output));
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, &link).unwrap();
+    link
+}
+
+fn remove_folder_link(link: &Path) {
+    #[cfg(windows)]
+    fs::remove_dir(link).unwrap();
+    #[cfg(unix)]
+    fs::remove_file(link).unwrap();
+}
+
 /// An instance whose only snapshot manifest cannot be read.
 fn instance_with_unreadable_snapshot(paths: &AppPaths, id: &str) -> PathBuf {
     let dir = paths.instance_dir(id).unwrap();
@@ -136,6 +173,27 @@ fn gc_reclaims_an_old_object_nothing_names_and_says_so() {
     assert!(
         stdout.contains("reclaimed") || stdout.contains("freed"),
         "the command prints what the collection did: {stdout}"
+    );
+}
+
+#[test]
+fn gc_help_and_docs_describe_the_shared_store_scope() {
+    let (dir, _paths) = prepared_root();
+    let output = agora(dir.path(), &["games", "content", "gc", "--help"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let help = text(&output);
+    assert!(
+        help.contains("content/objects") && help.contains("migration"),
+        "{help}"
+    );
+
+    let row = include_str!("../../../docs/CLI.md")
+        .lines()
+        .find(|line| line.starts_with("| `agora games content gc "))
+        .unwrap();
+    assert!(
+        row.contains("from `content/objects` only") && row.contains("migration"),
+        "{row}"
     );
 }
 
@@ -220,10 +278,13 @@ fn gc_with_the_override_names_each_ignored_snapshot_and_its_risk() {
         text(&output)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("broken-snap") && stderr.to_lowercase().contains("restore"),
-        "stderr names the ignored snapshot and that it may not restore: {stderr}"
-    );
+    let warning = stderr
+        .lines()
+        .find(|line| line.contains("broken-snap"))
+        .unwrap();
+    assert!(warning.contains("not counted as in use"), "{warning}");
+    assert!(warning.contains("may have been reclaimed"), "{warning}");
+    assert!(warning.contains("may not restore"), "{warning}");
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +383,7 @@ fn migrate_restart_sets_the_damaged_journal_aside_and_finishes() {
 #[test]
 fn migrate_lists_kept_mismatches_by_path() {
     let (dir, paths) = prepared_root();
+    let good = legacy_object(&paths, b"moved at startup");
     let claimed = sha256_hex(b"what the name promises");
     let bad = paths
         .root()
@@ -335,6 +397,8 @@ fn migrate_lists_kept_mismatches_by_path() {
 
     assert!(output.status.success(), "{}", text(&output));
     let parsed = json_of(&output);
+    assert_eq!(parsed["moved"], 1, "{parsed}");
+    assert!(!good.exists());
     let mismatched = parsed["mismatched"]
         .as_array()
         .unwrap_or_else(|| panic!("the report lists kept mismatches: {parsed}"));
@@ -345,6 +409,149 @@ fn migrate_lists_kept_mismatches_by_path() {
         "{parsed}"
     );
     assert!(bad.exists());
+
+    fs::write(&bad, b"what the name promises").unwrap();
+    let output = agora(dir.path(), &["games", "content", "migrate", "--json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let parsed = json_of(&output);
+    assert_eq!(parsed["moved"], 2, "{parsed}");
+    assert_eq!(parsed["mismatched"], serde_json::json!([]), "{parsed}");
+    assert!(!bad.exists());
+}
+
+#[test]
+fn migrate_and_doctor_name_the_link_and_the_command_to_run_after_removing_it() {
+    let (dir, paths) = prepared_root();
+    let legacy = legacy_object(&paths, b"waits for link removal");
+    let link = linked_legacy_shard(&paths);
+    let doctor_before_migrate = agora(dir.path(), &["doctor", "--json"]);
+    assert_eq!(
+        doctor_before_migrate.status.code(),
+        Some(10),
+        "{}",
+        text(&doctor_before_migrate)
+    );
+    assert!(!journal(&paths).exists());
+
+    let output = agora(dir.path(), &["games", "content", "migrate", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(MIGRATION_NEEDS_A_HAND),
+        "{}",
+        text(&output)
+    );
+    let refused = json_of(&output);
+    assert_eq!(refused["status"], "needs_hand", "{refused}");
+    assert_eq!(
+        refused["command"], "agora games content migrate",
+        "{refused}"
+    );
+    let reason = refused["reason"].as_str().unwrap();
+    assert!(reason.contains(link.to_str().unwrap()), "{reason}");
+    assert!(
+        reason.contains("Remove or replace") && reason.contains("agora games content migrate"),
+        "{reason}"
+    );
+    let report = json_of(&doctor_before_migrate);
+    let entry = migration_entry(&report);
+    assert_eq!(entry["outcome"], "needsHand", "{entry}");
+    assert_eq!(entry["command"], refused["command"], "{entry}");
+    assert_eq!(entry["reason"], refused["reason"], "{entry}");
+
+    let plain = agora(dir.path(), &["games", "content", "migrate"]);
+    assert_eq!(
+        plain.status.code(),
+        Some(MIGRATION_NEEDS_A_HAND),
+        "{}",
+        text(&plain)
+    );
+    assert!(
+        String::from_utf8_lossy(&plain.stdout).contains(reason),
+        "{}",
+        text(&plain)
+    );
+
+    let output = agora(dir.path(), &["doctor", "--json"]);
+    assert_eq!(output.status.code(), Some(10), "{}", text(&output));
+    let report = json_of(&output);
+    let entry = migration_entry(&report);
+    assert_eq!(entry["outcome"], "needsHand", "{entry}");
+    assert_eq!(entry["command"], refused["command"], "{entry}");
+    assert_eq!(entry["reason"], refused["reason"], "{entry}");
+    assert!(legacy.exists());
+
+    remove_folder_link(&link);
+    let output = agora(dir.path(), &["games", "content", "migrate", "--json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert_eq!(json_of(&output)["moved"], 1);
+    assert!(!legacy.exists());
+}
+
+#[test]
+fn replacing_the_running_journals_legacy_directory_has_no_restart_command() {
+    let (dir, paths) = prepared_root();
+    let link = linked_legacy_shard(&paths);
+    let output = agora(dir.path(), &["games", "content", "migrate", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(MIGRATION_NEEDS_A_HAND),
+        "{}",
+        text(&output)
+    );
+    remove_folder_link(&link);
+    fs::rename(link.parent().unwrap(), dir.path().join("old-directory")).unwrap();
+    let new_object = legacy_object(&paths, b"replacement directory");
+    let journal_before = fs::read(journal(&paths)).unwrap();
+
+    let output = agora(
+        dir.path(),
+        &["games", "content", "migrate", "--restart", "--json"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(MIGRATION_NEEDS_A_HAND),
+        "{}",
+        text(&output)
+    );
+    let refused = json_of(&output);
+    assert_eq!(refused["status"], "needs_hand", "{refused}");
+    assert!(refused["command"].is_null(), "{refused}");
+    assert!(
+        refused["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no longer the legacy directory"),
+        "{refused}"
+    );
+    assert_eq!(fs::read(journal(&paths)).unwrap(), journal_before);
+    assert!(new_object.exists());
+
+    let output = agora(dir.path(), &["doctor", "--json"]);
+    assert_eq!(output.status.code(), Some(10), "{}", text(&output));
+    let report = json_of(&output);
+    let entry = migration_entry(&report);
+    assert_eq!(entry["outcome"], "needsHand", "{entry}");
+    assert!(entry["command"].is_null(), "{entry}");
+    assert!(
+        entry["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no longer the legacy directory"),
+        "{entry}"
+    );
+}
+
+#[test]
+fn migrate_and_doctor_exit_codes_are_distinguished_in_the_migrate_row() {
+    let row = include_str!("../../../docs/CLI.md")
+        .lines()
+        .find(|line| line.starts_with("| `agora games content migrate "))
+        .unwrap();
+    assert!(
+        row.contains("`migrate` exits `72` for `needs_hand` and `11` for `busy`"),
+        "{row}"
+    );
+    assert!(row.contains("`agora doctor` exits `10`"), "{row}");
 }
 
 // ---------------------------------------------------------------------------
@@ -360,14 +567,9 @@ fn doctor_names_a_stuck_migration_and_moves_nothing() {
     let damaged = damage_journal(&paths);
 
     let output = agora(dir.path(), &["doctor", "--json"]);
+    assert_eq!(output.status.code(), Some(10), "{}", text(&output));
     let parsed = json_of(&output);
-
-    let entry = parsed["recovery"]["entries"]
-        .as_array()
-        .unwrap_or_else(|| panic!("doctor reports recovery entries: {parsed}"))
-        .iter()
-        .find(|entry| entry["kind"] == "snapshot-object-migration")
-        .unwrap_or_else(|| panic!("the migration journal is listed: {parsed}"));
+    let entry = migration_entry(&parsed);
     assert!(
         entry["command"]
             .as_str()
@@ -376,4 +578,57 @@ fn doctor_names_a_stuck_migration_and_moves_nothing() {
     );
     assert!(legacy.exists(), "doctor moves nothing");
     assert_eq!(fs::read(&damaged).unwrap(), b"{ not a journal");
+}
+
+#[test]
+fn doctor_lists_a_done_migration_with_pending_objects_without_reopening_it() {
+    let (dir, paths) = prepared_root();
+    legacy_object(&paths, b"moved before doctor");
+    let output = agora(dir.path(), &["games", "content", "migrate"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let journal_before = fs::read(journal(&paths)).unwrap();
+    let pending = legacy_object(&paths, b"arrived after done");
+
+    let output = agora(dir.path(), &["doctor", "--json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let report = json_of(&output);
+    let entry = migration_entry(&report);
+    assert_eq!(entry["state"], "done", "{entry}");
+    assert_eq!(entry["outcome"], "wouldFinish", "{entry}");
+    assert_eq!(entry["command"], "agora games content migrate", "{entry}");
+    assert_eq!(fs::read(journal(&paths)).unwrap(), journal_before);
+    assert!(pending.exists());
+    assert!(!paths
+        .content_object_path(&sha256_hex(b"arrived after done"))
+        .exists());
+}
+
+#[test]
+fn doctor_lists_a_running_migration_while_the_store_lock_is_held() {
+    let (dir, paths) = prepared_root();
+    let link = linked_legacy_shard(&paths);
+    let output = agora(dir.path(), &["games", "content", "migrate"]);
+    assert_eq!(
+        output.status.code(),
+        Some(MIGRATION_NEEDS_A_HAND),
+        "{}",
+        text(&output)
+    );
+    remove_folder_link(&link);
+    let manager = LockManager::new(paths.locks_root());
+    let _guard = manager
+        .acquire(LockResource::ContentStore, "test holder")
+        .unwrap();
+
+    let output = agora(dir.path(), &["doctor", "--json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let report = json_of(&output);
+    let entry = migration_entry(&report);
+    assert_eq!(entry["state"], "running", "{entry}");
+    assert_eq!(entry["outcome"], "wouldFinish", "{entry}");
+    assert_eq!(entry["command"], "agora games content migrate", "{entry}");
+
+    let output = agora(dir.path(), &["games", "content", "migrate", "--json"]);
+    assert_eq!(output.status.code(), Some(11), "{}", text(&output));
+    assert_eq!(json_of(&output)["status"], "busy");
 }
