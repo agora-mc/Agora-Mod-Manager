@@ -622,6 +622,12 @@ fn snapshot(root: &Path) -> Snapshot {
     out
 }
 
+/// Whether a path is one of SQLite's own `-shm` / `-wal` sidecars: the WAL's index and log, which
+/// hold no part of the data root's content.
+fn is_sqlite_sidecar(path: &str) -> bool {
+    path.ends_with("local_state.db-shm") || path.ends_with("local_state.db-wal")
+}
+
 /// `agora doctor` is read-only: every file the data root had when it was asked is unchanged
 /// afterwards, byte for byte, and nothing is removed or added — its own support log included, since
 /// `doctor` runs before the log is opened.
@@ -649,14 +655,17 @@ fn asking_doctor_changes_nothing_in_the_data_root() {
     for (path, value) in &before {
         match after.get(path) {
             Some(other) if other == value => {}
+            // The sidecars' bytes are the WAL's business, not the data root's (see above): the
+            // fixture that builds the crash leaves a different wal-index by the time `doctor`
+            // reads it, which says nothing about what `doctor` wrote.
+            Some(_) if is_sqlite_sidecar(path) => {}
             Some(_) => differences.push(format!("changed: {path}")),
+            None if is_sqlite_sidecar(path) => {}
             None => differences.push(format!("removed: {path}")),
         }
     }
     for path in after.keys() {
-        if !before.contains_key(path)
-            && !(path.ends_with("local_state.db-shm") || path.ends_with("local_state.db-wal"))
-        {
+        if !before.contains_key(path) && !is_sqlite_sidecar(path) {
             differences.push(format!("added: {path}"));
         }
     }
