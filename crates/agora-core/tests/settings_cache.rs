@@ -382,3 +382,39 @@ fn c3_fix_clock_rollback_since_the_last_warm_check_expires_permission() {
         .expect_err("t=1 is backwards from the last check at t=29 and must reload permission");
     assert_eq!(denied.code(), "ERR_NETWORK_LOCKDOWN", "{denied}");
 }
+
+#[test]
+fn c4_a_warm_check_hands_out_the_snapshot_it_already_holds() {
+    use agora_core::settings::{SettingsCache, SettingsReads};
+
+    let (_root, ctx) = context();
+    let cache = SettingsCache::new();
+    let reads = SettingsReads::of(&ctx);
+    let first = cache
+        .load(&reads)
+        .expect("the first check loads the settings");
+    let second = cache
+        .load(&reads)
+        .expect("the warm check reads the version");
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "a warm check copied every setting instead of handing out the snapshot it already had"
+    );
+
+    let writer = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    db::set_setting(&writer, LOCKDOWN, &json!(true)).unwrap();
+    let third = cache.load(&reads).expect("the changed version reloads");
+    assert!(
+        !Arc::ptr_eq(&second, &third),
+        "a version that changed must produce a new snapshot, not the cached one"
+    );
+    assert_eq!(
+        third.version(),
+        second.version() + 1,
+        "the new snapshot carries the version the write published"
+    );
+    assert!(
+        third.lockdown_denies_network().unwrap_or(false),
+        "the new snapshot carries the values the write stored"
+    );
+}

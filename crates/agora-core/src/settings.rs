@@ -54,9 +54,6 @@ pub struct SettingsSnapshot {
     /// When the values were read: the backstop period counts from here, so a warm check cannot
     /// postpone the reload that catches a write nobody versioned.
     loaded_at: SystemTime,
-    /// When this snapshot was last checked: a clock that is now earlier than this has moved
-    /// backwards, and the time it has been trusted is unknown.
-    checked_at: SystemTime,
     values: HashMap<String, serde_json::Value>,
 }
 
@@ -104,7 +101,14 @@ pub struct SettingsCache {
 
 #[derive(Default)]
 struct CacheState {
+    /// The snapshot the last successful check produced. A warm check hands this same snapshot
+    /// out again rather than copying its values: the values cannot have changed, because the
+    /// version they were published with did not.
     snapshot: Option<Arc<SettingsSnapshot>>,
+    /// When the snapshot above was last checked. A clock that is now earlier than this has moved
+    /// backwards, and the time the snapshot was trusted for is unknown. It lives here rather than
+    /// in the snapshot so that recording a check does not require building a new one.
+    checked_at: Option<SystemTime>,
     /// The connection the version is read on, retained so a warm check costs one read and no
     /// open. Dropped at every periodic refresh and after any read error, so a database file
     /// that was replaced on disk is opened again rather than read through the old handle.
@@ -134,6 +138,7 @@ impl SettingsCache {
             Err(poisoned) => {
                 let mut state = poisoned.into_inner();
                 state.snapshot = None;
+                state.checked_at = None;
                 state.connection = None;
                 state
             }
@@ -143,6 +148,7 @@ impl SettingsCache {
             .settings_refresh_period_override()
             .unwrap_or(SETTINGS_REFRESH_PERIOD);
         let now = reads.clock.now();
+        let last_checked = state.checked_at;
         let expired = state.snapshot.as_ref().is_none_or(|snapshot| {
             // The backstop period counts from the last *load*: a request every few seconds must
             // not keep postponing the reload that catches a change nobody versioned.
@@ -154,7 +160,7 @@ impl SettingsCache {
             };
             // And a clock that moved backwards since the last *check* means the time this
             // snapshot has been trusted is unknown, so it is not trusted further.
-            let clock_moved_backwards = now < snapshot.checked_at;
+            let clock_moved_backwards = last_checked.is_some_and(|checked| now < checked);
             period_passed || clock_moved_backwards
         });
         if expired {
@@ -164,6 +170,7 @@ impl SettingsCache {
             Ok(snapshot) => Ok(snapshot),
             Err(error) => {
                 state.snapshot = None;
+                state.checked_at = None;
                 state.connection = None;
                 Err(error)
             }
@@ -210,16 +217,11 @@ fn read_settings(
         .filter(|snapshot| snapshot.version == version && !expired)
         .cloned();
     let snapshot = match cached {
-        Some(snapshot) => {
-            // The version still matches and nothing expired, so the values stand. The check is
-            // recorded for the backwards-clock rule, but the period keeps running from the load.
-            Arc::new(SettingsSnapshot {
-                version: snapshot.version,
-                loaded_at: snapshot.loaded_at,
-                checked_at: now,
-                values: snapshot.values.clone(),
-            })
-        }
+        // The version still matches and nothing expired, so the values stand and this is the same
+        // snapshot: handing back the one the cache holds costs an `Arc` clone, where building a
+        // copy would copy every setting on every request. The check itself is recorded in the
+        // cache state below, and the period keeps running from the load.
+        Some(snapshot) => snapshot,
         None => {
             reads
                 .seams
@@ -235,13 +237,13 @@ fn read_settings(
             Arc::new(SettingsSnapshot {
                 version,
                 loaded_at: now,
-                checked_at: now,
                 values,
             })
         }
     };
     drop(transaction);
     state.snapshot = Some(Arc::clone(&snapshot));
+    state.checked_at = Some(now);
     Ok(snapshot)
 }
 
