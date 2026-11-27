@@ -241,20 +241,22 @@ describe('LibraryPage', () => {
       gameId: 'minecraft',
       gameIds: ['minecraft'],
     };
-    let removed = false;
-    invokeMock.mockImplementation(async (command: string) => {
+    const blockedItem = { ...unusedItem, itemId: 'a'.repeat(64), name: 'Blocked Mod' };
+    const ignoredItem = { ...unusedItem, itemId: 'b'.repeat(64), name: 'Unselected Mod' };
+    let remaining = [unusedItem, blockedItem, ignoredItem];
+    invokeMock.mockImplementation(async (command: string, args?: { itemId: string }) => {
       switch (command) {
         case 'games_library_list':
           return { items: [first], damaged: [], warnings: [] };
         case 'games_library_instances':
           return { instances: [], warnings: [] };
         case 'games_library_unused':
-          return removed
-            ? { items: [], totalSize: 0, warnings: [] }
-            : { items: [unusedItem], totalSize: unusedItem.totalSize, warnings: [] };
+          return { items: remaining, totalSize: remaining.length * unusedItem.totalSize, warnings: [] };
         case 'games_content_remove':
-          removed = true;
-          return null;
+          remaining = remaining.filter((item) => item.itemId !== args?.itemId);
+          return args?.itemId === blockedItem.itemId
+            ? { summary: 'nothing was reclaimed: a linked object root', reclaimed: 0, refused: true }
+            : { summary: 'reclaimed 2 object(s)', reclaimed: 2, refused: false };
         default:
           throw new Error(`unmocked command in a library test: ${command}`);
       }
@@ -262,18 +264,19 @@ describe('LibraryPage', () => {
 
     render(<LibraryPage />);
     expect(await screen.findByTestId('unused-summary')).toHaveTextContent(
-      'Unused: 1 item, 2.0 MB',
+      'Unused: 3 items, 6.0 MB',
     );
 
     fireEvent.click(screen.getByRole('button', { name: 'Review unused items' }));
     const dialog = await screen.findByRole('dialog');
-    fireEvent.click(within(dialog).getByRole('checkbox'));
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: /Old Mod/ }));
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: /Blocked Mod/ }));
     fireEvent.click(within(dialog).getByRole('button', { name: 'Remove selected…' }));
 
     expect(invokeMock).not.toHaveBeenCalledWith('games_content_remove', expect.anything());
-    expect(within(dialog).getByText(/Remove 1 item\?/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/Remove 2 items\?/)).toBeInTheDocument();
 
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Remove 1 item' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Remove 2 items' }));
 
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith('games_content_remove', {
@@ -281,10 +284,15 @@ describe('LibraryPage', () => {
         ignoreUnreadableSnapshots: false,
       });
     });
-    expect(await screen.findByRole('status')).toHaveTextContent('Removed 1 item.');
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Removed 2 items. Reclaimed 2 object(s). Blocked Mod — Nothing was reclaimed: a linked object root.',
+    );
     await waitFor(() => {
-      expect(screen.queryByTestId('unused-summary')).not.toBeInTheDocument();
+      expect(screen.getByTestId('unused-summary')).toHaveTextContent('Unused: 1 item, 2.0 MB');
     });
+    expect(invokeMock).not.toHaveBeenCalledWith('games_content_remove', expect.objectContaining({
+      itemId: ignoredItem.itemId,
+    }));
   });
 
   it('offers to delete an unreadable snapshot that blocks removal', async () => {

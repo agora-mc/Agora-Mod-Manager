@@ -394,22 +394,40 @@ Those snapshots will no longer be able to restore this item.`,
     setUnusedBusy(true);
     setUnusedError(null);
     const failures: string[] = [];
+    const collectionDetails = new Set<string>();
+    let reclaimed = 0;
     let removed = 0;
     for (const item of chosen) {
       try {
-        await removeLibraryItem(item.itemId);
+        const report = await removeLibraryItem(item.itemId);
+        if (report) {
+          reclaimed += report.reclaimed;
+          const count = `reclaimed ${report.reclaimed} object(s)`;
+          const summary = report.reclaimed > 0 && report.summary.startsWith(count)
+            ? report.summary.slice(count.length).replace(/^; /, '')
+            : report.summary;
+          const detail = describeCollection({ ...report, summary });
+          if (detail) collectionDetails.add(`${item.name} — ${detail}`);
+        }
         removed += 1;
       } catch (error) {
         failures.push(`${item.name}: ${errorMessage(error)}`);
       }
     }
     setUnusedBusy(false);
+    if (removed > 0) {
+      const reclaimedLine = reclaimed > 0 ? `Reclaimed ${reclaimed} object(s).` : '';
+      setNotice(
+        [`Removed ${plural(removed, 'item')}.`, reclaimedLine, ...collectionDetails]
+          .filter(Boolean)
+          .join(' '),
+      );
+    }
     if (failures.length > 0) {
       setUnusedError(failures.join(' '));
       await load();
       return;
     }
-    setNotice(`Removed ${plural(removed, 'item')}.`);
     setUnusedOpen(false);
     setUnusedSelected(new Set());
     setUnusedConfirming(false);

@@ -5089,7 +5089,16 @@ pub async fn apply_backup_retention(
         keep_days,
     };
     let ctx = crate::core_context(&app)?;
-    agora_core::backup::apply_instance_retention(&ctx, &instance_id, policy).await
+    let (evicted, collection) =
+        agora_core::backup::apply_instance_retention_with_report(&ctx, &instance_id, policy)
+            .await?;
+    if let Some(report) = collection {
+        crate::auth::log_line(&format!(
+            "backup retention for {instance_id}: {}",
+            report.summary()
+        ));
+    }
+    Ok(evicted)
 }
 
 // ---------------------------------------------------------------------------
@@ -5419,18 +5428,7 @@ pub async fn delete_snapshot(
     tokio::task::spawn_blocking(move || -> Result<_, String> {
         let report =
             agora_core::snapshot::delete_snapshot_with_report(&instance_dir, &snapshot_id)?;
-        match agora_core::lkg::run_retention_with_report(&instance_dir) {
-            Ok(Some(round)) => crate::auth::log_line(&format!(
-                "snapshot retention after deleting {} for {}: {}",
-                snapshot_id,
-                instance_dir.display(),
-                round.outcome().summary
-            )),
-            Ok(None) => {}
-            Err(error) => crate::auth::log_line(&format!(
-                "snapshot retention after deleting a snapshot failed: {error}"
-            )),
-        }
+        log_snapshot_retention(&instance_dir, "after snapshot deletion");
         Ok(report.outcome())
     })
     .await
@@ -5442,6 +5440,18 @@ pub async fn delete_snapshot(
         code: "ERR_SNAPSHOT".into(),
         message: e,
     })
+}
+
+fn log_snapshot_retention(instance_dir: &std::path::Path, reason: &str) {
+    let summary = match agora_core::lkg::run_retention_with_report(instance_dir) {
+        Ok(Some(report)) => report.summary(),
+        Ok(None) => return,
+        Err(error) => format!("failed: {error}"),
+    };
+    crate::auth::log_line(&format!(
+        "snapshot retention {reason} for {}: {summary}",
+        instance_dir.display()
+    ));
 }
 
 fn loadout_error(message: String) -> LauncherError {
@@ -6188,9 +6198,7 @@ pub async fn apply_install_plan(
         shared.active_install_instances.remove(&instance_id);
     }
     guard.disarm();
-    if let Err(error) = agora_core::lkg::run_retention(&instance_dir) {
-        crate::auth::log_line(&format!("snapshot retention after install failed: {error}"));
-    }
+    log_snapshot_retention(&instance_dir, "after install");
     Ok(outcome)
 }
 
@@ -6594,7 +6602,7 @@ pub async fn repair_lockfile(
                     )),
                 };
             }
-            let _ = agora_core::lkg::run_retention(&post_dir);
+            log_snapshot_retention(&post_dir, "after lockfile repair");
             Ok(outcome.clone())
         })
         .await
@@ -7123,8 +7131,13 @@ pub async fn import_lockfile(
     }
     {
         let retention_dir = instance_dir.clone();
-        let _ = tokio::task::spawn_blocking(move || agora_core::lkg::run_retention(&retention_dir))
-            .await;
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            log_snapshot_retention(&retention_dir, "after lockfile import");
+        })
+        .await
+        {
+            crate::auth::log_line(&format!("snapshot retention task failed: {error}"));
+        }
     }
     Ok(instance_id)
 }

@@ -88,6 +88,7 @@ import {
   createSnapshot,
   restoreSnapshot,
   deleteSnapshot,
+  describeCollection,
   describeRestoreCoverage,
   detectDrift,
   checkInstanceHealth,
@@ -2792,8 +2793,10 @@ Restoring while the game runs can be overwritten by the game. Restore anyway?`,
                           onClick={async () => {
                             setSnapshotBusy(snap.id);
                             setError(null);
+                            setStatus(null);
                             try {
-                              await deleteSnapshot(instanceId, snap.id);
+                              const collected = await deleteSnapshot(instanceId, snap.id);
+                              setStatus(['Snapshot deleted.', describeCollection(collected)].filter(Boolean).join(' '));
                               const result = await listSnapshots(instanceId);
                               setSnapshots(result);
                               setConfirmDeleteSnapshot(null);
