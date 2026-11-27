@@ -2268,8 +2268,8 @@ fn read_manifest(path: &std::path::Path) -> LauncherResult<Option<InstanceManife
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agora_core::operation_manager::OpStatus;
     use agora_core::db::local_state_connection;
+    use agora_core::operation_manager::OpStatus;
     use std::path::PathBuf;
 
     fn context() -> (Ctx, PathBuf) {
@@ -3010,8 +3010,7 @@ mod tests {
         assert!(cloned_dir.join("mods").join("test.jar").exists());
         assert!(cloned_dir.join("saves").join("world.dat").exists());
 
-        let cloned_conn =
-            local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let cloned_conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let cloned_detail = agora_core::db::get_instance(&cloned_conn, "Clone").unwrap();
         assert!(cloned_detail.is_some());
         assert_eq!(cloned_detail.unwrap().name, "Clone");
@@ -3066,8 +3065,7 @@ mod tests {
         // Clones are always fresh, unlocked working copies — never inherit the
         // source's locked flag in either the DB row or the manifest.
         assert!(!clone_row.is_locked);
-        let cloned_conn =
-            local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let cloned_conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let cloned_row = agora_core::db::get_instance(&cloned_conn, "Clone")
             .unwrap()
             .unwrap();
@@ -4068,8 +4066,7 @@ $#
             let (ctx, root) = context();
             seed(&ctx, "pack");
             {
-                let conn =
-                    local_state_connection(&ctx.paths.local_state_db()).unwrap();
+                let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
                 conn.execute(
                     "INSERT INTO mcp_approval_grants (tool_name, instance_id, state, granted_at)
                      VALUES ('tool.x', 'pack', 'granted', '2026-01-01T00:00:00Z')",
@@ -4149,8 +4146,7 @@ $#
             let (ctx, root) = context();
             seed(&ctx, "pack");
             {
-                let conn =
-                    local_state_connection(&ctx.paths.local_state_db()).unwrap();
+                let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
                 conn.execute_batch(
                     "CREATE TRIGGER review_block_clone_import BEFORE INSERT ON instance_imports
                      WHEN NEW.installation_key = 'clone'
@@ -4270,8 +4266,7 @@ $#
             let (ctx, root) = context();
             seed(&ctx, "pack");
             {
-                let conn =
-                    local_state_connection(&ctx.paths.local_state_db()).unwrap();
+                let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
                 conn.execute(
                     "INSERT INTO mcp_approval_grants (tool_name, instance_id, state, granted_at)
                      VALUES ('tool.x', 'pack', 'granted', '2026-01-01T00:00:00Z')",
@@ -4320,16 +4315,14 @@ $#
             let (ctx, root) = context();
             seed(&ctx, "pack");
             let before = {
-                let conn =
-                    local_state_connection(&ctx.paths.local_state_db()).unwrap();
+                let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
                 crate::recently_deleted::capture_db_state(&conn, "pack").unwrap()
             };
             let service = InstanceService::new(ctx.clone());
             service.delete("pack").unwrap();
             // Crash simulation: the folder is in the entry but the rows are back.
             {
-                let mut conn =
-                    local_state_connection(&ctx.paths.local_state_db()).unwrap();
+                let mut conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
                 crate::recently_deleted::replay_db_state(&mut conn, &before, "pack", "pack", None)
                     .unwrap();
             }
@@ -4357,8 +4350,7 @@ $#
             // A new instance (different created_at) took the id, then lost its folder.
             seed(&ctx, "pack");
             {
-                let conn =
-                    local_state_connection(&ctx.paths.local_state_db()).unwrap();
+                let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
                 conn.execute(
                     "UPDATE instances SET created_at = 'other' WHERE instance_id='pack'",
                     [],
