@@ -668,6 +668,94 @@ pub(crate) fn path_identity(path: &Path) -> std::io::Result<Option<PathIdentity>
     }
 }
 
+/// What a plain file was when a writer last saw it: which file on disk (a rename keeps it), how
+/// long, and when its bytes last changed. A file replaced since has another identity; one rewritten
+/// in place has another length or time. Recovery takes back only a file whose stamp still matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStamp {
+    /// The volume and file the OS reported.
+    pub identity: PathIdentity,
+    /// The length in bytes.
+    pub len: u64,
+    /// The last write, in nanoseconds since the Unix epoch (0 when the OS gave none).
+    pub modified_ns: u64,
+}
+
+/// The stamp of the plain file at `path`: `Ok(None)` when nothing is there; an error for a link, a
+/// folder, or a file the OS would not describe (never read as "nothing is there").
+pub(crate) fn file_stamp(path: &Path) -> std::io::Result<Option<FileStamp>> {
+    let opened = {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Open the link itself, never what it points at, so a link is seen and refused.
+            options.custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        options.open(path)
+    };
+    let file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || agora_game_api::is_a_reparse_point(&metadata) {
+        return Err(std::io::Error::other("expected a plain file"));
+    }
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| {
+            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+        });
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        PathIdentity::File {
+            volume: metadata.dev(),
+            file: metadata.ino(),
+        }
+    };
+    #[cfg(windows)]
+    let identity = {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `file` is open for the call, and `info` is a valid out-parameter.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        PathIdentity::File {
+            volume: u64::from(info.dwVolumeSerialNumber),
+            file: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        }
+    };
+    #[cfg(not(any(unix, windows)))]
+    let identity: PathIdentity = {
+        return Err(std::io::Error::other(
+            "this platform reports no file identity".to_string(),
+        ));
+    };
+    Ok(Some(FileStamp {
+        identity,
+        len: metadata.len(),
+        modified_ns,
+    }))
+}
+
 /// A path whose proof matched when the decision was made, with what the OS said it was then.
 #[derive(Debug, Clone)]
 struct VerifiedPath {

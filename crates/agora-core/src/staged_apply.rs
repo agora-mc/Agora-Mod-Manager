@@ -40,8 +40,8 @@ use crate::instance_runtime::InstanceGuard;
 use crate::lock_manager::{LockGuard, LockManager, LockRefusal, LockResource};
 use crate::process_identity;
 use crate::recovery::{
-    self, Decision, Envelope, JournalRead, JournalState, NoContentProof, OperationKind, OwnedPath,
-    PathProof, RecoveryCapability,
+    self, Decision, Envelope, FileStamp, JournalRead, JournalState, NoContentProof, OperationKind,
+    OwnedPath, PathProof, RecoveryCapability,
 };
 
 /// The folder below an instance root that holds every stage and journal.
@@ -88,8 +88,13 @@ pub struct KeptAside {
 /// What recovery did about one unresolved apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StagedRecovery {
-    /// The apply had not reached its commit point: the instance is as it was before it.
-    RolledBack { operation: String },
+    /// The apply had not reached its commit point: the instance is as it was before it, except
+    /// where something else put a file in a place this apply had emptied. That file stays, and the
+    /// one Agora would have put back is left at `left_at` (never deleted).
+    RolledBack {
+        operation: String,
+        left_at: Vec<PathBuf>,
+    },
     /// The apply had committed: its cleanup was finished.
     Finished { operation: String },
     /// Another Agora holds the instance lock: its apply may still be running. Nothing was touched.
@@ -147,16 +152,24 @@ enum Previous {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 enum Op {
-    /// The staged file `staged` takes `path`; what was there went to `previous`.
+    /// The staged file `staged` takes `path`; what was there went to `previous`. `made` is the
+    /// staged file's stamp: a rollback takes back only the file it still describes.
     Write {
         path: String,
         staged: String,
         previous: Option<Previous>,
+        #[serde(default)]
+        made: Option<FileStamp>,
     },
     /// What was at `path` went to `previous`.
     Remove { path: String, previous: Previous },
-    /// `from` became `to`.
-    Rename { from: String, to: String },
+    /// `from` became `to`. `made` is the file's stamp, as for a write.
+    Rename {
+        from: String,
+        to: String,
+        #[serde(default)]
+        made: Option<FileStamp>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -651,10 +664,12 @@ impl<'g> Stage<'g> {
                             Some(self.previous_for(path, expect, &mut aside_taken, &mut report)?)
                         }
                     };
+                    let made = stamp(&self.dir.join(staged))?;
                     ops.push(Op::Write {
                         path: path.as_str().to_string(),
                         staged: staged.clone(),
                         previous,
+                        made: Some(made),
                     });
                 }
                 Pending::Remove { path, expect } => {
@@ -683,9 +698,11 @@ impl<'g> Stage<'g> {
                             from.as_str()
                         )));
                     }
+                    let made = stamp(&self.root.join(from.as_str()))?;
                     ops.push(Op::Rename {
                         from: from.as_str().to_string(),
                         to: to.as_str().to_string(),
+                        made: Some(made),
                     });
                 }
             }
@@ -785,6 +802,7 @@ fn forward_moves(root: &Path, dir: &Path, op: &Op) -> Vec<(PathBuf, PathBuf)> {
             path,
             staged,
             previous,
+            ..
         } => {
             let live = root.join(path);
             let mut moves = Vec::new();
@@ -797,7 +815,7 @@ fn forward_moves(root: &Path, dir: &Path, op: &Op) -> Vec<(PathBuf, PathBuf)> {
         Op::Remove { path, previous } => {
             vec![(root.join(path), previous_location(root, dir, previous))]
         }
-        Op::Rename { from, to } => vec![(root.join(from), root.join(to))],
+        Op::Rename { from, to, .. } => vec![(root.join(from), root.join(to))],
     }
 }
 
@@ -889,8 +907,19 @@ pub fn recover_instances(ctx: &crate::ctx::Ctx) -> (Vec<String>, Vec<String>) {
         };
         for outcome in outcomes {
             match outcome {
-                StagedRecovery::RolledBack { .. } => actions.push(format!(
-                    "Put instance '{id}' back as it was before a change that was interrupted."
+                StagedRecovery::RolledBack { left_at, .. } if left_at.is_empty() => actions
+                    .push(format!(
+                        "Put instance '{id}' back as it was before a change that was interrupted."
+                    )),
+                StagedRecovery::RolledBack { left_at, .. } => warnings.push(format!(
+                    "Put instance '{id}' back as it was before a change that was interrupted, except \
+                     where something else had put a file since. Those files were kept, and Agora's \
+                     own were left at: {}",
+                    left_at
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )),
                 StagedRecovery::Finished { .. } => actions.push(format!(
                     "Finished a change to instance '{id}' that was interrupted after it was made."
@@ -1152,11 +1181,14 @@ fn settle_one(
             }
         },
     };
+    let mut left_at = Vec::new();
     let result = if committed {
         finish_cleanup(&mut capability, &dir, &journal, cleanup_crash)
     } else {
-        roll_back(&mut capability, root, &dir, &journal, undo_crash)
-            .and_then(|()| clear_stage(&capability, &dir))
+        roll_back(&mut capability, root, &dir, &journal, undo_crash).and_then(|left| {
+            left_at = left;
+            clear_stage(&capability, &dir)
+        })
     };
     match result {
         Ok(()) => {}
@@ -1175,19 +1207,27 @@ fn settle_one(
     if committed {
         StagedRecovery::Finished { operation }
     } else {
-        StagedRecovery::RolledBack { operation }
+        StagedRecovery::RolledBack { operation, left_at }
     }
 }
 
 /// Undo the journal's moves, newest first, judging each one by what is on disk.
+///
+/// Something other than Agora may have changed the instance between the crash and this recovery:
+/// a file put where this apply had emptied a place, or a file Agora made live replaced. Neither is
+/// ever taken or deleted. A file Agora made live is taken back only while its stamp says it is
+/// still that file; an old file that cannot go back to its place because another file is there is
+/// left aside below the instance, and its new place is returned.
 fn roll_back(
     capability: &mut RecoveryCapability<'_, State>,
     root: &Path,
     dir: &Path,
     journal: &StagedJournal,
     crash_after: Option<usize>,
-) -> LauncherResult<()> {
+) -> LauncherResult<Vec<PathBuf>> {
     let mut moves = 0usize;
+    let mut left_at = Vec::new();
+    let mut aside_taken = Vec::<String>::new();
     let mut undo = |capability: &mut RecoveryCapability<'_, State>,
                     from: &Path,
                     to: &Path|
@@ -1201,40 +1241,100 @@ fn roll_back(
     };
     for op in journal.ops.iter().rev() {
         match op {
-            Op::Rename { from, to } => {
+            Op::Rename { from, to, made } => {
                 let (from, to) = (root.join(from), root.join(to));
-                if present(&to)? && !present(&from)? {
-                    undo(capability, &to, &from)?;
+                if still_made(&to, made)? {
+                    if present(&from)? {
+                        // Another file took the old name: both stay, and the renamed file is left
+                        // under its new one.
+                        left_at.push(to);
+                    } else {
+                        undo(capability, &to, &from)?;
+                    }
                 }
             }
             Op::Remove { path, previous } => {
                 let live = root.join(path);
                 let kept = previous_location(root, dir, previous);
-                if present(&kept)? && !present(&live)? {
-                    undo(capability, &kept, &live)?;
+                if present(&kept)? {
+                    if present(&live)? {
+                        let at =
+                            leave_aside(capability, root, &kept, path, previous, &mut aside_taken)?;
+                        left_at.push(at);
+                    } else {
+                        undo(capability, &kept, &live)?;
+                    }
                 }
             }
             Op::Write {
                 path,
                 staged,
                 previous,
+                made,
             } => {
                 let live = root.join(path);
                 let staged = dir.join(staged);
-                if !present(&staged)? && present(&live)? {
-                    // The new file was made live: take it back into the stage.
+                if !present(&staged)? && still_made(&live, made)? {
+                    // The new file was made live and is still that file: take it back into the stage.
                     undo(capability, &live, &staged)?;
                 }
                 if let Some(previous) = previous {
                     let kept = previous_location(root, dir, previous);
-                    if present(&kept)? && !present(&live)? {
-                        undo(capability, &kept, &live)?;
+                    if present(&kept)? {
+                        if present(&live)? {
+                            let at = leave_aside(
+                                capability,
+                                root,
+                                &kept,
+                                path,
+                                previous,
+                                &mut aside_taken,
+                            )?;
+                            left_at.push(at);
+                        } else {
+                            undo(capability, &kept, &live)?;
+                        }
                     }
                 }
             }
         }
     }
-    Ok(())
+    Ok(left_at)
+}
+
+/// Whether the plain file at `path` is still the one `made` describes. A journal without a stamp
+/// cannot say, and a file it cannot vouch for is never taken.
+fn still_made(path: &Path, made: &Option<FileStamp>) -> LauncherResult<bool> {
+    match recovery::file_stamp(path) {
+        Ok(None) => Ok(false),
+        Ok(Some(now)) => Ok(made.as_ref() == Some(&now)),
+        // A link or a folder where Agora put a file is not Agora's.
+        Err(_) if !present(path)? => Ok(false),
+        Err(error) => Err(io(path, error)),
+    }
+}
+
+/// Keep `kept` (an old file whose place another file now holds) where nothing deletes it: a file
+/// already aside stays there; a backup in the stage, which the stage's cleanup would delete, moves
+/// aside below the instance.
+fn leave_aside(
+    capability: &mut RecoveryCapability<'_, State>,
+    root: &Path,
+    kept: &Path,
+    path: &str,
+    previous: &Previous,
+    taken: &mut Vec<String>,
+) -> LauncherResult<PathBuf> {
+    match previous {
+        Previous::Aside { .. } => Ok(kept.to_path_buf()),
+        Previous::Backup { .. } => {
+            let aside = free_aside(root, path, taken)?;
+            let target = root.join(&aside);
+            capability.rename_file_below(root, kept, &target)?;
+            taken.push(aside);
+            Ok(target)
+        }
+    }
 }
 
 /// After the commit point: delete the stage's backups of Agora's old files. Files kept aside are
@@ -1393,6 +1493,18 @@ fn inspect(root: &Path, relative: &str) -> LauncherResult<Option<()>> {
 
 /// Move a plain file, both ends below `root`, without following a link (the forward path; recovery
 /// uses the capability's own copy of this rule).
+/// The stamp of a file this apply is about to move (it is there: the plan just looked).
+fn stamp(path: &Path) -> LauncherResult<FileStamp> {
+    recovery::file_stamp(path)
+        .map_err(|error| io(path, error))?
+        .ok_or_else(|| {
+            refused(format!(
+                "{} vanished before the change was made",
+                path.display()
+            ))
+        })
+}
+
 fn move_file(root: &Path, from: &Path, to: &Path) -> LauncherResult<()> {
     recovery::move_file_below(root, from, to)
 }

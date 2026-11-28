@@ -872,3 +872,125 @@ fn the_startup_pass_judges_a_receipt_apply_by_its_receipt() {
     assert_eq!(receipts(&conn), 0);
     no_stage_left(&root);
 }
+
+// ---------------------------------------------------------------------------
+// 6. Something else changed the instance between the crash and the recovery
+// ---------------------------------------------------------------------------
+
+/// Every path the apply touches.
+const APPLY_PATHS: [&str; 6] = [
+    "mods/new.jar",
+    "mods/agora.jar",
+    "mods/mine.jar",
+    "config/old.txt",
+    "notes/a.txt",
+    "notes/b.txt",
+];
+
+/// The old instance's bytes, each of which must survive any recovery exactly once.
+const OLD_BYTES: [&[u8]; 4] = [b"agora-v1", b"user edited", b"old", b"rename me"];
+
+fn outsider(path: &str) -> Vec<u8> {
+    format!("another program's {path}").into_bytes()
+}
+
+fn copies_of(root: &Path, bytes: &[u8]) -> usize {
+    tree(root)
+        .values()
+        .filter(|held| held.as_slice() == bytes)
+        .count()
+}
+
+#[test]
+fn a_file_put_where_an_apply_emptied_a_place_is_kept_and_so_is_the_old_file() {
+    let mut pre_commit = vec![Boundary::AfterPlan];
+    pre_commit.extend((1..=7).map(Boundary::AfterMove));
+    for boundary in pre_commit {
+        let (_dir, ctx, root) = fixture();
+        old_instance(&root);
+        {
+            let guard = guard(&ctx);
+            let mut stage = stage_the_apply(&guard, &root);
+            stage.crash_at(boundary);
+            assert!(stage.commit().is_err());
+        }
+        // Another program fills every place the apply left empty before Agora starts again.
+        let mut filled = Vec::new();
+        for path in APPLY_PATHS {
+            if !root.join(path).exists() {
+                put(&root, path, &outsider(path));
+                filled.push(path);
+            }
+        }
+
+        let outcomes = staged_apply::recover(&ctx.lock_manager, ID, &root);
+        assert!(
+            matches!(outcomes.as_slice(), [StagedRecovery::RolledBack { .. }]),
+            "{boundary:?}: {outcomes:?}"
+        );
+        for path in &filled {
+            assert_eq!(
+                fs::read(root.join(path)).unwrap(),
+                outsider(path),
+                "{boundary:?}: the other program's {path} is never taken"
+            );
+        }
+        for bytes in OLD_BYTES {
+            assert_eq!(
+                copies_of(&root, bytes),
+                1,
+                "{boundary:?}: the old {:?} survives exactly once",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        no_stage_left(&root);
+    }
+}
+
+#[test]
+fn a_file_agora_made_live_and_something_then_replaced_is_never_taken() {
+    let (_dir, ctx, root) = fixture();
+    old_instance(&root);
+    {
+        let guard = guard(&ctx);
+        let mut stage = stage_the_apply(&guard, &root);
+        // Every move made, the commit point not reached.
+        stage.crash_at(Boundary::AfterMove(7));
+        assert!(stage.commit().is_err());
+    }
+    // Another program replaces two files Agora made live, and rewrites the renamed one in place.
+    for path in ["mods/new.jar", "mods/agora.jar"] {
+        fs::remove_file(root.join(path)).unwrap();
+        put(&root, path, &outsider(path));
+    }
+    fs::write(root.join("notes/b.txt"), outsider("notes/b.txt")).unwrap();
+
+    let outcomes = staged_apply::recover(&ctx.lock_manager, ID, &root);
+    assert!(
+        matches!(outcomes.as_slice(), [StagedRecovery::RolledBack { .. }]),
+        "{outcomes:?}"
+    );
+    for path in ["mods/new.jar", "mods/agora.jar", "notes/b.txt"] {
+        assert_eq!(
+            fs::read(root.join(path)).unwrap(),
+            outsider(path),
+            "the other program's {path} is never taken"
+        );
+    }
+    // The old files the other program did not overwrite all survive, once.
+    for bytes in [b"agora-v1".as_slice(), b"user edited", b"old"] {
+        assert_eq!(
+            copies_of(&root, bytes),
+            1,
+            "the old {:?} survives exactly once",
+            String::from_utf8_lossy(bytes)
+        );
+    }
+    // Untouched places are back as they were.
+    assert_eq!(fs::read(root.join("config/old.txt")).unwrap(), b"old");
+    assert!(
+        !root.join("notes/a.txt").exists(),
+        "a rewritten file is not renamed back"
+    );
+    no_stage_left(&root);
+}
