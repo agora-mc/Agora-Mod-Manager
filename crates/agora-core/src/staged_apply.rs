@@ -963,7 +963,9 @@ pub fn recover_instances(ctx: &crate::ctx::Ctx) -> (Vec<String>, Vec<String>) {
             Ok(kind) if kind.is_dir() && !agora_game_api::is_a_reparse_point(&kind) => {}
             _ => continue,
         }
-        if !has_stage(&instance) {
+        let staged = has_stage(&instance);
+        let publication = new_instance::has_journal(&instance);
+        if !staged && !publication {
             continue;
         }
         let id = entry.file_name().to_string_lossy().to_string();
@@ -974,6 +976,26 @@ pub fn recover_instances(ctx: &crate::ctx::Ctx) -> (Vec<String>, Vec<String>) {
                 Err(error) => warnings.push(format!(
                     "Agora could not open the local database to finish interrupted changes: {error}"
                 )),
+            }
+        }
+        if publication {
+            // A new instance whose creation was cut off: registered, or removed.
+            match new_instance::settle(&ctx.lock_manager, &instance, conn.as_ref()) {
+                StagedRecovery::RolledBack { .. } => actions.push(format!(
+                    "Removed '{id}', an instance whose creation was interrupted before it was                      registered."
+                )),
+                StagedRecovery::Finished { .. } => actions.push(format!(
+                    "Finished creating instance '{id}', which was interrupted after it was                      registered."
+                )),
+                StagedRecovery::Busy(reason) => warnings.push(format!(
+                    "An instance being created at '{id}' was left alone: {reason}"
+                )),
+                StagedRecovery::NeedsHand(reason) => warnings.push(format!(
+                    "An instance being created at '{id}' needs a hand: {reason}"
+                )),
+            }
+            if !staged || !instance.exists() {
+                continue;
             }
         }
         let outcomes = match &conn {
@@ -1788,6 +1810,9 @@ fn crash_error() -> LauncherError {
         message: "stopped by the test seam, as a crash would".into(),
     }
 }
+
+#[path = "staged_apply_new_instance.rs"]
+pub mod new_instance;
 
 #[cfg(test)]
 #[path = "staged_apply_tests.rs"]

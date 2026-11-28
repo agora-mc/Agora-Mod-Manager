@@ -6,7 +6,7 @@ use agora_core::event_sink::{OperationId, ProgressEvent, ProgressPhase, Progress
 use agora_core::models::{
     InstalledMod, InstanceManifest, PackOrigin, PackPlatform, CURRENT_MANIFEST_VERSION,
 };
-use agora_core::{ctx::Ctx, paths};
+use agora_core::{ctx::Ctx, paths, staged_apply::new_instance};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -645,7 +645,10 @@ fn prepare_import_target(instances_root: &Path, name: &str) -> LauncherResult<Im
 
     let staging_dir =
         instances_root.join(format!(".agora-import-{instance_id}-{}", Uuid::new_v4()));
-    fs::create_dir(&staging_dir).map_err(|e| {
+    // The staging folder carries the publication's journal from its first moment, so a crash at
+    // any point before the instance is registered leaves nothing the next start does not remove
+    // (MASTER_SPEC §32.4, the whole-folder protocol).
+    new_instance::begin(&staging_dir, &instance_id, &final_dir).map_err(|e| {
         import_error(
             "ERR_IMPORT_MKDIR",
             format!("Cannot create a safe staging folder for the import: {e}"),
@@ -675,14 +678,17 @@ fn finalize_import(target: &ImportTarget) -> LauncherResult<()> {
             ),
         ));
     }
-    fs::rename(&target.staging_dir, &target.final_dir).map_err(|e| {
-        import_error(
-            "ERR_IMPORT_FINALIZE",
-            format!(
-                "Could not finalize the imported instance. Your existing instances were not changed: {e}"
-            ),
-        )
-    })
+    // Published, not yet registered: the caller registers it (`new_instance::commit_with_receipt`),
+    // and until then a crash leaves it for the next start to remove.
+    new_instance::publish(&target.staging_dir, &target.final_dir)
+        .map_err(|e| {
+            import_error(
+                "ERR_IMPORT_FINALIZE",
+                format!(
+                    "Could not finalize the imported instance. Your existing instances were not changed: {e}"
+                ),
+            )
+        })
 }
 
 /// Normalize archive-provided separators before applying the path safety

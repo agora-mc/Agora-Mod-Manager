@@ -87,6 +87,8 @@ pub enum OperationKind {
     SnapshotObjectMigration,
     /// Putting files into an instance through staged apply, under the instance lock (§32.4).
     StagedApply,
+    /// Building a new instance aside and publishing it whole, under its instance lock (§32.4).
+    NewInstance,
 }
 
 impl OperationKind {
@@ -96,6 +98,7 @@ impl OperationKind {
             OperationKind::PluginInstall => "plugin-install",
             OperationKind::SnapshotObjectMigration => "snapshot-object-migration",
             OperationKind::StagedApply => "staged-apply",
+            OperationKind::NewInstance => "new-instance",
         }
     }
 }

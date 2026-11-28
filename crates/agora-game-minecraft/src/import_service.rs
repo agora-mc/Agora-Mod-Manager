@@ -7,9 +7,9 @@ use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::event_sink::{
     self, CancellationToken, CoreEvent, OperationId, ProgressEvent, ProgressPhase, ProgressSink,
 };
-use agora_core::models::InstanceRow;
 use agora_core::network::NetworkPolicy;
 use agora_core::operation_manager::OpHandle;
+use agora_core::{models::InstanceRow, staged_apply::new_instance};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -719,7 +719,21 @@ impl ImportService {
             }
         };
 
-        if let Err(error) = agora_core::db::upsert_instance(&conn, crate::GAME_ID, &row) {
+        // The commit point: the row and the publication's receipt in one transaction. Before it a
+        // crash leaves the published folder for the next start to remove; after it, the instance.
+        let mut conn = conn;
+        let registered = match self.ctx.paths.instance_dir(&result.instance_id) {
+            Ok(instance_dir) => new_instance::commit_with_receipt(&instance_dir, &mut conn, |tx| {
+                agora_core::db::upsert_instance(tx, crate::GAME_ID, &row).map_err(|error| {
+                    LauncherError::Generic {
+                        code: "ERR_LOCAL_STATE_FAILED".into(),
+                        message: error.to_string(),
+                    }
+                })
+            }),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = registered {
             let _ = rollback();
             op.fail(error.to_string());
             return Err(LauncherError::Generic {
@@ -1070,8 +1084,9 @@ fn remove_promoted(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agora_core::event_sink::CollectingProgressSink;
-    use agora_core::operation_manager::OpStatus;
+    use agora_core::{
+        db, event_sink::CollectingProgressSink, operation_manager::OpStatus, startup_recovery,
+    };
     use std::io::Write;
 
     /// A fresh temp directory for one test. The random component matters:
@@ -1177,6 +1192,69 @@ mod tests {
         let result = svc.run_import(request).await.unwrap();
         assert_eq!(result.instance_id, "a-pack");
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A finished import is registered and carries none of the protocol's own files.
+    #[tokio::test]
+    async fn an_import_registers_its_instance_and_leaves_no_publication_record() {
+        let ctx = test_ctx();
+        let svc = ImportService::new(ctx.clone());
+        let tmp = test_tmp("pub-done");
+        let src = tmp.join("pub-done");
+        std::fs::create_dir_all(src.join("mods")).unwrap();
+        std::fs::write(src.join("mods").join("a.jar"), b"mod").unwrap();
+
+        let result = svc
+            .run_import(ImportRequest {
+                source: ImportSource::Directory(src),
+                symlink_saves: false,
+            })
+            .await
+            .unwrap();
+
+        let dir = ctx.paths.instance_dir(&result.instance_id).unwrap();
+        assert!(!dir.join(new_instance::JOURNAL).exists());
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".agora-new-instance"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let conn = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        assert!(db::get_instance(&conn, &result.instance_id)
+            .unwrap()
+            .is_some());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// An import cut off after its folder took its name but before it was registered (the window
+    /// covers the metadata download and the loader install) holds nothing after the next start.
+    #[test]
+    fn an_import_cut_off_before_it_was_registered_is_removed_by_the_next_start() {
+        let ctx = test_ctx();
+        let tmp = test_tmp("pub-cut");
+        let src = tmp.join("pub-cut");
+        std::fs::create_dir_all(src.join("mods")).unwrap();
+        std::fs::write(src.join("mods").join("a.jar"), b"mod").unwrap();
+        // The import's own half: built and published, and then the process stopped.
+        let result =
+            crate::import::import_directory(&src, &ctx.paths.instances_root(), false).unwrap();
+        let dir = ctx.paths.instance_dir(&result.instance_id).unwrap();
+        assert!(dir.join("mods").join("a.jar").exists());
+        let journal = dir.join(new_instance::JOURNAL);
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+        record["writer"]["pid"] = serde_json::json!(u32::MAX - 1);
+        std::fs::write(&journal, serde_json::to_vec(&record).unwrap()).unwrap();
+
+        let report = startup_recovery::run_at_startup(&ctx);
+
+        assert!(!dir.exists(), "{report:?}");
+        assert!(
+            src.join("mods").join("a.jar").exists(),
+            "the source is untouched"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
