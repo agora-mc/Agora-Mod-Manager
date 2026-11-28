@@ -425,21 +425,6 @@ fn store_file_at(
     Ok(stored)
 }
 
-/// Place a stored object at the instance's content path, using the user's link/copy choice.
-pub fn place_file(
-    ctx: &Ctx,
-    sha256: &str,
-    instance_dir: &Path,
-    content_type: &str,
-    filename: &str,
-) -> LauncherResult<store::PlacedAs> {
-    let target = instance_dir
-        .join(subdir_for_content_type(content_type))
-        .join(filename);
-    let mode = store::placement_mode(ctx).map_err(content_error)?;
-    store::place_object_at(ctx, sha256, &target, mode).map_err(content_error)
-}
-
 /// Make one change to an instance through staged apply (MASTER_SPEC §32.4): `build` stages it,
 /// and it is made in one journaled commit, or not at all.
 ///

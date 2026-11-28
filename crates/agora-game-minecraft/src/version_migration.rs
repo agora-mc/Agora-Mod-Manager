@@ -87,13 +87,17 @@ use crate::migration_report::{
     generate_migration_report, MigrationReport, MigrationStatus, ModrinthChecker, SuccessorLookup,
     TargetBuildInfo,
 };
-use agora_core::ctx::Ctx;
-use agora_core::error::{LauncherError, LauncherResult};
-use agora_core::models::{InstalledMod, InstanceManifest};
+use agora_core::{
+    ctx::Ctx,
+    error::{LauncherError, LauncherResult},
+    instance_runtime::InstanceGuard,
+    models::{InstalledMod, InstanceManifest},
+    staged_apply::{Expect, Stage},
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Seams
@@ -643,13 +647,14 @@ pub async fn execute_migration(
         Ok(id) => id,
         Err(error) => return failed("precondition", error.to_string()),
     };
-    let _guard = match ctx
-        .lock_manager
-        .acquire_async(
-            agora_core::lock_manager::LockResource::Instance(instance_id.clone()),
-            "version-migration",
-        )
-        .await
+    // The instance lock, as the guard staged apply takes. The running-session check below stays
+    // this migration's own answer to "is the game using it".
+    let guard = match InstanceGuard::for_mutation_while_running_async(
+        ctx,
+        &instance_id,
+        "version-migration",
+    )
+    .await
     {
         Ok(guard) => guard,
         Err(error) => return failed("lock", error.to_string()),
@@ -824,89 +829,93 @@ pub async fn execute_migration(
     };
     let snapshot_id = snapshot.id.clone();
 
-    // 5. Apply: reversible journal, atomic manifest rename as the commit.
-    let manifest_path = instance_dir.join("instance_manifest.json");
-    let original_manifest = match std::fs::read(&manifest_path) {
-        Ok(bytes) => bytes,
+    // 5. Apply the swaps, the manifest and the instance row together (MASTER_SPEC §32.4): the files
+    //    are staged and moved, then the row's compare-and-set and this apply's receipt commit in one
+    //    transaction, which is the commit point. A crash before it leaves the old files and the old
+    //    row; a crash after it is finished by the startup pass. Never old files with a new row.
+    let mut conn = match agora_core::db::local_state_connection(&ctx.paths.local_state_db()) {
+        Ok(conn) => conn,
         Err(error) => {
             let _ = std::fs::remove_dir_all(&staging_dir);
-            return failed(
-                "apply",
-                format!("failed to read current manifest during apply: {error}"),
-            );
+            return failed("apply", format!("local state failed: {error}"));
         }
     };
-    let mut journal = ApplyJournal::default();
-    let commit_temp_path = instance_dir.join(format!(
-        "instance_manifest.json.tmp.migration-{}",
-        &plan.fingerprint[..16.min(plan.fingerprint.len())]
-    ));
-    let applied = apply_migration_moves(
+    let mut stage = match Stage::begin_with_receipts(&guard, &instance_dir, &conn) {
+        Ok(stage) => stage,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return failed("apply", error.to_string());
+        }
+    };
+    if let Err(error) = stage_migration(
         plan,
         ctx,
+        &mut stage,
         &instance_dir,
         &staging_dir,
         &stored_artifacts,
-        &mut journal,
-    );
-    if let Err(error) = applied {
-        let undo = undo_migration(
-            &journal,
-            &manifest_path,
-            &original_manifest,
-            &commit_temp_path,
-        );
+    ) {
+        // Nothing in the instance changed yet: dropping the stage removes it.
+        drop(stage);
         let _ = std::fs::remove_dir_all(&staging_dir);
-        return match undo {
-            Ok(()) => MigrationOutcome::RolledBack {
-                phase: "apply".into(),
-                error: format!("Apply failed before commit; every change was reversed: {error}"),
-                snapshot_id: Some(snapshot_id),
-                health_report: None,
-            },
-            Err(undo_error) => MigrationOutcome::Failed {
-                phase: "apply".into(),
-                error: format!("Apply failed ({error}) and undo did not complete cleanly ({undo_error}); restore snapshot {snapshot_id} to recover"),
-                rolled_back: false,
-                instance_changed: true,
-                snapshot_id: Some(snapshot_id),
-            },
+        return MigrationOutcome::RolledBack {
+            phase: "apply".into(),
+            error: format!("Apply failed before commit; every change was reversed: {error}"),
+            snapshot_id: Some(snapshot_id),
+            health_report: None,
         };
     }
-
-    // 6. DB row commit with guarded compare-and-set. On failure, undo the
-    //    committed manifest and every file move.
-    let db_result = commit_migration_db(
-        ctx,
-        &instance_id,
-        &plan.loader,
-        &plan.source_version,
-        &plan.source_loader_version,
-        &plan.target_version,
-        &new_loader_version(plan),
-    );
-    if let Err(error) = db_result {
-        let undo = undo_migration(
-            &journal,
-            &manifest_path,
-            &original_manifest,
-            &commit_temp_path,
-        );
+    #[cfg(test)]
+    if let Some(boundary) = MIGRATION_TEST_CRASH.with(|slot| slot.take()) {
+        stage.crash_at(boundary);
+    }
+    let row_failed = std::cell::Cell::new(false);
+    let committed = stage.commit_with_receipt(&mut conn, |tx| {
+        update_migration_row(
+            tx,
+            &instance_id,
+            &plan.loader,
+            &plan.source_version,
+            &plan.source_loader_version,
+            &plan.target_version,
+            &new_loader_version(plan),
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            row_failed.set(true);
+            LauncherError::Generic {
+                code: "ERR_STAGED_APPLY".into(),
+                message: error,
+            }
+        })
+    });
+    if let Err(error) = committed {
         let _ = std::fs::remove_dir_all(&staging_dir);
-        return match undo {
-            Ok(()) => MigrationOutcome::RolledBack {
-                phase: "db-commit".into(),
-                error: format!("The instance row could not be committed; files and manifest were restored: {error}"),
+        let phase = if row_failed.get() {
+            "db-commit"
+        } else {
+            "apply"
+        };
+        let message = error.to_string();
+        return if message.contains("nothing in the instance was changed") {
+            MigrationOutcome::RolledBack {
+                phase: phase.into(),
+                error: if row_failed.get() {
+                    format!("The instance row could not be committed; files and manifest were restored: {message}")
+                } else {
+                    format!("Apply failed before commit; every change was reversed: {message}")
+                },
                 snapshot_id: Some(snapshot_id),
                 health_report: None,
-            },
-            Err(undo_error) => MigrationOutcome::Failed {
-                phase: "db-commit".into(),
-                error: format!("DB commit failed ({error}) and undo did not complete cleanly ({undo_error}); restore snapshot {snapshot_id} to recover"),
+            }
+        } else {
+            MigrationOutcome::Failed {
+                phase: phase.into(),
+                error: format!("{message}; restore snapshot {snapshot_id} to recover"),
                 rolled_back: false,
                 instance_changed: true,
                 snapshot_id: Some(snapshot_id),
-            },
+            }
         };
     }
 
@@ -1475,24 +1484,19 @@ fn build_future_manifest(
     Ok((future, bytes))
 }
 
-#[derive(Default)]
-struct ApplyJournal {
-    /// (trash backup path, live original path)
-    removed: Vec<(PathBuf, PathBuf)>,
-    /// (live destination, staged source, placed from the store)
-    added: Vec<(PathBuf, PathBuf, bool)>,
-}
-
-fn apply_migration_moves(
+/// Stage the migration's swaps and its new manifest. Nothing in the instance changes here.
+///
+/// Each old file is removed only while it is what the manifest recorded; a jar changed outside
+/// Agora is kept aside instead (staged apply). A swap that keeps the file name is one replacement.
+fn stage_migration(
     plan: &MigrationPlan,
     ctx: &Ctx,
+    stage: &mut Stage<'_>,
     instance_dir: &Path,
     staging_dir: &Path,
     stored: &BTreeMap<String, crate::content_bridge::StoredFile>,
-    journal: &mut ApplyJournal,
 ) -> Result<(), String> {
     let manifest_path = instance_dir.join("instance_manifest.json");
-    let trash_dir = staging_dir.join("trash");
     let artifacts_dir = staging_dir.join("artifacts");
 
     // Read the live manifest to locate each old entry's real file (disabled
@@ -1502,9 +1506,15 @@ fn apply_migration_moves(
     if current.is_read_only() {
         return Err("instance manifest is read-only: written by a newer Agora".into());
     }
+    if !stored.is_empty() {
+        // A link to a protected object can only be moved out of a folder that grants delete-child.
+        crate::content_bridge::ensure_folder_can_delete_children(stage.dir())
+            .map_err(|error| format!("could not make the staging area safe to clean: {error}"))?;
+    }
 
+    let mut removals: Vec<(agora_game_api::StrictRelPath, Expect, String)> = Vec::new();
     for swap in &plan.swaps {
-        let live = current
+        let entry = current
             .mods
             .iter()
             .chain(current.resourcepacks.iter())
@@ -1514,31 +1524,32 @@ fn apply_migration_moves(
                 entry.filename == swap.old_filename
                     && normalized_content_type(&entry.content_type)
                         == normalized_content_type(&swap.content_type)
-            })
-            .map(|entry| {
-                instance_dir
-                    .join(content_subdir(&swap.content_type))
-                    .join(effective_installed_filename(entry))
-            })
-            .unwrap_or_else(|| {
-                instance_dir
-                    .join(content_subdir(&swap.content_type))
-                    .join(&swap.old_filename)
             });
+        let name = entry
+            .map(effective_installed_filename)
+            .unwrap_or_else(|| swap.old_filename.clone());
+        let live = instance_dir
+            .join(content_subdir(&swap.content_type))
+            .join(&name);
         if !live.exists() {
             continue;
         }
-        let relative = live
-            .strip_prefix(instance_dir)
-            .map_err(|_| format!("removal path escaped instance: {}", live.display()))?;
-        let backup = trash_dir.join(relative);
-        if let Some(parent) = backup.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create transaction trash: {e}"))?;
-        }
-        std::fs::rename(&live, &backup)
-            .map_err(|e| format!("failed to stage removal of {}: {e}", swap.old_filename))?;
-        journal.removed.push((backup, live));
+        let expect = entry
+            .and_then(|entry| {
+                entry
+                    .object_sha256
+                    .as_deref()
+                    .filter(|hash| !hash.trim().is_empty())
+                    .or_else(|| {
+                        let hash = entry.sha256.as_str();
+                        (!hash.trim().is_empty()).then_some(hash)
+                    })
+                    .map(|hash| Expect::Agora(hash.to_string()))
+            })
+            .unwrap_or(Expect::Unknown);
+        let path = crate::content_bridge::content_path(&swap.content_type, &name)
+            .map_err(|error| error.to_string())?;
+        removals.push((path, expect, swap.old_filename.clone()));
     }
 
     for swap in &plan.swaps {
@@ -1549,114 +1560,54 @@ fn apply_migration_moves(
                 swap.new_filename
             ));
         }
-        let live = instance_dir
-            .join(content_subdir(&swap.content_type))
-            .join(&swap.new_filename);
-        if live.exists() {
-            return Err(format!("target file already exists: {}", live.display()));
-        }
+        let path = crate::content_bridge::content_path(&swap.content_type, &swap.new_filename)
+            .map_err(|error| error.to_string())?;
+        let live = instance_dir.join(path.as_str());
+        let replaces = removals
+            .iter()
+            .position(|(removed, _, _)| removed.as_str().eq_ignore_ascii_case(path.as_str()));
+        let expect = match replaces {
+            Some(index) => removals.remove(index).1,
+            None if live.exists() => {
+                return Err(format!("target file already exists: {}", live.display()))
+            }
+            None => Expect::Absent,
+        };
         if let Some(parent) = live.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create content directory: {e}"))?;
+            if !stored.is_empty() {
+                crate::content_bridge::ensure_folder_can_delete_children(parent).map_err(
+                    |error| format!("could not make {} safe to clean: {error}", parent.display()),
+                )?;
+            }
         }
         check_failpoint("artifact-move")?;
         match stored.get(&staging_artifact_name(swap)) {
             Some(stored) => {
-                crate::content_bridge::place_file(
-                    ctx,
-                    &stored.sha256,
-                    instance_dir,
-                    &swap.content_type,
-                    &swap.new_filename,
-                )
-                .map_err(|error| format!("failed to promote {}: {error}", swap.new_filename))?;
-                journal.added.push((live, staged, true));
+                crate::content_bridge::stage_object(ctx, stage, &path, &stored.sha256, expect)
             }
-            None => {
-                std::fs::rename(&staged, &live)
-                    .map_err(|e| format!("failed to promote {}: {e}", swap.new_filename))?;
-                journal.added.push((live, staged, false));
-            }
+            None => stage.write_moving(&path, &staged, expect),
         }
+        .map_err(|error| format!("failed to promote {}: {error}", swap.new_filename))?;
+    }
+    for (path, expect, filename) in removals {
+        stage
+            .remove(&path, expect)
+            .map_err(|e| format!("failed to stage removal of {filename}: {e}"))?;
     }
 
-    // Commit through the canonical writer, including the schema upgrade backup.
+    // The new manifest, through staged apply's manifest rule (the canonical writer's bytes and its
+    // schema upgrade backup).
     let prepared = staging_dir.join("instance_manifest.next.json");
     if !prepared.is_file() {
         return Err("prepared manifest vanished before commit".into());
     }
     check_failpoint("manifest-commit")?;
     let next = agora_core::helpers::read_manifest(&prepared).map_err(|e| e.to_string())?;
-    agora_core::helpers::atomic_write_manifest(&manifest_path, &next)
+    stage
+        .write_manifest(&next)
         .map_err(|e| format!("failed to commit instance manifest: {e}"))
-}
-
-/// Reverse every journal entry and restore the pre-commit manifest bytes.
-/// Only valid while the DB row still describes the original state.
-fn undo_migration(
-    journal: &ApplyJournal,
-    manifest_path: &Path,
-    original_manifest: &[u8],
-    commit_temp_path: &Path,
-) -> Result<(), String> {
-    let mut errors = Vec::new();
-    for (live, staged, placed) in journal.added.iter().rev() {
-        if !live.exists() {
-            continue;
-        }
-        if *placed {
-            // A store placement is a new directory entry; the object is the store's, so undo
-            // removes the entry rather than renaming it over the untouched staged file.
-            if let Err(error) = std::fs::remove_file(live) {
-                errors.push(format!("added {}: {error}", live.display()));
-            }
-            continue;
-        }
-        if let Some(parent) = staged.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Err(error) = std::fs::rename(live, staged) {
-            errors.push(format!("added {}: {error}", live.display()));
-        }
-    }
-    for (backup, original) in journal.removed.iter().rev() {
-        if backup.exists() && !original.exists() {
-            if let Some(parent) = original.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Err(error) = std::fs::rename(backup, original) {
-                errors.push(format!("removed {}: {error}", original.display()));
-            }
-        }
-    }
-    // If the commit rename pair was interrupted, a tmp manifest may be parked
-    // beside the live one; discard it before restoring the original bytes.
-    if commit_temp_path.exists() {
-        let _ = std::fs::remove_file(commit_temp_path);
-    }
-    // Restore the original bytes atomically (write-then-rename), whichever
-    // point of the commit sequence failed.
-    if let Err(error) = atomic_write_bytes(manifest_path, original_manifest) {
-        errors.push(format!("manifest restore: {error}"));
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
-    }
-}
-
-fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-    let temp = path.with_extension(format!("restoring-{}", std::process::id()));
-    let mut file = std::fs::File::create(&temp)
-        .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
-    file.write_all(bytes)
-        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
-    file.sync_all()
-        .map_err(|e| format!("failed to sync {}: {e}", path.display()))?;
-    drop(file);
-    std::fs::rename(&temp, path).map_err(|e| format!("failed to restore {}: {e}", path.display()))
 }
 
 /// Guarded compare-and-set on the instance row, mirroring
@@ -1671,10 +1622,31 @@ fn commit_migration_db(
     new_mc: &str,
     new_loader_version: &str,
 ) -> Result<u64, String> {
-    check_failpoint("db-commit")
-        .map_err(|error| format!("failed to persist the migration instance row: {error}"))?;
     let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())
         .map_err(|e| format!("local state failed: {e}"))?;
+    update_migration_row(
+        &conn,
+        instance_id,
+        expected_loader,
+        expected_mc,
+        expected_loader_version,
+        new_mc,
+        new_loader_version,
+    )
+}
+
+/// The compare-and-set itself, on a connection (or a transaction) the caller holds.
+fn update_migration_row(
+    conn: &rusqlite::Connection,
+    instance_id: &str,
+    expected_loader: &str,
+    expected_mc: &str,
+    expected_loader_version: &str,
+    new_mc: &str,
+    new_loader_version: &str,
+) -> Result<u64, String> {
+    check_failpoint("db-commit")
+        .map_err(|error| format!("failed to persist the migration instance row: {error}"))?;
     let affected = conn
         .execute(
             "UPDATE minecraft_instances
@@ -1750,6 +1722,18 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    static MIGRATION_TEST_CRASH: std::cell::Cell<Option<agora_core::staged_apply::Boundary>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Stop the next migration's staged apply at `boundary`, as a crash would (test seam).
+#[cfg(test)]
+pub(crate) fn set_migration_crash(boundary: Option<agora_core::staged_apply::Boundary>) {
+    MIGRATION_TEST_CRASH.with(|slot| slot.set(boundary));
+}
+
+#[cfg(test)]
 pub(crate) fn set_migration_failpoint(name: Option<&'static str>) {
     MIGRATION_TEST_FAILPOINT.with(|slot| *slot.borrow_mut() = name);
 }
@@ -1777,6 +1761,10 @@ mod tests {
     use super::*;
     use crate::migration_report::{NoopSuccessorLookup, SupportInfo};
     use agora_core::models::InstanceRow;
+    use agora_core::{
+        staged_apply::{self as staged, Boundary},
+        startup_recovery,
+    };
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::sync::Mutex;
@@ -1785,7 +1773,7 @@ mod tests {
     const TARGET_MC: &str = "1.21.4";
     const SOURCE_LOADER_VERSION: &str = "0.18.6";
 
-    fn context() -> (Ctx, PathBuf) {
+    fn context() -> (Ctx, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "agora-version-migration-{}-{}",
             std::process::id(),
@@ -2605,6 +2593,94 @@ mod tests {
         );
         assert!(!dir.join("mods").join("moda-2.0.jar").exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A real migration cut off by a crash, settled by the startup pass: before the commit point
+    /// (the instance row and its receipt, in one transaction) the old files and the old row stay
+    /// together; after it, the new files and the new row do.
+    #[tokio::test]
+    async fn a_migration_cut_off_by_a_crash_is_settled_by_the_startup_pass() {
+        for (boundary, committed) in [
+            (Boundary::AfterMove(1), false),
+            (Boundary::AfterMove(2), false),
+            (Boundary::AfterReceipt, true),
+        ] {
+            let (ctx, root) = context();
+            let old_a = fabric_jar("moda", "1.0", None);
+            seed_instance(
+                &ctx,
+                "crashed",
+                &[Seed {
+                    filename: "moda-1.0.jar",
+                    modrinth_id: Some("proj-a"),
+                    content_type: "mod",
+                    bytes: old_a.clone(),
+                }],
+                |_, _| {},
+            );
+            let new_a = fabric_jar("moda", "2.0", None);
+            let build_a = target_build("moda-2.0.jar", "2.0", &new_a);
+            let checker = MockChecker::new().ready_with_build("proj-a", build_a.clone());
+            let provisioner = MockProvisioner::ok();
+            let fetcher = MockFetcher::new().with(&build_a, new_a.clone());
+
+            set_migration_crash(Some(boundary));
+            let outcome = migrate_instance(
+                &ctx,
+                "crashed",
+                TARGET_MC,
+                &services(&checker, &provisioner, &fetcher),
+                false,
+            )
+            .await;
+            set_migration_crash(None);
+            assert!(
+                !matches!(outcome, MigrationOutcome::Migrated { .. }),
+                "{boundary:?}: the crash stops the migration: {outcome:?}"
+            );
+
+            let report = startup_recovery::run_at_startup(&ctx);
+
+            let dir = ctx.paths.instance_dir("crashed").unwrap();
+            if committed {
+                assert_eq!(
+                    read_manifest_of(&ctx, "crashed").minecraft_version,
+                    TARGET_MC,
+                    "{boundary:?}: {report:?}"
+                );
+                assert_eq!(
+                    read_row(&ctx, "crashed").minecraft_version,
+                    TARGET_MC,
+                    "{boundary:?}"
+                );
+                assert_eq!(
+                    std::fs::read(dir.join("mods").join("moda-2.0.jar")).unwrap(),
+                    new_a,
+                    "{boundary:?}"
+                );
+                assert!(
+                    !dir.join("mods").join("moda-1.0.jar").exists(),
+                    "{boundary:?}"
+                );
+            } else {
+                assert_untouched(&ctx, "crashed");
+                assert_eq!(
+                    std::fs::read(dir.join("mods").join("moda-1.0.jar")).unwrap(),
+                    old_a,
+                    "{boundary:?}: {report:?}"
+                );
+                assert!(
+                    !dir.join("mods").join("moda-2.0.jar").exists(),
+                    "{boundary:?}"
+                );
+            }
+            let stage = staged::stage_root(&dir);
+            assert!(
+                !stage.exists() || std::fs::read_dir(&stage).unwrap().next().is_none(),
+                "{boundary:?}: nothing is left in the stage"
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[tokio::test]
