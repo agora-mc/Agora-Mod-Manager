@@ -18,13 +18,13 @@
 //! logic can be tested without a network; [`CoreBackend`] is the real one.
 
 use agora_core::artifact_hash::{blank_asserted_hash, HashOrigin};
-use agora_core::ctx::Ctx;
 use agora_core::db::{local_state_connection, InstancePackGap};
 use agora_core::error::{HashConfirmation, LauncherError, LauncherResult};
 use agora_core::models::{
     InstalledMod, InstanceManifest, ModVersionCandidate, PackOrigin, PackPlatform,
 };
 use agora_core::registry::RegistryItem;
+use agora_core::{ctx::Ctx, instance_runtime::InstanceGuard, staged_apply::Stage};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -1341,6 +1341,10 @@ fn all_entries_mut(
 
 /// Mark the pack's files as pack-owned and refresh the pack inventory.
 ///
+/// The manifest and the inventory change together (MASTER_SPEC §32.4's receipt rule): the manifest
+/// is written through staged apply under the instance guard, and the inventory with the apply's
+/// receipt is its commit point, so a crash never leaves one without the other.
+///
 /// `pack_managed` is what the Mods tab groups on ("From the modpack" vs "Added
 /// by you"); installing a file does not set it, so without this every imported
 /// mod reads as added by the user. `origin` creates the pack origin when the
@@ -1352,6 +1356,9 @@ pub fn finalize_pack_files(
     pack_filenames: &[String],
     origin: Option<(&str, &AgoraPackInstance)>,
 ) -> Result<(), String> {
+    // Taken before anything is read, so an interrupted change is settled first.
+    let guard = InstanceGuard::for_mutation(ctx, instance_id, "finish a pack import")
+        .map_err(|e| e.to_string())?;
     let manifest_path = ctx
         .paths
         .instance_manifest(instance_id)
@@ -1374,10 +1381,6 @@ pub fn finalize_pack_files(
     } else {
         Some(crate::pack_inventory::pack_content_hash(&files))
     };
-    let conn = local_state_connection(&ctx.paths.local_state_db()).map_err(|e| e.to_string())?;
-    agora_core::db::replace_instance_pack_files(&conn, instance_id, &files)
-        .map_err(|e| e.to_string())?;
-
     match (&mut manifest.pack_origin, origin) {
         (Some(existing), _) => existing.pack_content_hash = hash,
         (slot @ None, Some((pack_name, instance))) => {
@@ -1404,7 +1407,22 @@ pub fn finalize_pack_files(
         (None, None) => {}
     }
     manifest.manifest_version = agora_core::models::CURRENT_MANIFEST_VERSION;
-    agora_core::helpers::atomic_write_manifest(&manifest_path, &manifest).map_err(|e| e.to_string())
+    let mut conn =
+        local_state_connection(&ctx.paths.local_state_db()).map_err(|e| e.to_string())?;
+    let mut stage =
+        Stage::begin_with_receipts(&guard, &instance_dir, &conn).map_err(|e| e.to_string())?;
+    stage.write_manifest(&manifest).map_err(|e| e.to_string())?;
+    stage
+        .commit_with_receipt(&mut conn, |tx| {
+            agora_core::db::replace_instance_pack_files(tx, instance_id, &files).map_err(|error| {
+                LauncherError::Generic {
+                    code: "ERR_LOCAL_STATE_FAILED".into(),
+                    message: error.to_string(),
+                }
+            })
+        })
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 fn pack_filenames(outcomes: &[PackEntryOutcome]) -> Vec<String> {
@@ -2283,9 +2301,7 @@ mod tests {
         sha512: Option<&str>,
         accept: bool,
     ) -> LauncherResult<InstalledMod> {
-        let guard =
-            agora_core::instance_runtime::InstanceGuard::for_mutation(ctx, "inst", "test-commit")
-                .unwrap();
+        let guard = InstanceGuard::for_mutation(ctx, "inst", "test-commit").unwrap();
         crate::install_service::InstallService::new(ctx.clone()).commit_verified_artifact(
             &guard,
             &InstallRequest {
@@ -2311,7 +2327,7 @@ mod tests {
     fn required_sha256_mismatch_installs_nothing_even_when_sha1_matches() {
         let (ctx, root) = temp_ctx_with_instance();
         let bytes = b"jar bytes";
-        let sha1 = agora_core::download::sha1_hex(bytes);
+        let sha1 = sha1_hex(bytes);
         let err = commit(&ctx, bytes, &sha1, Some(GOOD_PIN)).unwrap_err();
         assert_eq!(err.code(), "ERR_HASH_CONFIRMATION_REQUIRED");
         let dir = ctx.paths.instance_dir("inst").unwrap();
@@ -2327,7 +2343,7 @@ mod tests {
     fn required_sha256_match_installs() {
         let (ctx, root) = temp_ctx_with_instance();
         let bytes = b"jar bytes";
-        let sha1 = agora_core::download::sha1_hex(bytes);
+        let sha1 = sha1_hex(bytes);
         let sha256 = agora_core::download::sha256_hex(bytes);
         commit(&ctx, bytes, &sha1, Some(&sha256)).unwrap();
         assert!(ctx
@@ -3052,9 +3068,7 @@ mod tests {
         pinned: &str,
         accept: bool,
     ) -> LauncherResult<InstalledMod> {
-        let guard =
-            agora_core::instance_runtime::InstanceGuard::for_mutation(ctx, "inst", "test-commit")
-                .unwrap();
+        let guard = InstanceGuard::for_mutation(ctx, "inst", "test-commit").unwrap();
         crate::install_service::InstallService::new(ctx.clone()).commit_verified_artifact(
             &guard,
             &InstallRequest {
@@ -3105,9 +3119,7 @@ mod tests {
         let (ctx, root) = temp_ctx_with_instance();
         let bytes = b"jar bytes";
         let actual = sha256_hex(bytes);
-        let guard =
-            agora_core::instance_runtime::InstanceGuard::for_mutation(&ctx, "inst", "test-commit")
-                .unwrap();
+        let guard = InstanceGuard::for_mutation(&ctx, "inst", "test-commit").unwrap();
         let stop = crate::install_service::InstallService::new(ctx.clone())
             .commit_verified_artifact(
                 &guard,
@@ -3179,11 +3191,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The manifest's pack marks and the pack inventory change together: when the inventory cannot
+    /// be written, the manifest is not changed either (MASTER_SPEC §32.4's receipt rule).
+    #[test]
+    fn a_pack_inventory_that_cannot_be_written_leaves_the_manifest_as_it_was() {
+        let (ctx, root) = temp_ctx_with_instance();
+        let bytes = b"jar bytes";
+        let sha1 = sha1_hex(bytes);
+        commit(&ctx, bytes, &sha1, None).unwrap();
+        let manifest_path = ctx.paths.instance_manifest("inst").unwrap();
+        let before = std::fs::read(&manifest_path).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_inventory BEFORE INSERT ON instance_pack_files
+             BEGIN SELECT RAISE(ABORT, 'the disk is full'); END;",
+        )
+        .unwrap();
+        let instance = AgoraPackInstance {
+            id: None,
+            name: None,
+            minecraft_version: "1.21".into(),
+            loader: "fabric".into(),
+            loader_version: "0.16.0".into(),
+        };
+
+        let error = finalize_pack_files(
+            &ctx,
+            "inst",
+            &["m.jar".to_string()],
+            Some(("Pack", &instance)),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("disk is full"), "{error}");
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn imported_files_are_marked_as_from_the_pack() {
         let (ctx, root) = temp_ctx_with_instance();
         let bytes = b"jar bytes";
-        let sha1 = agora_core::download::sha1_hex(bytes);
+        let sha1 = sha1_hex(bytes);
         let installed = commit(&ctx, bytes, &sha1, None).unwrap();
         assert!(
             !installed.pack_managed,
@@ -3312,7 +3361,7 @@ mod tests {
     fn matching_sha1_with_wrong_sha512_installs_nothing() {
         let (ctx, root) = temp_ctx_with_instance();
         let bytes = b"jar bytes";
-        let sha1 = agora_core::download::sha1_hex(bytes);
+        let sha1 = sha1_hex(bytes);
         let wrong = agora_core::download::sha512_hex(b"other bytes");
         let err = commit_with_sha512(&ctx, bytes, &sha1, None, Some(&wrong)).unwrap_err();
         assert_eq!(err.code(), "ERR_HASH_MISMATCH");
