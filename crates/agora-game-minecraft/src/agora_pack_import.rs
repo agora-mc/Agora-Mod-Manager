@@ -904,43 +904,22 @@ fn candidate_strategy_of<'a>(
 
 /// The catalog's pin for a candidate, to be held as a *curator pin* (a mismatch
 /// asks the user, a match is labelled as the curator's, never as the source's):
+/// the curator's `pins` entry for exactly this release file, the same pins a
+/// single-mod install holds ([`crate::resolver::curator_pins_for`]).
 ///
-/// * the curator's `pins` entry for exactly this release file, the same pins a
-///   single-mod install holds ([`crate::resolver::curator_pins_for`]); else
-/// * the catalog item's `sha256`, when the source published nothing at all (no
-///   SHA-256, SHA-1 or SHA-512) and the item is not one whose manifest hash is
-///   already the hard expectation (`direct_hash`, `technic_pack`) or one with
-///   per-release pins (`github_release`).
+/// The catalog item's own `sha256` is never used as one. It names one file, and
+/// a versioned source (GitHub, Modrinth) serves a different file with each
+/// release, so it would be stale for every release but one
+/// (REGISTRY_CURATION_REFERENCE: "never used to check a github_release or
+/// modrinth_id file").
 pub fn curator_pin_for_pack(
     item: &RegistryItem,
     candidate: &ModVersionCandidate,
-) -> LauncherResult<Option<String>> {
-    if let Some(pin) = crate::resolver::curator_pins_for(item, candidate)
+) -> Option<String> {
+    crate::resolver::curator_pins_for(item, candidate)
         .into_iter()
         .next()
-    {
-        return Ok(Some(pin.sha256));
-    }
-    let published = |hash: &Option<String>| non_empty(hash).is_some();
-    if published(&candidate.sha256) || published(&candidate.sha1) || published(&candidate.sha512) {
-        return Ok(None);
-    }
-    if matches!(
-        candidate_strategy_of(item, candidate),
-        "direct_hash" | "technic_pack" | "github_release"
-    ) {
-        return Ok(None);
-    }
-    match item.sha256.as_deref() {
-        None => Ok(None),
-        // The field is present but blank: that is a broken curator assertion,
-        // not "no pin". An absent hash stays "no pin"; a present blank is
-        // refused (the compiler and resolver reject it upstream too).
-        Some(value) if value.trim().is_empty() => {
-            Err(blank_asserted_hash(&item.id, "curator fallback sha256"))
-        }
-        Some(value) => Ok(Some(value.trim().to_ascii_lowercase())),
-    }
+        .map(|pin| pin.sha256)
 }
 
 pub struct CoreBackend {
@@ -1101,8 +1080,7 @@ impl PackBackend for CoreBackend {
                     sha1: c.sha1.clone(),
                     sha512: c.sha512.clone(),
                     expected_sha256,
-                    curator_pin: curator_pin_for_pack(&item, c)
-                        .map_err(|error| BackendError::Failed(error.to_string()))?,
+                    curator_pin: curator_pin_for_pack(&item, c),
                     content_type: content_type.clone(),
                     registry_id: Some(item.id.clone()),
                     modrinth_id: item.modrinth_id.clone(),
@@ -2949,56 +2927,26 @@ mod tests {
     }
 
     #[test]
-    fn the_catalog_hash_is_a_curator_pin_only_when_the_source_published_nothing() {
-        let item = catalog_item("curseforge_id", Some(&CURATOR.to_uppercase()), None);
-        // Nothing published: the catalog's hash is held, in lower case.
-        assert_eq!(
-            curator_pin_for_pack(&item, &served("curseforge_id", None))
-                .unwrap()
-                .as_deref(),
-            Some(CURATOR)
-        );
-        // Any published hash means the source vouches; the catalog hash (one
-        // historical file) is not compared with another version.
-        assert_eq!(
-            curator_pin_for_pack(&item, &served("curseforge_id", Some(&"1".repeat(40)))).unwrap(),
-            None
-        );
-        // A blank published hash is nothing published.
-        assert!(
-            curator_pin_for_pack(&item, &served("curseforge_id", Some("  ")))
-                .unwrap()
-                .is_some()
-        );
-        // An absent catalog hash means no pin. A present-but-blank one is
-        // refused (see review_a_blank_catalog_fallback_pin_is_refused).
-        let item = catalog_item("curseforge_id", None, None);
-        assert_eq!(
-            curator_pin_for_pack(&item, &served("curseforge_id", None)).unwrap(),
-            None
-        );
-        // Hand-pinned strategies already hold the manifest hash as the expectation,
-        // and github releases carry per-release pins instead.
-        for strategy in ["direct_hash", "technic_pack", "github_release"] {
-            let item = catalog_item(strategy, Some(CURATOR), None);
-            assert_eq!(
-                curator_pin_for_pack(&item, &served(strategy, None)).unwrap(),
-                None,
-                "{strategy}"
-            );
-        }
-    }
-
-    #[test]
-    fn review_a_blank_catalog_fallback_pin_is_refused() {
-        for blank in ["", "   "] {
-            let item = catalog_item("curseforge_id", Some(blank), None);
-            let error = curator_pin_for_pack(&item, &served("curseforge_id", None))
-                .expect_err("a present-but-blank catalog hash is bad data, not no pin");
-            assert_eq!(error.code(), "ERR_ASSERTED_HASH_BLANK", "{blank:?}");
-            let message = error.to_string();
-            assert!(message.contains("oldmod"), "names the item: {message}");
-            assert!(message.contains("sha256"), "names the field: {message}");
+    fn the_catalog_hash_is_never_a_curator_pin() {
+        // Not when the source published nothing, not when it is blank, for any strategy: it names
+        // one file, and a versioned source's next release is another.
+        for strategy in [
+            "curseforge_id",
+            "modrinth_id",
+            "github_release",
+            "direct_hash",
+            "technic_pack",
+        ] {
+            for catalog in [Some(CURATOR), Some("   "), None] {
+                let item = catalog_item(strategy, catalog, None);
+                for published in [None, Some("  ")] {
+                    assert_eq!(
+                        curator_pin_for_pack(&item, &served(strategy, published)),
+                        None,
+                        "{strategy} {catalog:?} {published:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -3023,13 +2971,12 @@ mod tests {
         let item = catalog_item("github_release", None, Some(&sources));
         assert_eq!(
             curator_pin_for_pack(&item, &served("github_release", Some(&"1".repeat(40))))
-                .unwrap()
                 .as_deref(),
             Some(CURATOR)
         );
         let mut other = served("github_release", None);
         other.version = "v2".into();
-        assert_eq!(curator_pin_for_pack(&item, &other).unwrap(), None);
+        assert_eq!(curator_pin_for_pack(&item, &other), None);
     }
 
     fn curator_pinned(pin: &str) -> PackCandidate {
