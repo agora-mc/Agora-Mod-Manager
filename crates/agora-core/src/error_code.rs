@@ -840,6 +840,7 @@ error_codes! {
     RecoveryJournal = "ERR_RECOVERY_JOURNAL", Recovery, 1;
     RecoveryRefused = "ERR_RECOVERY_REFUSED", Recovery, 1;
     SnapshotObjectMigration = "ERR_SNAPSHOT_OBJECT_MIGRATION", Recovery, 1;
+    StagedApply = "ERR_STAGED_APPLY", Recovery, 1;
     // ---- Other ----
     AppDataDir = "ERR_APP_DATA_DIR", Other, 1;
     AppPaths = "ERR_APP_PATHS", Other, 1;

@@ -638,10 +638,9 @@ impl InstallService {
             content_type
         };
         let target_dir = dir.join(agora_core::helpers::content_subdir(content_type));
-        std::fs::create_dir_all(&target_dir).map_err(|_| LauncherError::InstanceCreateFailed)?;
         let item_path = target_dir.join(filename);
-        let backup = make_room_for_install(&manifest, &item_path, filename)?;
-        let outcome = (|| -> LauncherResult<InstalledMod> {
+        let expect = expect_for_install(&manifest, &item_path, filename)?;
+        (|| -> LauncherResult<InstalledMod> {
             // The verified bytes go into the shared store first, then the store places them into
             // the instance as a link or a copy. Storing from a temporary file keeps the pipeline's
             // verified bytes as the object's bytes.
@@ -685,16 +684,9 @@ impl InstallService {
                         .into(),
             });
             }
-            let _ = crate::content_bridge::place_file(
-                &self.ctx,
-                &stored.sha256,
-                &dir,
-                content_type,
-                filename,
-            )?;
-
+            // The stored object holds the bytes the placement will: read its metadata there.
             let metadata = crate::jar_metadata::parse_jar_metadata_for_loader_at_mc(
-                &item_path,
+                &self.ctx.paths.content_object_path(&stored.sha256),
                 &manifest.loader,
                 &manifest.minecraft_version,
             );
@@ -731,20 +723,14 @@ impl InstallService {
 
             agora_core::helpers::remove_from_content_array(&mut manifest, filename);
             agora_core::helpers::push_to_content_array(&mut manifest, &installed_mod);
-            agora_core::helpers::atomic_write_manifest(&manifest_path, &manifest)?;
+            let path = crate::content_bridge::content_path(content_type, filename)?;
+            let sha256 = installed_mod.sha256.clone();
+            crate::content_bridge::staged_change(guard, &dir, &[&target_dir], |stage| {
+                crate::content_bridge::stage_object(&self.ctx, stage, &path, &sha256, expect)?;
+                stage.write_manifest(&manifest)
+            })?;
             Ok(installed_mod)
-        })();
-        match outcome {
-            Ok(installed) => {
-                finish_replace(backup.as_deref());
-                let _ = agora_core::snapshot::mark_instance_mutated(&dir);
-                Ok(installed)
-            }
-            Err(error) => {
-                restore_replaced_file(&item_path, backup.as_deref());
-                Err(error)
-            }
-        }
+        })()
     }
 
     /// Remove an artifact from an instance by filename.
@@ -753,7 +739,7 @@ impl InstallService {
     /// updates the manifest atomically.
     pub fn remove_artifact(&self, instance_id: &str, filename: &str) -> LauncherResult<bool> {
         self.check_not_locked(instance_id)?;
-        let _guard = self.mutation_guard(instance_id, "remove_artifact")?;
+        let guard = self.mutation_guard(instance_id, "remove_artifact")?;
 
         if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
             return Err(LauncherError::Generic {
@@ -790,13 +776,17 @@ impl InstallService {
                 ),
             });
         }
-        std::fs::remove_file(&live).map_err(|error| LauncherError::Generic {
+        agora_core::helpers::remove_from_content_array(&mut manifest, &entry.filename);
+        let path =
+            crate::content_bridge::content_path(&entry.content_type, &effective_filename(&entry))?;
+        crate::content_bridge::staged_change(&guard, &dir, &[], |stage| {
+            stage.remove(&path, ac::staged_apply::Expect::Agora(entry.sha256.clone()))?;
+            stage.write_manifest(&manifest)
+        })
+        .map_err(|error| LauncherError::Generic {
             code: "ERR_REMOVE_FAILED".into(),
             message: format!("Could not remove '{filename}': {error}"),
         })?;
-        agora_core::helpers::remove_from_content_array(&mut manifest, &entry.filename);
-        agora_core::helpers::atomic_write_manifest(&manifest_path, &manifest)?;
-        let _ = agora_core::snapshot::mark_instance_mutated(&dir);
         Ok(true)
     }
 
@@ -810,7 +800,7 @@ impl InstallService {
         source_path: &str,
     ) -> LauncherResult<InstalledMod> {
         self.check_not_locked(instance_id)?;
-        let _guard = self.mutation_guard(instance_id, "add_manual_artifact")?;
+        let guard = self.mutation_guard(instance_id, "add_manual_artifact")?;
 
         let src = std::path::Path::new(source_path);
         let ext = src
@@ -879,9 +869,8 @@ impl InstallService {
         }
         let mut manifest = agora_core::helpers::read_manifest(&manifest_path)?;
 
-        std::fs::create_dir_all(&mods_dir).map_err(|_| LauncherError::InstanceCreateFailed)?;
-        let backup = make_room_for_install(&manifest, &dest, file_name)?;
-        let outcome = (|| -> LauncherResult<InstalledMod> {
+        let expect = expect_for_install(&manifest, &dest, file_name)?;
+        (|| -> LauncherResult<InstalledMod> {
             let stored = crate::content_bridge::store_file(
                 &self.ctx,
                 &resolved,
@@ -897,10 +886,9 @@ impl InstallService {
                     provider_origin: None,
                 },
             )?;
-            crate::content_bridge::place_file(&self.ctx, &stored.sha256, &dir, "mod", file_name)?;
-
+            // The stored object holds the bytes the placement will: read its metadata there.
             let metadata = crate::jar_metadata::parse_jar_metadata_for_loader_at_mc(
-                &dest,
+                &self.ctx.paths.content_object_path(&stored.sha256),
                 &manifest.loader,
                 &manifest.minecraft_version,
             );
@@ -935,20 +923,14 @@ impl InstallService {
             };
             agora_core::helpers::remove_from_content_array(&mut manifest, file_name);
             agora_core::helpers::push_to_content_array(&mut manifest, &installed_mod);
-            agora_core::helpers::atomic_write_manifest(&manifest_path, &manifest)?;
+            let path = crate::content_bridge::content_path("mod", file_name)?;
+            let sha256 = installed_mod.sha256.clone();
+            crate::content_bridge::staged_change(&guard, &dir, &[&mods_dir], |stage| {
+                crate::content_bridge::stage_object(&self.ctx, stage, &path, &sha256, expect)?;
+                stage.write_manifest(&manifest)
+            })?;
             Ok(installed_mod)
-        })();
-        match outcome {
-            Ok(installed) => {
-                finish_replace(backup.as_deref());
-                let _ = agora_core::snapshot::mark_instance_mutated(&dir);
-                Ok(installed)
-            }
-            Err(error) => {
-                restore_replaced_file(&dest, backup.as_deref());
-                Err(error)
-            }
-        }
+        })()
     }
 
     /// Add an item already in the shared store to a Minecraft instance, with no network.
@@ -990,15 +972,25 @@ impl InstallService {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Make room for a new placement at `target`. A file Agora recorded and that still matches its
-/// recorded hash is Agora's to replace; anything else is the user's and is never deleted.
-fn make_room_for_install(
+/// Whose file is at `target`, before a direct install places one there: nothing (an add), or a
+/// file Agora recorded that still matches its recorded hash (Agora's to replace). Anything else is
+/// the user's: the install refuses and names it, and the file is never touched.
+fn expect_for_install(
     manifest: &InstanceManifest,
     target: &std::path::Path,
     filename: &str,
-) -> LauncherResult<Option<std::path::PathBuf>> {
-    if target.symlink_metadata().is_err() {
-        return Ok(None);
+) -> LauncherResult<ac::staged_apply::Expect> {
+    match target.symlink_metadata() {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ac::staged_apply::Expect::Absent)
+        }
+        Err(error) => {
+            return Err(LauncherError::Generic {
+                code: "ERR_INSTALL_FAILED".into(),
+                message: format!("Could not check '{filename}' before installing: {error}"),
+            })
+        }
     }
     let entry = all_installed(manifest)
         .find(|item| item.filename == filename || effective_filename(item) == filename);
@@ -1018,32 +1010,7 @@ fn make_room_for_install(
             ),
         });
     }
-    // Keep the old file until the manifest is written. It stays in the same folder, which already
-    // allows deleting a placed link from it.
-    let backup = target.with_file_name(format!(
-        ".{filename}.agora-old-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::rename(target, &backup).map_err(|error| LauncherError::Generic {
-        code: "ERR_INSTALL_FAILED".into(),
-        message: format!("Could not replace '{filename}': {error}"),
-    })?;
-    Ok(Some(backup))
-}
-
-/// Undo a [`make_room_for_install`]: remove the newly placed file and put the old one back.
-fn restore_replaced_file(target: &std::path::Path, backup: Option<&std::path::Path>) {
-    let _ = std::fs::remove_file(target);
-    if let Some(backup) = backup {
-        let _ = std::fs::rename(backup, target);
-    }
-}
-
-/// The new manifest is written: the old file is no longer needed.
-fn finish_replace(backup: Option<&std::path::Path>) {
-    if let Some(backup) = backup {
-        let _ = std::fs::remove_file(backup);
-    }
+    Ok(ac::staged_apply::Expect::Agora(entry.sha256.clone()))
 }
 
 fn all_installed(manifest: &InstanceManifest) -> impl Iterator<Item = &InstalledMod> {

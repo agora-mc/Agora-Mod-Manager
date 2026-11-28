@@ -885,11 +885,47 @@ fn review_store_item(ctx: &Ctx, source: &Path, rel: &str, game_id: Option<&str>)
 }
 
 #[cfg(windows)]
-fn review_set_readonly(path: &Path, readonly: bool) {
-    let mut perms = std::fs::metadata(path).unwrap().permissions();
-    #[allow(clippy::permissions_set_readonly_false)]
-    perms.set_readonly(readonly);
-    std::fs::set_permissions(path, perms).unwrap();
+/// Make replacing the instance manifest fail, as another program holding it would, until the
+/// value is dropped. Staged apply replaces the manifest by a rename, which a read-only attribute
+/// does not stop: on Windows the file is held open with no sharing, which does; elsewhere the
+/// instance folder is made read-only, so nothing can be renamed in it.
+struct ManifestReplaceBlocked {
+    #[cfg(windows)]
+    _held: std::fs::File,
+    #[cfg(not(windows))]
+    folder: (std::path::PathBuf, std::fs::Permissions),
+}
+
+fn review_block_manifest_replace(manifest: &Path) -> ManifestReplaceBlocked {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(manifest)
+            .unwrap();
+        ManifestReplaceBlocked { _held: held }
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = manifest.parent().unwrap().to_path_buf();
+        let before = std::fs::metadata(&folder).unwrap().permissions();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+        ManifestReplaceBlocked {
+            folder: (folder, before),
+        }
+    }
+}
+
+impl Drop for ManifestReplaceBlocked {
+    fn drop(&mut self) {
+        #[cfg(not(windows))]
+        {
+            let _ = std::fs::set_permissions(&self.folder.0, self.folder.1.clone());
+        }
+    }
 }
 
 #[test]
@@ -936,11 +972,11 @@ fn review_offline_add_failing_manifest_write_leaves_no_file() {
     let source = write_mod_jar(tmp.path(), "offline", "1.0.0");
     let item_id = review_store_item(&ctx, &source, "mods/offline.jar", Some("minecraft"));
     let manifest_path = dir.join("instance_manifest.json");
-    review_set_readonly(&manifest_path, true);
+    let blocked = review_block_manifest_replace(&manifest_path);
 
     let service = crate::install_service::InstallService::new(ctx.clone());
     let result = service.install_stored_item("test", &item_id);
-    review_set_readonly(&manifest_path, false);
+    drop(blocked);
 
     assert!(result.is_err(), "the manifest write was made to fail");
     assert!(
@@ -975,10 +1011,10 @@ fn review_failed_manual_reinstall_keeps_the_old_file() {
     let old_bytes = std::fs::read(dir.join("mods/same.jar")).unwrap();
     let manifest_path = dir.join("instance_manifest.json");
     let manifest_before = std::fs::read(&manifest_path).unwrap();
-    review_set_readonly(&manifest_path, true);
+    let blocked = review_block_manifest_replace(&manifest_path);
 
     let result = service.add_manual_artifact("test", v2.join("same.jar").to_str().unwrap());
-    review_set_readonly(&manifest_path, false);
+    drop(blocked);
 
     assert!(result.is_err(), "the manifest write was made to fail");
     assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest_before);

@@ -12,9 +12,11 @@ use agora_core::{
     ctx::Ctx,
     error::{LauncherError, LauncherResult},
     helpers,
+    instance_runtime::InstanceGuard,
     library::{self as core_library},
     models::{InstalledMod, ProviderOrigin},
     paths, snapshot,
+    staged_apply::{ApplyReport, Expect, Stage},
 };
 
 #[cfg(test)]
@@ -438,6 +440,61 @@ pub fn place_file(
     store::place_object_at(ctx, sha256, &target, mode).map_err(content_error)
 }
 
+/// Make one change to an instance through staged apply (MASTER_SPEC §32.4): `build` stages it,
+/// and it is made in one journaled commit, or not at all.
+///
+/// The stage is given the right a placed link to a protected object needs to be moved out of it,
+/// and so is every folder `folders` names (the folders a link is placed into), so a rollback can
+/// move such a link back.
+pub(crate) fn staged_change<T>(
+    guard: &InstanceGuard,
+    instance_dir: &Path,
+    folders: &[&Path],
+    build: impl FnOnce(&mut Stage<'_>) -> LauncherResult<T>,
+) -> LauncherResult<(T, ApplyReport)> {
+    let mut stage = Stage::begin(guard, instance_dir)?;
+    ensure_folder_can_delete_children(stage.dir())?;
+    for folder in folders {
+        std::fs::create_dir_all(folder).map_err(|error| LauncherError::Generic {
+            code: "ERR_INSTALL_FAILED".into(),
+            message: format!("Could not create {}: {error}", folder.display()),
+        })?;
+        ensure_folder_can_delete_children(folder)?;
+    }
+    let value = build(&mut stage)?;
+    let report = stage.commit()?;
+    let _ = snapshot::mark_instance_mutated(instance_dir);
+    Ok((value, report))
+}
+
+/// The instance path of a file of `content_type` named `filename`, as staged apply takes it.
+pub(crate) fn content_path(
+    content_type: &str,
+    filename: &str,
+) -> LauncherResult<agora_game_api::StrictRelPath> {
+    agora_game_api::RelPath::strict(format!(
+        "{}/{filename}",
+        helpers::content_subdir(content_type)
+    ))
+    .map_err(|error| LauncherError::Generic {
+        code: "ERR_INVALID_FILENAME".into(),
+        message: format!("'{filename}' cannot be a file in an instance: {error}"),
+    })
+}
+
+/// Stage the stored object `sha256` to become the file at `path`.
+pub(crate) fn stage_object(
+    ctx: &Ctx,
+    stage: &mut Stage<'_>,
+    path: &agora_game_api::StrictRelPath,
+    sha256: &str,
+    expect: Expect,
+) -> LauncherResult<()> {
+    stage.write_with(path, expect, |at| {
+        place_file_at(ctx, sha256, at).map(|_| ())
+    })
+}
+
 /// Place the stored object `sha256` at exactly `target` (a staged apply's stage, for example), the
 /// way [`place_file`] places it into an instance folder.
 pub fn place_file_at(ctx: &Ctx, sha256: &str, target: &Path) -> LauncherResult<store::PlacedAs> {
@@ -527,7 +584,7 @@ pub fn stored_mod_fields(item: &store::ContentItem) -> LauncherResult<(String, S
 /// Adding the same item twice returns the existing entry.
 pub fn add_item_to_instance(
     ctx: &Ctx,
-    guard: &agora_core::instance_runtime::InstanceGuard,
+    guard: &InstanceGuard,
     instance_id: &str,
     item_id: &str,
 ) -> LauncherResult<InstalledMod> {
@@ -580,18 +637,18 @@ pub fn add_item_to_instance(
             .join(helpers::content_subdir(&existing.content_type))
             .join(&placed_name);
         if !target.is_file() {
-            place_file(ctx, &sha256, &dir, &existing.content_type, &placed_name)?;
-            let _ = snapshot::mark_instance_mutated(&dir);
+            let path = content_path(&existing.content_type, &placed_name)?;
+            let folder = dir.join(helpers::content_subdir(&existing.content_type));
+            staged_change(guard, &dir, &[&folder], |stage| {
+                stage_object(ctx, stage, &path, &sha256, Expect::Absent)
+            })?;
         }
         return Ok(existing);
     }
 
-    place_file(ctx, &sha256, &dir, &content_type, &filename)?;
-    let target = dir
-        .join(helpers::content_subdir(&content_type))
-        .join(&filename);
+    // The stored object holds the same bytes the placement will: read its metadata there.
     let metadata = crate::jar_metadata::parse_jar_metadata_for_loader_at_mc(
-        &target,
+        &ctx.paths.content_object_path(&sha256),
         &manifest.loader,
         &manifest.minecraft_version,
     );
@@ -652,15 +709,15 @@ pub fn add_item_to_instance(
         enabled: true,
         content_type,
         content_item_id: Some(item.item_id),
-        object_sha256: Some(sha256),
+        object_sha256: Some(sha256.clone()),
     };
     helpers::push_to_content_array(&mut manifest, &installed);
-    if let Err(error) = helpers::atomic_write_manifest(&manifest_path, &manifest) {
-        // The placement is ours and has no manifest entry yet: take it back.
-        let _ = std::fs::remove_file(&target);
-        return Err(error);
-    }
-    let _ = snapshot::mark_instance_mutated(&dir);
+    let path = content_path(&installed.content_type, &installed.filename)?;
+    let folder = dir.join(helpers::content_subdir(&installed.content_type));
+    staged_change(guard, &dir, &[&folder], |stage| {
+        stage_object(ctx, stage, &path, &sha256, Expect::Absent)?;
+        stage.write_manifest(&manifest)
+    })?;
     Ok(installed)
 }
 
