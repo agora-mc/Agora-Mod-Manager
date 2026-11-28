@@ -1627,6 +1627,96 @@ def committed_archive_budget() -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
+# 18. Direct writes in the Minecraft package: counted, and the count may only go down
+# ---------------------------------------------------------------------------
+# MASTER_SPEC §32.4: one durable way to put files into an instance is staged apply (and, for a new
+# instance, its whole-folder protocol). A writer that writes the instance's files itself gets
+# none of it: no journal, no commit point, no recovery, no keeping the user's changed files. The
+# Minecraft package is where the instance writers live, so its direct writes are counted per
+# file, and a file's number may only fall: a new direct write fails until it goes through staged
+# apply or its file's number is raised in the budget, which a reviewer then sees.
+#
+# A *direct write* is a call that changes a file's bytes or where it is: `fs::write`, `fs::copy`,
+# `fs::rename`, `fs::remove_file`, `fs::remove_dir_all`, and the manifest's `atomic_write_manifest`
+# (with or without a `std::` prefix). Creating a folder is not counted. The count is textual, on
+# the production code only (comments, strings and test items blanked, as in §15), so it also
+# counts writes that never touch an instance (exports, the app's own data); those are the ones a
+# slice may leave. It does not tell an instance path from another, and does not try.
+INSTANCE_WRITE_BUDGET = REPO_ROOT / "scripts" / "instance_write_budget.json"
+INSTANCE_WRITE_ROOT = REPO_ROOT / "crates" / "agora-game-minecraft" / "src"
+DIRECT_WRITE_PATTERNS = (
+    re.compile(r"\bfs\s*::\s*(?:write|copy|rename|remove_file|remove_dir_all)\s*\("),
+    re.compile(r"\batomic_write_manifest\s*\("),
+)
+
+
+def count_direct_instance_writes(source: str) -> int:
+    """Direct writes in one Rust file's production code."""
+    cleaned = blank_test_items(blank_rust_noise(source))
+    return sum(len(pattern.findall(cleaned)) for pattern in DIRECT_WRITE_PATTERNS)
+
+
+def is_test_file_by_name(path: Path) -> bool:
+    """A file of test code by where it lives: below a `tests` folder, or named `tests.rs` or
+    `*_tests.rs`. (`is_test_only_module_file` sees only the module that declares a file; a test
+    folder's files are declared by its own `mod.rs`, which is itself the test-only one.)"""
+    relative = path.relative_to(INSTANCE_WRITE_ROOT)
+    return (
+        "tests" in relative.parts[:-1]
+        or path.stem == "tests"
+        or path.stem.endswith("_tests")
+    )
+
+
+def check_direct_instance_writes() -> None:
+    try:
+        budget = json.loads(INSTANCE_WRITE_BUDGET.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        err(f"{INSTANCE_WRITE_BUDGET.name} is missing: the direct-write budget is checked in")
+        return
+    except (OSError, ValueError) as exc:
+        err(f"Cannot read {INSTANCE_WRITE_BUDGET.name}: {exc}")
+        return
+    allowed = budget.get("writes", {})
+    if not isinstance(allowed, dict):
+        err(f"{INSTANCE_WRITE_BUDGET.name}: 'writes' must be an object of file to count")
+        return
+    found = {}
+    if INSTANCE_WRITE_ROOT.is_dir():
+        for path in sorted(INSTANCE_WRITE_ROOT.rglob("*.rs")):
+            if is_test_only_module_file(path) or is_test_file_by_name(path):
+                continue
+            count = count_direct_instance_writes(
+                path.read_text(encoding="utf-8", errors="replace")
+            )
+            if count:
+                found[path.relative_to(REPO_ROOT).as_posix()] = count
+    problems = []
+    for name in sorted(set(found) | set(allowed)):
+        count, limit = found.get(name, 0), allowed.get(name, 0)
+        if not isinstance(limit, int):
+            problems.append(f"  {name}: budget must be a whole number, not {limit!r}")
+        elif count > limit:
+            problems.append(
+                f"  {name}: {count} direct writes, budget {limit}; write through staged apply "
+                f"(agora_core::staged_apply) instead, or raise its number in "
+                f"{INSTANCE_WRITE_BUDGET.name} with the reason in the commit"
+            )
+        elif count < limit:
+            removal = " (remove the entry)" if not count else ""
+            problems.append(
+                f"  {name}: {count} direct writes, below the budget of {limit}; lower it to "
+                f"{count} in {INSTANCE_WRITE_BUDGET.name}{removal}"
+            )
+    if problems:
+        err("Direct file writes in the Minecraft package (MASTER_SPEC §32.4)")
+        for problem in problems:
+            print(problem, file=sys.stderr)
+    else:
+        print(f"OK: {sum(found.values())} direct writes in {len(found)} files, within budget")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> int:
@@ -1696,6 +1786,10 @@ def main() -> int:
 
     print("--- 17. One archive reader ---")
     check_one_archive_reader()
+    print()
+
+    print("--- 18. Direct instance writes ---")
+    check_direct_instance_writes()
     print()
 
     if EXIT_CODE == 0:

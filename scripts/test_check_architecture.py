@@ -366,3 +366,81 @@ class FailClosedReadBudgetTests(unittest.TestCase):
         budget["crates/agora-core/src/content_store"]["place.rs"] = 1
         self.budget_of(directories=budget)
         self.assertEqual(self.check(), 0)
+
+
+class DirectInstanceWriteBudgetTests(unittest.TestCase):
+    """MASTER_SPEC 32.4: direct file writes in the Minecraft package are counted and only go down."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.src = self.root / "crates/agora-game-minecraft/src"
+        self.src.mkdir(parents=True)
+        self.budget = self.root / "scripts" / "instance_write_budget.json"
+        self.budget.parent.mkdir()
+        for name, value in {
+            "REPO_ROOT": self.root,
+            "INSTANCE_WRITE_BUDGET": self.budget,
+            "INSTANCE_WRITE_ROOT": self.src,
+            "EXIT_CODE": 0,
+        }.items():
+            patcher = patch.object(architecture, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def write(self, name: str, source: str) -> None:
+        (self.src / name).write_text(source, encoding="utf-8")
+
+    def budget_of(self, writes) -> None:
+        self.budget.write_text(json.dumps({"writes": writes}), encoding="utf-8")
+
+    def check(self) -> int:
+        architecture.EXIT_CODE = 0
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            architecture.check_direct_instance_writes()
+        return architecture.EXIT_CODE
+
+    def test_each_kind_of_direct_write_counts_and_tests_and_comments_do_not(self):
+        source = (
+            'fn a(p: &Path) { std::fs::write(p, b"x").unwrap(); fs::copy(p, p).unwrap(); }\n'
+            "fn b(p: &Path) { fs::rename(p, p).unwrap(); std::fs::remove_file(p).unwrap(); }\n"
+            "fn c(p: &Path) { fs::remove_dir_all(p).unwrap(); helpers::atomic_write_manifest(p, m); }\n"
+            "fn d(p: &Path) { fs::create_dir_all(p).unwrap(); } // fs::write(p) in a comment\n"
+            "#[cfg(test)]\n"
+            'mod tests { fn t(p: &Path) { std::fs::write(p, b"x").unwrap(); } }\n'
+        )
+        self.assertEqual(architecture.count_direct_instance_writes(source), 6)
+
+    def test_a_file_with_writes_and_no_budget_entry_fails(self):
+        self.write("new_writer.rs", 'fn a(p: &Path) { std::fs::write(p, b"x").unwrap(); }\n')
+        self.budget_of({})
+        self.assertEqual(self.check(), 1)
+
+    def test_at_budget_passes_and_one_more_write_fails(self):
+        self.write("writer.rs", 'fn a(p: &Path) { std::fs::write(p, b"x").unwrap(); }\n')
+        self.budget_of({"crates/agora-game-minecraft/src/writer.rs": 1})
+        self.assertEqual(self.check(), 0)
+        self.write(
+            "writer.rs",
+            'fn a(p: &Path) { std::fs::write(p, b"x").unwrap(); fs::copy(p, p).unwrap(); }\n',
+        )
+        self.assertEqual(self.check(), 1)
+
+    def test_a_writer_moved_onto_staged_apply_must_lower_its_number(self):
+        self.write("writer.rs", "fn a(stage: &mut Stage) { stage.write(p, b, e); }\n")
+        self.budget_of({"crates/agora-game-minecraft/src/writer.rs": 2})
+        self.assertEqual(self.check(), 1)
+        self.budget_of({})
+        self.assertEqual(self.check(), 0)
+
+    def test_a_missing_budget_file_fails(self):
+        self.assertEqual(self.check(), 1)
+
+    def test_test_folders_and_test_files_do_not_count(self):
+        (self.src / "pipeline" / "tests").mkdir(parents=True)
+        line = 'fn t(p: &Path) { std::fs::write(p, b"x").unwrap(); }' + chr(10)
+        (self.src / "pipeline" / "tests" / "store.rs").write_text(line, encoding="utf-8")
+        self.write("thing_tests.rs", line)
+        self.budget_of({})
+        self.assertEqual(self.check(), 0)

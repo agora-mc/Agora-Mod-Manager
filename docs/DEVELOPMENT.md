@@ -227,6 +227,14 @@ A new or renamed Tauri command also needs `python scripts/check_tauri_bindings.p
   after a `#[cfg(test)] mod tests;` declaration is still counted. It is textual: a file's number is
   the number of patterns, not a compiler's opinion of them. A directory entry counts every `.rs`
   file below it, so a new subdirectory needs its own entries.
+- `scripts/instance_write_budget.json` counts direct file writes (`fs::write`, `copy`, `rename`,
+  `remove_file`, `remove_dir_all`, `atomic_write_manifest`) in the Minecraft package's production
+  code, per file (MASTER_SPEC §32.4). Files into an instance go through staged apply
+  (`agora_core::staged_apply`, and `staged_apply::new_instance` for a new instance), so a new
+  direct write fails `check_architecture.py`, and a writer moved onto staged apply fails it until
+  its lower number is written back. The count is textual and also counts writes that never touch an
+  instance (exports, app data); raising a file's number is a reviewed change with its reason in the
+  commit. Test files (below a `tests` folder, or named `*_tests.rs`) are not counted.
 - `scripts/path_rules_budget.json` counts what is left of the old per-feature path rules
   (MASTER_SPEC §32.3): private functions that decide whether a path or a name may be used, and
   hand-written path comparisons in recovery, trust and staging modules. New writes and anything
