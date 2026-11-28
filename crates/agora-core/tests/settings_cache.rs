@@ -228,9 +228,8 @@ fn schema_step_32_adds_a_version_to_an_existing_database_and_preserves_settings(
 
     db::init_local_state_db(&path).unwrap();
     let conn = Connection::open(&path).unwrap();
-    assert_eq!(
-        db::recorded_schema_version(&conn).unwrap(),
-        32,
+    assert!(
+        db::recorded_schema_version(&conn).unwrap() >= 32,
         "startup did not apply the settings version schema step"
     );
     assert_eq!(db::get_setting(&conn, LOCKDOWN).unwrap(), Some(json!(true)));

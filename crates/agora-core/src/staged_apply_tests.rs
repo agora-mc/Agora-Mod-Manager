@@ -712,7 +712,7 @@ fn insert_row(tx: &rusqlite::Transaction<'_>) -> crate::error::LauncherResult<()
     tx.execute("INSERT INTO test_rows (value) VALUES ('new')", [])
         .map(|_| ())
         .map_err(|error| crate::error::LauncherError::Generic {
-            code: "ERR_TEST".into(),
+            code: "ERR_STAGED_APPLY".into(),
             message: error.to_string(),
         })
 }
@@ -747,7 +747,7 @@ fn a_failed_database_change_rolls_the_files_back() {
     let stage = stage_the_apply(&guard, &root);
     let result = stage.commit_with_receipt(&mut conn, |_| {
         Err(crate::error::LauncherError::Generic {
-            code: "ERR_TEST".into(),
+            code: "ERR_STAGED_APPLY".into(),
             message: "the row changed under us".into(),
         })
     });

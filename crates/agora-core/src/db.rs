@@ -1154,7 +1154,6 @@ fn migrate_v33(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS staged_apply_receipts (
              operation_id TEXT PRIMARY KEY NOT NULL,
-             instance_id TEXT NOT NULL,
              created_at TEXT NOT NULL
          );",
     )?;

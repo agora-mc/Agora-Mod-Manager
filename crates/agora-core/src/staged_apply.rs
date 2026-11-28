@@ -537,10 +537,7 @@ impl<'g> Stage<'g> {
 
         if let Some(receipt) = receipt.as_deref_mut() {
             // The commit point: the caller's change and this apply's receipt, in one transaction.
-            if let Err(error) = receipt.commit(
-                &self.journal.envelope.operation_id,
-                &self.journal.instance_id,
-            ) {
+            if let Err(error) = receipt.commit(&self.journal.envelope.operation_id) {
                 self.settled = true;
                 let outcomes = self.settle_here(None, Some(&*receipt));
                 let undone = outcomes
@@ -1294,14 +1291,17 @@ fn clear_stage(capability: &RecoveryCapability<'_, State>, dir: &Path) -> Launch
 // Receipts
 // ---------------------------------------------------------------------------
 
+/// The caller's own database change, run inside the receipt's transaction.
+type DatabaseChange<'c> = Box<dyn FnOnce(&rusqlite::Transaction<'_>) -> LauncherResult<()> + 'c>;
+
 /// A caller's database change, committed with this apply's receipt as its commit point.
 struct ReceiptCommit<'c> {
     conn: &'c mut rusqlite::Connection,
-    change: Option<Box<dyn FnOnce(&rusqlite::Transaction<'_>) -> LauncherResult<()> + 'c>>,
+    change: Option<DatabaseChange<'c>>,
 }
 
 impl ReceiptCommit<'_> {
-    fn commit(&mut self, operation: &str, instance_id: &str) -> LauncherResult<()> {
+    fn commit(&mut self, operation: &str) -> LauncherResult<()> {
         let change = self
             .change
             .take()
@@ -1309,9 +1309,8 @@ impl ReceiptCommit<'_> {
         let tx = self.conn.transaction().map_err(database)?;
         change(&tx)?;
         tx.execute(
-            "INSERT INTO staged_apply_receipts (operation_id, instance_id, created_at)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![operation, instance_id, chrono::Utc::now().to_rfc3339()],
+            "INSERT INTO staged_apply_receipts (operation_id, created_at) VALUES (?1, ?2)",
+            rusqlite::params![operation, chrono::Utc::now().to_rfc3339()],
         )
         .map_err(database)?;
         tx.commit().map_err(database)
