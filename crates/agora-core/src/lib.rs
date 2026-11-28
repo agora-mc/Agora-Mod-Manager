@@ -111,6 +111,7 @@ pub mod shared_settings;
 pub mod snapshot;
 pub mod snapshot_service;
 pub mod source_identify;
+pub mod staged_apply;
 pub mod startup_recovery;
 pub mod task_scheduler;
 pub mod test_seams;

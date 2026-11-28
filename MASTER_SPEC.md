@@ -5665,8 +5665,12 @@ At least twelve paths write files into a Minecraft instance, each with its own s
 rollback: the install pipeline (`apply_transaction`, whose journal is in memory only, so a crash
 mid-install leaves a half-installed instance), a second `ApplyJournal` in `version_migration.rs`,
 `template_service`, the importers, pack install and update, launcher import and curated packs.
-- **`staged_apply` lives in `agora-game-minecraft`.** `Stage::begin(&guard, root)` takes the instance
-  guard (through `GameHost`). Add, replace, remove and rename take `RelPath`s, never the root.
+- **`staged_apply` lives in `agora-core`** (decided 2026-11-27, superseding "in
+  `agora-game-minecraft`"): the engine is game-agnostic, it extends the §32.11 recovery capability
+  (it moves files below the folders a journal proves it owns), other games' deploy writers can use
+  it, and the Minecraft package reaches it with one import instead of growing its §26.12 budget.
+  Game packages call it. `Stage::begin(&guard, root)` takes the instance guard. Add, replace,
+  remove and rename take `StrictRelPath`s, never the root.
 - **Durability, specified before it is built:**
   - the journal (32.11 envelope) is written and flushed, and its directory flushed, before the first
     change;

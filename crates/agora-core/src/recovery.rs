@@ -85,6 +85,8 @@ pub enum OperationKind {
     PluginInstall,
     /// Moving pre-B3a snapshot objects under the content-store lock.
     SnapshotObjectMigration,
+    /// Putting files into an instance through staged apply, under the instance lock (§32.4).
+    StagedApply,
 }
 
 impl OperationKind {
@@ -93,6 +95,7 @@ impl OperationKind {
         match self {
             OperationKind::PluginInstall => "plugin-install",
             OperationKind::SnapshotObjectMigration => "snapshot-object-migration",
+            OperationKind::StagedApply => "staged-apply",
         }
     }
 }
@@ -267,6 +270,84 @@ pub(crate) fn sync_parent(path: &Path) -> std::io::Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+/// Move a plain file from `from` to `to`, both below `base`, and persist both directory entries.
+///
+/// Every component of both paths below `base` is checked first: a link (or junction) anywhere, a
+/// non-folder where a folder belongs, a non-file at `from` or anything at all at `to` refuses the
+/// move with `ERR_RECOVERY_REFUSED`. Missing folders on the way to `to` are created. `base` itself
+/// is the caller's to have verified.
+pub(crate) fn move_file_below(base: &Path, from: &Path, to: &Path) -> LauncherResult<()> {
+    let relative = |path: &Path| -> LauncherResult<String> {
+        let relative = path
+            .strip_prefix(base)
+            .map_err(|_| refused(format!("{} is outside {}", path.display(), base.display())))?;
+        let spelling = relative
+            .to_str()
+            .ok_or_else(|| refused(format!("{} has a non-Unicode name", path.display())))?
+            .replace('\\', "/");
+        let checked = agora_game_api::RelPath::strict(spelling.as_str())
+            .map_err(|error| refused(format!("{}: {error}", path.display())))?;
+        if !agora_game_api::same_spelling(path, &base.join(checked.as_str())) {
+            return Err(refused(format!(
+                "{} changes under path validation",
+                path.display()
+            )));
+        }
+        Ok(checked.as_str().to_string())
+    };
+    let walk = |relative: &str, create: bool| -> LauncherResult<Option<std::fs::Metadata>> {
+        let mut current = base.to_path_buf();
+        let mut parts = relative.split('/').peekable();
+        while let Some(part) = parts.next() {
+            current.push(part);
+            let last = parts.peek().is_none();
+            let metadata = match std::fs::symlink_metadata(&current) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if last {
+                        return Ok(None);
+                    }
+                    if !create {
+                        return Ok(None);
+                    }
+                    std::fs::create_dir(&current).map_err(|error| path_error(&current, error))?;
+                    continue;
+                }
+                Err(error) => return Err(path_error(&current, error)),
+            };
+            if agora_game_api::is_a_reparse_point(&metadata) {
+                return Err(refused(format!("{} is a link", current.display())));
+            }
+            if last {
+                return Ok(Some(metadata));
+            }
+            if !metadata.is_dir() {
+                return Err(refused(format!("{} is not a folder", current.display())));
+            }
+        }
+        Ok(None)
+    };
+    let from_relative = relative(from)?;
+    let to_relative = relative(to)?;
+    match walk(&from_relative, false)? {
+        Some(metadata) if metadata.is_file() => {}
+        Some(_) => return Err(refused(format!("{} is not a plain file", from.display()))),
+        None => return Err(refused(format!("{} is not there", from.display()))),
+    }
+    if walk(&to_relative, true)?.is_some() {
+        return Err(refused(format!("{} is occupied", to.display())));
+    }
+    durable_rename(from, to, false).map_err(|error| {
+        journal_error(format!(
+            "could not move {} to {}: {error}",
+            from.display(),
+            to.display()
+        ))
+    })?;
+    sync_parent(to).map_err(|error| path_error(to, error))?;
+    sync_parent(from).map_err(|error| path_error(from, error))
 }
 
 /// Move a directory and persist the changed entries before advancing a journal.
@@ -1254,6 +1335,21 @@ impl<'a, S> RecoveryCapability<'a, S> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(path_error(path, error)),
         }
+    }
+
+    /// Move a plain file from one place below the verified folder `base` to another place below
+    /// it, refusing a link or a non-folder anywhere along either path, and an occupied
+    /// destination ([`move_file_below`]).
+    pub(crate) fn rename_file_below(
+        &self,
+        base: &Path,
+        from: &Path,
+        to: &Path,
+    ) -> LauncherResult<()> {
+        if self.verified_identity(base)?.is_none() {
+            return Err(refused(format!("{} is no longer there", base.display())));
+        }
+        move_file_below(base, from, to)
     }
 
     /// Remove an owned folder.
