@@ -138,7 +138,10 @@ fn assert_schema_32_refuses_missing_version(
     write: impl FnOnce(&Connection) -> anyhow::Result<()>,
 ) {
     let (_root, raw) = state_db();
-    assert_eq!(db::recorded_schema_version(&raw).unwrap(), 32);
+    assert!(
+        db::recorded_schema_version(&raw).unwrap() >= 32,
+        "the settings version arrived in step 32"
+    );
     raw.execute(SEED, []).unwrap();
     raw.execute_batch(erase).unwrap();
     let result = write(&raw);

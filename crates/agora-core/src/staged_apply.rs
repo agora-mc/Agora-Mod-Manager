@@ -107,6 +107,9 @@ pub enum Boundary {
     AfterPlan,
     /// After this many moves.
     AfterMove(usize),
+    /// After the caller's database change and its receipt committed, before the journal's
+    /// `committed` record ([`Stage::commit_with_receipt`]).
+    AfterReceipt,
     /// After the `committed` record, before any cleanup.
     AfterCommit,
     /// After this many backups were removed by the cleanup.
@@ -163,6 +166,10 @@ struct StagedJournal {
     instance_id: String,
     #[serde(default)]
     ops: Vec<Op>,
+    /// The commit point is a row in `staged_apply_receipts` written with the caller's database
+    /// change, not the `committed` record alone ([`Stage::commit_with_receipt`]).
+    #[serde(default)]
+    receipt: bool,
 }
 
 fn journal_path(root: &Path, operation: &str) -> PathBuf {
@@ -226,8 +233,26 @@ impl<'g> Stage<'g> {
     /// cleanup finished). One that cannot be settled safely refuses the new apply, so it is never
     /// overwritten.
     pub fn begin(guard: &'g InstanceGuard, root: &Path) -> LauncherResult<Self> {
+        Self::begin_settling(guard, root, None)
+    }
+
+    /// [`Self::begin`] for a writer that also changes the database: an earlier apply whose commit
+    /// point is a receipt ([`Self::commit_with_receipt`]) is judged by `conn`.
+    pub fn begin_with_receipts(
+        guard: &'g InstanceGuard,
+        root: &Path,
+        conn: &rusqlite::Connection,
+    ) -> LauncherResult<Self> {
+        Self::begin_settling(guard, root, Some(conn))
+    }
+
+    fn begin_settling(
+        guard: &'g InstanceGuard,
+        root: &Path,
+        receipts: Option<&rusqlite::Connection>,
+    ) -> LauncherResult<Self> {
         plain_directory(root)?;
-        for outcome in settle(guard.lock(), guard.instance_id(), root, None) {
+        for outcome in settle(guard.lock(), guard.instance_id(), root, None, receipts) {
             if let StagedRecovery::NeedsHand(reason) | StagedRecovery::Busy(reason) = outcome {
                 return Err(refused(format!(
                     "An earlier change to this instance was interrupted and cannot be finished \
@@ -260,6 +285,7 @@ impl<'g> Stage<'g> {
             envelope,
             instance_id: guard.instance_id().to_string(),
             ops: Vec::new(),
+            receipt: false,
         };
         let journal_path = journal_path(root, &operation);
         recovery::write(&journal_path, &journal)?;
@@ -428,7 +454,31 @@ impl<'g> Stage<'g> {
     }
 
     /// Make the staged changes: all of them, or (after recovery) none.
-    pub fn commit(mut self) -> LauncherResult<ApplyReport> {
+    pub fn commit(self) -> LauncherResult<ApplyReport> {
+        self.commit_inner(None)
+    }
+
+    /// Make the staged changes together with a database change. The files are moved first; then
+    /// `change` and a receipt row for this apply are committed in **one** SQLite transaction on
+    /// `conn`, which is the commit point: a crash before it leaves the old files (and no change), a
+    /// crash after it is finished by recovery. If `change` or the transaction fails, the files are
+    /// put back.
+    pub fn commit_with_receipt<'c>(
+        self,
+        conn: &'c mut rusqlite::Connection,
+        change: impl FnOnce(&rusqlite::Transaction<'_>) -> LauncherResult<()> + 'c,
+    ) -> LauncherResult<ApplyReport> {
+        self.commit_inner(Some(Box::new(ReceiptCommit {
+            conn,
+            change: Some(Box::new(change)),
+        })))
+    }
+
+    fn commit_inner(
+        mut self,
+        mut receipt: Option<Box<ReceiptCommit<'_>>>,
+    ) -> LauncherResult<ApplyReport> {
+        self.journal.receipt = receipt.is_some();
         if self.crash == Some(Boundary::BeforePlan) {
             return self.crashed();
         }
@@ -465,12 +515,7 @@ impl<'g> Stage<'g> {
             // A real failure before the commit point: roll back now, through the same recovery
             // that would run after a crash.
             self.settled = true;
-            let outcomes = settle(
-                self.guard.lock(),
-                self.guard.instance_id(),
-                &self.root,
-                None,
-            );
+            let outcomes = self.settle_here(None, receipt.as_deref());
             let undone = outcomes
                 .iter()
                 .any(|outcome| matches!(outcome, StagedRecovery::RolledBack { .. }));
@@ -490,7 +535,36 @@ impl<'g> Stage<'g> {
             });
         }
 
-        // The commit point.
+        if let Some(receipt) = receipt.as_deref_mut() {
+            // The commit point: the caller's change and this apply's receipt, in one transaction.
+            if let Err(error) = receipt.commit(
+                &self.journal.envelope.operation_id,
+                &self.journal.instance_id,
+            ) {
+                self.settled = true;
+                let outcomes = self.settle_here(None, Some(&*receipt));
+                let undone = outcomes
+                    .iter()
+                    .any(|outcome| matches!(outcome, StagedRecovery::RolledBack { .. }));
+                return Err(LauncherError::Generic {
+                    code: "ERR_STAGED_APPLY".into(),
+                    message: if undone {
+                        format!("{error}; nothing in the instance was changed.")
+                    } else {
+                        format!(
+                            "{error}; putting the instance back did not finish ({outcomes:?}). It \
+                             will be tried again the next time Agora starts."
+                        )
+                    },
+                });
+            }
+            if self.crash == Some(Boundary::AfterReceipt) {
+                self.settled = true;
+                return Err(crash_error());
+            }
+        }
+
+        // The commit point (for an apply without a receipt), and the record that it was reached.
         self.journal.envelope.state = State::Committed;
         recovery::write(&self.journal_path, &self.journal)?;
         self.settled = true;
@@ -501,12 +575,7 @@ impl<'g> Stage<'g> {
             Some(Boundary::AfterCleanup(n)) => Some(n),
             _ => None,
         };
-        let outcomes = settle(
-            self.guard.lock(),
-            self.guard.instance_id(),
-            &self.root,
-            cleanup_crash,
-        );
+        let outcomes = self.settle_here(cleanup_crash, receipt.as_deref());
         if cleanup_crash.is_some() {
             return Err(crash_error());
         }
@@ -522,6 +591,34 @@ impl<'g> Stage<'g> {
             );
         }
         Ok(report)
+    }
+
+    /// Settle this instance's applies under the guard this stage holds, judging a receipt apply by
+    /// the connection `receipt` commits on.
+    fn settle_here(
+        &self,
+        cleanup_crash: Option<usize>,
+        receipt: Option<&ReceiptCommit<'_>>,
+    ) -> Vec<StagedRecovery> {
+        match receipt {
+            Some(receipt) => {
+                let conn: &rusqlite::Connection = &*receipt.conn;
+                settle(
+                    self.guard.lock(),
+                    self.guard.instance_id(),
+                    &self.root,
+                    cleanup_crash,
+                    Some(conn),
+                )
+            }
+            None => settle(
+                self.guard.lock(),
+                self.guard.instance_id(),
+                &self.root,
+                cleanup_crash,
+                None,
+            ),
+        }
     }
 
     fn crashed(mut self) -> LauncherResult<ApplyReport> {
@@ -679,6 +776,7 @@ impl Drop for Stage<'_> {
             self.guard.instance_id(),
             &self.root,
             None,
+            None,
         );
     }
 }
@@ -723,7 +821,19 @@ fn previous_location(root: &Path, dir: &Path, previous: &Previous) -> PathBuf {
 /// Every adapter's startup pass calls this through its game package, and [`Stage::begin`] calls it
 /// before every apply.
 pub fn recover(locks: &LockManager, instance_id: &str, root: &Path) -> Vec<StagedRecovery> {
-    recover_inner(locks, instance_id, root, None)
+    recover_inner(locks, instance_id, root, None, None)
+}
+
+/// [`recover`], judging an apply whose commit point is a receipt by the receipts in `conn` (the
+/// local state database). Without the database such an apply needs a hand: rolling it back could
+/// pair old files with a database change that committed.
+pub fn recover_with_receipts(
+    locks: &LockManager,
+    instance_id: &str,
+    root: &Path,
+    conn: &rusqlite::Connection,
+) -> Vec<StagedRecovery> {
+    recover_inner(locks, instance_id, root, None, Some(conn))
 }
 
 /// Settle the interrupted applies of every instance in the context's instances folder, for the
@@ -732,6 +842,10 @@ pub fn recover_instances(ctx: &crate::ctx::Ctx) -> (Vec<String>, Vec<String>) {
     let mut actions = Vec::new();
     let mut warnings = Vec::new();
     let root = ctx.paths.instances_root();
+    // Opened only when an instance has a stage: an apply whose commit point is a receipt is judged
+    // by it, and without it such an apply is left for a hand rather than guessed.
+    let mut conn: Option<rusqlite::Connection> = None;
+    let mut conn_tried = false;
     let entries = match std::fs::read_dir(&root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (actions, warnings),
@@ -763,7 +877,20 @@ pub fn recover_instances(ctx: &crate::ctx::Ctx) -> (Vec<String>, Vec<String>) {
             continue;
         }
         let id = entry.file_name().to_string_lossy().to_string();
-        for outcome in recover(&ctx.lock_manager, &id, &instance) {
+        if !conn_tried {
+            conn_tried = true;
+            match crate::db::local_state_connection(&ctx.paths.local_state_db()) {
+                Ok(opened) => conn = Some(opened),
+                Err(error) => warnings.push(format!(
+                    "Agora could not open the local database to finish interrupted changes: {error}"
+                )),
+            }
+        }
+        let outcomes = match &conn {
+            Some(conn) => recover_with_receipts(&ctx.lock_manager, &id, &instance, conn),
+            None => recover(&ctx.lock_manager, &id, &instance),
+        };
+        for outcome in outcomes {
             match outcome {
                 StagedRecovery::RolledBack { .. } => actions.push(format!(
                     "Put instance '{id}' back as it was before a change that was interrupted."
@@ -791,7 +918,7 @@ pub fn recover_crashing_after(
     root: &Path,
     moves: usize,
 ) -> Vec<StagedRecovery> {
-    recover_inner(locks, instance_id, root, Some(moves))
+    recover_inner(locks, instance_id, root, Some(moves), None)
 }
 
 fn recover_inner(
@@ -799,6 +926,7 @@ fn recover_inner(
     instance_id: &str,
     root: &Path,
     crash_after: Option<usize>,
+    receipts: Option<&rusqlite::Connection>,
 ) -> Vec<StagedRecovery> {
     if !has_stage(root) {
         return Vec::new();
@@ -823,7 +951,7 @@ fn recover_inner(
             ))]
         }
     };
-    settle_inner(&lock, instance_id, root, crash_after, None)
+    settle_inner(&lock, instance_id, root, crash_after, None, receipts)
 }
 
 /// Settle under a lock the caller holds. `cleanup_crash` stops a committed cleanup after that many
@@ -833,8 +961,9 @@ fn settle(
     instance_id: &str,
     root: &Path,
     cleanup_crash: Option<usize>,
+    receipts: Option<&rusqlite::Connection>,
 ) -> Vec<StagedRecovery> {
-    settle_inner(lock, instance_id, root, None, cleanup_crash)
+    settle_inner(lock, instance_id, root, None, cleanup_crash, receipts)
 }
 
 fn has_stage(root: &Path) -> bool {
@@ -850,6 +979,7 @@ fn settle_inner(
     root: &Path,
     undo_crash: Option<usize>,
     cleanup_crash: Option<usize>,
+    receipts: Option<&rusqlite::Connection>,
 ) -> Vec<StagedRecovery> {
     let base = stage_root(root);
     let entries = match std::fs::read_dir(&base) {
@@ -904,6 +1034,7 @@ fn settle_inner(
             journal,
             undo_crash,
             cleanup_crash,
+            receipts,
         ));
     }
     // A stage whose journal was never written (a crash inside `begin`) holds at most its marker:
@@ -939,6 +1070,7 @@ fn settle_inner(
     outcomes
 }
 
+#[allow(clippy::too_many_arguments)]
 fn settle_one(
     lock: &LockGuard,
     instance_id: &str,
@@ -946,6 +1078,7 @@ fn settle_one(
     journal_path: &Path,
     undo_crash: Option<usize>,
     cleanup_crash: Option<usize>,
+    receipts: Option<&rusqlite::Connection>,
 ) -> StagedRecovery {
     let resource = LockResource::Instance(instance_id.to_string());
     let read = recovery::read::<State>(journal_path);
@@ -998,7 +1131,30 @@ fn settle_one(
     }
     let operation = journal.envelope.operation_id.clone();
     let dir = stage_dir(root, &operation);
-    let committed = journal.envelope.state == State::Committed;
+    // An apply whose commit point is a receipt committed if, and only if, its receipt is there; the
+    // `committed` record only follows it. Without the receipts, or with ones that cannot be read,
+    // it cannot be judged, and is left alone.
+    let committed = match (journal.envelope.state, journal.receipt) {
+        (State::Committed, _) => true,
+        (State::Applying, false) => false,
+        (State::Applying, true) => match receipts.map(|conn| receipt_present(conn, &operation)) {
+            Some(Ok(present)) => present,
+            Some(Err(error)) => {
+                return StagedRecovery::NeedsHand(format!(
+                    "whether change {operation} reached its commit point is recorded in the local \
+                     database, which could not be read: {error}. Nothing was changed; the journal \
+                     was kept."
+                ))
+            }
+            None => {
+                return StagedRecovery::NeedsHand(format!(
+                    "whether change {operation} reached its commit point is recorded in the local \
+                     database, which this recovery was not given. Nothing was changed; the journal \
+                     was kept."
+                ))
+            }
+        },
+    };
     let result = if committed {
         finish_cleanup(&mut capability, &dir, &journal, cleanup_crash)
     } else {
@@ -1013,6 +1169,12 @@ fn settle_one(
         return StagedRecovery::NeedsHand(error.to_string());
     }
     let _ = std::fs::remove_dir(&dir);
+    if committed && journal.receipt {
+        // The apply is finished: its receipt has done its job. A row left behind is harmless.
+        if let Some(conn) = receipts {
+            let _ = forget_receipt(conn, &operation);
+        }
+    }
     if committed {
         StagedRecovery::Finished { operation }
     } else {
@@ -1126,6 +1288,61 @@ fn clear_stage(capability: &RecoveryCapability<'_, State>, dir: &Path) -> Launch
         capability.remove_file(dir, &entry.path())?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Receipts
+// ---------------------------------------------------------------------------
+
+/// A caller's database change, committed with this apply's receipt as its commit point.
+struct ReceiptCommit<'c> {
+    conn: &'c mut rusqlite::Connection,
+    change: Option<Box<dyn FnOnce(&rusqlite::Transaction<'_>) -> LauncherResult<()> + 'c>>,
+}
+
+impl ReceiptCommit<'_> {
+    fn commit(&mut self, operation: &str, instance_id: &str) -> LauncherResult<()> {
+        let change = self
+            .change
+            .take()
+            .ok_or_else(|| refused("the database change of this apply already ran".into()))?;
+        let tx = self.conn.transaction().map_err(database)?;
+        change(&tx)?;
+        tx.execute(
+            "INSERT INTO staged_apply_receipts (operation_id, instance_id, created_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![operation, instance_id, chrono::Utc::now().to_rfc3339()],
+        )
+        .map_err(database)?;
+        tx.commit().map_err(database)
+    }
+}
+
+/// Whether the receipt of `operation` is in the database. A database that cannot answer is an
+/// error, never "no receipt".
+fn receipt_present(conn: &rusqlite::Connection, operation: &str) -> LauncherResult<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM staged_apply_receipts WHERE operation_id = ?1)",
+        [operation],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(database)
+}
+
+fn forget_receipt(conn: &rusqlite::Connection, operation: &str) -> LauncherResult<()> {
+    conn.execute(
+        "DELETE FROM staged_apply_receipts WHERE operation_id = ?1",
+        [operation],
+    )
+    .map(|_| ())
+    .map_err(database)
+}
+
+fn database(error: rusqlite::Error) -> LauncherError {
+    LauncherError::Generic {
+        code: "ERR_STAGED_APPLY".into(),
+        message: format!("the local database: {error}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

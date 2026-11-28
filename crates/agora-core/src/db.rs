@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 /// Expected schema version for the mutable local SQLite database.
 /// Migrations are applied sequentially on startup.
-pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 32;
+pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 33;
 
 /// The game whose columns `minecraft_instances` holds.
 ///
@@ -1143,6 +1143,24 @@ fn migrate_v32(conn: &Connection) -> anyhow::Result<()> {
     install_settings_version_triggers(conn)
 }
 
+/// Schema step 33: staged apply's commit receipts (MASTER_SPEC §32.4).
+///
+/// A writer that changes an instance's files and the database together writes a row here, keyed
+/// by its staged apply's operation id, in the same transaction as its own database change. That
+/// transaction is the apply's commit point: recovery that finds the row finishes the apply, and
+/// recovery that finds none rolls the files back, so old files are never paired with new rows.
+/// The row is removed once the apply's cleanup is done.
+fn migrate_v33(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS staged_apply_receipts (
+             operation_id TEXT PRIMARY KEY NOT NULL,
+             instance_id TEXT NOT NULL,
+             created_at TEXT NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
 /// The three triggers schema step 32 installs on `user_settings`, with the SQL that installs each.
 ///
 /// They are named and kept here, rather than inlined in the step, because a database can lose one:
@@ -1426,6 +1444,12 @@ const MIGRATIONS: &[MigrationStep] = &[
         name: "settings version",
         foreign_keys_off: false,
         run: migrate_v32,
+    },
+    MigrationStep {
+        version: 33,
+        name: "staged apply receipts",
+        foreign_keys_off: false,
+        run: migrate_v33,
     },
 ];
 

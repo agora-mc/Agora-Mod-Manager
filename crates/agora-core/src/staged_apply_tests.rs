@@ -680,3 +680,195 @@ fn the_startup_pass_finishes_an_apply_cut_off_after_its_commit() {
     );
     no_stage_left(&root);
 }
+
+// ---------------------------------------------------------------------------
+// 6. Files and the database together: the receipt is the commit point
+// ---------------------------------------------------------------------------
+
+fn state(ctx: &Ctx) -> rusqlite::Connection {
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS test_rows (value TEXT NOT NULL)")
+        .unwrap();
+    conn
+}
+
+fn rows(conn: &rusqlite::Connection) -> Vec<String> {
+    let mut statement = conn.prepare("SELECT value FROM test_rows").unwrap();
+    statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn receipts(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM staged_apply_receipts", [], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
+fn insert_row(tx: &rusqlite::Transaction<'_>) -> crate::error::LauncherResult<()> {
+    tx.execute("INSERT INTO test_rows (value) VALUES ('new')", [])
+        .map(|_| ())
+        .map_err(|error| crate::error::LauncherError::Generic {
+            code: "ERR_TEST".into(),
+            message: error.to_string(),
+        })
+}
+
+#[test]
+fn files_and_a_database_change_commit_together_and_the_receipt_is_cleared() {
+    let (_dir, ctx, root) = fixture();
+    old_instance(&root);
+    let mut conn = state(&ctx);
+    let guard = guard(&ctx);
+
+    let stage = stage_the_apply(&guard, &root);
+    stage.commit_with_receipt(&mut conn, insert_row).unwrap();
+
+    assert_eq!(without(tree(&root), ASIDE), new_tree());
+    assert_eq!(rows(&conn), vec!["new".to_string()]);
+    assert_eq!(
+        receipts(&conn),
+        0,
+        "the receipt is cleared once the apply is finished"
+    );
+    no_stage_left(&root);
+}
+
+#[test]
+fn a_failed_database_change_rolls_the_files_back() {
+    let (_dir, ctx, root) = fixture();
+    old_instance(&root);
+    let mut conn = state(&ctx);
+    let guard = guard(&ctx);
+
+    let stage = stage_the_apply(&guard, &root);
+    let result = stage.commit_with_receipt(&mut conn, |_| {
+        Err(crate::error::LauncherError::Generic {
+            code: "ERR_TEST".into(),
+            message: "the row changed under us".into(),
+        })
+    });
+
+    assert!(result.is_err());
+    assert_eq!(tree(&root), old_tree());
+    assert!(rows(&conn).is_empty());
+    assert_eq!(receipts(&conn), 0);
+    no_stage_left(&root);
+}
+
+#[test]
+fn a_crash_before_the_receipt_rolls_back_and_one_after_it_rolls_forward() {
+    for (boundary, committed) in [
+        (Boundary::AfterMove(7), false),
+        (Boundary::AfterReceipt, true),
+        (Boundary::AfterCommit, true),
+    ] {
+        let (_dir, ctx, root) = fixture();
+        old_instance(&root);
+        let mut conn = state(&ctx);
+        {
+            let guard = guard(&ctx);
+            let mut stage = stage_the_apply(&guard, &root);
+            stage.crash_at(boundary);
+            assert!(
+                stage.commit_with_receipt(&mut conn, insert_row).is_err(),
+                "{boundary:?}"
+            );
+        }
+
+        let outcomes = staged_apply::recover_with_receipts(&ctx.lock_manager, ID, &root, &conn);
+
+        if committed {
+            assert!(
+                matches!(outcomes.as_slice(), [StagedRecovery::Finished { .. }]),
+                "{boundary:?}: {outcomes:?}"
+            );
+            assert_eq!(without(tree(&root), ASIDE), new_tree(), "{boundary:?}");
+            assert_eq!(rows(&conn), vec!["new".to_string()], "{boundary:?}");
+        } else {
+            assert!(
+                matches!(outcomes.as_slice(), [StagedRecovery::RolledBack { .. }]),
+                "{boundary:?}: {outcomes:?}"
+            );
+            assert_eq!(tree(&root), old_tree(), "{boundary:?}");
+            assert!(rows(&conn).is_empty(), "{boundary:?}");
+        }
+        assert_eq!(receipts(&conn), 0, "{boundary:?}");
+        assert_eq!(copies_of_the_users_edit(&root), 1, "{boundary:?}");
+        no_stage_left(&root);
+    }
+}
+
+/// Without the database, an apply whose commit point is a receipt cannot be judged: rolling it back
+/// could pair old files with a committed row. It is left alone.
+#[test]
+fn a_receipt_apply_is_not_judged_without_the_database() {
+    let (_dir, ctx, root) = fixture();
+    old_instance(&root);
+    let mut conn = state(&ctx);
+    {
+        let guard = guard(&ctx);
+        let mut stage = stage_the_apply(&guard, &root);
+        stage.crash_at(Boundary::AfterReceipt);
+        assert!(stage.commit_with_receipt(&mut conn, insert_row).is_err());
+    }
+    let midway = tree(&root);
+
+    let outcomes = staged_apply::recover(&ctx.lock_manager, ID, &root);
+
+    assert!(
+        matches!(outcomes.as_slice(), [StagedRecovery::NeedsHand(_)]),
+        "{outcomes:?}"
+    );
+    assert_eq!(tree(&root), midway, "nothing was touched");
+}
+
+#[test]
+fn an_unreadable_receipt_table_needs_a_hand_and_touches_nothing() {
+    let (_dir, ctx, root) = fixture();
+    old_instance(&root);
+    let mut conn = state(&ctx);
+    {
+        let guard = guard(&ctx);
+        let mut stage = stage_the_apply(&guard, &root);
+        stage.crash_at(Boundary::AfterMove(7));
+        assert!(stage.commit_with_receipt(&mut conn, insert_row).is_err());
+    }
+    let midway = tree(&root);
+    conn.execute_batch("DROP TABLE staged_apply_receipts")
+        .unwrap();
+
+    let outcomes = staged_apply::recover_with_receipts(&ctx.lock_manager, ID, &root, &conn);
+
+    assert!(
+        matches!(outcomes.as_slice(), [StagedRecovery::NeedsHand(_)]),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        tree(&root),
+        midway,
+        "a receipt that cannot be read is not 'absent'"
+    );
+}
+
+#[test]
+fn the_startup_pass_judges_a_receipt_apply_by_its_receipt() {
+    let (_dir, ctx, root) = fixture();
+    old_instance(&root);
+    let mut conn = state(&ctx);
+    {
+        let guard = guard(&ctx);
+        let mut stage = stage_the_apply(&guard, &root);
+        stage.crash_at(Boundary::AfterReceipt);
+        assert!(stage.commit_with_receipt(&mut conn, insert_row).is_err());
+    }
+
+    crate::startup_recovery::run_at_startup(&ctx);
+
+    assert_eq!(without(tree(&root), ASIDE), new_tree());
+    assert_eq!(receipts(&conn), 0);
+    no_stage_left(&root);
+}
