@@ -407,7 +407,8 @@ fn a_failed_apply_rolls_a_linked_update_back_without_the_snapshot() {
     }
     prepare_manifest(&update, &dir, &staging, Some(&ctx)).unwrap();
     set_install_failpoint(Some("manifest-rename"));
-    let result = apply_transaction(&update, &dir, &staging, Some(&ctx));
+    let guard = InstanceGuard::for_mutation_while_running(&ctx, "test", "test apply").unwrap();
+    let result = apply_transaction(&guard, &update, &dir, &staging, Some(&ctx));
     set_install_failpoint(None);
 
     assert!(result.is_err(), "the injected failure must surface");

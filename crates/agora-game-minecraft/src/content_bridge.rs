@@ -438,6 +438,13 @@ pub fn place_file(
     store::place_object_at(ctx, sha256, &target, mode).map_err(content_error)
 }
 
+/// Place the stored object `sha256` at exactly `target` (a staged apply's stage, for example), the
+/// way [`place_file`] places it into an instance folder.
+pub fn place_file_at(ctx: &Ctx, sha256: &str, target: &Path) -> LauncherResult<store::PlacedAs> {
+    let mode = store::placement_mode(ctx).map_err(content_error)?;
+    store::place_object_at(ctx, sha256, target, mode).map_err(content_error)
+}
+
 /// Whether the file on disk still holds the bytes the manifest recorded. A file that does not
 /// match is the user's, not Agora's, and must never be deleted.
 pub fn file_matches_recorded(path: &Path, recorded_sha256: &str) -> LauncherResult<bool> {

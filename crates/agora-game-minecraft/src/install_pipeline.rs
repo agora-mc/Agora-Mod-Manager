@@ -40,6 +40,8 @@ use agora_core::{
     artifact_hash::{all_unmet, blank_asserted_hash, ConfirmableHash, HashOrigin},
     ctx::Ctx,
     error::HashConfirmation,
+    instance_runtime::InstanceGuard,
+    staged_apply::{self, Expect, Stage},
     task_scheduler::{BlockingPriority, TaskScheduler},
 };
 
@@ -1548,7 +1550,6 @@ impl InstallPipeline {
         cancel: &CancellationToken,
         resources: InstallExecutionResources<'_>,
     ) -> InstallOutcome {
-        let _ = guard;
         let scheduler = resources.scheduler;
         let registry_db_path = resources.registry_db_path;
         let loader_service = resources.loader_service;
@@ -1805,20 +1806,17 @@ impl InstallPipeline {
             bytes_total: plan.disk_estimate.download_bytes,
             message: "Atomically applying files and manifest…".into(),
         });
-        let apply_plan = plan.clone();
-        let apply_dir = instance_dir.to_path_buf();
-        let apply_staging = staging_dir.clone();
+        // The apply runs here, under the instance guard staged apply borrows: the downloads and
+        // checks behind it already ran on the worker pool, and what is left is renames, the hash
+        // of each file being replaced, and content-store links.
         let mut moved_aside = Vec::new();
-        let apply_store = content_store.clone();
-        let apply_result = run_blocking_phase(scheduler, "install transaction apply", move || {
-            apply_transaction(
-                &apply_plan,
-                &apply_dir,
-                &apply_staging,
-                apply_store.as_ref(),
-            )
-        })
-        .await
+        let apply_result = apply_transaction(
+            guard,
+            plan,
+            instance_dir,
+            &staging_dir,
+            content_store.as_ref(),
+        )
         .map(|moved| {
             moved_aside = moved;
         });
@@ -3944,35 +3942,36 @@ fn prepare_manifest(
     Ok(())
 }
 
-#[derive(Default)]
-struct ApplyJournal {
-    removed: Vec<(std::path::PathBuf, std::path::PathBuf)>,
-    disabled: Vec<(std::path::PathBuf, std::path::PathBuf)>,
-    enabled: Vec<(std::path::PathBuf, std::path::PathBuf)>,
-    added: Vec<(std::path::PathBuf, std::path::PathBuf)>,
-    /// Files placed from a stored object; rollback deletes the name it created.
-    placed: Vec<std::path::PathBuf>,
-    /// Files the user changed, kept in Agora's moved-aside folder and put back on rollback.
-    moved_aside: Vec<(std::path::PathBuf, std::path::PathBuf)>,
-}
-
+/// Apply a staged plan through staged apply (MASTER_SPEC §32.4): every removal, disable, enable,
+/// added file and the new manifest are staged first, then made in one journaled commit. A crash
+/// leaves the old instance or the new one after recovery, never a mix; a file the user changed is
+/// kept in `.agora/moved-aside/` and returned here, never deleted.
 fn apply_transaction(
+    guard: &InstanceGuard,
     plan: &ResolvedInstallPlan,
     instance_dir: &Path,
     staging_dir: &Path,
     content_store: Option<&Ctx>,
 ) -> Result<Vec<std::path::PathBuf>, String> {
+    apply_transaction_crashing(guard, plan, instance_dir, staging_dir, content_store, None)
+}
+
+/// [`apply_transaction`], with the commit stopped at `crash` as a crash would stop it (test seam:
+/// production passes `None`).
+fn apply_transaction_crashing(
+    guard: &InstanceGuard,
+    plan: &ResolvedInstallPlan,
+    instance_dir: &Path,
+    staging_dir: &Path,
+    content_store: Option<&Ctx>,
+    crash: Option<staged_apply::Boundary>,
+) -> Result<Vec<std::path::PathBuf>, String> {
     let manifest_path = instance_dir.join("instance_manifest.json");
-    let original_text = std::fs::read_to_string(&manifest_path)
-        .map_err(|e| format!("failed to read current manifest during apply: {e}"))?;
     let manifest = agora_core::helpers::read_manifest(&manifest_path)
         .map_err(|e| format!("failed to parse current manifest during apply: {e}"))?;
     if manifest.is_read_only() {
         return Err("instance manifest is read-only: written by a newer Agora".into());
     }
-    let manifest_backup = staging_dir.join("instance_manifest.original.json");
-    std::fs::write(&manifest_backup, original_text.as_bytes())
-        .map_err(|e| format!("failed to back up current manifest: {e}"))?;
 
     // Which staged additions already have a stored object: the prepared manifest records the
     // object each new entry was placed from.
@@ -3998,10 +3997,29 @@ fn apply_transaction(
         BTreeMap::new()
     };
 
-    let mut moved_aside = Vec::new();
-    let mut journal = ApplyJournal::default();
-    let result = (|| -> Result<(), String> {
-        let trash_dir = staging_dir.join("trash");
+    let relative = |path: &Path| -> Result<agora_game_api::StrictRelPath, String> {
+        let inside = path
+            .strip_prefix(instance_dir)
+            .map_err(|_| format!("path escaped instance: {}", path.display()))?;
+        let spelling = inside
+            .to_str()
+            .ok_or_else(|| format!("{} has a name Agora cannot write", path.display()))?
+            .replace('\\', "/");
+        agora_game_api::RelPath::strict(spelling).map_err(|error| error.to_string())
+    };
+
+    let mut stage = Stage::begin(guard, instance_dir).map_err(|error| error.to_string())?;
+    let staged = (|| -> Result<(), String> {
+        if content_store.is_some() {
+            // A link to a protected object can only be moved out of, or deleted from, a folder
+            // that grants delete-child: the stage keeps the old links until the cleanup.
+            crate::content_bridge::ensure_folder_can_delete_children(stage.dir()).map_err(
+                |error| format!("could not make the staging area safe to clean: {error}"),
+            )?;
+        }
+        // A removal and an addition at the same path (an update that keeps the file name) are one
+        // replacement: the removal's judgement of whose file it is carries over to it.
+        let mut removals: Vec<(agora_game_api::StrictRelPath, Expect, String)> = Vec::new();
         for remove in &plan.files_to_remove {
             let live = locate_live_file(
                 instance_dir,
@@ -4012,63 +4030,24 @@ fn apply_transaction(
             if !live.exists() {
                 continue;
             }
-            let relative = live
-                .strip_prefix(instance_dir)
-                .map_err(|_| format!("removal path escaped instance: {}", live.display()))?;
-            // A file the user changed is theirs, not Agora's: keep it, out of the way, and say
-            // where. Only a file whose bytes still match the manifest is removed.
-            if content_store.is_some() {
-                if let Some(entry) =
-                    manifest_entry_for(&manifest, &remove.filename, remove.content_type.as_deref())
-                {
-                    // Entries written before the store carry the object hash in `sha256`; with
-                    // neither hash there is no way to prove the file is Agora's, so it is the
-                    // user's.
-                    let recorded = entry
-                        .object_sha256
-                        .as_deref()
-                        .filter(|hash| !hash.is_empty())
-                        .or_else(|| {
-                            let hash = entry.sha256.as_str();
-                            (!hash.is_empty()).then_some(hash)
-                        });
-                    let users_file = match recorded {
-                        Some(recorded) => {
-                            !crate::content_bridge::file_matches_recorded(&live, recorded)
-                                .map_err(|error| error.to_string())?
-                        }
-                        None => true,
-                    };
-                    if users_file {
-                        let aside = moved_aside_path(instance_dir, relative);
-                        if let Some(parent) = aside.parent() {
-                            std::fs::create_dir_all(parent).map_err(|e| {
-                                format!("failed to create the moved-aside folder: {e}")
-                            })?;
-                        }
-                        std::fs::rename(&live, &aside).map_err(|e| {
-                            format!("failed to move your changed {} aside: {e}", remove.filename)
-                        })?;
-                        journal.moved_aside.push((aside.clone(), live));
-                        moved_aside.push(aside);
-                        continue;
-                    }
-                }
-            }
-            let backup = trash_dir.join(relative);
-            if let Some(parent) = backup.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("failed to create transaction trash: {e}"))?;
-                // A link to a protected object cannot be deleted from a folder that only grants
-                // Modify. The trash is outside the folder the placement granted, so grant it here
-                // before the old file moves in; the same right is needed to rename it back.
-                crate::content_bridge::ensure_folder_can_delete_children(parent).map_err(
-                    |error| format!("could not make the transaction trash safe to clean: {error}"),
-                )?;
-            }
-            std::fs::rename(&live, &backup)
-                .map_err(|e| format!("failed to stage removal of {}: {e}", remove.filename))?;
-            journal.removed.push((backup, live));
+            // A file is Agora's only while its bytes still match what the manifest recorded
+            // (entries written before the store carry it in `sha256`). Anything else is the
+            // user's: staged apply keeps it aside instead of removing it.
+            let expect =
+                manifest_entry_for(&manifest, &remove.filename, remove.content_type.as_deref())
+                    .and_then(|entry| {
+                        entry
+                            .object_sha256
+                            .as_deref()
+                            .filter(|hash| !hash.trim().is_empty())
+                            .or_else(|| {
+                                let hash = entry.sha256.as_str();
+                                (!hash.trim().is_empty()).then_some(hash)
+                            })
+                            .map(|hash| Expect::Agora(hash.to_string()))
+                    })
+                    .unwrap_or(Expect::Unknown);
+            removals.push((relative(&live)?, expect, remove.filename.clone()));
         }
 
         for disable in &plan.files_to_disable {
@@ -4091,9 +4070,9 @@ fn apply_transaction(
                     disabled.display()
                 ));
             }
-            std::fs::rename(&live, &disabled)
+            stage
+                .rename(&relative(&live)?, &relative(&disabled)?)
                 .map_err(|e| format!("failed to disable {}: {e}", disable.filename))?;
-            journal.disabled.push((disabled, live));
         }
 
         for enable in &plan.files_to_enable {
@@ -4111,9 +4090,9 @@ fn apply_transaction(
                 ));
             }
             check_test_failpoint("enable-rename")?;
-            std::fs::rename(&disabled, &live)
+            stage
+                .rename(&relative(&disabled)?, &relative(&live)?)
                 .map_err(|e| format!("failed to enable {}: {e}", enable.filename))?;
-            journal.enabled.push((live, disabled));
         }
 
         for add in &plan.files_to_add {
@@ -4126,35 +4105,46 @@ fn apply_transaction(
             }
             let subdir = content_subdir(&artifact_metadata(&add.artifact).content_type);
             let live = instance_dir.join(subdir).join(&add.target_filename);
-            if live.exists() {
-                return Err(format!("target file already exists: {}", live.display()));
-            }
+            let path = relative(&live)?;
+            let replaces = removals
+                .iter()
+                .position(|(removed, _, _)| removed.as_str().eq_ignore_ascii_case(path.as_str()));
+            let expect = match replaces {
+                Some(index) => removals.remove(index).1,
+                None if live.exists() => {
+                    return Err(format!("target file already exists: {}", live.display()))
+                }
+                None => Expect::Absent,
+            };
             if let Some(parent) = live.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("failed to create content directory: {e}"))?;
+                if content_store.is_some() {
+                    // The same right, where a placed link may have to be moved back from.
+                    crate::content_bridge::ensure_folder_can_delete_children(parent).map_err(
+                        |error| {
+                            format!("could not make {} safe to clean: {error}", parent.display())
+                        },
+                    )?;
+                }
             }
             check_test_failpoint("artifact-rename")?;
             let target_key = format!("{subdir}/{}", add.target_filename);
             match (content_store, placed_targets.get(&target_key)) {
-                (Some(ctx), Some(sha256)) => {
-                    let content_type =
-                        normalized_content_type(&artifact_metadata(&add.artifact).content_type);
-                    crate::content_bridge::place_file(
-                        ctx,
-                        sha256,
-                        instance_dir,
-                        content_type,
-                        &add.target_filename,
-                    )
-                    .map_err(|e| format!("failed to place {}: {e}", add.target_filename))?;
-                    journal.placed.push(live);
-                }
-                _ => {
-                    std::fs::rename(&staged, &live)
-                        .map_err(|e| format!("failed to promote {}: {e}", add.target_filename))?;
-                    journal.added.push((live, staged));
-                }
+                (Some(ctx), Some(sha256)) => stage
+                    .write_with(&path, expect, |at| {
+                        crate::content_bridge::place_file_at(ctx, sha256, at).map(|_| ())
+                    })
+                    .map_err(|e| format!("failed to place {}: {e}", add.target_filename))?,
+                _ => stage
+                    .write_moving(&path, &staged, expect)
+                    .map_err(|e| format!("failed to promote {}: {e}", add.target_filename))?,
             }
+        }
+        for (path, expect, filename) in removals {
+            stage
+                .remove(&path, expect)
+                .map_err(|e| format!("failed to stage removal of {filename}: {e}"))?;
         }
 
         let prepared = staging_dir.join("instance_manifest.next.json");
@@ -4163,43 +4153,38 @@ fn apply_transaction(
         }
         check_test_failpoint("manifest-rename")?;
         let next = agora_core::helpers::read_manifest(&prepared).map_err(|e| e.to_string())?;
-        agora_core::helpers::atomic_write_manifest(&manifest_path, &next)
+        stage
+            .write_manifest(&next)
             .map_err(|e| format!("failed to commit instance manifest: {e}"))?;
         Ok(())
     })();
-
-    if let Err(error) = result {
-        let rollback = rollback_apply(&journal, &manifest_path, &manifest_backup);
-        return match rollback {
-            Ok(()) => Err(format!("{error}; pre-commit file moves were reversed")),
-            Err(rollback_error) => Err(format!("{error}; fast rollback failed: {rollback_error}")),
-        };
+    if let Err(error) = staged {
+        // Nothing in the instance changed yet: dropping the stage removes it.
+        drop(stage);
+        return Err(format!("{error}; pre-commit file moves were reversed"));
     }
+    #[cfg(test)]
+    if let Some(boundary) = crash {
+        stage.crash_at(boundary);
+    }
+    #[cfg(not(test))]
+    let _ = crash;
+    let report = stage.commit().map_err(|error| {
+        let message = error.to_string();
+        if message.contains("did not finish") {
+            format!("{message}; fast rollback failed")
+        } else {
+            format!("{message}; pre-commit file moves were reversed")
+        }
+    })?;
     // Tracked content changed; the next launch must not reuse a pre-install
     // recovery snapshot from before the apply.
     let _ = agora_core::snapshot::mark_instance_mutated(instance_dir);
-    Ok(moved_aside)
-}
-
-/// Where a changed file is kept when Agora must not delete it: an Agora-owned folder inside the
-/// instance, beside the staging area.
-fn moved_aside_path(instance_dir: &Path, relative: &Path) -> std::path::PathBuf {
-    let base = instance_dir.join(".agora").join("moved-aside");
-    let mut candidate = base.join(relative);
-    let mut counter = 1;
-    while candidate.exists() {
-        let name = format!(
-            "{}.{}",
-            relative
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file"),
-            counter
-        );
-        candidate = base.join(relative).with_file_name(name);
-        counter += 1;
-    }
-    candidate
+    Ok(report
+        .kept_aside
+        .into_iter()
+        .map(|kept| kept.kept_at)
+        .collect())
 }
 
 /// The manifest entry a removal names, if there is one.
@@ -4227,75 +4212,6 @@ fn moved_aside_warnings(moved: &[std::path::PathBuf]) -> Vec<PlanWarning> {
             ),
         })
         .collect()
-}
-
-fn rollback_apply(
-    journal: &ApplyJournal,
-    manifest_path: &Path,
-    manifest_backup: &Path,
-) -> Result<(), String> {
-    let mut errors = Vec::new();
-    for live in journal.placed.iter().rev() {
-        if live.exists() {
-            if let Err(error) = std::fs::remove_file(live) {
-                errors.push(format!("placed {}: {error}", live.display()));
-            }
-        }
-    }
-    for (aside, original) in journal.moved_aside.iter().rev() {
-        if aside.exists() && !original.exists() {
-            if let Some(parent) = original.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Err(error) = std::fs::rename(aside, original) {
-                errors.push(format!("moved-aside {}: {error}", original.display()));
-            }
-        }
-    }
-    for (live, staged) in journal.added.iter().rev() {
-        if live.exists() {
-            if let Some(parent) = staged.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Err(error) = std::fs::rename(live, staged) {
-                errors.push(format!("added {}: {error}", live.display()));
-            }
-        }
-    }
-    for (live, disabled) in journal.enabled.iter().rev() {
-        if live.exists() && !disabled.exists() {
-            if let Err(error) = std::fs::rename(live, disabled) {
-                errors.push(format!("enabled {}: {error}", live.display()));
-            }
-        }
-    }
-    for (disabled, original) in journal.disabled.iter().rev() {
-        if disabled.exists() && !original.exists() {
-            if let Err(error) = std::fs::rename(disabled, original) {
-                errors.push(format!("disabled {}: {error}", original.display()));
-            }
-        }
-    }
-    for (backup, original) in journal.removed.iter().rev() {
-        if backup.exists() && !original.exists() {
-            if let Some(parent) = original.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Err(error) = std::fs::rename(backup, original) {
-                errors.push(format!("removed {}: {error}", original.display()));
-            }
-        }
-    }
-    if !manifest_path.is_file() && manifest_backup.is_file() {
-        if let Err(error) = std::fs::copy(manifest_backup, manifest_path) {
-            errors.push(format!("manifest: {error}"));
-        }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
-    }
 }
 
 fn locate_live_file(
@@ -4962,8 +4878,18 @@ mod tests {
         }
     }
 
-    /// Stages the planned file and runs the same manifest-prepare and apply
-    /// steps the pipeline runs, so the test sees what is left on disk.
+    /// The instance guard staged apply needs, for an instance folder a test made by hand.
+    fn test_guard(instance_dir: &Path) -> InstanceGuard {
+        let root = instance_dir.parent().unwrap().to_path_buf();
+        let ctx = Ctx::for_testing(root);
+        let id = instance_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        InstanceGuard::for_mutation_while_running(&ctx, &id, "test apply").unwrap()
+    }
+
     /// The manifest an apply left on disk, as the flat JSON the planner's tests inspect. The disk
     /// layout is the package's own, so it is read through the manifest loader.
     fn manifest_as_json(instance_dir: &Path) -> serde_json::Value {
@@ -4973,13 +4899,22 @@ mod tests {
         serde_json::to_value(&manifest).unwrap()
     }
 
+    /// Stages the planned file and runs the same manifest-prepare and apply
+    /// steps the pipeline runs, so the test sees what is left on disk.
     fn apply_planned_file(instance_dir: &Path, plan: &ResolvedInstallPlan, bytes: &[u8]) {
         let staging = instance_dir.parent().unwrap().join("staging");
         std::fs::create_dir_all(staging.join("artifacts")).unwrap();
         let staged_name = &plan.files_to_add[0].staging_filename;
         std::fs::write(staging.join("artifacts").join(staged_name), bytes).unwrap();
         prepare_manifest(plan, instance_dir, &staging, None).unwrap();
-        apply_transaction(plan, instance_dir, &staging, None).unwrap();
+        apply_transaction(
+            &test_guard(instance_dir),
+            plan,
+            instance_dir,
+            &staging,
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -5142,7 +5077,14 @@ mod tests {
             .unwrap();
         }
         prepare_manifest(plan, instance_dir, &staging, None).unwrap();
-        apply_transaction(plan, instance_dir, &staging, None).unwrap();
+        apply_transaction(
+            &test_guard(instance_dir),
+            plan,
+            instance_dir,
+            &staging,
+            None,
+        )
+        .unwrap();
     }
 
     /// Applies a plan that only turns files on, the way the pipeline does:
@@ -5151,7 +5093,14 @@ mod tests {
         let staging = instance_dir.parent().unwrap().join("staging");
         std::fs::create_dir_all(staging.join("artifacts")).unwrap();
         prepare_manifest(plan, instance_dir, &staging, None).unwrap();
-        apply_transaction(plan, instance_dir, &staging, None).unwrap();
+        apply_transaction(
+            &test_guard(instance_dir),
+            plan,
+            instance_dir,
+            &staging,
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -5273,7 +5222,13 @@ mod tests {
         }
         prepare_manifest(&plan, &instance_dir, &staging, None).unwrap();
         set_install_failpoint(Some("manifest-rename"));
-        let result = apply_transaction(&plan, &instance_dir, &staging, None);
+        let result = apply_transaction(
+            &test_guard(&instance_dir),
+            &plan,
+            &instance_dir,
+            &staging,
+            None,
+        );
         set_install_failpoint(None);
 
         assert!(result.is_err(), "the injected failure must surface");
@@ -5282,6 +5237,89 @@ mod tests {
             "rollback puts the copy back as it was"
         );
         assert!(!mods.join("fabric-api.jar").exists());
+    }
+
+    /// A real install's apply cut off by a crash, settled by the startup pass every adapter runs:
+    /// before the commit point the instance is exactly what it was, after it the install stands.
+    #[test]
+    fn an_install_cut_off_by_a_crash_is_settled_by_the_startup_pass() {
+        use staged_apply::Boundary;
+        for (boundary, committed) in [
+            (Boundary::AfterMove(1), false),
+            (Boundary::AfterMove(2), false),
+            (Boundary::AfterCommit, true),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let made = make_instance(&tmp);
+            let ctx = Ctx::for_testing(tmp.path().join("app"));
+            let instance_dir = ctx.paths.instance_dir("test").unwrap();
+            std::fs::create_dir_all(instance_dir.parent().unwrap()).unwrap();
+            std::fs::rename(&made, &instance_dir).unwrap();
+            write_matching_fabric_api_entry(&instance_dir, false);
+            let mods = instance_dir.join("mods");
+            std::fs::write(mods.join("fabric-api.jar.disabled"), REINSTALL_BYTES).unwrap();
+            let plan = dependency_plan_for_fabric_api(&instance_dir);
+            let staging = tmp.path().join("staging");
+            std::fs::create_dir_all(staging.join("artifacts")).unwrap();
+            for add in &plan.files_to_add {
+                std::fs::write(
+                    staging.join("artifacts").join(&add.staging_filename),
+                    b"sodium bytes",
+                )
+                .unwrap();
+            }
+            prepare_manifest(&plan, &instance_dir, &staging, None).unwrap();
+            let manifest_before =
+                std::fs::read(instance_dir.join("instance_manifest.json")).unwrap();
+            {
+                let guard = InstanceGuard::for_mutation_while_running(&ctx, "test", "test install")
+                    .unwrap();
+                let result = apply_transaction_crashing(
+                    &guard,
+                    &plan,
+                    &instance_dir,
+                    &staging,
+                    None,
+                    Some(boundary),
+                );
+                assert!(result.is_err(), "{boundary:?}: the crash stops the apply");
+            }
+
+            let report = agora_core::startup_recovery::run_at_startup(&ctx);
+
+            assert!(
+                report.actions.iter().any(|line| line.contains("'test'")),
+                "{boundary:?}: {report:?}"
+            );
+            let manifest_after =
+                std::fs::read(instance_dir.join("instance_manifest.json")).unwrap();
+            if committed {
+                assert!(mods.join("fabric-api.jar").is_file(), "{boundary:?}");
+                assert!(
+                    !mods.join("fabric-api.jar.disabled").exists(),
+                    "{boundary:?}"
+                );
+                assert_ne!(manifest_after, manifest_before, "{boundary:?}");
+            } else {
+                assert!(
+                    mods.join("fabric-api.jar.disabled").is_file(),
+                    "{boundary:?}"
+                );
+                assert!(!mods.join("fabric-api.jar").exists(), "{boundary:?}");
+                assert_eq!(
+                    manifest_after, manifest_before,
+                    "{boundary:?}: the manifest is untouched"
+                );
+                for add in &plan.files_to_add {
+                    assert!(!mods.join(&add.target_filename).exists(), "{boundary:?}");
+                }
+            }
+            let stage = staged_apply::stage_root(&instance_dir);
+            assert!(
+                !stage.exists() || std::fs::read_dir(&stage).unwrap().next().is_none(),
+                "{boundary:?}: nothing is left in the stage"
+            );
+        }
     }
 
     #[test]
