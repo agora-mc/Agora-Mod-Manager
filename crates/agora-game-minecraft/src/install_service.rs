@@ -826,19 +826,27 @@ impl InstallService {
             // The recorded file is gone. Never search another folder for the same name.
             return Ok(false);
         }
-        if !crate::content_bridge::file_matches_recorded(&live, &entry.sha256)? {
+        let recorded = crate::content_bridge::recorded_sha256(&entry).map(str::to_string);
+        let matches = match recorded.as_deref() {
+            Some(recorded) => crate::content_bridge::file_matches_recorded(&live, recorded)?,
+            None => false,
+        };
+        let (true, Some(recorded)) = (matches, recorded) else {
             return Err(LauncherError::Generic {
                 code: "ERR_FILE_CHANGED".into(),
                 message: format!(
                     "'{filename}' was changed outside Agora, so it was left in place. Move it away, then remove it again."
                 ),
             });
-        }
+        };
         agora_core::helpers::remove_from_content_array(&mut manifest, &entry.filename);
         let path =
             crate::content_bridge::content_path(&entry.content_type, &effective_filename(&entry))?;
-        crate::content_bridge::staged_change(&guard, &dir, &[], |stage| {
-            stage.remove(&path, ac::staged_apply::Expect::Agora(entry.sha256.clone()))?;
+        // The folder the install placed it in gets the same right the install gave it, so a placed
+        // link can be moved out of it (and back, if the removal is rolled back).
+        let folder = dir.join(agora_core::helpers::content_subdir(&entry.content_type));
+        crate::content_bridge::staged_change(&guard, &dir, &[&folder], |stage| {
+            stage.remove(&path, ac::staged_apply::Expect::Agora(recorded))?;
             stage.write_manifest(&manifest)
         })
         .map_err(|error| LauncherError::Generic {
@@ -1060,15 +1068,20 @@ fn expect_for_install(
             ),
         });
     };
-    if !crate::content_bridge::file_matches_recorded(target, &entry.sha256)? {
-        return Err(LauncherError::Generic {
+    let recorded = crate::content_bridge::recorded_sha256(entry);
+    let matches = match recorded {
+        Some(recorded) => crate::content_bridge::file_matches_recorded(target, recorded)?,
+        None => false,
+    };
+    match (matches, recorded) {
+        (true, Some(recorded)) => Ok(ac::staged_apply::Expect::Agora(recorded.to_string())),
+        _ => Err(LauncherError::Generic {
             code: "ERR_FILE_CHANGED".into(),
             message: format!(
                 "'{filename}' was changed outside Agora, so it was left alone. Move it away, then install again."
             ),
-        });
+        }),
     }
-    Ok(ac::staged_apply::Expect::Agora(entry.sha256.clone()))
 }
 
 fn all_installed(manifest: &InstanceManifest) -> impl Iterator<Item = &InstalledMod> {

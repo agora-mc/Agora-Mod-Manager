@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn a_digest_parses_trimmed_and_lowercased() {
-        let upper = format!("  {}	", "AB".repeat(32));
+        let upper = format!("  {}\t", "AB".repeat(32));
         let parsed = Sha256::parse("a.jar", "pack hash", &upper).expect("well formed");
         assert_eq!(parsed.as_str(), "ab".repeat(32));
         assert_eq!(
@@ -295,10 +295,7 @@ mod tests {
 
     #[test]
     fn a_blank_digest_is_an_error_never_none_published() {
-        for blank in [
-            "", " ", "	
-",
-        ] {
+        for blank in ["", " ", "\t\n"] {
             for error in [
                 Sha1::parse("a.jar", "published SHA-1", blank).unwrap_err(),
                 Sha256::parse("a.jar", "published SHA-256", blank).unwrap_err(),

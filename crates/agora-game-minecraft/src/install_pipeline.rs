@@ -4081,14 +4081,7 @@ fn apply_transaction_crashing(
             let expect =
                 manifest_entry_for(&manifest, &remove.filename, remove.content_type.as_deref())
                     .and_then(|entry| {
-                        entry
-                            .object_sha256
-                            .as_deref()
-                            .filter(|hash| !hash.trim().is_empty())
-                            .or_else(|| {
-                                let hash = entry.sha256.as_str();
-                                (!hash.trim().is_empty()).then_some(hash)
-                            })
+                        crate::content_bridge::recorded_sha256(entry)
                             .map(|hash| Expect::Agora(hash.to_string()))
                     })
                     .unwrap_or(Expect::Unknown);

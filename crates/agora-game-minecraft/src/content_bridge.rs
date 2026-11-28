@@ -483,6 +483,17 @@ pub fn place_file_at(ctx: &Ctx, sha256: &str, target: &Path) -> LauncherResult<s
     store::place_object_at(ctx, sha256, target, mode).map_err(content_error)
 }
 
+/// The SHA-256 the manifest recorded for the file Agora placed: its stored object's, or (for an
+/// entry written before the content store) its own. `None` when neither is recorded, which means
+/// Agora cannot say the file is its own.
+pub(crate) fn recorded_sha256(entry: &agora_core::models::InstalledMod) -> Option<&str> {
+    entry
+        .object_sha256
+        .as_deref()
+        .filter(|hash| !hash.trim().is_empty())
+        .or_else(|| Some(entry.sha256.as_str()).filter(|hash| !hash.trim().is_empty()))
+}
+
 /// Whether the file on disk still holds the bytes the manifest recorded. A file that does not
 /// match is the user's, not Agora's, and must never be deleted.
 pub fn file_matches_recorded(path: &Path, recorded_sha256: &str) -> LauncherResult<bool> {
