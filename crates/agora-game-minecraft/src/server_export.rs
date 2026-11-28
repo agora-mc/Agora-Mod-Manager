@@ -2225,7 +2225,7 @@ side = "CLIENT"
             agora_core::db::set_setting(&conn, "network_loader_enabled", &serde_json::json!(false))
                 .unwrap();
         }
-        agora_core::network_gate::install(std::sync::Arc::new(
+        let _gate = agora_core::network_gate::install_for_test(std::sync::Arc::new(
             agora_core::network_gate::SettingsGate::new(ctx.paths.local_state_db()),
         ));
 
@@ -2278,7 +2278,7 @@ side = "CLIENT"
             )
             .unwrap();
         }
-        agora_core::network_gate::install(std::sync::Arc::new(
+        let _gate = agora_core::network_gate::install_for_test(std::sync::Arc::new(
             agora_core::network_gate::SettingsGate::new(ctx.paths.local_state_db()),
         ));
 

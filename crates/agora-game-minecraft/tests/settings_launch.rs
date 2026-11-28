@@ -132,11 +132,12 @@ fn proxy_worker(
     }
 }
 
-fn context(root: &Path) -> Ctx {
+/// A context whose settings the process-wide gate reads, held for the test's whole run.
+fn context(root: &Path) -> (Ctx, network_gate::TestGate) {
     let ctx = Ctx::for_testing(root.to_owned());
     db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
-    network_gate::install(Arc::new(SettingsGate::for_context(&ctx)));
-    ctx
+    let gate = network_gate::install_for_test(Arc::new(SettingsGate::for_context(&ctx)));
+    (ctx, gate)
 }
 
 fn plan(ctx: &Ctx) -> ResolvedLaunchPlan {
@@ -189,7 +190,7 @@ fn plan(ctx: &Ctx) -> ResolvedLaunchPlan {
 
 async fn exercise_materialization(redirect: bool) {
     let root = tempfile::tempdir().unwrap();
-    let ctx = context(root.path());
+    let (ctx, _gate) = context(root.path());
     let plan = plan(&ctx);
     let cache = plan.cache_dir.clone();
     let db_path = ctx.paths.local_state_db();
@@ -268,7 +269,7 @@ fn c3_fix_launch_lockdown_before_location_refuses_the_redirect() {
 fn assert_installer_refused(loader: &str) {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let root = tempfile::tempdir().unwrap();
-    let ctx = context(root.path());
+    let (ctx, _gate) = context(root.path());
     let executable = fake_java(root.path());
     let started = root.path().join("installer-started");
     let archive = root.path().join("fixture.jar");

@@ -193,6 +193,41 @@ pub fn install(gate: SharedGate) {
     }
 }
 
+/// A test's hold on the process-wide gate: while it lives, no other test that installs a gate
+/// through [`install_for_test`] runs, and dropping it puts back the gate it found.
+#[doc(hidden)]
+pub struct TestGate {
+    previous: Option<SharedGate>,
+    _exclusive: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for TestGate {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = slot().write() {
+            *slot = self.previous.take();
+        }
+    }
+}
+
+/// **Tests only.** Install `gate` process-wide for the life of the returned guard. The gate is one
+/// slot per process and `cargo test` runs a crate's tests as threads of one process, so every test
+/// that installs a gate must hold this for its whole run: a bare [`install`] in one test changes
+/// what another test's requests are allowed to do (a Lockdown test once downloaded a real runtime
+/// this way).
+#[doc(hidden)]
+pub fn install_for_test(gate: SharedGate) -> TestGate {
+    static EXCLUSIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A test that panicked while holding it left the gate restored by its guard's drop.
+    let exclusive = EXCLUSIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous = slot().write().ok().and_then(|mut slot| slot.replace(gate));
+    TestGate {
+        previous,
+        _exclusive: exclusive,
+    }
+}
+
 /// The installed gate, or a denying one if no adapter installed anything.
 pub fn current() -> SharedGate {
     match slot().read() {
@@ -210,6 +245,18 @@ pub fn authorize(category: ClientCategory) -> LauncherResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_test_that_fails_holding_the_gate_does_not_block_the_next_one() {
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = install_for_test(Arc::new(AllowAll));
+            assert!(authorize(ClientCategory::GitHub).is_ok());
+            panic!("a test failing while it holds the gate");
+        }));
+        assert!(failed.is_err());
+        let _next = install_for_test(Arc::new(DenyAll));
+        assert!(authorize(ClientCategory::GitHub).is_err());
+    }
 
     #[test]
     fn nothing_installed_denies() {

@@ -133,7 +133,7 @@ mod tests {
     use crate::runtime_catalog::{RuntimeCatalog, RuntimeCatalogEntry};
     use crate::runtime_manager::{managed_entry_path, NoopProgress, RuntimeReceipt};
     use agora_core::network::NetworkPolicy;
-    use agora_core::network_gate::{install, SettingsGate};
+    use agora_core::network_gate::{install_for_test, SettingsGate, TestGate};
     use serde_json::json;
     use std::sync::Arc;
 
@@ -166,9 +166,10 @@ mod tests {
         .unwrap();
     }
 
-    /// The worker inspect mock and the outbound gate are process-wide, and each guard restores
-    /// what it found: two of these tests overlapping under `cargo test` would leave the later one
-    /// with no mock (it then tries to download its runtime). Held for each test's whole run.
+    /// The worker inspect mock is process-wide, and its guard restores what it found: two of these
+    /// tests overlapping under `cargo test` would leave the later one with no mock (it then tries
+    /// to download its runtime). Held for each test's whole run. The outbound gate is held the
+    /// same way, by every test that installs one ([`install_for_test`]).
     static PROCESS_STATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn mocked_inspect() -> crate::java::WorkerMockInspectGuard {
@@ -183,20 +184,20 @@ mod tests {
         }))
     }
 
-    fn locked_down_context() -> (tempfile::TempDir, Ctx) {
+    fn locked_down_context() -> (tempfile::TempDir, Ctx, TestGate) {
         let root = tempfile::tempdir().unwrap();
         let ctx = crate::testing_context(root.path().to_owned());
         db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
         let conn = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
         db::set_setting(&conn, "network_lockdown_enabled", &json!(true)).unwrap();
-        install(Arc::new(SettingsGate::for_context(&ctx)));
-        (root, ctx)
+        let gate = install_for_test(Arc::new(SettingsGate::for_context(&ctx)));
+        (root, ctx, gate)
     }
 
     #[tokio::test]
     async fn c4_lockdown_lets_a_runtime_that_is_already_installed_through() {
         let _serial = PROCESS_STATE.lock().await;
-        let (_root, ctx) = locked_down_context();
+        let (_root, ctx, _gate) = locked_down_context();
         let _inspect = mocked_inspect();
         let entry = catalog_entry();
         install_stand_in_runtime(&ctx, &entry);
@@ -215,7 +216,7 @@ mod tests {
     #[tokio::test]
     async fn c4_lockdown_refuses_a_runtime_it_would_have_to_download() {
         let _serial = PROCESS_STATE.lock().await;
-        let (_root, ctx) = locked_down_context();
+        let (_root, ctx, _gate) = locked_down_context();
         let _inspect = mocked_inspect();
         let _entry = catalog_entry();
 

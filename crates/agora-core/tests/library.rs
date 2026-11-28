@@ -306,7 +306,7 @@ fn the_library_makes_no_network_request() {
     });
     // The context's own clients ask the context's gate (MASTER_SPEC 32.9), and clients built
     // without a context ask the process-wide one: count both.
-    network_gate::install(Arc::clone(&gate));
+    let _gate = network_gate::install_for_test(Arc::clone(&gate));
     let ctx = ctx.with_network_gate(gate);
 
     let listing = library::list(&ctx).unwrap();

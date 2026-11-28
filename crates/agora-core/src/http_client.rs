@@ -2578,7 +2578,7 @@ mod transport_failure_tests {
     async fn request_through_a_dead_proxy_reports_no_internet_not_a_url_error() {
         // Policy is the subject under test here, so the process gate is the
         // permissive test gate, as in `Ctx::for_testing`.
-        crate::network_gate::install(Arc::new(crate::network_gate::AllowAll));
+        let _gate = crate::network_gate::install_for_test(Arc::new(crate::network_gate::AllowAll));
         let proxy = reqwest::Proxy::all(format!("http://127.0.0.1:{}", closed_local_port()))
             .expect("proxy url");
         let client = reqwest::Client::builder()

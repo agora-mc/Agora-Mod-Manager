@@ -29,7 +29,7 @@ fn a_blocking_request_goes_through_the_configured_proxy() {
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
 
-    network_gate::install(Arc::new(network_gate::AllowAll));
+    let _gate = network_gate::install_for_test(Arc::new(network_gate::AllowAll));
     http_client::configure_proxy(ProxySetting::Manual {
         url: format!("http://127.0.0.1:{port}"),
         username: None,
