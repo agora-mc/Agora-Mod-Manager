@@ -5701,8 +5701,13 @@ mid-install leaves a half-installed instance), a second `ApplyJournal` in `versi
 `install_artifact_pinned` takes 14 positional arguments, five of them optional hash strings (2 public
 callers, 6 internal).
 - **`InstallRequest { instance, target, source: InstallSource, hashes: ExpectedHashes, policy }`.**
-  `InstallSource` is an enum (registry entry, Modrinth version, CurseForge file, direct URL, local
-  file, pack entry); provenance comes from the variant, and the stored string is derived from it.
+  `InstallSource` is an enum of where a single installed file came from, for its later updates:
+  `Catalog` (any catalog entry, whatever its download type; the type is recorded beside it as
+  `source_strategy`) and `Modrinth` (a project outside the catalog), the two that reach this
+  install today. A pack entry is a catalog entry. Others (a pasted link, a local file) are added
+  with the flows that make them (owner, 2026-11-28); provenance comes from the variant, and the
+  stored string is derived from it. One typed provenance for every writer, with "local" for files
+  matched to nothing, is part of C2.
 - **Digests are types** (`Sha1`, `Sha256`, `Sha512`) parsed at the edge: a malformed, empty or
   whitespace-only digest is an error, never "none published". Supplied digests are validated before
   any download.
