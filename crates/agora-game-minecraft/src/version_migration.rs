@@ -840,21 +840,27 @@ pub async fn execute_migration(
             return failed("apply", format!("local state failed: {error}"));
         }
     };
-    let mut stage = match Stage::begin_with_receipts(&guard, &instance_dir, &conn) {
+    // The staging and the commit are blocking file work under the guard the stage borrows: the
+    // runtime's worker hands its other tasks off first.
+    let mut stage = match crate::install_pipeline::blocking_in_place(|| {
+        Stage::begin_with_receipts(&guard, &instance_dir, &conn)
+    }) {
         Ok(stage) => stage,
         Err(error) => {
             let _ = std::fs::remove_dir_all(&staging_dir);
             return failed("apply", error.to_string());
         }
     };
-    if let Err(error) = stage_migration(
-        plan,
-        ctx,
-        &mut stage,
-        &instance_dir,
-        &staging_dir,
-        &stored_artifacts,
-    ) {
+    if let Err(error) = crate::install_pipeline::blocking_in_place(|| {
+        stage_migration(
+            plan,
+            ctx,
+            &mut stage,
+            &instance_dir,
+            &staging_dir,
+            &stored_artifacts,
+        )
+    }) {
         // Nothing in the instance changed yet: dropping the stage removes it.
         drop(stage);
         let _ = std::fs::remove_dir_all(&staging_dir);
@@ -870,23 +876,25 @@ pub async fn execute_migration(
         stage.crash_at(boundary);
     }
     let row_failed = std::cell::Cell::new(false);
-    let committed = stage.commit_with_receipt(&mut conn, |tx| {
-        update_migration_row(
-            tx,
-            &instance_id,
-            &plan.loader,
-            &plan.source_version,
-            &plan.source_loader_version,
-            &plan.target_version,
-            &new_loader_version(plan),
-        )
-        .map(|_| ())
-        .map_err(|error| {
-            row_failed.set(true);
-            LauncherError::Generic {
-                code: "ERR_STAGED_APPLY".into(),
-                message: error,
-            }
+    let committed = crate::install_pipeline::blocking_in_place(|| {
+        stage.commit_with_receipt(&mut conn, |tx| {
+            update_migration_row(
+                tx,
+                &instance_id,
+                &plan.loader,
+                &plan.source_version,
+                &plan.source_loader_version,
+                &plan.target_version,
+                &new_loader_version(plan),
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                row_failed.set(true);
+                LauncherError::Generic {
+                    code: "ERR_STAGED_APPLY".into(),
+                    message: error,
+                }
+            })
         })
     });
     let report = match committed {

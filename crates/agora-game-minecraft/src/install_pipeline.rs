@@ -1806,17 +1806,19 @@ impl InstallPipeline {
             bytes_total: plan.disk_estimate.download_bytes,
             message: "Atomically applying files and manifest…".into(),
         });
-        // The apply runs here, under the instance guard staged apply borrows: the downloads and
-        // checks behind it already ran on the worker pool, and what is left is renames, the hash
-        // of each file being replaced, and content-store links.
+        // The apply runs here, under the instance guard staged apply borrows. It is blocking file
+        // work (the hash of each file being replaced, copies in copy mode, a sync of each file), so
+        // the runtime's worker hands its other tasks off first.
         let mut moved_aside = Vec::new();
-        let apply_result = apply_transaction(
-            guard,
-            plan,
-            instance_dir,
-            &staging_dir,
-            content_store.as_ref(),
-        )
+        let apply_result = blocking_in_place(|| {
+            apply_transaction(
+                guard,
+                plan,
+                instance_dir,
+                &staging_dir,
+                content_store.as_ref(),
+            )
+        })
         .map(|moved| {
             moved_aside = moved;
         });
@@ -1995,6 +1997,19 @@ impl InstallPipeline {
 // -----------------------------------------------------------------------
 // Internal helpers
 // -----------------------------------------------------------------------
+
+/// Run blocking file work that borrows something the caller holds (the instance guard a staged
+/// apply borrows, so it cannot move to the worker pool) without stalling the async runtime: on a
+/// multi-thread runtime the worker first hands its other tasks to the rest (`block_in_place`); on
+/// a current-thread runtime, which has nobody to hand them to, it runs inline.
+pub(crate) fn blocking_in_place<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
 
 async fn run_blocking_phase<T, F>(
     scheduler: Option<&TaskScheduler>,
@@ -9036,5 +9051,52 @@ mod tests {
             content_item_id: None,
             object_sha256: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod blocking_in_place_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// One worker: if the blocking work held it, nothing else on the runtime would run meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn other_tasks_keep_running_while_the_apply_blocks() {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker = {
+            let ticks = Arc::clone(&ticks);
+            tokio::spawn(async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+        };
+        tokio::task::yield_now().await;
+        let before = ticks.load(Ordering::SeqCst);
+
+        // Spawned, so the blocking work runs on the one worker (the test body itself does not).
+        let during = {
+            let ticks = Arc::clone(&ticks);
+            tokio::spawn(async move {
+                super::blocking_in_place(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    ticks.load(Ordering::SeqCst)
+                })
+            })
+            .await
+            .unwrap()
+        };
+
+        ticker.abort();
+        assert!(
+            during > before + 5,
+            "the runtime kept serving other tasks during the blocking work ({before} -> {during})"
+        );
+    }
+
+    #[test]
+    fn without_a_runtime_the_work_simply_runs() {
+        assert_eq!(super::blocking_in_place(|| 7), 7);
     }
 }
