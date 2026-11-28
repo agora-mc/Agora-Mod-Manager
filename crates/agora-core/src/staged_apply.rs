@@ -1011,6 +1011,44 @@ pub fn recover_instances(ctx: &crate::ctx::Ctx) -> (Vec<String>, Vec<String>) {
     (actions, warnings)
 }
 
+/// Settle what a crash left in an instance as soon as a writer takes its guard, before the writer
+/// reads anything: a writer that read first would build its change on a half-made one this settle
+/// is about to undo. Applies with a receipt are judged by the local database, so they settle
+/// mid-session too, not only at the next start.
+///
+/// Best effort: an apply that cannot be settled is left as it is (and [`Stage::begin`] refuses
+/// to start another), so taking the guard never fails because of it.
+pub(crate) fn settle_under_new_guard(ctx: &crate::ctx::Ctx, guard: &InstanceGuard) {
+    let Ok(root) = ctx.paths.instance_dir(guard.instance_id()) else {
+        return;
+    };
+    if !has_stage(&root) {
+        return;
+    }
+    let conn = match crate::db::local_state_connection(&ctx.paths.local_state_db()) {
+        Ok(conn) => Some(conn),
+        // Without it, an apply with a receipt is left alone, never guessed.
+        Err(error) => {
+            eprintln!("[staged-apply] the local database could not be opened to settle: {error}");
+            None
+        }
+    };
+    for outcome in settle(
+        guard.lock(),
+        guard.instance_id(),
+        &root,
+        None,
+        conn.as_ref(),
+    ) {
+        if let StagedRecovery::NeedsHand(reason) | StagedRecovery::Busy(reason) = outcome {
+            eprintln!(
+                "[staged-apply] an interrupted change to instance '{}' was left: {reason}",
+                guard.instance_id()
+            );
+        }
+    }
+}
+
 /// [`recover`] cut off after `moves` of its rollback moves, as a second crash would (test seam).
 #[cfg(any(test, feature = "test-support"))]
 pub fn recover_crashing_after(
@@ -1326,6 +1364,9 @@ fn settle_one(
         return StagedRecovery::NeedsHand(error.to_string());
     }
     let _ = std::fs::remove_dir(&dir);
+    // Settling changed the instance (finished the change, or undid part of it): a recovery snapshot
+    // taken before it no longer describes it, so the next launch must not reuse one.
+    let _ = crate::snapshot::mark_instance_mutated(root);
     if committed && journal.receipt {
         // The apply is finished: its receipt has done its job. A row left behind is harmless.
         if let Some(conn) = receipts {

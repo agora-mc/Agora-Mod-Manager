@@ -594,11 +594,13 @@ fn decide(
             return refusal;
         }
     }
-    MayMutate::Yes(InstanceGuard {
+    let guard = InstanceGuard {
         instance_id: instance_id.to_string(),
         lock,
         allow_while_running,
-    })
+    };
+    crate::staged_apply::settle_under_new_guard(ctx, &guard);
+    MayMutate::Yes(guard)
 }
 
 /// The liveness answer as a refusal, or `None` when a change may proceed.
@@ -818,11 +820,13 @@ impl InstanceGuard {
                 return refusal;
             }
         }
-        MayMutate::Yes(InstanceGuard {
+        let guard = InstanceGuard {
             instance_id: instance_id.to_string(),
             lock,
             allow_while_running,
-        })
+        };
+        crate::staged_apply::settle_under_new_guard(ctx, &guard);
+        MayMutate::Yes(guard)
     }
 
     /// Whether the user explicitly allowed this change while the game runs. Services

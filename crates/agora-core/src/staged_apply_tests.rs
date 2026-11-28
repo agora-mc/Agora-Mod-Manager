@@ -42,7 +42,8 @@ fn put(root: &Path, path: &str, bytes: &[u8]) {
     fs::write(path, bytes).unwrap();
 }
 
-/// Every file under `root`, by its `/` path, with its bytes. Empty folders do not count.
+/// Every file under `root`, by its `/` path, with its bytes. Empty folders do not count, and nor
+/// does the snapshot bookkeeping (`.agora_snapshots`), which records that the instance changed.
 fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut files = BTreeMap::new();
     let mut folders = vec![root.to_path_buf()];
@@ -50,6 +51,9 @@ fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
         for entry in fs::read_dir(&folder).unwrap() {
             let path = entry.unwrap().path();
             let kind = fs::symlink_metadata(&path).unwrap();
+            if kind.is_dir() && path == root.join(".agora_snapshots") {
+                continue;
+            }
             if kind.is_dir() {
                 folders.push(path);
             } else {
@@ -1195,4 +1199,76 @@ fn a_read_only_source_is_staged_as_an_ordinary_file() {
         );
     }
     no_stage_left(&root);
+}
+
+// ---------------------------------------------------------------------------
+// 10. Settling comes before reading
+// ---------------------------------------------------------------------------
+
+fn generation(root: &Path) -> Option<u64> {
+    let bytes = fs::read(root.join(".agora_snapshots/mutation-journal.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    value["generation"].as_u64()
+}
+
+#[test]
+fn taking_the_guard_settles_an_interrupted_change_before_anything_is_read() {
+    let (_dir, ctx, root) = fixture();
+    old_instance(&root);
+    {
+        let guard = guard(&ctx);
+        let mut stage = stage_the_apply(&guard, &root);
+        stage.crash_at(Boundary::AfterMove(3));
+        assert!(stage.commit().is_err());
+    }
+    // No startup pass ran (another Agora process crashed while this one was running): the next
+    // writer's first read, made right after it takes the guard, must already see the old instance.
+    let _guard = guard(&ctx);
+    assert_eq!(tree(&root), old_tree());
+    no_stage_left(&root);
+}
+
+#[test]
+fn taking_the_guard_settles_a_receipt_change_by_its_receipt() {
+    let (_dir, ctx, root) = fixture();
+    old_instance(&root);
+    let mut conn = state(&ctx);
+    {
+        let guard = guard(&ctx);
+        let mut stage = stage_the_apply(&guard, &root);
+        stage.crash_at(Boundary::AfterReceipt);
+        assert!(stage.commit_with_receipt(&mut conn, insert_row).is_err());
+    }
+    let guard = guard(&ctx);
+    assert_eq!(without(tree(&root), ASIDE), new_tree());
+    assert_eq!(receipts(&conn), 0);
+    no_stage_left(&root);
+    // And the instance takes ordinary applies again, without a restart.
+    Stage::begin(&guard, &root).unwrap().commit().unwrap();
+}
+
+#[test]
+fn a_recovery_that_changes_the_instance_marks_it_changed() {
+    for (boundary, committed) in [
+        (Boundary::AfterMove(3), false),
+        (Boundary::AfterCommit, true),
+    ] {
+        let (_dir, ctx, root) = fixture();
+        old_instance(&root);
+        {
+            let guard = guard(&ctx);
+            let mut stage = stage_the_apply(&guard, &root);
+            stage.crash_at(boundary);
+            assert!(stage.commit().is_err());
+        }
+        let before = generation(&root);
+
+        let outcomes = staged_apply::recover(&ctx.lock_manager, ID, &root);
+
+        assert_eq!(outcomes.len(), 1, "{boundary:?}: {outcomes:?}");
+        assert!(
+            generation(&root) > before,
+            "{boundary:?} (committed: {committed}): a snapshot taken before the recovery no longer              matches the instance, so it must not be reused"
+        );
+    }
 }
