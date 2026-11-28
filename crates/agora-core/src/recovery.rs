@@ -1224,6 +1224,12 @@ fn examine<S: JournalState>(
     })
 }
 
+/// Whether the marker at `at` is one Agora wrote for `operation_id`. Anything else (missing,
+/// unreadable, another operation's) is not proof.
+pub(crate) fn marker_names(at: &Path, operation_id: &str) -> bool {
+    matches!(marker_verdict(at, operation_id), MarkerVerdict::Ours)
+}
+
 /// What a marker file says about ownership.
 enum MarkerVerdict {
     Ours,

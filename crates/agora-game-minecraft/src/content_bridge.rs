@@ -204,7 +204,7 @@ pub fn store_staged_content(
     let target = instance_dir.join(relative_path);
     if target.exists() {
         if let Some(folder) = target.parent() {
-            ensure_folder_can_delete_children(folder)?;
+            ensure_folder_can_delete_children(instance_dir, folder)?;
         }
         std::fs::remove_file(&target)
             .map_err(|error| write_error("replace a staged pack file", &target, error))?;
@@ -251,7 +251,7 @@ pub fn relink_recorded_content(ctx: &Ctx, instance_dir: &Path) -> LauncherResult
                 continue;
             }
             if let Some(folder) = target.parent() {
-                ensure_folder_can_delete_children(folder)?;
+                ensure_folder_can_delete_children(instance_dir, folder)?;
             }
             std::fs::remove_file(&target)
                 .map_err(|error| write_error("replace a restored file", &target, error))?;
@@ -438,13 +438,9 @@ pub(crate) fn staged_change<T>(
     build: impl FnOnce(&mut Stage<'_>) -> LauncherResult<T>,
 ) -> LauncherResult<(T, ApplyReport)> {
     let mut stage = Stage::begin(guard, instance_dir)?;
-    ensure_folder_can_delete_children(stage.dir())?;
+    ensure_folder_can_delete_children(instance_dir, stage.dir())?;
     for folder in folders {
-        std::fs::create_dir_all(folder).map_err(|error| LauncherError::Generic {
-            code: "ERR_INSTALL_FAILED".into(),
-            message: format!("Could not create {}: {error}", folder.display()),
-        })?;
-        ensure_folder_can_delete_children(folder)?;
+        ensure_folder_can_delete_children(instance_dir, folder)?;
     }
     let value = build(&mut stage)?;
     let report = stage.commit()?;
@@ -497,9 +493,84 @@ pub fn file_matches_recorded(path: &Path, recorded_sha256: &str) -> LauncherResu
     Ok(actual.eq_ignore_ascii_case(recorded_sha256))
 }
 
-/// Make sure a folder can have files deleted from it. A link to a protected object cannot be
-/// deleted from a folder that only grants Modify; the store's placement grants the missing right.
-pub fn ensure_folder_can_delete_children(folder: &Path) -> LauncherResult<()> {
+/// Make `folder` exist below `root` as plain folders all the way down, creating what is missing
+/// one folder at a time. A link (or a file) anywhere between `root` and `folder` is refused before
+/// anything is created, so nothing is ever made outside the instance through one.
+pub(crate) fn plain_folder_below(root: &Path, folder: &Path) -> LauncherResult<()> {
+    let refused = |message: String| LauncherError::Generic {
+        code: "ERR_INSTALL_FAILED".into(),
+        message,
+    };
+    let relative = folder.strip_prefix(root).map_err(|_| {
+        refused(format!(
+            "{} is not inside {}",
+            folder.display(),
+            root.display()
+        ))
+    })?;
+    let mut at = root.to_path_buf();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(name) => at.push(name),
+            _ => {
+                return Err(refused(format!(
+                    "{} is not a plain path below the instance",
+                    folder.display()
+                )))
+            }
+        }
+        let made = match std::fs::symlink_metadata(&at) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::create_dir(&at) {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+                    Err(error) => {
+                        return Err(refused(format!(
+                            "Could not create {}: {error}",
+                            at.display()
+                        )))
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(refused(format!(
+                    "Could not examine {}: {error}",
+                    at.display()
+                )))
+            }
+            Ok(_) => false,
+        };
+        match std::fs::symlink_metadata(&at) {
+            Ok(kind) if kind.is_dir() && !agora_game_api::is_a_reparse_point(&kind) => {}
+            Ok(_) => {
+                return Err(refused(format!(
+                    "{} is a link or a file, not a folder, so Agora will not write through it",
+                    at.display()
+                )))
+            }
+            Err(error) if made => {
+                return Err(refused(format!(
+                    "{} vanished after it was created: {error}",
+                    at.display()
+                )))
+            }
+            Err(error) => {
+                return Err(refused(format!(
+                    "Could not examine {}: {error}",
+                    at.display()
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Make sure `folder` (below the instance `root`, created if missing) can have files deleted from
+/// it. A link to a protected object cannot be deleted from a folder that only grants Modify; the
+/// store's placement grants the missing right. A link anywhere below `root` is refused first, so a
+/// folder outside the instance never has its rights changed.
+pub fn ensure_folder_can_delete_children(root: &Path, folder: &Path) -> LauncherResult<()> {
+    plain_folder_below(root, folder)?;
     if store::protect::grants_delete_child(folder).map_err(|error| LauncherError::Generic {
         code: "ERR_CONTENT_STORE".into(),
         message: error.to_string(),
@@ -848,5 +919,61 @@ mod review_store_metadata {
             after.icon_sha256, before.icon_sha256,
             "the saved icon was erased by re-storing the same file"
         );
+    }
+}
+
+#[cfg(test)]
+mod folders_below_the_instance {
+    use super::*;
+
+    fn folder_link(target: &Path, link: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
+    #[test]
+    fn a_content_folder_that_is_a_link_is_refused_and_nothing_is_made_through_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let instance = tmp.path().join("instance");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&instance).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        assert!(
+            folder_link(&outside, &instance.join("mods")),
+            "this process cannot create a folder link, so the check must not be skipped silently"
+        );
+
+        assert!(plain_folder_below(&instance, &instance.join("mods").join("sub")).is_err());
+        assert!(ensure_folder_can_delete_children(&instance, &instance.join("mods")).is_err());
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "nothing was created outside the instance"
+        );
+    }
+
+    #[test]
+    fn missing_content_folders_are_made_as_plain_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let instance = tmp.path().join("instance");
+        std::fs::create_dir_all(&instance).unwrap();
+        let folder = instance.join("resourcepacks").join("nested");
+
+        plain_folder_below(&instance, &folder).unwrap();
+
+        assert!(folder.is_dir());
+        assert!(plain_folder_below(&instance, &tmp.path().join("elsewhere")).is_err());
     }
 }

@@ -265,6 +265,7 @@ impl<'g> Stage<'g> {
         receipts: Option<&rusqlite::Connection>,
     ) -> LauncherResult<Self> {
         plain_directory(root)?;
+        plain_or_absent(&stage_root(root))?;
         for outcome in settle(guard.lock(), guard.instance_id(), root, None, receipts) {
             if let StagedRecovery::NeedsHand(reason) | StagedRecovery::Busy(reason) = outcome {
                 return Err(refused(format!(
@@ -1008,6 +1009,23 @@ fn settle_inner(
     receipts: Option<&rusqlite::Connection>,
 ) -> Vec<StagedRecovery> {
     let base = stage_root(root);
+    match std::fs::symlink_metadata(&base) {
+        Ok(kind) if kind.is_dir() && !agora_game_api::is_a_reparse_point(&kind) => {}
+        Ok(_) => {
+            return vec![StagedRecovery::NeedsHand(format!(
+                "{} is not a plain folder (a link, or a file), so Agora did not look inside it. \
+                 Nothing was changed.",
+                base.display()
+            ))]
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            return vec![StagedRecovery::NeedsHand(format!(
+                "{} could not be examined: {error}",
+                base.display()
+            ))]
+        }
+    }
     let entries = match std::fs::read_dir(&base) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
@@ -1020,6 +1038,7 @@ fn settle_inner(
     };
     let mut journals = Vec::new();
     let mut folders = Vec::new();
+    let mut temporaries = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -1041,6 +1060,11 @@ fn settle_inner(
             }
             Ok(kind) if kind.is_dir() => folders.push(name),
             Ok(_) if name.ends_with(".json") && !name.contains(".tmp") => journals.push(path),
+            // A journal a crash cut off while it was being written: the journal it would have
+            // replaced (or none) is what counts.
+            Ok(_) if name.starts_with(".journal-") && name.ends_with(".tmp") => {
+                temporaries.push(path)
+            }
             Ok(_) => {}
             Err(error) => {
                 return vec![StagedRecovery::NeedsHand(format!(
@@ -1074,13 +1098,32 @@ fn settle_inner(
             continue;
         }
         let dir = base.join(&folder);
-        let only_marker = std::fs::read_dir(&dir)
-            .map(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .all(|entry| entry.file_name() == MARKER)
-            })
-            .unwrap_or(false);
+        let only_marker = std::fs::read_dir(&dir).and_then(|entries| {
+            let mut only = true;
+            for entry in entries {
+                only &= entry?.file_name() == MARKER;
+            }
+            Ok(only)
+        });
+        let only_marker = match only_marker {
+            Ok(only) => only,
+            Err(error) => {
+                outcomes.push(StagedRecovery::NeedsHand(format!(
+                    "{} could not be read: {error}. Nothing was changed.",
+                    dir.display()
+                )));
+                continue;
+            }
+        };
+        let marker = dir.join(MARKER);
+        if only_marker && !recovery::marker_names(&marker, &folder) {
+            outcomes.push(StagedRecovery::NeedsHand(format!(
+                "{} holds a marker that is not this folder's, so Agora cannot tell it is its own. \
+                 Nothing was changed.",
+                dir.display()
+            )));
+            continue;
+        }
         if only_marker {
             let _ = std::fs::remove_file(dir.join(MARKER));
             let _ = std::fs::remove_dir(&dir);
@@ -1090,6 +1133,17 @@ fn settle_inner(
                  was changed.",
                 dir.display()
             )));
+        }
+    }
+    let all_settled = outcomes.iter().all(|outcome| {
+        matches!(
+            outcome,
+            StagedRecovery::RolledBack { .. } | StagedRecovery::Finished { .. }
+        )
+    });
+    if all_settled {
+        for temporary in temporaries {
+            let _ = std::fs::remove_file(temporary);
         }
     }
     let _ = std::fs::remove_dir(&base);
@@ -1522,6 +1576,14 @@ fn free_aside(root: &Path, relative: &str, taken: &[String]) -> LauncherResult<S
         }
         candidate = format!("{base}.{counter}");
         counter += 1;
+    }
+}
+
+/// A plain folder, or nothing yet: anything else (a link, a file) is refused.
+fn plain_or_absent(path: &Path) -> LauncherResult<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => plain_directory(path),
     }
 }
 

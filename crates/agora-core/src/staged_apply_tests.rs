@@ -994,3 +994,77 @@ fn a_file_agora_made_live_and_something_then_replaced_is_never_taken() {
     );
     no_stage_left(&root);
 }
+
+// ---------------------------------------------------------------------------
+// 7. The stage folder itself
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_stage_folder_that_is_a_link_is_refused_and_what_it_points_at_is_untouched() {
+    let (dir, ctx, root) = fixture();
+    put(&root, "mods/keep.jar", b"keep");
+    let outside = dir.path().join("outside-stage");
+    fs::create_dir_all(outside.join("not-a-stage")).unwrap();
+    fs::write(outside.join("not-a-stage").join(".owner.json"), b"{}").unwrap();
+    fs::write(outside.join("theirs.json"), b"not a journal").unwrap();
+    let before = tree(&outside);
+    assert!(
+        make_folder_link(&outside, &staged_apply::stage_root(&root)),
+        "this process cannot create a folder link, so the check must not be skipped silently"
+    );
+
+    let guard = guard(&ctx);
+    assert!(
+        Stage::begin(&guard, &root).is_err(),
+        "an apply never starts in a stage folder that leads out of the instance"
+    );
+    drop(guard);
+    let outcomes = staged_apply::recover(&ctx.lock_manager, ID, &root);
+    assert!(
+        matches!(outcomes.as_slice(), [StagedRecovery::NeedsHand(_)]),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        tree(&outside),
+        before,
+        "nothing outside the instance was touched"
+    );
+    assert_eq!(fs::read(root.join("mods/keep.jar")).unwrap(), b"keep");
+}
+
+#[test]
+fn a_left_journal_temporary_is_cleared_with_the_stage() {
+    let (_dir, ctx, root) = fixture();
+    put(&root, "mods/keep.jar", b"keep");
+    // A crash while a journal was being written leaves its temporary beside the journals.
+    let stage = staged_apply::stage_root(&root);
+    fs::create_dir_all(&stage).unwrap();
+    fs::write(stage.join(".journal-0000.tmp"), b"half a journal").unwrap();
+
+    let outcomes = staged_apply::recover(&ctx.lock_manager, ID, &root);
+    assert!(outcomes.is_empty(), "{outcomes:?}");
+    assert!(
+        !stage.exists(),
+        "the stage folder is gone, so later starts skip this instance"
+    );
+}
+
+#[test]
+fn a_stage_without_a_journal_whose_marker_names_another_change_needs_a_hand() {
+    let (_dir, ctx, root) = fixture();
+    let stage = staged_apply::stage_root(&root);
+    let folder = stage.join("11111111-1111-1111-1111-111111111111");
+    fs::create_dir_all(&folder).unwrap();
+    crate::recovery::write_marker(
+        &folder.join(".owner.json"),
+        "22222222-2222-2222-2222-222222222222",
+    )
+    .unwrap();
+
+    let outcomes = staged_apply::recover(&ctx.lock_manager, ID, &root);
+    assert!(
+        matches!(outcomes.as_slice(), [StagedRecovery::NeedsHand(_)]),
+        "a marker is proof only for the folder it names: {outcomes:?}"
+    );
+    assert!(folder.join(".owner.json").exists());
+}

@@ -1852,7 +1852,7 @@ fn remove_instance_file(instance_dir: &Path, path: &Path) -> Result<(), String> 
         });
     if agora_managed {
         if let Some(folder) = path.parent() {
-            crate::content_bridge::ensure_folder_can_delete_children(folder)
+            crate::content_bridge::ensure_folder_can_delete_children(instance_dir, folder)
                 .map_err(|error| error.to_string())?;
         }
     }

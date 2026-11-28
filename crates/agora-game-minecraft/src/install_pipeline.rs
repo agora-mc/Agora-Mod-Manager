@@ -4013,9 +4013,10 @@ fn apply_transaction_crashing(
         if content_store.is_some() {
             // A link to a protected object can only be moved out of, or deleted from, a folder
             // that grants delete-child: the stage keeps the old links until the cleanup.
-            crate::content_bridge::ensure_folder_can_delete_children(stage.dir()).map_err(
-                |error| format!("could not make the staging area safe to clean: {error}"),
-            )?;
+            crate::content_bridge::ensure_folder_can_delete_children(instance_dir, stage.dir())
+                .map_err(|error| {
+                    format!("could not make the staging area safe to clean: {error}")
+                })?;
         }
         // A removal and an addition at the same path (an update that keeps the file name) are one
         // replacement: the removal's judgement of whose file it is carries over to it.
@@ -4117,15 +4118,14 @@ fn apply_transaction_crashing(
                 None => Expect::Absent,
             };
             if let Some(parent) = live.parent() {
-                std::fs::create_dir_all(parent)
+                crate::content_bridge::plain_folder_below(instance_dir, parent)
                     .map_err(|e| format!("failed to create content directory: {e}"))?;
                 if content_store.is_some() {
                     // The same right, where a placed link may have to be moved back from.
-                    crate::content_bridge::ensure_folder_can_delete_children(parent).map_err(
-                        |error| {
+                    crate::content_bridge::ensure_folder_can_delete_children(instance_dir, parent)
+                        .map_err(|error| {
                             format!("could not make {} safe to clean: {error}", parent.display())
-                        },
-                    )?;
+                        })?;
                 }
             }
             check_test_failpoint("artifact-rename")?;

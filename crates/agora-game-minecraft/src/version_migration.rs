@@ -1508,7 +1508,7 @@ fn stage_migration(
     }
     if !stored.is_empty() {
         // A link to a protected object can only be moved out of a folder that grants delete-child.
-        crate::content_bridge::ensure_folder_can_delete_children(stage.dir())
+        crate::content_bridge::ensure_folder_can_delete_children(instance_dir, stage.dir())
             .map_err(|error| format!("could not make the staging area safe to clean: {error}"))?;
     }
 
@@ -1574,12 +1574,13 @@ fn stage_migration(
             None => Expect::Absent,
         };
         if let Some(parent) = live.parent() {
-            std::fs::create_dir_all(parent)
+            crate::content_bridge::plain_folder_below(instance_dir, parent)
                 .map_err(|e| format!("failed to create content directory: {e}"))?;
             if !stored.is_empty() {
-                crate::content_bridge::ensure_folder_can_delete_children(parent).map_err(
-                    |error| format!("could not make {} safe to clean: {error}", parent.display()),
-                )?;
+                crate::content_bridge::ensure_folder_can_delete_children(instance_dir, parent)
+                    .map_err(|error| {
+                        format!("could not make {} safe to clean: {error}", parent.display())
+                    })?;
             }
         }
         check_failpoint("artifact-move")?;
