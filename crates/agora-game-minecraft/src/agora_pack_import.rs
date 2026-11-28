@@ -2884,7 +2884,7 @@ mod tests {
         );
         assert_eq!(request.hashes.pack_sha256, None);
         assert_eq!(request.hashes.published_sha1, None);
-        assert_eq!(request.source.stored_source(), "registry");
+        assert_eq!(request.source.content_source().stored(), "registry");
         assert_eq!(
             request.source,
             InstallSource::Catalog {

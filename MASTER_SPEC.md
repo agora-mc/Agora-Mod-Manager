@@ -5706,8 +5706,10 @@ callers, 6 internal).
   `source_strategy`) and `Modrinth` (a project outside the catalog), the two that reach this
   install today. A pack entry is a catalog entry. Others (a pasted link, a local file) are added
   with the flows that make them (owner, 2026-11-28); provenance comes from the variant, and the
-  stored string is derived from it. One typed provenance for every writer, with "local" for files
-  matched to nothing, is part of C2.
+  stored string is derived from it. Every writer and reader of an installed file's `source` goes
+  through one list, `agora_game_api::ContentSource` (C2, 2026-11-28): catalog, Modrinth, provider,
+  pack, launcher import, and `local` for a file matched to nothing; every spelling written before
+  it still reads.
 - **Digests are types** (`Sha1`, `Sha256`, `Sha512`) parsed at the edge: a malformed, empty or
   whitespace-only digest is an error, never "none published". Supplied digests are validated before
   any download.

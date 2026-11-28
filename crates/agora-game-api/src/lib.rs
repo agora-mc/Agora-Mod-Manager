@@ -8,6 +8,7 @@
 
 pub mod archive;
 pub mod condition;
+pub mod content_source;
 pub mod crash;
 pub mod game;
 pub mod host;
@@ -20,6 +21,7 @@ pub mod scope;
 
 pub use archive::*;
 pub use condition::*;
+pub use content_source::*;
 pub use game::*;
 pub use host::*;
 pub use id::*;

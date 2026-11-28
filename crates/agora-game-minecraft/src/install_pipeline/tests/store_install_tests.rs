@@ -586,7 +586,8 @@ fn a_manual_drop_links_from_the_store() {
         .add_manual_artifact("test", source.to_str().unwrap())
         .unwrap();
 
-    assert_eq!(installed.source, "manual_drag_drop");
+    // A dropped file is tied to no source: the shared list records it as local.
+    assert_eq!(installed.source, "local");
     assert!(installed.content_item_id.is_some());
     let object = installed.object_sha256.clone().unwrap();
     assert!(ctx.paths.content_object_path(&object).is_file());

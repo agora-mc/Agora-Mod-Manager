@@ -51,11 +51,11 @@ pub enum InstallSource {
 }
 
 impl InstallSource {
-    /// The manifest's `source` value for a file installed from here.
-    pub fn stored_source(&self) -> &'static str {
+    /// Where a file installed from here came from, as the manifest records it.
+    pub fn content_source(&self) -> agora_game_api::ContentSource {
         match self {
-            InstallSource::Catalog { .. } => "registry",
-            InstallSource::Modrinth { .. } => "modrinth_raw",
+            InstallSource::Catalog { .. } => agora_game_api::ContentSource::Catalog,
+            InstallSource::Modrinth { .. } => agora_game_api::ContentSource::Modrinth,
         }
     }
 
@@ -757,7 +757,7 @@ impl InstallService {
                 filename: filename.to_string(),
                 registry_id: registry_id.map(|s| s.to_string()),
                 modrinth_id: modrinth_id.map(|s| s.to_string()),
-                source: request.source.stored_source().to_string(),
+                source: request.source.content_source().stored(),
                 source_url: Some(download_url.to_string()),
                 version: version.map(|s| s.to_string()),
                 sha256: installed_sha256,
@@ -967,7 +967,7 @@ impl InstallService {
                 filename: file_name.to_string(),
                 registry_id: None,
                 modrinth_id: None,
-                source: "manual_drag_drop".to_string(),
+                source: agora_game_api::ContentSource::Local.stored(),
                 source_url: None,
                 version: None,
                 sha256: stored.sha256.clone(),

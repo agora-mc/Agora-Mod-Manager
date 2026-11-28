@@ -617,12 +617,11 @@ impl<'de> Deserialize<'de> for InstanceManifest {
 
 /// Whether a legacy `source` string implies the entry came from a pack.
 ///
-/// Only used to heal manifests written before `pack_managed` existed. Hyphens
-/// are normalized because `.mrpack` import writes `modrinth-pack` while the
-/// launcher importer writes `imported_<launcher>`.
+/// Only used to heal manifests written before `pack_managed` existed: `.mrpack` import writes
+/// `modrinth-pack` and the launcher importer `imported_<launcher>`
+/// ([`agora_game_api::ContentSource::came_with_a_pack`]).
 pub fn source_implies_pack_managed(source: &str) -> bool {
-    let normalized = source.trim().to_ascii_lowercase().replace('-', "_");
-    normalized == "modrinth_pack" || normalized.starts_with("imported_")
+    agora_game_api::ContentSource::parse(source).came_with_a_pack()
 }
 
 /// Populate `pack_managed` on entries loaded from a pre-v2 manifest.

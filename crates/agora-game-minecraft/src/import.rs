@@ -364,7 +364,7 @@ fn inventory_pack_content(
             filename,
             registry_id: None,
             modrinth_id: modrinth_file.map(|file| file.project_id.clone()),
-            source: "modrinth-pack".into(),
+            source: agora_game_api::ContentSource::Pack.stored(),
             source_url: modrinth_file.map(|file| file.download_url.clone()),
             version: None,
             sha256: stored_file

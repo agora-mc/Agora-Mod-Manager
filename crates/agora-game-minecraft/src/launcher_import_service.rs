@@ -675,7 +675,7 @@ fn inventory_directory(
             filename,
             registry_id: None,
             modrinth_id: None,
-            source: format!("imported_{source}"),
+            source: agora_game_api::ContentSource::LauncherImport(source.to_string()).stored(),
             source_url: None,
             version,
             sha256: sha,

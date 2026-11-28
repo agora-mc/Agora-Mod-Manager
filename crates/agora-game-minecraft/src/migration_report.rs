@@ -607,9 +607,11 @@ fn classify_unclassifiable(m: &InstalledMod) -> UnclassifiableReason {
         return UnclassifiableReason::CuratedOnly;
     }
     let src = m.source.trim().to_ascii_lowercase();
-    if src.contains("manual")
+    let source = agora_game_api::ContentSource::parse(&m.source);
+    if source == agora_game_api::ContentSource::Local
+        || src.contains("manual")
         || src.contains("local")
-        || src == "modrinth_raw" && m.modrinth_id.is_none()
+        || source == agora_game_api::ContentSource::Modrinth && m.modrinth_id.is_none()
         || src.is_empty()
     {
         // `modrinth_raw` without an id is effectively manual.

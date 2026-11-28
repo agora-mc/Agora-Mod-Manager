@@ -44,6 +44,7 @@ use agora_core::{
     staged_apply::{self, Expect, Stage},
     task_scheduler::{BlockingPriority, TaskScheduler},
 };
+use agora_game_api::ContentSource;
 
 // Reuse types from dependency_ops to avoid duplication.
 pub use agora_core::{
@@ -3866,12 +3867,13 @@ fn prepare_manifest(
             registry_id: metadata.registry_id.clone(),
             modrinth_id: metadata.modrinth_id.clone(),
             source: match metadata.source_type {
-                SourceType::Curated => "registry",
-                SourceType::Modrinth => "modrinth_raw",
-                SourceType::Manual => "manual",
-                SourceType::Provider => "provider",
+                SourceType::Curated => ContentSource::Catalog,
+                SourceType::Modrinth => ContentSource::Modrinth,
+                // A file the user chose by hand: Agora cannot tie it to a source.
+                SourceType::Manual => ContentSource::Local,
+                SourceType::Provider => ContentSource::Provider,
             }
-            .into(),
+            .stored(),
             source_url: source_url.clone(),
             version: version_label.clone(),
             sha256,

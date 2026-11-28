@@ -1081,7 +1081,7 @@ pub async fn install_raw_modrinth(
         filename: candidate.filename.clone(),
         registry_id: None,
         modrinth_id: Some(project_id.to_string()),
-        source: "modrinth_raw".to_string(),
+        source: agora_game_api::ContentSource::Modrinth.stored(),
         source_url: Some(candidate.download_url.clone()),
         version: Some(candidate.version.clone()),
         sha256,

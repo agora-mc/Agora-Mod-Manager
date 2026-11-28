@@ -672,23 +672,22 @@ fn provider_source_label(provider_id: &str) -> String {
 }
 
 fn source_label(source: &str) -> String {
-    let normalized = source.trim().to_ascii_lowercase().replace([' ', '-'], "_");
-    if normalized == "modrinth" || normalized == "modrinth_raw" {
-        return "Modrinth".to_string();
+    use agora_game_api::ContentSource;
+    match ContentSource::parse(source) {
+        ContentSource::Modrinth => "Modrinth".to_string(),
+        ContentSource::Pack => "Modrinth Pack".to_string(),
+        ContentSource::Catalog => "Agora Registry".to_string(),
+        ContentSource::Local => "Manual".to_string(),
+        ContentSource::Other(other) if other.to_ascii_lowercase().contains("github") => {
+            "GitHub Release".to_string()
+        }
+        ContentSource::Other(other) if other.to_ascii_lowercase().contains("manual") => {
+            "Manual".to_string()
+        }
+        ContentSource::Provider | ContentSource::LauncherImport(_) | ContentSource::Other(_) => {
+            "Other".to_string()
+        }
     }
-    if normalized == "modrinth_pack" {
-        return "Modrinth Pack".to_string();
-    }
-    if normalized.contains("github") {
-        return "GitHub Release".to_string();
-    }
-    if normalized == "registry" || normalized == "curated" {
-        return "Agora Registry".to_string();
-    }
-    if normalized.contains("manual") || normalized == "local" {
-        return "Manual".to_string();
-    }
-    "Other".to_string()
 }
 
 fn curation_status(status: &str) -> CurationStatus {
@@ -879,7 +878,7 @@ mod tests {
             filename: filename.to_string(),
             registry_id: None,
             modrinth_id: None,
-            source: "manual_drag_drop".to_string(),
+            source: agora_game_api::ContentSource::Local.stored(),
             source_url: None,
             version: None,
             sha256: "hash".to_string(),
